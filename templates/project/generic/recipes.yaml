@@ -1,0 +1,42 @@
+# Declarative recipes for this project.
+# command MUST be an argv array (never a shell string); cwd is relative to the project root.
+recipes:
+  - name: typecheck
+    description: Run TypeScript type checking
+    command: ["npm", "run", "typecheck"]
+    cwd: "."
+    timeout_ms: 120000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: []
+    artifacts: []
+    environment: []
+    output_strategy: tail
+    max_lines: 2000
+    max_bytes: 51200
+  - name: test
+    description: Run the project test suite
+    command: ["npm", "test"]
+    cwd: "."
+    timeout_ms: 300000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: []
+    artifacts: []
+    environment: []
+    output_strategy: tail
+    max_lines: 2000
+    max_bytes: 51200
+  - name: build
+    description: Build the project
+    command: ["npm", "run", "build"]
+    cwd: "."
+    timeout_ms: 300000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: []
+    artifacts: ["dist/**"]
+    environment: []
+    output_strategy: tail
+    max_lines: 2000
+    max_bytes: 51200

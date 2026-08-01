@@ -1,0 +1,140 @@
+{
+	"$schema": "https://json-schema.org/draft/2020-12/schema",
+	"$id": "https://pi-dev-workbench/quant-result.schema.json",
+	"title": "Quant Result",
+	"description": "Output contract for quantitative research artifacts (default path results/quant-result.json). The workbench never computes strategy metrics — it only validates that a project's declared output conforms to this contract. Enforcement lives in extensions/workbench-runtime/core/quant-result.ts, which additionally rejects non-finite numbers (e.g. 1e999 parses to Infinity) and records every fold — including failed folds — so failures are never filtered out.",
+	"type": "object",
+	"required": [
+		"schema_version",
+		"run_id",
+		"strategy_type",
+		"frequency",
+		"universe",
+		"data_range",
+		"split",
+		"benchmark",
+		"costs",
+		"metrics",
+		"folds",
+		"parameters",
+		"artifacts"
+	],
+	"properties": {
+		"schema_version": { "type": "string", "minLength": 1 },
+		"run_id": { "type": "string", "minLength": 1 },
+		"strategy_type": { "type": "string", "minLength": 1 },
+		"frequency": { "type": "string", "minLength": 1 },
+		"universe": {
+			"oneOf": [
+				{ "type": "string", "minLength": 1 },
+				{
+					"type": "object",
+					"properties": {
+						"name": { "type": "string" },
+						"point_in_time": { "description": "stock-selection profile optional field", "oneOf": [{ "type": "boolean" }, { "type": "object" }] }
+					}
+				}
+			]
+		},
+		"data_range": {
+			"type": "object",
+			"required": ["start", "end"],
+			"properties": {
+				"start": { "type": "string" },
+				"end": { "type": "string" }
+			}
+		},
+		"split": {
+			"type": "object",
+			"required": ["method"],
+			"properties": {
+				"method": { "enum": ["walk-forward", "train/validation/test", "time-series", "custom"] },
+				"train": { "type": "object" },
+				"validation": { "type": "object" },
+				"test": { "type": "object" },
+				"walk_forward": { "type": "object" }
+			}
+		},
+		"benchmark": {
+			"type": "object",
+			"required": ["name"],
+			"properties": {
+				"name": { "type": "string", "minLength": 1 },
+				"return": { "type": "number" }
+			}
+		},
+		"costs": {
+			"type": "object",
+			"description": "Fee/slippage assumptions. All numeric values must be finite numbers."
+		},
+		"metrics": {
+			"type": "object",
+			"required": ["return", "volatility", "drawdown", "turnover", "exposure", "benchmark_delta"],
+			"anyOf": [{ "required": ["sharpe"] }, { "required": ["sortino"] }, { "required": ["calmar"] }, { "required": ["information_ratio"] }],
+			"description": "All numbers must be finite. return_pre_cost / return_post_cost are optional (pre/post cost reporting)."
+		},
+		"folds": {
+			"type": "array",
+			"minItems": 1,
+			"description": "Full trial reporting: every fold is recorded, failed folds are never filtered.",
+			"items": {
+				"type": "object",
+				"required": ["id", "status"],
+				"properties": {
+					"id": { "type": "string", "minLength": 1 },
+					"status": { "enum": ["passed", "failed", "skipped", "pending"] },
+					"period": { "type": "object" },
+					"parameters": { "type": "object" },
+					"metrics": { "type": "object" }
+				}
+			}
+		},
+		"parameters": {
+			"type": "object",
+			"description": "Declared search space / parameter values. All numbers must be finite."
+		},
+		"artifacts": {
+			"type": "array",
+			"items": { "type": "string", "minLength": 1 }
+		},
+		"warnings": {
+			"type": "array",
+			"items": { "type": "string" }
+		},
+		"semantics": {
+			"type": "object",
+			"description": "Declared backtest semantics (e.g. signal_execution_delay, no_future_leakage). Presence is a contract; the manual Q-gate audits are what verify the declaration is true."
+		},
+		"exposure": {
+			"type": "object",
+			"description": "stock-selection profile optional field",
+			"properties": {
+				"industry": { "type": "number" },
+				"market_cap": { "type": "number" }
+			}
+		},
+		"rebalance": {
+			"type": "object",
+			"description": "stock-selection profile optional field",
+			"properties": {
+				"frequency": { "type": "string" },
+				"turnover_target": { "type": "number" }
+			}
+		},
+		"regime": {
+			"type": "object",
+			"description": "market-timing profile optional field",
+			"properties": {
+				"states": { "type": "array" }
+			}
+		},
+		"position_sizing": {
+			"type": "object",
+			"description": "market-timing profile optional field",
+			"properties": {
+				"method": { "type": "string" },
+				"max_position": { "type": "number" }
+			}
+		}
+	}
+}

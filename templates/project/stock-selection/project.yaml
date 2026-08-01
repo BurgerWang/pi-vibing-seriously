@@ -1,0 +1,4 @@
+# Workbench project configuration.
+name: stock-selection-research
+description: Quantitative stock selection research (mid/low frequency)
+profile: quant-research/stock-selection

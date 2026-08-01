@@ -1,0 +1,44 @@
+# Declarative recipes for this quantitative research project.
+# command MUST be an argv array (never a shell string); cwd is relative to the project root.
+# The scripts below (scripts/*.py) are placeholders your project must provide.
+# The workbench only runs declared commands — it implements no backtesting engine.
+recipes:
+  - name: data:fetch
+    description: Fetch/refresh the input dataset (user-provided script)
+    command: ["python", "scripts/fetch_data.py"]
+    cwd: "."
+    timeout_ms: 600000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: ["data/", "results/"]
+    artifacts: ["results/**/*.json", "results/**/*.csv"]
+    environment: []
+    output_strategy: tail
+    max_lines: 2000
+    max_bytes: 51200
+  - name: backtest:timing
+    description: Run the market-timing backtest (user-provided script)
+    command: ["python", "scripts/backtest.py"]
+    cwd: "."
+    timeout_ms: 600000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: ["data/", "results/"]
+    artifacts: ["results/**/*.json", "results/**/*.csv"]
+    environment: []
+    output_strategy: tail
+    max_lines: 2000
+    max_bytes: 51200
+  - name: walkforward:validate
+    description: Run walk-forward / out-of-sample validation
+    command: ["python", "scripts/walkforward.py"]
+    cwd: "."
+    timeout_ms: 900000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: ["data/", "results/"]
+    artifacts: ["results/**/*.json", "results/**/*.csv"]
+    environment: []
+    output_strategy: tail
+    max_lines: 2000
+    max_bytes: 51200

@@ -1,0 +1,4 @@
+# Workbench profile definitions for this project.
+profiles:
+  - name: quant-research/stock-selection
+    description: Quantitative stock selection research (mid/low frequency)

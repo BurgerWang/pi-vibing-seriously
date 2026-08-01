@@ -1,0 +1,4 @@
+# Workbench project configuration.
+name: market-timing-research
+description: Quantitative market timing research (mid/low frequency)
+profile: quant-research/market-timing

@@ -1,0 +1,354 @@
+/**
+ * Workbench recipe schema — validation and argv construction. Pure logic.
+ *
+ * A recipe is a fully declarative command description. The model can only
+ * request a recipe by name plus parameters declared in the recipe's `params`
+ * schema — it can never inject an arbitrary command or shell string.
+ *
+ * Security invariants enforced here / by the runner:
+ *   - `command` MUST be an argv array; a plain shell string is rejected.
+ *   - Parameters are substituted into argv entries via `{{name}}` placeholders;
+ *     no shell string is ever assembled.
+ *   - `environment` only allows explicitly declared env var names.
+ *   - `cwd` / `writes` / `artifacts` containment is enforced by path-guard.
+ */
+
+import type { WorkbenchMode } from "./mode-policy.ts";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
+
+export const RECIPE_SCHEMA_VERSION = 1;
+
+export type OutputStrategy = "head" | "tail";
+export type RecipeParamType = "string" | "number" | "boolean";
+
+export interface RecipeParam {
+	name: string;
+	type: RecipeParamType;
+	required: boolean;
+	description?: string;
+}
+
+export interface Recipe {
+	name: string;
+	description: string;
+	/** argv array; first element is the executable. Never a shell string. */
+	command: string[];
+	/** Working directory, relative to the project root. */
+	cwd: string;
+	timeout_ms: number;
+	allowed_modes: WorkbenchMode[];
+	expected_exit_codes: number[];
+	/** Declared write paths (relative to project root) — containment-checked. */
+	writes: string[];
+	/** Result-file globs (relative to project root) — containment-checked. */
+	artifacts: string[];
+	/** Env var names the process may inherit. Nothing else is passed. */
+	environment: string[];
+	output_strategy: OutputStrategy;
+	max_lines: number;
+	max_bytes: number;
+	/** Declared parameters the model may pass; substituted into argv. */
+	params: RecipeParam[];
+}
+
+export interface RecipeParseResult {
+	recipes: Recipe[];
+	errors: string[];
+}
+
+export const DEFAULT_TIMEOUT_MS = 120_000;
+
+export const DEFAULT_RECIPE: Omit<Recipe, "name" | "command"> = {
+	description: "",
+	cwd: ".",
+	timeout_ms: DEFAULT_TIMEOUT_MS,
+	allowed_modes: ["DEV", "VERIFY"],
+	expected_exit_codes: [0],
+	writes: [],
+	artifacts: [],
+	environment: [],
+	output_strategy: "tail",
+	max_lines: DEFAULT_MAX_LINES,
+	max_bytes: DEFAULT_MAX_BYTES,
+	params: [],
+};
+
+const MODE_VALUES: readonly string[] = ["AUDIT", "DEV", "VERIFY"];
+const PARAM_TYPES: readonly string[] = ["string", "number", "boolean"];
+const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const PLACEHOLDER_RE = /\{\{([A-Za-z_][A-Za-z0-9_]*)\}\}/g;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function asStringArray(value: unknown, field: string, errors: string[]): string[] {
+	if (value === undefined) return [];
+	if (!Array.isArray(value)) {
+		errors.push(`"${field}" must be an array of strings`);
+		return [];
+	}
+	const out: string[] = [];
+	for (const item of value) {
+		if (typeof item !== "string") {
+			errors.push(`"${field}" entries must be strings`);
+			continue;
+		}
+		out.push(item);
+	}
+	return out;
+}
+
+function asPositiveInt(value: unknown, label: string, fallback: number, errors: string[]): number {
+	if (value === undefined) return fallback;
+	if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+		errors.push(`${label} must be a positive integer`);
+		return fallback;
+	}
+	return value;
+}
+
+/** Parse one raw recipe mapping into a validated Recipe (or errors). */
+export function parseRecipe(raw: unknown, index: number): RecipeParseResult {
+	const errors: string[] = [];
+	if (!isRecord(raw)) {
+		return { recipes: [], errors: [`recipe #${index + 1} must be a mapping`] };
+	}
+	for (const key of Object.keys(raw)) {
+		if (!(key in DEFAULT_RECIPE) && key !== "name" && key !== "command") {
+			errors.push(`recipe #${index + 1} (${typeof raw.name === "string" ? `"${raw.name}"` : "unnamed"}): unknown field "${key}"`);
+		}
+	}
+	const name = raw.name;
+	let recipeName: string | undefined;
+	if (typeof name !== "string" || name.trim().length === 0) {
+		errors.push(`recipe #${index + 1}: "name" must be a non-empty string`);
+	} else {
+		recipeName = name;
+	}
+	const label = (): string => (recipeName ? `"${recipeName}"` : `#${index + 1}`);
+	const command = raw.command;
+	let commandArgv: string[] | undefined;
+	if (command === undefined) {
+		errors.push(`recipe ${label()}: "command" is required`);
+	} else if (typeof command === "string") {
+		errors.push(
+			`recipe ${label()}: "command" must be an argv array (e.g. ["npm","test"]), not a shell string`,
+		);
+	} else if (!Array.isArray(command) || command.length === 0 || command.some((c) => typeof c !== "string" || c.trim() === "")) {
+		errors.push(
+			`recipe ${label()}: "command" must be a non-empty argv array of non-empty strings`,
+		);
+	} else {
+		commandArgv = command;
+	}
+	if (errors.length > 0) return { recipes: [], errors };
+	const recipe = recipeName as string;
+	const commandFinal = commandArgv as string[];
+
+	const cwdRaw = raw.cwd === undefined ? "." : raw.cwd;
+	if (typeof cwdRaw !== "string" || cwdRaw.length === 0) {
+		errors.push(`recipe "${recipe}": "cwd" must be a non-empty string`);
+	}
+	const cwd = cwdRaw as string;
+
+	const allowedModesRaw = raw.allowed_modes ?? ["DEV", "VERIFY"];
+	const allowed_modes: WorkbenchMode[] = [];
+	if (!Array.isArray(allowedModesRaw)) {
+		errors.push(`recipe "${name}": "allowed_modes" must be an array`);
+	} else {
+		for (const m of allowedModesRaw) {
+			if (typeof m === "string" && MODE_VALUES.includes(m)) {
+				allowed_modes.push(m as WorkbenchMode);
+			} else {
+				errors.push(`recipe "${name}": invalid allowed_modes entry ${JSON.stringify(m)} (expected AUDIT, DEV or VERIFY)`);
+			}
+		}
+	}
+
+	const outputStrategyRaw = raw.output_strategy ?? "tail";
+	if (outputStrategyRaw !== "head" && outputStrategyRaw !== "tail") {
+		errors.push(`recipe "${name}": "output_strategy" must be "head" or "tail"`);
+	}
+
+	const expectedRaw = raw.expected_exit_codes ?? [0];
+	const expected_exit_codes: number[] = [];
+	if (!Array.isArray(expectedRaw)) {
+		errors.push(`recipe "${name}": "expected_exit_codes" must be an array of integers`);
+	} else {
+		for (const code of expectedRaw) {
+			if (typeof code !== "number" || !Number.isInteger(code)) {
+				errors.push(`recipe "${name}": "expected_exit_codes" entries must be integers`);
+			} else {
+				expected_exit_codes.push(code);
+			}
+		}
+	}
+
+	const environment = asStringArray(raw.environment, `recipe "${name}": "environment"`, errors);
+	for (const envName of environment) {
+		if (!ENV_NAME_RE.test(envName)) {
+			errors.push(`recipe "${name}": invalid environment variable name "${envName}"`);
+		}
+	}
+
+	const params: RecipeParam[] = [];
+	const paramsRaw = raw.params;
+	if (paramsRaw !== undefined) {
+		if (!Array.isArray(paramsRaw)) {
+			errors.push(`recipe "${name}": "params" must be an array`);
+		} else {
+			const seen = new Set<string>();
+			for (const p of paramsRaw) {
+				if (!isRecord(p) || typeof p.name !== "string" || p.name.length === 0) {
+					errors.push(`recipe "${name}": each param needs a "name" string`);
+					continue;
+				}
+				if (seen.has(p.name)) {
+					errors.push(`recipe "${name}": duplicate param "${p.name}"`);
+					continue;
+				}
+				seen.add(p.name);
+				const type = p.type ?? "string";
+				if (typeof type !== "string" || !PARAM_TYPES.includes(type)) {
+					errors.push(`recipe "${name}": param "${p.name}" has invalid type ${JSON.stringify(type)}`);
+					continue;
+				}
+				if (p.description !== undefined && typeof p.description !== "string") {
+					errors.push(`recipe "${name}": param "${p.name}" description must be a string`);
+					continue;
+				}
+				params.push({
+					name: p.name,
+					type: type as RecipeParamType,
+					required: p.required === true,
+					description: typeof p.description === "string" ? p.description : undefined,
+				});
+			}
+		}
+	}
+
+	const timeoutMs = asPositiveInt(raw.timeout_ms, `recipe "${recipe}": "timeout_ms"`, DEFAULT_TIMEOUT_MS, errors);
+	const maxLines = asPositiveInt(raw.max_lines, `recipe "${recipe}": "max_lines"`, DEFAULT_MAX_LINES, errors);
+	const maxBytes = asPositiveInt(raw.max_bytes, `recipe "${recipe}": "max_bytes"`, DEFAULT_MAX_BYTES, errors);
+	const writes = asStringArray(raw.writes, `recipe "${recipe}": "writes"`, errors);
+	const artifacts = asStringArray(raw.artifacts, `recipe "${recipe}": "artifacts"`, errors);
+
+	if (errors.length > 0) return { recipes: [], errors };
+
+	return {
+		recipes: [
+			{
+				name: recipe,
+				command: commandFinal,
+				description: typeof raw.description === "string" ? raw.description : "",
+				cwd,
+				timeout_ms: timeoutMs,
+				allowed_modes,
+				expected_exit_codes,
+				writes,
+				artifacts,
+				environment,
+				output_strategy: outputStrategyRaw as OutputStrategy,
+				max_lines: maxLines,
+				max_bytes: maxBytes,
+				params,
+			},
+		],
+		errors,
+	};
+}
+
+/**
+ * Parse the `recipes.yaml` document. Accepts either a top-level list or a
+ * mapping with a `recipes` key. Returns validated recipes plus file-level
+ * errors. Duplicate names are rejected.
+ */
+export function parseRecipesDocument(doc: unknown): RecipeParseResult {
+	if (doc === null || doc === undefined) return { recipes: [], errors: [] };
+	let list: unknown[];
+	if (Array.isArray(doc)) {
+		list = doc;
+	} else if (isRecord(doc) && Array.isArray(doc.recipes)) {
+		list = doc.recipes;
+	} else {
+		return { recipes: [], errors: ["recipes.yaml root must be a list or a mapping with a \"recipes\" key"] };
+	}
+
+	const recipes: Recipe[] = [];
+	const errors: string[] = [];
+	const seen = new Set<string>();
+	list.forEach((raw, index) => {
+		const result = parseRecipe(raw, index);
+		errors.push(...result.errors);
+		for (const recipe of result.recipes) {
+			if (seen.has(recipe.name)) {
+				errors.push(`duplicate recipe name "${recipe.name}"`);
+				continue;
+			}
+			seen.add(recipe.name);
+			recipes.push(recipe);
+		}
+	});
+	return { recipes, errors };
+}
+
+// ---------------------------------------------------------------------------
+// Parameter substitution (argv construction)
+// ---------------------------------------------------------------------------
+
+export class RecipeParamError extends Error {}
+
+/**
+ * Build the final argv for a recipe from declared params.
+ * - Any param not declared in the recipe schema is rejected.
+ * - Required params must be provided.
+ * - Provided values must match the declared type.
+ * - `{{name}}` placeholders in command entries are replaced with the string
+ *   form of the value. Undeclared placeholders are rejected.
+ */
+export function buildArgv(recipe: Recipe, params: Readonly<Record<string, unknown>>): string[] {
+	const declared = new Map(recipe.params.map((p) => [p.name, p]));
+
+	for (const key of Object.keys(params)) {
+		if (!declared.has(key)) {
+			throw new RecipeParamError(
+				`unknown parameter "${key}" for recipe "${recipe.name}" (declared: ${recipe.params.map((p) => p.name).join(", ") || "none"})`,
+			);
+		}
+	}
+	for (const param of recipe.params) {
+		if (param.required && !(param.name in params)) {
+			throw new RecipeParamError(`missing required parameter "${param.name}" for recipe "${recipe.name}"`);
+		}
+		if (param.name in params) {
+			const value = params[param.name];
+			const ok =
+				(param.type === "string" && typeof value === "string") ||
+				(param.type === "number" && typeof value === "number") ||
+				(param.type === "boolean" && typeof value === "boolean");
+			if (!ok) {
+				throw new RecipeParamError(
+					`parameter "${param.name}" for recipe "${recipe.name}" must be a ${param.type}, got ${JSON.stringify(value)}`,
+				);
+			}
+		}
+	}
+
+	const argv: string[] = [];
+	for (const part of recipe.command) {
+		const expanded = part.replace(PLACEHOLDER_RE, (match, rawName: string) => {
+			const param = declared.get(rawName);
+			if (!param) {
+				throw new RecipeParamError(
+					`command placeholder "{{${rawName}}}" in recipe "${recipe.name}" is not a declared parameter`,
+				);
+			}
+			const value = params[rawName];
+			if (value === undefined) return "";
+			return String(value);
+		});
+		argv.push(expanded);
+	}
+	return argv;
+}

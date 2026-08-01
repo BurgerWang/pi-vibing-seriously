@@ -1,0 +1,38 @@
+{
+	"$comment": "Tested-environment matrix for pi-dev-workbench v0.6.0 (P5). Only environments that were actually exercised are listed — no untested compatibility claims. See docs/compatibility.md for details.",
+	"schema_version": 1,
+	"package": {
+		"name": "pi-dev-workbench",
+		"version": "0.6.0"
+	},
+	"pi": {
+		"package": "@earendil-works/pi-coding-agent",
+		"tested_version": "0.83.0",
+		"peer_spec": "*",
+		"tested_modes": ["tui", "print", "json"],
+		"tested_session_reasons": ["startup", "new", "resume", "fork", "reload"],
+		"note": "TUI tested via component tests with pi-tui 0.83.0 and live print/json smoke runs; a full interactive TUI session was not automated."
+	},
+	"runtime": {
+		"node": "v24.13.0",
+		"npm": "11.18.0",
+		"os": "CachyOS Linux (Arch-based)",
+		"kernel": "7.1.5-1-cachyos",
+		"arch": "x86_64"
+	},
+	"dependencies_tested": {
+		"@earendil-works/pi-tui": "0.83.0",
+		"typebox": "1.3.7",
+		"typescript": "5.9.x",
+		"tsx": "4.23.x",
+		"yaml": "2.9.x"
+	},
+	"verification": {
+		"typecheck": "npm run typecheck",
+		"tests": "npm test",
+		"full_check": "npm run check",
+		"smoke_print_mode": "pi -a -p",
+		"smoke_json_mode": "pi --mode json -a -p",
+		"extension_direct_load": "tests/p5-inventory.test.ts (stub ExtensionAPI)"
+	}
+}

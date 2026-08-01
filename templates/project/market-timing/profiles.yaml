@@ -1,0 +1,4 @@
+# Workbench profile definitions for this project.
+profiles:
+  - name: quant-research/market-timing
+    description: Quantitative market timing research (mid/low frequency)

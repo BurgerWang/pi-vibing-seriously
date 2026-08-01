@@ -1,0 +1,391 @@
+# Changelog
+
+All notable changes to pi-dev-workbench are documented here.
+
+## [0.6.0] — P5: Hardening, Compatibility, Documentation, and Release Readiness
+
+Path protection, a token-based command guard, state recovery and
+compaction supplements, compatibility documentation, and the final
+release-readiness audit.
+
+### Added
+
+- **Protected-path policy** (`core/path-policy.ts`): default protected set
+  `.env` / `.env.*` (except `.env.example` and `.env.template`, explicitly
+  allowed), `*.pem`, `*.key`, `id_rsa`, `id_ed25519`, `id_ecdsa`, `id_dsa`,
+  `credentials.*`, `secrets.*`, `exchange-keys.*`, `auth.json`, `.netrc`,
+  `*.token`, keystores. Policy: `edit`/`write` on protected paths is blocked
+  in ALL modes; `read`/`ls`/`find`/`grep` on protected paths is blocked in
+  AUDIT/VERIFY and allowed in DEV; bash display-reads (`cat .env`, ...) are
+  blocked in AUDIT/VERIFY (defense in depth). Basename matching,
+  case-insensitive, `~`-aware — documented in docs/security.md.
+- **Token-based command guard** (`core/command-guard.ts`): quote-aware shell
+  scanner + 11 rules — `rm -rf /`, `rm -rf ~`/`$HOME`, `rm` of `.git`,
+  `git reset --hard`, `git clean -fd`+, `git push -f`/`--force`
+  (+`--force-with-lease`, any position), `git checkout -- .` / `git restore
+  .`, `git remote` add/remove/set-url/rename, `git config --global/--system`
+  writes (reads stay allowed), `sudo`, and
+  `npm|yarn|pnpm|bun publish|unpublish` (`--dry-run` stays allowed).
+  Quoted text, commit messages and branch names cannot false-positive;
+  quoted destructive forms are still caught.
+- **State recovery** (`core/compact.ts` + wiring): mode and key task state
+  (task, phase, gates, last run, evidence paths, next step, do-not-retry)
+  are persisted as Pi custom entries and restored on every `session_start`
+  (covers `/new`, `/resume`, `/fork`, `/clone`, `/reload` and compaction;
+  a fresh `/new` session falls back to DEV).
+- **Compaction supplement**: on `session_before_compact` the workbench only
+  SUPPLEMENTS Pi's own compaction — never cancels it, never replaces its
+  summary — with a bounded (40 lines / 2.4 KB) redacted ASCII note
+  (task, mode, gates, last run, evidence paths, next step, do-not-retry,
+  repeated-failure warnings) persisted as a custom entry and delivered as a
+  hidden (`display: false`) next-turn custom message. Run logs never enter
+  the session context.
+- **`/q-status`** now reports the active path policy and command guard.
+- **Compatibility surface**: `compatibility/pi.json` (tested-environment
+  matrix) and docs/ — `compatibility.md`, `architecture.md`, `security.md`,
+  `project-onboarding.md`, `quant-research-profile.md`. Only actually tested
+  versions are claimed: Pi 0.83.0, Node v24.13.0, npm 11.18.0, CachyOS
+  Linux (kernel 7.1.5-1-cachyos), pi-tui 0.83.0, typebox 1.3.7.
+- **Tests**: 259 total (P5 adds `p5-command-guard` — tokenizer/segment
+  splitting, all 11 rules, false-positive battery; `p5-path-policy` —
+  protected matching incl. `.env.example` allowlist, per-mode matrix;
+  `p5-compact` — state sanitization/caps, do-not-retry tracking, bounded
+  redacted notes; `p5-state-recovery` — real-extension wiring via stub API:
+  session_start restore, /new fallback, supplement/dedupe/never-cancel;
+  `p5-inventory` — direct-load smoke, exact 15-command/7-tool/7-prompt
+  inventory, no naming conflicts; `p5-redact` — argv `key=value`
+  credential-carrier redaction with word-boundary parsing).
+
+### Changed
+
+- `core/mode-policy.ts` now integrates the command guard and path policy
+  into `checkToolCall`; the catastrophic-command section moved to
+  `core/command-guard.ts` (same public names, token-based internals).
+- README updated with the P5 protection model and docs pointers; version
+  bumped to 0.6.0.
+
+### Known limitations (P5)
+
+- Path matching is basename-based (a directory named `credentials/` does not
+  protect ordinary files inside it) and POSIX-oriented.
+- The bash path check covers display readers (`cat`, `head`, ...); general
+  bash parsing is not attempted — the structured tools are the enforcement
+  point.
+- `--dry-run` publishing is allowed by design; unpublishing is blocked.
+- Full interactive TUI session automation remains out of scope (component
+  tests + print/json smokes cover the surface).
+
+## [0.5.0] — P4: Pi-native TUI Status, Run Reports, and Run Comparison
+
+A P4-status line (footer slot via `ctx.ui.setStatus` — the Pi footer is
+never replaced), an auto-hiding widget via `ctx.ui.setWidget`, `/q-report`
+and `/q-compare` commands, a new `workbench_compare_runs` tool, and compact
+`renderCall`/`renderResult` renderers for the five workbench tools.
+
+### Added
+
+- **Status bar** (`core/status.ts`): `WB:<MODE> | <profile> | <gate>:<status>
+  | run:<id>` from the project config and persisted run records only;
+  missing parts degrade to shorter lines; long profiles are width-fitted.
+- **Widget** (`core/widget.ts`): shown only while a task is active, the
+  latest gate run is not a PASS, or the user forced it on
+  (`/q-widget on`); auto-clears otherwise; content is task, phase, gate,
+  last run, blocking reason; plain ASCII, width-fitted; `widgetAction`
+  returns `"noop"` without UI so print/json modes never touch TUI APIs.
+- **Run reports** (`core/report.ts`): `/q-report latest | <run-id>` —
+  manifest facts (recipe, profile, mode, duration, exit code, status, git,
+  artifacts, log paths) plus per-gate statuses/failed checks for gate runs
+  and the declared quant facts for runs with a quant-result artifact.
+- **Run comparison** (`core/compare.ts`): `/q-compare <a> <b>` and
+  `workbench_compare_runs` — generic deltas (exit code, duration, artifact
+  additions/removals, gate delta, gate-run test counts, numeric deltas of
+  shared JSON artifact snapshots) and quant deltas (benchmark, return,
+  drawdown, turnover, cost impact, fold pass/fail, parameter changes) when
+  both runs carry a valid quant-result artifact. Deltas are descriptive:
+  a higher return is never automatically interpreted as a better strategy
+  (neutrality note). Incompatible schemas (recipe vs gate, quant vs
+  non-quant) are reported with notes, never silently.
+- **Recipe-run JSON artifact snapshots** (`core/recipe-runner.ts`): declared
+  JSON artifacts (<= 1MB) are copied into the run directory at run time, so
+  later runs overwriting the same project file cannot corrupt earlier run
+  records; the comparator and quant report read only run-attributed copies
+  (live-file fallback only for pre-P4 runs).
+- **Tool renderers** (`core/render.ts` pure line builders +
+  `ui/tool-renderers.ts` TUI components): compact `renderCall`/`renderResult`
+  for `workbench_project_inspect`, `workbench_run_recipe`,
+  `workbench_run_gate`, `workbench_read_run` and `workbench_compare_runs`;
+  expanded view adds recipe, duration, exit code, artifacts, failed checks
+  and log paths; partial/streaming and error states are handled; renderers
+  render the structured `details` payloads verbatim — they never re-read
+  run files and never recompute business metrics; narrow terminals degrade
+  via Pi's Text wrapping plus `fitToWidth` truncation; colors are an
+  overlay on plain ASCII (readable without color, no emoji semantics).
+- **Commands**: `/q-report latest | <run-id>`, `/q-compare <run-id-a>
+  <run-id-b>`, `/q-widget on | off`.
+- **Tool**: `workbench_compare_runs` (read-only; available in AUDIT too).
+- **Tests**: 200 total (P4 adds `p4-status`, `p4-report`, `p4-compare`,
+  `p4-render`) covering compact/expanded/partial renderers, missing fields,
+  narrow widths, report latest, unknown runs, incompatible schemas, generic
+  and quant comparisons, and the UI-disabled guard.
+
+## [0.4.0] — P3: Gate Engine, Evidence Artifacts, and the Quant Research Validation Ladder
+
+Gate enforcement (`gates.yaml` is no longer "reserved"), a built-in
+validation ladder (base gates B0-B5 for every profile, quant gates Q0-Q5 for
+quant-research profiles), evidence artifacts per gate run, the
+quant-result.schema.json output contract, and the `/q-gate` command family
+plus three new workbench tools.
+
+### Added
+
+- **Gate schema** (`core/gate-schema.ts`): gates and checks with
+  `id`, `title`, `description`, `profiles`, `prerequisites`, `required`,
+  `blocking`, `evidence`, `acceptance`; check kinds `config` (config parses
+  cleanly), `recipe` (declared recipe runs; alternatives supported),
+  `artifact` (a recipe run's persisted artifacts), `file` (path or any-of),
+  `json` (field exists / equals / any-of-paths), `numeric` (finite number
+  with min/max, incl. array `.length` paths), `manual` (explicit human
+  evidence only), `schema` (quant-result contract validation). Strict
+  parsing — broken gates.yaml aborts with a setup error, never silently
+  drops checks.
+- **Built-in gate catalog** (`core/gate-catalog.ts`): base gates B0-B5
+  (project readiness, static quality, unit correctness, integration
+  correctness, output contract, reproducibility/handoff) and quant gates
+  Q0-Q5 (research contract, market data integrity, backtest semantics,
+  experiment integrity, out-of-sample robustness, strategy reporting).
+  Base gates load for every profile; quant gates load only for
+  quant-research profiles. A project's gates.yaml replaces built-ins by id
+  and can add new gates.
+- **Gate engine** (`core/gate-engine.ts`): runs selectors (`<gate-id>`,
+  comma lists, `base`, `quant`, `all`) in prerequisite order; prerequisite
+  status resolves from the current run first, then the most recent
+  persisted gate run; a non-PASS outcome of a blocking prerequisite BLOCKs
+  dependents; a required check that is NOT_RUN can never pass a gate;
+  warnings never upgrade status; numeric constraints are only evaluated
+  against structured artifacts; manual evidence is only ever recorded as
+  type `manual`. Path containment (lexical + realpath/symlink) applies to
+  every evidence path. Each gate run persists
+  `manifest.json`, `gates.json`, `evidence.json`, `summary.json`,
+  `stdout.log`, `stderr.log`, `artifacts/` (copied evidence sources) under
+  `.pi/workbench/runs/<run-id>/`.
+- **Quant result contract** (`core/quant-result.ts` +
+  `schemas/quant-result.schema.json`): the workbench never computes strategy
+  metrics — it validates the project's declared output
+  (`results/quant-result.json` by convention). Required fields:
+  `schema_version`, `run_id`, `strategy_type`, `frequency`, `universe`,
+  `data_range`, `split`, `benchmark`, `costs`, `metrics` (return,
+  volatility, drawdown, turnover, exposure, benchmark_delta plus a
+  risk-adjusted metric), `folds`, `parameters`, `artifacts`; optional
+  `warnings`, `semantics`, and profile-specific optional fields for
+  stock-selection (`universe.point_in_time`, `exposure`, `rebalance`) and
+  market-timing (`regime`, `position_sizing`). Every number must be finite
+  (`1e999` parses to Infinity and is rejected); every fold is recorded —
+  failed folds are reported, never filtered.
+- **Commands**: `/q-gate <gate-id|base|quant|all> [manual:<check-id>=<note>]`,
+  `/q-gates`, `/q-gate-show <gate-id>`, `/q-evidence <run-id>`.
+- **Tools**: `workbench_run_gate` (runs selectors, accepts manual evidence),
+  `workbench_read_gate` (gate run record or gate definition + latest
+  status), `workbench_list_gates` (available gates + latest status).
+  AUDIT keeps read-only gate tools but hard-denies `workbench_run_gate`;
+  VERIFY allows gate runs (they only execute declared recipes).
+- **Templates**: per-profile `gates.yaml` now documents the enforced ladder
+  and the override mechanism; `AGENTS.quant-research.md` documents the
+  validation ladder and the quant output contract.
+- **Tests** (`tests/gates.test.ts`, `tests/quant-result.test.ts`, updated
+  `tests/mode-policy.test.ts`): gate dependency order, prerequisite FAIL →
+  BLOCKED, required NOT_RUN never PASSes, missing artifacts, missing JSON
+  fields, numeric constraints, non-numeric/NaN/Infinity values, quant gates
+  loading only for quant profiles, generic not enforcing quant gates,
+  failed folds not filtered, evidence path escapes (including symlinks),
+  gate result persistence, independent run ids, recipe/artifact/manual/
+  schema/config checks, yaml catalog overrides, and the quant-result
+  contract validator.
+
+### Changed
+
+- `gates.yaml` is enforced (P2 kept it reserved); empty `gates: []` means
+  "use the built-in catalog" so existing projects keep working.
+- `mode-policy.ts` registers the three new workbench tools and hard-denies
+  `workbench_run_gate` in AUDIT.
+- Version bumped to 0.4.0.
+
+### Known limitations (P3)
+
+- The schema check supports the built-in `quant-result` schema only;
+  project-defined JSON schemas are not yet loadable.
+- Recipe-name conventions (`check:*`, `test:*`, `data:fetch`, `backtest`)
+  are documented; projects that use different names should override the
+  checks in gates.yaml.
+
+## [0.3.0] — P2: Full Skills, Prompt Templates, and Project Templates
+
+Complete general-development and quantitative-research skills, the full
+`q-*` prompt template set, and project templates (AGENTS + per-profile
+configs) written by `/q-init`.
+
+### Added
+
+- **General-development skills (7)**: `repository-orientation` and
+  `implementation-workflow` completed; `validation-ladder` completed;
+  new `repository-audit`, `debugging-workflow`, `cli-product-development`,
+  `handoff-and-release`. Every skill is a focused `SKILL.md` plus detailed
+  checklists in `references/*.md` (progressive disclosure, no content
+  duplication across skills).
+- **Quantitative-research skills (7)**: `quant-research-design`,
+  `market-data-integrity`, `stock-selection-research`, `market-timing-research`,
+  `backtest-integrity`, `experiment-validation`, `strategy-reporting`.
+  Coverage per spec: selection (point-in-time universe, survivorship,
+  delisting, corporate actions, cross-sectional features, ranking/grouping,
+  industry and market-cap exposure, rebalance, portfolio construction,
+  turnover, benchmark, attribution); timing (signal generation vs tradable
+  time, entry/exit, position sizing, market state, time-series splits,
+  benchmark, regime performance, parameter stability, walk-forward);
+  backtest integrity (future leakage, look-ahead bias, signal/execution
+  alignment, adjustments, suspensions, delisting, fees, slippage, cash and
+  positions, benchmark alignment, return computation, rebalance semantics).
+  Out of scope explicitly: order book, tick replay, queue models, market
+  making, colocation, microsecond latency, exchange execution engines.
+  Skills are language-neutral (no python-only assumptions), vendor- and
+  exchange-agnostic, and treat statistical conventions as conventions —
+  only correctness properties are stated as rules.
+- **Prompt templates (7)**: `q-audit` (evidence-first, confirmed / probable /
+  unknown classification), `q-plan` (phased plan with a verifiable Gate per
+  phase, no code changes), `q-build` (real implementation, tests in sync, no
+  stubs/TODOs), `q-debug` (reproduce first, preserve original error, fix
+  root cause, regression verify), `q-verify` (no source changes, declared
+  recipes/gates, PASS/FAIL/BLOCKED/NOT_RUN), `q-optimize` (engineering
+  optimization or selection/timing parameter experiments; no parameter
+  chasing without out-of-sample validation; full trial reporting, never
+  best-trial-only), `q-review` (diff/commit/implementation review: logic,
+  tests, compatibility, omissions). All templates support `argument-hint`
+  and `$ARGUMENTS`; none collide with extension command names.
+- **Project templates** (`templates/project/`): `AGENTS.generic.md`,
+  `AGENTS.quant-research.md`, plus per-profile config sets (`generic/`,
+  `stock-selection/`, `market-timing/`) — the single source of truth loaded
+  by the `/q-init` service. `/q-init` now also writes an `AGENTS.md` at the
+  project root, selected by profile; an existing `AGENTS.md` is never
+  overwritten by default (per-file confirmation required, consistent with
+  the config files).
+- **Package-content tests** (`tests/package-content.test.ts`): every skill
+  directory has `SKILL.md`; frontmatter parses; names legal and matching
+  their directories; descriptions present; prompts parse with description +
+  `argument-hint` + `$ARGUMENTS`; no filename collisions and no collision
+  with extension commands; every `skill:name` reference in prompts and
+  AGENTS templates resolves; no empty or TODO-only skills; the package
+  manifest discovers all 14 skills and 7 prompts; quant topic-coverage
+  assertions per skill; language/vendor neutrality checks.
+
+### Changed
+
+- `templates.ts` now loads template files from `templates/project/` on disk
+  (`getInitTemplate` is async) — templates are real files, not generated
+  strings, and the AGENTS content is selected per profile.
+- `init.ts` plans an `AGENTS.md` entry at the project root in addition to
+  the four config files; `applyInit` writes the profile-selected AGENTS
+  template; the plan display marks `AGENTS.md (project root)`.
+- README updated with the full skill/prompt tables, project-template
+  layout, and P2 roadmap.
+
+### Known limitations (P2)
+
+- `gates.yaml` is parsed but not yet enforced (gate engine is a later
+  milestone).
+- The quant recipe placeholders in project templates assume script entry
+  points (`scripts/*.py`); the skills and AGENTS templates themselves are
+  language-neutral.
+
+## [0.2.0] — P1: Project Configuration and Controlled Recipe Runner
+
+Project configuration, `/q-init`, declarative recipes, a controlled Recipe
+Runner, run records with redaction, output truncation, and VERIFY without free
+bash.
+
+### Added
+
+- **Project configuration** (`core/config.ts`):
+  - Config under `<project-root>/<CONFIG_DIR_NAME>/workbench/` using Pi's
+    official `CONFIG_DIR_NAME` export (never hardcoded): `project.yaml`,
+    `recipes.yaml`, `gates.yaml` (parsed, reserved), `profiles.yaml` (parsed,
+    reserved).
+  - Project root via `git rev-parse --show-toplevel` with `ctx.cwd` fallback.
+  - Trust gate: `ctx.isProjectTrusted()` is required before any config is read
+    or executed; untrusted projects are refused.
+  - Invalid YAML and schema violations are reported as config issues, never
+    thrown away silently.
+- **`/q-init` command**: profiles `generic`, `quant-research/stock-selection`,
+  `quant-research/market-timing`. Displays files before writing; existing files
+  are never overwritten by default; overwrites require per-file confirmation;
+  `hft`/`market-making`/`lob`/`execution-engine` rejected by design.
+- **Declarative Recipe Schema** (`core/recipe-schema.ts`): strict validation
+  (argv-only commands, unknown-field rejection, type-checked params),
+  `{{param}}` substitution into argv, defaults aligned with Pi's truncation
+  constants.
+- **Recipe Runner** (`core/recipe-runner.ts`): single service behind the tools
+  and commands — mode gating via `allowed_modes`, timeout + AbortSignal
+  forwarding, exit-code policy, `shell=false` argv execution via `pi.exec`,
+  lexical + realpath containment for `cwd`/`writes`/`artifacts`
+  (`core/path-guard.ts`), env allow-list, artifact glob collection.
+- **Run records** (`core/runs.ts`): `runs/<run-id>/` with `manifest.json`,
+  `command.json`, `environment.json`, `stdout.log`, `stderr.log`,
+  `summary.json`; secret redaction (`core/redact.ts`) on every artifact;
+  git commit/dirty captured.
+- **Output truncation**: Pi's official `truncateHead`/`truncateTail` with
+  `DEFAULT_MAX_LINES`/`DEFAULT_MAX_BYTES`; full logs always on disk; returned
+  summaries always cite full log paths.
+- **Custom tools**: `workbench_project_inspect`, `workbench_run_recipe`,
+  `workbench_read_run` (bounded log tails, never full large logs inline).
+- **Commands**: `/q-run <recipe> [k=v ...]`, `/q-runs [limit]`,
+  `/q-run-show <run-id>` — same services as the tools, no duplicated logic.
+- **Mode redefinition (P1)**: VERIFY no longer allows free `bash` — its tool
+  set is read/grep/find/ls + all `workbench_*` tools, with `bash`/`edit`/`write`
+  hard-denied at the `tool_call` guard. AUDIT hard-denies
+  `workbench_run_recipe` as well. DEV keeps all built-in dev tools plus
+  `workbench_*` tools.
+- **Runtime dependency**: `yaml` (formal `dependencies`, not peer).
+- **Tests**: 82 tests across `mode-policy`, `config`, `recipe-schema`,
+  `path-guard`, `recipe-runner`, `init`, `templates`.
+
+### Changed
+
+- `tests/mode-policy.test.ts` assertions for VERIFY (no bash) and the
+  workbench tool sets were updated to the P1 semantics defined by the P1 spec
+  (the P0 VERIFY-with-bash behavior was deliberately redefined; no P0 tests
+  were deleted).
+- README updated with the P1 mode model, `/q-init`, recipe config examples,
+  local package install, project trust flow, and the no-sandbox security model.
+
+### Known limitations (P1)
+
+- `gates.yaml` is parsed but not yet enforced (gate engine is a later
+  milestone).
+- Recipe restrictions are discipline/guardrails, not an OS sandbox — a recipe
+  runs with the user's full permissions (see README Security model).
+- Run records are retained indefinitely; no retention/GC policy yet.
+
+## [0.1.0] — P0 Bootstrap
+
+Initial release. Minimal, loadable, verifiable baseline built purely on Pi native mechanisms.
+
+### Added
+
+- **Pi package manifest** (`package.json` `pi` key) declaring `./extensions`, `./skills`, `./prompts`.
+- **Workbench Runtime extension** (`extensions/workbench-runtime/`):
+  - Native commands `/q-mode-audit`, `/q-mode-dev`, `/q-mode-verify`, `/q-status`.
+  - Mode policy core (`core/mode-policy.ts`): AUDIT / DEV / VERIFY tool sets,
+    hard `tool_call` guard, catastrophic-command blocking (`rm -rf /`,
+    `git reset --hard`, `git clean -fd`/`-fdx`, `git push --force`/`-f`).
+  - State persistence (`core/state.ts`) via Pi custom session entry
+    `workbench-mode`; restored on `session_start`; default DEV.
+  - TUI status `WB:AUDIT` / `WB:DEV` / `WB:VERIFY`; safe degradation in
+    print/json modes.
+- **Skills**: `repository-orientation`, `implementation-workflow`, `validation-ladder`.
+- **Prompt templates**: `/q-audit`, `/q-build`, `/q-verify`.
+- **Tests**: `tests/mode-policy.test.ts` covering tool sets, guard behavior,
+  catastrophic/safe command classification, and state restore fallback.
+
+### Known limitations (P0)
+
+- VERIFY still allows free `bash` and is **not** a final security mode; P1 replaces
+  it with a declarative Recipe Runner.
+- No `workbench_*` custom tools, no Recipe Runner, no Gate Engine, no quant
+  profiles, no complex TUI yet.

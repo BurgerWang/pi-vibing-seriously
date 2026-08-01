@@ -1,0 +1,23 @@
+# Workbench gates (P3: enforced by the Gate Engine).
+#
+# The built-in base gates B0-B5 load automatically for EVERY profile:
+#   b0 Project Readiness            b3 Integration Correctness
+#   b1 Static Quality               b4 Output Contract
+#   b2 Unit Correctness             b5 Reproducibility and Handoff
+#
+# The engine's built-in checks use convention recipe names:
+#   check:format / check:lint / check:typecheck / check:static
+#   test:unit / test:integration
+# Declare those recipes in recipes.yaml to make the base ladder
+# machine-verifiable. Checks that cannot be automated are manual-evidence
+# checks: they only PASS with explicit manual evidence (recorded as type
+# "manual" in evidence.json — never from model prose).
+#
+# Declare additional gates or REPLACE built-in gates by id here, e.g.:
+#   gates:
+#     - id: b1
+#       title: Static Quality
+#       checks:
+#         - { id: b1.1, title: Format, kind: recipe, recipe: check:format }
+# A project gate with a built-in id replaces the built-in entirely.
+gates: []

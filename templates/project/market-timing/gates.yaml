@@ -1,0 +1,32 @@
+# Workbench gates (P3: enforced by the Gate Engine).
+#
+# The built-in ladder loads automatically for quant-research profiles:
+#   base gates (every profile):
+#     b0 Project Readiness            b3 Integration Correctness
+#     b1 Static Quality               b4 Output Contract
+#     b2 Unit Correctness             b5 Reproducibility and Handoff
+#   quant gates (quant profiles only):
+#     q0 Research Contract            q3 Experiment Integrity
+#     q1 Market Data Integrity        q4 Out-of-Sample Robustness
+#     q2 Backtest Semantics           q5 Strategy Reporting
+#
+# Quant checks validate the project's DECLARED output — the workbench never
+# computes strategy metrics. Conventions used by the built-in checks:
+#   research/contract.json           — Q0 research contract
+#   results/quant-result.json        — quant output contract
+#                                      (quant-result.schema.json)
+#   recipes: data:fetch, backtest (backtest:selection / backtest:timing are
+#            accepted as alternatives), check:*, test:unit, test:integration
+# Audits that cannot be machine-verified (look-ahead, survivorship, ...) are
+# manual-evidence checks: they only PASS with explicit manual evidence
+# (recorded as type "manual" in evidence.json — never from model prose).
+#
+# Override built-in gates by id or add new gates here, e.g.:
+#   gates:
+#     - id: q4
+#       title: Out-of-Sample Robustness
+#       checks:
+#         - { id: q4.2, title: Multi-fold OOS, kind: numeric,
+#             file: results/quant-result.json, path: folds.length, min: 3 }
+# A project gate with a built-in id replaces the built-in entirely.
+gates: []

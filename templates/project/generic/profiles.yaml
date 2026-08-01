@@ -1,0 +1,4 @@
+# Workbench profile definitions for this project.
+profiles:
+  - name: generic
+    description: General software engineering project

@@ -1,0 +1,49 @@
+{
+	"name": "pi-dev-workbench",
+	"version": "0.6.0",
+	"private": true,
+	"type": "module",
+	"description": "Pi-native development workbench: AUDIT/DEV/VERIFY mode policy, skills, and prompt templates for quantitative research (selection, timing, backtesting, data analysis, parameter experiments, walk-forward, out-of-sample validation) and general software engineering. No HFT/L2/market-making/exchange-order routing.",
+	"keywords": [
+		"pi-package",
+		"workbench",
+		"quant",
+		"backtest",
+		"mode-policy",
+		"audit",
+		"verify"
+	],
+	"license": "UNLICENSED",
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"test": "tsx --test tests/*.test.ts",
+		"check": "npm run typecheck && npm test && git diff --check"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "0.83.0",
+		"@earendil-works/pi-tui": "0.83.0",
+		"@types/node": "^24.0.0",
+		"tsx": "^4.23.0",
+		"typebox": "1.3.7",
+		"typescript": "^5.9.0"
+	},
+	"pi": {
+		"extensions": [
+			"./extensions"
+		],
+		"skills": [
+			"./skills"
+		],
+		"prompts": [
+			"./prompts"
+		]
+	},
+	"dependencies": {
+		"yaml": "^2.9.0"
+	}
+}
