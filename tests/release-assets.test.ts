@@ -36,6 +36,16 @@ test("package-lock root entry is consistent with package.json", async () => {
 	assert.equal(lock.packages[""].license, pkg.license);
 });
 
+test("EXTENSION_VERSION stays in sync with package.json (version bump guard)", async () => {
+	const pkg = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8")) as { version: string };
+	const { EXTENSION_VERSION } = await import("../extensions/workbench-runtime/cache/cache-types.ts");
+	assert.equal(
+		EXTENSION_VERSION,
+		pkg.version,
+		"cache-types.ts EXTENSION_VERSION must equal package.json version — telemetry records it per request",
+	);
+});
+
 test("banner.svg exists, is referenced by the README, and is renderer-safe", async () => {
 	const svg = await readFile(join(ROOT, "assets", "banner.svg"), "utf8");
 	const readme = await readFile(join(ROOT, "README.md"), "utf8");
