@@ -1,6 +1,6 @@
 {
 	"name": "pi-dev-workbench",
-	"version": "0.6.0",
+	"version": "0.6.1",
 	"private": true,
 	"type": "module",
 	"description": "Pi-native development workbench: AUDIT/DEV/VERIFY mode policy, skills, and prompt templates for quantitative research (selection, timing, backtesting, data analysis, parameter experiments, walk-forward, out-of-sample validation) and general software engineering. No HFT/L2/market-making/exchange-order routing.",
@@ -13,7 +13,7 @@
 		"audit",
 		"verify"
 	],
-	"license": "UNLICENSED",
+	"license": "MIT",
 	"scripts": {
 		"typecheck": "tsc --noEmit",
 		"test": "tsx --test tests/*.test.ts",

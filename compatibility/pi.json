@@ -3,7 +3,7 @@
 	"schema_version": 1,
 	"package": {
 		"name": "pi-dev-workbench",
-		"version": "0.6.0"
+		"version": "0.6.1"
 	},
 	"pi": {
 		"package": "@earendil-works/pi-coding-agent",

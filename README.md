@@ -1,6 +1,10 @@
 # pi-dev-workbench
 
-A **Pi Package** (v0.6.0, P5) that adds a native development workbench to
+<p align="center">
+  <img src="assets/banner.svg" alt="pi-dev-workbench v0.6.1 — a Pi-native development workbench" width="586" />
+</p>
+
+A **Pi Package** (v0.6.1, P5) that adds a native development workbench to
 [Pi](https://pi.dev): a mode policy (AUDIT / DEV / VERIFY), project
 configuration, a declarative Recipe Runner, a **Gate Engine with evidence
 artifacts and a quant research validation ladder**, Pi-native TUI status,
