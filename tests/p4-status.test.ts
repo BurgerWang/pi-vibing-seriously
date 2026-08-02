@@ -55,6 +55,14 @@ test("status line skips missing parts", () => {
 	assert.equal(line, "WB:VERIFY | generic | run:20260801-004:TIMED OUT");
 });
 
+test("status line appends the P6-A cache segment when provided", () => {
+	const line = buildStatusLine({ mode: "VERIFY", cache: "CACHE 72% | read 184k | miss 71k" });
+	assert.equal(line, "WB:VERIFY | CACHE 72% | read 184k | miss 71k");
+	const na = buildStatusLine({ mode: "DEV", cache: "CACHE N/A" });
+	assert.equal(na, "WB:DEV | CACHE N/A");
+	assert.equal(buildStatusLine({ mode: "DEV" }), "WB:DEV");
+});
+
 test("status line fits an over-long profile to the footer width", () => {
 	const line = buildStatusLine({ mode: "DEV", profile: "quant-research/stock-selection/very-long-profile-name" });
 	assert.ok(line.length < 60, `status must stay compact, got: ${line}`);

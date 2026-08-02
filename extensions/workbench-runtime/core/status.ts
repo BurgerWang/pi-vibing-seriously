@@ -22,6 +22,12 @@ export interface StatusLineInput {
 	activeGate?: { id: string; status: string; run_id?: string };
 	/** Latest run record (recipe or gate). */
 	latestRun?: { run_id: string; status: string; ok: boolean };
+	/**
+	 * P6-A compact cache segment, e.g. "CACHE 72% | read 184k | miss 71k"
+	 * (or "CACHE N/A" when the usage semantics are not verified). Appended
+	 * as-is when present — only shown when the data is valid.
+	 */
+	cache?: string;
 }
 
 const MAX_PROFILE_WIDTH = 32;
@@ -38,5 +44,6 @@ export function buildStatusLine(input: StatusLineInput): string {
 	if (input.latestRun) {
 		parts.push(`run:${input.latestRun.run_id}${input.latestRun.ok ? "" : `:${input.latestRun.status}`}`);
 	}
+	if (input.cache) parts.push(input.cache);
 	return parts.join(" | ");
 }

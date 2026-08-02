@@ -2,6 +2,291 @@
 
 All notable changes to pi-dev-workbench are documented here.
 
+## [0.8.0] — P6-E: Cache Benchmark, Hardening, and Release Gate
+
+Offline cache benchmarking, DeepSeek-final-constraint audit, privacy audit,
+compatibility/security docs update, and the P6 release gate. No commit,
+tag or npm publish is performed by this milestone.
+
+### Added
+
+- **Offline cache benchmark CLI** (`scripts/cache-benchmark.ts`): `report`,
+  `doctor` and `compare` subcommands; reads ONLY workbench telemetry JSONL,
+  run manifests and action cache records. Never calls a model, never sends
+  HTTP, never reads `auth.json`/`models.json`, never warms caches, never
+  modifies providers, never hardcodes provider prices (`--cost-map`
+  required for `estimatedAvoidedCost`, otherwise `null`). Outputs the full
+  contract: requestCount, uncachedInputTokens, cacheReadTokens,
+  outputTokens, cacheHitRatio, usageSemanticStatus, providerReportedCost,
+  estimatedAvoidedCost, expectedInvalidations, unexpectedDrifts,
+  mode/model/thinking changes, reloads, compactions, recipe executions /
+  cache hits / misses / hit ratio, localExecutionTimeAvoided,
+  cacheStorageSize, corruptionCount, fallbackCount. JSON and human-readable
+  output; friendly exit when no telemetry; corrupt lines counted, never
+  fatal; `--session`/`--since`/`--until` scoping; `--save` (atomic) and
+  `compare` over saved reports (both the extension and benchmark report
+  shapes).
+- **npm scripts** `cache:report` and `cache:doctor`.
+- **Offline doctor context** in `cache-doctor.ts` (`context: "cli"`):
+  Pi-dependent checks (system prompt, live tool registry, model registry)
+  are honestly SKIPPED offline — never silently passed — and provider/
+  model/apiKind are derived from the last telemetry record; new offline
+  checks: action-cache integrity, index consistency, stale locks, recipe
+  cache consistency.
+- **Docs**: `docs/cache/cache-benchmark.md` (statistical definitions),
+  `docs/cache/P6_BENCHMARK_REPORT.md` (P6-A→P6-B→P6-C before/after from
+  `p6a-baseline` / `p6b-stable-dev` / `p6c-action-cache` saved reports),
+  `docs/cache/P6_RELEASE_REPORT.md` (tested versions, P6-A usage mapping,
+  P6-B prefix stability evidence, P6-C/P6-D verification, DeepSeek final
+  constraints, known limitations, rollback + clear/prune instructions);
+  README, CHANGELOG, compatibility.md, security.md and
+  compatibility/pi.json updated.
+- **Benchmark corpus**: `p6b-stable-dev.json` saved report (135-request
+  P6-B session); whole-corpus analysis: 602 requests, 99.55% provider-billed
+  cache hit ratio, systemPromptHash/toolNamesHash/toolOrderHash constant
+  across the corpus, zero same-mode `UNEXPECTED_DRIFT` with driftSource,
+  5/12 recipe cache hits (138.4 s local execution avoided), 0 corruption,
+  0 lock fallbacks.
+- **Tests**: `tests/p6-e-cache-benchmark.test.ts` (15 tests) covering
+  tolerant telemetry reading, run-manifest parsing, action-cache facts,
+  the full 23-field report contract, cost-map rules, session scoping,
+  rendering, mixed-shape normalization, CLI exit behavior.
+
+### Changed
+
+- Version 0.7.0 → 0.8.0 (package.json, package-lock.json,
+  `EXTENSION_VERSION` in `cache-types.ts`); banner alt text.
+
+### Audited (this milestone)
+
+- **DeepSeek final constraints (17/17 hold):** no auth.json access, no
+  models.json/models-store.json writes, no DEEPSEEK_API_KEY dependency, no
+  cache_control / prompt_cache_key / prompt_cache_retention, no cache TTL
+  configuration, no keepalive, no warmup requests, no dynamic/deferred
+  tool loader, no supportsToolSearch/supportsToolReferences, stable per-mode
+  tool sets, P5 permission isolation on mode switch, cacheWrite=0 is not an
+  error, provider best-effort miss is a normal possibility, no hardcoded
+  DeepSeek prices.
+- **Privacy/security audit:** hash-only telemetry with forbidden-key deep
+  scan, read-only payload digests, recipe redaction/truncation, path
+  containment (lexical + realpath) for recipes and report saves, corruption
+  → miss + quarantine, rebuildable index, per-key locks with stale-lock
+  recovery, rotation/prune bounds, prune/clear never delete run evidence,
+  non-TUI crash safety, project-trust gating, cache hits never bypass
+  gates, mutable `latest` never cached, failed folds never hidden, no
+  HFT/LOB/market-making functionality (grep-verified).
+
+## [0.7.3] — P6-D: Quant Research Cache Contracts
+
+Versioned manifest contracts that make quantitative research caching safe.
+The workbench only **defines, validates and connects** the contracts — it
+never downloads market data, never computes features, never runs a backtest
+engine. Cache hits never bypass Q0–Q5.
+
+### Added
+
+- **Three versioned contract schemas** (`cache/quant-contracts.ts`):
+  DATA_SNAPSHOT, FEATURE_SET, BACKTEST_RESULT with required fields,
+  per-profile requirements (stock-selection: point-in-time universe,
+  industry/market-cap versions, financial publication alignment,
+  winsorization, normalization, missing-value policy; market-timing:
+  signal timestamp, bar open/close, resampling, warmup, timezone,
+  calendar) and a strict validation status model (`invalid` / `unresolved` /
+  `validated`). Manifests that merely parse — missing adjustment/
+  corporate-action/delisting semantics, mutable ids, unresolved logical
+  references, walk-forward with empty folds, best-trial-only, missing
+  trial lineage — can never be `validated` and never cacheable.
+- **Immutable reference discipline**: `latest`/`current`/`now`/`today` can
+  never be a final manifest id or cache key; logical references resolve
+  against a registry (same-dir, `artifacts/**`, `.pi/workbench/quant/registry/**`)
+  to the newest immutable revision; unresolved references refuse the quant
+  cache; `logicalReference`/`resolvedReference` are recorded in action
+  records.
+- **Recipe cache `domain: quant` + `quantContract {type, manifest}`**: still
+  opt-in (default off), manifest must exist, schema-invalid refuses the
+  cache at key time and write time, the resolved immutable key joins the
+  action key, `backtest-result` hits re-verify `resultArtifactHash`
+  (mismatch = corruption), manifest warnings preserved verbatim, failed
+  folds never filtered.
+- **Gate integration**: built-in schema checks for the three contracts
+  (`schema: data-snapshot|feature-set|backtest-result`) that only PASS for
+  fully `validated` manifests; cached runs keep re-validating through the
+  full Q ladder.
+- **Commands**: `/q-cache-validate <manifest-path>` (contract type, schema
+  version, immutable/mutable, content hash, upstream keys, missing fields,
+  warnings, cache eligibility, Q gate implications) and `/q-cache-lineage
+  <run-id|action-key>` (contract chain, upstream relationships, action
+  keys, artifact hashes, reused runs, invalidation reason). Neither ever
+  reads data files into the model context.
+- **Fixtures** (`fixtures/quant/`, real structure, no investment
+  conclusions): valid-data-snapshot, invalid-latest-snapshot,
+  valid-stock-selection-feature-set, valid-market-timing-feature-set,
+  valid-stock-selection-backtest, valid-market-timing-backtest,
+  missing-point-in-time, missing-corporate-action-policy,
+  failed-fold-retained, corrupted-artifact.
+- **Templates**: stock-selection and market-timing recipes gain
+  `domain: quant` cache blocks (data:fetch → data-snapshot,
+  feature:compute → feature-set, backtest → backtest-result) and the
+  gates.yaml documentation covers the contract schema checks.
+- **Docs**: `docs/cache/quant-cache.md`, `data-snapshot-contract.md`,
+  `feature-set-contract.md`, `backtest-result-contract.md`,
+  `quant-cache-invalidation.md`; recipe-cache-schema updated for
+  `domain`/`quantContract`.
+- **Tests**: `tests/p6-d-quant-contracts.test.ts` (32) and
+  `tests/p6-d-quant-cache.test.ts` (25) covering the key/invalidation
+  matrix, reference resolution, corruption, lineage and cached Q Gate
+  revalidation.
+
+### Not implemented (by design)
+
+- No HFT / L2/LOB / tick replay / queue model / market making / matching
+  engine / colocation / latency / exchange order routing / live execution
+  schema or module — verified by tests.
+- The workbench does not verify `rawDataHash`/data-file content hashes
+  beyond bounded streaming verification of the declared result artifact;
+  data files are never read into memory or the model context.
+
+## [0.7.2] — P6-C: Deterministic Recipe Action Cache
+
+An **opt-in, project-local, result-only cache** for declared recipes:
+`actionKey -> execution result metadata`. Disabled by default; only
+successful results cached by default; cache failures degrade to normal
+execution; gates are never bypassed (a hit creates a full new run record
+with `executionSource: cache` and gate statuses stay PASS/FAIL/BLOCKED/
+NOT_RUN).
+
+### Added
+
+- **Action cache** (`cache/action-types.ts`, `action-key.ts`,
+  `action-fingerprint.ts`, `action-store.ts`, `action-cache.ts`,
+  `action-explain.ts`): full action key (recipe definition, argv, cwd,
+  mode, declared env hashes, toolchain versions, OS/arch, lockfile
+  hashes, declared-input Merkle hash, workbench config, profile, gate
+  schema, upstream keys — never git state/mtime/size), streaming SHA-256
+  input fingerprinting with symlink-escape refusal and protected-secret
+  refusal, per-key locking with stale recovery, atomic writes, LRU prune,
+  corruption handling (action JSON → quarantine+miss, index rebuild, CAS
+  re-verify), capacity limit via `project.yaml cache.actionCache.maxBytes`.
+- **Recipe schema** `cache:` block: `enabled/version/mode/successOnly/
+  inputs/outputs/environment/toolchain/maxAgeSeconds/upstream` with
+  parse-time denial of network/time/random/source-mutating recipes
+  (violations disable caching with a warning, never the recipe).
+- **Commands**: `/q-run <recipe> [--no-cache|--refresh-cache]`,
+  `/q-cache-explain <recipe>`, `/q-cache-prune [--apply]`,
+  `/q-cache-clear <recipe|all>`; `workbench_run_recipe` gained a `cache`
+  parameter. Gate recipe evidence records `execution_source`.
+- **Bootstrap recipes** in `.pi/workbench/recipes.yaml`: `typecheck` and
+  `unit-test` cached (result-only), `check` intentionally uncached.
+- **Docs**: `docs/cache/action-cache.md`, `recipe-cache-schema.md`,
+  `cache-maintenance.md`, `cache-correctness.md`.
+- **Tests**: `tests/p6-c-action-key.test.ts` (27) and
+  `tests/p6-c-action-cache.test.ts` (28) covering hit/miss lifecycle,
+  every key component, symlink/protected/limits, locking, corruption,
+  LRU, CAS primitives, gate evidence and failure fallback.
+
+### Disabled / not implemented (documented)
+
+- artifacts RESTORE is disabled (`ARTIFACT_RESTORE_ENABLED = false`) —
+  CAS primitives exist and are tested, but no file is restored until
+  restore passes its own security gate; artifacts-mode recipes always
+  execute (metadata only).
+- upstream keys use empty params; chained recipes with params stay
+  uncached.
+
+## [0.7.1] — P6-B: DeepSeek Stable Prefix Optimization
+
+DeepSeek's prompt cache is a full-prefix cache, so the workbench now
+formalizes and enforces a **stable prefix contract**: the system prompt,
+tool metadata, registration order and per-mode tool matrices are static;
+dynamic facts (time, git, run/gate ids, cache stats) are confined to the
+allowed dynamic channels; same-mode drift is classified as
+`UNEXPECTED_DRIFT` with a `driftSource` detail.
+
+### Added
+
+- **Stable-prefix contract** (`cache/stable-prefix.ts`): stable/dynamic
+  zone constants, deterministic stable sorts (`stableSortStrings`,
+  `sortedById/ByName/ByPath`), `modePrefixFingerprint` (system prompt +
+  tool names/order/schema per mode), `stableResourcesHash` (skills,
+  templates, gates, recipes, profiles, extensions), dynamic-value markers
+  and `staticToolMetadataIssues` for tool metadata audits.
+- **Static tool catalog** (`core/tool-catalog.ts`): `WORKBENCH_TOOL_NAMES`
+  is the explicit registration-order constant; name/label/description/
+  promptSnippet/promptGuidelines/parameters are centralized static
+  metadata that `index.ts` spreads into `registerTool`.
+- **`UNEXPECTED_DRIFT` classification**: same-mode system/tool drift now
+  records `inferredInvalidationReason: "UNEXPECTED_DRIFT"` with
+  `driftSource` (SYSTEM_PROMPT/TOOL_SET/TOOL_ORDER/TOOL_SCHEMA); the P6-A
+  specific reasons are still recognized on old (1.0) records. Telemetry
+  schema version bumped to 1.1.
+- **Doctor/report extensions**: `/q-cache-doctor` shows
+  `prefix_hashes` (systemPromptHash, activeToolNamesHash,
+  activeToolOrderHash, activeToolSchemaHash), `same_mode_drift`,
+  `expected_vs_unexpected`, `tool_metadata_static`, and churn now counts
+  compaction; `/q-cache-report` gains the `same-mode mutat.` line.
+- **Deterministic resource discovery**: gates sorted by id
+  (`effectiveGates`), recipes sorted by name, profiles sorted by name,
+  readdir results sorted; DEV mode preserves foreign tools in
+  name-sorted order.
+- **Docs**: `docs/cache/stable-prefix-contract.md`,
+  `docs/cache/deepseek-cache-limitations.md`,
+  `docs/cache/cache-efficient-workflow.md`; telemetry and provider docs
+  updated for schema 1.1.
+
+### Changed
+
+- Tool metadata is now spread from the catalog (behavior-identical
+  strings).
+- P6-A telemetry tests updated for the 1.1 schema and
+  `UNEXPECTED_DRIFT`/`driftSource`.
+
+## [0.7.0] — P6-A: DeepSeek Prompt Cache Telemetry and Baseline
+
+Observability for the DeepSeek prompt cache: hash-only telemetry of
+normalized usage and context fingerprints, inferred invalidation reasons,
+per-project JSONL storage with rotation, three new commands, and a compact
+footer segment. Observation only — no payload mutation, no TTL control, no
+warm-up requests, no Recipe Action Cache.
+
+### Added
+
+- **Cache telemetry module** (`extensions/workbench-runtime/cache/`):
+  `cache-types.ts` (schema + verified usage semantics), `canonical-hash.ts`
+  (deterministic SHA-256 canonicalization), `prompt-fingerprint.ts`
+  (system prompt / tool / payload digests — text never retained),
+  `invalidation-classifier.ts` (14 inferred reasons, expected vs
+  unexpected), `cache-telemetry.ts` (session observer + state entry),
+  `cache-store.ts` (append-only JSONL, rotation, atomic reports, forbidden
+  field refusal), `cache-report.ts` (aggregation + rendering),
+  `cache-doctor.ts` (health checks).
+- **Pi-native events**: `session_start` (state restore, reload/new
+  classification), `model_select`, `thinking_level_select`,
+  `before_provider_request` (read-only structural peek),
+  `message_end` (assistant only), `session_before_compact`,
+  `session_shutdown` (safe flush).
+- **Usage mapping (verified against installed Pi 0.83.0)**: for
+  `openai-completions` (deepseek) `usage.input` is the un-cached input
+  (`prompt_cache_miss_tokens`), `usage.cacheRead` the hit portion;
+  `cacheHitRatio = cacheRead / (input + cacheRead)`; `usage.cost.total` is
+  the cost fact. Unknown api kinds degrade to `partial`/`unverified` and
+  never guess a ratio.
+- **Storage**: `<root>/.pi/workbench/cache/telemetry.jsonl` (5 MB limit,
+  5 archives), `reports/` (atomic writes, sanitized names), user-only file
+  modes, gitignored, opt-out via `project.yaml` `cache.telemetry: false`.
+- **Commands**: `/q-cache-status`, `/q-cache-report [session|project]
+  [--save <name>]`, `/q-cache-doctor [json]`; footer segment
+  `CACHE 72% | read 184k | miss 71k` (or `CACHE N/A`).
+- **Docs**: `docs/cache/deepseek-prompt-cache.md`,
+  `docs/cache/cache-telemetry.md`, `docs/cache/cache-privacy.md`.
+
+### Changed
+
+- Version bumped to 0.7.0; `EXTENSION_VERSION` in cache-types.ts must stay
+  in sync with package.json.
+- `ProjectConfig` gains `cacheTelemetry` (project.yaml `cache.telemetry`).
+- Command inventory grows from 15 to 18 (P5 inventory test updated);
+  lifecycle-event inventory extended.
+
 ## [0.6.1] — MIT License and README Banner
 
 ### Added

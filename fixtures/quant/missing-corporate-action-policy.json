@@ -1,0 +1,26 @@
+{
+	"schemaVersion": 1,
+	"contractType": "data-snapshot",
+	"snapshotId": "2026-08-01-eod-v1",
+	"provider": "example-data-vendor",
+	"dataset": "us-equities-daily",
+	"providerDatasetVersion": "2026.08",
+	"providerRevision": "r1",
+	"acquiredAt": "2026-08-01T01:00:00Z",
+	"effectiveAsOf": "2026-07-31T21:00:00Z",
+	"symbols": ["AAPL", "MSFT", "NVDA"],
+	"pointInTimeUniverseId": "universe:sp500-pit:2026-08-01:v2",
+	"startDate": "2015-01-01",
+	"endDate": "2026-07-31",
+	"frequency": "daily",
+	"timezone": "America/New_York",
+	"tradingCalendar": "NYSE",
+	"adjustmentPolicy": "total-return-adjusted",
+	"delistingPolicy": "retained-with-delisting-marker",
+	"schemaHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac",
+	"rawDataHash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbd",
+	"sourceArtifacts": ["data/equities/daily.parquet"],
+	"warnings": [
+		"corporateActionVersion is absent — split/dividend adjustment semantics are not declared; the contract parses but its validation status can never be validated"
+	]
+}

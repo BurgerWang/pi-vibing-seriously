@@ -4,3 +4,4 @@ coverage/
 .DS_Store
 .cache/
 .pi/workbench/runs/
+.pi/workbench/cache/

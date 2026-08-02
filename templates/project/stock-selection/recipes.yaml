@@ -2,33 +2,113 @@
 # command MUST be an argv array (never a shell string); cwd is relative to the project root.
 # The scripts below (scripts/*.py) are placeholders your project must provide.
 # The workbench only runs declared commands — it implements no backtesting engine.
+#
+# P6-D quant cache contracts: each data/feature/backtest recipe declares a
+# quant contract manifest. The workbench only DEFINES, VALIDATES and CONNECTS
+# the contracts (cache/quant-contracts.ts in the workbench package); your
+# scripts produce the manifest JSON files:
+#   artifacts/data-snapshot.json    — DATA_SNAPSHOT contract
+#   artifacts/feature-set.json      — FEATURE_SET contract
+#   artifacts/backtest-result.json  — BACKTEST_RESULT contract
+# Rules enforced by the workbench:
+#   - snapshotId must be immutable (latest/current/now/today never cache)
+#   - a logical reference must resolve to an immutable revision before caching
+#   - stock-selection feature sets need a point-in-time universe, industry
+#     classification version, market-cap source version, financial
+#     publication-time alignment, winsorization, normalization and
+#     missing-value policy — otherwise the manifest parses but is never
+#     "validated" and never cacheable
+#   - failed folds are never filtered; walk-forward with empty folds is never
+#     validated; best-trial-only caching is never valid
+#   - cache hits never bypass Q0-Q5 (gates re-validate every run)
 recipes:
   - name: data:fetch
-    description: Fetch/refresh the input dataset (user-provided script)
+    description: Fetch/refresh the input dataset and write the data-snapshot manifest (user-provided script)
     command: ["python", "scripts/fetch_data.py"]
     cwd: "."
     timeout_ms: 600000
     allowed_modes: [DEV, VERIFY]
     expected_exit_codes: [0]
-    writes: ["data/", "results/"]
-    artifacts: ["results/**/*.json", "results/**/*.csv"]
+    writes: ["data/", "results/", "artifacts/"]
+    artifacts: ["results/**/*.json", "results/**/*.csv", "artifacts/**/*.json"]
     environment: []
     output_strategy: tail
     max_lines: 2000
     max_bytes: 51200
+    # P6-D: quant cache — the DATA_SNAPSHOT manifest is the cache fact source.
+    # inputs fingerprint the SCRIPT (declarative input), never the data files:
+    # the data identity comes from the immutable manifest (provider revision,
+    # rawDataHash, symbols, effectiveAsOf). The cache is refused when the
+    # manifest is missing, schema-invalid, mutable or unresolvable.
+    cache:
+      enabled: true
+      domain: quant
+      mode: result-only
+      successOnly: true
+      inputs:
+        - scripts/fetch_data.py
+      outputs: []
+      environment: []
+      toolchain: [python]
+      maxAgeSeconds: null
+      quantContract:
+        type: data-snapshot
+        manifest: artifacts/data-snapshot.json
+  - name: feature:compute
+    description: Compute cross-sectional features and write the feature-set manifest (user-provided script)
+    command: ["python", "scripts/features.py"]
+    cwd: "."
+    timeout_ms: 600000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: ["data/", "results/", "artifacts/"]
+    artifacts: ["results/**/*.json", "results/**/*.csv", "artifacts/**/*.json"]
+    environment: []
+    output_strategy: tail
+    max_lines: 2000
+    max_bytes: 51200
+    cache:
+      enabled: true
+      domain: quant
+      mode: result-only
+      successOnly: true
+      inputs:
+        - scripts/features.py
+      outputs: []
+      environment: []
+      toolchain: [python]
+      maxAgeSeconds: null
+      quantContract:
+        type: feature-set
+        manifest: artifacts/feature-set.json
   - name: backtest:selection
-    description: Run the stock-selection backtest (user-provided script)
+    description: Run the stock-selection backtest and write the backtest-result manifest (user-provided script)
     command: ["python", "scripts/backtest.py"]
     cwd: "."
     timeout_ms: 600000
     allowed_modes: [DEV, VERIFY]
     expected_exit_codes: [0]
-    writes: ["data/", "results/"]
-    artifacts: ["results/**/*.json", "results/**/*.csv"]
+    writes: ["data/", "results/", "artifacts/"]
+    artifacts: ["results/**/*.json", "results/**/*.csv", "artifacts/**/*.json"]
     environment: []
     output_strategy: tail
     max_lines: 2000
     max_bytes: 51200
+    cache:
+      enabled: true
+      domain: quant
+      mode: result-only
+      successOnly: true
+      inputs:
+        - scripts/backtest.py
+        - scripts/metrics.py
+      outputs: []
+      environment: []
+      toolchain: [python]
+      maxAgeSeconds: null
+      quantContract:
+        type: backtest-result
+        manifest: artifacts/backtest-result.json
   - name: backtest:metrics
     description: Compute evaluation metrics from backtest results
     command: ["python", "scripts/metrics.py"]
@@ -36,8 +116,8 @@ recipes:
     timeout_ms: 300000
     allowed_modes: [DEV, VERIFY]
     expected_exit_codes: [0]
-    writes: ["data/", "results/"]
-    artifacts: ["results/**/*.json", "results/**/*.csv"]
+    writes: ["data/", "results/", "artifacts/"]
+    artifacts: ["results/**/*.json", "results/**/*.csv", "artifacts/**/*.json"]
     environment: []
     output_strategy: tail
     max_lines: 2000

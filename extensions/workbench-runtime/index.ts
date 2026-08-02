@@ -24,15 +24,83 @@
  *     a hidden custom message. Pi compaction itself is never cancelled or
  *     reimplemented, and no run logs ever enter the session context.
  *
+ * P6-A additions (DeepSeek prompt-cache telemetry — observability only):
+ *   - hash-only telemetry of usage, context fingerprints and inferred cache
+ *     invalidations (cache/ directory); records go to
+ *     <root>/<CONFIG_DIR_NAME>/workbench/cache/telemetry.jsonl (append-only,
+ *     rotated, privacy-filtered — no prompt/message/tool/schema text, no
+ *     secrets, no full session ids)
+ *   - Pi-native events only: session_start, model_select,
+ *     thinking_level_select, before_provider_request (read-only structural
+ *     peek — payload/headers never mutated), message_end (assistant only),
+ *     session_before_compact, session_shutdown (safe flush)
+ *   - usage facts come from Pi's normalized assistant usage; usage.cost.total
+ *     is the actual cost fact source; cacheHitRatio is computed only for api
+ *     kinds whose semantics are verified in the installed Pi source
+ *   - /q-cache-status /q-cache-report [session|project] [--save <name>]
+ *     /q-cache-doctor; compact CACHE segment in the footer status
+ *   - telemetry never blocks or modifies model requests; opt-out via
+ *     project.yaml cache.telemetry: false. No Recipe Action Cache yet.
+ *
+ * P6-C additions (Deterministic Recipe Action Cache — opt-in, disabled by
+ * default):
+ *   - actionKey -> execution result metadata for DECLARED recipes only;
+ *     never model answers/patches/audit conclusions/arbitrary bash
+ *   - full action key: schema/policy/package versions, recipe definition
+ *     hash, cache policy hash, argv hash, relative cwd, mode, declared env
+ *     hashes, toolchain versions, OS/arch, lockfile hashes, declared-input
+ *     Merkle hash, workbench config hash, profile hash, gate schema hash,
+ *     upstream action keys — never git commit/branch/mtime/dirty state
+ *   - input fingerprinting: content SHA-256 (streaming, bounded), dirs via
+ *     recursive Merkle, symlinks resolved with escape refusal, protected
+ *     secret paths never read, missing patterns and glob no-match are key
+ *     components
+ *   - hit lifecycle: new run manifest with executionSource: cache,
+ *     actionKey, reusedFromRunId, cacheCreatedAt, cacheValidatedAt,
+ *     exitCode, evidencePaths, artifactValidation; gates still only see
+ *     PASS/FAIL/BLOCKED/NOT_RUN and re-validate every run record
+ *   - /q-run <recipe> [--no-cache|--refresh-cache]; /q-cache-explain
+ *     /q-cache-prune [--apply] /q-cache-clear <recipe|all>
+ *   - cache failures degrade to normal execution; artifacts restore stays
+ *     disabled until it passes its own security gate
+ *
+ * P6-D additions (Quant Research Cache Contracts):
+ *   - three versioned manifest contracts (cache/quant-contracts.ts):
+ *     DATA_SNAPSHOT, FEATURE_SET, BACKTEST_RESULT — the workbench only
+ *     defines, validates and connects the contracts; it never downloads
+ *     data, computes features or runs a backtest engine
+ *   - immutable-reference discipline: latest/current/now/today can never
+ *     be a final manifest id or cache key; logical references resolve to
+ *     an immutable manifest (registry-based) or the quant cache is refused
+ *   - recipe cache `domain: quant` + `quantContract: {type, manifest}`:
+ *     manifest must exist, schema-valid and immutable; the resolved
+ *     immutable key joins the action key; result artifact hash mismatch on
+ *     a hit is CORRUPTION; manifest warnings are preserved verbatim;
+ *     failed folds are never filtered; walk-forward with empty folds is
+ *     never validated; best-trial-only caching is never valid
+ *   - gate schema checks for the three contracts (data-snapshot,
+ *     feature-set, backtest-result) — cache hits never bypass Q0-Q5
+ *   - /q-cache-validate <manifest-path>; /q-cache-lineage <run-id|action-key>
+ *     (never reads data files into the model context)
+ *
  * Registers native Pi commands:
  *   /q-mode-audit /q-mode-dev /q-mode-verify /q-status   — mode control (P0)
  *   /q-init <profile>                                    — project init (P1)
- *   /q-run <recipe> /q-runs /q-run-show <run-id>         — recipe runner (P1)
+ *   /q-run <recipe> [--no-cache|--refresh-cache]         — recipe runner (P1+P6-C)
+ *   /q-runs /q-run-show <run-id>                         — run records (P1)
  *   /q-gate <selector> /q-gates /q-gate-show <gate-id>   — gate engine (P3)
  *   /q-evidence <run-id>                                 — evidence viewer (P3)
  *   /q-report latest|<run-id>                            — run report (P4)
  *   /q-compare <a> <b>                                   — run comparison (P4)
  *   /q-widget on|off                                     — widget toggle (P4)
+ *   /q-cache-status                                     — cache telemetry status (P6-A)
+ *   /q-cache-report [session|project] [--save <name>]   — cache telemetry report (P6-A)
+ *   /q-cache-doctor [json]                             — cache telemetry health check (P6-A)
+ *   /q-cache-explain <recipe>                          — action key / hit-miss (P6-C)
+ *   /q-cache-prune [--apply]                           — LRU prune (P6-C)
+ *   /q-cache-clear <recipe|all>                        — clear action cache (P6-C)
+ *   /q-cache-validate <manifest-path>                  — quant contract validation (P6-D)
+ *   /q-cache-lineage <run-id|action-key>               — quant cache lineage (P6-D)
  *
  * Registers workbench custom tools (P1/P3/P4):
  *   workbench_project_inspect — project root, git, stacks, profile, recipes,
@@ -76,13 +144,12 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { access } from "node:fs/promises";
 import { dirname } from "node:path";
 
-import { Type } from "typebox";
-import {
-	CONFIG_DIR_NAME,
-	type ExtensionAPI,
-	type ExtensionCommandContext,
-	type ExtensionContext,
+import type {
+	ExtensionAPI,
+	ExtensionCommandContext,
+	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import {
 	checkToolCall,
@@ -90,6 +157,7 @@ import {
 	MODE_TOOLS,
 	type WorkbenchMode,
 } from "./core/mode-policy.ts";
+import { WORKBENCH_TOOL_METADATA, WORKBENCH_TOOL_PARAMETERS } from "./core/tool-catalog.ts";
 import {
 	describeMode,
 	loadModeFromEntries,
@@ -105,6 +173,8 @@ import { inspectProject } from "./core/inspect.ts";
 import { planInit, applyInit, renderInitPlan } from "./core/init.ts";
 import { isSupportedInitProfile, INIT_PROFILES } from "./core/templates.ts";
 import { displayRelative, runRecipe, RecipeSetupError } from "./core/recipe-runner.ts";
+import { buildArgv } from "./core/recipe-schema.ts";
+import { EXTENSION_VERSION, type TelemetryRecord } from "./cache/cache-types.ts";
 import {
 	GateSetupError,
 	latestGateStatus,
@@ -145,6 +215,25 @@ import {
 	type RecipeToolDetails,
 } from "./core/render.ts";
 import { workbenchToolRenderer } from "./ui/tool-renderers.ts";
+import {
+	createCacheTelemetry,
+	type CacheTelemetry,
+} from "./cache/cache-telemetry.ts";
+import { buildCacheReport, renderCacheReport, renderCacheStatus, type RateLookup } from "./cache/cache-report.ts";
+import { runDoctor, renderDoctor, doctorToJson, type DoctorFacts } from "./cache/cache-doctor.ts";
+import { CacheStore, DEFAULT_MAX_TELEMETRY_BYTES } from "./cache/cache-store.ts";
+import { ActionCacheStore } from "./cache/action-store.ts";
+import {
+	computeKey,
+	lookupValidated,
+	planCache,
+	type ActionCacheContext,
+	type CacheRequestMode,
+} from "./cache/action-cache.ts";
+import { renderCacheExplain, renderPrune, renderClear, type ExplainFacts } from "./cache/action-explain.ts";
+import { validateQuantManifestCommand, renderQuantCacheValidate } from "./cache/quant-cache-validate.ts";
+import { buildQuantLineage, renderQuantLineage } from "./cache/quant-cache-lineage.ts";
+import type { ActionRecord } from "./cache/action-types.ts";
 
 const STATUS_KEY = "workbench";
 
@@ -179,6 +268,13 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	const execFn: ExecFn = (command, args, options) =>
 		pi.exec(command, args, { cwd: options?.cwd, timeout: options?.timeout, signal: options?.signal });
 
+	// ---------------------------------------------------------- P6-A cache
+
+	/** Session-scoped prompt-cache telemetry (hash-only, never blocking). */
+	const cacheTelemetry: CacheTelemetry = createCacheTelemetry({
+		appendEntry: (customType, data) => pi.appendEntry(customType, data),
+	});
+
 	// ------------------------------------------------------------------ state
 
 	function applyModeTools(): void {
@@ -198,6 +294,8 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			if (ctx.isProjectTrusted()) {
 				const projectRoot = await projectRootFor(ctx);
 				const config = await loadProjectConfig(projectRoot, { trusted: true });
+				cacheTelemetry.setEnabled(config.cacheTelemetry);
+				cacheTelemetry.setProjectRoot(projectRoot);
 				const gate = await latestGateRunSummary(projectRoot);
 				const runs = await listRuns(projectRoot, 1);
 				const latestRun = runs[0];
@@ -213,7 +311,26 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		} catch {
 			// keep the mode-only fallback line
 		}
+		// P6-A compact cache segment — only when the data is valid.
+		const cacheSegment = cacheTelemetry.statusSegment();
+		if (cacheSegment) line = line ? `${line} | ${cacheSegment}` : cacheSegment;
 		ctx.ui.setStatus(STATUS_KEY, line);
+	}
+
+	/** P6-A: keep the telemetry enable flag in sync with project.yaml (opt-out). */
+	async function refreshCacheConfig(ctx: ExtensionContext): Promise<void> {
+		try {
+			if (!ctx.isProjectTrusted()) {
+				cacheTelemetry.setEnabled(false);
+				return;
+			}
+			const projectRoot = await projectRootFor(ctx);
+			const config = await loadProjectConfig(projectRoot, { trusted: true });
+			cacheTelemetry.setEnabled(config.cacheTelemetry);
+		} catch {
+			// default on — telemetry is best-effort and hash-only
+			cacheTelemetry.setEnabled(true);
+		}
 	}
 
 	// ------------------------------------------------------------------ widget
@@ -271,6 +388,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 
 	function setMode(next: WorkbenchMode, ctx: ExtensionContext, label: string): void {
 		mode = next;
+		cacheTelemetry.observeModeChange(next);
 		pi.appendEntry(MODE_ENTRY_TYPE, { mode });
 		applyModeTools();
 		const text = `${label}: ${describeMode(mode)}`;
@@ -335,7 +453,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 
 	// -------------------------------------------------------------- lifecycle
 
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
 		// Restore the most recent persisted mode and workbench state from the
 		// current session's custom entries. Custom entries survive compaction
 		// and every session-replacement path (/new, /resume, /fork, /clone,
@@ -345,6 +463,20 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		mode = loadModeFromEntries(entries);
 		compactState = loadCompactStateFromEntries(entries, mode);
 		applyModeTools();
+
+		// P6-A: restore the cache telemetry summary and lifecycle reasons.
+		const sessionId = ctx.sessionManager.getSessionFile() ?? ctx.sessionManager.getSessionId() ?? ctx.cwd;
+		cacheTelemetry.setSessionId(sessionId);
+		cacheTelemetry.setMode(mode);
+		cacheTelemetry.setThinkingLevel(ctx.thinkingLevel ?? pi.getThinkingLevel());
+		cacheTelemetry.restoreFromEntries(entries);
+		if (event.reason === "reload") cacheTelemetry.observeReload();
+		if (event.reason === "new") cacheTelemetry.observeNewSession();
+		if (ctx.model) {
+			cacheTelemetry.observeModelChange({ provider: ctx.model.provider, id: ctx.model.id, api: ctx.model.api });
+		}
+
+		void refreshCacheConfig(ctx);
 		void refreshStatus(ctx);
 		void refreshWidget(ctx); // a previously failed gate keeps the widget visible
 	});
@@ -359,6 +491,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	// the facts visible to the model without putting any log content into the
 	// session context.
 	pi.on("session_before_compact", (_event, _ctx) => {
+		cacheTelemetry.observeCompaction();
 		if (!shouldSupplement(compactState)) return undefined;
 		const note = buildCompactNote(compactState);
 		if (note === lastCompactNote) return undefined;
@@ -439,6 +572,80 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		touchCompactState();
 		void refreshStatus(ctx);
 		void refreshWidget(ctx);
+	});
+
+	// ------------------------------------------------------- P6-A cache events
+
+	// Model/thinking/mode changes are the strongest (explicit) invalidation
+	// signals; the next message_end classifies them as such.
+	pi.on("model_select", (event) => {
+		cacheTelemetry.observeModelChange({ provider: event.model.provider, id: event.model.id, api: event.model.api });
+	});
+
+	pi.on("thinking_level_select", (event) => {
+		cacheTelemetry.observeThinkingChange(event.level);
+	});
+
+	// READ-ONLY structural peek: the payload is never replaced, mutated or
+	// stored — only a structural digest (roles, lengths, per-segment hashes,
+	// tool names) is kept in memory for contextShapeHash classification.
+	pi.on("before_provider_request", (event) => {
+		cacheTelemetry.observePayload(event.payload);
+		return undefined;
+	});
+
+	// message_end handles ASSISTANT messages only. All telemetry work is
+	// wrapped so a failure can never block, delay or alter the request.
+	pi.on("message_end", async (event, ctx) => {
+		if (event.message.role !== "assistant") return;
+		const message = event.message as {
+			provider?: string;
+			model?: string;
+			api?: string;
+			usage?: {
+				input: number;
+				output: number;
+				cacheRead: number;
+				cacheWrite: number;
+				totalTokens: number;
+				cost: { total: number };
+			};
+			stopReason?: string;
+			errorMessage?: string;
+		};
+		try {
+			if (!ctx.isProjectTrusted()) return;
+			const projectRoot = await projectRootFor(ctx);
+			cacheTelemetry.setProjectRoot(projectRoot);
+			if (!message.usage) return;
+			await cacheTelemetry.observeMessageEnd({
+				provider: message.provider ?? "unknown",
+				model: message.model ?? "unknown",
+				apiKind: typeof message.api === "string" ? message.api : ctx.model?.api ?? null,
+				usage: message.usage,
+				stopReason: message.stopReason,
+				errorMessage: message.errorMessage,
+				thinkingLevel: ctx.thinkingLevel ?? pi.getThinkingLevel(),
+				systemPrompt: ctx.getSystemPrompt(),
+				activeToolNames: pi.getActiveTools(),
+				tools: pi.getAllTools().map((t) => ({
+					name: t.name,
+					description: t.description,
+					promptSnippet: (t as { promptSnippet?: string }).promptSnippet,
+					parameters: t.parameters,
+					promptGuidelines: t.promptGuidelines,
+				})),
+			});
+		} catch {
+			// telemetry must never break a model request
+		}
+		return undefined;
+	});
+
+	// Safe flush: persist the session state entry (append-only JSONL records
+	// are already written per request; nothing is buffered here).
+	pi.on("session_shutdown", () => {
+		cacheTelemetry.flush();
 	});
 
 	// --------------------------------------------------------------- commands
@@ -550,8 +757,12 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 
 	// ------------------------------------------------------------ /q-run
 
-	function parseRunArgs(args: string): { recipe: string; params: Record<string, unknown> } {
-		const tokens = args.trim().split(/\s+/).filter((t) => t.length > 0);
+	function parseRunArgs(args: string): { recipe: string; params: Record<string, unknown>; cacheMode: CacheRequestMode } {
+		let cacheMode: CacheRequestMode = "default";
+		const tokens = args.trim().split(/\s+/).filter((t) => t.length > 0 && !t.startsWith("--"));
+		const flags = args.trim().split(/\s+/).filter((t) => t.startsWith("--"));
+		if (flags.includes("--no-cache")) cacheMode = "no-cache";
+		if (flags.includes("--refresh-cache")) cacheMode = "refresh-cache";
 		const recipe = tokens[0] ?? "";
 		const params: Record<string, unknown> = {};
 		for (const token of tokens.slice(1)) {
@@ -564,15 +775,15 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			else if (/^-?\d+(\.\d+)?$/.test(raw)) params[key] = Number(raw);
 			else params[key] = raw;
 		}
-		return { recipe, params };
+		return { recipe, params, cacheMode };
 	}
 
 	pi.registerCommand("q-run", {
-		description: "Run a declared recipe: /q-run <recipe> [key=value ...] (same service as workbench_run_recipe)",
+		description: "Run a declared recipe: /q-run <recipe> [key=value ...] [--no-cache|--refresh-cache] (same service as workbench_run_recipe)",
 		handler: async (args, ctx) => {
-			const { recipe, params } = parseRunArgs(args);
+			const { recipe, params, cacheMode } = parseRunArgs(args);
 			if (!recipe) {
-				output(ctx, ["/q-run: usage: /q-run <recipe> [key=value ...]"]);
+				output(ctx, ["/q-run: usage: /q-run <recipe> [key=value ...] [--no-cache|--refresh-cache]"]);
 				return;
 			}
 			const trustError = trustedOrError(ctx);
@@ -582,7 +793,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			}
 			const projectRoot = await projectRootFor(ctx);
 			try {
-				const result = await runRecipe({ projectRoot, recipeName: recipe, params, mode, exec: execFn, signal: ctx.signal });
+				const result = await runRecipe({ projectRoot, recipeName: recipe, params, mode, exec: execFn, signal: ctx.signal, cacheMode });
 				if (!result.ok && result.error) {
 					output(ctx, [`/q-run: ${result.error}`]);
 					return;
@@ -592,12 +803,16 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 					output(ctx, ["/q-run: no summary produced"]);
 					return;
 				}
+				const cacheLine = result.cache
+					? `cache      : ${result.cache.status.toUpperCase()}${result.cache.actionKey ? ` (key ${result.cache.actionKey.slice(0, 16)}…)` : ""}${result.cache.reusedFromRunId ? `, reused ${result.cache.reusedFromRunId}` : ""}${result.cache.reason ? ` — ${result.cache.reason}` : ""}`
+					: "cache      : (no cache policy)";
 				const lines = [
 					`run        : ${summary.run_id}`,
 					`recipe     : ${summary.recipe}`,
 					`exit code  : ${summary.exit_code ?? "killed"} (expected: ${result.record?.expected_exit_codes.join(", ") ?? "?"})`,
 					`status     : ${summary.timed_out ? "TIMED OUT" : summary.cancelled ? "CANCELLED" : result.ok ? "OK" : "FAILED"}`,
 					`duration   : ${summary.duration_ms} ms`,
+					cacheLine,
 					`artifacts  : ${summary.artifact_paths.length > 0 ? summary.artifact_paths.join(", ") : "(none)"}`,
 					`stdout log : ${displayRelative(projectRoot, summary.stdout_log)}`,
 					`stderr log : ${displayRelative(projectRoot, summary.stderr_log)}`,
@@ -929,18 +1144,326 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		},
 	});
 
+	// ------------------------------------------------------- P6-A cache cmds
+
+	pi.registerCommand("q-cache-status", {
+		description: "Show prompt-cache telemetry for the current session (provider, usage, hit ratio, last inferred invalidation)",
+		handler: async (_args, ctx) => {
+			const trustError = trustedOrError(ctx);
+			if (trustError) {
+				output(ctx, [`/q-cache-status: ${trustError}`]);
+				return;
+			}
+			const projectRoot = await projectRootFor(ctx);
+			await refreshCacheConfig(ctx);
+			cacheTelemetry.setProjectRoot(projectRoot);
+			cacheTelemetry.setMode(mode);
+			cacheTelemetry.setThinkingLevel(ctx.thinkingLevel ?? pi.getThinkingLevel());
+			output(ctx, renderCacheStatus(cacheTelemetry.snapshot()));
+		},
+	});
+
+	pi.registerCommand("q-cache-report", {
+		description: "Show cache telemetry report: /q-cache-report [session|project] [--save <name>]",
+		handler: async (args, ctx) => {
+			const tokens = args.trim().split(/\s+/).filter((t) => t.length > 0);
+			const scopeArg = tokens[0] === "session" || tokens[0] === "project" ? (tokens.shift() as "session" | "project") : "session";
+			const saveIndex = tokens.indexOf("--save");
+			const saveName = saveIndex >= 0 && tokens[saveIndex + 1] ? tokens[saveIndex + 1] : undefined;
+			const trustError = trustedOrError(ctx);
+			if (trustError) {
+				output(ctx, [`/q-cache-report: ${trustError}`]);
+				return;
+			}
+			const projectRoot = await projectRootFor(ctx);
+			await refreshCacheConfig(ctx);
+			cacheTelemetry.setProjectRoot(projectRoot);
+			const store = new CacheStore(projectRoot);
+			const { records, skipped } = await store.readRecords();
+			const scope = scopeArg;
+			let scoped = records as TelemetryRecord[];
+			if (scope === "session") {
+				const hashed = cacheTelemetry.snapshot().hashedSessionId;
+				scoped = scoped.filter((r) => r.hashedSessionId === hashed);
+			}
+			const rateLookup: RateLookup = (provider, model) => {
+				const m = ctx.modelRegistry.find(provider, model);
+				if (!m || typeof m.cost?.cacheRead !== "number" || !Number.isFinite(m.cost.cacheRead)) return undefined;
+				return { cacheRead: m.cost.cacheRead };
+			};
+			const report = buildCacheReport(scoped, scope, rateLookup);
+			report.skippedRecords = skipped;
+			const lines = renderCacheReport(report);
+			if (saveName) {
+				const saved = await store.saveReport(saveName, report);
+				if (saved.ok && saved.path) {
+					lines.push("", `report saved: ${displayRelative(projectRoot, saved.path)}`);
+				} else {
+					lines.push("", `report save failed: ${saved.error ?? "unknown error"}`);
+				}
+			}
+			if (skipped > 0) lines.push(`(note: ${skipped} corrupted line(s) skipped in telemetry.jsonl)`);
+			output(ctx, lines);
+		},
+	});
+
+	pi.registerCommand("q-cache-doctor", {
+		description: "Check cache telemetry health: /q-cache-doctor [json] (provider/model, usage validity, cost metadata, drift, forbidden fields)",
+		handler: async (args, ctx) => {
+			const jsonMode = args.trim().toLowerCase() === "json";
+			const trustError = trustedOrError(ctx);
+			if (trustError) {
+				const checks = [{ id: "trust", status: "fail" as const, message: trustError }];
+				output(ctx, jsonMode ? [JSON.stringify(doctorToJson(checks), null, 2)] : renderDoctor(checks));
+				return;
+			}
+			const projectRoot = await projectRootFor(ctx);
+			await refreshCacheConfig(ctx);
+			cacheTelemetry.setProjectRoot(projectRoot);
+			const store = new CacheStore(projectRoot);
+			const { records } = await store.readRecords();
+			const model = ctx.model;
+			const facts: DoctorFacts = {
+				provider: model?.provider ?? null,
+				model: model?.id ?? null,
+				apiKind: model?.api ?? null,
+				modelCostPresent: Boolean(model && typeof model.cost === "object" && model.cost !== null),
+				modelCostRatesValid: Boolean(
+					model && typeof model.cost?.cacheRead === "number" && Number.isFinite(model.cost.cacheRead) && model.cost.cacheRead >= 0,
+				),
+				systemPrompt: ctx.getSystemPrompt(),
+				activeToolNames: pi.getActiveTools(),
+				tools: pi.getAllTools().map((t) => ({
+					name: t.name,
+					description: t.description,
+					promptSnippet: (t as { promptSnippet?: string }).promptSnippet,
+					parameters: t.parameters,
+					promptGuidelines: t.promptGuidelines,
+				})),
+				records: records as TelemetryRecord[],
+				telemetryEnabled: cacheTelemetry.isEnabled(),
+				telemetryBytes: await store.telemetryBytes(),
+				telemetryMaxBytes: DEFAULT_MAX_TELEMETRY_BYTES,
+				rotatedFiles: await store.rotatedFileCount(),
+			};
+			const checks = runDoctor(facts);
+			output(ctx, jsonMode ? [JSON.stringify(doctorToJson(checks, facts), null, 2)] : renderDoctor(checks));
+		},
+	});
+
+	// ------------------------------------------------------ P6-C cache cmds
+
+	/** Shared P6-C cache context builder (explain/prune/clear). */
+	function actionCacheContextFor(projectRoot: string, recipeName: string, cacheMode: CacheRequestMode) {
+		return async (): Promise<{ ok: boolean; error?: string; ctx?: ActionCacheContext; store?: ActionCacheStore; keyResult?: Awaited<ReturnType<typeof computeKey>> | null }> => {
+			const config = await loadProjectConfig(projectRoot, { trusted: true });
+			const recipe = config.recipes.find((r) => r.name === recipeName);
+			if (!recipe) return { ok: false, error: `recipe "${recipeName}" not found in recipes.yaml` };
+			const store = new ActionCacheStore(projectRoot, { maxBytes: config.actionCacheMaxBytes });
+			const ctx: ActionCacheContext = {
+				projectRoot,
+				recipe,
+				policy: recipe.cache,
+				argv: buildArgv(recipe, {}),
+				mode,
+				profile: config.profile,
+				projectGates: config.gates,
+				packageVersion: EXTENSION_VERSION,
+				exec: execFn,
+				store,
+				cacheMode,
+			};
+			const plan = planCache(ctx);
+			const keyResult = plan.active ? await computeKey(ctx) : null;
+			return { ok: true, ctx, store, keyResult };
+		};
+	}
+
+	/** Newest stored record for a recipe (different key) — change classification. */
+	async function previousRecordFor(store: ActionCacheStore, recipeName: string, currentKey: string | undefined): Promise<ActionRecord | null> {
+		try {
+			const index = await store.readIndex();
+			const candidates = index.entries.filter((e) => e.recipe === recipeName && e.key !== currentKey);
+			candidates.sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
+			for (const candidate of candidates) {
+				const { record } = await store.readRecord(candidate.key);
+				if (record) return record;
+			}
+			return null;
+		} catch {
+			return null;
+		}
+	}
+
+	pi.registerCommand("q-cache-explain", {
+		description: "Explain the action cache for a recipe: /q-cache-explain <recipe> (action key, hit/miss, key components, changed inputs, toolchain/config/env diffs; never prints secrets or per-file hashes)",
+		handler: async (args, ctx) => {
+			const recipeName = args.trim().split(/\s+/)[0] ?? "";
+			if (!recipeName) {
+				output(ctx, ["/q-cache-explain: usage: /q-cache-explain <recipe>"]);
+				return;
+			}
+			const trustError = trustedOrError(ctx);
+			if (trustError) {
+				output(ctx, [`/q-cache-explain: ${trustError}`]);
+				return;
+			}
+			const projectRoot = await projectRootFor(ctx);
+			const build = actionCacheContextFor(projectRoot, recipeName, "default");
+			const built = await build();
+			if (!built.ok || !built.ctx || !built.store) {
+				output(ctx, [`/q-cache-explain: ${built.error ?? "unknown error"}`]);
+				return;
+			}
+			const { ctx: cacheCtx, store } = built;
+			const config = await loadProjectConfig(projectRoot, { trusted: true });
+			const keyResult = built.keyResult;
+			const facts: ExplainFacts = {
+				recipeName,
+				cacheEnabled: cacheCtx.policy.enabled,
+				mode: cacheCtx.policy.mode,
+				requestMode: "default",
+				status: cacheCtx.policy.enabled ? "miss" : "disabled",
+				key: keyResult?.ok ? keyResult.key.key : undefined,
+				components: keyResult?.ok ? keyResult.key.components : null,
+				currentEntries: keyResult?.ok ? keyResult.inputEntries : [],
+				record: null,
+				previousRecord: null,
+				maxBytes: config.actionCacheMaxBytes,
+				stats: await store.stats(),
+			};
+			if (!keyResult) {
+				facts.status = cacheCtx.policy.enabled ? "refused" : "disabled";
+			} else if (!keyResult.ok) {
+				facts.status = "refused";
+				facts.reason = keyResult.reason;
+			} else {
+				const outcome = await lookupValidated(cacheCtx, keyResult.key);
+				facts.status = outcome.status;
+				facts.reason = outcome.reason;
+				facts.record = outcome.record ?? null;
+				facts.previousRecord = await previousRecordFor(store, recipeName, keyResult.key.key);
+			}
+			output(ctx, renderCacheExplain(facts));
+		},
+	});
+
+	pi.registerCommand("q-cache-prune", {
+		description: "Prune the action cache: /q-cache-prune [--apply] (dry-run by default; --apply needs confirmation; never deletes runs/evidence)",
+		handler: async (args, ctx) => {
+			const tokens = args.trim().split(/\s+/).filter((t) => t.length > 0);
+			const apply = tokens.includes("--apply");
+			const confirmToken = tokens.filter((t) => t !== "--apply").join(" ");
+			const trustError = trustedOrError(ctx);
+			if (trustError) {
+				output(ctx, [`/q-cache-prune: ${trustError}`]);
+				return;
+			}
+			const projectRoot = await projectRootFor(ctx);
+			const config = await loadProjectConfig(projectRoot, { trusted: true });
+			const store = new ActionCacheStore(projectRoot, { maxBytes: config.actionCacheMaxBytes });
+			if (apply) {
+				let confirmed = false;
+				if (ctx.hasUI) {
+					confirmed = await ctx.ui.confirm("Prune action cache?", "Delete LRU action-cache records beyond the configured budget? Runs and evidence are never touched.");
+				} else {
+					confirmed = confirmToken === "yes";
+				}
+				if (!confirmed) {
+					output(ctx, ["/q-cache-prune: not applied (no confirmation)", ...renderPrune(await store.prune({ apply: false }), config.actionCacheMaxBytes)]);
+					return;
+				}
+			}
+			const result = await store.prune({ apply });
+			output(ctx, renderPrune(result, config.actionCacheMaxBytes));
+		},
+	});
+
+	pi.registerCommand("q-cache-clear", {
+		description: "Clear the action cache: /q-cache-clear <recipe|all> (single recipe needs confirmation; all needs double confirmation; never deletes runs/evidence)",
+		handler: async (args, ctx) => {
+			const tokens = args.trim().split(/\s+/).filter((t) => t.length > 0);
+			const target = tokens[0] ?? "";
+			if (!target) {
+				output(ctx, ["/q-cache-clear: usage: /q-cache-clear <recipe|all>"]);
+				return;
+			}
+			const trustError = trustedOrError(ctx);
+			if (trustError) {
+				output(ctx, [`/q-cache-clear: ${trustError}`]);
+				return;
+			}
+			const projectRoot = await projectRootFor(ctx);
+			const config = await loadProjectConfig(projectRoot, { trusted: true });
+			const store = new ActionCacheStore(projectRoot, { maxBytes: config.actionCacheMaxBytes });
+			const confirmToken = tokens.slice(1).join(" ");
+			let confirmed = false;
+			if (target === "all") {
+				if (ctx.hasUI) {
+					const first = await ctx.ui.confirm("Clear ALL action-cache records?", "This deletes every cached recipe result for this project. Runs and evidence are never touched.");
+					if (first) confirmed = await ctx.ui.confirm("Really clear ALL?", "This is the second and final confirmation. Type Cancel to keep the cache.");
+				} else {
+					confirmed = confirmToken === "yes yes";
+				}
+			} else if (ctx.hasUI) {
+				confirmed = await ctx.ui.confirm(`Clear action cache for "${target}"?`, "Only this recipe's cached results are deleted. Runs and evidence are never touched.");
+			} else {
+				confirmed = confirmToken === "yes";
+			}
+			if (!confirmed) {
+				output(ctx, [`/q-cache-clear: ${target} not cleared (no confirmation)`]);
+				return;
+			}
+			const result = await store.clear(target === "all" ? "all" : target);
+			output(ctx, renderClear(result));
+		},
+	});
+
+	// ------------------------------------------------ P6-D quant cache cmds
+
+	pi.registerCommand("q-cache-validate", {
+		description: "Validate a quant cache contract manifest: /q-cache-validate <manifest-path> (contract type, schema version, immutable/mutable, content hash, upstream keys, missing fields, warnings, cache eligibility, Q gate implications; never reads data files)",
+		handler: async (args, ctx) => {
+			const manifestPath = args.trim();
+			if (!manifestPath) {
+				output(ctx, ["/q-cache-validate: usage: /q-cache-validate <manifest-path> (project-relative, e.g. artifacts/data-snapshot.json)"]);
+				return;
+			}
+			const trustError = trustedOrError(ctx);
+			if (trustError) {
+				output(ctx, [`/q-cache-validate: ${trustError}`]);
+				return;
+			}
+			const projectRoot = await projectRootFor(ctx);
+			const report = await validateQuantManifestCommand(projectRoot, manifestPath);
+			output(ctx, renderQuantCacheValidate(report));
+		},
+	});
+
+	pi.registerCommand("q-cache-lineage", {
+		description: "Trace quant cache lineage: /q-cache-lineage <run-id|action-key> (data snapshot -> feature set -> backtest result, upstream relationships, action keys, artifact hashes, reused runs, invalidation reason; never reads data files)",
+		handler: async (args, ctx) => {
+			const target = args.trim();
+			if (!target) {
+				output(ctx, ["/q-cache-lineage: usage: /q-cache-lineage <run-id|action-key>"]);
+				return;
+			}
+			const trustError = trustedOrError(ctx);
+			if (trustError) {
+				output(ctx, [`/q-cache-lineage: ${trustError}`]);
+				return;
+			}
+			const projectRoot = await projectRootFor(ctx);
+			const report = await buildQuantLineage(projectRoot, target);
+			output(ctx, renderQuantLineage(report));
+		},
+	});
+
 	// --------------------------------------------------------- custom tools
 
 	pi.registerTool({
-		name: "workbench_project_inspect",
-		label: "Workbench project inspect",
-		description:
-			"Inspect the current project's workbench setup: project root, git state, detected language/package manager, workbench profile, declared recipes, and configuration errors. Never outputs secrets.",
-		promptSnippet: "Inspect workbench project configuration (root, git, stack, profile, recipes, config errors)",
-		promptGuidelines: [
-			"Use workbench_project_inspect before running or designing recipes to learn the project profile and available recipe names.",
-		],
-		parameters: Type.Object({}),
+		...WORKBENCH_TOOL_METADATA.workbench_project_inspect,
+		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_project_inspect,
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			const trustError = trustedOrError(ctx);
 			if (trustError) {
@@ -972,23 +1495,8 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
-		name: "workbench_run_recipe",
-		label: "Workbench run recipe",
-		description:
-			"Run a declared recipe from .pi/workbench/recipes.yaml by name with schema-approved parameters. Only declared recipes run — arbitrary commands are never accepted. Full output is written to the run directory; a truncated summary is returned. Use workbench_project_inspect to list recipes.",
-		promptSnippet: "Run a declared workbench recipe by name (controlled execution)",
-		promptGuidelines: [
-			"Use workbench_run_recipe instead of bash for project commands that are declared as recipes — the model must not improvise shell commands in VERIFY mode.",
-			"Only pass parameters declared in the recipe's params schema.",
-		],
-		parameters: Type.Object({
-			recipe: Type.String({ description: "Name of a declared recipe in .pi/workbench/recipes.yaml" }),
-			params: Type.Optional(
-				Type.Record(Type.String(), Type.Union([Type.String(), Type.Number(), Type.Boolean()]), {
-					description: "Recipe parameters declared in the recipe schema (substituted into argv placeholders)",
-				}),
-			),
-		}),
+		...WORKBENCH_TOOL_METADATA.workbench_run_recipe,
+		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_run_recipe,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const trustError = trustedOrError(ctx);
 			if (trustError) {
@@ -1007,6 +1515,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 					mode,
 					exec: execFn,
 					signal,
+					cacheMode: params.cache ?? "default",
 				});
 				if (!result.ok && result.error) {
 					return { content: [{ type: "text", text: `workbench_run_recipe: ${result.error}` }], details: { ok: false, error: result.error } };
@@ -1016,6 +1525,9 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 					return { content: [{ type: "text", text: "workbench_run_recipe: no summary produced" }], details: { ok: false } };
 				}
 				const status = summary.timed_out ? "TIMED OUT" : summary.cancelled ? "CANCELLED" : result.ok ? "OK" : "FAILED";
+				const cacheText = result.cache
+					? `cache     : ${result.cache.status.toUpperCase()}${result.cache.actionKey ? ` (key ${result.cache.actionKey.slice(0, 16)}…)` : ""}${result.cache.reusedFromRunId ? `, reused run ${result.cache.reusedFromRunId}` : ""}${result.cache.reason ? ` — ${result.cache.reason}` : ""}`
+					: "";
 				const text = [
 					`run_id    : ${summary.run_id}`,
 					`recipe    : ${summary.recipe}`,
@@ -1025,6 +1537,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 					`artifacts : ${summary.artifact_paths.length > 0 ? summary.artifact_paths.join(", ") : "(none)"}`,
 					`stdout log: ${displayRelative(projectRoot, summary.stdout_log)} (${summary.stdout_truncated ? "truncated below" : "complete below"})`,
 					`stderr log: ${displayRelative(projectRoot, summary.stderr_log)} (${summary.stderr_truncated ? "truncated below" : "complete below"})`,
+					cacheText,
 					"",
 					"--- stdout ---",
 					summary.stdout || "(empty)",
@@ -1044,6 +1557,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 					stdout_log: displayRelative(projectRoot, summary.stdout_log),
 					stderr_log: displayRelative(projectRoot, summary.stderr_log),
 					expected_exit_codes: result.record?.expected_exit_codes ?? [0],
+					cache: result.cache,
 					phase: "finished",
 				};
 				onUpdate?.({
@@ -1060,24 +1574,8 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
-		name: "workbench_read_run",
-		label: "Workbench read run",
-		description:
-			"Read a workbench run record by run_id: manifest metadata, summary, and bounded log snippets. Full logs are never sent inline; use the returned log paths with read/grep when more detail is needed.",
-		promptSnippet: "Read a workbench run record (manifest, summary, bounded logs) by run_id",
-		promptGuidelines: [
-			"Use workbench_read_run to inspect previous recipe runs; default output is deliberately bounded.",
-		],
-		parameters: Type.Object({
-			run_id: Type.String({ description: "Run id, e.g. 20260101-120000-abcd" }),
-			include: Type.Optional(
-				Type.Union([Type.Literal("summary"), Type.Literal("manifest"), Type.Literal("logs"), Type.Literal("all")], {
-					description: "What to include (default: all, with bounded log tails)",
-				}),
-			),
-			max_lines: Type.Optional(Type.Integer({ description: "Log snippet line cap (default 200)", minimum: 1, maximum: 2000 })),
-			max_bytes: Type.Optional(Type.Integer({ description: "Log snippet byte cap (default 20KB)", minimum: 1, maximum: 512000 })),
-		}),
+		...WORKBENCH_TOOL_METADATA.workbench_read_run,
+		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_read_run,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const trustError = trustedOrError(ctx);
 			if (trustError) {
@@ -1149,23 +1647,8 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
-		name: "workbench_run_gate",
-		label: "Workbench run gate",
-		description:
-			"Run a gate selector (gate id, comma-separated ids, or base|quant|all) from the validation ladder. Only declared recipes run; the gate engine never trusts model prose — manual evidence supplied here is recorded with type \"manual\" and can never masquerade as machine verification.",
-		promptSnippet: "Run validation gates (base/quant ladder) for the project",
-		promptGuidelines: [
-			"Use workbench_list_gates or /q-gates to see the gates available for the current profile.",
-			"Manual evidence for manual checks must be passed as manual_evidence keyed by check id; it is recorded as type \"manual\" only.",
-		],
-		parameters: Type.Object({
-			gates: Type.String({ description: "Gate selector: a gate id (e.g. \"b0\"), comma-separated ids, or base|quant|all" }),
-			manual_evidence: Type.Optional(
-				Type.Record(Type.String(), Type.String(), {
-					description: "Manual evidence notes keyed by check id — recorded as manual evidence, never as machine verification",
-				}),
-			),
-		}),
+		...WORKBENCH_TOOL_METADATA.workbench_run_gate,
+		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_run_gate,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const trustError = trustedOrError(ctx);
 			if (trustError) {
@@ -1219,19 +1702,8 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
-		name: "workbench_read_gate",
-		label: "Workbench read gate",
-		description:
-			"Read a gate run record by run_id (gates.json summary) or a gate definition by gate_id (with its latest persisted status). Provide exactly one of run_id / gate_id.",
-		promptSnippet: "Read a gate run record or gate definition",
-		promptGuidelines: [
-			"Use workbench_read_gate with run_id to inspect the per-gate statuses of a gate run.",
-			"Use workbench_read_gate with gate_id to see the gate definition and its latest status.",
-		],
-		parameters: Type.Object({
-			run_id: Type.Optional(Type.String({ description: "Run id of a gate run (e.g. 20260101-120000-abcd)" })),
-			gate_id: Type.Optional(Type.String({ description: "Gate id (e.g. b0, q3)" })),
-		}),
+		...WORKBENCH_TOOL_METADATA.workbench_read_gate,
+		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_read_gate,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const trustError = trustedOrError(ctx);
 			if (trustError) {
@@ -1282,14 +1754,8 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
-		name: "workbench_list_gates",
-		label: "Workbench list gates",
-		description: "List the validation gates available for the current project/profile with their latest persisted status.",
-		promptSnippet: "List available validation gates and their latest status",
-		promptGuidelines: [
-			"Use workbench_list_gates before running gates to see which gates the current profile loads (base b0-b5 always; quant q0-q5 only for quant-research profiles).",
-		],
-		parameters: Type.Object({}),
+		...WORKBENCH_TOOL_METADATA.workbench_list_gates,
+		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_list_gates,
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			const trustError = trustedOrError(ctx);
 			if (trustError) {
@@ -1311,19 +1777,8 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	});
 
 	pi.registerTool({
-		name: "workbench_compare_runs",
-		label: "Workbench compare runs",
-		description:
-			"Compare two workbench run records by run_id: exit code, duration, artifact changes, gate delta, and (when both runs carry a valid quant-result artifact) benchmark/return/drawdown/turnover/cost/fold deltas and parameter changes. All facts come from the runs' own JSON records; deltas are descriptive — a higher return is never automatically interpreted as a better strategy.",
-		promptSnippet: "Compare two workbench run records (exit code, duration, artifacts, gates, quant metrics)",
-		promptGuidelines: [
-			"Use workbench_compare_runs to diff two persisted run records; use /q-runs or workbench_read_run to discover run ids first.",
-			"Deltas are descriptive facts — do not treat a higher return as automatically better without risk-adjusted and out-of-sample evidence.",
-		],
-		parameters: Type.Object({
-			a: Type.String({ description: "First run id, e.g. 20260101-120000-abcd" }),
-			b: Type.String({ description: "Second run id, e.g. 20260102-120000-efgh" }),
-		}),
+		...WORKBENCH_TOOL_METADATA.workbench_compare_runs,
+		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_compare_runs,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const trustError = trustedOrError(ctx);
 			if (trustError) {

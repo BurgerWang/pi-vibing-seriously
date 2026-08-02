@@ -32,6 +32,7 @@ import {
 	bashProtectedReadReason,
 	pathPolicyBlockReason,
 } from "./path-policy.ts";
+import { WORKBENCH_TOOL_NAMES } from "./tool-catalog.ts";
 
 export type WorkbenchMode = "AUDIT" | "DEV" | "VERIFY";
 
@@ -39,16 +40,12 @@ export const DEFAULT_MODE: WorkbenchMode = "DEV";
 
 export const MODE_NAMES: readonly WorkbenchMode[] = ["AUDIT", "DEV", "VERIFY"];
 
-/** Workbench custom tools registered by the extension. */
-export const WORKBENCH_TOOLS: readonly string[] = [
-	"workbench_project_inspect",
-	"workbench_run_recipe",
-	"workbench_read_run",
-	"workbench_run_gate",
-	"workbench_read_gate",
-	"workbench_list_gates",
-	"workbench_compare_runs",
-] as const;
+/**
+ * Workbench custom tools registered by the extension. The order is the
+ * explicit registration order from core/tool-catalog.ts (P6-B) — never a
+ * filesystem/YAML/glob order.
+ */
+export const WORKBENCH_TOOLS: readonly string[] = WORKBENCH_TOOL_NAMES;
 
 export const AUDIT_TOOLS: readonly string[] = [
 	"read",
@@ -135,15 +132,22 @@ export function isToolHardDenied(mode: WorkbenchMode, toolName: string): boolean
 
 /**
  * Active-tool set to configure for a mode, based on the currently active set.
- * DEV preserves non-managed custom tools; AUDIT and VERIFY are strict.
+ * DEV preserves non-managed custom tools (P5) in DETERMINISTIC order — they
+ * are sorted by name so the active set never depends on the order another
+ * extension or Pi reports them in (P6-B stable prefix). AUDIT and VERIFY
+ * are strict.
  */
 export function computeActiveTools(mode: WorkbenchMode, currentlyActive: readonly string[]): string[] {
 	const active = new Set<string>();
 	for (const tool of MODE_TOOLS[mode]) active.add(tool);
 	if (mode === "DEV") {
+		const foreign: string[] = [];
 		for (const tool of currentlyActive) {
-			if (!MANAGED_TOOLS.has(tool)) active.add(tool);
+			if (!MANAGED_TOOLS.has(tool)) foreign.push(tool);
 		}
+		// Stable order: sorted by name, deduplicated.
+		foreign.sort();
+		for (const tool of foreign) active.add(tool);
 	}
 	return [...active];
 }

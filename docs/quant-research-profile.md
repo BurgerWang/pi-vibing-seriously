@@ -86,6 +86,26 @@ manual-evidence checks with explicit prompts.
   automatically interpreted as a better strategy** (the report always
   carries the neutrality statement)
 - `/q-report latest|<run-id>` — manifest, gates, declared quant facts
+- `/q-cache-validate <manifest-path>` — validate a quant cache contract
+  manifest (data-snapshot / feature-set / backtest-result): schema
+  version, immutable/mutable status, content hash, upstream keys, missing
+  fields, warnings, cache eligibility, Q gate implications
+- `/q-cache-lineage <run-id|action-key>` — trace the quant cache lineage
+  (data snapshot → feature set → backtest result, artifact hashes, reused
+  runs, invalidation reason)
+
+## Quant cache contracts (P6-D)
+
+Three versioned manifest contracts make research caching safe
+(`docs/cache/quant-cache.md`): `DATA_SNAPSHOT`, `FEATURE_SET` and
+`BACKTEST_RESULT`. The workbench only defines, validates and connects the
+contracts — it never downloads data, computes features or runs a backtest
+engine. `latest`/`current`/`now`/`today` can never be a final manifest id;
+logical references resolve to an immutable revision or the cache is
+refused. Cache hits never bypass Q0–Q5: gates re-validate every run, and
+the three contracts are available as gate schema checks
+(`schema: data-snapshot|feature-set|backtest-result`) that only PASS for
+fully `validated` manifests.
 
 ## Skills for quant work
 

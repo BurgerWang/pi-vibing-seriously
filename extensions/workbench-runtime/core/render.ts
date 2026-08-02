@@ -31,6 +31,13 @@ export interface RecipeToolDetails {
 	stdout_log: string;
 	stderr_log: string;
 	expected_exit_codes: number[];
+	/** P6-C cache facts (hit/miss/refused/...). */
+	cache?: {
+		status: string;
+		actionKey?: string;
+		reusedFromRunId?: string;
+		reason?: string;
+	};
 	phase?: string;
 }
 

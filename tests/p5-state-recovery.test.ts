@@ -65,6 +65,7 @@ function makeStub(): StubAPI & ExtensionAPI {
 		},
 		getActiveTools: () => stub.activeTools,
 		getAllTools: () => [...stub.tools.values()] as never[],
+		getThinkingLevel: () => "high" as never,
 	} as unknown as StubAPI & ExtensionAPI;
 	return stub;
 }
@@ -77,7 +78,11 @@ function fakeCtx(entries: StubAPI["entries"], overrides: Partial<ExtensionContex
 		isProjectTrusted: () => false,
 		sessionManager: {
 			getEntries: () => entries.map((e) => ({ type: e.type, customType: e.customType, data: e.data })),
+			getSessionFile: () => "/tmp/workbench-project/session.jsonl",
+			getSessionId: () => "stub-session-id",
 		} as unknown as ExtensionContext["sessionManager"],
+		model: undefined,
+		thinkingLevel: undefined,
 		ui: {
 			setStatus: () => {},
 			setWidget: () => {},

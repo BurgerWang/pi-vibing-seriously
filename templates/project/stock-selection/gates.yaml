@@ -21,6 +21,20 @@
 # manual-evidence checks: they only PASS with explicit manual evidence
 # (recorded as type "manual" in evidence.json — never from model prose).
 #
+# P6-D quant cache contracts (optional; the workbench defines, validates and
+# connects them — it never downloads data, computes features or runs a
+# backtest engine). Convention: the quant recipes write manifest JSON files
+# under artifacts/, and gates can validate them with kind: schema:
+#   artifacts/data-snapshot.json     — schema: data-snapshot  (Q1)
+#   artifacts/feature-set.json       — schema: feature-set    (Q1/Q2)
+#   artifacts/backtest-result.json   — schema: backtest-result (Q2-Q5)
+# A schema check only PASSES when the manifest is fully validated
+# (structure + semantics + immutable). Manifests that merely parse (missing
+# adjustment/corporate-action/delisting semantics, mutable ids, unresolved
+# logical references, walk-forward without folds, best-trial-only) FAIL.
+# Cache hits never bypass Q0-Q5: every gate re-validates every run, cached
+# or not.
+#
 # Override built-in gates by id or add new gates here, e.g.:
 #   gates:
 #     - id: q4

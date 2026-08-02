@@ -136,6 +136,63 @@ step, do-not-retry — via `pi.sendMessage(..., { deliverAs: "nextTurn" })`
 and a durable custom entry. No run logs are ever written into the session
 context.
 
+## Cache layer (P6)
+
+### Privacy properties
+
+- Telemetry records are **hash-only**: a deep forbidden-key scan
+  (`prompt`, `content`, `text`, `messages`, `toolInput`, `toolResult`,
+  `apiKey`, `auth`, `secret`, `token`, `sessionId`, `cwd`, `env`, `files`,
+  …) refuses any record before disk; `systemPromptHash` is a hash, never
+  the prompt. Provider payloads are only structurally digested (roles,
+  lengths, per-segment SHA-256, tool names) — never copied, never mutated.
+- The benchmark CLI (`scripts/cache-benchmark.ts`) is observation-only: no
+  model calls, no HTTP, no `auth.json`, no `models.json`/`models-store.json`
+  access, no warmup/keepalive, no cache_control/prompt_cache_key/
+  prompt_cache_retention, no TTL configuration, no hardcoded provider
+  prices (`estimatedAvoidedCost` requires an explicit `--cost-map`). The
+  only write it ever performs is an optional new file in
+  `.pi/workbench/cache/reports/` via `--save` (atomic, sanitized, contained).
+- Action records store hashes of env values, never values; recipe output is
+  redacted and truncated before it reaches the model context.
+
+### Corruption and tampering
+
+- Corrupted action JSON or key/schema mismatches → quarantined copy in
+  `tmp/` + treated as a miss (a wrong cached answer is impossible by
+  construction).
+- `cache-index.json` is rebuildable from `actions/`; the benchmark doctor
+  detects entry/record mismatches (index drift is never trusted blindly).
+- CAS (v1: disabled) would re-verify SHA-256 and quarantine mismatches.
+- Telemetry read skips and counts bad lines; a record with forbidden keys
+  is refused at write time.
+
+### Concurrency and locks
+
+- Per-key lockfiles carry `{key, token, ownerPid, createdAt}`; a lock whose
+  owner is alive is never broken; dead-owner locks older than 60 s are
+  broken; lock-wait timeouts proceed without the lock (cache writes become
+  best-effort — never a task blocker). The benchmark counts stale locks as
+  `fallbackCount` evidence.
+
+### Storage bounds and deletion safety
+
+- Telemetry rotates at 5 MB (max 5 archives, oldest dropped); the action
+  cache prunes by LRU against a budget (default 256 MB); report files are
+  written only on explicit `--save`/`/q-cache-report --save`.
+- `/q-cache-prune` and `/q-cache-clear` **never** delete run records,
+  evidence, telemetry or reports; `.pi/workbench/cache/` and `runs/` are
+  gitignored.
+
+### Caching vs gates
+
+- Recipe cache hits materialize a **new** run manifest
+  (`execution_source: "cache"`) and re-validate through the full gate
+  ladder; quant contracts re-validate at key time AND write time;
+  backtest-result hits re-verify `resultArtifactHash`; mutable
+  `latest`/`current` ids are never cache keys; failed folds are never
+  filtered.
+
 ## What is out of scope
 
 - HFT, L2/LOB order books, market making, queue position, matching engines,

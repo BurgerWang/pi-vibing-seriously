@@ -56,7 +56,8 @@ export async function inspectProject(projectRoot: string, options: { trusted: bo
 
 	let topLevel: string[];
 	try {
-		topLevel = (await readdir(projectRoot, { withFileTypes: true })).map((e) => e.name);
+		// P6-B: readdir order is filesystem-dependent — sort for determinism.
+		topLevel = (await readdir(projectRoot, { withFileTypes: true })).map((e) => e.name).sort();
 	} catch {
 		topLevel = [];
 	}

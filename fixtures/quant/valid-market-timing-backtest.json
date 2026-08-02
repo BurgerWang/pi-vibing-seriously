@@ -1,0 +1,32 @@
+{
+	"schemaVersion": 1,
+	"contractType": "backtest-result",
+	"backtestId": "trend-regime-v7-wf-2026-08",
+	"strategyType": "market-timing",
+	"sourceCodeHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+	"strategyConfigHash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+	"dataSnapshotKey": "quant:data-snapshot:index-daily-2026-08-01:v2:2222222222222222",
+	"featureSetKey": "quant:feature-set:trend-regime-v7:r0:3333333333333333",
+	"universeSnapshotKey": "quant:data-snapshot:index-daily-2026-08-01:v2:2222222222222222",
+	"splitDefinitionHash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+	"walkForwardDefinitionHash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+	"seed": "2026-wf-seed",
+	"engineVersion": "example-backtest-engine-2.4.0",
+	"tradingCalendar": "index-calendar",
+	"feeModelHash": "1111111111111111111111111111111111111111111111111111111111111112",
+	"slippageModelHash": "1111111111111111111111111111111111111111111111111111111111111113",
+	"benchmarkDefinitionHash": "1111111111111111111111111111111111111111111111111111111111111114",
+	"rebalanceSemanticsHash": "1111111111111111111111111111111111111111111111111111111111111115",
+	"positionConstraintHash": "1111111111111111111111111111111111111111111111111111111111111116",
+	"corporateActionPolicyHash": "1111111111111111111111111111111111111111111111111111111111111110",
+	"resultArtifactHash": "2222222222222222222222222222222222222222222222222222222222222221",
+	"metricsArtifact": "results/quant-result.json",
+	"parametersArtifact": "results/parameters.json",
+	"foldArtifacts": [
+		{ "id": "wf1", "status": "passed", "artifact": "results/folds/wf1.json" },
+		{ "id": "wf2", "status": "passed", "artifact": "results/folds/wf2.json" }
+	],
+	"failedFolds": [],
+	"trialLineage": { "digest": "4444444444444444444444444444444444444444444444444444444444444444" },
+	"warnings": []
+}

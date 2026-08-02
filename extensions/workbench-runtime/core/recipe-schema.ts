@@ -16,6 +16,8 @@
 import type { WorkbenchMode } from "./mode-policy.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
 
+import { DEFAULT_CACHE_POLICY, parseCachePolicy, type RecipeCachePolicy } from "../cache/action-types.ts";
+
 export const RECIPE_SCHEMA_VERSION = 1;
 
 export type OutputStrategy = "head" | "tail";
@@ -44,6 +46,12 @@ export interface Recipe {
 	artifacts: string[];
 	/** Env var names the process may inherit. Nothing else is passed. */
 	environment: string[];
+	/**
+	 * P6-C action-cache policy (opt-in, default disabled). A cache
+	 * declaration that violates the safety rules disables caching for this
+	 * recipe and records a warning — the recipe itself still runs.
+	 */
+	cache: RecipeCachePolicy;
 	output_strategy: OutputStrategy;
 	max_lines: number;
 	max_bytes: number;
@@ -54,6 +62,8 @@ export interface Recipe {
 export interface RecipeParseResult {
 	recipes: Recipe[];
 	errors: string[];
+	/** Non-fatal issues (e.g. a disabled cache block) — never drop a recipe. */
+	warnings: string[];
 }
 
 export const DEFAULT_TIMEOUT_MS = 120_000;
@@ -71,6 +81,7 @@ export const DEFAULT_RECIPE: Omit<Recipe, "name" | "command"> = {
 	max_lines: DEFAULT_MAX_LINES,
 	max_bytes: DEFAULT_MAX_BYTES,
 	params: [],
+	cache: DEFAULT_CACHE_POLICY,
 };
 
 const MODE_VALUES: readonly string[] = ["AUDIT", "DEV", "VERIFY"];
@@ -111,8 +122,9 @@ function asPositiveInt(value: unknown, label: string, fallback: number, errors: 
 /** Parse one raw recipe mapping into a validated Recipe (or errors). */
 export function parseRecipe(raw: unknown, index: number): RecipeParseResult {
 	const errors: string[] = [];
+	const warnings: string[] = [];
 	if (!isRecord(raw)) {
-		return { recipes: [], errors: [`recipe #${index + 1} must be a mapping`] };
+		return { recipes: [], errors: [`recipe #${index + 1} must be a mapping`], warnings };
 	}
 	for (const key of Object.keys(raw)) {
 		if (!(key in DEFAULT_RECIPE) && key !== "name" && key !== "command") {
@@ -142,7 +154,7 @@ export function parseRecipe(raw: unknown, index: number): RecipeParseResult {
 	} else {
 		commandArgv = command;
 	}
-	if (errors.length > 0) return { recipes: [], errors };
+	if (errors.length > 0) return { recipes: [], errors, warnings };
 	const recipe = recipeName as string;
 	const commandFinal = commandArgv as string[];
 
@@ -234,7 +246,15 @@ export function parseRecipe(raw: unknown, index: number): RecipeParseResult {
 	const writes = asStringArray(raw.writes, `recipe "${recipe}": "writes"`, errors);
 	const artifacts = asStringArray(raw.artifacts, `recipe "${recipe}": "artifacts"`, errors);
 
-	if (errors.length > 0) return { recipes: [], errors };
+	if (errors.length > 0) return { recipes: [], errors, warnings };
+
+	// P6-C: cache policy (opt-in; violations disable caching, never the recipe).
+	const cacheRaw = raw.cache;
+	if (cacheRaw !== undefined && !isRecord(cacheRaw)) {
+		warnings.push(`recipe "${recipe}": "cache" must be a mapping — cache disabled`);
+	}
+	const cacheResult = parseCachePolicy(cacheRaw, commandFinal, writes);
+	warnings.push(...cacheResult.issues.map((message) => `recipe "${recipe}": ${message}`));
 
 	return {
 		recipes: [
@@ -253,9 +273,11 @@ export function parseRecipe(raw: unknown, index: number): RecipeParseResult {
 				max_lines: maxLines,
 				max_bytes: maxBytes,
 				params,
+				cache: cacheResult.policy,
 			},
 		],
 		errors,
+		warnings,
 	};
 }
 
@@ -265,22 +287,24 @@ export function parseRecipe(raw: unknown, index: number): RecipeParseResult {
  * errors. Duplicate names are rejected.
  */
 export function parseRecipesDocument(doc: unknown): RecipeParseResult {
-	if (doc === null || doc === undefined) return { recipes: [], errors: [] };
+	if (doc === null || doc === undefined) return { recipes: [], errors: [], warnings: [] };
 	let list: unknown[];
 	if (Array.isArray(doc)) {
 		list = doc;
 	} else if (isRecord(doc) && Array.isArray(doc.recipes)) {
 		list = doc.recipes;
 	} else {
-		return { recipes: [], errors: ["recipes.yaml root must be a list or a mapping with a \"recipes\" key"] };
+		return { recipes: [], errors: ["recipes.yaml root must be a list or a mapping with a \"recipes\" key"], warnings: [] };
 	}
 
 	const recipes: Recipe[] = [];
 	const errors: string[] = [];
+	const warnings: string[] = [];
 	const seen = new Set<string>();
 	list.forEach((raw, index) => {
 		const result = parseRecipe(raw, index);
 		errors.push(...result.errors);
+		warnings.push(...result.warnings);
 		for (const recipe of result.recipes) {
 			if (seen.has(recipe.name)) {
 				errors.push(`duplicate recipe name "${recipe.name}"`);
@@ -290,7 +314,10 @@ export function parseRecipesDocument(doc: unknown): RecipeParseResult {
 			recipes.push(recipe);
 		}
 	});
-	return { recipes, errors };
+	// P6-B: deterministic recipe order — sorted by name, never YAML list/key
+	// order. Recipes are resolved by name at run time, so this only makes the
+	// discovery surface (inspect/status) stable across installs.
+	return { recipes: recipes.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)), errors, warnings };
 }
 
 // ---------------------------------------------------------------------------

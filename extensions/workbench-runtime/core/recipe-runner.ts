@@ -13,6 +13,18 @@
  *   - An exit code outside `expected_exit_codes` is a failure.
  *   - Full output lands in the run directory; only truncated summaries go
  *     back to the model. Secrets are redacted from all artifacts.
+ *
+ * P6-C action cache (opt-in per recipe, disabled by default):
+ *   - a cache HIT materializes a NEW full run record
+ *     (execution_source: "cache", action_key, reused_from_run_id,
+ *     cache_created_at, cache_validated_at, artifact_validation,
+ *     evidence_paths) without executing anything
+ *   - a MISS executes normally; successful results may be written under the
+ *     per-key lock (concurrent same-key runs execute once or wait safely)
+ *   - `--no-cache` neither reads nor writes; `--refresh-cache` never reads
+ *     but executes and (re)writes on success
+ *   - ANY cache machinery failure degrades to normal execution — the cache
+ *     never blocks the task and never bypasses gates
  */
 
 import { mkdir, writeFile } from "node:fs/promises";
@@ -28,6 +40,21 @@ import { realpathContained, lexicalContain } from "./path-guard.ts";
 import { buildArgv, RecipeParamError, type Recipe } from "./recipe-schema.ts";
 import { collectSecretValues, redactArgvEntry, redactEnvValue, redactText } from "./redact.ts";
 import { makeRunId, RUN_SCHEMA_VERSION, type RunRecord, type RunSummaryRecord } from "./runs.ts";
+import { EXTENSION_VERSION } from "../cache/cache-types.ts";
+import { ActionCacheStore, type LockHandle } from "../cache/action-store.ts";
+import { ARTIFACT_RESTORE_ENABLED } from "../cache/action-types.ts";
+import { resolveQuantContract } from "../cache/quant-files.ts";
+import {
+	buildActionRecord,
+	computeKey,
+	lookupValidated,
+	materializeCachedRun,
+	planCache,
+	shouldCacheRun,
+	type ActionCacheContext,
+	type CacheRequestMode,
+} from "../cache/action-cache.ts";
+import type { ActionKey, ActionRecord } from "../cache/action-types.ts";
 
 export interface RunRecipeInput {
 	projectRoot: string;
@@ -37,6 +64,8 @@ export interface RunRecipeInput {
 	exec: ExecFn;
 	signal?: AbortSignal;
 	now?: () => Date;
+	/** P6-C: cache request mode (default = read/write per recipe policy). */
+	cacheMode?: CacheRequestMode;
 }
 
 export interface RunRecipeResult {
@@ -45,6 +74,23 @@ export interface RunRecipeResult {
 	record?: RunRecord;
 	summary?: RunSummaryRecord;
 	runDir?: string;
+	/** P6-C cache facts for the caller (/q-run, tool details). */
+	cache?: {
+		status:
+			| "hit"
+			| "miss"
+			| "disabled"
+			| "refused"
+			| "no-cache"
+			| "refresh-executed"
+			| "write-failed"
+			| "artifacts-disabled"
+			| "corrupt"
+			| "expired";
+		actionKey?: string;
+		reusedFromRunId?: string;
+		reason?: string;
+	};
 }
 
 export class RecipeSetupError extends Error {
@@ -157,6 +203,7 @@ async function snapshotJsonArtifacts(projectRoot: string, runDir: string, artifa
 export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult> {
 	const { projectRoot, recipeName, mode, exec } = input;
 	const params = input.params ?? {};
+	const cacheMode: CacheRequestMode = input.cacheMode ?? "default";
 	const now = input.now ?? (() => new Date());
 	const startedAt = now();
 
@@ -182,6 +229,94 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 
 	await validateRecipePaths(projectRoot, recipe);
 
+	// ------------------------------------------------------------ P6-C cache
+	const store = new ActionCacheStore(projectRoot, { maxBytes: config.actionCacheMaxBytes, now });
+	const cacheCtx: ActionCacheContext = {
+		projectRoot,
+		recipe,
+		policy: recipe.cache,
+		argv,
+		mode,
+		profile: config.profile,
+		projectGates: config.gates,
+		packageVersion: EXTENSION_VERSION,
+		exec,
+		store,
+		cacheMode,
+		now,
+	};
+	const plan = planCache(cacheCtx);
+	let computed = plan.active ? await computeKey(cacheCtx) : null;
+	if (computed && !computed.ok) {
+		// Cache refused (fingerprint/toolchain/limits) — fall back to normal
+		// execution. The refusal reason is surfaced, never blocking.
+	}
+
+	// Lookup + validate + materialize a hit; null when not a hit. (const arrow
+	// so TS narrowing of `recipe` carries into the closure.)
+	const tryHit = async (key: ActionKey): Promise<{ materialized: Awaited<ReturnType<typeof materializeCachedRun>>; record: ActionRecord } | null> => {
+		const outcome = await lookupValidated(cacheCtx, key);
+		if (outcome.status !== "hit" || !outcome.record) return null;
+		const git = await gitState(projectRoot, exec);
+		const materialized = await materializeCachedRun({
+			projectRoot,
+			recipe,
+			policy: recipe.cache,
+			profile: config.profile,
+			key,
+			record: outcome.record,
+			mode,
+			git,
+			now,
+		});
+		return { materialized, record: outcome.record };
+	};
+
+	// Fast path: lookup without the lock.
+	if (plan.active && computed?.ok && cacheMode !== "refresh-cache") {
+		const hit = await tryHit(computed.key);
+		if (hit) {
+			return {
+				ok: hit.record.success,
+				record: hit.materialized.record,
+				summary: hit.materialized.summary,
+				runDir: hit.materialized.runDir,
+				cache: {
+					status: "hit",
+					actionKey: computed.key.key,
+					reusedFromRunId: hit.record.sourceRunId,
+					reason: "validated against the current action key (definition, inputs, env, toolchain, OS/arch, lockfiles, config, profile, gate schema)",
+				},
+			};
+		}
+	}
+
+	// Locked path: execute once per key or wait safely, then write.
+	let lock: LockHandle | null = null;
+	if (plan.active && computed?.ok) {
+		lock = await store.acquireLock(computed.key.key);
+		if (lock && cacheMode !== "refresh-cache") {
+			// Re-check under the lock: a concurrent run may have finished.
+			const hit = await tryHit(computed.key);
+			if (hit) {
+				await lock.release().catch(() => {});
+				return {
+					ok: hit.record.success,
+					record: hit.materialized.record,
+					summary: hit.materialized.summary,
+					runDir: hit.materialized.runDir,
+					cache: {
+						status: "hit",
+						actionKey: computed.key.key,
+						reusedFromRunId: hit.record.sourceRunId,
+						reason: "reused result written by a concurrent run (double-checked lock)",
+					},
+				};
+			}
+		}
+	}
+
+	// ------------------------------------------------------------------ exec
 	const runId = makeRunId(startedAt);
 	const runDir = join(runsDir(projectRoot), runId);
 	const env = buildEnvironment(recipe);
@@ -204,6 +339,7 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 	} catch (error) {
 		// Spawn failure: persist what we know so the run is not lost, then
 		// surface the error to the caller.
+		if (lock) await lock.release().catch(() => {});
 		const failedAt = now();
 		const redactedArgv = redactText(argv.join("\u0000"), secrets).split("\u0000").map(redactArgvEntry);
 		const record: RunRecord = {
@@ -279,6 +415,7 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		expected_exit_codes: recipe.expected_exit_codes,
 		declared_writes: recipe.writes,
 		environment_names: recipe.environment,
+		execution_source: "exec",
 	};
 
 	const summary: RunSummaryRecord = {
@@ -333,7 +470,69 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 	await writeFile(join(runDir, "stderr.log"), stderrFull, "utf8");
 	await writeFile(join(runDir, "summary.json"), JSON.stringify(summary, null, 2), "utf8");
 
-	return { ok: exitOk, record, summary, runDir };
+	// ---------------------------------------------------------- cache write
+	let cacheStatus: RunRecipeResult["cache"] = {
+		status: cacheMode === "no-cache" ? "no-cache" : !recipe.cache.enabled ? "disabled" : "miss",
+		actionKey: computed?.ok ? computed.key.key : undefined,
+	};
+	if (computed && !computed.ok) {
+		cacheStatus = { status: "refused", reason: computed.reason };
+	} else if (computed?.ok) {
+		const envNames = [...new Set([...recipe.environment, ...recipe.cache.environment])];
+		const envForRecord: Record<string, string> = {};
+		for (const name of envNames) {
+			const value = process.env[name];
+			if (value !== undefined) envForRecord[name] = value;
+		}
+		const facts = {
+			runId,
+			startedAt,
+			finishedAt,
+			durationMs: record.duration_ms,
+			exitCode: record.exit_code,
+			killed: result.killed,
+			timedOut,
+			cancelled,
+			exitOk,
+			stdoutView: stdoutView.content,
+			stderrView: stderrView.content,
+			stdoutTruncated: stdoutView.truncated,
+			stderrTruncated: stderrView.truncated,
+			artifactPaths,
+			env: envForRecord,
+			gitCommit: git.commit,
+			gitDirty: git.dirty,
+		};
+		if (shouldCacheRun(recipe.cache, facts)) {
+			// P6-D: the quant contract is re-validated AT WRITE TIME — a schema
+			// that became invalid (or a logical reference that can no longer
+			// resolve) between key computation and write REFUSES the cache.
+			let quantWriteBlocked: string | null = null;
+			if (recipe.cache.domain === "quant" && recipe.cache.quantContract) {
+				const recheck = await resolveQuantContract(projectRoot, recipe.cache.quantContract, { profile: config.profile });
+				if (!recheck.ok) quantWriteBlocked = recheck.reason;
+			}
+			if (quantWriteBlocked) {
+				cacheStatus = { status: "refused", actionKey: computed.key.key, reason: `quant contract invalid at write time: ${quantWriteBlocked}` };
+			} else {
+				const actionRecord = buildActionRecord(cacheCtx, computed.key, facts, computed.inputEntries, computed.quantContractInfo ?? null);
+				const written = await store.writeRecord(actionRecord);
+				if (!written.ok) {
+					cacheStatus = { status: "write-failed", actionKey: computed.key.key, reason: written.error };
+				} else if (recipe.cache.mode === "artifacts" && !ARTIFACT_RESTORE_ENABLED) {
+					// v1: artifacts restore is disabled — the run always executes and
+					// only result metadata is stored.
+					cacheStatus = { status: "artifacts-disabled", actionKey: computed.key.key, reason: "artifacts restore disabled — result metadata stored only" };
+				} else {
+					cacheStatus = { status: cacheMode === "refresh-cache" ? "refresh-executed" : "miss", actionKey: computed.key.key };
+				}
+			}
+		}
+	}
+
+	if (lock) await lock.release().catch(() => {});
+
+	return { ok: exitOk, record, summary, runDir, cache: cacheStatus };
 }
 
 /** Project-relative form of a path for display (keeps messages portable). */
