@@ -1,0 +1,69 @@
+# Workbench gates for the pi-dev-workbench repository itself.
+#
+# The built-in ladder loads automatically. This project (the workbench's own
+# repo) declares exactly three recipes — typecheck, unit-test, check — and
+# has no formatter/linter/static-analyzer configured, so the built-in
+# checks that look for other recipe names (check:format/check:lint,
+# test:unit, test:integration) are overridden by id to the recipes this
+# repo actually declares. The `check` recipe (typecheck + unit tests + git
+# diff --check) exercises the full surface; the unit-test suite includes
+# the spawn/integration-style tests (real exec, real cache store, real
+# telemetry files). Everything else stays built-in.
+#
+# Convention (see templates/project/*/gates.yaml): a project gate with a
+# built-in id replaces the built-in gate entirely.
+gates:
+  - id: b1
+    title: Static Quality
+    description: "Overridden for this repository: the only declared static-quality recipe is typecheck (npm run typecheck). No formatter/linter is configured in this repo."
+    checks:
+      - id: b1.1
+        title: Typecheck passes
+        kind: recipe
+        recipes: [typecheck]
+        required: true
+        blocking: true
+  - id: b2
+    title: Unit Correctness
+    description: "Overridden for this repository: the declared unit-test recipe is unit-test (npm test)."
+    checks:
+      - id: b2.1
+        title: Unit tests pass
+        kind: recipe
+        recipes: [unit-test]
+        required: true
+        blocking: true
+      - id: b2.2
+        title: Boundary conditions covered
+        kind: manual
+        prompt: "Evidence that boundary conditions (empty input, extremes, zero/negative values) are tested — e.g. test list or coverage report."
+        required: true
+        blocking: true
+      - id: b2.3
+        title: Error paths covered
+        kind: manual
+        prompt: "Evidence that error paths are tested — failures return non-zero exit codes and are handled gracefully."
+        required: true
+        blocking: true
+  - id: b3
+    title: Integration Correctness
+    description: "Overridden for this repository: no separate integration suite exists; the unit-test suite (unit-test recipe) contains the spawn/integration-style tests, and live smoke evidence covers the CLI/API and data paths."
+    checks:
+      - id: b3.1
+        title: Integration tests pass
+        kind: recipe
+        recipes: [unit-test]
+        required: true
+        blocking: true
+      - id: b3.2
+        title: CLI/API entry and config loading smoke
+        kind: manual
+        prompt: "Smoke-test evidence that the CLI/API entry point works and configuration loads correctly."
+        required: true
+        blocking: true
+      - id: b3.3
+        title: Data read/write path smoke
+        kind: manual
+        prompt: "Smoke-test evidence that the data read/write path works (for quant projects this is covered by the Q1 data:fetch recipe check)."
+        required: true
+        blocking: true

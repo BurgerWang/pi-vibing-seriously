@@ -1,0 +1,112 @@
+# pi-dev-workbench bootstrap recipes (P6-C deterministic action cache).
+#
+# Caching is OPT-IN per recipe and disabled by default. Only declared
+# recipes can be cached; only successful results are cached; the action key
+# is a content fingerprint of the DECLARED inputs (never git state, mtime
+# or file sizes). See docs/cache/action-cache.md and
+# docs/cache/recipe-cache-schema.md.
+#
+# Security rules enforced at parse time (violations disable caching for the
+# recipe with a recorded warning, never the recipe itself):
+#   - network / time / random / external-API recipes are not cacheable
+#   - recipes whose declared writes modify source code are not cacheable
+#   - `cache.outputs` (artifacts restore) is disabled in this version
+#   - secret env values are hashed into the key, never stored
+#
+# Cache location (project-local, gitignored):
+#   .pi/workbench/cache/{actions,cas,locks,tmp,cache-index.json}
+
+recipes:
+  - name: typecheck
+    description: TypeScript typecheck (tsc --noEmit) — cached (result-only)
+    command: [npm, run, typecheck]
+    cwd: .
+    timeout_ms: 300000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: []
+    artifacts: []
+    environment: []
+    output_strategy: tail
+    max_lines: 200
+    max_bytes: 20480
+    cache:
+      enabled: true
+      version: 1
+      mode: result-only
+      successOnly: true
+      inputs:
+        - package.json
+        - package-lock.json
+        - tsconfig.json
+        - extensions/**/*.ts
+        - tests/**/*.ts
+        - prompts/**/*.md
+        - skills/**/SKILL.md
+        - templates/**
+        - assets/**
+        - tools/**
+        - compatibility/**
+        - docs/**/*.md
+      outputs: []
+      environment: []
+      toolchain: [node, npm]
+      maxAgeSeconds: null
+
+  - name: unit-test
+    description: Unit test suite (tsx --test tests/*.test.ts) — cached (result-only)
+    command: [npm, test]
+    cwd: .
+    timeout_ms: 600000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: []
+    artifacts: []
+    environment: []
+    output_strategy: tail
+    max_lines: 300
+    max_bytes: 30720
+    cache:
+      enabled: true
+      version: 1
+      mode: result-only
+      successOnly: true
+      inputs:
+        - package.json
+        - package-lock.json
+        - tsconfig.json
+        - README.md
+        - CHANGELOG.md
+        - LICENSE
+        - .gitignore
+        - extensions/**/*.ts
+        - tests/**/*.ts
+        - prompts/**/*.md
+        - skills/**/SKILL.md
+        - templates/**
+        - assets/**
+        - tools/**
+        - compatibility/**
+        - docs/**/*.md
+      outputs: []
+      environment: []
+      toolchain: [node, npm]
+      maxAgeSeconds: null
+
+  # `check` runs typecheck + unit tests + `git diff --check` in one chain.
+  # Its outcome depends on git working-tree state, which is deliberately NOT
+  # part of any action key — so it stays UNCACHED in this version. Run the
+  # cached typecheck/unit-test recipes for the fast path.
+  - name: check
+    description: Full check (typecheck + unit tests + whitespace) — intentionally not cached
+    command: [npm, run, check]
+    cwd: .
+    timeout_ms: 900000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: []
+    artifacts: []
+    environment: []
+    output_strategy: tail
+    max_lines: 300
+    max_bytes: 30720

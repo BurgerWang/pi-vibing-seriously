@@ -59,6 +59,36 @@ export interface RunRecord {
 	expected_exit_codes: number[];
 	declared_writes: string[];
 	environment_names: string[];
+	/** P6-C: how this run was produced. Absent = executed normally. */
+	execution_source?: "exec" | "cache";
+	/** P6-C: action key when execution_source === "cache". */
+	action_key?: string;
+	/** P6-C: hash of the executed argv (values are never stored). */
+	argv_hash?: string;
+	/** P6-C: the run whose cached result was reused. */
+	reused_from_run_id?: string;
+	/** P6-C: when the cached result was produced / re-validated. */
+	cache_created_at?: string;
+	cache_validated_at?: string;
+	/** P6-C: artifact restore/verification facts of a cached run. */
+	artifact_validation?: {
+		mode: string;
+		artifacts_restored: boolean;
+		hash_verified: boolean;
+		status: string;
+	};
+	/** P6-D: quant contract facts of a cached quant-domain run. */
+	quant_contract?: {
+		type: string;
+		manifest: string;
+		immutable_key: string;
+		validation_status: string;
+		logical_reference: string | null;
+		resolved_reference: string | null;
+		warnings: string[];
+	};
+	/** P6-C: evidence locations recorded for this run. */
+	evidence_paths?: string[];
 }
 
 export async function readManifest(projectRoot: string, runId: string): Promise<RunRecord | null> {

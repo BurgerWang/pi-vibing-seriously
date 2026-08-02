@@ -1,15 +1,32 @@
 # pi-dev-workbench
 
 <p align="center">
-  <img src="assets/banner.svg" alt="pi-dev-workbench v0.6.1 — a Pi-native development workbench" width="586" />
+  <img src="assets/banner.svg" alt="pi-dev-workbench v0.8.0 — a Pi-native development workbench" width="586" />
 </p>
 
-A **Pi Package** (v0.6.1, P5) that adds a native development workbench to
+A **Pi Package** (v0.8.0, P6) that adds a native development workbench to
 [Pi](https://pi.dev): a mode policy (AUDIT / DEV / VERIFY), project
 configuration, a declarative Recipe Runner, a **Gate Engine with evidence
 artifacts and a quant research validation ladder**, Pi-native TUI status,
 run reports and run comparison, workbench skills, `q-*` prompt templates,
-and project templates. It runs entirely on Pi's native mechanisms —
+project templates, and **prompt-cache telemetry for the DeepSeek provider**
+(P6-A: hash-only usage/context observability, inferred invalidations, and
+`/q-cache-*` commands) with a **stable-prefix contract** (P6-B: static tool
+registration and per-mode tool matrices, deterministic resource discovery,
+`UNEXPECTED_DRIFT` same-mode drift detection) and a **Deterministic Recipe
+Action Cache** (P6-C: opt-in, project-local, result-only caching of
+declared recipes — content-addressed action keys, `/q-cache-explain`,
+`/q-cache-prune`, `/q-cache-clear`, `--no-cache`/`--refresh-cache`; never
+caches LLM answers or arbitrary bash) and a **Quant Research Cache
+Contract layer** (P6-D: versioned DATA_SNAPSHOT / FEATURE_SET /
+BACKTEST_RESULT manifest contracts, immutable-reference resolution,
+`domain: quant` recipe caching, `/q-cache-validate`, `/q-cache-lineage`;
+cache hits never bypass Q0–Q5) and an **offline Cache Benchmark** (P6-E:
+`scripts/cache-benchmark.ts`, `npm run cache:report` / `npm run
+cache:doctor` — telemetry + run-manifest + action-cache analysis with
+JSON/human output, never a model call, never a warmup request, no
+hardcoded provider prices). It runs entirely on Pi's native
+mechanisms —
 extensions, custom commands, custom tools, skills, prompt templates,
 session custom entries, `ctx.ui.setStatus`/`setWidget`, and custom tool
 renderers. **It is not an agent framework, a daemon, a second agent loop,
@@ -20,6 +37,24 @@ Documentation: [docs/architecture.md](docs/architecture.md) ·
 [docs/compatibility.md](docs/compatibility.md) ·
 [docs/project-onboarding.md](docs/project-onboarding.md) ·
 [docs/quant-research-profile.md](docs/quant-research-profile.md) ·
+[docs/cache/deepseek-prompt-cache.md](docs/cache/deepseek-prompt-cache.md) ·
+[docs/cache/cache-telemetry.md](docs/cache/cache-telemetry.md) ·
+[docs/cache/cache-privacy.md](docs/cache/cache-privacy.md) ·
+[docs/cache/stable-prefix-contract.md](docs/cache/stable-prefix-contract.md) ·
+[docs/cache/deepseek-cache-limitations.md](docs/cache/deepseek-cache-limitations.md) ·
+[docs/cache/cache-efficient-workflow.md](docs/cache/cache-efficient-workflow.md) ·
+[docs/cache/action-cache.md](docs/cache/action-cache.md) ·
+[docs/cache/recipe-cache-schema.md](docs/cache/recipe-cache-schema.md) ·
+[docs/cache/cache-maintenance.md](docs/cache/cache-maintenance.md) ·
+[docs/cache/cache-correctness.md](docs/cache/cache-correctness.md) ·
+[docs/cache/quant-cache.md](docs/cache/quant-cache.md) ·
+[docs/cache/data-snapshot-contract.md](docs/cache/data-snapshot-contract.md) ·
+[docs/cache/feature-set-contract.md](docs/cache/feature-set-contract.md) ·
+[docs/cache/backtest-result-contract.md](docs/cache/backtest-result-contract.md) ·
+[docs/cache/quant-cache-invalidation.md](docs/cache/quant-cache-invalidation.md) ·
+[docs/cache/cache-benchmark.md](docs/cache/cache-benchmark.md) (statistical definitions, `cache:report`/`cache:doctor`) ·
+[docs/cache/P6_BENCHMARK_REPORT.md](docs/cache/P6_BENCHMARK_REPORT.md) (before/after, P6-A→P6-C) ·
+[docs/cache/P6_RELEASE_REPORT.md](docs/cache/P6_RELEASE_REPORT.md) (P6-E release evidence, rollback, cleanup) ·
 [compatibility/pi.json](compatibility/pi.json) (tested-environment matrix).
 
 ## Scope
@@ -504,6 +539,8 @@ npm test                       # node:test via tsx (mode policy, config, schema,
                                # path guard, runner, init, templates, gates,
                                # quant-result contract, package content)
 npm run check                  # typecheck + tests + git diff --check
+npm run cache:report           # offline cache benchmark (telemetry + runs + action cache)
+npm run cache:doctor           # offline cache health checks (exits non-zero on FAIL)
 ```
 
 ## Roadmap
@@ -527,10 +564,16 @@ npm run check                  # typecheck + tests + git diff --check
   never replaced), auto-hiding widget (`setWidget`), `/q-report`,
   `/q-compare`, `/q-widget`, `workbench_compare_runs`, compact tool
   renderers for the five workbench tools, JSON artifact snapshots per run.
-- **P5 (this release):** protected-path policy, token-based command guard,
+- **P5 (previous):** protected-path policy, token-based command guard,
   state recovery via custom entries, compaction supplements
   (`session_before_compact`), compatibility matrix + docs, final
   release-readiness audit.
+- **P6 (this release):** DeepSeek prompt-cache observability (P6-A,
+  hash-only telemetry + `/q-cache-*`), stable-prefix contract (P6-B),
+  deterministic recipe action cache (P6-C), quant cache contracts (P6-D),
+  and the offline cache benchmark + release gate (P6-E, this file's
+  `cache:report`/`cache:doctor`). See
+  [docs/cache/P6_RELEASE_REPORT.md](docs/cache/P6_RELEASE_REPORT.md).
 - **Later:** walk-forward and parameter-experiment tooling as Pi custom
   tools, project-defined JSON schemas for `schema` checks, all within the
   quantitative scope above.
@@ -540,6 +583,8 @@ npm run check                  # typecheck + tests + git diff --check
 ```
 extensions/workbench-runtime/   # Pi extension
 ├── index.ts                    # commands, custom tools, renderers, status/widget wiring
+├── cache/                      # P6: telemetry, stable-prefix, action cache, quant contracts,
+│                               #     cache-report/doctor (P6-A..D) — see docs/cache/
 ├── schemas/
 │   └── quant-result.schema.json # quant output contract (validated, never computed)
 ├── ui/
@@ -570,4 +615,5 @@ skills/                         # fourteen SKILL.md skill packages (7 general + 
 prompts/                        # q-audit/q-plan/q-build/q-debug/q-verify/q-optimize/q-review
 templates/project/               # AGENTS templates + per-profile config templates (loaded by /q-init)
 tests/                          # unit + integration tests (node:test)
+scripts/cache-benchmark.ts      # P6-E offline benchmark CLI (cache:report / cache:doctor)
 ```

@@ -1,16 +1,26 @@
 {
-	"$comment": "Tested-environment matrix for pi-dev-workbench v0.6.0 (P5). Only environments that were actually exercised are listed — no untested compatibility claims. See docs/compatibility.md for details.",
+	"$comment": "Tested-environment matrix for pi-dev-workbench v0.8.0 (P6-E). Only environments that were actually exercised are listed \u2014 no untested compatibility claims. See docs/compatibility.md for details.",
 	"schema_version": 1,
 	"package": {
 		"name": "pi-dev-workbench",
-		"version": "0.6.1"
+		"version": "0.8.0"
 	},
 	"pi": {
 		"package": "@earendil-works/pi-coding-agent",
 		"tested_version": "0.83.0",
 		"peer_spec": "*",
-		"tested_modes": ["tui", "print", "json"],
-		"tested_session_reasons": ["startup", "new", "resume", "fork", "reload"],
+		"tested_modes": [
+			"tui",
+			"print",
+			"json"
+		],
+		"tested_session_reasons": [
+			"startup",
+			"new",
+			"resume",
+			"fork",
+			"reload"
+		],
 		"note": "TUI tested via component tests with pi-tui 0.83.0 and live print/json smoke runs; a full interactive TUI session was not automated."
 	},
 	"runtime": {
@@ -33,6 +43,15 @@
 		"full_check": "npm run check",
 		"smoke_print_mode": "pi -a -p",
 		"smoke_json_mode": "pi --mode json -a -p",
-		"extension_direct_load": "tests/p5-inventory.test.ts (stub ExtensionAPI)"
+		"extension_direct_load": "tests/p5-inventory.test.ts (stub ExtensionAPI)",
+		"cache_benchmark_cli": "npm run cache:report / npm run cache:doctor (scripts/cache-benchmark.ts)"
+	},
+	"provider_tested": {
+		"provider": "deepseek",
+		"model": "deepseek-v4-flash",
+		"api_kind": "openai-completions",
+		"thinking_level": "max",
+		"workbench_mode": "DEV",
+		"note": "P6 benchmark corpus: 602 requests across 5 sessions on 2026-08-02; usage semantics verified against installed Pi 0.83.0 source."
 	}
 }

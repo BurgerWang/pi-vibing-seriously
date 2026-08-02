@@ -1,0 +1,22 @@
+{
+	"schemaVersion": 1,
+	"contractType": "feature-set",
+	"featureSetId": "momentum-quality-v12",
+	"profile": "quant-research/stock-selection",
+	"dataSnapshotKey": "quant:data-snapshot:2026-08-01-eod-v3:r3:aaaaaaaaaaaaaaaa",
+	"universeSnapshotKey": "quant:data-snapshot:universe-sp500-pit-2026-08-01:v2:cccccccccccccccc",
+	"featureCodeHash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+	"featureDefinitionHash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+	"parameters": { "lookback": 20, "quality_floor": 0.05 },
+	"warmupPeriod": 60,
+	"missingValuePolicy": "forward-fill-limit-5-days",
+	"winsorizationPolicy": "cross-sectional-1pct-99pct",
+	"normalizationPolicy": "cross-sectional-zscore",
+	"industryClassificationVersion": "gic-v2026-07",
+	"marketCapSourceVersion": "mcap-float-v2026-07",
+	"financialReleaseAlignmentPolicy": "point-in-time-publication",
+	"signalTimestampPolicy": "next-bar-open",
+	"outputSchemaHash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+	"featureArtifactHash": "1111111111111111111111111111111111111111111111111111111111111111",
+	"warnings": []
+}

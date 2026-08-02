@@ -432,7 +432,11 @@ export function effectiveGates(profile: string | undefined, catalog: readonly Ga
 		}
 		out.push(gate);
 	}
-	return out;
+	// P6-B: deterministic order — gate id sort, never YAML key order. The
+	// built-in ladder (b0..b5, q0..q5) keeps its natural order; project gates
+	// with custom ids land in a stable position regardless of gates.yaml key
+	// order. Execution order is decided separately by orderGates (topological).
+	return out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
 /** Resolve a gate selector ("b0", "base", "quant", "all", "b0,b1") to ids. */

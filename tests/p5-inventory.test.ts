@@ -1,10 +1,11 @@
 /**
- * P5 command-inventory and direct-load tests.
+ * P5 command-inventory and direct-load tests (extended by P6-A with the
+ * cache telemetry commands and lifecycle events).
  *
  * 1. Direct load: the extension module is imported and its default export is
  *    invoked with a stub ExtensionAPI — no Pi runtime needed. This is the
  *    "extension direct-load smoke test" as a repeatable unit test.
- * 2. Inventory: the registered command set must be EXACTLY the 15
+ * 2. Inventory: the registered command set must be EXACTLY the 18
  *    deterministic workbench commands, the 7 workbench tools, and the 7
  *    prompt templates — no missing, extra, or colliding names.
  */
@@ -18,7 +19,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import workbenchRuntime from "../extensions/workbench-runtime/index.ts";
 
-/** The deterministic command surface (P5 requirement 七). */
+/** The deterministic command surface (P5 requirement 七, extended by P6-A). */
 export const EXPECTED_COMMANDS = [
 	"q-mode-audit",
 	"q-mode-dev",
@@ -35,6 +36,17 @@ export const EXPECTED_COMMANDS = [
 	"q-report",
 	"q-compare",
 	"q-widget",
+	// P6-A cache telemetry commands.
+	"q-cache-status",
+	"q-cache-report",
+	"q-cache-doctor",
+	// P6-C action cache commands.
+	"q-cache-explain",
+	"q-cache-prune",
+	"q-cache-clear",
+	// P6-D quant cache contract commands.
+	"q-cache-validate",
+	"q-cache-lineage",
 ] as const;
 
 export const EXPECTED_TOOLS = [
@@ -77,14 +89,14 @@ function makeStub(): ExtensionAPI & Record<string, unknown> {
 	return stub as unknown as ExtensionAPI & Record<string, unknown>;
 }
 
-test("extension module direct-loads and registers exactly the 15 deterministic commands", () => {
+test("extension module direct-loads and registers exactly the 23 deterministic commands", () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	const registered = stub.commands as Map<string, unknown>;
 	assert.deepEqual(
 		[...registered.keys()].sort(),
 		[...EXPECTED_COMMANDS].sort(),
-		"registered commands must be exactly the P5 command list",
+		"registered commands must be exactly the P5+P6-A+P6-C+P6-D command list",
 	);
 });
 
@@ -102,7 +114,21 @@ test("extension registers the lifecycle events it relies on", () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	const events = (stub as unknown as { events: Map<string, number> }).events;
-	for (const event of ["session_start", "session_before_compact", "before_agent_start", "agent_settled", "tool_execution_start", "tool_execution_end", "tool_call"]) {
+	for (const event of [
+		"session_start",
+		"session_before_compact",
+		"session_shutdown",
+		"before_agent_start",
+		"agent_settled",
+		"tool_execution_start",
+		"tool_execution_end",
+		"tool_call",
+		// P6-A cache telemetry events.
+		"model_select",
+		"thinking_level_select",
+		"before_provider_request",
+		"message_end",
+	]) {
 		assert.ok((events.get(event) ?? 0) >= 1, event);
 	}
 });

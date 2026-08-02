@@ -34,8 +34,24 @@ extensions/workbench-runtime/
 │                            # events, status/widget wiring, guard wiring
 ├── schemas/quant-result.schema.json   # quant output contract (validated, never computed)
 ├── ui/tool-renderers.ts     # P4 TUI renderers (theme-colored Text components)
+└── cache/                   # P6-A prompt-cache telemetry (hash-only)
+    ├── cache-types.ts       # record schema (1.1), usage semantics (verified api kinds)
+    ├── canonical-hash.ts    # deterministic SHA-256 canonicalization
+    ├── prompt-fingerprint.ts# system prompt / tool / payload digests (no text kept)
+    ├── invalidation-classifier.ts  # inferred invalidation reasons (incl. UNEXPECTED_DRIFT)
+    ├── stable-prefix.ts     # P6-B stable-prefix contract: stable sorts, mode prefix
+    │                        #   fingerprint, stable resource hash, dynamic markers
+    ├── cache-telemetry.ts   # session observer + state entry + status segment
+    ├── cache-store.ts       # append-only JSONL, rotation, atomic reports, privacy filter
+    ├── cache-report.ts      # aggregation + /q-cache-* text rendering
+    ├── cache-doctor.ts      # hygiene checks (usage, drift, churn, forbidden fields, hashes)
+    ├── quant-contracts.ts   # P6-D three contract schemas + immutable reference resolution
+    ├── quant-files.ts       # P6-D manifest read/validate/resolve + bounded hash verification
+    ├── quant-cache-validate.ts  # P6-D /q-cache-validate service + renderer
+    └── quant-cache-lineage.ts   # P6-D /q-cache-lineage service + renderer
 └── core/
     ├── mode-policy.ts       # AUDIT/DEV/VERIFY tool sets; combined tool_call check
+    ├── tool-catalog.ts      # P6-B static tool metadata + WORKBENCH_TOOL_NAMES order
     ├── command-guard.ts     # P5 token-based destructive-command detection (11 rules)
     ├── path-policy.ts       # P5 protected credential paths + per-mode read/write rules
     ├── path-guard.ts        # lexical + realpath containment for recipe paths
@@ -117,9 +133,62 @@ session_before_compact
 session_start → loadCompactStateFromEntries(entries)   (restore)
 ```
 
-Custom entries (`workbench-mode`, `workbench-state`) do not participate in
-LLM context; the hidden note is the only context addition, and it is bounded
-(40 lines / 2.4 KB) and redacted — run logs never enter session context.
+Custom entries (`workbench-mode`, `workbench-state`, `workbench-cache-state`)
+do not participate in LLM context; the hidden note is the only context
+addition, and it is bounded (40 lines / 2.4 KB) and redacted — run logs never
+enter session context.
+
+## Prompt-cache telemetry (P6-A)
+
+```
+message_end (assistant only)  → normalized usage (Pi's usage object)
+before_provider_request       → structural payload digest (read-only, in memory)
+session_start / model_select / thinking_level_select / session_before_compact
+  → lifecycle flags (reload/new/model/thinking/mode/compaction)
+        ↓
+observeMessageEnd: verify usage semantics → hash system prompt + tools
+  + payload shape → classify invalidation (priority chain)
+        ↓
+append record: .pi/workbench/cache/telemetry.jsonl  (JSONL, 5MB rotation)
+  + pi.appendEntry("workbench-cache-state", lightweight summary)
+        ↓
+footer segment: CACHE 72% | read 184k | miss 71k  (or CACHE N/A)
+commands: /q-cache-status /q-cache-report [--save] /q-cache-doctor
+```
+
+Rules: hash-only (never text), `usage.cost.total` is the cost fact,
+cacheHitRatio only for verified api kinds, telemetry never blocks or mutates
+requests, opt-out via `project.yaml` `cache.telemetry: false`. See
+docs/cache/ for details.
+
+## Stable prefix contract (P6-B)
+
+DeepSeek caches the FULL prefix, so the workbench keeps its side of the
+prefix byte-stable: the system prompt is never rewritten per turn,
+tool metadata is static (`core/tool-catalog.ts`, registered in the explicit
+`WORKBENCH_TOOL_NAMES` order), the active tool set is frozen per mode and
+swapped only on mode switches (one `setActiveTools` call), and resource
+discovery is deterministically sorted (gates by id, recipes/profiles by
+name, readdir/glob results sorted, DEV foreign tools name-sorted). Dynamic
+facts (time, git, mode, run/gate ids, cache stats) only flow through TUI
+status/widget, custom entries, tool results, telemetry hashes, and normal
+chat messages. Same-mode prefix changes are recorded as
+`UNEXPECTED_DRIFT` (with `driftSource`) and surfaced by `/q-cache-doctor`
+(`prefix_hashes`, `same_mode_drift`) and `/q-cache-report`
+(`same-mode mutat.`). See docs/cache/stable-prefix-contract.md.
+
+## Cache benchmark (P6-E)
+
+The offline benchmark CLI (`scripts/cache-benchmark.ts`, `npm run
+cache:report` / `npm run cache:doctor`) aggregates the SAME telemetry
+records as `/q-cache-report` plus run manifests and action-cache records,
+with no Pi session: it never calls a model, never reads `auth.json` or
+`models.json`, never warms caches, and never hardcodes provider prices
+(`estimatedAvoidedCost` requires an explicit `--cost-map`; otherwise
+`null`). The doctor reuses `runDoctor` in an honest offline context —
+Pi-dependent checks are skipped, never silently passed — and adds local
+hygiene checks (action-cache integrity, index consistency, stale locks).
+See docs/cache/cache-benchmark.md and P6_BENCHMARK_REPORT.md.
 
 ## Trust and identity
 
@@ -150,4 +219,8 @@ LLM context; the hidden note is the only context addition, and it is bounded
 - P4 TUI status/widget, run reports, run comparison, tool renderers, JSON
   artifact snapshots
 - P5 path protection, token-based command guard, state recovery, compaction
-  supplements, compatibility docs (this milestone)
+  supplements, compatibility docs
+- P6-A DeepSeek prompt-cache telemetry and baseline: hash-only usage/context
+  observability, inferred invalidations, JSONL store with rotation,
+  /q-cache-status /q-cache-report /q-cache-doctor, footer cache segment
+  (observation only — no Recipe Action Cache yet)

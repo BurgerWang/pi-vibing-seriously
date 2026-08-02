@@ -38,6 +38,7 @@ import {
 	QUANT_GATE_ID_RE,
 } from "./gate-schema.ts";
 import { validateQuantResult } from "./quant-result.ts";
+import { validateQuantContract } from "../cache/quant-contracts.ts";
 import { realpathContained } from "./path-guard.ts";
 import { runRecipe } from "./recipe-runner.ts";
 import { listRuns, makeRunId, readManifest, RUN_SCHEMA_VERSION } from "./runs.ts";
@@ -64,6 +65,8 @@ export interface EvidenceEntry {
 	run_id?: string;
 	recipe?: string;
 	exit_code?: number | null;
+	/** P6-C: "exec" (executed) or "cache" (reused from the action cache). */
+	execution_source?: string;
 	value?: unknown;
 	paths?: string[];
 	check_id?: string;
@@ -376,6 +379,7 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 						run_id: result.record?.run_id,
 						recipe: declared,
 						exit_code: result.record?.exit_code ?? null,
+						execution_source: result.record?.execution_source ?? "exec",
 						detail: ok ? `recipe "${declared}" exited ${result.record?.exit_code} as expected` : `recipe "${declared}" failed (exit ${result.record?.exit_code ?? "killed"}, timed_out=${result.record?.timed_out})`,
 					},
 				];
@@ -562,8 +566,9 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 			case "schema": {
 				const file = check.json_file as string;
 				const schemaName = check.schema_name ?? "quant-result";
-				if (schemaName !== "quant-result") {
-					throw new GateSetupError(`${label}: unknown built-in schema "${schemaName}" (supported: quant-result)`);
+				const QUANT_CONTRACT_SCHEMAS: readonly string[] = ["data-snapshot", "feature-set", "backtest-result"];
+				if (schemaName !== "quant-result" && !QUANT_CONTRACT_SCHEMAS.includes(schemaName)) {
+					throw new GateSetupError(`${label}: unknown built-in schema "${schemaName}" (supported: quant-result, ${QUANT_CONTRACT_SCHEMAS.join(", ")})`);
 				}
 				let resolved: { path: string; value: unknown };
 				try {
@@ -579,19 +584,53 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 				const copied = await copyEvidenceFile(ctx.projectRoot, ctx.runDir, check.id, resolved.path);
 				if (copied) artifactPaths.push(copied);
 
-				const result = validateQuantResult(resolved.value, { profile: ctx.profile });
-				const evidence: EvidenceEntry = {
-					type: "schema",
-					source: file,
-					detail: result.valid ? `conforms to ${schemaName}.schema.json` : `schema violations: ${result.errors.slice(0, 5).join("; ")}`,
-					errors: result.errors,
-					warnings: result.warnings,
-				};
-				if (result.failed_folds.length > 0) {
-					evidence.detail += ` | failed folds reported: ${result.failed_folds.join(", ")}`;
-				}
-				if (result.valid) pass([evidence]);
-				else fail(`artifact ${file} does not conform to ${schemaName} contract`, [evidence]);
+				// P6-D: the three quant cache contracts validate as built-in
+				// schemas. For them the evidence records the validation status
+				// (validated/unresolved/invalid), cache eligibility and the
+				// manifest warnings verbatim — a cache hit never bypasses these
+				// gates, and "validated" is never claimed for manifests that only
+				// parse (missing adjustment/corporate-action/delisting semantics
+				// or per-profile requirements stay unresolved).
+				const isQuantContract = QUANT_CONTRACT_SCHEMAS.includes(schemaName);
+				const result = isQuantContract
+					? validateQuantContract(resolved.value, { profile: ctx.profile })
+					: validateQuantResult(resolved.value, { profile: ctx.profile });
+				const evidence: EvidenceEntry = isQuantContract
+					? (() => {
+							const q = result as ReturnType<typeof validateQuantContract>;
+							return {
+								type: "schema",
+								source: file,
+								detail: q.validationStatus === "validated"
+									? `conforms to ${schemaName}.schema (${q.validationStatus}${q.cacheEligible ? ", cache-eligible" : ""})`
+									: `not ${schemaName}.schema validated: ${q.errors.slice(0, 3).join("; ") || q.warnings.filter((w) => w.includes("validated") || w.includes("semantics")).slice(0, 3).join("; ") || q.validationStatus}`,
+								errors: q.errors,
+								warnings: q.warnings,
+							};
+						})()
+					: (() => {
+							const q = result as ReturnType<typeof validateQuantResult>;
+							const entry: EvidenceEntry = {
+								type: "schema",
+								source: file,
+								detail: q.valid ? `conforms to ${schemaName}.schema.json` : `schema violations: ${q.errors.slice(0, 5).join("; ")}`,
+								errors: q.errors,
+								warnings: q.warnings,
+							};
+							if (q.failed_folds.length > 0) {
+								entry.detail += ` | failed folds reported: ${q.failed_folds.join(", ")}`;
+							}
+							return entry;
+						})();
+				// Quant contract schemas only PASS when the manifest is fully
+				// VALIDATED (structure + semantics, immutable). A manifest that
+				// merely parses (missing adjustment/corporate-action/delisting
+				// semantics or per-profile requirements) FAILS the gate.
+				const quantPassed = isQuantContract
+					? (result as ReturnType<typeof validateQuantContract>).validationStatus === "validated"
+					: result.valid;
+				if (quantPassed) pass([evidence]);
+				else fail(`artifact ${file} does not conform to ${schemaName} contract (validation status: ${isQuantContract ? (result as ReturnType<typeof validateQuantContract>).validationStatus : "invalid"})`, [evidence]);
 				break;
 			}
 

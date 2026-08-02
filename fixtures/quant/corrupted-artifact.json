@@ -1,0 +1,34 @@
+{
+	"schemaVersion": 1,
+	"contractType": "backtest-result",
+	"backtestId": "momentum-quality-v12-wf-2026-08-corrupt",
+	"strategyType": "stock-selection",
+	"sourceCodeHash": "7777777777777777777777777777777777777777777777777777777777777777",
+	"strategyConfigHash": "8888888888888888888888888888888888888888888888888888888888888888",
+	"dataSnapshotKey": "quant:data-snapshot:2026-08-01-eod-v3:r3:aaaaaaaaaaaaaaaa",
+	"featureSetKey": "quant:feature-set:momentum-quality-v12:r0:dddddddddddddddd",
+	"universeSnapshotKey": "quant:data-snapshot:universe-sp500-pit-2026-08-01:v2:cccccccccccccccc",
+	"splitDefinitionHash": "9999999999999999999999999999999999999999999999999999999999999999",
+	"walkForwardDefinitionHash": "0000000000000000000000000000000000000000000000000000000000000000",
+	"seed": 42,
+	"engineVersion": "example-backtest-engine-2.4.0",
+	"tradingCalendar": "NYSE",
+	"feeModelHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab",
+	"slippageModelHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac",
+	"benchmarkDefinitionHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad",
+	"rebalanceSemanticsHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaae",
+	"positionConstraintHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaf",
+	"corporateActionPolicyHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0",
+	"resultArtifactHash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+	"metricsArtifact": "results/quant-result.json",
+	"parametersArtifact": "results/parameters.json",
+	"foldArtifacts": [
+		{ "id": "f1", "status": "passed", "artifact": "results/folds/f1.json" },
+		{ "id": "f2", "status": "passed", "artifact": "results/folds/f2.json" }
+	],
+	"failedFolds": [],
+	"trialLineage": { "retained": true },
+	"warnings": [
+		"fixture with a deliberately wrong resultArtifactHash — hash verification must classify this as corruption"
+	]
+}

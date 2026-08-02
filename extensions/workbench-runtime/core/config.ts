@@ -21,6 +21,7 @@ import { parse as parseYaml } from "yaml";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import { parseRecipesDocument, type Recipe } from "./recipe-schema.ts";
+import { DEFAULT_ACTION_CACHE_MAX_BYTES } from "../cache/action-types.ts";
 
 export const WORKBENCH_DIR = "workbench";
 export const RUNS_DIR = "runs";
@@ -50,6 +51,10 @@ export interface ProjectConfig {
 	gates: unknown[];
 	profiles: unknown[];
 	issues: ConfigIssue[];
+	/** P6-A: prompt-cache telemetry opt-out (project.yaml cache.telemetry). Default true. */
+	cacheTelemetry: boolean;
+	/** P6-C: action-cache capacity limit (project.yaml cache.actionCache.maxBytes). */
+	actionCacheMaxBytes: number;
 }
 
 /** The workbench config directory for a project root. */
@@ -133,9 +138,37 @@ export async function loadProjectConfig(projectRoot: string, options: { trusted:
 		issues.push({ file: "project.yaml", message: '"profile" is missing (expected one of the profiles in profiles.yaml)' });
 	}
 
+	// P6-A: telemetry opt-out. project.yaml: cache: { telemetry: false }.
+	let cacheTelemetry = true;
+	// P6-C: action-cache capacity. project.yaml: cache: { actionCache: { maxBytes: N } }.
+	let actionCacheMaxBytes = DEFAULT_ACTION_CACHE_MAX_BYTES;
+	const cacheDoc = projectDoc?.cache;
+	if (cacheDoc !== undefined && (typeof cacheDoc !== "object" || Array.isArray(cacheDoc))) {
+		issues.push({ file: "project.yaml", message: '"cache" must be a mapping (e.g. cache: { telemetry: false })' });
+	} else if (cacheDoc !== undefined) {
+		const cacheMap = cacheDoc as Record<string, unknown>;
+		if (cacheMap.telemetry !== undefined && typeof cacheMap.telemetry !== "boolean") {
+			issues.push({ file: "project.yaml", message: '"cache.telemetry" must be a boolean' });
+		} else {
+			cacheTelemetry = cacheMap.telemetry !== false;
+		}
+		const actionCacheDoc = cacheMap.actionCache;
+		if (actionCacheDoc !== undefined && (typeof actionCacheDoc !== "object" || Array.isArray(actionCacheDoc))) {
+			issues.push({ file: "project.yaml", message: '"cache.actionCache" must be a mapping (e.g. { maxBytes: 268435456 })' });
+		} else if (actionCacheDoc !== undefined) {
+			const maxBytes = (actionCacheDoc as Record<string, unknown>).maxBytes;
+			if (maxBytes !== undefined && (typeof maxBytes !== "number" || !Number.isInteger(maxBytes) || maxBytes <= 0)) {
+				issues.push({ file: "project.yaml", message: '"cache.actionCache.maxBytes" must be a positive integer' });
+			} else if (typeof maxBytes === "number") {
+				actionCacheMaxBytes = maxBytes;
+			}
+		}
+	}
+
 	const recipesDoc = documents.get("recipes.yaml");
 	const parsed = parseRecipesDocument(recipesDoc);
 	for (const message of parsed.errors) issues.push({ file: "recipes.yaml", message });
+	for (const message of parsed.warnings) issues.push({ file: "recipes.yaml", message });
 
 	const gatesDoc = documents.get("gates.yaml") as Record<string, unknown> | undefined;
 	const gates = Array.isArray(gatesDoc?.gates) ? (gatesDoc.gates as unknown[]) : [];
@@ -144,10 +177,16 @@ export async function loadProjectConfig(projectRoot: string, options: { trusted:
 	}
 
 	const profilesDoc = documents.get("profiles.yaml") as Record<string, unknown> | undefined;
-	const profiles = Array.isArray(profilesDoc?.profiles) ? (profilesDoc.profiles as unknown[]) : [];
+	let profiles = Array.isArray(profilesDoc?.profiles) ? (profilesDoc.profiles as unknown[]) : [];
 	if (profilesDoc !== undefined && !Array.isArray(profilesDoc?.profiles)) {
 		issues.push({ file: "profiles.yaml", message: 'expected a mapping with a "profiles" list' });
 	}
+	// P6-B: deterministic profile order — sorted by name, never YAML order.
+	profiles = [...profiles].sort((a, b) => {
+		const nameA = typeof a === "object" && a !== null && typeof (a as Record<string, unknown>).name === "string" ? ((a as Record<string, unknown>).name as string) : "";
+		const nameB = typeof b === "object" && b !== null && typeof (b as Record<string, unknown>).name === "string" ? ((b as Record<string, unknown>).name as string) : "";
+		return nameA < nameB ? -1 : nameA > nameB ? 1 : 0;
+	});
 
-	return { projectRoot, projectName, description, profile, recipes: parsed.recipes, gates, profiles, issues };
+	return { projectRoot, projectName, description, profile, recipes: parsed.recipes, gates, profiles, issues, cacheTelemetry, actionCacheMaxBytes };
 }
