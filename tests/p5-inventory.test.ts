@@ -6,7 +6,7 @@
  *    invoked with a stub ExtensionAPI — no Pi runtime needed. This is the
  *    "extension direct-load smoke test" as a repeatable unit test.
  * 2. Inventory: the registered command set must be EXACTLY the 18
- *    deterministic workbench commands, the 7 workbench tools, and the 7
+ *    deterministic workbench commands, the 8 workbench tools, and the 7
  *    prompt templates — no missing, extra, or colliding names.
  */
 
@@ -57,6 +57,7 @@ export const EXPECTED_TOOLS = [
 	"workbench_read_gate",
 	"workbench_list_gates",
 	"workbench_compare_runs",
+	"workbench_delegate_worker",
 ] as const;
 
 export const EXPECTED_PROMPTS = ["q-audit", "q-plan", "q-build", "q-debug", "q-verify", "q-optimize", "q-review"] as const;
@@ -100,7 +101,7 @@ test("extension module direct-loads and registers exactly the 23 deterministic c
 	);
 });
 
-test("extension registers exactly the 7 workbench tools", () => {
+test("extension registers exactly the 8 workbench tools", () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	const tools = stub.tools as Map<string, unknown>;

@@ -29,10 +29,14 @@ hardcoded provider prices). It runs entirely on Pi's native
 mechanisms —
 extensions, custom commands, custom tools, skills, prompt templates,
 session custom entries, `ctx.ui.setStatus`/`setWidget`, and custom tool
-renderers. **It is not an agent framework, a daemon, a second agent loop,
-or a sandbox.**
+renderers. **It is not a standalone agent framework, daemon, background
+service, or sandbox.** In DEV, GPT-5.6 Sol may explicitly create one
+short-lived, pinned, non-recursive DeepSeek Pi worker for a bounded
+implementation task; the process ends with the tool call and never owns final
+verification.
 
 Documentation: [docs/architecture.md](docs/architecture.md) ·
+[docs/worker-delegation.md](docs/worker-delegation.md) ·
 [docs/security.md](docs/security.md) ·
 [docs/compatibility.md](docs/compatibility.md) ·
 [docs/project-onboarding.md](docs/project-onboarding.md) ·
@@ -74,9 +78,9 @@ exchange order routing, live high-frequency execution, and colocation.
 
 | Mode   | Active tools                                                                 | Hard-blocked at tool_call          | Use case                        |
 | ------ | ---------------------------------------------------------------------------- | ---------------------------------- | ------------------------------- |
-| AUDIT  | read, grep, find, ls, workbench_project_inspect, workbench_read_run, workbench_read_gate, workbench_list_gates, workbench_compare_runs | bash, edit, write, workbench_run_recipe, workbench_run_gate | Read-only inspection       |
-| DEV    | read, grep, find, ls, bash, edit, write, all `workbench_*` tools (plus any other extension tools) | —                     | Implementing features and fixes |
-| VERIFY | read, grep, find, ls, workbench_project_inspect, workbench_run_recipe, workbench_read_run, workbench_run_gate, workbench_read_gate, workbench_list_gates, workbench_compare_runs | bash, edit, write | Re-verifying completed work |
+| AUDIT  | read, grep, find, ls, workbench_project_inspect, workbench_read_run, workbench_read_gate, workbench_list_gates, workbench_compare_runs | bash, edit, write, workbench_run_recipe, workbench_run_gate, workbench_delegate_worker | Read-only inspection       |
+| DEV    | read, grep, find, ls, bash, edit, write, all `workbench_*` tools (including controlled worker delegation) | — | Implementing features and fixes |
+| VERIFY | read, grep, find, ls, workbench_project_inspect, workbench_run_recipe, workbench_read_run, workbench_run_gate, workbench_read_gate, workbench_list_gates, workbench_compare_runs | bash, edit, write, workbench_delegate_worker | Re-verifying completed work |
 
 - `/q-mode-audit` — switch to AUDIT
 - `/q-mode-dev` — switch to DEV (default)
@@ -261,6 +265,7 @@ Custom tools (callable by the model):
 | `workbench_read_gate` | Read a gate run record by `run_id`, or a gate definition by `gate_id` (with latest status). |
 | `workbench_list_gates` | List the gates available for the current profile with their latest status. |
 | `workbench_compare_runs` | Compare two run records by `run_id`: exit code, duration, artifact changes, gate delta, quant metrics (read-only; also available in AUDIT). |
+| `workbench_delegate_worker` | DEV only: GPT-5.6 Sol delegates one scoped task to pinned `deepseek-v4-flash:max`; worker cannot recurse, use free bash, run final gates, or write outside approved paths. |
 
 Commands (same services, no duplicated logic):
 

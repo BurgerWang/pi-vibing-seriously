@@ -2,6 +2,32 @@
 
 All notable changes to pi-dev-workbench are documented here.
 
+## [Unreleased] — Controlled Sol/DeepSeek Worker Delegation
+
+### Added
+
+- Static DEV-only `workbench_delegate_worker` tool: GPT-5.6 Sol delegates one
+  bounded implementation task to a short-lived, isolated
+  `deepseek/deepseek-v4-flash:max` Pi child process.
+- Fail-closed commander and worker model checks, non-recursive worker role,
+  sequential execution, abort/timeout propagation, bounded JSON event and
+  stderr handling, nested usage accounting, and parent-approved edit/write
+  path scopes.
+- Worker role guard blocks free-form bash and final gate execution; only
+  declared recipes with an empty `writes` list remain available for development checks. AUDIT and VERIFY
+  hard-deny delegation, preserving Sol-only final review and gate judgment.
+- Unit and spawn/integration tests for model pinning, environment isolation,
+  role restrictions, path containment, failures, timeout, and cancellation.
+- [Controlled Worker Delegation](docs/worker-delegation.md) documentation plus
+  architecture, security, mode-matrix, and tool-inventory updates.
+
+### Changed
+
+- The Pi-native architecture contract now permits an explicit short-lived Pi
+  worker loop while continuing to forbid standalone agent frameworks,
+  daemons, background services, recursive delegation, and worker-owned final
+  verification.
+
 ## [0.8.0] — P6-E: Cache Benchmark, Hardening, and Release Gate
 
 Offline cache benchmarking, DeepSeek-final-constraint audit, privacy audit,

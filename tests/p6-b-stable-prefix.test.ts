@@ -307,13 +307,13 @@ test("DEV / AUDIT / VERIFY tool hashes are stable and pairwise different", () =>
 
 test("mode matrix is exactly the P6-B spec matrix", () => {
 	assert.deepEqual(MODE_TOOLS.AUDIT, ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_read_run", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs"]);
-	assert.deepEqual(MODE_TOOLS.VERIFY, ["read", "grep", "find", "ls", ...WORKBENCH_TOOLS]);
+	assert.deepEqual(MODE_TOOLS.VERIFY, ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_run_recipe", "workbench_read_run", "workbench_run_gate", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs"]);
 	assert.deepEqual(MODE_TOOLS.DEV, ["read", "grep", "find", "ls", "bash", "edit", "write", ...WORKBENCH_TOOLS]);
 	// AUDIT has no mutating tools; VERIFY has no free bash/edit/write
-	for (const forbidden of ["bash", "edit", "write", "workbench_run_recipe", "workbench_run_gate"]) {
+	for (const forbidden of ["bash", "edit", "write", "workbench_run_recipe", "workbench_run_gate", "workbench_delegate_worker"]) {
 		assert.ok(!AUDIT_TOOLS.includes(forbidden), `AUDIT must not contain ${forbidden}`);
 	}
-	for (const forbidden of ["bash", "edit", "write"]) {
+	for (const forbidden of ["bash", "edit", "write", "workbench_delegate_worker"]) {
 		assert.ok(!VERIFY_TOOLS.includes(forbidden), `VERIFY must not contain ${forbidden}`);
 	}
 });
@@ -488,7 +488,7 @@ test("no dynamic tool loader: tools are registered statically in WORKBENCH_TOOL_
 	// exactly one setActiveTools call site (applyModeTools) — the tool set is
 	// swapped only on mode switches / session_start, never per turn
 	assert.equal(index.split("setActiveTools(").length - 1, 1, "setActiveTools called from exactly one place");
-	// exactly the 7 workbench tools are registered, in catalog order
+	// exactly the 8 workbench tools are registered, in catalog order
 	const registrations = index.split("pi.registerTool({").slice(1);
 	assert.equal(registrations.length, WORKBENCH_TOOL_NAMES.length, "one registerTool per catalog tool");
 	const registered: string[] = [];

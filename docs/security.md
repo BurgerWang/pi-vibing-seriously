@@ -76,6 +76,35 @@ branch names like `feature/--force-x` cannot false-positive, while quoted
 destructive forms (`rm -rf "/"`) are still caught. The guard is a discipline
 layer, not a sandbox.
 
+## Controlled worker delegation
+
+`workbench_delegate_worker` starts one short-lived Pi child process in DEV.
+It is not a sandbox: the child inherits the launching user's OS permissions
+and provider authentication. The parent project must already be trusted.
+
+Defense-in-depth controls:
+
+- only `gpt-5.6-sol` on the `openai-codex` or `openai` provider can invoke it;
+- the child selector is pinned to `deepseek/deepseek-v4-flash:max`, and
+  assistant provider/model drift fails closed;
+- AUDIT and VERIFY hard-deny the delegate tool;
+- the worker role removes recursive delegation, free-form `bash`, and
+  `workbench_run_gate` from its active matrix, with a hard guard if re-enabled;
+- worker `edit`/`write` calls must match a parent-approved exact path or
+  subtree; lexical plus realpath checks reject project escapes and symlink
+  hops outside the approved subtree;
+- the tool executes sequentially, propagates abort, enforces a timeout, and
+  bounds stdout/stderr processing.
+
+Only recipes with an empty declared `writes` list are available to a worker.
+This blocks honestly declared mutating recipes, but recipes remain
+trusted-project discipline mechanisms: a malicious command can write despite
+an empty declaration. They are not an OS sandbox or a substitute for reviewing
+repository configuration. Provider
+credentials may be used by the child but are never copied into the task
+message or tool details. See
+[worker-delegation.md](worker-delegation.md).
+
 ## Records and redaction
 
 Run records (`manifest.json`, `command.json`, `environment.json`,

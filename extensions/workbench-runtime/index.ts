@@ -112,13 +112,15 @@
  *   workbench_read_gate       — read a gate run record or gate definition
  *   workbench_list_gates      — list available gates with latest status
  *   workbench_compare_runs    — compare two run records (P4)
+ *   workbench_delegate_worker — DEV-only bounded implementation delegation
+ *                               from GPT-5.6 Sol to pinned DeepSeek max
  *
  * P4 UI (all Pi-native):
  *   - footer status via `ctx.ui.setStatus` (the Pi footer itself is never
  *     replaced): WB:<MODE> | <profile> | <gate>:<status> | run:<id>
  *   - compact widget via `ctx.ui.setWidget`, shown only while a task is
  *     active, a gate is failing, or the user forced it on (/q-widget)
- *   - compact renderCall/renderResult for the five tools above; expanded
+ *   - compact renderCall/renderResult for the run/inspect/compare tools; expanded
  *     shows recipe, duration, exit code, artifacts, failed checks, log path
  *   - all UI calls are guarded by ctx.mode/ctx.hasUI — print/json modes
  *     never touch TUI-only APIs and every fact comes from the run's own
@@ -129,9 +131,12 @@
  *   - `pi.appendEntry` + `session_start` for mode persistence
  *   - `pi.setActiveTools` for the mode tool set (layer 1)
  *   - `pi.on("tool_call")` hard guard (layer 2): AUDIT blocks
- *     bash/edit/write/workbench_run_recipe/workbench_run_gate; VERIFY blocks
- *     bash/edit/write
+ *     mutation/run/delegation; VERIFY blocks bash/edit/write/delegation;
+ *     delegated workers additionally block recursion/bash/final gates and
+ *     constrain edit/write paths
  *   - `pi.exec` (argv + shell=false + timeout/AbortSignal) for recipe runs
+ *   - one short-lived `pi --mode json --no-session` child for a delegated
+ *     worker task; no daemon, recursive delegation, or persistent worker
  *   - Pi's official CONFIG_DIR_NAME and truncation helpers
  *
  * Scope: stock selection, timing, mid/low-frequency backtesting, data
@@ -158,6 +163,18 @@ import {
 	type WorkbenchMode,
 } from "./core/mode-policy.ts";
 import { WORKBENCH_TOOL_METADATA, WORKBENCH_TOOL_PARAMETERS } from "./core/tool-catalog.ts";
+import {
+	commanderBlockReason,
+	computeRoleActiveTools,
+	parseWorkerAllowedPaths,
+	workerRecipeBlockReason,
+	workerRoleToolCallBlockReason,
+	WORKER_ALLOWED_PATHS_ENV,
+	WORKER_PROJECT_ROOT_ENV,
+	WORKER_ROLE_ENV,
+} from "./core/worker-policy.ts";
+import { assertWorkerSucceeded, runDeepseekWorker } from "./worker/runner.ts";
+import { isWorkerPathAllowedRealpath } from "./worker/path-scope.ts";
 import {
 	describeMode,
 	loadModeFromEntries,
@@ -264,6 +281,11 @@ function rememberRunOutcome(toolName: string, details: Record<string, unknown>):
 
 export default function workbenchRuntime(pi: ExtensionAPI): void {
 	let mode: WorkbenchMode = "DEV";
+	const workerRoleContext = {
+		role: process.env[WORKER_ROLE_ENV],
+		projectRoot: process.env[WORKER_PROJECT_ROOT_ENV],
+		allowedPaths: parseWorkerAllowedPaths(process.env[WORKER_ALLOWED_PATHS_ENV]),
+	};
 
 	const execFn: ExecFn = (command, args, options) =>
 		pi.exec(command, args, { cwd: options?.cwd, timeout: options?.timeout, signal: options?.signal });
@@ -278,7 +300,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	// ------------------------------------------------------------------ state
 
 	function applyModeTools(): void {
-		pi.setActiveTools(computeActiveTools(mode, pi.getActiveTools()));
+		pi.setActiveTools(computeRoleActiveTools(computeActiveTools(mode, pi.getActiveTools()), workerRoleContext.role));
 	}
 
 	/**
@@ -681,6 +703,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 				`active tools   : ${pi.getActiveTools().join(", ") || "(none)"}`,
 				`mode tool set  : ${MODE_TOOLS[mode].join(", ")}`,
 				`workbench tools: ${workbenchTools.length > 0 ? workbenchTools.join(", ") : "(none registered)"}`,
+				`agent role     : ${workerRoleContext.role ?? "commander"}`,
 				`path policy    : write .env/.pem/.key/credentials.*/secrets.*/auth.json blocked in all modes; read blocked in AUDIT/VERIFY, allowed in DEV`,
 				`command guard  : rm -rf / or ~, git reset --hard, git clean -fd, git push --force, git checkout -- ., git restore ., git remote changes, rm .git, git config --global writes, sudo, npm/yarn/pnpm/bun publish`,
 			];
@@ -1503,6 +1526,12 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 				return { content: [{ type: "text", text: `workbench_run_recipe: ${trustError}` }], details: {} };
 			}
 			const projectRoot = await projectRootFor(ctx);
+			if (workerRoleContext.role === "worker") {
+				const config = await loadProjectConfig(projectRoot, { trusted: true });
+				const recipe = config.recipes.find((candidate) => candidate.name === params.recipe);
+				const recipeRoleError = recipe ? workerRecipeBlockReason(workerRoleContext.role, recipe.name, recipe.writes) : undefined;
+				if (recipeRoleError) throw new Error(recipeRoleError);
+			}
 			onUpdate?.({
 				content: [{ type: "text", text: `Running recipe "${params.recipe}" (${mode} mode)...` }],
 				details: { phase: "started", recipe: params.recipe },
@@ -1799,9 +1828,80 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		...workbenchToolRenderer("compare", "workbench_compare_runs"),
 	});
 
+	pi.registerTool({
+		...WORKBENCH_TOOL_METADATA.workbench_delegate_worker,
+		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker,
+		executionMode: "sequential",
+		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+			const trustError = trustedOrError(ctx);
+			if (trustError) throw new Error(`workbench_delegate_worker: ${trustError}`);
+			const commanderError = commanderBlockReason(ctx.model?.provider, ctx.model?.id);
+			if (commanderError) throw new Error(commanderError);
+			const projectRoot = await projectRootFor(ctx);
+			onUpdate?.({
+				content: [{ type: "text", text: "Starting pinned DeepSeek worker in an isolated Pi process..." }],
+				details: { phase: "starting", model: "deepseek/deepseek-v4-flash:max" },
+			});
+			const result = await runDeepseekWorker({
+				projectRoot,
+				contract: {
+					task: params.task,
+					allowedPaths: params.allowed_paths,
+					acceptanceCriteria: params.acceptance_criteria,
+					verification: params.verification ?? [],
+				},
+				timeoutMs: (params.timeout_seconds ?? 1800) * 1000,
+				signal,
+				onProgress: (progress) => {
+					onUpdate?.({
+						content: [{ type: "text", text: `DeepSeek worker: ${progress.turns} turn(s), model ${progress.provider ?? "?"}/${progress.model ?? "?"}` }],
+						details: { phase: "running", turns: progress.turns, provider: progress.provider, model: progress.model },
+					});
+				},
+			});
+			assertWorkerSucceeded(result);
+			const text = [
+				result.output,
+				"",
+				"--- Commander action required ---",
+				"This is an untrusted worker implementation report. GPT-5.6 Sol must inspect the actual diff and run final workbench verification/gates independently.",
+			].join("\n");
+			return {
+				content: [{ type: "text", text }],
+				details: {
+					phase: "finished",
+					provider: result.provider,
+					model: result.model,
+					thinking_level: "max",
+					turns: result.turns,
+					stop_reason: result.stopReason,
+					exit_code: result.exitCode,
+					allowed_paths: params.allowed_paths,
+					final_judgment: "reserved_for_sol_commander",
+				},
+				usage: result.usage,
+			};
+		},
+	});
+
 	// ------------------------------------------- second-layer tool_call guard
 
 	pi.on("tool_call", async (event) => {
+		const workerRoleReason = workerRoleToolCallBlockReason(workerRoleContext, event.toolName, event.input);
+		if (workerRoleReason) return { block: true, reason: workerRoleReason };
+		if (
+			workerRoleContext.role === "worker" &&
+			(event.toolName === "edit" || event.toolName === "write") &&
+			workerRoleContext.projectRoot &&
+			event.input &&
+			typeof event.input === "object" &&
+			typeof (event.input as { path?: unknown }).path === "string"
+		) {
+			const path = (event.input as { path: string }).path;
+			if (!(await isWorkerPathAllowedRealpath(workerRoleContext.projectRoot, path, workerRoleContext.allowedPaths))) {
+				return { block: true, reason: `Delegated worker path failed realpath/symlink scope validation: ${path}` };
+			}
+		}
 		const check = checkToolCall(mode, event.toolName, event.input);
 		if (!check.allowed) {
 			return {

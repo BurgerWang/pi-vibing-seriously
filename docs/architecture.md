@@ -11,8 +11,11 @@ How pi-dev-workbench is built, and why. Companion docs:
    custom commands, custom tools, skills, prompt templates, custom session
    entries (`pi.appendEntry`), `ctx.ui.setStatus`/`setWidget`, custom tool
    renderers, `pi.exec` (argv + `shell=false`), and Pi's official
-   `CONFIG_DIR_NAME` and truncation helpers. There is no daemon, no second
-   agent loop, no background service, no sandbox.
+   `CONFIG_DIR_NAME` and truncation helpers. There is no daemon, standalone
+   agent framework, background service, or sandbox. DEV may explicitly spawn
+   one short-lived, isolated Pi worker loop for a bounded implementation task;
+   it is pinned, role-guarded, non-recursive, abortable, and torn down when the
+   tool call finishes. See [worker-delegation.md](worker-delegation.md).
 2. **Pure logic in `core/`, wiring in `index.ts`.** Everything decision-like
    (mode policy, path guard, command guard, redaction, containment, gate
    semantics, reports, comparisons, compaction notes) is a pure module with
@@ -34,6 +37,9 @@ extensions/workbench-runtime/
 │                            # events, status/widget wiring, guard wiring
 ├── schemas/quant-result.schema.json   # quant output contract (validated, never computed)
 ├── ui/tool-renderers.ts     # P4 TUI renderers (theme-colored Text components)
+├── worker/
+│   ├── runner.ts            # short-lived pinned DeepSeek Pi child process + JSON event/usage capture
+│   └── path-scope.ts        # realpath/symlink enforcement for parent-approved worker writes
 └── cache/                   # P6-A prompt-cache telemetry (hash-only)
     ├── cache-types.ts       # record schema (1.1), usage semantics (verified api kinds)
     ├── canonical-hash.ts    # deterministic SHA-256 canonicalization
@@ -51,6 +57,7 @@ extensions/workbench-runtime/
     └── quant-cache-lineage.ts   # P6-D /q-cache-lineage service + renderer
 └── core/
     ├── mode-policy.ts       # AUDIT/DEV/VERIFY tool sets; combined tool_call check
+    ├── worker-policy.ts     # commander/model/role/path contract for controlled delegation
     ├── tool-catalog.ts      # P6-B static tool metadata + WORKBENCH_TOOL_NAMES order
     ├── command-guard.ts     # P5 token-based destructive-command detection (11 rules)
     ├── path-policy.ts       # P5 protected credential paths + per-mode read/write rules
@@ -90,6 +97,25 @@ every tool call  →  checkToolCall(mode, tool, input)           (layer 2)
                     ├─ command guard     (bash input, token-based)
                     └─ path policy       (protected files, per mode)
 ```
+
+### Controlled worker delegation
+
+```
+GPT-5.6 Sol parent in DEV
+  → workbench_delegate_worker(task, allowed_paths, acceptance_criteria)
+  → trust + commander identity check
+  → short-lived pi --mode json --no-session
+       --model deepseek/deepseek-v4-flash:max
+  → child role matrix + hard guard: no recursion, no bash, no final gates
+  → edit/write limited to parent-approved paths
+  → bounded JSON event stream + verified model identity + nested usage
+  → untrusted report to Sol
+  → Sol reads actual diff → VERIFY recipes/gates → final judgment
+```
+
+The delegate tool is static in the DEV prefix and absent from AUDIT/VERIFY.
+No worker process survives its tool call. See
+[worker-delegation.md](worker-delegation.md).
 
 ### Recipe execution
 

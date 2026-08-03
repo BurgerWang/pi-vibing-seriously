@@ -9,7 +9,7 @@ compatibility is claimed. The machine-readable copy lives in
 
 | Component | Version | How it was exercised |
 | --------- | ------- | -------------------- |
-| Pi (`@earendil-works/pi-coding-agent`) | **0.83.0** | `npm run typecheck`/`npm test` against the pinned devDependency; live `pi -a -p` print-mode smoke runs; `pi --mode json -a -p` JSON-mode smoke runs; extension direct-load tests (stub API); live provider sessions (deepseek / deepseek-v4-flash, `openai-completions`) recorded hash-only telemetry for the P6 benchmark corpus. |
+| Pi (`@earendil-works/pi-coding-agent`) | **0.83.0** | `npm run typecheck`/`npm test` against the pinned devDependency; live `pi -a -p` print-mode smoke runs; `pi --mode json -a -p` JSON-mode smoke runs; extension direct-load tests (stub API); live controlled-worker smoke spawned `deepseek/deepseek-v4-flash:max`, verified the JSON-event provider/model, performed two read-only tool turns, returned nested usage, exited 0, and left git status unchanged. |
 | Pi TUI (`@earendil-works/pi-tui`) | **0.83.0** | Status/widget/renderer components compiled and rendered through pi-tui's `Text` in unit tests (`tests/p4-*.test.ts`). A full interactive TUI session was not automated (see Limitations). |
 | Node.js | **v24.13.0** | All test runs and smoke runs. |
 | npm | **11.18.0** | `npm install`, `npm run typecheck/test/check`. |
@@ -27,7 +27,9 @@ semantics were verified against the installed Pi 0.83.0 source for
 max, DEV mode), plus `openai-responses`, `azure-openai-responses` and
 `anthropic-messages` (mapped, not live-tested). Any other api kind is
 recorded `unverified` — the workbench never guesses. `cacheWrite = 0` is
-normal for DeepSeek and never treated as an error.
+normal for DeepSeek and never treated as an error. Controlled worker
+execution was live-tested with `deepseek-v4-flash:max`: 2 turns, verified
+provider/model, stop reason `stop`, exit 0, and no file modifications.
 
 ## Non-interactive modes
 
