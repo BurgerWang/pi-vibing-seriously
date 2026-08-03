@@ -21,6 +21,12 @@ import type { ExtensionAPI, ExtensionContext, ExtensionCommandContext } from "@e
 import workbenchRuntime from "../extensions/workbench-runtime/index.ts";
 import { COMPACT_NOTE_MESSAGE_TYPE, COMPACT_STATE_ENTRY_TYPE, type CompactState } from "../extensions/workbench-runtime/core/compact.ts";
 import { MODE_ENTRY_TYPE } from "../extensions/workbench-runtime/core/state.ts";
+import { WORKER_ROLE_ENV } from "../extensions/workbench-runtime/core/worker-policy.ts";
+import {
+	WORKER_HARD_BUDGET,
+	WORKER_SOFT_BUDGET,
+	WORKER_SOFT_STEER_MESSAGE_TYPE,
+} from "../extensions/workbench-runtime/core/worker-budget.ts";
 
 interface StubAPI {
 	commands: Map<string, unknown>;
@@ -96,6 +102,18 @@ function fakeCtx(entries: StubAPI["entries"], overrides: Partial<ExtensionContex
 
 function entry(customType: string, data: unknown): { type: string; customType: string; data?: unknown } {
 	return { type: "custom", customType, data };
+}
+
+/** Run a block with the worker role env set, restoring the previous value after. */
+function withWorkerRole(fn: () => void): void {
+	const previous = process.env[WORKER_ROLE_ENV];
+	process.env[WORKER_ROLE_ENV] = "worker";
+	try {
+		fn();
+	} finally {
+		if (previous === undefined) delete process.env[WORKER_ROLE_ENV];
+		else process.env[WORKER_ROLE_ENV] = previous;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +193,84 @@ test("compaction notes are deduplicated", async () => {
 	await compact![0]!({ type: "session_before_compact", preparation: {}, branchEntries: [], reason: "manual", willRetry: false, signal: new AbortController().signal } as never, fakeCtx([]) as never);
 	await compact![0]!({ type: "session_before_compact", preparation: {}, branchEntries: [], reason: "manual", willRetry: false, signal: new AbortController().signal } as never, fakeCtx([]) as never);
 	assert.equal(stub.messages.length, 1, "identical notes are not re-sent");
+});
+
+// ---------------------------------------------------------------------------
+// Worker context-budget protection (extension lifecycle, worker role only)
+// ---------------------------------------------------------------------------
+
+test("commander session_before_compact never cancels compaction (unchanged)", async () => {
+	const stub = makeStub();
+	workbenchRuntime(stub);
+	const beforeStart = stub.events.get("before_agent_start");
+	await beforeStart![0]!({ type: "before_agent_start", prompt: "commander task", systemPrompt: "" } as never, fakeCtx([]) as never);
+	const compact = stub.events.get("session_before_compact");
+	const result = await compact![0]!({ type: "session_before_compact", preparation: {}, branchEntries: [], reason: "threshold", willRetry: true, signal: new AbortController().signal } as never, fakeCtx([]) as never);
+	assert.equal(result, undefined, "commander compaction is never cancelled");
+	assert.ok(stub.messages.length > 0, "the commander supplement note is still sent");
+	assert.equal(stub.messages[0]?.customType, COMPACT_NOTE_MESSAGE_TYPE);
+});
+
+test("worker session_before_compact cancels compaction (never silently continues)", async () => {
+	const stub = makeStub();
+	withWorkerRole(() => workbenchRuntime(stub));
+	const compact = stub.events.get("session_before_compact");
+	assert.ok(compact && compact.length > 0);
+	const result = await compact[0]!({ type: "session_before_compact", preparation: {}, branchEntries: [], reason: "threshold", willRetry: true, signal: new AbortController().signal } as never, fakeCtx([]) as never);
+	assert.deepEqual(result, { cancel: true }, "worker role cancels compaction");
+	assert.equal(stub.messages.length, 0, "no supplement note for a cancelled worker compaction");
+	// A second worker compaction event also cancels.
+	const again = await compact[0]!({ type: "session_before_compact", preparation: {}, branchEntries: [], reason: "overflow", willRetry: true, signal: new AbortController().signal } as never, fakeCtx([]) as never);
+	assert.deepEqual(again, { cancel: true });
+});
+
+function assistantUsage(totalTokens: number): Record<string, unknown> {
+	return { input: 10, output: 5, cacheRead: 20, cacheWrite: 0, totalTokens, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+}
+
+function messageEndEvent(totalTokens: number): never {
+	return {
+		type: "message_end",
+		message: { role: "assistant", provider: "deepseek", model: "deepseek-v4-flash", usage: assistantUsage(totalTokens) },
+	} as never;
+}
+
+test("worker role sends exactly one hidden soft-budget steer at/above 80%", async () => {
+	const stub = makeStub();
+	withWorkerRole(() => workbenchRuntime(stub));
+	const messageEnd = stub.events.get("message_end");
+	assert.ok(messageEnd && messageEnd.length > 0);
+	const handler = messageEnd[0]!;
+	const ctx = fakeCtx([]) as never;
+
+	// Below the soft threshold: no steer.
+	await handler(messageEndEvent(799_999), ctx);
+	assert.equal(stub.messages.length, 0);
+
+	// At the soft threshold (80%): exactly one hidden steer.
+	await handler(messageEndEvent(WORKER_SOFT_BUDGET), ctx);
+	assert.equal(stub.messages.length, 1);
+	const steer = stub.messages[0]!;
+	assert.equal(steer.customType, WORKER_SOFT_STEER_MESSAGE_TYPE);
+	assert.equal(steer.display, false, "steer is hidden from the TUI");
+	assert.deepEqual(steer.options, { deliverAs: "steer" }, "delivered in the active tool loop, not deferred to a future user turn");
+	assert.match(steer.content, /stop/i);
+	assert.match(steer.content, /handoff/i);
+	assert.match(steer.content, /remaining work/i);
+
+	// Above the soft threshold, even toward the hard stop: still exactly one.
+	await handler(messageEndEvent(899_999), ctx);
+	await handler(messageEndEvent(WORKER_HARD_BUDGET), ctx);
+	assert.equal(stub.messages.length, 1, "the steer is one-shot");
+});
+
+test("commander session never receives the worker soft-budget steer", async () => {
+	const stub = makeStub();
+	workbenchRuntime(stub);
+	const messageEnd = stub.events.get("message_end");
+	assert.ok(messageEnd && messageEnd.length > 0);
+	await messageEnd[0]!(messageEndEvent(WORKER_HARD_BUDGET), fakeCtx([]) as never);
+	assert.equal(stub.messages.length, 0, "the steer is worker-role only");
 });
 
 // ---------------------------------------------------------------------------

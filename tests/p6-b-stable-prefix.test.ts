@@ -282,6 +282,37 @@ test("tool metadata audit flags dynamic values and passes static catalog metadat
 	}
 });
 
+test("workbench_delegate_worker metadata is static and carries the responsibility contract", () => {
+	const meta = WORKBENCH_TOOL_METADATA.workbench_delegate_worker;
+	// Every metadata field stays free of dynamic values (no dates, times,
+	// hashes, absolute paths, or concrete run/gate/task ids).
+	for (const field of [meta.description, meta.promptSnippet, ...meta.promptGuidelines]) {
+		assert.deepEqual(findDynamicValueMarkers(field), [], `delegate metadata must be static: ${field.slice(0, 80)}`);
+	}
+	const text = [meta.description, meta.promptSnippet, ...meta.promptGuidelines].join("\n");
+	// Worker-owned routine local implementation decisions inside the contract.
+	assert.match(text, /routine local implementation decisions inside the approved contract/);
+	// Sol-owned authority: requirements, cross-cutting architecture, scope,
+	// actual-diff review, final verification/gates, verdict.
+	assert.match(text, /Sol owns requirements, cross-cutting architecture, scope, actual-diff review, final verification\/gates, and the verdict/);
+	// DEV default: coherent source+tests+docs vertical slices, bounded
+	// low/medium-risk, observable acceptance criteria, no worker-prose acceptance.
+	assert.match(text, /source\+tests\+docs vertical slices/);
+	assert.match(text, /bounded low\/medium-risk implementation/);
+	assert.match(text, /observable acceptance criteria/);
+	assert.match(text, /Worker prose is never acceptance evidence/);
+	// The registration-order/schema contract is untouched: same name, same
+	// position, same parameter schema hash — pinned to the reviewed baseline
+	// (a self-comparison would prove nothing).
+	assert.equal(meta.name, "workbench_delegate_worker");
+	assert.equal(WORKBENCH_TOOL_NAMES.indexOf("workbench_delegate_worker"), WORKBENCH_TOOL_NAMES.length - 1, "delegate tool keeps its registration position");
+	assert.equal(
+		canonicalHash(WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker),
+		"2cf1f563f78ffe2c85d142c1f40deea7bc658365345554db11c80b8af6b521d9",
+		"delegate parameter schema hash is pinned to the reviewed baseline (schema unchanged)",
+	);
+});
+
 // ---------------------------------------------------------------------------
 // 5. Per-mode tool hashes: stable, pairwise different
 // ---------------------------------------------------------------------------
@@ -307,13 +338,13 @@ test("DEV / AUDIT / VERIFY tool hashes are stable and pairwise different", () =>
 
 test("mode matrix is exactly the P6-B spec matrix", () => {
 	assert.deepEqual(MODE_TOOLS.AUDIT, ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_read_run", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs"]);
-	assert.deepEqual(MODE_TOOLS.VERIFY, ["read", "grep", "find", "ls", ...WORKBENCH_TOOLS]);
+	assert.deepEqual(MODE_TOOLS.VERIFY, ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_run_recipe", "workbench_read_run", "workbench_run_gate", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs"]);
 	assert.deepEqual(MODE_TOOLS.DEV, ["read", "grep", "find", "ls", "bash", "edit", "write", ...WORKBENCH_TOOLS]);
 	// AUDIT has no mutating tools; VERIFY has no free bash/edit/write
-	for (const forbidden of ["bash", "edit", "write", "workbench_run_recipe", "workbench_run_gate"]) {
+	for (const forbidden of ["bash", "edit", "write", "workbench_run_recipe", "workbench_run_gate", "workbench_delegate_worker"]) {
 		assert.ok(!AUDIT_TOOLS.includes(forbidden), `AUDIT must not contain ${forbidden}`);
 	}
-	for (const forbidden of ["bash", "edit", "write"]) {
+	for (const forbidden of ["bash", "edit", "write", "workbench_delegate_worker"]) {
 		assert.ok(!VERIFY_TOOLS.includes(forbidden), `VERIFY must not contain ${forbidden}`);
 	}
 });
@@ -488,7 +519,7 @@ test("no dynamic tool loader: tools are registered statically in WORKBENCH_TOOL_
 	// exactly one setActiveTools call site (applyModeTools) — the tool set is
 	// swapped only on mode switches / session_start, never per turn
 	assert.equal(index.split("setActiveTools(").length - 1, 1, "setActiveTools called from exactly one place");
-	// exactly the 7 workbench tools are registered, in catalog order
+	// exactly the 8 workbench tools are registered, in catalog order
 	const registrations = index.split("pi.registerTool({").slice(1);
 	assert.equal(registrations.length, WORKBENCH_TOOL_NAMES.length, "one registerTool per catalog tool");
 	const registered: string[] = [];

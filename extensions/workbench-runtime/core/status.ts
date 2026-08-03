@@ -28,6 +28,12 @@ export interface StatusLineInput {
 	 * as-is when present — only shown when the data is valid.
 	 */
 	cache?: string;
+	/**
+	 * Split session-cost segment, e.g. "COST S:$19.195 W:$0.063 O:$0.424"
+	 * (O omitted when zero). Appended as-is when present — session-entry
+	 * facts only, deterministic.
+	 */
+	cost?: string;
 }
 
 const MAX_PROFILE_WIDTH = 32;
@@ -45,5 +51,6 @@ export function buildStatusLine(input: StatusLineInput): string {
 		parts.push(`run:${input.latestRun.run_id}${input.latestRun.ok ? "" : `:${input.latestRun.status}`}`);
 	}
 	if (input.cache) parts.push(input.cache);
+	if (input.cost) parts.push(input.cost);
 	return parts.join(" | ");
 }

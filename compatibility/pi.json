@@ -44,7 +44,8 @@
 		"smoke_print_mode": "pi -a -p",
 		"smoke_json_mode": "pi --mode json -a -p",
 		"extension_direct_load": "tests/p5-inventory.test.ts (stub ExtensionAPI)",
-		"cache_benchmark_cli": "npm run cache:report / npm run cache:doctor (scripts/cache-benchmark.ts)"
+		"cache_benchmark_cli": "npm run cache:report / npm run cache:doctor (scripts/cache-benchmark.ts)",
+		"controlled_worker_smoke": "short-lived pi --mode json --no-session child; deepseek/deepseek-v4-flash:max; 2 read-only turns; verified provider/model; exit 0; git status unchanged"
 	},
 	"provider_tested": {
 		"provider": "deepseek",

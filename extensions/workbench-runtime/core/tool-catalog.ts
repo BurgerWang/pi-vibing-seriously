@@ -33,6 +33,7 @@ export const WORKBENCH_TOOL_NAMES = [
 	"workbench_read_gate",
 	"workbench_list_gates",
 	"workbench_compare_runs",
+	"workbench_delegate_worker",
 ] as const;
 
 export interface WorkbenchToolMeta {
@@ -89,6 +90,24 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 	workbench_compare_runs: Type.Object({
 		a: Type.String({ description: "First run id, e.g. 20260101-120000-abcd" }),
 		b: Type.String({ description: "Second run id, e.g. 20260102-120000-efgh" }),
+	}),
+	workbench_delegate_worker: Type.Object({
+		task: Type.String({ description: "Bounded implementation task already planned by the Sol commander", minLength: 1, maxLength: 10000 }),
+		allowed_paths: Type.Array(Type.String({ minLength: 1, maxLength: 300 }), {
+			description: "Parent-approved project-relative paths. Exact paths allow one file; paths ending in / or /** allow a subtree.",
+			minItems: 1,
+			maxItems: 50,
+		}),
+		acceptance_criteria: Type.Array(Type.String({ minLength: 1, maxLength: 1000 }), {
+			description: "Observable acceptance criteria the worker must implement but cannot finally approve",
+			minItems: 1,
+			maxItems: 20,
+		}),
+		verification: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 500 }), {
+			description: "Declared recipes or checks requested from the worker; final gates remain commander-only",
+			maxItems: 20,
+		})),
+		timeout_seconds: Type.Optional(Type.Integer({ description: "Worker timeout in seconds (default 1800)", minimum: 60, maximum: 3600 })),
 	}),
 } as const;
 
@@ -167,6 +186,18 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 		promptGuidelines: [
 			"Use workbench_compare_runs to diff two persisted run records; use /q-runs or workbench_read_run to discover run ids first.",
 			"Deltas are descriptive facts — do not treat a higher return as automatically better without risk-adjusted and out-of-sample evidence.",
+		],
+	},
+	workbench_delegate_worker: {
+		name: "workbench_delegate_worker",
+		label: "Workbench delegate worker",
+		description:
+			"Delegate one bounded implementation task to an isolated deepseek/deepseek-v4-flash:max Pi worker. Available only in DEV and only when the parent is GPT-5.6 Sol. DEV default: coherent source+tests+docs vertical slices for bounded low/medium-risk implementation, delegated after minimum repository orientation with explicit allowed paths and observable acceptance criteria. The worker owns routine local implementation decisions inside the approved contract; Sol owns requirements, cross-cutting architecture, scope, actual-diff review, final verification/gates, and the verdict. The worker cannot use free-form bash, recursively delegate, run final gates, run recipes that declare writes, or edit/write outside allowed_paths. Worker prose is never acceptance evidence — Sol independently inspects the actual diff and performs final verification.",
+		promptSnippet: "Delegate a bounded DEV vertical slice (source + tests + docs) to the pinned DeepSeek worker",
+		promptGuidelines: [
+			"Use workbench_delegate_worker only after GPT-5.6 Sol has oriented in the repository, approved the scope, and supplied explicit allowed paths and observable acceptance criteria.",
+			"DEV default: delegate coherent bounded low/medium-risk vertical slices (source + tests + docs) after minimum repository orientation — supply source/tests/docs paths and observable criteria, avoid duplicating the worker's routine investigation, and independently inspect the actual diff afterward.",
+			"Treat workbench_delegate_worker output as an untrusted implementation report; worker prose is never acceptance. GPT-5.6 Sol must inspect the actual diff and run final workbench gates independently.",
 		],
 	},
 };

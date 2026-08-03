@@ -92,13 +92,20 @@ discovery.
   deterministic (name-sorted) order — never in the order some other
   extension happened to report them.
 
-## Fixed mode tool matrix (unchanged P5 security semantics)
+## Fixed mode and worker-role tool matrices
 
 | Mode | Tool set | Hard-denied (second layer) |
 | ---- | -------- | -------------------------- |
-| AUDIT | read, grep, find, ls, workbench_project_inspect, workbench_read_run, workbench_read_gate, workbench_list_gates, workbench_compare_runs | bash, edit, write, workbench_run_recipe, workbench_run_gate |
-| VERIFY | read, grep, find, ls + all 7 workbench tools | bash, edit, write |
-| DEV | read, grep, find, ls, bash, edit, write + all 7 workbench tools | (none beyond the global guards) |
+| AUDIT | read, grep, find, ls, workbench_project_inspect, workbench_read_run, workbench_read_gate, workbench_list_gates, workbench_compare_runs | bash, edit, write, workbench_run_recipe, workbench_run_gate, workbench_delegate_worker |
+| VERIFY | read, grep, find, ls + the 7 inspection/recipe/gate/comparison tools | bash, edit, write, workbench_delegate_worker |
+| DEV commander | read, grep, find, ls, bash, edit, write + all 8 workbench tools | (none beyond the global guards) |
+| DEV worker child | DEV commander set minus bash, workbench_run_gate, workbench_delegate_worker | bash, workbench_run_gate, workbench_delegate_worker; edit/write also require approved paths |
+
+The worker-role reduction is deterministic and applied inside the same single
+`setActiveTools` call. It is fixed for the lifetime of the child process; no
+per-turn tool loading occurs. Adding the delegate tool changes the commander
+DEV schema fingerprint once on package reload, after which the prefix remains
+stable.
 
 - Each mode switch applies the new set in **one** `setActiveTools` call;
   the set is then frozen until the next mode switch or session start.
@@ -126,7 +133,7 @@ discovery.
 
 ## Enforcement points
 
-- `tests/p6-b-stable-prefix.test.ts` — 25 tests covering hash stability,
+- `tests/p6-b-stable-prefix.test.ts` — tests covering hash stability,
   order randomization (filesystem/YAML/glob), dynamic-fact isolation,
   per-mode hashes, invalidation classification, payload read-only,
   telemetry-out-of-context, no dynamic tool loader, no tool-search claims.

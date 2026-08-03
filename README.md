@@ -9,7 +9,7 @@ A **Pi Package** (v0.8.0, P6) that adds a native development workbench to
 configuration, a declarative Recipe Runner, a **Gate Engine with evidence
 artifacts and a quant research validation ladder**, Pi-native TUI status,
 run reports and run comparison, workbench skills, `q-*` prompt templates,
-project templates, and **prompt-cache telemetry for the DeepSeek provider**
+project templates, and **provider prompt-cache telemetry for DeepSeek and OpenAI Codex**
 (P6-A: hash-only usage/context observability, inferred invalidations, and
 `/q-cache-*` commands) with a **stable-prefix contract** (P6-B: static tool
 registration and per-mode tool matrices, deterministic resource discovery,
@@ -29,10 +29,21 @@ hardcoded provider prices). It runs entirely on Pi's native
 mechanisms —
 extensions, custom commands, custom tools, skills, prompt templates,
 session custom entries, `ctx.ui.setStatus`/`setWidget`, and custom tool
-renderers. **It is not an agent framework, a daemon, a second agent loop,
-or a sandbox.**
+renderers. **It is not a standalone agent framework, daemon, background
+service, or sandbox.** In DEV, GPT-5.6 Sol may explicitly create one
+short-lived, pinned, non-recursive DeepSeek Pi worker for a bounded
+implementation task; the process ends with the tool call and never owns final
+verification. The default is to delegate coherent source+tests+docs vertical
+slices for bounded low/medium-risk work after minimum repository orientation:
+the worker owns routine local implementation decisions inside the approved
+contract, while Sol owns requirements, cross-cutting architecture, scope,
+actual-diff review, final gates, and the verdict. The worker's context is
+budget-protected (1,000,000-token window; one hidden steer at 80%,
+fail-closed termination at 90%, worker
+compaction cancelled — commander compaction unchanged).
 
 Documentation: [docs/architecture.md](docs/architecture.md) ·
+[docs/worker-delegation.md](docs/worker-delegation.md) ·
 [docs/security.md](docs/security.md) ·
 [docs/compatibility.md](docs/compatibility.md) ·
 [docs/project-onboarding.md](docs/project-onboarding.md) ·
@@ -74,9 +85,9 @@ exchange order routing, live high-frequency execution, and colocation.
 
 | Mode   | Active tools                                                                 | Hard-blocked at tool_call          | Use case                        |
 | ------ | ---------------------------------------------------------------------------- | ---------------------------------- | ------------------------------- |
-| AUDIT  | read, grep, find, ls, workbench_project_inspect, workbench_read_run, workbench_read_gate, workbench_list_gates, workbench_compare_runs | bash, edit, write, workbench_run_recipe, workbench_run_gate | Read-only inspection       |
-| DEV    | read, grep, find, ls, bash, edit, write, all `workbench_*` tools (plus any other extension tools) | —                     | Implementing features and fixes |
-| VERIFY | read, grep, find, ls, workbench_project_inspect, workbench_run_recipe, workbench_read_run, workbench_run_gate, workbench_read_gate, workbench_list_gates, workbench_compare_runs | bash, edit, write | Re-verifying completed work |
+| AUDIT  | read, grep, find, ls, workbench_project_inspect, workbench_read_run, workbench_read_gate, workbench_list_gates, workbench_compare_runs | bash, edit, write, workbench_run_recipe, workbench_run_gate, workbench_delegate_worker | Read-only inspection       |
+| DEV    | read, grep, find, ls, bash, edit, write, all `workbench_*` tools (including controlled worker delegation) | — | Implementing features and fixes |
+| VERIFY | read, grep, find, ls, workbench_project_inspect, workbench_run_recipe, workbench_read_run, workbench_run_gate, workbench_read_gate, workbench_list_gates, workbench_compare_runs | bash, edit, write, workbench_delegate_worker | Re-verifying completed work |
 
 - `/q-mode-audit` — switch to AUDIT
 - `/q-mode-dev` — switch to DEV (default)
@@ -101,6 +112,13 @@ WB:VERIFY | quant-research/stock-selection | Q3:FAIL | run:20260801-004
 task is active, when the latest gate run is not a PASS, or when forced with
 `/q-widget on`; it auto-clears otherwise. Content: task, phase, gate, last
 run, blocking reason. Plain ASCII, width-fitted for narrow terminals.
+- A **split-cost segment** in the status line — `COST S:$19.195 W:$0.063
+O:$0.424` (O omitted when zero, S and W always shown) — splits session cost
+from session entries into commander (assistant usage), worker
+(`workbench_delegate_worker` tool results) and other (other tool results,
+branch summaries, compaction). The Pi footer itself is never replaced;
+`/q-cost-status` prints the exact amounts plus the per-model commander
+breakdown in TUI and print/json modes.
 - **Run reports**: `/q-report latest | <run-id>` — manifest facts, gates and
 failed checks for gate runs, declared quant facts for quant runs.
 - **Run comparison**: `/q-compare <run-id-a> <run-id-b>` (or the
@@ -261,6 +279,7 @@ Custom tools (callable by the model):
 | `workbench_read_gate` | Read a gate run record by `run_id`, or a gate definition by `gate_id` (with latest status). |
 | `workbench_list_gates` | List the gates available for the current profile with their latest status. |
 | `workbench_compare_runs` | Compare two run records by `run_id`: exit code, duration, artifact changes, gate delta, quant metrics (read-only; also available in AUDIT). |
+| `workbench_delegate_worker` | DEV only: GPT-5.6 Sol delegates one scoped task to pinned `deepseek-v4-flash:max`; default is coherent source+tests+docs vertical slices for bounded low/medium-risk work after minimum repository orientation. The worker owns routine local implementation decisions inside the approved contract; Sol owns requirements, cross-cutting architecture, scope, actual-diff review, final gates, and the verdict — worker prose is never acceptance. Worker cannot recurse, use free bash, run final gates, or write outside approved paths. Worker context budget protected: hidden one-shot steer at 80% (800k/1M), fail-closed termination at 90% (900k), compaction cancelled in the worker role and any `compaction_start` event rejects the result. |
 
 Commands (same services, no duplicated logic):
 
@@ -275,6 +294,7 @@ Commands (same services, no duplicated logic):
 /q-report latest|<run-id>         # run report: manifest, gates, quant facts
 /q-compare <run-id-a> <run-id-b>  # diff two run records
 /q-widget on|off                  # force the widget on/off (it auto-shows during tasks and gate failures)
+/q-cost-status                    # split session cost: commander / worker / other + per-model commander
 ```
 
 ### Run artifacts
@@ -529,6 +549,10 @@ Other versions are untested — no compatibility is claimed for them.
   do-not-retry warnings. Notes are capped (40 lines / 2.4 KB), redacted,
   deduplicated, and contain only pointers — **run logs never enter the
   session context**.
+- Inside a delegated worker process the same event is **cancelled** so a
+  worker never silently continues through lossy compaction; the runner
+  also fails closed on any `compaction_start` event and on the pinned 90%
+  hard context budget. Commander compaction behavior is unchanged.
 
 ## Development
 
@@ -591,6 +615,8 @@ extensions/workbench-runtime/   # Pi extension
 │   └── tool-renderers.ts       # P4 TUI renderers (theme-colored Text components)
 └── core/
     ├── mode-policy.ts          # AUDIT/DEV/VERIFY tool sets + hard guard logic
+    ├── worker-policy.ts        # commander/model/role/path contract for delegation
+    ├── worker-budget.ts        # pinned worker context budget: 1M window, 80% soft / 90% hard
     ├── state.ts                # mode persistence (session entries)
     ├── config.ts               # project root detection, config loading, trust gate
     ├── recipe-schema.ts        # strict recipe validation, argv construction
@@ -604,6 +630,7 @@ extensions/workbench-runtime/   # Pi extension
     ├── quant-result.ts         # quant output contract validation
     ├── format.ts               # P4 display formatting (duration, deltas, width fit)
     ├── status.ts               # P4 footer status line builder
+    ├── cost-breakdown.ts       # split session cost (commander/worker/other) — pure, mirrors Pi footer
     ├── widget.ts               # P4 widget visibility + lines
     ├── report.ts               # P4 run reports, gate-run summaries, quant artifacts
     ├── compare.ts              # P4 run comparison (generic + quant deltas)

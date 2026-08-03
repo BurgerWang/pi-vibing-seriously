@@ -12,12 +12,11 @@
  *            list_gates, compare_runs). bash/edit/write and
  *            workbench_run_recipe/workbench_run_gate are hard-denied.
  *   DEV    — full local development tool set (all Pi built-in dev tools plus
- *            all workbench_* tools). Keeps any other non-managed custom tools
- *            that are currently active.
- *   VERIFY — P1: read, grep, find, ls plus workbench_project_inspect,
- *            workbench_run_recipe, workbench_read_run. NO free bash (P1
- *            replaced free model bash with the declarative Recipe Runner),
- *            no edit/write.
+ *            all workbench_* tools, including controlled worker delegation).
+ *            Keeps any other non-managed custom tools that are currently active.
+ *   VERIFY — read-only built-ins plus verification workbench tools. NO free
+ *            bash/edit/write and NO worker delegation: the Sol commander runs
+ *            declared recipes/gates and owns final judgment.
  *
  * Second-layer protection (P1 + P5): see core/command-guard.ts (token-based
  * destructive-command detection) and core/path-policy.ts (protected
@@ -33,6 +32,7 @@ import {
 	pathPolicyBlockReason,
 } from "./path-policy.ts";
 import { WORKBENCH_TOOL_NAMES } from "./tool-catalog.ts";
+import { WORKER_TOOL_NAME } from "./worker-policy.ts";
 
 export type WorkbenchMode = "AUDIT" | "DEV" | "VERIFY";
 
@@ -73,7 +73,13 @@ export const VERIFY_TOOLS: readonly string[] = [
 	"grep",
 	"find",
 	"ls",
-	...WORKBENCH_TOOLS,
+	"workbench_project_inspect",
+	"workbench_run_recipe",
+	"workbench_read_run",
+	"workbench_run_gate",
+	"workbench_read_gate",
+	"workbench_list_gates",
+	"workbench_compare_runs",
 ];
 
 export const MODE_TOOLS: Readonly<Record<WorkbenchMode, readonly string[]>> = {
@@ -110,9 +116,8 @@ export function isToolAllowedInMode(mode: WorkbenchMode, toolName: string): bool
  *            workbench tool) are denied.
  * P3: workbench_run_gate is also mutating (writes gate runs) and is denied
  *     in AUDIT.
- *   VERIFY — free bash is denied (P1 replaced free model bash with the
- *            declarative Recipe Runner), plus edit and write. Gate runs are
- *            allowed: they only execute declared recipes.
+ *   VERIFY — free bash/edit/write and worker delegation are denied. Gate runs
+ *            are allowed: they only execute declared recipes.
  */
 export function isToolHardDenied(mode: WorkbenchMode, toolName: string): boolean {
 	if (mode === "AUDIT") {
@@ -121,11 +126,12 @@ export function isToolHardDenied(mode: WorkbenchMode, toolName: string): boolean
 			toolName === "edit" ||
 			toolName === "write" ||
 			toolName === "workbench_run_recipe" ||
-			toolName === "workbench_run_gate"
+			toolName === "workbench_run_gate" ||
+			toolName === WORKER_TOOL_NAME
 		);
 	}
 	if (mode === "VERIFY") {
-		return toolName === "bash" || toolName === "edit" || toolName === "write";
+		return toolName === "bash" || toolName === "edit" || toolName === "write" || toolName === WORKER_TOOL_NAME;
 	}
 	return false;
 }
@@ -163,8 +169,8 @@ export interface ToolCallCheck {
 
 /**
  * Decide whether a tool call may execute.
- * 1. Hard mode denial (P1: bash/edit/write/workbench_run_recipe in AUDIT;
- *    bash/edit/write in VERIFY).
+ * 1. Hard mode denial (mutation/run/delegation in AUDIT;
+ *    bash/edit/write/delegation in VERIFY).
  * 2. Catastrophic command guard for bash input (all modes where bash can
  *    run) — token-based, see core/command-guard.ts.
  * 3. Path policy for structured tools and bash display-reads — protected

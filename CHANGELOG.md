@@ -2,6 +2,141 @@
 
 All notable changes to pi-dev-workbench are documented here.
 
+## [Unreleased] — Controlled Sol/DeepSeek Worker Delegation
+
+### Added
+
+- Static DEV-only `workbench_delegate_worker` tool: GPT-5.6 Sol delegates one
+  bounded implementation task to a short-lived, isolated
+  `deepseek/deepseek-v4-flash:max` Pi child process.
+- Fail-closed commander and worker model checks, non-recursive worker role,
+  sequential execution, abort/timeout propagation, bounded JSON event and
+  stderr handling, nested usage accounting, and parent-approved edit/write
+  path scopes.
+- Worker role guard blocks free-form bash and final gate execution; only
+  declared recipes with an empty `writes` list remain available for development checks. AUDIT and VERIFY
+  hard-deny delegation, preserving Sol-only final review and gate judgment.
+- Unit and spawn/integration tests for model pinning, environment isolation,
+  role restrictions, path containment, failures, timeout, and cancellation.
+- [Controlled Worker Delegation](docs/worker-delegation.md) documentation plus
+  architecture, security, mode-matrix, and tool-inventory updates.
+- Cache observability for the commander session and the worker report:
+  `openai-codex-responses` (Pi's Codex provider — GPT-5.6 Sol) is now a
+  verified Responses-style usage semantic (it streams through
+  `openai-responses-shared`), so Sol's telemetry records compute the exact
+  `cacheHitRatio` and the footer renders a numeric `CACHE` segment instead
+  of `CACHE N/A`; unknown api kinds still degrade to `partial`/`null`.
+- Deterministic worker cache summary (`workerCacheHitRatio` +
+  `formatWorkerCacheSummary` in `worker/runner.ts`): the
+  `workbench_delegate_worker` final text appends
+  `worker cache : uncached input N | cache read N | hit ratio P%`, the
+  structured `details` carry the aggregated `usage` and a nullable
+  `cache_hit_ratio`, and the top-level tool `usage` is preserved. A worker
+  with zero input (zero denominator) renders `hit ratio N/A` and
+  `cache_hit_ratio: null` — never NaN.
+- Raw Codex Responses usage fixture (same `finalizeResponse` mapping as
+  `openai-responses`) and telemetry regressions: a Sol record is verified,
+  computes the exact ratio, and renders the numeric CACHE footer; verified
+  zero-denominator usage yields `null`/`CACHE N/A`.
+- Split session-cost observability: `core/cost-breakdown.ts` mirrors Pi's
+  default footer cost aggregation over session entries — assistant message
+  usage lands in the commander bucket (grouped per
+  `provider/responseModel ?? model`), `workbench_delegate_worker` tool-result
+  usage in the worker bucket, and all other tool-result plus
+  `branch_summary`/`compaction` usage in the other bucket. Malformed,
+  non-finite and negative values contribute zero (never NaN, never a crash),
+  and `total` is exactly `commander + worker + other`; for valid data the
+  totals match Pi's native footer numbers.
+- Compact deterministic `COST S:$… W:$… O:$…` status segment (O omitted
+  when zero, S and W always shown) appended through the existing
+  `ctx.ui.setStatus` flow — the Pi footer is never replaced.
+- Status refresh after assistant/tool-result `message_end`; because Pi 0.83
+  persists messages after extension handlers, the pending event message is
+  included exactly once so COST/CACHE update immediately without double
+  counting.
+- `/q-cost-status` command printing the exact commander, worker, other and
+  total costs plus the per-model commander breakdown from
+  `ctx.sessionManager.getEntries()` — works in TUI and print/json modes via
+  the shared output helper.
+- Unit tests for classification, reconciliation (exact bucket sums and the
+  Pi-footer mirror), malformed values, formatting, status integration, the
+  registered command's TUI/print behavior, and the deterministic command
+  inventory (23 → 24 commands).
+- Worker context-budget protection: pure `core/worker-budget.ts` for the
+  pinned `deepseek/deepseek-v4-flash:max` window (1,000,000 context tokens,
+  80% soft handoff at 800,000, 90% hard stop at 900,000 — model-specific
+  and independent of the Commander/project compaction reserve) with
+  Pi-compatible context-token calculation (positive `totalTokens` wins,
+  otherwise the non-negative `input + output + cacheRead + cacheWrite`
+  sum; malformed values contribute zero).
+- Worker-role lifecycle only: one hidden active-loop (`display: false`,
+  `deliverAs: "steer"`) soft-budget handoff telling the worker to stop new
+  implementation, finish a concise handoff, and list the remaining work;
+  `session_before_compact`
+  is cancelled (`{ cancel: true }`) so a worker never silently continues
+  through lossy compaction. Commander compaction behavior is unchanged.
+- Runner budget/compaction tracking: per-message max context tokens and
+  ratio, soft-budget reach flag, `compaction_start` parsing with count and
+  distinct reasons, fail-closed termination at the 90% hard budget, and
+  rejection of any result with a compaction attempt or hard-budget stop.
+- The worker report exposes `max_context_tokens`, `max_context_ratio`,
+  `soft_budget_reached`, `hard_budget_exceeded`, `compaction_count` and
+  `compaction_reasons` in structured `details` plus a deterministic
+  `worker budget : max context N / 1000000 (P%) | soft 800000 | hard 900000`
+  text line.
+- Focused tests: pure threshold/fallback/malformed-usage boundaries, runner
+  soft/hard/compaction fail-closed behavior, and worker-role lifecycle
+  (one-shot steer, compaction cancel) with commander compaction unchanged.
+
+### Changed
+
+- The Pi-native architecture contract now permits an explicit short-lived Pi
+  worker loop while continuing to forbid standalone agent frameworks,
+  daemons, background services, recursive delegation, and worker-owned final
+  verification.
+- Sol/Worker responsibility split: Sol owns requirements, cross-cutting
+  architecture, scope, actual-diff review, final verification/gates, and the
+  verdict; the worker owns routine local implementation decisions inside the
+  approved contract and is expected to deliver a complete source+tests+docs
+  vertical slice (investigation, production source changes, tests, docs,
+  write-free recipe checks, in-scope repair) instead of stopping after a
+  narrow code edit.
+- Static `workbench_delegate_worker` metadata and the worker system prompt
+  now codify the DEV default: coherent bounded low/medium-risk vertical
+  slices after minimum repository orientation, with explicit
+  source/tests/docs paths and observable acceptance criteria, Sol
+  independent diff inspection, and worker prose never treated as acceptance.
+- Documentation: low/medium/high-risk delegation rubric, Commander-led
+  responsibilities, fresh-worker continuation (every delegation is a new
+  `--no-session` worker), and the one-writing-worker-per-worktree rule.
+- Focused tests for the responsibility boundaries, the complete-slice
+  task/prompt contract, and the static delegate-tool metadata. Worker
+  verification reports are observation-only: they may not self-mark any
+  acceptance criterion satisfied/met/passed/accepted/complete; only Sol maps
+  evidence to criteria.
+- `session_before_compact` is now cancelled inside the delegated worker
+  process only; the commander session still supplements (never cancels)
+  Pi compaction. The runner keeps exactly one short-lived
+  `pi --mode json -p --no-session` subprocess per invocation — no worker
+  process reuse, session persistence, or daemon is introduced.
+- `VERIFIED_API_KINDS` now includes `openai-codex-responses`; cache telemetry
+  and worker-delegation docs describe Sol and worker cache observability
+  accurately.
+- Reviewed policy corrections: high-risk work is Commander-led, not
+  categorically impossible to delegate — Sol owns requirements,
+  cross-cutting architecture, and core safety decisions and implements or
+  repairs high-risk work directly by default; only explicitly designed
+  bounded support slices (helper code, tests, docs) may be delegated, and
+  that is never the DEV default. The worker system prompt now requires
+  stopping and reporting instead of guessing or expanding scope when
+  completion needs an unapproved architecture, security/policy, destructive,
+  or out-of-scope decision.
+- The worker-prompt focused test asserts the explicit
+  no-final-PASS/acceptance prohibition instead of a banned substring, and
+  the delegate parameter-schema regression pins the reviewed baseline hash
+  `2cf1f563f78ffe2c85d142c1f40deea7bc658365345554db11c80b8af6b521d9`
+  instead of comparing the schema to itself.
+
 ## [0.8.0] — P6-E: Cache Benchmark, Hardening, and Release Gate
 
 Offline cache benchmarking, DeepSeek-final-constraint audit, privacy audit,

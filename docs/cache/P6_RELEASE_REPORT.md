@@ -36,9 +36,12 @@ For `openai-completions` (DeepSeek's api kind in Pi 0.83.0):
 `usage.input` is the **un-cached** input (`prompt_tokens − cacheRead −
 cacheWrite`), `cacheRead` is the cache-hit input (DeepSeek's
 `prompt_cache_hit_tokens`), `cacheWrite` is 0 for DeepSeek (not an error),
-`cost.total` is Pi's cost fact. `openai-responses`, `azure-openai-responses`
-and `anthropic-messages` semantics are also mapped; any other api kind is
-recorded as `unverified` — the workbench never guesses. Evidence:
+`cost.total` is Pi's cost fact. At the v0.8.0 release,
+`openai-responses`, `azure-openai-responses` and `anthropic-messages`
+semantics were also mapped; other api kinds were recorded as `unverified`.
+The current Unreleased runtime additionally verifies
+`openai-codex-responses`, which uses the same `openai-responses-shared`
+normalization. The workbench never guesses. Evidence:
 `extensions/workbench-runtime/cache/cache-types.ts` + tests
 `tests/p6-cache-usage.test.ts`.
 

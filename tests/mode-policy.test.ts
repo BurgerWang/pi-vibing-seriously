@@ -54,6 +54,7 @@ test("AUDIT tool set is exactly read/grep/find/ls + read-only workbench tools (P
 	assert.ok(!isToolAllowedInMode("AUDIT", "write"));
 	assert.ok(!isToolAllowedInMode("AUDIT", "workbench_run_recipe"));
 	assert.ok(!isToolAllowedInMode("AUDIT", "workbench_run_gate"));
+	assert.ok(!isToolAllowedInMode("AUDIT", "workbench_delegate_worker"));
 });
 
 test("DEV tool set contains all local development tools plus all workbench tools", () => {
@@ -63,22 +64,24 @@ test("DEV tool set contains all local development tools plus all workbench tools
 	}
 });
 
-test("VERIFY tool set has no bash/edit/write (P1: declared recipes only) and keeps workbench tools", () => {
-	assert.deepEqual(VERIFY_TOOLS, ["read", "grep", "find", "ls", ...WORKBENCH_TOOLS]);
-	for (const tool of ["read", "grep", "find", "ls", ...WORKBENCH_TOOLS]) {
+test("VERIFY tool set has no bash/edit/write/delegation and keeps verification tools", () => {
+	const expected = ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_run_recipe", "workbench_read_run", "workbench_run_gate", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs"];
+	assert.deepEqual(VERIFY_TOOLS, expected);
+	for (const tool of expected) {
 		assert.ok(isToolAllowedInMode("VERIFY", tool), `VERIFY should allow ${tool}`);
 	}
 	assert.ok(!isToolAllowedInMode("VERIFY", "bash"));
 	assert.ok(!isToolAllowedInMode("VERIFY", "edit"));
 	assert.ok(!isToolAllowedInMode("VERIFY", "write"));
+	assert.ok(!isToolAllowedInMode("VERIFY", "workbench_delegate_worker"));
 });
 
 // ---------------------------------------------------------------------------
 // Hard denial (second-layer tool_call guard)
 // ---------------------------------------------------------------------------
 
-test("AUDIT hard-denies bash, edit, write, workbench_run_recipe and workbench_run_gate (P3)", () => {
-	for (const tool of ["bash", "edit", "write", "workbench_run_recipe", "workbench_run_gate"]) {
+test("AUDIT hard-denies mutation, gate execution, and worker delegation", () => {
+	for (const tool of ["bash", "edit", "write", "workbench_run_recipe", "workbench_run_gate", "workbench_delegate_worker"]) {
 		assert.ok(isToolHardDenied("AUDIT", tool), `AUDIT should hard-deny ${tool}`);
 		assert.equal(checkToolCall("AUDIT", tool, {}).allowed, false, `${tool} blocked`);
 	}
@@ -99,10 +102,11 @@ test("VERIFY hard-denies bash, edit and write (no free bash in P1)", () => {
 	assert.equal(checkToolCall("VERIFY", "workbench_read_run", {}).allowed, true);
 	assert.equal(checkToolCall("VERIFY", "workbench_read_gate", {}).allowed, true);
 	assert.equal(checkToolCall("VERIFY", "workbench_list_gates", {}).allowed, true);
+	assert.equal(checkToolCall("VERIFY", "workbench_delegate_worker", {}).allowed, false);
 });
 
 test("DEV hard-denies nothing", () => {
-	for (const tool of ["read", "grep", "find", "ls", "bash", "edit", "write"]) {
+	for (const tool of ["read", "grep", "find", "ls", "bash", "edit", "write", "workbench_delegate_worker"]) {
 		assert.ok(!isToolHardDenied("DEV", tool));
 		assert.equal(checkToolCall("DEV", tool, {}).allowed, true, `${tool} allowed in DEV`);
 	}
@@ -234,6 +238,7 @@ test("AUDIT and VERIFY tool sets are strict — only their declared tools are ke
 	const active = ["read", "bash", "workbench_run_recipe", "workbench_gate_check"];
 	assert.deepEqual(computeActiveTools("AUDIT", active), ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_read_run", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs"]);
 	assert.deepEqual(computeActiveTools("VERIFY", active), ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_run_recipe", "workbench_read_run", "workbench_run_gate", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs"]);
+	assert.ok(!computeActiveTools("VERIFY", active).includes("workbench_delegate_worker"));
 });
 
 test("mode tool sets are deduplicated", () => {
