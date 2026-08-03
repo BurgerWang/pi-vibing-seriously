@@ -296,6 +296,40 @@ test("anthropic-messages api kind is verified (input excludes cache reads)", asy
 	assert.equal(record.cacheHitRatio, 0.8);
 });
 
+test("openai-codex-responses (Sol) is verified, computes exact ratio, renders numeric CACHE footer", async () => {
+	// Root-cause regression: Pi normalizes the Codex provider through
+	// openai-responses-shared, so GPT-5.6 Sol's nonzero cacheRead must never
+	// show CACHE N/A again.
+	const { telemetry } = makeHarness();
+	const record = await telemetry.observeMessageEnd(
+		baseFacts({
+			provider: "openai-codex",
+			model: "gpt-5.6-sol",
+			apiKind: "openai-codex-responses",
+			usage: { input: 10000, output: 500, cacheRead: 40000, cacheWrite: 0, totalTokens: 50500, cost: { total: 0.001 } },
+		}),
+	);
+	assert.ok(record);
+	assert.equal(record.apiKind, "openai-codex-responses");
+	assert.equal(record.usageSemanticStatus, "verified");
+	assert.equal(record.cacheHitRatio, 0.8, "exact ratio cacheRead/(input+cacheRead)");
+	assert.equal(telemetry.statusSegment(), "CACHE 80% | read 40k | miss 10k", "numeric CACHE footer, not N/A");
+});
+
+test("verified semantics with zero denominator: null ratio and CACHE N/A footer", async () => {
+	const { telemetry } = makeHarness();
+	const record = await telemetry.observeMessageEnd(
+		baseFacts({
+			apiKind: "openai-codex-responses",
+			usage: { input: 0, output: 10, cacheRead: 0, cacheWrite: 0, totalTokens: 10, cost: { total: 0 } },
+		}),
+	);
+	assert.ok(record);
+	assert.equal(record.usageSemanticStatus, "verified");
+	assert.equal(record.cacheHitRatio, null, "zero denominator yields null, never NaN/Infinity");
+	assert.equal(telemetry.statusSegment(), "CACHE N/A");
+});
+
 test("disabled telemetry records nothing", async () => {
 	const { telemetry } = makeHarness();
 	telemetry.setEnabled(false);

@@ -83,6 +83,25 @@
  *   - /q-cache-validate <manifest-path>; /q-cache-lineage <run-id|action-key>
  *     (never reads data files into the model context)
  *
+ * Unreleased additions (split session-cost observability):
+ *   - pure defensive cost-breakdown module (core/cost-breakdown.ts) that
+ *     mirrors Pi's default footer aggregation over session entries:
+ *     assistant usage => commander bucket (grouped per
+ *     provider/responseModel-or-model), toolResult usage with toolName
+ *     workbench_delegate_worker => worker bucket, other toolResult usage
+ *     and branch_summary/compaction usage => other bucket; malformed /
+ *     non-finite / negative values contribute zero; total is exactly the
+ *     bucket sum
+ *   - compact deterministic status segment COST S:$… W:$… O:$… (O omitted
+ *     when zero, S and W always shown) appended via the existing
+ *     ctx.ui.setStatus flow — the Pi footer is never replaced
+ *   - status refresh after assistant/tool-result message_end; the pending
+ *     message is included exactly once so COST/CACHE update immediately
+ *     despite Pi 0.83 persisting messages after extension handlers
+ *   - /q-cost-status prints exact commander/worker/other/total and the
+ *     per-model commander breakdown from ctx.sessionManager.getEntries()
+ *     in TUI and print/json modes
+ *
  * Registers native Pi commands:
  *   /q-mode-audit /q-mode-dev /q-mode-verify /q-status   — mode control (P0)
  *   /q-init <profile>                                    — project init (P1)
@@ -101,6 +120,7 @@
  *   /q-cache-clear <recipe|all>                        — clear action cache (P6-C)
  *   /q-cache-validate <manifest-path>                  — quant contract validation (P6-D)
  *   /q-cache-lineage <run-id|action-key>               — quant cache lineage (P6-D)
+ *   /q-cost-status                                     — split session cost (commander/worker/other)
  *
  * Registers workbench custom tools (P1/P3/P4):
  *   workbench_project_inspect — project root, git, stacks, profile, recipes,
@@ -173,8 +193,18 @@ import {
 	WORKER_PROJECT_ROOT_ENV,
 	WORKER_ROLE_ENV,
 } from "./core/worker-policy.ts";
-import { assertWorkerSucceeded, runDeepseekWorker } from "./worker/runner.ts";
+import { assertWorkerSucceeded, formatWorkerCacheSummary, runDeepseekWorker, type WorkerRunResult } from "./worker/runner.ts";
 import { isWorkerPathAllowedRealpath } from "./worker/path-scope.ts";
+import {
+	WORKER_HARD_BUDGET,
+	WORKER_MODEL_CONTEXT_TOKENS,
+	WORKER_SOFT_BUDGET,
+	WORKER_SOFT_STEER_MESSAGE_TYPE,
+	WORKER_SOFT_STEER_TEXT,
+	formatWorkerBudgetSummary,
+	workerBudgetBand,
+	workerContextTokens,
+} from "./core/worker-budget.ts";
 import {
 	describeMode,
 	loadModeFromEntries,
@@ -205,6 +235,7 @@ import { isValidRunId, listRuns, readLogSnippet, readManifest, readSummary } fro
 import { join } from "node:path";
 import { runStatusLabel, fitToWidth } from "./core/format.ts";
 import { buildStatusLine } from "./core/status.ts";
+import { buildCostBreakdown, costStatusSegment, renderCostBreakdown } from "./core/cost-breakdown.ts";
 import { buildWidgetLines, widgetAction, type WidgetState } from "./core/widget.ts";
 import { buildRunReport, latestGateRunSummary, resolveRunTarget } from "./core/report.ts";
 import { compareRuns } from "./core/compare.ts";
@@ -279,6 +310,42 @@ function rememberRunOutcome(toolName: string, details: Record<string, unknown>):
 	compactState.doNotRetry = collectDoNotRetry(recentOutcomes, MAX_DO_NOT_RETRY);
 }
 
+export function buildDelegateWorkerResult(result: WorkerRunResult, allowedPaths: readonly string[]) {
+	const text = [
+		result.output,
+		"",
+		`worker cache : ${formatWorkerCacheSummary(result.usage)}`,
+		`worker budget : ${formatWorkerBudgetSummary(result.maxContextTokens, result.maxContextRatio)}`,
+		"",
+		"--- Commander action required ---",
+		"This is an untrusted worker implementation report. GPT-5.6 Sol must inspect the actual diff and run final workbench verification/gates independently.",
+	].join("\n");
+	return {
+		content: [{ type: "text" as const, text }],
+		details: {
+			phase: "finished",
+			provider: result.provider,
+			model: result.model,
+			thinking_level: "max",
+			turns: result.turns,
+			stop_reason: result.stopReason,
+			exit_code: result.exitCode,
+			allowed_paths: allowedPaths,
+			final_judgment: "reserved_for_sol_commander",
+			usage: result.usage,
+			cache_hit_ratio: result.cacheHitRatio,
+			// Pinned worker context-budget and compaction facts (see core/worker-budget.ts).
+			max_context_tokens: result.maxContextTokens,
+			max_context_ratio: result.maxContextRatio,
+			soft_budget_reached: result.softBudgetReached,
+			hard_budget_exceeded: result.hardBudgetExceeded,
+			compaction_count: result.compactionCount,
+			compaction_reasons: result.compactionReasons,
+		},
+		usage: result.usage,
+	};
+}
+
 export default function workbenchRuntime(pi: ExtensionAPI): void {
 	let mode: WorkbenchMode = "DEV";
 	const workerRoleContext = {
@@ -286,6 +353,8 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		projectRoot: process.env[WORKER_PROJECT_ROOT_ENV],
 		allowedPaths: parseWorkerAllowedPaths(process.env[WORKER_ALLOWED_PATHS_ENV]),
 	};
+	/** One-shot worker soft-budget steer flag (worker role only, per process). */
+	let workerSoftSteerSent = false;
 
 	const execFn: ExecFn = (command, args, options) =>
 		pi.exec(command, args, { cwd: options?.cwd, timeout: options?.timeout, signal: options?.signal });
@@ -306,9 +375,12 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	/**
 	 * P4 status bar: WB:<MODE> | <profile> | <gate>:<status> | run:<id>.
 	 * All facts come from the project config and the persisted run records;
-	 * missing pieces degrade to shorter lines (mode-only fallback).
+	 * missing pieces degrade to shorter lines (mode-only fallback). The
+	 * P6-A CACHE segment and the Unreleased COST segment (split
+	 * commander/worker/other session cost from session entries) are
+	 * appended when they carry valid facts.
 	 */
-	async function refreshStatus(ctx: ExtensionContext): Promise<void> {
+	async function refreshStatus(ctx: ExtensionContext, pendingMessage?: unknown): Promise<void> {
 		// No status bar exists in print/json modes; skip silently.
 		if (ctx.mode === "print" || ctx.mode === "json") return;
 		let line = statusText(mode);
@@ -336,6 +408,10 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		// P6-A compact cache segment — only when the data is valid.
 		const cacheSegment = cacheTelemetry.statusSegment();
 		if (cacheSegment) line = line ? `${line} | ${cacheSegment}` : cacheSegment;
+		// Unreleased: split session-cost segment (commander/worker/other) —
+		// session-entry facts only, deterministic, O omitted when zero.
+		const costSegment = costStatusSegment(buildCostBreakdown(ctx.sessionManager.getEntries(), pendingMessage));
+		if (costSegment) line = line ? `${line} | ${costSegment}` : costSegment;
 		ctx.ui.setStatus(STATUS_KEY, line);
 	}
 
@@ -513,6 +589,11 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	// the facts visible to the model without putting any log content into the
 	// session context.
 	pi.on("session_before_compact", (_event, _ctx) => {
+		// Worker role only: a delegated worker must never silently continue
+		// through lossy compaction — cancel it and let the runner's pinned
+		// budget policy decide the outcome. Commander compaction behavior is
+		// unchanged (supplement, never cancel).
+		if (workerRoleContext.role === "worker") return { cancel: true };
 		cacheTelemetry.observeCompaction();
 		if (!shouldSupplement(compactState)) return undefined;
 		const note = buildCompactNote(compactState);
@@ -616,10 +697,10 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		return undefined;
 	});
 
-	// message_end handles ASSISTANT messages only. All telemetry work is
-	// wrapped so a failure can never block, delay or alter the request.
+	// message_end records telemetry for ASSISTANT messages and refreshes cost
+	// status for assistant/tool-result usage. All work is wrapped so a failure
+	// can never block, delay or alter the request.
 	pi.on("message_end", async (event, ctx) => {
-		if (event.message.role !== "assistant") return;
 		const message = event.message as {
 			provider?: string;
 			model?: string;
@@ -635,31 +716,73 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			stopReason?: string;
 			errorMessage?: string;
 		};
+		if (event.message.role === "assistant") {
+			try {
+				// Telemetry is best-effort and must never block or alter the request.
+				if (ctx.isProjectTrusted()) {
+					const projectRoot = await projectRootFor(ctx);
+					cacheTelemetry.setProjectRoot(projectRoot);
+					if (message.usage) {
+						await cacheTelemetry.observeMessageEnd({
+							provider: message.provider ?? "unknown",
+							model: message.model ?? "unknown",
+							apiKind: typeof message.api === "string" ? message.api : ctx.model?.api ?? null,
+							usage: message.usage,
+							stopReason: message.stopReason,
+							errorMessage: message.errorMessage,
+							thinkingLevel: ctx.thinkingLevel ?? pi.getThinkingLevel(),
+							systemPrompt: ctx.getSystemPrompt(),
+							activeToolNames: pi.getActiveTools(),
+							tools: pi.getAllTools().map((t) => ({
+								name: t.name,
+								description: t.description,
+								promptSnippet: (t as { promptSnippet?: string }).promptSnippet,
+								parameters: t.parameters,
+								promptGuidelines: t.promptGuidelines,
+							})),
+						});
+					}
+				}
+			} catch {
+				// telemetry must never break a model request
+			}
+			// Worker role only, one-shot: at/above the 80% soft budget, send one
+			// hidden steer telling the worker to stop new implementation, finish a
+			// concise handoff, and list the remaining work. The commander session
+			// never receives this steer.
+			if (workerRoleContext.role === "worker" && !workerSoftSteerSent) {
+				try {
+					const contextTokens = workerContextTokens(message.usage);
+					if (workerBudgetBand(contextTokens) !== "ok") {
+						pi.sendMessage(
+							{
+								customType: WORKER_SOFT_STEER_MESSAGE_TYPE,
+								content: WORKER_SOFT_STEER_TEXT,
+								display: false,
+								details: {
+									context_tokens: contextTokens,
+									budget: WORKER_MODEL_CONTEXT_TOKENS,
+									soft: WORKER_SOFT_BUDGET,
+									hard: WORKER_HARD_BUDGET,
+								},
+							},
+							{ deliverAs: "steer" },
+						);
+						workerSoftSteerSent = true;
+					}
+				} catch {
+					// a steer must never break a model request
+				}
+			}
+		}
+		// Pi 0.83 persists message_end after extension handlers. Include this
+		// pending assistant/tool-result message exactly once so COST is current
+		// immediately; buildCostBreakdown deduplicates if persistence ordering
+		// changes in a future compatible Pi version.
 		try {
-			if (!ctx.isProjectTrusted()) return;
-			const projectRoot = await projectRootFor(ctx);
-			cacheTelemetry.setProjectRoot(projectRoot);
-			if (!message.usage) return;
-			await cacheTelemetry.observeMessageEnd({
-				provider: message.provider ?? "unknown",
-				model: message.model ?? "unknown",
-				apiKind: typeof message.api === "string" ? message.api : ctx.model?.api ?? null,
-				usage: message.usage,
-				stopReason: message.stopReason,
-				errorMessage: message.errorMessage,
-				thinkingLevel: ctx.thinkingLevel ?? pi.getThinkingLevel(),
-				systemPrompt: ctx.getSystemPrompt(),
-				activeToolNames: pi.getActiveTools(),
-				tools: pi.getAllTools().map((t) => ({
-					name: t.name,
-					description: t.description,
-					promptSnippet: (t as { promptSnippet?: string }).promptSnippet,
-					parameters: t.parameters,
-					promptGuidelines: t.promptGuidelines,
-				})),
-			});
+			await refreshStatus(ctx, event.message);
 		} catch {
-			// telemetry must never break a model request
+			// a status refresh must never break a model request
 		}
 		return undefined;
 	});
@@ -708,6 +831,18 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 				`command guard  : rm -rf / or ~, git reset --hard, git clean -fd, git push --force, git checkout -- ., git restore ., git remote changes, rm .git, git config --global writes, sudo, npm/yarn/pnpm/bun publish`,
 			];
 			output(ctx, lines);
+		},
+	});
+
+	// ------------------------------------------------------ /q-cost-status
+
+	pi.registerCommand("q-cost-status", {
+		description:
+			"Show the split session cost breakdown from session entries: commander (assistant usage), worker (workbench_delegate_worker tool results), other (tools/summaries), total, and per-model commander costs",
+		handler: async (_args, ctx) => {
+			// Session facts only — no project config, no trust gate; works in
+			// TUI and print/json modes through the shared output helper.
+			output(ctx, renderCostBreakdown(buildCostBreakdown(ctx.sessionManager.getEntries())));
 		},
 	});
 
@@ -1860,27 +1995,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 				},
 			});
 			assertWorkerSucceeded(result);
-			const text = [
-				result.output,
-				"",
-				"--- Commander action required ---",
-				"This is an untrusted worker implementation report. GPT-5.6 Sol must inspect the actual diff and run final workbench verification/gates independently.",
-			].join("\n");
-			return {
-				content: [{ type: "text", text }],
-				details: {
-					phase: "finished",
-					provider: result.provider,
-					model: result.model,
-					thinking_level: "max",
-					turns: result.turns,
-					stop_reason: result.stopReason,
-					exit_code: result.exitCode,
-					allowed_paths: params.allowed_paths,
-					final_judgment: "reserved_for_sol_commander",
-				},
-				usage: result.usage,
-			};
+			return buildDelegateWorkerResult(result, params.allowed_paths);
 		},
 	});
 

@@ -1,5 +1,10 @@
 {
   "packages": [
     ".."
-  ]
+  ],
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 27200,
+    "keepRecentTokens": 20000
+  }
 }

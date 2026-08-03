@@ -58,6 +58,8 @@ extensions/workbench-runtime/
 └── core/
     ├── mode-policy.ts       # AUDIT/DEV/VERIFY tool sets; combined tool_call check
     ├── worker-policy.ts     # commander/model/role/path contract for controlled delegation
+    ├── worker-budget.ts     # pinned worker context budget: 1,000,000 window, 80% soft
+    │                        #   handoff / 90% hard stop, Pi-compatible context tokens
     ├── tool-catalog.ts      # P6-B static tool metadata + WORKBENCH_TOOL_NAMES order
     ├── command-guard.ts     # P5 token-based destructive-command detection (11 rules)
     ├── path-policy.ts       # P5 protected credential paths + per-mode read/write rules
@@ -75,6 +77,8 @@ extensions/workbench-runtime/
     ├── quant-result.ts      # quant output contract validation
     ├── format.ts            # P4 display formatting (duration, deltas, width fit)
     ├── status.ts            # P4 footer status line builder
+    ├── cost-breakdown.ts    # Unreleased: split session cost (commander/worker/other)
+    │                        #   — pure, mirrors Pi's footer aggregation, defensive
     ├── widget.ts            # P4 widget visibility + lines
     ├── report.ts            # P4 run reports, gate-run summaries, quant artifacts
     ├── compare.ts           # P4 run comparison (generic + quant deltas)
@@ -108,13 +112,35 @@ GPT-5.6 Sol parent in DEV
        --model deepseek/deepseek-v4-flash:max
   → child role matrix + hard guard: no recursion, no bash, no final gates
   → edit/write limited to parent-approved paths
+  → worker-role lifecycle: one hidden soft-budget steer at 80%, cancel
+       session_before_compact (commander compaction unchanged)
   → bounded JSON event stream + verified model identity + nested usage
-  → untrusted report to Sol
+  → per-message context tracking (max tokens/ratio, 80% soft flag),
+       compaction_start counting, 90% hard-stop termination, fail-closed
+       rejection of any compaction attempt or hard-budget stop
+  → untrusted report to Sol (budget/compaction facts in details + text)
   → Sol reads actual diff → VERIFY recipes/gates → final judgment
 ```
 
+Responsibility split: Sol owns requirements, cross-cutting architecture,
+scope, actual-diff review, final recipes/gates, and the verdict; the worker
+owns routine local implementation decisions inside the approved contract and
+delivers a complete source+tests+docs vertical slice (investigation,
+production changes, tests, docs, write-free recipe checks, in-scope repair).
+The DEV default is to delegate coherent bounded low/medium-risk vertical
+slices after minimum repository orientation; high-risk work is Commander-led —
+Sol owns requirements, cross-cutting architecture, and core safety decisions
+and implements or repairs high-risk work directly by default, delegating at
+most explicitly designed bounded support slices (helper code, tests, docs),
+never the decision itself. See
+[worker-delegation.md](worker-delegation.md) for the risk rubric,
+fresh-worker continuation, and the one-writing-worker-per-worktree rule.
+
 The delegate tool is static in the DEV prefix and absent from AUDIT/VERIFY.
-No worker process survives its tool call. See
+No worker process survives its tool call. The pinned budget policy lives in
+`core/worker-budget.ts` (pure): a 1,000,000-token window, 80% soft handoff
+(800,000), 90% hard stop (900,000) — model-specific, independent of the
+Commander/project compaction reserve. See
 [worker-delegation.md](worker-delegation.md).
 
 ### Recipe execution
@@ -149,13 +175,16 @@ workbench_run_recipe / /q-run
 workbench events (task, phases, run/gate outcomes, edited files)
   → compactState (in-memory, bounded)
 session_before_compact
-  → if shouldSupplement(state):
-      pi.appendEntry("workbench-state", state)        (durable across compaction
-                                                       and session replacement)
-      pi.sendMessage({customType: "workbench-compact-note",
-                      display: false}, {deliverAs: "nextTurn"})
-      → hidden, bounded ASCII note in the next turn's context
-  → never cancels, never replaces Pi's own compaction summary
+  → if role == worker: return { cancel: true }   (worker never continues
+       through lossy compaction; runner budget policy owns the outcome)
+  → else (commander, unchanged):
+      if shouldSupplement(state):
+        pi.appendEntry("workbench-state", state)        (durable across compaction
+                                                         and session replacement)
+        pi.sendMessage({customType: "workbench-compact-note",
+                        display: false}, {deliverAs: "nextTurn"})
+        → hidden, bounded ASCII note in the next turn's context
+      → never cancels, never replaces Pi's own compaction summary
 session_start → loadCompactStateFromEntries(entries)   (restore)
 ```
 
@@ -186,6 +215,42 @@ Rules: hash-only (never text), `usage.cost.total` is the cost fact,
 cacheHitRatio only for verified api kinds, telemetry never blocks or mutates
 requests, opt-out via `project.yaml` `cache.telemetry: false`. See
 docs/cache/ for details.
+
+## Session cost breakdown (commander / worker / other)
+
+`core/cost-breakdown.ts` is a pure, defensive mirror of Pi's default footer
+cost aggregation over `ctx.sessionManager.getEntries()` (the same loop
+footer.js runs for the native session cost):
+
+- assistant message usage → **commander** bucket, grouped per
+  `provider/responseModel ?? model` (the same key Pi's
+  `getUsageCostBreakdown` uses);
+- `toolResult` usage whose `toolName` is `workbench_delegate_worker` →
+  **worker** bucket;
+- every other `toolResult` usage plus `branch_summary`/`compaction` usage →
+  **other** bucket (Pi's "Tools/summaries" bucket).
+
+Token totals follow Pi's convention (`input + output + cacheRead +
+cacheWrite`). The only deliberate differences from Pi are defensive:
+malformed, non-finite or negative values contribute **zero** (never NaN,
+never a crash), and `total` is computed as `commander + worker + other`, so
+reconciliation holds exactly by construction. For valid data the totals are
+identical to Pi's native footer numbers.
+
+The status line appends a deterministic `COST S:$… W:$… O:$…` segment
+(S and W always shown once the session has any usage facts, O omitted when
+zero) through the existing `refreshStatus`/`ctx.ui.setStatus` flow — the Pi
+footer is never replaced and no other TUI surface changes. `refreshStatus`
+also runs after assistant and tool-result `message_end` events (in addition
+to the existing session/tool refreshes). Pi 0.83 persists the finished
+message after extension handlers, so the event message is included as a
+pending fact exactly once; identity/timestamp deduplication prevents double
+counting if persistence ordering changes in a future compatible Pi version.
+
+`/q-cost-status` prints the exact commander, worker, other and total amounts
+(plus token totals) and the per-model commander breakdown. It reads session
+entries only — no project config, no trust gate — and works in TUI and
+print/json modes through the shared `output()` helper.
 
 ## Stable prefix contract (P6-B)
 
@@ -250,3 +315,13 @@ See docs/cache/cache-benchmark.md and P6_BENCHMARK_REPORT.md.
   observability, inferred invalidations, JSONL store with rotation,
   /q-cache-status /q-cache-report /q-cache-doctor, footer cache segment
   (observation only — no Recipe Action Cache yet)
+- Unreleased: split session-cost observability — pure cost-breakdown module
+  (commander/worker/other buckets mirroring Pi's footer aggregation), COST
+  status segment, current assistant/tool-result message_end refresh,
+  /q-cost-status
+- Unreleased: worker context-budget protection — pure `core/worker-budget.ts`
+  (1,000,000-token pinned window, 80% soft handoff / 90% hard stop,
+  Pi-compatible context tokens), one-shot hidden soft-budget steer and
+  compaction cancellation in the worker-role lifecycle only, runner
+  budget/compaction tracking with fail-closed hard stop and compaction
+  rejection, budget/compaction facts in the worker report

@@ -96,13 +96,37 @@ Defense-in-depth controls:
 - the tool executes sequentially, propagates abort, enforces a timeout, and
   bounds stdout/stderr processing.
 
+Context-budget protection (model-specific, independent of the
+Commander/project compaction reserve):
+
+- the pinned worker window is 1,000,000 context tokens; per-message tokens
+  use Pi's normalized usage semantics (positive `totalTokens` wins,
+  otherwise the non-negative `input + output + cacheRead + cacheWrite` sum);
+- at 800,000 tokens (80%) the worker role sends one hidden steer to stop new
+  implementation, finish a concise handoff, and list remaining work;
+- at 900,000 tokens (90%) the runner terminates the child and the invocation
+  fails closed;
+- in the worker role only, `session_before_compact` is cancelled
+  (`{ cancel: true }`) so a worker never silently continues through lossy
+  compaction — the Commander's compaction behavior is unchanged;
+- defense in depth: the runner counts `compaction_start` events (with
+  distinct reasons) and any compaction attempt fails the result closed even
+  if the child exits 0.
+
 Only recipes with an empty declared `writes` list are available to a worker.
 This blocks honestly declared mutating recipes, but recipes remain
 trusted-project discipline mechanisms: a malicious command can write despite
 an empty declaration. They are not an OS sandbox or a substitute for reviewing
 repository configuration. Provider
 credentials may be used by the child but are never copied into the task
-message or tool details. See
+message or tool details.
+
+Every delegation is a fresh `--no-session` child — worker sessions are never
+resumed (fresh-worker continuation), so no worker state persists between
+delegations. The tool executes sequentially and a worker can never delegate,
+so at most one writing worker exists per worktree at any time; Sol must not
+start a second writing delegation before the first has returned and its diff
+has been inspected. See
 [worker-delegation.md](worker-delegation.md).
 
 ## Records and redaction
@@ -158,12 +182,18 @@ never outputs environment values.
 
 ## Compaction
 
-The workbench never cancels Pi compaction and never replaces Pi's summary.
-On `session_before_compact` it may add (only when there is meaningful state)
-a hidden, bounded note — task, mode, gates, last run, evidence paths, next
-step, do-not-retry — via `pi.sendMessage(..., { deliverAs: "nextTurn" })`
-and a durable custom entry. No run logs are ever written into the session
-context.
+In the commander session the workbench never cancels Pi compaction and never
+replaces Pi's summary. On `session_before_compact` it may add (only when
+there is meaningful state) a hidden, bounded note — task, mode, gates, last
+run, evidence paths, next step, do-not-retry — via
+`pi.sendMessage(..., { deliverAs: "nextTurn" })` and a durable custom entry.
+No run logs are ever written into the session context.
+
+Inside a delegated worker process the same event is cancelled
+(`{ cancel: true }`) so a worker never silently continues through lossy
+compaction; the runner additionally fails closed on any `compaction_start`
+event and on the 90% hard context budget (see Controlled worker delegation
+above).
 
 ## Cache layer (P6)
 

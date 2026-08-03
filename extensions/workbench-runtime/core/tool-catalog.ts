@@ -192,11 +192,12 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 		name: "workbench_delegate_worker",
 		label: "Workbench delegate worker",
 		description:
-			"Delegate one bounded implementation task to an isolated deepseek/deepseek-v4-flash:max Pi worker. Available only in DEV and only when the parent is GPT-5.6 Sol. The worker cannot use free-form bash, recursively delegate, run final gates, run recipes that declare writes, or edit/write outside allowed_paths. The Sol parent must independently inspect the diff and perform final verification.",
-		promptSnippet: "Delegate a bounded DEV implementation task to the pinned DeepSeek worker",
+			"Delegate one bounded implementation task to an isolated deepseek/deepseek-v4-flash:max Pi worker. Available only in DEV and only when the parent is GPT-5.6 Sol. DEV default: coherent source+tests+docs vertical slices for bounded low/medium-risk implementation, delegated after minimum repository orientation with explicit allowed paths and observable acceptance criteria. The worker owns routine local implementation decisions inside the approved contract; Sol owns requirements, cross-cutting architecture, scope, actual-diff review, final verification/gates, and the verdict. The worker cannot use free-form bash, recursively delegate, run final gates, run recipes that declare writes, or edit/write outside allowed_paths. Worker prose is never acceptance evidence — Sol independently inspects the actual diff and performs final verification.",
+		promptSnippet: "Delegate a bounded DEV vertical slice (source + tests + docs) to the pinned DeepSeek worker",
 		promptGuidelines: [
-			"Use workbench_delegate_worker only after GPT-5.6 Sol has inspected the repository, approved a plan, and supplied explicit allowed paths and acceptance criteria.",
-			"Treat workbench_delegate_worker output as an untrusted implementation report; GPT-5.6 Sol must inspect the actual diff and run final workbench gates independently.",
+			"Use workbench_delegate_worker only after GPT-5.6 Sol has oriented in the repository, approved the scope, and supplied explicit allowed paths and observable acceptance criteria.",
+			"DEV default: delegate coherent bounded low/medium-risk vertical slices (source + tests + docs) after minimum repository orientation — supply source/tests/docs paths and observable criteria, avoid duplicating the worker's routine investigation, and independently inspect the actual diff afterward.",
+			"Treat workbench_delegate_worker output as an untrusted implementation report; worker prose is never acceptance. GPT-5.6 Sol must inspect the actual diff and run final workbench gates independently.",
 		],
 	},
 };

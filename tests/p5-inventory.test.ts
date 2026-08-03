@@ -5,7 +5,7 @@
  * 1. Direct load: the extension module is imported and its default export is
  *    invoked with a stub ExtensionAPI — no Pi runtime needed. This is the
  *    "extension direct-load smoke test" as a repeatable unit test.
- * 2. Inventory: the registered command set must be EXACTLY the 18
+ * 2. Inventory: the registered command set must be EXACTLY the 24
  *    deterministic workbench commands, the 8 workbench tools, and the 7
  *    prompt templates — no missing, extra, or colliding names.
  */
@@ -47,6 +47,8 @@ export const EXPECTED_COMMANDS = [
 	// P6-D quant cache contract commands.
 	"q-cache-validate",
 	"q-cache-lineage",
+	// Unreleased split session-cost observability command.
+	"q-cost-status",
 ] as const;
 
 export const EXPECTED_TOOLS = [
@@ -90,14 +92,14 @@ function makeStub(): ExtensionAPI & Record<string, unknown> {
 	return stub as unknown as ExtensionAPI & Record<string, unknown>;
 }
 
-test("extension module direct-loads and registers exactly the 23 deterministic commands", () => {
+test("extension module direct-loads and registers exactly the 24 deterministic commands", () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	const registered = stub.commands as Map<string, unknown>;
 	assert.deepEqual(
 		[...registered.keys()].sort(),
 		[...EXPECTED_COMMANDS].sort(),
-		"registered commands must be exactly the P5+P6-A+P6-C+P6-D command list",
+		"registered commands must be exactly the P5+P6-A+P6-C+P6-D+Unreleased command list",
 	);
 });
 

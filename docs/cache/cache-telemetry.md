@@ -92,8 +92,13 @@ hardcoded):
 `usageSemanticStatus` rules:
 
 - `verified` — api kind is one of the kinds whose normalized semantics are
-  confirmed in the installed Pi source AND all usage fields are finite,
-  non-negative and `totalTokens` is consistent.
+  confirmed in the installed Pi source (`openai-completions`,
+  `openai-responses`, `azure-openai-responses`, `openai-codex-responses`,
+  `anthropic-messages`) AND all usage fields are finite, non-negative and
+  `totalTokens` is consistent. `openai-codex-responses` (Pi's Codex
+  provider, e.g. GPT-5.6 Sol) streams through the same
+  `openai-responses-shared` normalization as the other Responses kinds, so
+  `usage.input` is the un-cached input there too.
 - `partial` — structure looks right but the api kind is not in the verified
   set: the ratio is `null`.
 - `unverified` — missing/invalid usage or inconsistent totals: the ratio is
@@ -157,6 +162,6 @@ Pi footer itself is never replaced):
 CACHE 72% | read 184k | miss 71k
 ```
 
-`CACHE N/A` is shown when the usage semantics are not verified. Nothing is
-shown before the first request, in print/json modes, or when telemetry is
-disabled.
+`CACHE N/A` is shown when the usage semantics are not verified or the
+input-plus-cache-read denominator is zero. Nothing is shown before the first
+request, in print/json modes, or when telemetry is disabled.

@@ -64,12 +64,19 @@ established.** DeepSeek simply does not bill cache writes.
   `message_end` — it never parses the raw HTTP response.
 - For the api kinds verified in the installed Pi source
   (`openai-completions`, `openai-responses`, `azure-openai-responses`,
-  `anthropic-messages`), `usage.input` is confirmed to be the **un-cached**
-  portion of the input, so the hit ratio is:
+  `openai-codex-responses`, `anthropic-messages`), `usage.input` is
+  confirmed to be the **un-cached** portion of the input, so the hit ratio
+  is:
 
   ```
   cacheHitRatio = cacheRead / (input + cacheRead)
   ```
+
+  `openai-codex-responses` (Pi's Codex provider — the GPT-5.6 Sol
+  commander) streams through the same `openai-responses-shared`
+  `finalizeResponse` normalization as `openai-responses`, so its
+  `usage.input`/`usage.cacheRead` semantics are identical and the Sol
+  session gets a numeric `CACHE` footer instead of `CACHE N/A`.
 
 - For any other api kind the normalized usage is kept, `cacheHitRatio` is
   `null`, and the record's `usageSemanticStatus` is `unverified`/`partial`

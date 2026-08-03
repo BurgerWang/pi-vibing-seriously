@@ -24,9 +24,11 @@ The prompt-cache layer (P6-A..E) is provider-agnostic observation: it only
 reads Pi's normalized `usage` and the model metadata Pi provides. The usage
 semantics were verified against the installed Pi 0.83.0 source for
 `openai-completions` (tested live: deepseek / deepseek-v4-flash, thinking
-max, DEV mode), plus `openai-responses`, `azure-openai-responses` and
-`anthropic-messages` (mapped, not live-tested). Any other api kind is
-recorded `unverified` — the workbench never guesses. `cacheWrite = 0` is
+max, DEV mode) and `openai-codex-responses` (tested live: openai-codex /
+gpt-5.6-sol, thinking high, DEV mode), plus `openai-responses`,
+`azure-openai-responses` and `anthropic-messages` (mapped, not live-tested).
+Any other api kind is recorded `partial`/`unverified` — the workbench never
+guesses. `cacheWrite = 0` is
 normal for DeepSeek and never treated as an error. Controlled worker
 execution was live-tested with `deepseek-v4-flash:max`: 2 turns, verified
 provider/model, stop reason `stop`, exit 0, and no file modifications.

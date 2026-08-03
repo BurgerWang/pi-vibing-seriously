@@ -61,7 +61,7 @@ equal in-Pi numbers.
 | `outputTokens` | Σ `usage.output`. |
 | `cacheWriteTokens` | Σ `usage.cacheWrite` (0 for DeepSeek — it reports no cache writes; a zero is NOT an error). |
 | `totalTokens` | Σ `usage.totalTokens` (input + output + cacheRead + cacheWrite per record). |
-| `cacheHitRatio` | `cacheRead / (input + cacheRead)` over the scope totals; `null` when usage semantics are not verified or the denominator is 0. Only meaningful for api kinds whose semantics were confirmed in the installed Pi source (`openai-completions`, `openai-responses`, `azure-openai-responses`, `anthropic-messages`). |
+| `cacheHitRatio` | `cacheRead / (input + cacheRead)` over the scope totals; `null` when usage semantics are not verified or the denominator is 0. Only meaningful for api kinds whose semantics were confirmed in the installed Pi source (`openai-completions`, `openai-responses`, `azure-openai-responses`, `openai-codex-responses`, `anthropic-messages`). |
 | `usageSemanticStatus` | Worst status across records: `verified` (api kind verified + internally consistent numbers), `partial` (structure ok, api kind unverified), `unverified` (invalid/missing usage). Never guessed. |
 | `providerReportedCost` | Σ `usage.cost` — Pi's `usage.cost.total`, the cost fact from the provider's own billing fields. |
 | `estimatedAvoidedCost` | Σ (`cacheRead` × `cacheRead` rate)/1M tokens using the **explicit `--cost-map`**; `null` if any record's provider/model has no rate in the map (strict — no partial estimates) or no map is given. |

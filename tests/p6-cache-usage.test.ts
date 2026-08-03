@@ -19,6 +19,10 @@
  *       cacheRead  = input_tokens_details.cached_tokens
  *       totalTokens = raw total_tokens
  *
+ *   - openai-codex-responses: the Codex provider streams through the same
+ *     openai-responses-shared finalizeResponse mapping, so the raw ->
+ *     normalized conversion is identical to openai-responses.
+ *
  * The runtime itself never parses raw payloads — it consumes Pi's
  * normalized usage and only computes a ratio for api kinds whose semantics
  * are confirmed (VERIFIED_API_KINDS).
@@ -74,6 +78,21 @@ function normalizeResponses(raw: {
 	};
 }
 
+/**
+ * Pi's openai-codex-responses stream (pi-ai dist/api/openai-codex-responses.js)
+ * calls processResponsesStream from openai-responses-shared, so Codex raw
+ * Responses payloads normalize through the exact same finalizeResponse
+ * mapping as openai-responses.
+ */
+function normalizeCodexResponses(raw: {
+	input_tokens: number;
+	input_tokens_details?: { cached_tokens?: number; cache_write_tokens?: number };
+	output_tokens: number;
+	total_tokens: number;
+}): PiUsageLike {
+	return normalizeResponses(raw);
+}
+
 test("DeepSeek Chat Completions usage fixture maps to Pi normalized usage", () => {
 	// DeepSeek API: prompt_tokens = hit + miss; hit reported top-level.
 	const raw = { prompt_tokens: 50000, prompt_cache_hit_tokens: 40000, prompt_cache_miss_tokens: 10000, completion_tokens: 2000 };
@@ -117,6 +136,27 @@ test("DeepSeek Responses usage fixture maps to Pi normalized usage", () => {
 	const semantics = verifyUsageSemantics("openai-responses", usage);
 	assert.equal(semantics.status, "verified");
 	assert.equal(semantics.cacheHitRatio, 0.8);
+});
+
+test("Codex Responses raw usage fixture is verified with Responses semantics and exact ratio", () => {
+	// OpenAI Codex reports cached tokens inside input_tokens_details; Pi
+	// normalizes the Codex stream through openai-responses-shared, so
+	// usage.input is the un-cached portion and cacheRead the cached portion.
+	const raw = {
+		input_tokens: 50000,
+		input_tokens_details: { cached_tokens: 40000, cache_write_tokens: 0 },
+		output_tokens: 2000,
+		total_tokens: 52000,
+	};
+	const usage = normalizeCodexResponses(raw);
+	assert.equal(usage.input, 10000, "codex: input excludes cached tokens");
+	assert.equal(usage.cacheRead, 40000);
+	assert.equal(usage.cacheWrite, 0);
+	assert.equal(usage.output, 2000);
+	assert.equal(usage.totalTokens, 52000);
+	const semantics = verifyUsageSemantics("openai-codex-responses", usage);
+	assert.equal(semantics.status, "verified", "openai-codex-responses uses verified Responses semantics");
+	assert.equal(semantics.cacheHitRatio, 40000 / (10000 + 40000), "exact ratio cacheRead/(input+cacheRead)");
 });
 
 test("Pi normalized usage fixture (as delivered on assistant messages)", () => {

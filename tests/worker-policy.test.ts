@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 
+import { WORKBENCH_TOOL_METADATA } from "../extensions/workbench-runtime/core/tool-catalog.ts";
 import {
 	commanderBlockReason,
 	computeRoleActiveTools,
@@ -109,4 +110,63 @@ test("formatted worker task carries the complete bounded contract in the user me
 	assert.match(text, /- Reject invalid input/);
 	assert.match(text, /Requested verification:/);
 	assert.ok(!text.includes("final PASS"));
+});
+
+test("the complete-slice task contract travels fully and stays acceptance-free", () => {
+	const contract: WorkerTaskContract = {
+		task: "Implement the parser slice with tests and docs",
+		allowedPaths: ["src/parser/**", "tests/parser.test.ts", "docs/parser.md"],
+		acceptanceCriteria: ["Unit tests cover the new option", "Docs describe the new option"],
+		verification: ["Run the unit-test recipe", "Run the docs-check recipe"],
+	};
+	const text = formatWorkerTask(contract);
+	// Source, tests, and docs paths plus observable criteria and requested
+	// verification all travel in the worker user message.
+	for (const path of contract.allowedPaths) assert.ok(text.includes(path), `allowed path missing: ${path}`);
+	for (const criterion of contract.acceptanceCriteria) assert.ok(text.includes(criterion), `criterion missing: ${criterion}`);
+	for (const step of contract.verification) assert.ok(text.includes(step), `verification step missing: ${step}`);
+	// The contract is what the worker implements; acceptance stays with Sol.
+	assert.ok(!text.includes("acceptance evidence"), "the task text never claims acceptance evidence");
+	assert.ok(!text.includes("final PASS"), "the task text never grants a final verdict");
+});
+
+test("delegate-tool metadata codifies the Sol/worker responsibility split and the vertical-slice default", () => {
+	const meta = WORKBENCH_TOOL_METADATA.workbench_delegate_worker;
+	const text = [meta.description, meta.promptSnippet, ...meta.promptGuidelines].join("\n");
+	// Worker-owned: routine local implementation decisions inside the contract.
+	assert.match(text, /routine local implementation decisions inside the approved contract/);
+	// Sol-owned: requirements, cross-cutting architecture, scope, actual-diff
+	// review, final verification/gates, and verdict.
+	assert.match(text, /Sol owns requirements, cross-cutting architecture, scope, actual-diff review, final verification\/gates, and the verdict/);
+	// DEV default: coherent source+tests+docs vertical slices for bounded
+	// low/medium-risk implementation, with explicit paths and observable criteria.
+	assert.match(text, /source\+tests\+docs vertical slices/);
+	assert.match(text, /bounded low\/medium-risk implementation/);
+	assert.match(text, /observable acceptance criteria/);
+	assert.match(text, /minimum repository orientation/);
+	assert.match(text, /avoid duplicating the worker's routine investigation/);
+	// Worker prose is never acceptance; Sol independently inspects the diff.
+	assert.match(text, /Worker prose is never acceptance evidence/);
+	assert.match(text, /untrusted implementation report/);
+	assert.match(text, /independently inspect the actual diff/);
+});
+
+test("worker-delegation documentation defines the risk rubric, Commander-led high-risk responsibilities, fresh continuation, and one writing worker per worktree", async () => {
+	const doc = await readFile(new URL("../docs/worker-delegation.md", import.meta.url), "utf8");
+	// Risk rubric with low/medium/high tiers.
+	assert.match(doc, /## Risk rubric/);
+	assert.match(doc, /\| Low \|/);
+	assert.match(doc, /\| Medium \|/);
+	assert.match(doc, /\| High \|/);
+	assert.match(doc, /Commander-led: Sol owns the decision and implements or repairs directly by default/);
+	assert.match(doc, /explicitly designed bounded support slices/);
+	assert.match(doc, /never the DEV default/);
+	// Commander-led responsibilities are spelled out.
+	assert.match(doc, /### Responsibility split/);
+	assert.match(doc, /\| Owned by Sol \(never delegated\) \| Owned by the Worker \(inside the approved contract\) \|/);
+	// Fresh continuation and one writing worker per worktree.
+	assert.match(doc, /## Fresh-worker continuation/);
+	assert.match(doc, /brand-new `--no-session` worker/);
+	assert.match(doc, /## One writing worker per worktree/);
+	assert.match(doc, /at most one worker writes to a worktree at any time/);
 });

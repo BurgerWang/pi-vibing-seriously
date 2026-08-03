@@ -63,6 +63,21 @@ test("status line appends the P6-A cache segment when provided", () => {
 	assert.equal(buildStatusLine({ mode: "DEV" }), "WB:DEV");
 });
 
+test("status line appends the split-cost segment when provided (S and W always, O optional)", () => {
+	const full = buildStatusLine({ mode: "VERIFY", cost: "COST S:$19.195 W:$0.063 O:$0.424" });
+	assert.equal(full, "WB:VERIFY | COST S:$19.195 W:$0.063 O:$0.424");
+	const noOther = buildStatusLine({ mode: "DEV", cost: "COST S:$19.195 W:$0.063" });
+	assert.equal(noOther, "WB:DEV | COST S:$19.195 W:$0.063");
+	const zeroWorker = buildStatusLine({ mode: "DEV", cost: "COST S:$1.000 W:$0.000" });
+	assert.equal(zeroWorker, "WB:DEV | COST S:$1.000 W:$0.000");
+	assert.equal(buildStatusLine({ mode: "DEV" }), "WB:DEV");
+});
+
+test("status line appends CACHE then COST in deterministic order", () => {
+	const line = buildStatusLine({ mode: "DEV", cache: "CACHE 72%", cost: "COST S:$1.000 W:$0.000" });
+	assert.equal(line, "WB:DEV | CACHE 72% | COST S:$1.000 W:$0.000");
+});
+
 test("status line fits an over-long profile to the footer width", () => {
 	const line = buildStatusLine({ mode: "DEV", profile: "quant-research/stock-selection/very-long-profile-name" });
 	assert.ok(line.length < 60, `status must stay compact, got: ${line}`);

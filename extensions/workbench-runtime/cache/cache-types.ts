@@ -16,9 +16,13 @@
  *     up as the miss portion. `cacheWrite` is 0 for DeepSeek (it does not
  *     report cache writes) — a zero `cacheWrite` is NOT an error and does NOT
  *     mean the cache was not established.
- *   - `openai-responses` / `azure-openai-responses`: `input =
+ *   - `openai-responses` / `azure-openai-responses` /
+ *     `openai-codex-responses`: `input =
  *     max(0, input_tokens - cached_tokens - cache_write_tokens)` with
- *     `cacheRead = input_tokens_details.cached_tokens`.
+ *     `cacheRead = input_tokens_details.cached_tokens`. The Codex provider
+ *     (`openai-codex-responses`) streams through the same
+ *     `openai-responses-shared` `finalizeResponse` normalization, so its
+ *     semantics are identical to the other Responses kinds.
  *   - `anthropic-messages`: `input = input_tokens` (Anthropic reports cache
  *     reads/writes in separate fields, so `input_tokens` already excludes
  *     them), `cacheRead = cache_read_input_tokens`.
@@ -47,6 +51,7 @@ export const VERIFIED_API_KINDS: ReadonlySet<string> = new Set([
 	"openai-completions",
 	"openai-responses",
 	"azure-openai-responses",
+	"openai-codex-responses",
 	"anthropic-messages",
 ]);
 

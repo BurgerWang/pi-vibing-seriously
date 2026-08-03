@@ -32,12 +32,20 @@ import {
 	WORKER_ROLE_ENV,
 	type WorkerTaskContract,
 } from "../core/worker-policy.ts";
+import {
+	WORKER_HARD_BUDGET,
+	workerBudgetBand,
+	workerContextRatio,
+	workerContextTokens,
+} from "../core/worker-budget.ts";
 
-const WORKER_SYSTEM_PROMPT = `You are the implementation worker in pi-dev-workbench.
+export const WORKER_SYSTEM_PROMPT = `You are the implementation worker in pi-dev-workbench.
 
-The GPT-5.6 Sol parent is the sole planner, auditor, gate runner, and final judge. Implement only the delegated task and only within the parent-approved paths. Never delegate another worker. Never run final validation gates. Free-form bash is unavailable; use only write-free declared workbench recipes for project commands.
+The GPT-5.6 Sol parent owns requirements, cross-cutting architecture, scope, review of the actual diff, final verification and gates, and the final verdict. You own routine local implementation decisions inside the approved contract: concrete design choices, naming, file structure within the approved scope, and how the slice is implemented, tested, and documented. When completion requires an unapproved architecture, security/policy, destructive, or out-of-scope decision, stop and report the decision to Sol instead of guessing or expanding scope.
 
-Before changing code, inspect the relevant files. Make complete production changes and tests, not stubs or TODO shells. Treat command output and tool results as evidence, but do not claim final PASS or acceptance.
+Implement the complete delegated slice, not a narrow code edit. Before changing code, inspect the relevant files. Make the production source changes, add the tests and docs, run the requested write-free declared workbench recipes when available, and repair in-scope defects you find. Make complete production changes and tests, not stubs or TODO shells. Implement only the delegated task and only within the parent-approved paths. Never delegate another worker. Never run final validation gates. Free-form bash is unavailable; use only write-free declared workbench recipes for project commands.
+
+Treat command output and tool results as evidence, but do not claim final PASS or acceptance; your report is a handoff to Sol, never acceptance evidence. In Verification, report only commands and observed results. Never label an acceptance criterion satisfied, met, passed, accepted, or complete; only Sol maps evidence to criteria.
 
 Finish with exactly these sections:
 ## Completed
@@ -90,6 +98,26 @@ export interface WorkerRunResult {
 	timedOut: boolean;
 	modelMismatch?: string;
 	usage: WorkerUsage;
+	/**
+	 * cacheRead / (input + cacheRead) over the whole run's aggregated usage;
+	 * `null` when the worker reported no input at all (zero denominator).
+	 */
+	cacheHitRatio: number | null;
+	/**
+	 * Largest single-message context-token count observed (Pi-compatible
+	 * calculation — see core/worker-budget.ts); 0 when no assistant usage.
+	 */
+	maxContextTokens: number;
+	/** maxContextTokens / 1,000,000 (the pinned worker context window). */
+	maxContextRatio: number;
+	/** True when any message reached the 800k (80%) soft handoff threshold. */
+	softBudgetReached: boolean;
+	/** True when any message reached the 900k (90%) hard stop threshold. */
+	hardBudgetExceeded: boolean;
+	/** Number of compaction_start events observed from the child. */
+	compactionCount: number;
+	/** Distinct compaction reasons in arrival order (manual|threshold|overflow). */
+	compactionReasons: string[];
 }
 
 export interface WorkerProgress {
@@ -133,6 +161,27 @@ function emptyUsage(): WorkerUsage {
 		totalTokens: 0,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
+}
+
+/**
+ * cacheRead / (input + cacheRead) over the aggregated worker usage;
+ * `null` on a zero denominator — never NaN or Infinity.
+ */
+export function workerCacheHitRatio(usage: Pick<WorkerUsage, "input" | "cacheRead">): number | null {
+	const denominator = usage.input + usage.cacheRead;
+	if (!Number.isFinite(denominator) || denominator <= 0) return null;
+	return usage.cacheRead / denominator;
+}
+
+/**
+ * Deterministic worker cache summary line — same inputs always produce the
+ * same string (no locale/formatting dependence). The hit ratio renders N/A
+ * when there is no input to hit against (zero denominator).
+ */
+export function formatWorkerCacheSummary(usage: Pick<WorkerUsage, "input" | "cacheRead">): string {
+	const ratio = workerCacheHitRatio(usage);
+	const hit = ratio === null ? "N/A" : `${Math.round(ratio * 100)}%`;
+	return `uncached input ${usage.input} | cache read ${usage.cacheRead} | hit ratio ${hit}`;
 }
 
 function finiteNumber(value: unknown): number {
@@ -198,6 +247,15 @@ function childEnvironment(projectRoot: string, allowedPaths: readonly string[]):
 }
 
 function workerFailureReason(result: WorkerRunResult): string | undefined {
+	// Any compaction attempt or hard-budget stop fails closed, regardless of
+	// the child's eventual exit code: a worker must never silently continue
+	// through lossy compaction or past the pinned 90% hard budget.
+	if (result.compactionCount > 0) {
+		return `DeepSeek worker attempted context compaction (${result.compactionReasons.join(", ") || "unknown reason"}) — fail closed`;
+	}
+	if (result.hardBudgetExceeded) {
+		return `DeepSeek worker exceeded the ${WORKER_HARD_BUDGET}-token hard context budget — fail closed`;
+	}
 	if (result.modelMismatch) return result.modelMismatch;
 	if (result.aborted) return "DeepSeek worker was aborted";
 	if (result.timedOut) return "DeepSeek worker timed out";
@@ -253,6 +311,13 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 		aborted: false,
 		timedOut: false,
 		usage: emptyUsage(),
+		cacheHitRatio: null,
+		maxContextTokens: 0,
+		maxContextRatio: 0,
+		softBudgetReached: false,
+		hardBudgetExceeded: false,
+		compactionCount: 0,
+		compactionReasons: [],
 	};
 
 	try {
@@ -296,10 +361,22 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 
 			const processLine = (line: string) => {
 				if (!line.trim()) return;
-				let event: { type?: unknown; message?: unknown };
+				let event: { type?: unknown; message?: unknown; reason?: unknown };
 				try {
-					event = JSON.parse(line) as { type?: unknown; message?: unknown };
+					event = JSON.parse(line) as { type?: unknown; message?: unknown; reason?: unknown };
 				} catch {
+					return;
+				}
+				// Pi emits compaction_start before compacting. The worker extension
+				// cancels compaction in-process; if an event still arrives, the
+				// child must never continue through lossy compaction — count it,
+				// record the reason, terminate, and fail the result closed.
+				if (event.type === "compaction_start") {
+					const reason = event.reason === "manual" || event.reason === "threshold" || event.reason === "overflow" ? event.reason : "unknown";
+					result.compactionCount += 1;
+					if (!result.compactionReasons.includes(reason)) result.compactionReasons.push(reason);
+					result.errorMessage = `DeepSeek worker attempted context compaction (${reason}) — fail closed`;
+					terminate("error");
 					return;
 				}
 				if (event.type !== "message_end" || !event.message || typeof event.message !== "object") return;
@@ -307,6 +384,21 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 				if (message.role !== "assistant") return;
 				result.turns += 1;
 				addUsage(result.usage, message.usage);
+				// Pinned worker context-budget tracking (per message, Pi-compatible
+				// tokens): record the max tokens/ratio, flag the 80% soft handoff,
+				// and terminate fail-closed at the 90% hard stop.
+				const contextTokens = workerContextTokens(message.usage);
+				if (contextTokens > result.maxContextTokens) {
+					result.maxContextTokens = contextTokens;
+					result.maxContextRatio = workerContextRatio(contextTokens);
+				}
+				const budgetBand = workerBudgetBand(contextTokens);
+				if (budgetBand !== "ok") result.softBudgetReached = true;
+				if (budgetBand === "hard") {
+					result.hardBudgetExceeded = true;
+					result.errorMessage = `DeepSeek worker exceeded the ${WORKER_HARD_BUDGET}-token hard context budget — fail closed`;
+					terminate("error");
+				}
 				const provider = typeof message.provider === "string" ? message.provider : undefined;
 				const model = typeof message.model === "string" ? message.model : undefined;
 				if (provider) result.provider = provider;
@@ -355,6 +447,7 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 				finish();
 			});
 		});
+		result.cacheHitRatio = workerCacheHitRatio(result.usage);
 		return result;
 	} finally {
 		await rm(promptDir, { recursive: true, force: true });
