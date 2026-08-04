@@ -2,6 +2,92 @@
 
 All notable changes to pi-dev-workbench are documented here.
 
+## [Unreleased] — P8 Safe Nested Project Support
+
+Adds an optional `project_dir` to `project.yaml` so a repository can point
+stack detection and gate file-type checks at a nested directory while every
+repository-root service stays put. No commit, tag or npm publish is
+performed by this milestone.
+
+### Added
+
+- `project.yaml` `project_dir` (optional, default `.`): after config load
+  the safe **effective project root** is resolved by
+  `resolveEffectiveProjectRoot` (`core/config.ts`). POSIX absolute (`/x`)
+  and Windows absolute (`C:\x`, `C:/x`, `\x`, `\\server\share`, `C:x`)
+  values, paths that resolve outside the repository via `..`, missing paths
+  and non-directories are rejected; the real (symlink-free) target must
+  stay inside the real repository root (escaping symlinks rejected,
+  inside-repository symlinks accepted). Every violation becomes a
+  `project.yaml` `ConfigIssue` and the effective root falls back to the
+  repository root — the effective root never points outside the repository
+  and no outside content is ever read. `ProjectConfig` now exposes
+  `projectDir` (raw) and `effectiveProjectRoot`.
+- **Scope split:** stack detection (`core/inspect.ts`) reads only the
+  effective project root's top level; git state and config-files-present
+  stay repository-root based. Gate file-type content checks
+  (`core/gate-engine.ts`): `kind: file` globs and the files read by
+  `json` / `numeric` / `schema` checks resolve relative to the effective
+  project root with realpath containment — always; the only
+  repository-root exception is the built-in b0.4 check via internal
+  catalog-only metadata (see Fixed below). Gate config, run persistence,
+  recipe checks/execution, artifact run records and git stay
+  repository-root based. Recipe `cwd` semantics are unchanged.
+- `workbench_project_inspect` returns `effective_project_root` and its
+  text output and the P4 renderer show the effective root explicitly
+  (`core/render.ts` `InspectToolDetails.effective_project_root`).
+- All three `templates/project/*/project.yaml` templates declare
+  `project_dir: .` with a comment explaining the boundary; README,
+  `docs/project-onboarding.md` and `docs/architecture.md` document the
+  default/compatibility behavior.
+
+### Fixed
+
+- Cross-root defect in the built-in B0.4 check ("Required workbench files
+  present"): it is `kind: file` with paths `.pi/workbench/project.yaml` /
+  `.pi/workbench/recipes.yaml`, and after the P8 root split all `kind: file`
+  checks resolved against the effective project root — so a legal nested
+  project looked for the workbench config inside the nested directory
+  (failing B0.4) and a nested `.pi/workbench` could impersonate the
+  repository configuration. B0.4 now carries the INTERNAL catalog-only
+  `file_root: "repository"` metadata (`GateCheck.file_root`, set only in
+  `gate-catalog.ts`) and the engine resolves it against the repository
+  root; general file/json/numeric/schema checks keep resolving against
+  the effective root. Root selection is deliberately NOT part of the
+  public gate schema: `parseCheck` never reads or returns `file_root`,
+  and gates.yaml rejects both `root` and `file_root` as unknown fields —
+  a project can never anchor a check at the repository root. Recipe and
+  run semantics are unchanged.
+
+### Tests
+
+- `tests/config.test.ts`: default (omitted and explicit `.`), explicit
+  nested directory, inside-repository symlink accepted, POSIX/Windows
+  absolute rejections, `..` escape, symlink escape, missing path,
+  non-directory, non-string and empty values, and the inspectable
+  repository-root fallback (profile/recipes still load).
+- `tests/inspect.test.ts` (new): stack detection reads only the effective
+  root's top level (repo-root `package.json` ignored for nested projects),
+  default root without `project_dir`, git and config-files-present stay at
+  the repository root, bad `project_dir` falls back and surfaces as a
+  config error.
+- `tests/gates.test.ts`: file/json/numeric/schema checks resolve against
+  the effective root; repo-root files do not satisfy nested checks;
+  nested symlink escapes rejected; gate runs persist under the repo root's
+  `.pi/workbench/runs`; recipe execution and artifact checks stay
+  repository-root based; built-in B0.4 passes for a legal nested project
+  (manifest/dependency at the effective root, workbench config at the
+  repository root) while b0.2/b0.3 stay effective-root based; a nested
+  `.pi/workbench` alone never satisfies the built-in B0.4 repository-root
+  check; default file checks still resolve against the effective root;
+  gates.yaml `root`/`file_root` are rejected by the strict schema; a
+  catalog unit test proves B0.4 is the only check carrying the internal
+  `file_root: "repository"` metadata and that `fileCheckRoot` maps it to
+  the repository root.
+- `tests/p4-render.test.ts`: expanded inspect renderer shows the effective
+  root (nested and repository-root default).
+
+
 ## [0.9.1] — P7 Bounded Worker Handoff
 
 Replaces the oversized single-toolResult worker handoff with durable

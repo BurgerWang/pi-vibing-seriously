@@ -20,6 +20,8 @@ export interface DetectedStack {
 
 export interface ProjectInspectResult {
 	project_root: string;
+	/** Safe effective project root (project.yaml project_dir; repo root by default). */
+	effective_project_root: string;
 	git: { is_git: boolean; commit: string | null; dirty: boolean; branch: string | null };
 	stacks: DetectedStack[];
 	profile: string | undefined;
@@ -53,11 +55,15 @@ const LOCKFILE_PM: readonly { file: string; pm: string; language: string }[] = [
 
 export async function inspectProject(projectRoot: string, options: { trusted: boolean; exec: ExecFn }): Promise<ProjectInspectResult> {
 	const config = await loadProjectConfig(projectRoot, { trusted: options.trusted });
+	// P8: stack detection reads ONLY the effective project root's top level
+	// (project.yaml project_dir, repo root by default). Git and
+	// config-files-present below stay repository-root based.
+	const effectiveProjectRoot = config.effectiveProjectRoot;
 
 	let topLevel: string[];
 	try {
 		// P6-B: readdir order is filesystem-dependent — sort for determinism.
-		topLevel = (await readdir(projectRoot, { withFileTypes: true })).map((e) => e.name).sort();
+		topLevel = (await readdir(effectiveProjectRoot, { withFileTypes: true })).map((e) => e.name).sort();
 	} catch {
 		topLevel = [];
 	}
@@ -105,6 +111,7 @@ export async function inspectProject(projectRoot: string, options: { trusted: bo
 
 	return {
 		project_root: projectRoot,
+		effective_project_root: effectiveProjectRoot,
 		git: { is_git: isGit, commit, dirty, branch },
 		stacks,
 		profile: config.profile,

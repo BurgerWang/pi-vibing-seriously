@@ -73,6 +73,8 @@ export interface ReadRunToolDetails {
 
 export interface InspectToolDetails {
 	project_root: string;
+	/** P8: safe effective project root (project.yaml project_dir; repo root by default). */
+	effective_project_root?: string;
 	git: { is_git: boolean; commit: string | null; dirty: boolean; branch: string | null };
 	stacks: string[];
 	profile: string | undefined;
@@ -135,6 +137,11 @@ export function renderInspectLines(d: InspectToolDetails, expanded: boolean): st
 	return [
 		compact,
 		`project root : ${d.project_root}`,
+		...(d.effective_project_root && d.effective_project_root !== d.project_root
+			? [`effective root: ${d.effective_project_root}`]
+			: d.project_root
+				? [`effective root: ${d.project_root} (repository root)`]
+				: []),
 		`stacks       : ${fmtList(d.stacks)}`,
 		`config files : ${fmtList(d.config_files_present)}`,
 		`config errors: ${fmtList(d.config_errors)}`,

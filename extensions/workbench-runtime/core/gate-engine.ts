@@ -223,6 +223,16 @@ export async function latestGateStatus(projectRoot: string, gateId: string): Pro
 
 export interface CheckContext {
 	projectRoot: string;
+	/**
+	 * P8: safe effective project root (project.yaml project_dir; repo root by
+	 * default). File-type content checks — kind=file (unless the check carries
+	 * the internal catalog-only `file_root: "repository"` metadata) and the
+	 * files read by json/numeric/schema checks — resolve against this root
+	 * with realpath containment; everything else (the b0.4 repository-root
+	 * workbench-config check, recipe/artifact checks, git, run persistence)
+	 * stays repository-root based on `projectRoot`.
+	 */
+	effectiveProjectRoot: string;
 	runDir: string;
 	configIssues: ConfigIssue[];
 	profile: string | undefined;
@@ -244,6 +254,20 @@ async function assertPathContained(projectRoot: string, target: string, label: s
 		throw new GateSetupError(`${label} path escapes the project root: ${target}`);
 	}
 	return real;
+}
+
+/**
+ * The base root a kind=file check resolves against: the effective project
+ * root by default; the repository root only when the check carries the
+ * INTERNAL catalog-only `file_root: "repository"` metadata. Only the
+ * built-in b0.4 workbench-config check sets it — .pi/workbench always
+ * lives at the repository root, so a nested `.pi/workbench` can never
+ * impersonate the repository configuration. gates.yaml cannot set
+ * file_root: parseCheck rejects both `root` and `file_root` as unknown
+ * fields.
+ */
+export function fileCheckRoot(ctx: CheckContext, check: GateCheck): string {
+	return check.file_root === "repository" ? ctx.projectRoot : ctx.effectiveProjectRoot;
 }
 
 /** Copy an evidence source into runDir/artifacts/ and return the relative path. */
@@ -278,7 +302,7 @@ class JsonArtifactError extends Error {
 }
 
 async function resolveJsonFile(ctx: CheckContext, check: GateCheck, file: string, label: string): Promise<{ path: string; value: unknown }> {
-	const absolute = await assertPathContained(ctx.projectRoot, file, label);
+	const absolute = await assertPathContained(ctx.effectiveProjectRoot, file, label);
 	let raw: string;
 	try {
 		raw = await readFile(absolute, "utf8");
@@ -559,15 +583,18 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 
 			case "file": {
 				const patterns = check.any_of ?? (check.path ? [check.path] : []);
+				const baseRoot = fileCheckRoot(ctx, check);
 				const matched: string[] = [];
+				const matchedAbsolute: string[] = [];
 				for (const pattern of patterns) {
-					if ((await realpathContained(ctx.projectRoot, pattern)) === undefined) {
+					if ((await realpathContained(baseRoot, pattern)) === undefined) {
 						throw new GateSetupError(`${label}: file path escapes the project root: ${pattern}`);
 					}
-					for (const match of globSync(pattern, { cwd: ctx.projectRoot })) {
-						const absolute = await realpathContained(ctx.projectRoot, match);
+					for (const match of globSync(pattern, { cwd: baseRoot })) {
+						const absolute = await realpathContained(baseRoot, match);
 						if (absolute === undefined) continue;
 						matched.push(match);
+						matchedAbsolute.push(absolute);
 					}
 				}
 				if (matched.length === 0) {
@@ -576,9 +603,8 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 					]);
 					break;
 				}
-				for (const match of matched.slice(0, 1)) {
-					const absolute = join(ctx.projectRoot, match);
-					const copied = await copyEvidenceFile(ctx.projectRoot, ctx.runDir, check.id, absolute);
+				for (let i = 0; i < matched.length && i < 1; i++) {
+					const copied = await copyEvidenceFile(ctx.projectRoot, ctx.runDir, check.id, matchedAbsolute[i]!);
 					if (copied) {
 						artifactPaths.push(copied);
 					}
@@ -1023,6 +1049,7 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 
 	const ctx: CheckContext = {
 		projectRoot,
+		effectiveProjectRoot: config.effectiveProjectRoot,
 		runDir,
 		configIssues: config.issues,
 		profile: config.profile,

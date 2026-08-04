@@ -147,6 +147,16 @@ test("compact read_run and inspect renderers stay one line", () => {
 	assert.ok(inspect[0]!.includes("recipes:2"));
 });
 
+test("expanded inspect renderer shows the effective project root explicitly", () => {
+	const nested = renderInspectLines({ ...INSPECT, effective_project_root: "/tmp/proj/research" }, true);
+	assert.ok(nested.some((l) => l.includes("effective root: /tmp/proj/research")), nested.join("\n"));
+	assert.ok(nested.some((l) => l.includes("project root : /tmp/proj")), nested.join("\n"));
+
+	// Default (no project_dir): the effective root is the repository root.
+	const flat = renderInspectLines(INSPECT, true);
+	assert.ok(flat.some((l) => l.includes("effective root: /tmp/proj (repository root)")), flat.join("\n"));
+});
+
 test("compact compare renderer shows exit, duration, artifact and quant deltas", () => {
 	const [line] = renderCompareLines(QUANT_REPORT, false);
 	assert.ok(line!.includes("exit 0 -> 0"));

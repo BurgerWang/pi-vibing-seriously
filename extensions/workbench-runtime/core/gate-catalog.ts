@@ -64,8 +64,16 @@ const B0_CHECKS = [
 		"b0.4",
 		"Required workbench files present",
 		"file",
-		{ any_of: [`${WB}/project.yaml`, `${WB}/recipes.yaml`] },
-		"the workbench configuration written by /q-init exists",
+		// The workbench configuration always lives at the REPOSITORY root
+		// (.pi/workbench), even for nested projects (project.yaml project_dir) —
+		// so this check carries the INTERNAL catalog-only `file_root:
+		// "repository"` metadata and a nested `.pi/workbench` can never satisfy
+		// it. The metadata is set here in the built-in catalog only: parseCheck
+		// never reads or returns it and gates.yaml rejects both `root` and
+		// `file_root` as unknown fields. General project-file checks (b0.2/b0.3,
+		// json/numeric/schema) keep resolving against the effective root.
+		{ any_of: [`${WB}/project.yaml`, `${WB}/recipes.yaml`], file_root: "repository" },
+		"the workbench configuration written by /q-init exists at the repository root",
 	),
 ];
 

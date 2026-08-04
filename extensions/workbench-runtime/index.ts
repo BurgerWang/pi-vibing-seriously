@@ -166,6 +166,21 @@
  *     refresh, a lease that is no longer ACTIVE reverts the advertised
  *     set to the exact canonical 14 (no timers, no background resources)
  *
+ * P8 additions (safe nested project support):
+ *   - optional project.yaml `project_dir` (default "."): after config load
+ *     the safe effective project root is resolved — POSIX/Windows absolute
+ *     paths, `..` escapes and symlink escapes are rejected, the target
+ *     must exist and be a directory; violations become project.yaml
+ *     ConfigIssues and fall back to the repository root (config stays
+ *     inspectable, nothing outside the repository is ever read)
+ *   - stack detection reads only the effective project root's top level;
+ *     git and config-files-present stay repository-root based
+ *   - gate file/json/numeric/schema checks resolve relative to the
+ *     effective project root with realpath containment; gate config, run
+ *     persistence, recipe checks/execution, artifact run records and git
+ *     stay repository-root based (recipe cwd semantics unchanged)
+ *   - workbench_project_inspect and its renderer show the effective root
+ *
  * Registers native Pi commands:
  *   /q-mode-audit /q-mode-dev /q-mode-verify /q-status   — mode control (P0)
  *   /q-init <profile>                                    — project init (P1)
@@ -2372,6 +2387,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			const result = await inspectProject(projectRoot, { trusted: true, exec: execFn });
 			const lines = [
 				`project root : ${result.project_root}`,
+				`effective root: ${result.effective_project_root}${result.effective_project_root === result.project_root ? " (repository root)" : ""}`,
 				`git          : ${result.git.is_git ? `${result.git.branch ?? "(detached)"} @ ${result.git.commit?.slice(0, 12) ?? "(no commits)"}${result.git.dirty ? " (dirty)" : ""}` : "(not a git repo)"}`,
 				`stacks       : ${result.stacks.length > 0 ? result.stacks.map((s) => `${s.language}${s.package_manager ? ` (${s.package_manager})` : ""}`).join(", ") : "(none detected)"}`,
 				`profile      : ${result.profile ?? "(not set)"}`,
@@ -2381,6 +2397,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			];
 			const details: InspectToolDetails = {
 				project_root: result.project_root,
+				effective_project_root: result.effective_project_root,
 				git: result.git,
 				stacks: result.stacks.map((s) => `${s.language}${s.package_manager ? ` (${s.package_manager})` : ""}`),
 				profile: result.profile,

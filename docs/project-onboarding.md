@@ -33,6 +33,44 @@ are rejected by design.
 **Then exit Pi, re-enter the project, and approve project trust.** Config is
 only read and recipes only run under trust.
 
+## 2b. Nested projects (`project_dir`)
+
+A repository that hosts several research projects (or a repo whose
+configuration lives in a subdirectory) can point the workbench at one
+nested directory via `project.yaml`:
+
+```yaml
+name: stock-selection-research
+profile: quant-research/stock-selection
+project_dir: research/stock-selection
+```
+
+Boundaries:
+
+- `project_dir` is **relative** to the repository root. POSIX absolute
+  (`/x`) and Windows absolute (`C:\x`, `C:/x`, `\x`, `\\server\share`,
+  `C:x`) values, `..` escapes, symlink escapes, missing paths and
+  non-directories are rejected: each becomes a `project.yaml` config issue
+  (visible in `workbench_project_inspect`) and the workbench falls back to
+  the repository root. The effective root never points outside the
+  repository and nothing outside it is ever read. Symlinks that stay inside
+  the repository are accepted.
+- The effective root only affects **stack detection** (top-level
+  language/package-manager files) and **gate file-type content checks**
+  (`kind: file` and the files read by `json` / `numeric` / `schema`
+  checks; resolved relative to the effective root, symlink-checked). The
+  one exception is the built-in b0.4 check ("Required workbench files
+  present"): it anchors at the repository root via internal catalog-only
+  metadata (gates.yaml cannot set `root` or `file_root`), because the
+  workbench configuration always lives at the repository root — a nested
+  `.pi/workbench` never satisfies it.
+- Everything else stays at the repository root: `.pi/workbench` config,
+  run records, git state, delegation, recipe execution and recipe `cwd`
+  semantics. Omitted (or `"."`), the effective root is the repository
+  root — existing projects keep their exact behavior.
+- `workbench_project_inspect` shows both roots (`project root` and
+  `effective root`) explicitly.
+
 ## 3. Declare recipes
 
 Add argv-array recipes to `.pi/workbench/recipes.yaml`. The model can only

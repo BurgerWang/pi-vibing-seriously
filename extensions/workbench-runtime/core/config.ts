@@ -5,7 +5,8 @@
  * CONFIG_DIR_NAME is Pi's official export (".pi" by default — never hardcoded
  * here). Supported files:
  *
- *   - project.yaml  — project name, description, selected profile
+ *   - project.yaml  — project name, description, selected profile, optional
+ *                    `project_dir` (nested effective project root)
  *   - recipes.yaml  — declarative recipes (see recipe-schema.ts)
  *   - gates.yaml    — reserved: gate declarations (parsed, not enforced in P1)
  *   - profiles.yaml — profile definitions (parsed, not enforced in P1)
@@ -14,14 +15,15 @@
  * untrusted project is rejected before any file is read.
  */
 
-import { readFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { readFile, realpath, stat } from "node:fs/promises";
+import { join, resolve, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import { parseRecipesDocument, type Recipe } from "./recipe-schema.ts";
 import { DEFAULT_ACTION_CACHE_MAX_BYTES } from "../cache/action-types.ts";
+import { lexicalContain } from "./path-guard.ts";
 
 export const WORKBENCH_DIR = "workbench";
 export const RUNS_DIR = "runs";
@@ -43,7 +45,19 @@ export interface ConfigIssue {
 }
 
 export interface ProjectConfig {
+	/** The repository root — every service receives this as `projectRoot`. */
 	projectRoot: string;
+	/** Raw project.yaml `project_dir` value (undefined when absent). */
+	projectDir: string | undefined;
+	/**
+	 * Safe effective project root resolved from `project_dir` (default: the
+	 * repository root). Never points outside the repository: absolute paths,
+	 * `..` escapes and symlink escapes are rejected and fall back to
+	 * `projectRoot` with a recorded issue. Stack detection and gate
+	 * file/json/numeric/schema checks run against this root; config, runs,
+	 * git and delegation stay repository-root based.
+	 */
+	effectiveProjectRoot: string;
 	projectName: string | undefined;
 	description: string | undefined;
 	profile: string | undefined;
@@ -103,6 +117,65 @@ async function readOptionalText(path: string): Promise<string | undefined> {
 }
 
 /**
+ * True for POSIX absolute (`/x`), Windows drive (`C:\x`, `C:/x`, `C:x`) and
+ * Windows root/UNC absolute (`\x`, `\\server\share`) path forms. These are
+ * rejected before any resolution so a nested project can never point outside
+ * the repository regardless of the host platform.
+ */
+function isAbsoluteStyleProjectDir(value: string): boolean {
+	if (value.startsWith("/") || value.startsWith("\\")) return true;
+	return /^[A-Za-z]:/.test(value);
+}
+
+/**
+ * Resolve the optional project.yaml `project_dir` into the safe effective
+ * project root. Rules:
+ *   - omitted or `"."` → the repository root itself (backward compatible);
+ *   - POSIX/Windows absolute paths are rejected;
+ *   - paths that resolve outside the repository via `..` are rejected;
+ *   - the target must exist and be a directory;
+ *   - the real (symlink-free) target must stay inside the real repository
+ *     root — an escaping symlink is rejected, an inside symlink is fine;
+ *   - on any violation the caller gets the repository root plus an issue
+ *     message (the effective root never points outside the repository and
+ *     no content outside the repository is ever accessed).
+ */
+export async function resolveEffectiveProjectRoot(
+	projectRoot: string,
+	projectDir: string | undefined,
+): Promise<{ root: string; issue?: string }> {
+	if (projectDir === undefined || projectDir === ".") return { root: projectRoot };
+	if (projectDir.length === 0) {
+		return { root: projectRoot, issue: '"project_dir" must be a non-empty relative path' };
+	}
+	if (isAbsoluteStyleProjectDir(projectDir)) {
+		return { root: projectRoot, issue: `"project_dir" must be a relative path inside the project root (got "${projectDir}")` };
+	}
+	const lex = lexicalContain(projectRoot, projectDir);
+	if (lex === undefined) {
+		return { root: projectRoot, issue: `"project_dir" resolves outside the project root: ${projectDir}` };
+	}
+	let stats;
+	try {
+		stats = await stat(lex);
+	} catch {
+		return { root: projectRoot, issue: `"project_dir" does not exist or is not readable: ${projectDir}` };
+	}
+	if (!stats.isDirectory()) {
+		return { root: projectRoot, issue: `"project_dir" is not a directory: ${projectDir}` };
+	}
+	const rootReal = (await realpath(projectRoot).catch(() => resolve(projectRoot))) ?? resolve(projectRoot);
+	const targetReal = await realpath(lex).catch(() => undefined);
+	if (targetReal === undefined) {
+		return { root: projectRoot, issue: `"project_dir" cannot be resolved: ${projectDir}` };
+	}
+	if (targetReal !== rootReal && !targetReal.startsWith(rootReal + sep)) {
+		return { root: projectRoot, issue: `"project_dir" escapes the project root via a symlink: ${projectDir}` };
+	}
+	return { root: targetReal };
+}
+
+/**
  * Load and parse the workbench configuration for a project root.
  * Refuses (throws UntrustedProjectError) before reading anything when
  * `trusted` is false. Missing files are fine (empty config); invalid YAML and
@@ -136,6 +209,23 @@ export async function loadProjectConfig(projectRoot: string, options: { trusted:
 	const profile = typeof projectDoc?.profile === "string" ? projectDoc.profile : undefined;
 	if (projectDoc !== undefined && profile === undefined) {
 		issues.push({ file: "project.yaml", message: '"profile" is missing (expected one of the profiles in profiles.yaml)' });
+	}
+
+	// Optional nested project directory. Invalid values (non-string, empty,
+	// absolute, escaping, missing, non-directory) become project.yaml issues
+	// and fall back to the repository root — the effective root is never
+	// outside the repository and config stays inspectable.
+	let projectDir: string | undefined;
+	if (projectDoc?.project_dir !== undefined) {
+		if (typeof projectDoc.project_dir !== "string") {
+			issues.push({ file: "project.yaml", message: '"project_dir" must be a string' });
+		} else {
+			projectDir = projectDoc.project_dir;
+		}
+	}
+	const effective = await resolveEffectiveProjectRoot(projectRoot, projectDir);
+	if (effective.issue !== undefined) {
+		issues.push({ file: "project.yaml", message: effective.issue });
 	}
 
 	// P6-A: telemetry opt-out. project.yaml: cache: { telemetry: false }.
@@ -188,5 +278,18 @@ export async function loadProjectConfig(projectRoot: string, options: { trusted:
 		return nameA < nameB ? -1 : nameA > nameB ? 1 : 0;
 	});
 
-	return { projectRoot, projectName, description, profile, recipes: parsed.recipes, gates, profiles, issues, cacheTelemetry, actionCacheMaxBytes };
+	return {
+		projectRoot,
+		projectDir,
+		effectiveProjectRoot: effective.root,
+		projectName,
+		description,
+		profile,
+		recipes: parsed.recipes,
+		gates,
+		profiles,
+		issues,
+		cacheTelemetry,
+		actionCacheMaxBytes,
+	};
 }

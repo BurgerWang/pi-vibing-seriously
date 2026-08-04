@@ -2,3 +2,9 @@
 name: stock-selection-research
 description: Quantitative stock selection research (mid/low frequency)
 profile: quant-research/stock-selection
+# Optional: nested project directory, relative to the repository root.
+# Stack detection and gate file/json/numeric/schema checks run against this
+# directory (except the built-in b0.4 check, which anchors .pi/workbench at
+# the repository root); .pi/workbench config, runs, git and delegation stay
+# at the repository root. Default: "." (the repository root itself).
+project_dir: .

@@ -82,7 +82,8 @@ extensions/workbench-runtime/
     ├── redact.ts            # secret-name/value detection and redaction
     ├── compact.ts           # P5 compaction supplement state + bounded note builder
     ├── state.ts             # mode persistence via Pi custom session entries
-    ├── config.ts            # project root detection, config loading, trust gate
+    ├── config.ts            # project root detection, config loading, trust gate,
+    │                        #   safe project_dir → effective project root resolution (P8)
     ├── recipe-schema.ts     # strict recipe validation, argv construction
     ├── recipe-runner.ts     # the single execution service (tools + commands)
     ├── runs.ts              # run ids, manifests, bounded log reads
@@ -205,6 +206,43 @@ facts are NOT_RUN (a required NOT_RUN never PASSes), a pending/stale review
 BLOCKs B6, negative compliance facts FAIL it, and model prose can never
 satisfy B6.1-B6.8.
 
+### Nested projects (P8)
+
+`project.yaml` may declare an optional `project_dir` (default `"."`). After
+config load, `config.ts` resolves the **safe effective project root** from
+it:
+
+```
+project.yaml project_dir
+  → isAbsoluteStyleProjectDir?  → reject (POSIX `/x`, Windows C:\x, C:/x,
+                                   \x, \\server\share, C:x)
+  → lexicalContain(projectRoot, project_dir)  → `..` escape rejected
+  → stat() must succeed and be a directory (missing/non-dir rejected)
+  → realpath containment vs the real repository root (symlink escape
+    rejected; inside-repo symlinks accepted)
+  → effectiveProjectRoot = realpath of the target (or repository root on
+    any violation + a project.yaml ConfigIssue)
+```
+
+Every violation records a `project.yaml` ConfigIssue and falls back to the
+repository root — the effective root never points outside the repository
+and no outside content is ever accessed. Scope split:
+
+- **Effective-root based:** stack detection in `inspect.ts` (top-level
+  readdir only), and gate file-type content checks in `gate-engine.ts`
+  (`kind: file` globs plus the files read by `json` / `numeric` / `schema`
+  checks; resolved relative to the effective root and realpath-contained).
+- **Repository-root based (unchanged):** `.pi/workbench` config location,
+  run persistence, git state, delegation, recipe checks/execution and
+  recipe `cwd` semantics, artifact run records, config-files-present —
+  plus the built-in b0.4 workbench-config existence check, which carries
+  internal catalog-only `file_root: "repository"` metadata (not settable
+  from gates.yaml) so a nested `.pi/workbench` can never impersonate
+  the repository configuration.
+
+`workbench_project_inspect` exposes `effective_project_root` and its
+renderer shows the effective root explicitly.
+
 ### Compaction supplement (P5)
 
 ```
@@ -321,6 +359,9 @@ See docs/cache/cache-benchmark.md and P6_BENCHMARK_REPORT.md.
 ## Trust and identity
 
 - Project root: `git rev-parse --show-toplevel`, else `ctx.cwd`.
+- P8: the **effective project root** (project.yaml `project_dir`, default
+  the repository root) is resolved safely after config load — see
+  [Nested projects (P8)](#nested-projects-p8).
 - **No config is read or executed unless `ctx.isProjectTrusted()`.** Untrusted
   projects get an explicit refusal message from every workbench entry point.
 - Run ids (`YYYYMMDD-HHMMSS-xxxx`) are strictly validated before any path is
@@ -388,3 +429,20 @@ See docs/cache/cache-benchmark.md and P6_BENCHMARK_REPORT.md.
   only, workers: none only); worker-first workflow contract in q-build, the
   implementation-workflow skill, and both project AGENTS templates plus
   focused package-content tests.
+- P8 (this release): safe nested project support — optional `project.yaml`
+  `project_dir` (default `.`) resolved after config load into the safe
+  effective project root (`core/config.ts`: absolute-path, `..`-escape and
+  symlink-escape rejection; target must exist and be a directory; any
+  violation is a `project.yaml` ConfigIssue with a repository-root
+  fallback); stack detection reads only the effective root's top level
+  (`core/inspect.ts`) while git and config-files-present stay
+  repository-root based; gate file/json/numeric/schema checks resolve
+  against the effective root with realpath containment (`core/gate-engine.ts`;
+  only the built-in b0.4 workbench-config check anchors at the repository
+  root, via internal catalog-only `file_root` metadata — the public gate
+  schema has no `root` option) while gate config, run persistence, recipe
+  execution, artifact run
+  records and git stay at the repository root (recipe `cwd` semantics
+  unchanged); `workbench_project_inspect` exposes `effective_project_root`
+  and the renderer shows the effective root; templates, README and
+  onboarding docs updated.

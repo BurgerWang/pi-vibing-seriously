@@ -8,7 +8,12 @@
  *   - config   machine: workbench config parses without issues
  *   - recipe   machine: a declared recipe runs and exits as expected
  *   - artifact machine: the most recent run of a recipe produced artifacts
- *   - file     machine: a project file (or one of several) exists
+ *   - file     machine: a project file (or one of several) exists; the
+ *               path/glob resolves against the effective project root.
+ *               The built-in b0.4 workbench-config check is the single
+ *               exception: it carries internal catalog-only `file_root`
+ *               metadata (never settable from gates.yaml) so it anchors at
+ *               the repository root, where .pi/workbench always lives
  *   - json     machine: a JSON artifact field exists / equals a value
  *   - numeric  machine: a JSON artifact number is finite and within bounds
  *   - schema   machine: an artifact conforms to a built-in schema
@@ -137,6 +142,17 @@ export interface GateCheck {
 	path?: string;
 	/** kind=file: any-of project-relative paths/globs. */
 	any_of?: string[];
+	/**
+	 * INTERNAL catalog-only metadata (never settable from gates.yaml):
+	 * anchors this kind=file check at the REPOSITORY root instead of the
+	 * effective project root. Only the built-in catalog may set it — the
+	 * b0.4 "Required workbench files present" check uses it because the
+	 * workbench configuration (.pi/workbench) always lives at the
+	 * repository root, so a nested `.pi/workbench` can never satisfy it.
+	 * parseCheck never reads or returns this field, and CHECK_FIELDS
+	 * rejects both `root` and `file_root` from YAML as unknown fields.
+	 */
+	file_root?: "repository";
 	/** kind=artifact: recipe whose most recent run must have artifacts. */
 	artifact_recipe?: string;
 	/** kind=artifact: optional glob filter over that run's artifact_paths. */
@@ -253,6 +269,8 @@ const CHECK_FIELDS: ReadonlySet<string> = new Set([
 	"file",
 	"path",
 	"any_of",
+	// `root` and `file_root` are deliberately ABSENT: root selection is
+	// internal catalog metadata (GateCheck.file_root) that YAML cannot set.
 	"artifact_recipe",
 	"glob",
 	"equals",
@@ -295,6 +313,10 @@ export function parseCheck(raw: unknown, gateId: string, index: number): { check
 	if (kind === "file" && path === undefined && anyOf.length === 0) {
 		errors.push(`${label}: kind=file needs "path" or "any_of"`);
 	}
+	// Root selection is INTERNAL catalog metadata (GateCheck.file_root) —
+	// parseCheck never reads it from YAML. Both `root` and `file_root` fail
+	// the CHECK_FIELDS unknown-field check above, so a project gates.yaml
+	// can never anchor a check at the repository root.
 
 	const artifactRecipe = asString(raw.artifact_recipe, `${label}: "artifact_recipe"`, errors);
 	if (kind === "artifact" && artifactRecipe === undefined) {

@@ -213,7 +213,7 @@ like `git config --global --list`, and quoted text like
 Config lives in `<project-root>/<CONFIG_DIR_NAME>/workbench/` where
 `CONFIG_DIR_NAME` is Pi's official export (`.pi` by default — never hardcoded):
 
-- `project.yaml` — `name`, `description`, `profile`
+- `project.yaml` — `name`, `description`, `profile`, optional `project_dir`
 - `recipes.yaml` — declarative recipes
 - `gates.yaml` — gate declarations (enforced since P3; empty `gates: []` uses the built-in catalog)
 - `profiles.yaml` — profile definitions
@@ -221,6 +221,45 @@ Config lives in `<project-root>/<CONFIG_DIR_NAME>/workbench/` where
 Project root detection: `git rev-parse --show-toplevel` first, `ctx.cwd` for
 non-git projects. **No project configuration is read or executed unless
 `ctx.isProjectTrusted()` is true.**
+
+### Nested projects (`project_dir`, P8)
+
+`project.yaml` accepts an optional `project_dir` — a **relative** path to a
+directory inside the repository that acts as the *effective project root*:
+
+```yaml
+name: monorepo-research
+profile: quant-research/stock-selection
+project_dir: research/stock-selection
+```
+
+Boundaries (P8):
+
+- **Repository root vs effective root.** Every service still receives the
+  repository root: `.pi/workbench` config, run records, git state and
+  delegation stay at the repository root, and recipe `cwd` semantics are
+  unchanged. The effective root only changes **stack detection** (top-level
+  language/package-manager files are read from the effective root) and the
+  **gate file-type content checks** (`kind: file` and the files read by
+  `json` / `numeric` / `schema` checks; resolved relative to the effective
+  root with realpath containment). The one built-in exception is b0.4
+  "Required workbench files present": the workbench configuration always
+  lives at the repository root, so b0.4 anchors at the repository root via
+  internal catalog-only metadata (never settable from gates.yaml — the
+  public gate schema has no `root`/`file_root` option) and a nested
+  `.pi/workbench` can never satisfy it. Gate config, recipe
+  checks/execution, artifact run records and git stay repository-root
+  based.
+- **Safety.** POSIX absolute (`/x`) and Windows absolute (`C:\x`, `C:/x`,
+  `\x`, `\\server\share`, `C:x`) values, paths that resolve outside the
+  repository via `..`, and symlink escapes are rejected; the target must
+  exist and be a directory. An invalid `project_dir` is recorded as a
+  `project.yaml` config issue and falls back to the repository root — the
+  effective root never points outside the repository and nothing outside it
+  is ever read. Symlinks inside the repository are fine.
+- **Default / compatibility.** Omitted (or `"."`), the effective root is
+  the repository root — existing projects keep their exact behavior.
+  `workbench_project_inspect` shows the effective root explicitly.
 
 ### /q-init
 
@@ -311,7 +350,7 @@ Custom tools (callable by the model):
 
 | Tool | Purpose |
 | ---- | ------- |
-| `workbench_project_inspect` | Project root, git state, detected language/package manager, profile, recipes, config errors. Never outputs secrets. |
+| `workbench_project_inspect` | Project root + effective project root (`project_dir`), git state, detected language/package manager (effective root only), profile, recipes, config errors. Never outputs secrets. |
 | `workbench_run_recipe` | Run a declared recipe only. Streams short progress; returns a structured summary; full output lands on disk. |
 | `workbench_read_run` | Read a run record by `run_id`: manifest, summary, bounded log tails. Never sends full large logs inline. |
 | `workbench_run_gate` | Run the validation ladder (gate id, comma list, `base`, `quant`, `all`). |
@@ -758,6 +797,20 @@ npm run cache:doctor           # offline cache health checks (exits non-zero on 
   delegation and VERIFY, STALE after any diff change); command inventory
   24 → 28, tool inventory 8 → 10. The three P7 delegation tools have no
   compact TUI renderers (the P4 five remain the only ones).
+- **P8 (this release):** safe nested project support — optional
+  `project.yaml` `project_dir` (default `.`) resolves a safe effective
+  project root (absolute paths, `..` escapes and symlink escapes rejected;
+  target must exist and be a directory; violations become config issues
+  with a repository-root fallback); stack detection reads only the
+  effective root's top level while git and config-files-present stay
+  repository-root based; gate file/json/numeric/schema checks resolve
+  against the effective root with realpath containment (the built-in b0.4
+  workbench-config check anchors at the repository root via internal
+  catalog-only metadata — the public gate schema has no `root` option)
+  while gate config, run persistence, recipe execution, artifact run
+  records and git
+  stay at the repository root; `workbench_project_inspect` and its
+  renderer show the effective root.
 - **Later:** walk-forward and parameter-experiment tooling as Pi custom
   tools, project-defined JSON schemas for `schema` checks, all within the
   quantitative scope above.

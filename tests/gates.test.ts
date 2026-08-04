@@ -8,22 +8,28 @@
  * folds not filtered, evidence path escapes, gate result persistence, and
  * independent run ids — plus recipe checks, manual evidence marking,
  * non-blocking prerequisites, persisted prerequisite resolution, config
- * checks and yaml catalog overrides.
+ * checks and yaml catalog overrides — plus P8 nested projects: file/json/
+ * numeric/schema checks against the effective root while the built-in b0.4
+ * workbench-config existence check stays repository-root anchored via
+ * internal catalog-only metadata (gates.yaml can never set root/file_root).
  */
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 
 import {
 	GateSetupError,
+	fileCheckRoot,
 	latestGateStatus,
 	loadGates,
 	runGates,
+	type CheckContext,
 } from "../extensions/workbench-runtime/core/gate-engine.ts";
+import { BASE_GATES } from "../extensions/workbench-runtime/core/gate-catalog.ts";
 import { runRecipe } from "../extensions/workbench-runtime/core/recipe-runner.ts";
-import type { WorkerFirstGateFacts } from "../extensions/workbench-runtime/core/gate-schema.ts";
+import type { GateCheck, WorkerFirstGateFacts } from "../extensions/workbench-runtime/core/gate-schema.ts";
 import { makeValidQuantResult, spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
 
 const CONFIG_CHECK = "      - { id: g1.1, title: Config, kind: config }";
@@ -971,4 +977,300 @@ test("recipe checks apply the shared mutation policy: strict Sol denies mutation
 		assert.equal(other.gates[1]!.status, "PASS");
 		assert.equal(other.gates[2]!.status, "PASS");
 	});
+});
+
+// ---------------------------------------------------------------------------
+// P8: safe nested project support (project.yaml project_dir)
+// ---------------------------------------------------------------------------
+
+test("file/json/numeric gate checks resolve against the effective project root", async () => {
+	await withTempDir(async (dir) => {
+		await mkdir(join(dir, "research"), { recursive: true });
+		await writeConfigFile(dir, "project.yaml", "name: test-project\nprofile: generic\nproject_dir: research\n");
+		await writeConfigFile(
+			dir,
+			"gates.yaml",
+			gatesYaml(
+				[
+					`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Data, kind: file, path: data/prices.csv }`,
+					`  - id: g2\n    title: G2\n    checks:\n      - { id: g2.1, title: JSON, kind: json, file: results/r.json, path: split.method }`,
+					`  - id: g3\n    title: G3\n    checks:\n      - { id: g3.1, title: Numeric, kind: numeric, file: results/r.json, path: metrics.return, min: 0 }`,
+				].join("\n"),
+			),
+		);
+		// Artifacts exist ONLY under the nested root — never under the repo root.
+		await mkdir(join(dir, "research", "data"), { recursive: true });
+		await writeFile(join(dir, "research", "data", "prices.csv"), "x", "utf8");
+		await mkdir(join(dir, "research", "results"), { recursive: true });
+		await writeFile(join(dir, "research", "results", "r.json"), JSON.stringify({ split: { method: "walk-forward" }, metrics: { return: 0.1 } }), "utf8");
+
+		const result = await runGates({ projectRoot: dir, selector: "g1,g2,g3", mode: "DEV", exec: spawnExec });
+		assert.equal(result.gates[0]!.status, "PASS", result.gates[0]!.failure_reason ?? "");
+		assert.equal(result.gates[1]!.status, "PASS", result.gates[1]!.failure_reason ?? "");
+		assert.equal(result.gates[2]!.status, "PASS", result.gates[2]!.failure_reason ?? "");
+		assert.equal(result.ok, true);
+	});
+});
+
+test("nested gate file checks ignore repository-root files (no fallback to the repo root)", async () => {
+	await withTempDir(async (dir) => {
+		await mkdir(join(dir, "research"), { recursive: true });
+		await writeConfigFile(dir, "project.yaml", "name: test-project\nprofile: generic\nproject_dir: research\n");
+		await writeConfigFile(
+			dir,
+			"gates.yaml",
+			gatesYaml(`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Data, kind: file, path: data/prices.csv }`),
+		);
+		// The file exists ONLY at the repo root — the check must still FAIL.
+		await mkdir(join(dir, "data"), { recursive: true });
+		await writeFile(join(dir, "data", "prices.csv"), "x", "utf8");
+		const result = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
+		assert.equal(result.gates[0]!.status, "FAIL");
+		assert.ok(result.gates[0]!.checks[0]!.failure_reason?.includes("no file matched"));
+	});
+});
+
+test("nested gate file checks still reject symlink escapes relative to the effective root", async () => {
+	await withTempDir(async (dir) => {
+		await mkdir(join(dir, "research"), { recursive: true });
+		await symlink("/etc", join(dir, "research", "etc-link"));
+		await writeConfigFile(dir, "project.yaml", "name: test-project\nprofile: generic\nproject_dir: research\n");
+		await writeConfigFile(
+			dir,
+			"gates.yaml",
+			gatesYaml(`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Evil, kind: file, path: etc-link/passwd }`),
+		);
+		await assert.rejects(
+			runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec }),
+			(error) => error instanceof GateSetupError && error.message.includes("escapes the project root"),
+		);
+	});
+});
+
+test("schema checks read artifacts from the effective project root", async () => {
+	await withTempDir(async (dir) => {
+		await mkdir(join(dir, "research"), { recursive: true });
+		await writeConfigFile(dir, "project.yaml", "name: test-project\nprofile: generic\nproject_dir: research\n");
+		await writeConfigFile(
+			dir,
+			"gates.yaml",
+			gatesYaml(`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Contract, kind: schema, file: results/quant-result.json, schema: quant-result }`),
+		);
+		await mkdir(join(dir, "research", "results"), { recursive: true });
+		await writeFile(join(dir, "research", "results", "quant-result.json"), JSON.stringify(makeValidQuantResult()), "utf8");
+		const result = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
+		assert.equal(result.gates[0]!.status, "PASS", result.gates[0]!.checks[0]!.failure_reason ?? "");
+	});
+});
+
+test("gate runs persist at the repository root when project_dir is set", async () => {
+	await withTempDir(async (dir) => {
+		await mkdir(join(dir, "research"), { recursive: true });
+		await writeConfigFile(dir, "project.yaml", "name: test-project\nprofile: generic\nproject_dir: research\n");
+		await writeConfigFile(
+			dir,
+			"gates.yaml",
+			gatesYaml(`  - id: g1\n    title: G1\n    checks:\n${CONFIG_CHECK}`),
+		);
+		const result = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
+		assert.equal(result.gates[0]!.status, "PASS");
+		// The run record lives under the REPO root's .pi/workbench/runs — never
+		// inside the nested project directory.
+		assert.ok(
+			result.runDir.startsWith(join(dir, ".pi", "workbench", "runs") + sep),
+			`runDir ${result.runDir} must be under the repo root runs dir`,
+		);
+		const manifest = (await readRunFile(result.runDir, "manifest.json")) as Record<string, unknown>;
+		assert.equal(manifest.cwd, dir, "the gate run cwd stays at the repository root");
+	});
+});
+
+test("recipe execution and artifact checks stay repository-root based with project_dir set", async () => {
+	await withTempDir(async (dir) => {
+		await mkdir(join(dir, "research"), { recursive: true });
+		await writeConfigFile(dir, "project.yaml", "name: test-project\nprofile: generic\nproject_dir: research\n");
+		await writeConfigFile(
+			dir,
+			"recipes.yaml",
+			[
+				"recipes:",
+				'  - name: producer',
+				'    command: ["node", "-e", "process.stdout.write(process.cwd()); require(\\"fs\\").mkdirSync(\\"out\\", { recursive: true }); require(\\"fs\\").writeFileSync(\\"out/result.json\\", \\"{}\\")"]',
+				'    artifacts: ["out/*.json"]',
+				"",
+			].join("\n"),
+		);
+		await writeConfigFile(
+			dir,
+			"gates.yaml",
+			gatesYaml(`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Output, kind: artifact, artifact_recipe: producer }`),
+		);
+		// The recipe executes at the REPO root (recipe cwd semantics unchanged).
+		const recipe = await runRecipe({ projectRoot: dir, recipeName: "producer", mode: "DEV", exec: spawnExec });
+		assert.equal(recipe.ok, true, recipe.error ?? "");
+		assert.equal(recipe.record?.cwd, dir, "recipe cwd stays at the repository root");
+		const manifest = (await readRunFile(recipe.runDir!, "manifest.json")) as Record<string, unknown>;
+		assert.equal(manifest.cwd, dir);
+
+		// The artifact check reads the run record at the repo root and passes.
+		const gate = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
+		assert.equal(gate.gates[0]!.status, "PASS", gate.gates[0]!.failure_reason ?? "");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// P8: the built-in workbench-config existence check (b0.4) stays
+// repository-root anchored via INTERNAL catalog metadata — a nested
+// effective root must never relocate or impersonate it, and a project
+// gates.yaml can never request repository-root anchoring (root/file_root
+// are rejected by the strict schema)
+// ---------------------------------------------------------------------------
+
+test("built-in b0.4 checks the repository-root workbench config for nested projects", async () => {
+	await withTempDir(async (dir) => {
+		await mkdir(join(dir, "research"), { recursive: true });
+		// Repository root: the workbench config written by /q-init (project.yaml
+		// declares the nested effective root; recipes.yaml + empty gates.yaml
+		// keep the built-in catalog).
+		await writeConfigFile(dir, "project.yaml", "name: test-project\nprofile: generic\nproject_dir: research\n");
+		await writeConfigFile(dir, "recipes.yaml", "recipes: []\n");
+		await writeConfigFile(dir, "gates.yaml", "gates: []\n");
+		// Effective root only: manifest + dependency files (the b0.2/b0.3
+		// targets) — and NO .pi/workbench under the nested directory.
+		await writeFile(join(dir, "research", "package.json"), "{}", "utf8");
+		await writeFile(join(dir, "research", "package-lock.json"), "{}", "utf8");
+
+		const result = await runGates({ projectRoot: dir, selector: "b0", mode: "DEV", exec: spawnExec });
+		assert.equal(result.gates[0]!.id, "b0");
+		const byId = new Map(result.gates[0]!.checks.map((c) => [c.check_id, c]));
+		assert.equal(byId.get("b0.1")!.status, "PASS", byId.get("b0.1")!.failure_reason ?? "");
+		assert.equal(byId.get("b0.2")!.status, "PASS", "manifest is found at the effective root");
+		assert.equal(byId.get("b0.3")!.status, "PASS", "dependency files are found at the effective root");
+		assert.equal(
+			byId.get("b0.4")!.status,
+			"PASS",
+			"workbench config is found at the repository root even though the nested root has no .pi/workbench",
+		);
+		assert.equal(result.gates[0]!.status, "PASS", result.gates[0]!.failure_reason ?? "");
+		assert.equal(result.ok, true);
+	});
+});
+
+test("a nested .pi/workbench cannot satisfy the built-in b0.4 repository-root check", async () => {
+	await withTempDir(async (dir) => {
+		await mkdir(join(dir, "research", ".pi", "workbench"), { recursive: true });
+		// Repository root: NO workbench config at all (no .pi/workbench). The
+		// nested directory carries the complete config it would need if it
+		// were the project root — project.yaml + recipes.yaml + gates.yaml
+		// (impersonation attempt).
+		await writeFile(join(dir, "research", ".pi", "workbench", "project.yaml"), "name: nested\nprofile: generic\n", "utf8");
+		await writeFile(join(dir, "research", ".pi", "workbench", "recipes.yaml"), "recipes: []\n", "utf8");
+		await writeFile(join(dir, "research", ".pi", "workbench", "gates.yaml"), "gates: []\n", "utf8");
+
+		// Nested-only config must NOT satisfy the repository-root anchored b0.4.
+		const result = await runGates({ projectRoot: dir, selector: "b0", mode: "DEV", exec: spawnExec });
+		const byId = new Map(result.gates[0]!.checks.map((c) => [c.check_id, c]));
+		assert.equal(byId.get("b0.4")!.status, "FAIL", "a nested .pi/workbench must never satisfy b0.4");
+		assert.ok(byId.get("b0.4")!.failure_reason?.includes("no file matched"), byId.get("b0.4")!.failure_reason ?? "");
+		assert.equal(result.gates[0]!.status, "FAIL");
+
+		// Control: once the repository root itself carries the workbench config
+		// (project.yaml + recipes.yaml written by /q-init; project_dir keeps the
+		// effective root nested) the same check passes — the repository root is
+		// the only source, even with the nested .pi/workbench still present.
+		await writeConfigFile(dir, "project.yaml", "name: test-project\nprofile: generic\nproject_dir: research\n");
+		await writeConfigFile(dir, "recipes.yaml", "recipes: []\n");
+		await writeConfigFile(dir, "gates.yaml", "gates: []\n");
+		await writeFile(join(dir, "research", "package.json"), "{}", "utf8");
+		await writeFile(join(dir, "research", "package-lock.json"), "{}", "utf8");
+		const again = await runGates({ projectRoot: dir, selector: "b0", mode: "DEV", exec: spawnExec });
+		const againById = new Map(again.gates[0]!.checks.map((c) => [c.check_id, c]));
+		assert.equal(againById.get("b0.1")!.status, "PASS", againById.get("b0.1")!.failure_reason ?? "");
+		assert.equal(againById.get("b0.2")!.status, "PASS", againById.get("b0.2")!.failure_reason ?? "");
+		assert.equal(againById.get("b0.3")!.status, "PASS", againById.get("b0.3")!.failure_reason ?? "");
+		assert.equal(againById.get("b0.4")!.status, "PASS", againById.get("b0.4")!.failure_reason ?? "");
+		assert.equal(again.gates[0]!.status, "PASS", again.gates[0]!.failure_reason ?? "");
+		assert.equal(again.ok, true);
+	});
+});
+
+test("file checks without root metadata keep resolving against the effective root", async () => {
+	await withTempDir(async (dir) => {
+		await mkdir(join(dir, "research", ".pi", "workbench"), { recursive: true });
+		await writeConfigFile(dir, "project.yaml", "name: test-project\nprofile: generic\nproject_dir: research\n");
+		await writeConfigFile(
+			dir,
+			"gates.yaml",
+			gatesYaml(`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: WB config, kind: file, path: .pi/workbench/recipes.yaml }`),
+		);
+		// The file exists ONLY under the nested effective root — the default
+		// (effective-root) anchoring still finds it; only the built-in b0.4
+		// internal repository-root metadata would ignore it.
+		await writeFile(join(dir, "research", ".pi", "workbench", "recipes.yaml"), "recipes: []\n", "utf8");
+		const result = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
+		assert.equal(result.gates[0]!.status, "PASS", result.gates[0]!.failure_reason ?? "");
+	});
+});
+
+test("gates.yaml cannot set root or file_root (strict schema, internal metadata only)", async () => {
+	// `root` is no longer a public gate-check field: rejected for any kind,
+	// including kind=file with the previously-valid "repository" value.
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: C, kind: file, root: repository, path: package.json }`),
+		});
+		await assert.rejects(
+			runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec }),
+			(error) => error instanceof GateSetupError && error.message.includes('unknown field "root"'),
+		);
+	});
+	// Even the no-op "effective" value is rejected — the schema has no root option.
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: C, kind: file, root: effective, path: x }`),
+		});
+		await assert.rejects(
+			runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec }),
+			(error) => error instanceof GateSetupError && error.message.includes('unknown field "root"'),
+		);
+	});
+	// Non-file kinds reject it too (previously "root is only valid for kind=file").
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: C, kind: json, file: x.json, path: a, root: repository }`),
+		});
+		await assert.rejects(
+			runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec }),
+			(error) => error instanceof GateSetupError && error.message.includes('unknown field "root"'),
+		);
+	});
+	// The internal metadata name file_root is equally rejected from YAML.
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: C, kind: file, file_root: repository, path: package.json }`),
+		});
+		await assert.rejects(
+			runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec }),
+			(error) => error instanceof GateSetupError && error.message.includes('unknown field "file_root"'),
+		);
+	});
+});
+
+test("built-in b0.4 is the only catalog check with internal repository-root metadata", async () => {
+	const b0 = BASE_GATES.find((g) => g.id === "b0");
+	assert.ok(b0, "base gate b0 exists");
+	const b04 = b0!.checks.find((c) => c.id === "b0.4");
+	assert.ok(b04, "built-in b0.4 exists");
+	assert.equal(b04!.file_root, "repository", "b0.4 carries the internal file_root: repository metadata");
+	for (const c of b0!.checks) {
+		if (c.id !== "b0.4") {
+			assert.equal(c.file_root, undefined, `built-in ${c.id} must not carry file_root`);
+		}
+	}
+	// The engine helper maps the internal metadata to the repository root and
+	// everything else to the effective root.
+	const ctx = { projectRoot: "/repo", effectiveProjectRoot: "/repo/research" } as unknown as CheckContext;
+	assert.equal(fileCheckRoot(ctx, b04 as GateCheck), "/repo", "file_root: repository selects the repository root");
+	const plain: GateCheck = { ...(b04 as GateCheck), file_root: undefined };
+	assert.equal(fileCheckRoot(ctx, plain), "/repo/research", "default file checks select the effective root");
 });
