@@ -28,7 +28,9 @@ recipes:
     timeout_ms: 600000
     allowed_modes: [DEV, VERIFY]
     expected_exit_codes: [0]
+    # data/results/artifacts outputs only — never source-code mutation
     writes: ["data/", "results/", "artifacts/"]
+    mutation: artifacts
     artifacts: ["results/**/*.json", "results/**/*.csv", "artifacts/**/*.json"]
     environment: []
     output_strategy: tail
@@ -60,7 +62,9 @@ recipes:
     timeout_ms: 600000
     allowed_modes: [DEV, VERIFY]
     expected_exit_codes: [0]
+    # data/results/artifacts outputs only — never source-code mutation
     writes: ["data/", "results/", "artifacts/"]
+    mutation: artifacts
     artifacts: ["results/**/*.json", "results/**/*.csv", "artifacts/**/*.json"]
     environment: []
     output_strategy: tail
@@ -87,7 +91,9 @@ recipes:
     timeout_ms: 600000
     allowed_modes: [DEV, VERIFY]
     expected_exit_codes: [0]
+    # data/results/artifacts outputs only — never source-code mutation
     writes: ["data/", "results/", "artifacts/"]
+    mutation: artifacts
     artifacts: ["results/**/*.json", "results/**/*.csv", "artifacts/**/*.json"]
     environment: []
     output_strategy: tail
@@ -115,7 +121,9 @@ recipes:
     timeout_ms: 900000
     allowed_modes: [DEV, VERIFY]
     expected_exit_codes: [0]
+    # data/results/artifacts outputs only — never source-code mutation
     writes: ["data/", "results/", "artifacts/"]
+    mutation: artifacts
     artifacts: ["results/**/*.json", "results/**/*.csv", "artifacts/**/*.json"]
     environment: []
     output_strategy: tail

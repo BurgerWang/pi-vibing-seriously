@@ -80,6 +80,60 @@ test("allowed_modes gates recipe execution", async () => {
 	});
 });
 
+// ---------------------------------------------------------------------------
+// P7 slice 3: direct recipe execution applies the shared mutation policy
+// ---------------------------------------------------------------------------
+
+test("direct recipe calls enforce the mutation policy: strict Sol denies source, workers run only none", async () => {
+	await withTempDir(async (dir) => {
+		await writeConfigFile(
+			dir,
+			"recipes.yaml",
+			[
+				"recipes:",
+				'  - { name: fmt, command: ["node", "-e", "process.exit(0)"], mutation: source, writes: ["src/"] }',
+				'  - { name: build, command: ["node", "-e", "process.exit(0)"], mutation: artifacts, artifacts: ["dist/**"] }',
+				'  - { name: verify, command: ["node", "-e", "process.exit(0)"], mutation: none }',
+				"",
+			].join("\n"),
+		);
+		const sol = { role: undefined, provider: "openai-codex", model: "gpt-5.6-sol" };
+		const worker = { role: "worker", provider: "deepseek", model: "deepseek-v4-flash" };
+
+		// Strict Sol: mutation:source is denied; none/artifacts run.
+		const solSource = await runRecipe({ projectRoot: dir, recipeName: "fmt", mode: "DEV", exec: spawnExec, actorFacts: sol });
+		assert.equal(solSource.ok, false);
+		assert.ok(solSource.error?.includes("mutation: source"), solSource.error ?? "");
+		assert.equal((await runRecipe({ projectRoot: dir, recipeName: "build", mode: "DEV", exec: spawnExec, actorFacts: sol })).ok, true);
+		assert.equal((await runRecipe({ projectRoot: dir, recipeName: "verify", mode: "DEV", exec: spawnExec, actorFacts: sol })).ok, true);
+
+		// Delegated worker: only mutation:none runs (artifacts included).
+		const workerSource = await runRecipe({ projectRoot: dir, recipeName: "fmt", mode: "DEV", exec: spawnExec, actorFacts: worker });
+		assert.equal(workerSource.ok, false);
+		assert.ok(workerSource.error?.includes("mutation: source"));
+		const workerBuild = await runRecipe({ projectRoot: dir, recipeName: "build", mode: "DEV", exec: spawnExec, actorFacts: worker });
+		assert.equal(workerBuild.ok, false);
+		assert.ok(workerBuild.error?.includes("mutation: artifacts"));
+		assert.equal((await runRecipe({ projectRoot: dir, recipeName: "verify", mode: "DEV", exec: spawnExec, actorFacts: worker })).ok, true);
+
+		// Other controllers and fact-less callers keep prior behavior.
+		const other = { role: undefined, provider: "anthropic", model: "claude-sonnet" };
+		assert.equal((await runRecipe({ projectRoot: dir, recipeName: "fmt", mode: "DEV", exec: spawnExec, actorFacts: other })).ok, true);
+		assert.equal((await runRecipe({ projectRoot: dir, recipeName: "fmt", mode: "DEV", exec: spawnExec })).ok, true);
+
+		// Legacy inference: a writes-bearing recipe without an explicit
+		// mutation is source and is denied for strict Sol.
+		await writeConfigFile(
+			dir,
+			"recipes.yaml",
+			"recipes:\n  - { name: legacy-fmt, command: [\"node\", \"-e\", \"process.exit(0)\"], writes: [\"src/\"] }\n",
+		);
+		const legacy = await runRecipe({ projectRoot: dir, recipeName: "legacy-fmt", mode: "DEV", exec: spawnExec, actorFacts: sol });
+		assert.equal(legacy.ok, false);
+		assert.ok(legacy.error?.includes("mutation: source"), "legacy non-empty writes infer source");
+	});
+});
+
 test("timeout kills the process and marks the run timed out", async () => {
 	await withTempDir(async (dir) => {
 		await setupProject(dir);

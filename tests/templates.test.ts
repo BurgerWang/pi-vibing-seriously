@@ -86,3 +86,44 @@ test("every template recipe passes the strict schema", async () => {
 		}
 	}
 });
+
+test("template recipes declare mutation none/artifacts consistently with their writes", async () => {
+	// Generic: write-free checks declare mutation none; build (artifacts only)
+	// declares mutation artifacts. (parseRecipesDocument sorts by name.)
+	const genericYaml = (await getInitTemplate("generic")).files["recipes.yaml"];
+	assert.ok(genericYaml, "recipes.yaml present");
+	const generic = parseRecipesDocument(parseYaml(genericYaml));
+	assert.deepEqual(
+		generic.recipes.map((r) => [r.name, r.mutation]),
+		[["build", "artifacts"], ["test", "none"], ["typecheck", "none"]],
+	);
+	// Quant templates: every data/feature/backtest/walk-forward recipe writes
+	// ONLY data/result/artifact files, so each one declares mutation artifacts
+	// (never source — the scripts never mutate project source code).
+	for (const profile of ["quant-research/stock-selection", "quant-research/market-timing"] as const) {
+		const recipesYaml = (await getInitTemplate(profile)).files["recipes.yaml"];
+		assert.ok(recipesYaml, "recipes.yaml present");
+		const parsed = parseRecipesDocument(parseYaml(recipesYaml));
+		assert.ok(parsed.recipes.length >= 4, `${profile}: data/feature/backtest/walkforward recipes present`);
+		for (const recipe of parsed.recipes) {
+			assert.equal(recipe.mutation, "artifacts", `${profile} recipe ${recipe.name} declares mutation: artifacts`);
+			assert.ok(recipe.writes.length > 0, `${profile} recipe ${recipe.name} keeps its declared writes`);
+			for (const write of recipe.writes) {
+				assert.match(
+					write,
+					/^(data|results|artifacts)\//,
+					`${profile} recipe ${recipe.name} writes only under data/results/artifacts (got ${write})`,
+				);
+			}
+		}
+	}
+	// Explicit declarations, never inference: every template recipe carries
+	// the field verbatim.
+	for (const profile of INIT_PROFILES) {
+		const text = (await getInitTemplate(profile)).files["recipes.yaml"];
+		assert.ok(text, "recipes.yaml present");
+		const mutations = text.split("\n").filter((l) => l.trim().startsWith("mutation:"));
+		const parsed = parseRecipesDocument(parseYaml(text));
+		assert.equal(mutations.length, parsed.recipes.length, `${profile}: every recipe declares mutation explicitly`);
+	}
+});

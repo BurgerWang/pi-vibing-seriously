@@ -143,6 +143,54 @@ test("recipes.yaml accepts a top-level list or a recipes key", () => {
 });
 
 // ---------------------------------------------------------------------------
+// P7 mutation classification (none | artifacts | source)
+// ---------------------------------------------------------------------------
+
+test("explicit mutation values parse strictly (none/artifacts/source only)", () => {
+	for (const mutation of ["none", "artifacts", "source"] as const) {
+		const result = parseRecipe({ name: "r", command: ["ls"], mutation }, 0);
+		assert.deepEqual(result.errors, [], mutation);
+		assert.equal(result.recipes[0]?.mutation, mutation, mutation);
+	}
+	for (const bad of ["code", "MIXED", 42, true, null, "none,artifacts"]) {
+		const result = parseRecipe({ name: "r", command: ["ls"], mutation: bad }, 0);
+		assert.equal(result.recipes.length, 0, JSON.stringify(bad));
+		assert.ok(result.errors.some((e) => e.includes('"mutation" must be one of none, artifacts, source')), result.errors.join("; "));
+	}
+});
+
+test("missing mutation infers none for writes=[] and source for non-empty writes", () => {
+	const writeFree = parseRecipe({ name: "r", command: ["ls"], writes: [] }, 0);
+	assert.equal(writeFree.recipes[0]?.mutation, "none");
+	// Artifacts alone (e.g. a legacy build recipe) still infer none.
+	const artifactOnly = parseRecipe({ name: "build", command: ["npm", "run", "build"], artifacts: ["dist/**"] }, 0);
+	assert.equal(artifactOnly.recipes[0]?.mutation, "none");
+	const writing = parseRecipe({ name: "fmt", command: ["npm", "run", "format"], writes: ["src/"] }, 0);
+	assert.equal(writing.recipes[0]?.mutation, "source");
+	// The fully specified recipe (non-empty writes) also infers source.
+	assert.equal(parseRecipe(FULL_RECIPE, 0).recipes[0]?.mutation, "source");
+});
+
+test("explicit mutation overrides the legacy inference", () => {
+	const build = parseRecipe({ name: "build", command: ["npm", "run", "build"], writes: [], artifacts: ["dist/**"], mutation: "artifacts" }, 0);
+	assert.equal(build.recipes[0]?.mutation, "artifacts");
+	const constrained = parseRecipe({ name: "fmt", command: ["npm", "run", "format"], writes: ["src/"], mutation: "none" }, 0);
+	assert.equal(constrained.recipes[0]?.mutation, "none");
+});
+
+test("every parsed recipe exposes a deterministic mutation", () => {
+	const doc = parseRecipesDocument({
+		recipes: [
+			{ name: "a", command: ["x"], mutation: "artifacts" },
+			{ name: "b", command: ["x"], writes: ["out/"] },
+			{ name: "c", command: ["x"] },
+		],
+	});
+	assert.deepEqual(doc.errors, []);
+	assert.deepEqual(doc.recipes.map((r) => [r.name, r.mutation]), [["a", "artifacts"], ["b", "source"], ["c", "none"]]);
+});
+
+// ---------------------------------------------------------------------------
 // buildArgv — parameter substitution
 // ---------------------------------------------------------------------------
 

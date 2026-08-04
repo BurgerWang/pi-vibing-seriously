@@ -9,6 +9,7 @@ recipes:
     allowed_modes: [DEV, VERIFY]
     expected_exit_codes: [0]
     writes: []
+    mutation: none
     artifacts: []
     environment: []
     output_strategy: tail
@@ -22,6 +23,7 @@ recipes:
     allowed_modes: [DEV, VERIFY]
     expected_exit_codes: [0]
     writes: []
+    mutation: none
     artifacts: []
     environment: []
     output_strategy: tail
@@ -35,6 +37,7 @@ recipes:
     allowed_modes: [DEV, VERIFY]
     expected_exit_codes: [0]
     writes: []
+    mutation: artifacts
     artifacts: ["dist/**"]
     environment: []
     output_strategy: tail

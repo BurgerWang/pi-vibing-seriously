@@ -96,6 +96,80 @@ Defense-in-depth controls:
 - the tool executes sequentially, propagates abort, enforces a timeout, and
   bounds stdout/stderr processing.
 
+### Worker-first write authority (P7)
+
+Approved GPT-5.6 Sol in DEV resolves to the fixed `worker-first-strict`
+policy: the active tool set is exactly the canonical 14-tool allowlist
+(`read`, `grep`, `find`, `ls` plus all ten `workbench_*` tools) — no
+`bash`/`edit`/`write`, no foreign tools — and no persisted/prompt/config
+value can weaken or opt out of it. Actor identity comes only from the
+`WORKBENCH_AGENT_ROLE=worker` env contract and the provider/model pair;
+project config can never self-label a controller as Sol or as a worker.
+Workers and other controllers are outside the policy (the existing worker
+guards remain authoritative; other controllers are not newly denied).
+
+Second-layer `tool_call` guard for strict Sol: `bash` is always blocked;
+`edit`/`write` require an ACTIVE user-issued temporary write lease
+authorizing the project-relative path and the remaining call; every tool
+outside the allowlist is blocked despite any re-enable. Leases are user-only
+(`/q-commander-write-unlock`, `/q-commander-write-lock`, `/q-write-policy
+status` — commands, never model tools), with fixed reasons
+(`bootstrap-policy`, `worker-unavailable`, `security-emergency`,
+`user-directed`), project-relative exact or `/**` subtree paths (absolute
+POSIX, Windows drive and backslash-root paths are categorically rejected
+before normalization; `..` escapes refused), `edit`/`write` only (never
+`bash`), max 10 calls and max 30 minutes, and one call consumed per
+successful authorized write. Confirmation is mode-split: the real TUI
+requires an explicit human confirmation dialog; non-TUI issues a PENDING
+lease whose two bounded distinct token parts are displayed exactly once and
+must both be confirmed by a second invocation — both parts are consumed on
+success and a confirmed lease can never be re-confirmed. Token parts never
+appear in status/compact summaries or persisted summaries (`/q-write-policy
+status` and the footer show only `WF:LEASE used/max` / `WF:LOCKED` facts).
+Leases are revoked on leaving DEV, commander model/provider change, session
+end, explicit lock, and they expire (30 min) or exhaust (10 calls) —
+restoring the exact canonical 14 tools; restore is fail-closed (invalid
+records restore to locked).
+
+### Delegation ledger and review lifecycle (P7)
+
+Every delegation — success **and** failure — is recorded in a bounded ledger
+at `<project-root>/<CONFIG_DIR_NAME>/workbench/delegations/<id>/`
+(`manifest.json`, `before.json` before the worker starts; `after.json`,
+`worker-summary.json`, and a `review.json` PENDING_REVIEW placeholder at
+finish). Records are written atomically (tmp + rename, mode 0600), bounded
+(contract, per-path porcelain status codes + bounded content digests, diff
+hashes, usage/budget facts, redacted report summaries — never full worker
+transcripts or secrets), and the ledger's own directory is excluded from the
+git facts it records so records never pollute the diff they describe. Git
+facts come from argv-only `exec` calls (shell=false), never shell strings.
+
+`workbench_review_worker_diff` (DEV-only, Sol) re-reads the REAL git state:
+it scope-checks every worker path against the parent-approved `allowed_paths`
+(realpath/symlink-safe; `include_paths` narrows only the patch and can never
+hide a violation), compares the current diff hash with the recorded after
+hash (mismatch/drift are warnings), warns when the worker's `## Files
+Changed` section is missing or inconsistent with the actual diff, and writes
+the completed `review.json` (atomic). Verdict `PASS` marks the delegation
+REVIEWED bound to the CURRENT hash; `FAIL` keeps it PENDING_REVIEW. A
+pending or stale review blocks the next delegation AND VERIFY (mode entry
+and gate runs in VERIFY are refused); any diff change after REVIEWED turns
+the delegation STALE (a diff returning to exactly the reviewed hash
+re-validates). Blocked commander write attempts are counted while a review
+is outstanding. The review lifecycle and the lease persist as custom
+entries (`workbench-delegation-state`, `workbench-write-lease`) — durable
+across compaction and session replacement — and restore fail-closed on
+`session_start`.
+
+B6 (Worker-First Compliance, P7) is a machine-backed universal base gate:
+the runtime injects bounded worker-first facts into every gate run —
+strict policy active, zero unauthorized commander writes (or hard denial
+active), no pending/stale worker review, reviewed hash matches the current
+diff, worker paths within the approved contracts, no active unexplained
+write lease, and final verification initiated by the Sol commander. Missing
+facts are NOT_RUN (a required NOT_RUN never PASSes), a pending/stale review
+BLOCKs B6, and model prose can never satisfy B6.1-B6.8.
+
 Context-budget protection (model-specific, independent of the
 Commander/project compaction reserve):
 
@@ -114,6 +188,13 @@ Commander/project compaction reserve):
   if the child exits 0.
 
 Only recipes with an empty declared `writes` list are available to a worker.
+Recipe mutation policy (P7): every recipe declares
+`mutation: none | artifacts | source`; delegated workers run only
+`mutation: none` (write-free) recipes, and strict Sol runs only
+`none`/`artifacts` recipes — `source`-mutating recipes are denied to both
+(legacy inference maps non-empty declared `writes` to `source`, so this is
+exactly as strict as the declared writes for legacy recipes; other
+controllers are unaffected).
 This blocks honestly declared mutating recipes, but recipes remain
 trusted-project discipline mechanisms: a malicious command can write despite
 an empty declaration. They are not an OS sandbox or a substitute for reviewing
@@ -126,7 +207,8 @@ resumed (fresh-worker continuation), so no worker state persists between
 delegations. The tool executes sequentially and a worker can never delegate,
 so at most one writing worker exists per worktree at any time; Sol must not
 start a second writing delegation before the first has returned and its diff
-has been inspected. See
+has been reviewed (a pending or stale review blocks the next delegation in
+code as well). See
 [worker-delegation.md](worker-delegation.md).
 
 ## Records and redaction
@@ -156,7 +238,10 @@ from *using* them.
 No secret content appears in logs, manifests, error messages, the TUI
 status/widget, or reports: all display paths consume redacted or
 structural data (run ids, gate ids, paths). `workbench_project_inspect`
-never outputs environment values.
+never outputs environment values. Lease confirmation token parts appear
+only in the non-TUI issuance output and are never written into status or
+compact summaries; delegation ledger and review records are redacted and
+bounded.
 
 ## Path traversal and symlinks
 

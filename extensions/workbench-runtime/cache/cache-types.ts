@@ -44,7 +44,7 @@ import type { CacheInvalidationReason, DriftSource, InferenceConfidence } from "
 export const TELEMETRY_SCHEMA_VERSION = "1.1" as const;
 
 /** Must stay in sync with package.json version. */
-export const EXTENSION_VERSION = "0.8.0";
+export const EXTENSION_VERSION = "0.9.0";
 
 /** Pi usage api kinds whose normalized semantics were verified above. */
 export const VERIFIED_API_KINDS: ReadonlySet<string> = new Set([

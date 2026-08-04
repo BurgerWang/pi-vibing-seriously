@@ -302,10 +302,11 @@ test("workbench_delegate_worker metadata is static and carries the responsibilit
 	assert.match(text, /observable acceptance criteria/);
 	assert.match(text, /Worker prose is never acceptance evidence/);
 	// The registration-order/schema contract is untouched: same name, same
-	// position, same parameter schema hash — pinned to the reviewed baseline
-	// (a self-comparison would prove nothing).
+	// position (the first P7 tool, after the seven existing tools), same
+	// parameter schema hash — pinned to the reviewed baseline (a
+	// self-comparison would prove nothing).
 	assert.equal(meta.name, "workbench_delegate_worker");
-	assert.equal(WORKBENCH_TOOL_NAMES.indexOf("workbench_delegate_worker"), WORKBENCH_TOOL_NAMES.length - 1, "delegate tool keeps its registration position");
+	assert.equal(WORKBENCH_TOOL_NAMES.indexOf("workbench_delegate_worker"), WORKBENCH_TOOL_NAMES.length - 3, "delegate tool keeps its registration position (seven existing → delegate → review → status)");
 	assert.equal(
 		canonicalHash(WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker),
 		"2cf1f563f78ffe2c85d142c1f40deea7bc658365345554db11c80b8af6b521d9",
@@ -358,6 +359,33 @@ test("computeActiveTools: DEV foreign-tool order is deterministic (sorted by nam
 	assert.deepEqual(foreignPositions, ["alpha_ext", "workbench_gate_check", "zeta_ext"], "foreign tools sorted by name");
 	// frozen set: identical inputs -> identical output
 	assert.deepEqual(a, computeActiveTools("DEV", ["read", "bash", ...foreign]));
+});
+
+test("P7 tools keep the fixed seven→delegate→review→status order with static metadata", () => {
+	const names = [...WORKBENCH_TOOL_NAMES];
+	assert.deepEqual(
+		names.slice(0, 7),
+		["workbench_project_inspect", "workbench_run_recipe", "workbench_read_run", "workbench_run_gate", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs"],
+		"the seven existing tools keep their registration order",
+	);
+	assert.deepEqual(
+		names.slice(7),
+		["workbench_delegate_worker", "workbench_review_worker_diff", "workbench_delegation_status"],
+		"the three P7 tools follow in strict delegate → review → status order",
+	);
+	// Every P7 tool's metadata stays free of dynamic values (no dates,
+	// times, hashes, absolute paths, or concrete run/gate/task ids).
+	for (const name of names.slice(7)) {
+		const meta = WORKBENCH_TOOL_METADATA[name];
+		for (const field of [meta.description, meta.promptSnippet, ...meta.promptGuidelines]) {
+			assert.deepEqual(findDynamicValueMarkers(field), [], `${name} metadata must be static: ${field.slice(0, 80)}`);
+		}
+	}
+	// Review/status parameter schemas are constructed in source order and
+	// stable across builds (identical hashes on repeat construction).
+	for (const name of names.slice(7)) {
+		assert.equal(canonicalHash(WORKBENCH_TOOL_PARAMETERS[name]), canonicalHash(WORKBENCH_TOOL_PARAMETERS[name]), name);
+	}
 });
 
 test("workbench tool catalog: registration order, static metadata, stable schema hashes", () => {
@@ -519,7 +547,7 @@ test("no dynamic tool loader: tools are registered statically in WORKBENCH_TOOL_
 	// exactly one setActiveTools call site (applyModeTools) — the tool set is
 	// swapped only on mode switches / session_start, never per turn
 	assert.equal(index.split("setActiveTools(").length - 1, 1, "setActiveTools called from exactly one place");
-	// exactly the 8 workbench tools are registered, in catalog order
+	// exactly the 10 workbench tools are registered, in catalog order
 	const registrations = index.split("pi.registerTool({").slice(1);
 	assert.equal(registrations.length, WORKBENCH_TOOL_NAMES.length, "one registerTool per catalog tool");
 	const registered: string[] = [];

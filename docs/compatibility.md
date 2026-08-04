@@ -1,6 +1,6 @@
 # Compatibility
 
-Tested-environment matrix for **pi-dev-workbench v0.8.0 (P6-E)**. Only
+Tested-environment matrix for **pi-dev-workbench v0.9.0 (P7)**. Only
 environments that were actually exercised are listed; no untested
 compatibility is claimed. The machine-readable copy lives in
 [`compatibility/pi.json`](../compatibility/pi.json).
@@ -9,7 +9,7 @@ compatibility is claimed. The machine-readable copy lives in
 
 | Component | Version | How it was exercised |
 | --------- | ------- | -------------------- |
-| Pi (`@earendil-works/pi-coding-agent`) | **0.83.0** | `npm run typecheck`/`npm test` against the pinned devDependency; live `pi -a -p` print-mode smoke runs; `pi --mode json -a -p` JSON-mode smoke runs; extension direct-load tests (stub API); live controlled-worker smoke spawned `deepseek/deepseek-v4-flash:max`, verified the JSON-event provider/model, performed two read-only tool turns, returned nested usage, exited 0, and left git status unchanged. |
+| Pi (`@earendil-works/pi-coding-agent`) | **0.83.0** | `npm run typecheck`/`npm test` against the pinned devDependency; live `pi -a -p` print-mode smoke runs; `pi --mode json -a -p` JSON-mode smoke runs; extension direct-load tests (stub API); live controlled-worker smoke spawned `deepseek/deepseek-v4-flash:max`, verified the JSON-event provider/model, performed two read-only tool turns, returned nested usage, exited 0, and left git status unchanged. The P7 worker-first write authority, lease commands, delegation ledger and review lifecycle are exercised by the unit-test suite (write-authority, lease-command, delegation-ledger, delegation-state, diff-review, worker-policy, worker-runner, inventory, package-content tests — 717 tests total, full check `npm run check` passed 717/717); the P7 release slice adds the focused worker-first contract tests (q-build, the implementation-workflow skill, and both project AGENTS templates must encode the seven worker-first rules) and the release-asset version-consistency tests. No new live-smoke claim is made for P7. |
 | Pi TUI (`@earendil-works/pi-tui`) | **0.83.0** | Status/widget/renderer components compiled and rendered through pi-tui's `Text` in unit tests (`tests/p4-*.test.ts`). A full interactive TUI session was not automated (see Limitations). |
 | Node.js | **v24.13.0** | All test runs and smoke runs. |
 | npm | **11.18.0** | `npm install`, `npm run typecheck/test/check`. |
@@ -77,6 +77,13 @@ path (custom entries are read on every `session_start`):
 - A full interactive TUI session (real keypresses, real widget rendering)
   was not automated; the TUI surface is covered by component-level tests and
   the print/json smokes prove the shared line builders work end to end.
+- The three P7 delegation tools (`workbench_delegate_worker`,
+  `workbench_review_worker_diff`, `workbench_delegation_status`) have no
+  compact TUI renderers — they render through Pi's default text fallback;
+  the five P4 tools remain the only ones with compact renderers.
+- The P7 lease confirmation flows (TUI dialog, non-TUI two-part token) are
+  covered by pure parsing/renderer tests and command-handler unit tests, not
+  by an automated interactive-terminal session.
 - Windows and macOS are untested; the path policy uses POSIX path semantics.
 - Older Pi releases are untested; 0.83.0 is the only verified baseline.
 - The P6 benchmark corpus is single-provider/single-model/single-mode

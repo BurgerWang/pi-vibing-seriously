@@ -16,6 +16,13 @@
  *               computes strategy metrics itself)
  *   - manual   human: explicit manual evidence is required (never inferred
  *               from model prose; always recorded as type "manual")
+ *   - worker-first machine: a bounded injected WorkerFirstGateFacts object
+ *               (constructed by the runtime from actor/policy/lease/
+ *               delegation/review facts — never from model prose). Missing
+ *               facts are NOT_RUN; negative compliance facts are FAIL (or
+ *               BLOCKED when the runtime marks the evaluation blocked, e.g.
+ *               by a pending/stale review); a required NOT_RUN can never
+ *               make the gate PASS.
  *
  * Status model (spec §3): PASS | FAIL | BLOCKED | NOT_RUN only.
  * Rules enforced by the engine:
@@ -29,7 +36,10 @@
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
-export type CheckKind = "config" | "recipe" | "artifact" | "file" | "json" | "numeric" | "manual" | "schema";
+import type { ActorRole, LeaseReason, LeaseStatus, WritePolicy } from "./write-authority.ts";
+import type { DelegationReviewStatus } from "./delegation-state.ts";
+
+export type CheckKind = "config" | "recipe" | "artifact" | "file" | "json" | "numeric" | "manual" | "schema" | "worker-first";
 
 export type GateStatus = "PASS" | "FAIL" | "BLOCKED" | "NOT_RUN";
 
@@ -42,6 +52,75 @@ export const QUANT_PROFILES: readonly string[] = [
 	"quant-research/stock-selection",
 	"quant-research/market-timing",
 ];
+
+// ---------------------------------------------------------------------------
+// P7 worker-first gate facts (bounded injected object, never model prose)
+// ---------------------------------------------------------------------------
+
+/**
+ * The eight machine-backed worker-first compliance assertions. Each maps to
+ * exactly one fact (or a small group of facts) in WorkerFirstGateFacts.
+ */
+export type WorkerFirstCheckName =
+	| "strict-policy-active"
+	| "no-unauthorized-commander-writes"
+	| "no-pending-review"
+	| "no-stale-review"
+	| "reviewed-hash-matches-current"
+	| "worker-paths-within-contracts"
+	| "no-active-unexplained-lease"
+	| "commander-initiated-final-verification";
+
+export const WORKER_FIRST_CHECK_NAMES: readonly WorkerFirstCheckName[] = [
+	"strict-policy-active",
+	"no-unauthorized-commander-writes",
+	"no-pending-review",
+	"no-stale-review",
+	"reviewed-hash-matches-current",
+	"worker-paths-within-contracts",
+	"no-active-unexplained-lease",
+	"commander-initiated-final-verification",
+];
+
+/**
+ * Bounded worker-first compliance facts injected by the runtime into every
+ * gate run (slash command AND model tool). The gate engine never reads
+ * model prose or prompts for these checks — missing facts are NOT_RUN.
+ */
+export interface WorkerFirstGateFacts {
+	schema_version: 1;
+	/**
+	 * When set, the runtime could not evaluate compliance (final
+	 * verification is blocked — e.g. a pending/stale worker review): every
+	 * worker-first check evaluates BLOCKED with this reason.
+	 */
+	blockedReason?: string;
+	/** Resolved actor of the session that initiated this gate run. */
+	actor: ActorRole | null;
+	/** worker-first-strict for approved Sol; null when not applicable. */
+	writePolicy: WritePolicy | null;
+	/** True when commander edit/write is hard-denied right now. */
+	commanderWritesDenied: boolean | null;
+	/** Bounded counter of every blocked strict-Sol edit/write attempt. */
+	blockedCommanderWriteAttempts: number | null;
+	/** True when at least one delegation exists. */
+	hasDelegation: boolean | null;
+	latestDelegationId: string | null;
+	reviewStatus: DelegationReviewStatus | null;
+	currentDiffHash: string | null;
+	reviewedDiffHash: string | null;
+	/** Verdict of the latest completed review (null = none yet). */
+	reviewVerdict: "PASS" | "FAIL" | null;
+	/** Violation count of the latest completed review (null = none yet). */
+	reviewViolationCount: number | null;
+	leaseStatus: LeaseStatus | null;
+	/** Audited fixed lease reason (ALLOWED_LEASE_REASONS); null = locked. */
+	leaseReason: LeaseReason | null;
+	leaseCallsUsed: number | null;
+	leaseMaxCalls: number | null;
+	/** True when this gate run was initiated by the approved Sol commander. */
+	gateRunInitiatedByCommander: boolean | null;
+}
 
 export interface GateCheck {
 	id: string;
@@ -77,6 +156,8 @@ export interface GateCheck {
 	manual_prompt?: string;
 	/** kind=schema: built-in schema name ("quant-result"). */
 	schema_name?: string;
+	/** kind=worker-first: which machine-backed compliance assertion to evaluate. */
+	worker_first?: WorkerFirstCheckName;
 }
 
 export interface Gate {
@@ -157,6 +238,7 @@ const CHECK_KINDS: readonly string[] = [
 	"numeric",
 	"manual",
 	"schema",
+	"worker-first",
 ];
 
 const CHECK_FIELDS: ReadonlySet<string> = new Set([
@@ -179,6 +261,7 @@ const CHECK_FIELDS: ReadonlySet<string> = new Set([
 	"max",
 	"prompt",
 	"schema",
+	"worker_first",
 ]);
 
 /** Parse one raw check mapping into a validated GateCheck (or errors). */
@@ -260,6 +343,14 @@ export function parseCheck(raw: unknown, gateId: string, index: number): { check
 	if (kind === "schema" && schemaName === undefined) {
 		errors.push(`${label}: kind=schema needs "schema" (built-in: quant-result)`);
 	}
+	const workerFirst = asString(raw.worker_first, `${label}: "worker_first"`, errors);
+	if (kind === "worker-first") {
+		if (workerFirst === undefined || !WORKER_FIRST_CHECK_NAMES.includes(workerFirst as WorkerFirstCheckName)) {
+			errors.push(`${label}: kind=worker-first needs "worker_first" set to one of ${WORKER_FIRST_CHECK_NAMES.join(", ")}`);
+		}
+	} else if (raw.worker_first !== undefined) {
+		errors.push(`${label}: "worker_first" is only valid for kind=worker-first`);
+	}
 
 	const checkId = id ?? `${gateId}.${index + 1}`;
 	const title = asString(raw.title, `${label}: "title"`, errors) ?? checkId;
@@ -287,6 +378,7 @@ export function parseCheck(raw: unknown, gateId: string, index: number): { check
 		numeric_max: max,
 		manual_prompt: manualPrompt,
 		schema_name: schemaName,
+		worker_first: kind === "worker-first" ? (workerFirst as WorkerFirstCheckName) : undefined,
 	};
 	return { check, errors };
 }

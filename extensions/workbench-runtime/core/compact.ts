@@ -32,6 +32,12 @@ export const MAX_NOTE_LINES = 40;
 export const MAX_NOTE_CHARS = 2400;
 const MAX_STRING_FIELD = 240;
 
+/** Bound for the blocked commander write-attempt counter (mirrors delegation-state). */
+export const MAX_BLOCKED_COMMANDER_WRITE_ATTEMPTS = 999;
+
+/** The only write policy the workbench defines (P7 worker-first-strict). */
+const WORKER_FIRST_POLICY = "worker-first-strict";
+
 export interface CompactState {
 	mode: string;
 	task?: string;
@@ -46,6 +52,27 @@ export interface CompactState {
 	nextStep?: string;
 	doNotRetry: string[];
 	updatedAt: string;
+	// -------------------------------------------------------------------
+	// P7 worker-first write-authority facts (mirror, never authoritative —
+	// the hard guards read the lease/delegation custom entries directly and
+	// remain fully independent of this note text).
+	// -------------------------------------------------------------------
+	/** "worker-first-strict" when the fixed policy is active (approved Sol). */
+	writePolicy?: string;
+	/** True when commander edit/write is hard-denied (no active lease). */
+	commanderWritesDenied?: boolean;
+	/** Id of the latest worker delegation (undefined = none). */
+	lastDelegationId?: string;
+	/** True while the latest delegation needs a (re-)review (PENDING_REVIEW or STALE). */
+	pendingDelegationReview?: boolean;
+	/** Hash of the reviewed diff (REVIEWED/STALE states carry it). */
+	reviewedDiffHash?: string;
+	/** Bounded active-lease summary (status/id/reason/calls/paths — never tokens). */
+	activeWriteLease?: string;
+	/** Bounded audit counter of blocked strict-Sol edit/write attempts. */
+	blockedCommanderWriteAttempts?: number;
+	/** The next required delegation/review action (bounded pointer). */
+	nextDelegationAction?: string;
 }
 
 export function emptyCompactState(mode: string): CompactState {
@@ -76,6 +103,15 @@ function cleanList(value: unknown, cap: number): string[] {
 		.slice(0, cap);
 }
 
+function cleanBoolean(value: unknown, fallback: boolean | undefined): boolean | undefined {
+	return typeof value === "boolean" ? value : fallback;
+}
+
+function cleanBoundedCounter(value: unknown): number | undefined {
+	if (typeof value !== "number" || !Number.isInteger(value) || value < 0) return undefined;
+	return Math.min(value, MAX_BLOCKED_COMMANDER_WRITE_ATTEMPTS);
+}
+
 /** Sanitize an unknown persisted payload into a valid CompactState. */
 export function mergeCompactState(base: CompactState, raw: unknown): CompactState {
 	if (typeof raw !== "object" || raw === null) return base;
@@ -94,6 +130,16 @@ export function mergeCompactState(base: CompactState, raw: unknown): CompactStat
 		nextStep: cleanString(r.nextStep) ?? base.nextStep,
 		doNotRetry: cleanList(r.doNotRetry, MAX_DO_NOT_RETRY),
 		updatedAt: typeof r.updatedAt === "string" ? r.updatedAt.slice(0, 32) : base.updatedAt,
+		// P7 worker-first facts: sanitized (typed/bounded), mirrored, never
+		// authoritative — the guards read the lease/delegation entries.
+		writePolicy: cleanString(r.writePolicy, 64) === WORKER_FIRST_POLICY ? WORKER_FIRST_POLICY : base.writePolicy,
+		commanderWritesDenied: cleanBoolean(r.commanderWritesDenied, base.commanderWritesDenied),
+		lastDelegationId: cleanString(r.lastDelegationId, 64) ?? base.lastDelegationId,
+		pendingDelegationReview: cleanBoolean(r.pendingDelegationReview, base.pendingDelegationReview),
+		reviewedDiffHash: cleanString(r.reviewedDiffHash, 128) ?? base.reviewedDiffHash,
+		activeWriteLease: cleanString(r.activeWriteLease) ?? base.activeWriteLease,
+		blockedCommanderWriteAttempts: cleanBoundedCounter(r.blockedCommanderWriteAttempts) ?? base.blockedCommanderWriteAttempts,
+		nextDelegationAction: cleanString(r.nextDelegationAction) ?? base.nextDelegationAction,
 	};
 }
 
@@ -153,7 +199,14 @@ export function shouldSupplement(state: CompactState): boolean {
 			state.failedGates.length > 0 ||
 			state.blockedGates.length > 0 ||
 			state.modifiedFiles.length > 0 ||
-			state.doNotRetry.length > 0,
+			state.doNotRetry.length > 0 ||
+			// P7 worker-first facts are worth carrying across compaction.
+			state.writePolicy !== undefined ||
+			state.commanderWritesDenied === true ||
+			state.lastDelegationId !== undefined ||
+			state.pendingDelegationReview === true ||
+			state.blockedCommanderWriteAttempts !== undefined ||
+			state.nextDelegationAction !== undefined,
 	);
 }
 
@@ -175,6 +228,25 @@ export function buildCompactNote(state: CompactState): string {
 	];
 	lines.push(...line("task", state.task));
 	lines.push(...line("phase", state.phase));
+	// P7 worker-first facts: strict policy active, denied commander direct
+	// writes, pending/reviewed delegation state, and the next action. These
+	// are pointers/statuses only — the hard guards never read this text.
+	if (state.writePolicy === "worker-first-strict") lines.push("worker-first: strict active");
+	if (state.commanderWritesDenied === true) lines.push("commander writes: denied");
+	if (state.lastDelegationId) {
+		const reviewState =
+			state.pendingDelegationReview === true
+				? "PENDING_REVIEW"
+				: state.reviewedDiffHash
+					? "REVIEWED"
+					: "?";
+		lines.push(`delegation: ${state.lastDelegationId} ${reviewState}${state.reviewedDiffHash ? ` (hash ${state.reviewedDiffHash.slice(0, 12)})` : ""}`);
+	}
+	if (state.blockedCommanderWriteAttempts !== undefined && state.blockedCommanderWriteAttempts > 0) {
+		lines.push(`blocked commander writes: ${state.blockedCommanderWriteAttempts}`);
+	}
+	if (state.activeWriteLease) lines.push(`write lease: ${state.activeWriteLease}`);
+	lines.push(...line("next delegation action", state.nextDelegationAction));
 	if (state.lastRunId) lines.push(`last run: ${state.lastRunId}${state.lastRecipe ? ` (${state.lastRecipe})` : ""}`);
 	if (state.passedGates.length > 0) lines.push(`gates passed: ${state.passedGates.join(", ")}`);
 	if (state.failedGates.length > 0) lines.push(`gates failed: ${state.failedGates.join(", ")}`);

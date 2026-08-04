@@ -33,6 +33,23 @@ import {
 } from "./path-policy.ts";
 import { WORKBENCH_TOOL_NAMES } from "./tool-catalog.ts";
 import { WORKER_TOOL_NAME } from "./worker-policy.ts";
+import {
+	defaultWritePolicy,
+	detectActorRole,
+	LEASE_TOOLS,
+	STRICT_SOL_DEV_ALLOWLIST,
+} from "./write-authority.ts";
+
+/**
+ * P7 actor facts for the active-tool decision. Identity comes ONLY from the
+ * existing WORKBENCH_AGENT_ROLE worker env contract and the active
+ * provider/model pair — never from project config or the prompt.
+ */
+export interface ActorToolFacts {
+	roleEnv?: string | undefined;
+	provider?: string | undefined;
+	model?: string | undefined;
+}
 
 export type WorkbenchMode = "AUDIT" | "DEV" | "VERIFY";
 
@@ -138,12 +155,50 @@ export function isToolHardDenied(mode: WorkbenchMode, toolName: string): boolean
 
 /**
  * Active-tool set to configure for a mode, based on the currently active set.
- * DEV preserves non-managed custom tools (P5) in DETERMINISTIC order — they
- * are sorted by name so the active set never depends on the order another
- * extension or Pi reports them in (P6-B stable prefix). AUDIT and VERIFY
- * are strict.
+ *
+ * P7 strict Sol DEV: when the resolved actor is the approved GPT-5.6 Sol
+ * commander under the fixed worker-first-strict write policy, DEV returns
+ * EXACTLY the fixed STRICT_SOL_DEV_ALLOWLIST in its canonical order — no
+ * bash/edit/write, no foreign tools, never the order Pi or another
+ * extension reports them in. An ACTIVE confirmed user-issued write lease
+ * additionally enables exactly its edit/write tools AFTER the canonical 14
+ * (never bash; pending/expired/exhausted/revoked leases — or no lease —
+ * leave the exact 14). Delegated workers and other controllers are OUTSIDE
+ * that policy: they keep the existing DEV behavior below (foreign tools
+ * preserved in deterministic sorted order), which the worker role filter
+ * (worker-policy.ts) then narrows. AUDIT and VERIFY remain strict for
+ * every actor.
+ *
+ * Otherwise (existing P5 semantics): DEV preserves non-managed custom tools
+ * in DETERMINISTIC order — sorted by name so the active set never depends
+ * on the order another extension or Pi reports them in (P6-B stable
+ * prefix). AUDIT and VERIFY are strict.
  */
-export function computeActiveTools(mode: WorkbenchMode, currentlyActive: readonly string[]): string[] {
+export function computeActiveTools(
+	mode: WorkbenchMode,
+	currentlyActive: readonly string[],
+	facts?: ActorToolFacts,
+	/** P7: the edit/write subset of an ACTIVE confirmed lease (empty = locked). */
+	leaseTools: readonly string[] = [],
+): string[] {
+	if (mode === "DEV" && facts) {
+		const actor = detectActorRole(facts);
+		const policy = defaultWritePolicy(facts.provider, facts.model);
+		if (actor === "sol-commander" && policy === "worker-first-strict") {
+			// The full fixed allowlist is advertised (every allowlist tool is a
+			// Pi builtin or a statically registered workbench tool); foreign
+			// tools are dropped by construction. Intersecting with the current
+			// active set would lose tools when switching back from a stricter
+			// mode, so the canonical list is returned directly. An active lease
+			// appends exactly its edit/write tools in the CANONICAL order
+			// (edit, then write — deduplicated and never bash or any foreign
+			// value, whatever the input order/duplicates claim); anything
+			// outside edit/write is never enabled here (bash stays blocked by
+			// the second layer).
+			const lease = LEASE_TOOLS.filter((tool) => leaseTools.includes(tool));
+			return [...STRICT_SOL_DEV_ALLOWLIST, ...lease];
+		}
+	}
 	const active = new Set<string>();
 	for (const tool of MODE_TOOLS[mode]) active.add(tool);
 	if (mode === "DEV") {

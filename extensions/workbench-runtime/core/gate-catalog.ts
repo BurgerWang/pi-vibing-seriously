@@ -99,6 +99,79 @@ const B5_CHECKS = [
 	check("b5.2", "Git state and open issues documented", "manual", { manual_prompt: "Evidence that git state (commit, dirty files) and unresolved issues are documented in the handoff." }),
 ];
 
+// ---------------------------------------------------------------------------
+// B6 Worker-First Compliance (P7 slice 3) — machine-backed only.
+//
+// The eight checks evaluate the bounded WorkerFirstGateFacts object that the
+// runtime injects into EVERY gate run (slash command AND model tool). No
+// model prose, prompt text or manual evidence can satisfy them:
+//   - missing facts        -> NOT_RUN (a required NOT_RUN never PASSes)
+//   - runtime-blocked      -> BLOCKED (e.g. a pending/stale review blocks
+//                             final verification)
+//   - negative compliance  -> FAIL
+// B6 has no prerequisites: it runs directly (selector "b6") without any
+// manual B0-B5 evidence, and it is a universal base gate (base/all).
+// ---------------------------------------------------------------------------
+
+const B6_CHECKS = [
+	check(
+		"b6.1",
+		"Worker-first strict policy active",
+		"worker-first",
+		{ worker_first: "strict-policy-active" },
+		"the session resolves to the fixed worker-first-strict write policy (approved GPT-5.6 Sol)",
+	),
+	check(
+		"b6.2",
+		"No unauthorized commander writes (hard denial active)",
+		"worker-first",
+		{ worker_first: "no-unauthorized-commander-writes" },
+		"zero unauthorized commander write attempts, or commander edit/write is hard-denied",
+	),
+	check(
+		"b6.3",
+		"No pending worker review",
+		"worker-first",
+		{ worker_first: "no-pending-review" },
+		"the latest delegation is not PENDING_REVIEW (review before the next delegation / VERIFY)",
+	),
+	check(
+		"b6.4",
+		"No stale worker review",
+		"worker-first",
+		{ worker_first: "no-stale-review" },
+		"the latest delegation is not STALE (no diff change since the reviewed hash)",
+	),
+	check(
+		"b6.5",
+		"Reviewed diff hash matches the current diff",
+		"worker-first",
+		{ worker_first: "reviewed-hash-matches-current" },
+		"the latest reviewed diff hash equals the current diff hash",
+	),
+	check(
+		"b6.6",
+		"All worker paths within approved contracts",
+		"worker-first",
+		{ worker_first: "worker-paths-within-contracts" },
+		"the latest valid PASS review found zero worker paths outside the parent-approved contracts (sequential review gating means earlier delegations could not be bypassed)",
+	),
+	check(
+		"b6.7",
+		"No active unexplained commander write lease",
+		"worker-first",
+		{ worker_first: "no-active-unexplained-lease" },
+		"an active lease carries one of the fixed audited reasons; otherwise the lease is locked/terminal",
+	),
+	check(
+		"b6.8",
+		"Final verification initiated by the Sol commander",
+		"worker-first",
+		{ worker_first: "commander-initiated-final-verification" },
+		"this gate run was initiated by the approved GPT-5.6 Sol commander (workers cannot run final gates)",
+	),
+];
+
 const Q0_CHECKS = [
 	check("q0.1", "Strategy type declared", "json", { json_file: CONTRACT, json_path: "strategy_type" }, "research contract declares the strategy type"),
 	check("q0.2", "Universe declared", "json", { json_file: CONTRACT, json_path: "universe" }, "research contract declares the universe"),
@@ -230,6 +303,14 @@ export const BASE_GATES: readonly Gate[] = [
 		["b4"],
 		B5_CHECKS,
 		"Reproducibility snapshot and handoff documentation are complete.",
+	),
+	gate(
+		"b6",
+		"Worker-First Compliance",
+		"Machine-backed worker-first compliance: strict policy active, zero unauthorized commander writes / hard denial active, no pending or stale worker review, reviewed hash matches the current diff, all worker paths within the approved contracts, no active unexplained write lease, and final verification initiated by the Sol commander. Facts are injected by the runtime — model prose can never satisfy these checks.",
+		[],
+		B6_CHECKS,
+		"Worker-first compliance holds: strict policy active, hard denial of unauthorized commander writes, clean delegation review state (no pending/stale review, reviewed hash matches), all worker paths within contracts, no unexplained active lease, and Sol-initiated final verification.",
 	),
 ];
 

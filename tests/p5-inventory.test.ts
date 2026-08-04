@@ -5,9 +5,10 @@
  * 1. Direct load: the extension module is imported and its default export is
  *    invoked with a stub ExtensionAPI — no Pi runtime needed. This is the
  *    "extension direct-load smoke test" as a repeatable unit test.
- * 2. Inventory: the registered command set must be EXACTLY the 24
- *    deterministic workbench commands, the 8 workbench tools, and the 7
- *    prompt templates — no missing, extra, or colliding names.
+ * 2. Inventory: the registered command set must be EXACTLY the 28
+ *    deterministic workbench commands, the 10 workbench tools, and the 7
+ *    prompt templates — no missing, extra, or colliding names. The three
+ *    P7 lease commands are user-only: they are commands, never model tools.
  */
 
 import assert from "node:assert/strict";
@@ -49,6 +50,12 @@ export const EXPECTED_COMMANDS = [
 	"q-cache-lineage",
 	// Unreleased split session-cost observability command.
 	"q-cost-status",
+	// P7: delegation write-authority + review status command.
+	"q-delegation-status",
+	// P7 slice 3: user-only commander write-lease commands.
+	"q-write-policy",
+	"q-commander-write-unlock",
+	"q-commander-write-lock",
 ] as const;
 
 export const EXPECTED_TOOLS = [
@@ -59,7 +66,11 @@ export const EXPECTED_TOOLS = [
 	"workbench_read_gate",
 	"workbench_list_gates",
 	"workbench_compare_runs",
+	// P7: the three delegation tools follow the seven existing tools
+	// (delegate → review → status, matching WORKBENCH_TOOL_NAMES).
 	"workbench_delegate_worker",
+	"workbench_review_worker_diff",
+	"workbench_delegation_status",
 ] as const;
 
 export const EXPECTED_PROMPTS = ["q-audit", "q-plan", "q-build", "q-debug", "q-verify", "q-optimize", "q-review"] as const;
@@ -92,18 +103,18 @@ function makeStub(): ExtensionAPI & Record<string, unknown> {
 	return stub as unknown as ExtensionAPI & Record<string, unknown>;
 }
 
-test("extension module direct-loads and registers exactly the 24 deterministic commands", () => {
+test("extension module direct-loads and registers exactly the 28 deterministic commands", () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	const registered = stub.commands as Map<string, unknown>;
 	assert.deepEqual(
 		[...registered.keys()].sort(),
 		[...EXPECTED_COMMANDS].sort(),
-		"registered commands must be exactly the P5+P6-A+P6-C+P6-D+Unreleased command list",
+		"registered commands must be exactly the P5+P6-A+P6-C+P6-D+P7+Unreleased command list",
 	);
 });
 
-test("extension registers exactly the 8 workbench tools", () => {
+test("extension registers exactly the 10 workbench tools", () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	const tools = stub.tools as Map<string, unknown>;
@@ -133,6 +144,24 @@ test("extension registers the lifecycle events it relies on", () => {
 		"message_end",
 	]) {
 		assert.ok((events.get(event) ?? 0) >= 1, event);
+	}
+});
+
+test("the three P7 lease commands are user-only — never registered as model tools", () => {
+	const stub = makeStub();
+	workbenchRuntime(stub);
+	const commands = stub.commands as Map<string, unknown>;
+	const tools = stub.tools as Map<string, unknown>;
+	for (const name of ["q-write-policy", "q-commander-write-unlock", "q-commander-write-lock"]) {
+		assert.ok(commands.has(name), `${name} must be registered as a command`);
+		assert.ok(!tools.has(name), `${name} must NOT be registered as a model tool`);
+	}
+	// No registered tool may collide with any registered command (and vice versa).
+	for (const name of commands.keys()) {
+		assert.ok(!tools.has(name), `tool collision with command ${name}`);
+	}
+	for (const name of tools.keys()) {
+		assert.ok(!commands.has(name), `command collision with tool ${name}`);
 	}
 });
 

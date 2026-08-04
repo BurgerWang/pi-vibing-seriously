@@ -4,12 +4,14 @@ import { join } from "node:path";
 import { test } from "node:test";
 
 import { WORKBENCH_TOOL_METADATA } from "../extensions/workbench-runtime/core/tool-catalog.ts";
+import { STRICT_SOL_DEV_ALLOWLIST } from "../extensions/workbench-runtime/core/write-authority.ts";
 import {
 	commanderBlockReason,
 	computeRoleActiveTools,
 	formatWorkerTask,
 	isWorkerPathAllowed,
 	parseWorkerAllowedPaths,
+	recipeMutationBlockReason,
 	workerRecipeBlockReason,
 	workerRoleToolCallBlockReason,
 	WORKER_ROLE,
@@ -67,6 +69,14 @@ test("worker role uses a stable reduced tool matrix while commander tools are un
 	assert.deepEqual(computeRoleActiveTools(tools, undefined), tools);
 });
 
+test("worker-role filtering still hides recursion/final-gate tools from the strict Sol DEV allowlist (P7)", () => {
+	const workerTools = computeRoleActiveTools(STRICT_SOL_DEV_ALLOWLIST, WORKER_ROLE);
+	assert.ok(!workerTools.includes("workbench_delegate_worker"), "workers can never recursively delegate");
+	assert.ok(!workerTools.includes("workbench_run_gate"), "workers can never run final gates");
+	assert.ok(workerTools.includes("read"));
+	assert.ok(workerTools.includes("workbench_run_recipe"));
+});
+
 test("worker role blocks recursion, free bash, final gates, and out-of-scope writes", () => {
 	const context = { role: WORKER_ROLE, projectRoot: "/repo", allowedPaths: ["src/**", "tests/new.test.ts"] };
 	assert.match(workerRoleToolCallBlockReason(context, "workbench_delegate_worker", {}) ?? "", /recursively/);
@@ -84,6 +94,41 @@ test("worker recipes are read-only by declaration", () => {
 	assert.equal(workerRecipeBlockReason(WORKER_ROLE, "unit-test", []), undefined);
 	assert.match(workerRecipeBlockReason(WORKER_ROLE, "format", ["src/"]) ?? "", /declares writes: src\//);
 	assert.equal(workerRecipeBlockReason(undefined, "format", ["src/"]), undefined, "commander recipes are unchanged");
+});
+
+// ---------------------------------------------------------------------------
+// P7 slice 3: shared recipe mutation policy (direct execution + gate checks)
+// ---------------------------------------------------------------------------
+
+test("strict Sol runs only mutation none/artifacts recipes; mutation source is denied", () => {
+	const sol = { role: undefined, provider: "openai-codex", model: "gpt-5.6-sol" };
+	assert.equal(recipeMutationBlockReason(sol, "unit-test", "none"), undefined);
+	assert.equal(recipeMutationBlockReason(sol, "build", "artifacts"), undefined);
+	assert.match(recipeMutationBlockReason(sol, "format", "source") ?? "", /Worker-first write authority denies recipe "format"/);
+	assert.match(recipeMutationBlockReason(sol, "format", "source") ?? "", /mutation: source/);
+	assert.match(recipeMutationBlockReason(sol, "format", "source") ?? "", /workbench_delegate_worker/);
+});
+
+test("delegated workers run only mutation none recipes", () => {
+	const worker = { role: WORKER_ROLE, provider: "deepseek", model: "deepseek-v4-flash" };
+	assert.equal(recipeMutationBlockReason(worker, "unit-test", "none"), undefined);
+	assert.match(recipeMutationBlockReason(worker, "build", "artifacts") ?? "", /workers run only mutation: none/);
+	assert.match(recipeMutationBlockReason(worker, "format", "source") ?? "", /workers run only mutation: none/);
+});
+
+test("other controllers and fact-less callers retain prior behavior", () => {
+	const other = { role: undefined, provider: "anthropic", model: "claude-sonnet" };
+	assert.equal(recipeMutationBlockReason(other, "format", "source"), undefined);
+	assert.equal(recipeMutationBlockReason(other, "build", "artifacts"), undefined);
+	assert.equal(recipeMutationBlockReason(undefined, "format", "source"), undefined);
+	assert.equal(recipeMutationBlockReason({}, "format", "source"), undefined);
+});
+
+test("the worker env contract wins over Sol-looking model facts for the mutation decision", () => {
+	const impersonating = { role: WORKER_ROLE, provider: "openai-codex", model: "gpt-5.6-sol" };
+	assert.equal(recipeMutationBlockReason(impersonating, "unit-test", "none"), undefined);
+	assert.match(recipeMutationBlockReason(impersonating, "build", "artifacts") ?? "", /workers run only mutation: none/);
+	assert.match(recipeMutationBlockReason(impersonating, "fmt", "source") ?? "", /workers run only mutation: none/);
 });
 
 test("missing or malformed worker path contracts fail closed", () => {
@@ -151,15 +196,22 @@ test("delegate-tool metadata codifies the Sol/worker responsibility split and th
 	assert.match(text, /independently inspect the actual diff/);
 });
 
-test("worker-delegation documentation defines the risk rubric, Commander-led high-risk responsibilities, fresh continuation, and one writing worker per worktree", async () => {
+test("worker-delegation documentation defines the risk rubric, worker-first high-risk delegation, fresh continuation, one writing worker, and the P7 ledger/review lifecycle", async () => {
 	const doc = await readFile(new URL("../docs/worker-delegation.md", import.meta.url), "utf8");
 	// Risk rubric with low/medium/high tiers.
 	assert.match(doc, /## Risk rubric/);
 	assert.match(doc, /\| Low \|/);
 	assert.match(doc, /\| Medium \|/);
 	assert.match(doc, /\| High \|/);
-	assert.match(doc, /Commander-led: Sol owns the decision and implements or repairs directly by default/);
-	assert.match(doc, /explicitly designed bounded support slices/);
+	// High-risk decisions are Commander-led: Sol owns the decision and never
+	// delegates it; implementation/repair writes go to a fresh bounded worker
+	// by default; only explicitly designed bounded support/implementation
+	// scopes are delegated after the architecture is fixed; a temporary
+	// commander direct write requires an explicit user-issued write lease.
+	assert.match(doc, /Commander-led: Sol owns the decision and never delegates the decision itself/);
+	assert.match(doc, /implementation\/repair writes go to a fresh bounded worker/);
+	assert.match(doc, /explicitly designed bounded support\/implementation scopes are delegated after the architecture is fixed/);
+	assert.match(doc, /Temporary commander direct writes require an explicit user-issued write lease/);
 	assert.match(doc, /never the DEV default/);
 	// Commander-led responsibilities are spelled out.
 	assert.match(doc, /### Responsibility split/);
@@ -169,4 +221,12 @@ test("worker-delegation documentation defines the risk rubric, Commander-led hig
 	assert.match(doc, /brand-new `--no-session` worker/);
 	assert.match(doc, /## One writing worker per worktree/);
 	assert.match(doc, /at most one worker writes to a worktree at any time/);
+	// P7 worker-first write authority and the delegation ledger/review
+	// lifecycle: every delegation is recorded and reviewed, and a pending or
+	// stale review blocks both the next delegation and VERIFY.
+	assert.match(doc, /## Worker-first write authority \(P7\)/);
+	assert.match(doc, /## Delegation ledger and review lifecycle \(P7\)/);
+	assert.match(doc, /PENDING_REVIEW → REVIEWED → \(current diff hash changes\) → STALE/);
+	assert.match(doc, /a pending or stale review blocks BOTH the next delegation/);
+	assert.match(doc, /and VERIFY \(`\/q-mode-verify`\s+refuses/);
 });

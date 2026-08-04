@@ -57,6 +57,64 @@ test("mergeCompactState sanitizes unknown payloads", () => {
 	assert.deepEqual(merged.doNotRetry, ["a", "b"]);
 });
 
+test("mergeCompactState sanitizes the P7 worker-first fields (typed, bounded, fail-safe)", () => {
+	const base = emptyCompactState("DEV");
+	const merged = mergeCompactState(base, {
+		writePolicy: "worker-first-strict",
+		commanderWritesDenied: true,
+		lastDelegationId: "20260801-120000-abcd",
+		pendingDelegationReview: true,
+		reviewedDiffHash: "a".repeat(200),
+		activeWriteLease: "WRITE-LEASE active wl-1 user-directed 0/10 edit,write src/**",
+		blockedCommanderWriteAttempts: 42,
+		nextDelegationAction: "review delegation 20260801-120000-abcd (PENDING_REVIEW)",
+	});
+	assert.equal(merged.writePolicy, "worker-first-strict");
+	assert.equal(merged.commanderWritesDenied, true);
+	assert.equal(merged.lastDelegationId, "20260801-120000-abcd");
+	assert.equal(merged.pendingDelegationReview, true);
+	assert.equal(merged.reviewedDiffHash?.length, 128, "hash bounded to 128 chars");
+	assert.ok((merged.activeWriteLease?.length ?? 0) <= 240);
+	assert.equal(merged.blockedCommanderWriteAttempts, 42);
+	assert.ok(merged.nextDelegationAction?.includes("PENDING_REVIEW"));
+
+	// Hostile/corrupt values fail closed to the base (never fabricated).
+	const hostile = mergeCompactState(base, {
+		writePolicy: "lenient-policy",
+		commanderWritesDenied: "yes",
+		lastDelegationId: 42,
+		pendingDelegationReview: 1,
+		reviewedDiffHash: "",
+		activeWriteLease: ["x"],
+		blockedCommanderWriteAttempts: -5,
+		nextDelegationAction: "   ",
+	});
+	assert.equal(hostile.writePolicy, undefined, "unknown policy strings are dropped");
+	assert.equal(hostile.commanderWritesDenied, undefined);
+	assert.equal(hostile.lastDelegationId, undefined);
+	assert.equal(hostile.pendingDelegationReview, undefined);
+	assert.equal(hostile.reviewedDiffHash, undefined);
+	assert.equal(hostile.activeWriteLease, undefined);
+	assert.equal(hostile.blockedCommanderWriteAttempts, undefined, "negative counters are dropped");
+	assert.equal(hostile.nextDelegationAction, undefined);
+
+	// Over-large counters clamp to the bounded ceiling.
+	const clamped = mergeCompactState(base, { blockedCommanderWriteAttempts: 1_000_000 });
+	assert.equal(clamped.blockedCommanderWriteAttempts, 999);
+});
+
+test("loadCompactStateFromEntries restores the P7 worker-first fields", () => {
+	const entries = [
+		{ type: "custom", customType: COMPACT_STATE_ENTRY_TYPE, data: { mode: "DEV", lastDelegationId: "20260801-120000-abcd", pendingDelegationReview: true, blockedCommanderWriteAttempts: 7 } },
+		{ type: "custom", customType: COMPACT_STATE_ENTRY_TYPE, data: { mode: "DEV", lastDelegationId: "20260802-120000-abcd", reviewedDiffHash: "c".repeat(64), blockedCommanderWriteAttempts: 9 } },
+	];
+	const s = loadCompactStateFromEntries(entries, "DEV");
+	assert.equal(s.lastDelegationId, "20260802-120000-abcd", "later entries win");
+	assert.equal(s.reviewedDiffHash, "c".repeat(64));
+	assert.equal(s.blockedCommanderWriteAttempts, 9);
+	assert.equal(s.mode, "DEV");
+});
+
 test("loadCompactStateFromEntries restores the latest persisted entry", () => {
 	const entries = [
 		{ type: "custom", customType: COMPACT_STATE_ENTRY_TYPE, data: { mode: "AUDIT", task: "old task", failedGates: ["q1"] } },
@@ -124,6 +182,13 @@ test("shouldSupplement requires real content", () => {
 	assert.equal(shouldSupplement(state({ modifiedFiles: ["src/a.ts"] })), true);
 	assert.equal(shouldSupplement(state({ doNotRetry: ["x"] })), true);
 	assert.equal(shouldSupplement(state({ passedGates: ["b0"] })), false, "passes alone are not worth carrying");
+	// P7 worker-first facts trigger the supplement on their own.
+	assert.equal(shouldSupplement(state({ writePolicy: "worker-first-strict" })), true);
+	assert.equal(shouldSupplement(state({ commanderWritesDenied: true })), true);
+	assert.equal(shouldSupplement(state({ lastDelegationId: "20260801-120000-abcd" })), true);
+	assert.equal(shouldSupplement(state({ pendingDelegationReview: true })), true);
+	assert.equal(shouldSupplement(state({ blockedCommanderWriteAttempts: 3 })), true);
+	assert.equal(shouldSupplement(state({ nextDelegationAction: "review the diff" })), true);
 });
 
 test("buildCompactNote is bounded, ASCII, and contains pointers only", () => {
@@ -152,6 +217,51 @@ test("buildCompactNote is bounded, ASCII, and contains pointers only", () => {
 	assert.ok(note.includes(".pi/workbench/runs/20260801-120000-abcd"));
 	assert.ok(note.includes("do not retry"));
 	assert.ok(!/[\u{1F300}-\u{1FAFF}\u{2190}-\u{21FF}]/u.test(note), "no emoji/symbols");
+});
+
+test("buildCompactNote names worker-first strict active, denied commander writes, pending/reviewed delegation state and the next action", () => {
+	const s = state({
+		writePolicy: "worker-first-strict",
+		commanderWritesDenied: true,
+		lastDelegationId: "20260801-120000-abcd",
+		pendingDelegationReview: true,
+		reviewedDiffHash: undefined,
+		blockedCommanderWriteAttempts: 4,
+		nextDelegationAction: "review delegation 20260801-120000-abcd (PENDING_REVIEW) before the next delegation or VERIFY",
+	});
+	const note = buildCompactNote(s);
+	assert.ok(note.includes("worker-first: strict active"), note);
+	assert.ok(note.includes("commander writes: denied"), note);
+	assert.ok(note.includes("delegation: 20260801-120000-abcd PENDING_REVIEW"), note);
+	assert.ok(note.includes("blocked commander writes: 4"), note);
+	assert.ok(note.includes("next delegation action: review delegation 20260801-120000-abcd"), note);
+	assert.ok(note.split("\n").length <= MAX_NOTE_LINES);
+	assert.ok(note.length <= MAX_NOTE_CHARS);
+
+	// Reviewed state carries the bounded reviewed hash.
+	const reviewed = buildCompactNote(
+		state({
+			writePolicy: "worker-first-strict",
+			commanderWritesDenied: true,
+			lastDelegationId: "20260801-120000-abcd",
+			reviewedDiffHash: "f".repeat(64),
+			nextDelegationAction: "delegation 20260801-120000-abcd REVIEWED — start the next delegation or run final verification",
+		}),
+	);
+	assert.ok(reviewed.includes("delegation: 20260801-120000-abcd REVIEWED"), reviewed);
+	assert.ok(reviewed.includes(`(hash ${"f".repeat(12)})`), reviewed);
+
+	// An active lease summary line carries the bounded summary, never tokens.
+	const leased = buildCompactNote(
+		state({
+			writePolicy: "worker-first-strict",
+			commanderWritesDenied: false,
+			activeWriteLease: "WRITE-LEASE active wl-1 user-directed 0/10 edit,write src/**",
+			nextDelegationAction: "start the next worker delegation",
+		}),
+	);
+	assert.ok(leased.includes("write lease: WRITE-LEASE active wl-1"), leased);
+	assert.ok(!leased.includes("confirmation part"), "lease tokens never appear in the note");
 });
 
 test("buildCompactNote redacts credential shapes", () => {

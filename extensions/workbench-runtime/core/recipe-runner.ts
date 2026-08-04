@@ -38,6 +38,7 @@ import { loadProjectConfig, runsDir, type ExecFn } from "./config.ts";
 import type { WorkbenchMode } from "./mode-policy.ts";
 import { realpathContained, lexicalContain } from "./path-guard.ts";
 import { buildArgv, RecipeParamError, type Recipe } from "./recipe-schema.ts";
+import { recipeMutationBlockReason, type RecipeMutationFacts } from "./worker-policy.ts";
 import { collectSecretValues, redactArgvEntry, redactEnvValue, redactText } from "./redact.ts";
 import { makeRunId, RUN_SCHEMA_VERSION, type RunRecord, type RunSummaryRecord } from "./runs.ts";
 import { EXTENSION_VERSION } from "../cache/cache-types.ts";
@@ -66,6 +67,12 @@ export interface RunRecipeInput {
 	now?: () => Date;
 	/** P6-C: cache request mode (default = read/write per recipe policy). */
 	cacheMode?: CacheRequestMode;
+	/**
+	 * P7: actor facts for the shared recipe mutation policy (strict Sol /
+	 * delegated worker / other controller). Omitted callers keep prior
+	 * behavior (no mutation restriction).
+	 */
+	actorFacts?: RecipeMutationFacts;
 }
 
 export interface RunRecipeResult {
@@ -217,6 +224,15 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 			ok: false,
 			error: `recipe "${recipeName}" is not allowed in ${mode} mode (allowed_modes: ${recipe.allowed_modes.join(", ")})`,
 		};
+	}
+
+	// P7: the shared mutation-policy decision applies to DIRECT recipe
+	// execution (workbench_run_recipe tool and /q-run). Strict Sol is denied
+	// mutation: source; delegated workers run only mutation: none; other
+	// controllers and fact-less callers are unrestricted (prior behavior).
+	const mutationBlock = recipeMutationBlockReason(input.actorFacts, recipe.name, recipe.mutation);
+	if (mutationBlock) {
+		return { ok: false, error: mutationBlock };
 	}
 
 	let argv: string[];

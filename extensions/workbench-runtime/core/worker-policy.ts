@@ -9,6 +9,8 @@
 
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
+import type { RecipeMutation } from "./recipe-schema.ts";
+
 export const WORKER_TOOL_NAME = "workbench_delegate_worker";
 export const WORKER_ROLE_ENV = "WORKBENCH_AGENT_ROLE";
 export const WORKER_ALLOWED_PATHS_ENV = "WORKBENCH_WORKER_ALLOWED_PATHS";
@@ -142,6 +144,59 @@ export function workerRoleToolCallBlockReason(
 export function workerRecipeBlockReason(role: string | undefined, recipeName: string, declaredWrites: readonly string[]): string | undefined {
 	if (role !== WORKER_ROLE || declaredWrites.length === 0) return undefined;
 	return `Delegated worker cannot run recipe "${recipeName}" because it declares writes: ${declaredWrites.join(", ")}`;
+}
+
+// ---------------------------------------------------------------------------
+// P7 shared recipe mutation policy (used by direct recipe execution AND by
+// gate-engine recipe checks — one pure decision, two enforcement points)
+// ---------------------------------------------------------------------------
+
+/**
+ * Actor facts for the recipe mutation decision. Identity comes ONLY from
+ * the WORKBENCH_AGENT_ROLE worker env contract and the provider/model
+ * pair — never from project config or the prompt (same sources as
+ * write-authority.ts, kept dependency-free here to avoid an import cycle).
+ */
+export interface RecipeMutationFacts {
+	/** WORKBENCH_AGENT_ROLE value (worker child only). */
+	role?: string | undefined;
+	provider?: string | undefined;
+	model?: string | undefined;
+}
+
+/**
+ * The single shared mutation-policy decision (P7 slice 3):
+ *   - strict Sol (approved GPT-5.6 Sol under worker-first-strict) may run
+ *     recipes declaring mutation none or artifacts; mutation source is
+ *     DENIED (source-mutating work is delegated to a worker);
+ *   - delegated workers may run ONLY mutation none (write-free) recipes;
+ *   - every other controller retains prior behavior (no restriction);
+ *   - missing/unknown actor facts impose no restriction (backward
+ *     compatible with all pre-P7 callers).
+ * Legacy inference (recipe-schema.ts) maps non-empty writes to source, so
+ * this decision is exactly as strict as the declared writes for legacy
+ * recipes and additionally denies artifact-producing recipes to workers.
+ */
+export function recipeMutationBlockReason(
+	facts: RecipeMutationFacts | undefined,
+	recipeName: string,
+	mutation: RecipeMutation,
+): string | undefined {
+	if (facts?.role === WORKER_ROLE) {
+		if (mutation !== "none") {
+			return `Delegated worker cannot run recipe "${recipeName}": it declares mutation: ${mutation}; workers run only mutation: none (write-free) recipes`;
+		}
+		return undefined;
+	}
+	const approvedSol =
+		facts !== undefined &&
+		facts.model === COMMANDER_MODEL_ID &&
+		facts.provider !== undefined &&
+		COMMANDER_PROVIDERS.includes(facts.provider);
+	if (approvedSol && mutation === "source") {
+		return `Worker-first write authority denies recipe "${recipeName}" for the strict Sol commander: it declares mutation: source; strict Sol runs only mutation: none and mutation: artifacts recipes — delegate source-mutating implementation to workbench_delegate_worker`;
+	}
+	return undefined;
 }
 
 /** Stable task text: fixed instructions plus dynamic contract in the user message. */

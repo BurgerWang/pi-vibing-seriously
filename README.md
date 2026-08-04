@@ -1,10 +1,10 @@
 # pi-dev-workbench
 
 <p align="center">
-  <img src="assets/banner.svg" alt="pi-dev-workbench v0.8.0 — a Pi-native development workbench" width="586" />
+  <img src="assets/banner.svg" alt="pi-dev-workbench v0.9.0 — a Pi-native development workbench" width="586" />
 </p>
 
-A **Pi Package** (v0.8.0, P6) that adds a native development workbench to
+A **Pi Package** (v0.9.0, P7) that adds a native development workbench to
 [Pi](https://pi.dev): a mode policy (AUDIT / DEV / VERIFY), project
 configuration, a declarative Recipe Runner, a **Gate Engine with evidence
 artifacts and a quant research validation ladder**, Pi-native TUI status,
@@ -33,11 +33,21 @@ renderers. **It is not a standalone agent framework, daemon, background
 service, or sandbox.** In DEV, GPT-5.6 Sol may explicitly create one
 short-lived, pinned, non-recursive DeepSeek Pi worker for a bounded
 implementation task; the process ends with the tool call and never owns final
-verification. The default is to delegate coherent source+tests+docs vertical
-slices for bounded low/medium-risk work after minimum repository orientation:
-the worker owns routine local implementation decisions inside the approved
-contract, while Sol owns requirements, cross-cutting architecture, scope,
-actual-diff review, final gates, and the verdict. The worker's context is
+verification. The default is **worker-first write authority**: approved
+GPT-5.6 Sol resolves to the fixed `worker-first-strict` policy in DEV, which
+advertises exactly the canonical 14-tool allowlist — no `bash`/`edit`/`write`
+and no foreign tools — so implementation and repair writes go to a fresh
+bounded worker by default (coherent source+tests+docs vertical slices for
+bounded low/medium-risk work after minimum repository orientation: the worker
+owns routine local implementation decisions inside the approved contract,
+while Sol owns requirements, cross-cutting architecture, scope, actual-diff
+review, final gates, and the verdict). Temporary commander direct writes are
+the explicit exception: the human issues a bounded lease through user-only
+slash commands (`/q-commander-write-unlock`), and only an active confirmed
+lease adds `edit`/`write` to Sol's strict set. Every delegation is recorded
+in a bounded before/after ledger that starts `PENDING_REVIEW`; a pending or
+stale review blocks the next delegation and VERIFY until Sol reviews the
+actual diff (`workbench_review_worker_diff`). The worker's context is
 budget-protected (1,000,000-token window; one hidden steer at 80%,
 fail-closed termination at 90%, worker
 compaction cancelled — commander compaction unchanged).
@@ -86,17 +96,31 @@ exchange order routing, live high-frequency execution, and colocation.
 | Mode   | Active tools                                                                 | Hard-blocked at tool_call          | Use case                        |
 | ------ | ---------------------------------------------------------------------------- | ---------------------------------- | ------------------------------- |
 | AUDIT  | read, grep, find, ls, workbench_project_inspect, workbench_read_run, workbench_read_gate, workbench_list_gates, workbench_compare_runs | bash, edit, write, workbench_run_recipe, workbench_run_gate, workbench_delegate_worker | Read-only inspection       |
-| DEV    | read, grep, find, ls, bash, edit, write, all `workbench_*` tools (including controlled worker delegation) | — | Implementing features and fixes |
+| DEV    | For approved GPT-5.6 Sol (`worker-first-strict`): the exact canonical 14-tool allowlist (read, grep, find, ls + all 10 `workbench_*` tools) — no bash/edit/write, no foreign tools; an ACTIVE user-issued lease additionally enables exactly its edit/write tools. Other controllers: read, grep, find, ls, bash, edit, write, all `workbench_*` tools. | For strict Sol: bash always; edit/write without an active lease or outside its paths; any tool outside the allowlist. | Implementing features and fixes |
 | VERIFY | read, grep, find, ls, workbench_project_inspect, workbench_run_recipe, workbench_read_run, workbench_run_gate, workbench_read_gate, workbench_list_gates, workbench_compare_runs | bash, edit, write, workbench_delegate_worker | Re-verifying completed work |
 
 - `/q-mode-audit` — switch to AUDIT
 - `/q-mode-dev` — switch to DEV (default)
-- `/q-mode-verify` — switch to VERIFY
+- `/q-mode-verify` — switch to VERIFY (refused while a worker review is
+  pending or stale: `PENDING_REVIEW`/`STALE` blocks final gate verification
+  until the current diff is reviewed)
 - `/q-status` — current mode, cwd, project trust, active tools, registered workbench tools
 
 The mode is stored in a Pi custom session entry (`workbench-mode`) and restored
 from the current session on `session_start`. All UI calls degrade safely in
 print/json/RPC modes.
+
+**P7 worker-first write authority:** the strict Sol DEV tool set is fixed and
+policy-bound — approved GPT-5.6 Sol always resolves to `worker-first-strict`
+(a persisted/prompt/config value can neither weaken nor opt out of it), and
+`detectActorRole` derives identity only from the existing
+`WORKBENCH_AGENT_ROLE=worker` env contract and the provider/model pair, never
+from project config. Delegated workers keep the existing worker guards
+(no recursion, no free bash, no final gates, parent-approved write paths), and
+other controllers are outside the policy — they are not newly denied. `bash`
+is always blocked for strict Sol; `edit`/`write` require a valid user-issued
+temporary write lease (see [Worker-first workflow](#worker-first-workflow)).
+AUDIT/VERIFY remain strict for every actor.
 
 **P4 UI** — the TUI footer shows a workbench status line (a `setStatus` slot;
 the Pi footer itself is never replaced):
@@ -126,10 +150,20 @@ failed checks for gate runs, declared quant facts for quant runs.
 delta, test counts, and (for quant runs) benchmark/return/drawdown/turnover/
 cost/fold deltas and parameter changes. Deltas are descriptive: **a higher
 return is never automatically interpreted as a better strategy**.
-- The five workbench tools have compact TUI renderers (partial/error/expanded
+- The five P4 workbench tools have compact TUI renderers (partial/error/expanded
 states included); expanded shows recipe, duration, exit code, artifacts,
 failed checks and log paths. Facts come only from the runs' own JSON records
-(manifest/gates/result) — renderers never recompute business metrics.
+(manifest/gates/result) — renderers never recompute business metrics. The
+three P7 delegation tools (`workbench_delegate_worker`,
+`workbench_review_worker_diff`, `workbench_delegation_status`) have **no**
+compact renderers — they render through Pi's default text fallback; no more
+renderers exist than the P4 five.
+- **P7 write-authority segments** in the status line — `WF:LEASE 2/10` for an
+ACTIVE confirmed strict-Sol lease, `WF:LOCKED` for every other lease state
+(locked/pending/expired/exhausted/revoked), and `WF:REVIEW` (appended
+independently) while a delegation review is pending or stale. Workers and
+other controllers render no WF segment. Confirmation token parts never
+appear in any status summary.
 
 **P1 change:** VERIFY no longer includes free `bash`. The model runs project
 commands only through `workbench_run_recipe`, which executes *declared*
@@ -241,6 +275,7 @@ recipes:
     allowed_modes: [DEV, VERIFY]  # AUDIT can never run recipes
     expected_exit_codes: [0]      # anything else is a failure
     writes: ["data/", "results/"] # declared write paths, containment-checked
+    mutation: artifacts          # none | artifacts | source (P7)
     artifacts: ["results/**/*.csv", "results/**/*.json"]
     environment: []               # only explicitly declared env vars are passed
     output_strategy: tail         # head | tail (default tail)
@@ -265,6 +300,10 @@ Security invariants:
 9. `timeout_ms` and the session `AbortSignal` are forwarded to the process.
 10. Exit codes outside `expected_exit_codes` (and timeouts/cancellations) are
     failures.
+11. Every recipe declares `mutation` (`none` | `artifacts` | `source`); under
+    worker-first write authority, strict Sol runs only `none`/`artifacts`
+    recipes and workers only `none` (write-free) recipes — `source`-mutating
+    recipes are denied to both (other controllers are unaffected).
 
 ## Running recipes
 
@@ -279,7 +318,9 @@ Custom tools (callable by the model):
 | `workbench_read_gate` | Read a gate run record by `run_id`, or a gate definition by `gate_id` (with latest status). |
 | `workbench_list_gates` | List the gates available for the current profile with their latest status. |
 | `workbench_compare_runs` | Compare two run records by `run_id`: exit code, duration, artifact changes, gate delta, quant metrics (read-only; also available in AUDIT). |
-| `workbench_delegate_worker` | DEV only: GPT-5.6 Sol delegates one scoped task to pinned `deepseek-v4-flash:max`; default is coherent source+tests+docs vertical slices for bounded low/medium-risk work after minimum repository orientation. The worker owns routine local implementation decisions inside the approved contract; Sol owns requirements, cross-cutting architecture, scope, actual-diff review, final gates, and the verdict — worker prose is never acceptance. Worker cannot recurse, use free bash, run final gates, or write outside approved paths. Worker context budget protected: hidden one-shot steer at 80% (800k/1M), fail-closed termination at 90% (900k), compaction cancelled in the worker role and any `compaction_start` event rejects the result. |
+| `workbench_delegate_worker` | DEV only: GPT-5.6 Sol delegates one scoped task to pinned `deepseek-v4-flash:max`; default is coherent source+tests+docs vertical slices for bounded low/medium-risk work after minimum repository orientation. The worker owns routine local implementation decisions inside the approved contract; Sol owns requirements, cross-cutting architecture, scope, actual-diff review, final gates, and the verdict — worker prose is never acceptance. Worker cannot recurse, use free bash, run final gates, or write outside approved paths. Worker context budget protected: hidden one-shot steer at 80% (800k/1M), fail-closed termination at 90% (900k), compaction cancelled in the worker role and any `compaction_start` event rejects the result. Every outcome (success **and** failure) is recorded in the delegation ledger (`.pi/workbench/delegations/<id>/`) and starts `PENDING_REVIEW`; a pending or stale review blocks the next delegation and VERIFY. |
+| `workbench_review_worker_diff` | Sol reviews one delegation's actual diff: real git state vs the recorded before snapshot, every worker path scope-checked against the parent-approved `allowed_paths` (realpath/symlink-safe — `include_paths` narrows only the patch and can never hide a violation), current vs recorded after diff hash (mismatch/drift are warnings), bounded redacted patch, notes on the worker's `## Files Changed` section vs the actual diff. Verdict `PASS` marks the delegation REVIEWED (bound to the reviewed hash); `FAIL` keeps it PENDING_REVIEW. |
+| `workbench_delegation_status` | Write authority + delegation review status: actor, fixed policy, lease status (bounded summary — never token parts), latest delegation, review status, current/reviewed diff hashes, blocked write attempts, latest review verdict. Refreshes against the real git diff — any change after REVIEWED turns the delegation STALE. |
 
 Commands (same services, no duplicated logic):
 
@@ -295,7 +336,50 @@ Commands (same services, no duplicated logic):
 /q-compare <run-id-a> <run-id-b>  # diff two run records
 /q-widget on|off                  # force the widget on/off (it auto-shows during tasks and gate failures)
 /q-cost-status                    # split session cost: commander / worker / other + per-model commander
+/q-delegation-status              # write authority + delegation review status (real git diff refresh)
+/q-write-policy status            # actor, fixed worker-first-strict policy, lease lock status (user-only)
+/q-commander-write-unlock ...     # user-only temporary commander write lease (issue/confirm, see below)
+/q-commander-write-lock           # user-only revoke/lock of the commander write lease
 ```
+
+The deterministic inventory is **28 commands, 10 workbench tools, 7 prompt
+templates** (pinned by the inventory test). The three lease commands
+(`/q-write-policy`, `/q-commander-write-unlock`, `/q-commander-write-lock`)
+are **user-only**: slash commands that are never registered as model tools.
+
+### Worker-first workflow
+
+Approved GPT-5.6 Sol owns requirements, cross-cutting architecture, scope,
+actual-diff review, final gates, and the verdict — but **does not directly
+write by default**. In DEV, Sol's strict 14-tool allowlist has no
+`bash`/`edit`/`write`; implementation and repair writes go to a fresh bounded
+worker via `workbench_delegate_worker`. High-risk decisions remain
+commander-led — Sol keeps the decision itself and delegates only bounded
+support/implementation scopes after the architecture is fixed. The explicit
+exception is a **temporary commander write lease**, issued only by the human
+(user-only commands, never by prompts or config):
+
+- `/q-commander-write-unlock <reason> --paths <comma-list> --calls <N> --minutes <N>`
+  — fixed reasons: `bootstrap-policy`, `worker-unavailable`,
+  `security-emergency`, `user-directed`; paths are project-relative exact
+  paths or `/**` subtrees (absolute POSIX, Windows drive and backslash-root
+  paths are rejected before normalization, `..` escapes refused); `edit`/`write`
+  only, never `bash`; **max 10 calls / max 30 minutes** (one call consumed per
+  successful authorized write).
+- Confirmation is mode-split: in the real **TUI** an explicit human
+  confirmation dialog is required (cancel leaves everything locked); in
+  **non-TUI** (print/json/RPC) the lease is issued PENDING with two bounded
+  distinct confirmation token parts displayed once, and a second invocation
+  `/q-commander-write-unlock confirm <partA> <partB>` (optionally
+  `confirm <lease-id> <partA> <partB>`) activates it — both exact parts are
+  required and both are consumed on success. Token parts never appear in
+  status/compact summaries.
+- Expiry (30 min), exhaustion (10 calls) and revocation (leaving DEV, model/
+  provider change, session end, or `/q-commander-write-lock`) restore the
+  exact canonical 14 tools; the footer shows `WF:LEASE <used>/<max>` while
+  active and `WF:LOCKED` otherwise. `/q-write-policy status` accepts exactly
+  the trimmed `status` subcommand and prints actor, fixed policy, lock status
+  and a bounded lease summary — never any token part.
 
 ### Run artifacts
 
@@ -317,6 +401,39 @@ artifacts/         # JSON artifact snapshots (recipe runs, <= 1MB) and gate evid
 material. Env values whose names look like secrets (`*API_KEY*`, `*TOKEN*`,
 `*SECRET*`, `*PASSWORD*`, `*AUTH*`, ...) and well-known credential shapes are
 redacted from every artifact.
+
+### Delegation records (P7)
+
+Every worker delegation writes a bounded ledger under
+`<project-root>/<CONFIG_DIR_NAME>/workbench/delegations/<id>/` (same
+`run-id`-shaped id, strictly validated):
+
+```
+manifest.json        # schema_version, delegation_id, created/finished_at, status
+                     # (running|finished), review_status, git head before/after,
+                     # diff hashes before/after, changed-path counts
+before.json          # bounded contract (task, allowed paths, acceptance criteria,
+                     # verification, timeout), git HEAD/dirty, before diff hash,
+                     # per-path porcelain status codes + bounded content digests
+after.json           # outcome (success|failure), exit code, pinned identity,
+                     # TRUE changed paths since before (digest-based, incl.
+                     # previously-dirty paths), after diff hash, usage/budget
+                     # facts, bounded redacted report summary, safe
+                     # reported_paths parsed from the worker's ## Files Changed
+                     # section, review_status: PENDING_REVIEW
+worker-summary.json  # bounded redacted worker facts (provider/model, status,
+                     # exit, turns, stop reason, error, usage, budget, summary)
+review.json          # PENDING_REVIEW placeholder at finish; replaced by
+                     # workbench_review_worker_diff with the completed record
+```
+
+Records are written atomically (tmp + rename), bounded, redacted, and never
+contain full worker transcripts or secrets; the ledger's own directory is
+excluded from the git facts it records. **Every delegation — success and
+failure — is recorded and starts `PENDING_REVIEW`**; there is no fallback.
+`PENDING_REVIEW`/`STALE` blocks the next delegation and VERIFY until the
+current diff is reviewed; any diff change after REVIEWED turns the delegation
+STALE. The review binds the CURRENT diff hash and warns on mismatch/drift.
 
 **P4 snapshots:** declared JSON artifacts (<= 1MB) are copied into
 `artifacts/` at run time so later runs overwriting the same project file can
@@ -346,6 +463,16 @@ blocking prerequisite BLOCKs its dependents. The built-in catalog provides:
 | `b3` Integration Correctness | `q3` Experiment Integrity |
 | `b4` Output Contract | `q4` Out-of-Sample Robustness |
 | `b5` Reproducibility and Handoff | `q5` Strategy Reporting |
+| `b6` Worker-First Compliance (P7) |  |
+
+**B6 is machine-backed** (P7): the runtime injects bounded worker-first
+facts into every gate run — strict policy active, zero unauthorized
+commander writes (or hard denial active), no pending/stale worker review,
+reviewed diff hash matches the current diff, all worker paths within the
+approved contracts, no active unexplained write lease, and final
+verification initiated by the Sol commander. Missing facts are `NOT_RUN`
+(and a required `NOT_RUN` never PASSes), a pending/stale review BLOCKs B6,
+and model prose can never satisfy its checks.
 
 ### Gate and check schema
 
@@ -471,6 +598,16 @@ pi -a -p "/q-status"           # non-interactive smoke test (print mode)
   mechanism. It blocks destructive commands (P5 token-based list above),
   blocks writes to protected credential paths in every mode, and blocks
   reads of them in AUDIT/VERIFY.
+- **Worker-first write authority is a discipline layer, not a sandbox.** The
+  strict Sol DEV allowlist and the lease guard reduce the blast radius of
+  commander mistakes (bash always blocked; edit/write only under an active
+  human-issued lease with bounded calls, time and project-relative paths), but
+  a confirmed lease still executes with the user's full permissions. Lease
+  confirmation tokens are shown once at issuance, never persisted in
+  summaries, and leases are revoked on leaving DEV, model change, or session
+  end. The delegation ledger and review lifecycle bind every worker diff to a
+  reviewed hash and block the next delegation/VERIFY while a review is
+  outstanding — process discipline, not isolation.
 - **Protected paths (P5)** are matched by basename — a file named
   `credentials/anything` is only protected if the *file* name matches
   (`credentials.*`, ...). DEV may read `.env` (content enters the session
@@ -541,6 +678,13 @@ Other versions are untested — no compatibility is claimed for them.
   (`workbench-mode`, `workbench-state`) and restored on every
   `session_start` — `/new`, `/resume`, `/fork`, `/clone` and `/reload` all
   reach that handler; a fresh `/new` session falls back to DEV.
+- **P7:** the delegation review lifecycle (`workbench-delegation-state`) and
+  the temporary commander write lease (`workbench-write-lease`) are persisted
+  as custom entries — durable across compaction and session replacement — and
+  restored on `session_start`; a restored lease is
+  revoked when the mode or actor no longer qualifies (leaving DEV, model/
+  provider change), and a corrupt entry restores fail-closed (locked/no
+  delegation).
 - On `session_before_compact` the workbench only **supplements** Pi's own
   compaction (it never cancels it and never replaces its summary): when
   there is meaningful state it persists a bounded entry and injects a
@@ -592,12 +736,28 @@ npm run cache:doctor           # offline cache health checks (exits non-zero on 
   state recovery via custom entries, compaction supplements
   (`session_before_compact`), compatibility matrix + docs, final
   release-readiness audit.
-- **P6 (this release):** DeepSeek prompt-cache observability (P6-A,
+- **P6 (previous):** DeepSeek prompt-cache observability (P6-A,
   hash-only telemetry + `/q-cache-*`), stable-prefix contract (P6-B),
   deterministic recipe action cache (P6-C), quant cache contracts (P6-D),
   and the offline cache benchmark + release gate (P6-E, this file's
   `cache:report`/`cache:doctor`). See
   [docs/cache/P6_RELEASE_REPORT.md](docs/cache/P6_RELEASE_REPORT.md).
+- **P7 (this release):** worker-first write authority — approved GPT-5.6 Sol
+  resolves to the fixed `worker-first-strict` policy in DEV (exact canonical
+  14-tool allowlist, no bash/edit/write or foreign tools); user-only
+  temporary commander write leases (`/q-write-policy status`,
+  `/q-commander-write-unlock`, `/q-commander-write-lock`; TUI explicit
+  confirmation vs non-TUI two-part token confirmation; fixed reasons,
+  project-relative exact/subtree scope, edit/write only, max 10 calls / 30
+  minutes, expiry/exhaustion/revocation, `WF:LEASE`/`WF:LOCKED`/`WF:REVIEW`
+  footer segments); bounded delegation ledger
+  (`.pi/workbench/delegations/<id>/` — before/after/worker-summary/review
+  records, every success/failure PENDING_REVIEW); review lifecycle
+  (`workbench_review_worker_diff` actual-diff/scope/hash binding,
+  `workbench_delegation_status`, PENDING_REVIEW/STALE blocking the next
+  delegation and VERIFY, STALE after any diff change); command inventory
+  24 → 28, tool inventory 8 → 10. The three P7 delegation tools have no
+  compact TUI renderers (the P4 five remain the only ones).
 - **Later:** walk-forward and parameter-experiment tooling as Pi custom
   tools, project-defined JSON schemas for `schema` checks, all within the
   quantitative scope above.
@@ -617,6 +777,16 @@ extensions/workbench-runtime/   # Pi extension
     ├── mode-policy.ts          # AUDIT/DEV/VERIFY tool sets + hard guard logic
     ├── worker-policy.ts        # commander/model/role/path contract for delegation
     ├── worker-budget.ts        # pinned worker context budget: 1M window, 80% soft / 90% hard
+    ├── write-authority.ts      # P7 worker-first-strict policy, 14-tool Sol allowlist,
+    │                           #   commander guard + temporary write lease (pure)
+    ├── lease-command.ts        # P7 user-only lease commands: parsing, token generation,
+    │                           #   TUI/non-TUI renderers, WF footer segment (pure)
+    ├── delegation-ledger.ts    # P7 bounded before/after delegation records under
+    │                           #   <CONFIG_DIR_NAME>/workbench/delegations/<id>/ (pure + exec)
+    ├── delegation-state.ts     # P7 review lifecycle: PENDING_REVIEW → REVIEWED → STALE,
+    │                           #   hash binding, delegation/VERIFY blocking (pure)
+    ├── diff-review.ts          # P7 workbench_review_worker_diff: real-diff scope check,
+    │                           #   hash binding, bounded redacted patch, review.json (pure + exec)
     ├── state.ts                # mode persistence (session entries)
     ├── config.ts               # project root detection, config loading, trust gate
     ├── recipe-schema.ts        # strict recipe validation, argv construction
@@ -625,7 +795,7 @@ extensions/workbench-runtime/   # Pi extension
     ├── path-guard.ts           # lexical + realpath containment
     ├── redact.ts               # secret detection/redaction for run records
     ├── gate-schema.ts          # gate/check schema, gates.yaml parsing, catalog merge
-    ├── gate-catalog.ts         # built-in gates B0-B5 and Q0-Q5
+    ├── gate-catalog.ts         # built-in gates B0-B6 and Q0-Q5
     ├── gate-engine.ts          # gate runs, evidence, persistence
     ├── quant-result.ts         # quant output contract validation
     ├── format.ts               # P4 display formatting (duration, deltas, width fit)

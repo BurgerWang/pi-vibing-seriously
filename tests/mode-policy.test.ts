@@ -28,6 +28,7 @@ import {
 	MODE_ENTRY_TYPE,
 	statusText,
 } from "../extensions/workbench-runtime/core/state.ts";
+import { STRICT_SOL_DEV_ALLOWLIST } from "../extensions/workbench-runtime/core/write-authority.ts";
 
 // ---------------------------------------------------------------------------
 // Tool sets per mode (P1: VERIFY has no free bash; workbench tools are part
@@ -244,6 +245,102 @@ test("AUDIT and VERIFY tool sets are strict — only their declared tools are ke
 test("mode tool sets are deduplicated", () => {
 	const active = computeActiveTools("DEV", ["read", "read", "bash"]);
 	assert.equal(active.filter((t) => t === "read").length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// P7 strict Sol DEV allowlist (actor facts)
+// ---------------------------------------------------------------------------
+
+const SOL_FACTS = { provider: "openai-codex", model: "gpt-5.6-sol" };
+
+const FULL_DEV_ACTIVE = [
+	"read",
+	"bash",
+	"edit",
+	"write",
+	"web_search",
+	"workbench_delegate_worker",
+	"workbench_run_recipe",
+	"z_foreign",
+	"a_foreign",
+];
+
+test("strict Sol DEV: computeActiveTools returns exactly the fixed 14-tool allowlist, no bash/edit/write/foreign", () => {
+	const tools = computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS);
+	assert.deepEqual(tools, [...STRICT_SOL_DEV_ALLOWLIST], "exact canonical allowlist order");
+	assert.equal(tools.length, 14);
+	assert.ok(!tools.includes("bash"));
+	assert.ok(!tools.includes("edit"));
+	assert.ok(!tools.includes("write"));
+	assert.ok(!tools.includes("web_search"));
+	assert.ok(!tools.includes("a_foreign"));
+	// Re-enabled tools are dropped by construction, never ordered by Pi/another extension.
+	assert.deepEqual(computeActiveTools("DEV", [...FULL_DEV_ACTIVE].reverse(), SOL_FACTS), [...STRICT_SOL_DEV_ALLOWLIST]);
+	// openai provider is equally strict.
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, { provider: "openai", model: "gpt-5.6-sol" }), [...STRICT_SOL_DEV_ALLOWLIST]);
+	// AUDIT/VERIFY stay strict for Sol too (facts never widen them).
+	assert.deepEqual(computeActiveTools("AUDIT", FULL_DEV_ACTIVE, SOL_FACTS), AUDIT_TOOLS);
+	assert.deepEqual(computeActiveTools("VERIFY", FULL_DEV_ACTIVE, SOL_FACTS), VERIFY_TOOLS);
+});
+
+test("strict Sol allowlist applies only to the approved Sol identity; workers and other controllers keep DEV behavior", () => {
+	// The env worker contract wins: a Sol-looking model inside the worker
+	// child is still a delegated worker and keeps the existing DEV set.
+	const worker = computeActiveTools("DEV", FULL_DEV_ACTIVE, { roleEnv: "worker", provider: "openai-codex", model: "gpt-5.6-sol" });
+	assert.ok(worker.includes("bash"), "worker keeps the existing DEV set (role filtering narrows it later)");
+	assert.ok(worker.includes("edit"));
+	assert.ok(worker.includes("a_foreign"), "foreign tools preserved for non-strict actors");
+	// Other-controller models keep DEV behavior.
+	const other = computeActiveTools("DEV", FULL_DEV_ACTIVE, { provider: "deepseek", model: "deepseek-v4-flash" });
+	assert.ok(other.includes("bash"));
+	assert.ok(other.includes("edit"));
+	assert.ok(other.includes("a_foreign"));
+	// No facts at all: unchanged DEV behavior (backward compatible).
+	assert.ok(computeActiveTools("DEV", FULL_DEV_ACTIVE).includes("bash"));
+});
+
+// ---------------------------------------------------------------------------
+// P7 slice 3: lease-aware active tool set (active lease enables edit/write)
+// ---------------------------------------------------------------------------
+
+test("strict Sol DEV with an ACTIVE confirmed lease enables exactly its edit/write tools after the canonical 14", () => {
+	const tools = computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["edit", "write"]);
+	assert.deepEqual(tools, [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
+	assert.equal(tools.length, 16);
+	// A write-only lease enables only write.
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["write"]), [...STRICT_SOL_DEV_ALLOWLIST, "write"]);
+	// Lease-added tools are CANONICAL and deduplicated: always `edit` then
+	// `write` (never the input order), even when the input carries
+	// duplicates or foreign values — bash can never enter through the
+	// lease channel.
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["write", "edit"]), [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["edit", "edit", "write", "write"]), [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["write", "bash", "edit", "web_search", "write"]), [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
+});
+
+test("no lease / empty lease / pending / expired / exhausted / revoked lease returns to exactly the canonical 14", () => {
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS), [...STRICT_SOL_DEV_ALLOWLIST], "no lease");
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, []), [...STRICT_SOL_DEV_ALLOWLIST], "empty lease tools");
+	assert.equal(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, []).length, 14);
+	// bash can never be enabled through the lease channel (second layer stays authoritative).
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["bash", "edit", "write"]), [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["bash"]), [...STRICT_SOL_DEV_ALLOWLIST]);
+});
+
+test("lease tools never widen non-Sol DEV, AUDIT or VERIFY tool sets", () => {
+	// Worker role: lease facts are ignored (the existing DEV set + role filter govern).
+	const worker = computeActiveTools("DEV", FULL_DEV_ACTIVE, { roleEnv: "worker", provider: "openai-codex", model: "gpt-5.6-sol" }, ["edit", "write"]);
+	assert.ok(worker.includes("bash"), "worker keeps the existing DEV set");
+	assert.ok(worker.includes("edit"));
+	assert.ok(worker.includes("a_foreign"));
+	// Other controllers: lease facts are ignored.
+	const other = computeActiveTools("DEV", FULL_DEV_ACTIVE, { provider: "deepseek", model: "deepseek-v4-flash" }, ["edit", "write"]);
+	assert.ok(other.includes("bash"));
+	assert.ok(other.includes("edit"));
+	// AUDIT/VERIFY stay strict for Sol even with an active lease.
+	assert.deepEqual(computeActiveTools("AUDIT", FULL_DEV_ACTIVE, SOL_FACTS, ["edit", "write"]), AUDIT_TOOLS);
+	assert.deepEqual(computeActiveTools("VERIFY", FULL_DEV_ACTIVE, SOL_FACTS, ["edit", "write"]), VERIFY_TOOLS);
+	assert.ok(!computeActiveTools("VERIFY", FULL_DEV_ACTIVE, SOL_FACTS, ["edit", "write"]).includes("edit"));
 });
 
 // ---------------------------------------------------------------------------

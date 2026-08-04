@@ -387,3 +387,77 @@ test("quant-research-design states the research scope boundary", async () => {
 	assert.ok(/mid\/low[\s-]*frequency/i.test(text), "quant-research-design must scope to mid/low-frequency research");
 	assert.ok(/out of scope/i.test(text), "quant-research-design must state its scope boundary");
 });
+
+// ------------------------------------------------------- worker-first contract
+
+/**
+ * P7 worker-first workflow contract sources: the build prompt, the
+ * implementation-workflow skill, and both project AGENTS templates must
+ * encode the contract so that removing any rule breaks the suite.
+ */
+const WORKER_FIRST_SOURCES: ReadonlyArray<readonly [string, string]> = [
+	["prompts/q-build.md", "q-build prompt"],
+	["skills/implementation-workflow/SKILL.md", "implementation-workflow skill"],
+	["templates/project/AGENTS.generic.md", "AGENTS.generic template"],
+	["templates/project/AGENTS.quant-research.md", "AGENTS.quant-research template"],
+];
+
+/** Collapse runs of whitespace so line wrapping can never hide a rule. */
+function normalizeSpace(text: string): string {
+	return text.replace(/\s+/g, " ").trim();
+}
+
+async function workerFirstText(relPath: string): Promise<string> {
+	return normalizeSpace(await readFile(join(ROOT, relPath), "utf8"));
+}
+
+test("worker-first contract: q-build, the implementation skill, and both AGENTS templates state Sol ownership and worker-owned routine writes", async () => {
+	const phrases = [
+		"Sol owns requirements",
+		"cross-cutting architecture",
+		"worker owns routine local implementation decisions",
+		"bounded worker slices",
+	] as const;
+	for (const [relPath, label] of WORKER_FIRST_SOURCES) {
+		const text = await workerFirstText(relPath);
+		for (const phrase of phrases) {
+			assert.ok(text.includes(phrase), `${label} (${relPath}) must state \"${phrase}\"`);
+		}
+	}
+});
+
+test("worker-first contract: delegation and fresh-worker repair are required in all four sources", async () => {
+	const phrases = ["bounded delegation", "fresh worker"] as const;
+	for (const [relPath, label] of WORKER_FIRST_SOURCES) {
+		const text = await workerFirstText(relPath);
+		for (const phrase of phrases) {
+			assert.ok(text.includes(phrase), `${label} (${relPath}) must state \"${phrase}\"`);
+		}
+	}
+});
+
+test("worker-first contract: only a user-issued temporary write lease is an exception in all four sources", async () => {
+	const phrase = "user-issued temporary write lease";
+	for (const [relPath, label] of WORKER_FIRST_SOURCES) {
+		const text = await workerFirstText(relPath);
+		assert.ok(text.includes(phrase), `${label} (${relPath}) must state \"${phrase}\"`);
+	}
+});
+
+test("worker-first contract: worker reports are never acceptance in all four sources", async () => {
+	const phrase = "never acceptance";
+	for (const [relPath, label] of WORKER_FIRST_SOURCES) {
+		const text = await workerFirstText(relPath);
+		assert.ok(text.includes(phrase), `${label} (${relPath}) must state \"${phrase}\"`);
+	}
+});
+
+test("worker-first contract: Sol reviews the actual diff and runs the final gates in all four sources", async () => {
+	const phrases = ["actual diff", "final gates"] as const;
+	for (const [relPath, label] of WORKER_FIRST_SOURCES) {
+		const text = await workerFirstText(relPath);
+		for (const phrase of phrases) {
+			assert.ok(text.includes(phrase), `${label} (${relPath}) must state \"${phrase}\"`);
+		}
+	}
+});

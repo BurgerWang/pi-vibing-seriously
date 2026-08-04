@@ -20,6 +20,21 @@ import { DEFAULT_CACHE_POLICY, parseCachePolicy, type RecipeCachePolicy } from "
 
 export const RECIPE_SCHEMA_VERSION = 1;
 
+/**
+ * P7 recipe mutation classification — the write-authority surface of a
+ * recipe (consumed by the shared mutation-policy decision in
+ * worker-policy.ts):
+ *   - none      — the recipe never mutates the project (write-free)
+ *   - artifacts — the recipe only writes result/artifact files
+ *                 (data/results/artifacts/dist), never source code
+ *   - source    — the recipe may modify source code
+ * Legacy recipes without an explicit declaration infer `none` when
+ * `writes` is empty and `source` when `writes` is non-empty.
+ */
+export type RecipeMutation = "none" | "artifacts" | "source";
+
+export const RECIPE_MUTATIONS: readonly string[] = ["none", "artifacts", "source"];
+
 export type OutputStrategy = "head" | "tail";
 export type RecipeParamType = "string" | "number" | "boolean";
 
@@ -42,6 +57,12 @@ export interface Recipe {
 	expected_exit_codes: number[];
 	/** Declared write paths (relative to project root) — containment-checked. */
 	writes: string[];
+	/**
+	 * P7 mutation classification (none|artifacts|source) — present on every
+	 * parsed recipe: explicit values validate strictly; a missing declaration
+	 * infers none for writes=[] and source for non-empty writes.
+	 */
+	mutation: RecipeMutation;
 	/** Result-file globs (relative to project root) — containment-checked. */
 	artifacts: string[];
 	/** Env var names the process may inherit. Nothing else is passed. */
@@ -75,6 +96,7 @@ export const DEFAULT_RECIPE: Omit<Recipe, "name" | "command"> = {
 	allowed_modes: ["DEV", "VERIFY"],
 	expected_exit_codes: [0],
 	writes: [],
+	mutation: "none",
 	artifacts: [],
 	environment: [],
 	output_strategy: "tail",
@@ -246,6 +268,20 @@ export function parseRecipe(raw: unknown, index: number): RecipeParseResult {
 	const writes = asStringArray(raw.writes, `recipe "${recipe}": "writes"`, errors);
 	const artifacts = asStringArray(raw.artifacts, `recipe "${recipe}": "artifacts"`, errors);
 
+	// P7: strict mutation validation with legacy inference. Explicit values
+	// must be exactly none|artifacts|source; a missing declaration infers
+	// none for writes=[] and source for non-empty writes. Every parsed
+	// recipe therefore exposes a deterministic mutation.
+	let mutation: RecipeMutation;
+	if (raw.mutation === undefined) {
+		mutation = writes.length > 0 ? "source" : "none";
+	} else if (typeof raw.mutation === "string" && RECIPE_MUTATIONS.includes(raw.mutation)) {
+		mutation = raw.mutation as RecipeMutation;
+	} else {
+		errors.push(`recipe "${recipe}": "mutation" must be one of ${RECIPE_MUTATIONS.join(", ")}`);
+		mutation = writes.length > 0 ? "source" : "none";
+	}
+
 	if (errors.length > 0) return { recipes: [], errors, warnings };
 
 	// P6-C: cache policy (opt-in; violations disable caching, never the recipe).
@@ -273,6 +309,7 @@ export function parseRecipe(raw: unknown, index: number): RecipeParseResult {
 				max_lines: maxLines,
 				max_bytes: maxBytes,
 				params,
+				mutation,
 				cache: cacheResult.policy,
 			},
 		],

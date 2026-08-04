@@ -23,6 +23,7 @@ import {
 	runGates,
 } from "../extensions/workbench-runtime/core/gate-engine.ts";
 import { runRecipe } from "../extensions/workbench-runtime/core/recipe-runner.ts";
+import type { WorkerFirstGateFacts } from "../extensions/workbench-runtime/core/gate-schema.ts";
 import { makeValidQuantResult, spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
 
 const CONFIG_CHECK = "      - { id: g1.1, title: Config, kind: config }";
@@ -435,7 +436,7 @@ test("quant gates load only for quant profiles", async () => {
 	await withTempDir(async (dir) => {
 		await setupProject(dir, { profile: "generic" });
 		const generic = await loadGates(dir);
-		assert.deepEqual(generic.map((g) => g.id), ["b0", "b1", "b2", "b3", "b4", "b5"]);
+		assert.deepEqual(generic.map((g) => g.id), ["b0", "b1", "b2", "b3", "b4", "b5", "b6"]);
 		assert.ok(!generic.some((g) => g.id.startsWith("q")), "generic must not load quant gates");
 	});
 
@@ -443,7 +444,7 @@ test("quant gates load only for quant profiles", async () => {
 		await setupProject(dir, { profile: "quant-research/stock-selection" });
 		const quant = await loadGates(dir);
 		const ids = quant.map((g) => g.id);
-		assert.deepEqual(ids, ["b0", "b1", "b2", "b3", "b4", "b5", "q0", "q1", "q2", "q3", "q4", "q5"]);
+		assert.deepEqual(ids, ["b0", "b1", "b2", "b3", "b4", "b5", "b6", "q0", "q1", "q2", "q3", "q4", "q5"]);
 	});
 });
 
@@ -485,7 +486,29 @@ test("the full base ladder passes when recipes and manual evidence are provided"
 		for (const id of ["b2.2", "b2.3", "b3.2", "b3.3", "b4.1", "b4.2", "b4.3", "b5.1", "b5.2"]) {
 			manualEvidence[id] = `manual evidence for ${id}`;
 		}
-		const result = await runGates({ projectRoot: dir, selector: "all", mode: "DEV", exec: spawnExec, manualEvidence });
+		// P7: B6 is machine-backed — the runtime injects the bounded
+		// worker-first compliance facts (clean state: strict policy active,
+		// hard denial on, no delegation, lease locked, Sol-initiated run).
+		const workerFirstFacts: WorkerFirstGateFacts = {
+			schema_version: 1,
+			actor: "sol-commander",
+			writePolicy: "worker-first-strict",
+			commanderWritesDenied: true,
+			blockedCommanderWriteAttempts: 0,
+			hasDelegation: false,
+			latestDelegationId: null,
+			reviewStatus: null,
+			currentDiffHash: null,
+			reviewedDiffHash: null,
+			reviewVerdict: null,
+			reviewViolationCount: null,
+			leaseStatus: "locked",
+			leaseReason: null,
+			leaseCallsUsed: 0,
+			leaseMaxCalls: 10,
+			gateRunInitiatedByCommander: true,
+		};
+		const result = await runGates({ projectRoot: dir, selector: "all", mode: "DEV", exec: spawnExec, manualEvidence, workerFirstFacts });
 		assert.equal(result.ok, true, `expected full base ladder PASS, got ${result.gates.map((g) => `${g.id}:${g.status}`).join(", ")}`);
 		for (const g of result.gates) assert.equal(g.status, "PASS");
 	});
@@ -647,5 +670,305 @@ test("project gate definitions replace built-in catalog gates by id", async () =
 		const result = await runGates({ projectRoot: dir, selector: "b0", mode: "DEV", exec: spawnExec });
 		assert.equal(result.gates[0]!.checks.length, 1, "the yaml definition fully replaced the built-in");
 		assert.equal(result.gates[0]!.status, "PASS");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// P7 slice 3: B6 Worker-First Compliance (machine-backed injected facts)
+// ---------------------------------------------------------------------------
+
+function cleanWorkerFirstFacts(overrides: Partial<WorkerFirstGateFacts> = {}): WorkerFirstGateFacts {
+	return {
+		schema_version: 1,
+		actor: "sol-commander",
+		writePolicy: "worker-first-strict",
+		commanderWritesDenied: true,
+		blockedCommanderWriteAttempts: 0,
+		hasDelegation: false,
+		latestDelegationId: null,
+		reviewStatus: null,
+		currentDiffHash: null,
+		reviewedDiffHash: null,
+		reviewVerdict: null,
+		reviewViolationCount: null,
+		leaseStatus: "locked",
+		leaseReason: null,
+		leaseCallsUsed: 0,
+		leaseMaxCalls: 10,
+		gateRunInitiatedByCommander: true,
+		...overrides,
+	};
+}
+
+test("B6 is a built-in universal base gate with exactly eight worker-first checks", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, { profile: "generic" });
+		const gates = await loadGates(dir);
+		const b6 = gates.find((g) => g.id === "b6");
+		assert.ok(b6, "b6 loads for generic profiles (universal base gate)");
+		assert.equal(b6!.source, "catalog");
+		assert.equal(b6!.prerequisites.length, 0, "B6 is independent of B0-B5 (no manual-evidence prerequisites)");
+		assert.equal(b6!.required, true);
+		assert.equal(b6!.blocking, true);
+		assert.equal(b6!.checks.length, 8, "exactly the eight machine-backed checks");
+		for (const c of b6!.checks) {
+			assert.equal(c.kind, "worker-first");
+			assert.equal(c.required, true);
+			assert.ok(c.worker_first, `check ${c.id} names a worker_first assertion`);
+		}
+		assert.deepEqual(
+			b6!.checks.map((c) => c.worker_first),
+			[
+				"strict-policy-active",
+				"no-unauthorized-commander-writes",
+				"no-pending-review",
+				"no-stale-review",
+				"reviewed-hash-matches-current",
+				"worker-paths-within-contracts",
+				"no-active-unexplained-lease",
+				"commander-initiated-final-verification",
+			],
+		);
+	});
+});
+
+test("B6 passes with clean injected facts (no manual evidence can be involved)", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir);
+		const result = await runGates({ projectRoot: dir, selector: "b6", mode: "DEV", exec: spawnExec, workerFirstFacts: cleanWorkerFirstFacts() });
+		assert.equal(result.ok, true);
+		assert.equal(result.gates[0]!.status, "PASS");
+		for (const c of result.gates[0]!.checks) {
+			assert.equal(c.status, "PASS", `${c.check_id}: ${c.failure_reason ?? c.blocked_reason ?? ""}`);
+			assert.ok(c.evidence.some((e) => e.type === "worker_first"), `${c.check_id} records worker_first evidence`);
+		}
+	});
+});
+
+test("B6 fails on negative compliance facts (policy off, hash mismatch, violations, unexplained active lease, non-Sol initiator)", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir);
+		const cases: Array<{ label: string; facts: WorkerFirstGateFacts; failed: string[]; passed: string[] }> = [
+			{
+				label: "policy not active",
+				facts: cleanWorkerFirstFacts({ writePolicy: null }),
+				failed: ["b6.1"],
+				passed: ["b6.2", "b6.3", "b6.4", "b6.5", "b6.6", "b6.7", "b6.8"],
+			},
+			{
+				label: "unauthorized writes with denial off",
+				facts: cleanWorkerFirstFacts({ commanderWritesDenied: false, blockedCommanderWriteAttempts: 3 }),
+				failed: ["b6.2"],
+				passed: ["b6.1", "b6.3", "b6.4", "b6.5", "b6.6", "b6.7", "b6.8"],
+			},
+			{
+				label: "reviewed hash mismatch",
+				facts: cleanWorkerFirstFacts({
+					hasDelegation: true,
+					latestDelegationId: "20260101-120000-abcd",
+					reviewStatus: "REVIEWED",
+					currentDiffHash: "a".repeat(64),
+					reviewedDiffHash: "b".repeat(64),
+					reviewVerdict: "PASS",
+					reviewViolationCount: 0,
+				}),
+				failed: ["b6.5"],
+				passed: ["b6.1", "b6.2", "b6.3", "b6.4", "b6.6", "b6.7", "b6.8"],
+			},
+			{
+				label: "worker paths outside contracts",
+				facts: cleanWorkerFirstFacts({
+					hasDelegation: true,
+					latestDelegationId: "20260101-120000-abcd",
+					reviewStatus: "REVIEWED",
+					currentDiffHash: "a".repeat(64),
+					reviewedDiffHash: "a".repeat(64),
+					reviewVerdict: "FAIL",
+					reviewViolationCount: 2,
+				}),
+				failed: ["b6.6"],
+				passed: ["b6.1", "b6.2", "b6.3", "b6.4", "b6.5", "b6.7", "b6.8"],
+			},
+			{
+				label: "active lease without audited reason",
+				facts: cleanWorkerFirstFacts({ leaseStatus: "active", leaseReason: null, leaseCallsUsed: 1, leaseMaxCalls: 10 }),
+				failed: ["b6.7"],
+				passed: ["b6.1", "b6.2", "b6.3", "b6.4", "b6.5", "b6.6", "b6.8"],
+			},
+			{
+				label: "gate run initiated by another controller",
+				facts: cleanWorkerFirstFacts({ actor: "other-controller", gateRunInitiatedByCommander: false }),
+				failed: ["b6.8"],
+				passed: ["b6.1", "b6.2", "b6.3", "b6.4", "b6.5", "b6.6", "b6.7"],
+			},
+		];
+		for (const scenario of cases) {
+			const result = await runGates({ projectRoot: dir, selector: "b6", mode: "DEV", exec: spawnExec, workerFirstFacts: scenario.facts });
+			assert.equal(result.ok, false, `${scenario.label}: gate must not pass`);
+			const statuses = new Map(result.gates[0]!.checks.map((c) => [c.check_id, c.status]));
+			for (const id of scenario.failed) assert.equal(statuses.get(id), "FAIL", `${scenario.label}: ${id} must FAIL`);
+			for (const id of scenario.passed) assert.equal(statuses.get(id), "PASS", `${scenario.label}: ${id} must PASS`);
+		}
+	});
+});
+
+test("B6 checks are BLOCKED when the facts carry a blocked reason (pending/stale review blocks final verification)", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir);
+		const facts = cleanWorkerFirstFacts({
+			hasDelegation: true,
+			latestDelegationId: "20260101-120000-abcd",
+			reviewStatus: "PENDING_REVIEW",
+			currentDiffHash: "a".repeat(64),
+			blockedReason: "VERIFY mode / final gate verification is blocked while delegation 20260101-120000-abcd is PENDING_REVIEW; review the current diff first",
+		});
+		const result = await runGates({ projectRoot: dir, selector: "b6", mode: "DEV", exec: spawnExec, workerFirstFacts: facts });
+		assert.equal(result.gates[0]!.status, "BLOCKED");
+		assert.equal(result.ok, false);
+		for (const c of result.gates[0]!.checks) {
+			assert.equal(c.status, "BLOCKED", `${c.check_id} must be BLOCKED`);
+			assert.ok(c.blocked_reason?.includes("PENDING_REVIEW"));
+		}
+	});
+});
+
+test("B6 without injected facts is NOT_RUN and a required NOT_RUN never PASSes", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir);
+		// No facts at all: every worker-first check is NOT_RUN, the gate is
+		// NOT_RUN and never PASSes — model prose/manual evidence cannot help.
+		const result = await runGates({ projectRoot: dir, selector: "b6", mode: "DEV", exec: spawnExec });
+		assert.equal(result.gates[0]!.status, "NOT_RUN");
+		assert.equal(result.ok, false);
+		for (const c of result.gates[0]!.checks) assert.equal(c.status, "NOT_RUN");
+		// Manual evidence for worker-first check ids must not change anything.
+		const withManual = await runGates({
+			projectRoot: dir,
+			selector: "b6",
+			mode: "DEV",
+			exec: spawnExec,
+			manualEvidence: { "b6.1": "the policy is definitely active, trust me" },
+		});
+		assert.equal(withManual.gates[0]!.status, "NOT_RUN", "manual evidence can never satisfy worker-first checks");
+	});
+});
+
+test("partial facts produce NOT_RUN only for the checks whose fact is missing", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir);
+		const facts = cleanWorkerFirstFacts({
+			hasDelegation: true,
+			latestDelegationId: "20260101-120000-abcd",
+			reviewStatus: null, // review facts missing
+			leaseStatus: null, // lease facts missing
+		});
+		const result = await runGates({ projectRoot: dir, selector: "b6", mode: "DEV", exec: spawnExec, workerFirstFacts: facts });
+		const statuses = new Map(result.gates[0]!.checks.map((c) => [c.check_id, c.status]));
+		assert.equal(statuses.get("b6.1"), "PASS");
+		assert.equal(statuses.get("b6.3"), "NOT_RUN", "missing review-status fact -> NOT_RUN");
+		assert.equal(statuses.get("b6.4"), "NOT_RUN");
+		assert.equal(statuses.get("b6.7"), "NOT_RUN", "missing lease-status fact -> NOT_RUN");
+		assert.equal(result.gates[0]!.status, "NOT_RUN", "required NOT_RUN checks keep the gate NOT_RUN");
+	});
+});
+
+test("gates.yaml worker-first checks validate strictly (kind + worker_first name)", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(
+				`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: WF, kind: worker-first }`,
+			),
+		});
+		await assert.rejects(
+			runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec }),
+			(error) => error instanceof GateSetupError && error.message.includes("worker_first"),
+		);
+	});
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(
+				`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: WF, kind: worker-first, worker_first: made-up }`,
+			),
+		});
+		await assert.rejects(
+			runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec }),
+			(error) => error instanceof GateSetupError && error.message.includes("worker_first"),
+		);
+	});
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(
+				`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: WF, kind: file, worker_first: strict-policy-active }`,
+			),
+		});
+		await assert.rejects(
+			runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec }),
+			(error) => error instanceof GateSetupError && error.message.includes("worker_first"),
+		);
+	});
+});
+
+test("B6 runs directly with selector b6 without any B0-B5 evidence", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir);
+		// No manual evidence, no recipes, no B0-B5 prerequisite runs: B6 still
+		// evaluates from the injected facts alone.
+		const result = await runGates({ projectRoot: dir, selector: "b6", mode: "DEV", exec: spawnExec, workerFirstFacts: cleanWorkerFirstFacts() });
+		assert.equal(result.ok, true);
+		assert.equal(result.gates[0]!.status, "PASS");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// P7 slice 3: gate-engine recipe checks apply the shared mutation policy
+// ---------------------------------------------------------------------------
+
+test("recipe checks apply the shared mutation policy: strict Sol denies mutation:source, workers run only mutation:none", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			recipesYaml: [
+				"recipes:",
+				'  - { name: fmt, command: ["node", "-e", "process.exit(0)"], mutation: source, writes: ["src/"] }',
+				'  - { name: build, command: ["node", "-e", "process.exit(0)"], mutation: artifacts, artifacts: ["dist/**"] }',
+				'  - { name: verify, command: ["node", "-e", "process.exit(0)"], mutation: none }',
+				"",
+			].join("\n"),
+			gatesYaml: gatesYaml(
+				[
+					`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Fmt, kind: recipe, recipe: fmt }`,
+					`  - id: g2\n    title: G2\n    checks:\n      - { id: g2.1, title: Build, kind: recipe, recipe: build }`,
+					`  - id: g3\n    title: G3\n    checks:\n      - { id: g3.1, title: Verify, kind: recipe, recipe: verify }`,
+				].join("\n"),
+			),
+		});
+		// Strict Sol: mutation:source recipe check is BLOCKED; none/artifacts run.
+		const sol = await runGates({
+			projectRoot: dir,
+			selector: "g1,g2,g3",
+			mode: "DEV",
+			exec: spawnExec,
+			actorFacts: { role: undefined, provider: "openai-codex", model: "gpt-5.6-sol" },
+		});
+		assert.equal(sol.gates[0]!.status, "BLOCKED");
+		assert.ok(sol.gates[0]!.checks[0]!.blocked_reason?.includes("mutation: source"), sol.gates[0]!.checks[0]!.blocked_reason ?? "");
+		assert.equal(sol.gates[1]!.status, "PASS", "mutation:artifacts recipe check runs for strict Sol");
+		assert.equal(sol.gates[2]!.status, "PASS", "mutation:none recipe check runs for strict Sol");
+		// Delegated worker: only mutation:none runs.
+		const worker = await runGates({
+			projectRoot: dir,
+			selector: "g1,g2,g3",
+			mode: "DEV",
+			exec: spawnExec,
+			actorFacts: { role: "worker", provider: "deepseek", model: "deepseek-v4-flash" },
+		});
+		assert.equal(worker.gates[0]!.status, "BLOCKED");
+		assert.equal(worker.gates[1]!.status, "BLOCKED", "workers cannot run mutation:artifacts recipes");
+		assert.ok(worker.gates[1]!.checks[0]!.blocked_reason?.includes("mutation: artifacts"));
+		assert.equal(worker.gates[2]!.status, "PASS", "workers run mutation:none recipe checks");
+		// Other controllers / no actor facts: prior behavior (all run).
+		const other = await runGates({ projectRoot: dir, selector: "g1,g2,g3", mode: "DEV", exec: spawnExec });
+		assert.equal(other.gates[0]!.status, "PASS");
+		assert.equal(other.gates[1]!.status, "PASS");
+		assert.equal(other.gates[2]!.status, "PASS");
 	});
 });

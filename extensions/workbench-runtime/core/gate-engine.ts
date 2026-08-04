@@ -35,12 +35,17 @@ import {
 	type Gate,
 	type GateCheck,
 	type GateStatus,
+	type WorkerFirstCheckName,
+	type WorkerFirstGateFacts,
+	WORKER_FIRST_CHECK_NAMES,
 	QUANT_GATE_ID_RE,
 } from "./gate-schema.ts";
 import { validateQuantResult } from "./quant-result.ts";
 import { validateQuantContract } from "../cache/quant-contracts.ts";
 import { realpathContained } from "./path-guard.ts";
 import { runRecipe } from "./recipe-runner.ts";
+import type { Recipe } from "./recipe-schema.ts";
+import { recipeMutationBlockReason, type RecipeMutationFacts } from "./worker-policy.ts";
 import { listRuns, makeRunId, readManifest, RUN_SCHEMA_VERSION } from "./runs.ts";
 import type { WorkbenchMode } from "./mode-policy.ts";
 import { truncateTail } from "@earendil-works/pi-coding-agent";
@@ -59,7 +64,7 @@ export class GateSetupError extends Error {
 // ---------------------------------------------------------------------------
 
 export interface EvidenceEntry {
-	type: "config" | "recipe_run" | "artifact" | "file" | "json" | "numeric" | "manual" | "schema";
+	type: "config" | "recipe_run" | "artifact" | "file" | "json" | "numeric" | "manual" | "schema" | "worker_first";
 	source?: string;
 	detail: string;
 	run_id?: string;
@@ -120,6 +125,13 @@ export interface RunGatesInput {
 	signal?: AbortSignal;
 	now?: () => Date;
 	manualEvidence?: Record<string, string>;
+	/**
+	 * P7: bounded worker-first compliance facts injected by the runtime.
+	 * Missing facts make every worker-first check NOT_RUN (never PASS).
+	 */
+	workerFirstFacts?: WorkerFirstGateFacts;
+	/** P7: actor facts for the shared recipe mutation policy in recipe checks. */
+	actorFacts?: RecipeMutationFacts;
 }
 
 export interface RunGatesResult {
@@ -219,6 +231,10 @@ export interface CheckContext {
 	signal?: AbortSignal;
 	now: () => Date;
 	manualEvidence: Record<string, string>;
+	/** P7: injected worker-first compliance facts (undefined => NOT_RUN checks). */
+	workerFirstFacts?: WorkerFirstGateFacts;
+	/** P7: actor facts for the shared recipe mutation decision in recipe checks. */
+	actorFacts?: RecipeMutationFacts;
 	log: (line: string) => void;
 }
 
@@ -299,6 +315,106 @@ interface EvaluatedCheck {
 	artifactPaths: string[];
 }
 
+// ---------------------------------------------------------------------------
+// P7 worker-first compliance assertions (machine-backed, injected facts only)
+// ---------------------------------------------------------------------------
+
+/**
+ * Evaluate one worker-first assertion against the injected facts. The
+ * runtime constructed the facts from actor/policy/lease/delegation/review
+ * state — model prose and manual evidence can never influence them.
+ *   - PASS      — the compliance condition holds (vacuous PASS for "no
+ *                 delegation" review checks: nothing to review)
+ *   - FAIL      — a negative compliance fact
+ *   - NOT_RUN   — the required fact is missing (required NOT_RUN can never
+ *                 make the gate PASS)
+ * A facts-level `blockedReason` is handled by the caller BEFORE this
+ * function (every worker-first check then evaluates BLOCKED).
+ */
+export function evaluateWorkerFirstAssertion(
+	name: WorkerFirstCheckName,
+	facts: WorkerFirstGateFacts,
+): { status: "PASS" | "FAIL" | "NOT_RUN"; detail: string } {
+	switch (name) {
+		case "strict-policy-active": {
+			if (facts.writePolicy === "worker-first-strict") return { status: "PASS", detail: "worker-first-strict policy is active" };
+			// The runtime always resolves the policy for the current actor
+			// (worker-first-strict for approved Sol, null otherwise) — null is
+			// a negative compliance fact, not a missing one.
+			return { status: "FAIL", detail: `worker-first-strict policy is not active for this actor (got ${facts.writePolicy ?? "not applicable"})` };
+		}
+		case "no-unauthorized-commander-writes": {
+			if (facts.commanderWritesDenied === true) {
+				return { status: "PASS", detail: "commander edit/write is hard-denied — no unauthorized write can get through" };
+			}
+			if (facts.blockedCommanderWriteAttempts !== null && facts.blockedCommanderWriteAttempts === 0) {
+				return { status: "PASS", detail: "zero unauthorized commander write attempts" };
+			}
+			if (facts.blockedCommanderWriteAttempts !== null && facts.blockedCommanderWriteAttempts > 0) {
+				return { status: "FAIL", detail: `${facts.blockedCommanderWriteAttempts} unauthorized commander write attempt(s) while the hard denial was inactive` };
+			}
+			return { status: "NOT_RUN", detail: "no hard-denial / blocked-write fact injected" };
+		}
+		case "no-pending-review": {
+			if (facts.hasDelegation === false) return { status: "PASS", detail: "no delegation — nothing pending" };
+			if (facts.reviewStatus === null) return { status: "NOT_RUN", detail: "no review-status fact injected" };
+			if (facts.reviewStatus === "PENDING_REVIEW") {
+				return { status: "FAIL", detail: `delegation ${facts.latestDelegationId ?? "?"} is PENDING_REVIEW — review the worker diff first` };
+			}
+			return { status: "PASS", detail: `latest delegation ${facts.latestDelegationId ?? "?"} is ${facts.reviewStatus}` };
+		}
+		case "no-stale-review": {
+			if (facts.hasDelegation === false) return { status: "PASS", detail: "no delegation — nothing stale" };
+			if (facts.reviewStatus === null) return { status: "NOT_RUN", detail: "no review-status fact injected" };
+			if (facts.reviewStatus === "STALE") {
+				return { status: "FAIL", detail: `delegation ${facts.latestDelegationId ?? "?"} is STALE — the diff changed since the review` };
+			}
+			return { status: "PASS", detail: `latest delegation ${facts.latestDelegationId ?? "?"} is ${facts.reviewStatus}` };
+		}
+		case "reviewed-hash-matches-current": {
+			if (facts.hasDelegation === false) return { status: "PASS", detail: "no delegation — nothing reviewed yet" };
+			if (facts.reviewStatus === "PENDING_REVIEW") {
+				return { status: "NOT_RUN", detail: "no reviewed hash yet — the delegation is PENDING_REVIEW" };
+			}
+			if (facts.reviewedDiffHash === null || facts.currentDiffHash === null) {
+				return { status: "NOT_RUN", detail: "reviewed/current diff-hash facts not injected" };
+			}
+			if (facts.reviewedDiffHash === facts.currentDiffHash) {
+				return { status: "PASS", detail: `reviewed hash ${facts.reviewedDiffHash.slice(0, 12)}… equals the current diff hash` };
+			}
+			return { status: "FAIL", detail: `reviewed hash ${facts.reviewedDiffHash.slice(0, 12)}… differs from the current diff hash ${facts.currentDiffHash.slice(0, 12)}…` };
+		}
+		case "worker-paths-within-contracts": {
+			if (facts.hasDelegation === false) return { status: "PASS", detail: "no delegation — no worker paths to check" };
+			if (facts.reviewVerdict === null && facts.reviewViolationCount === null) {
+				return { status: "NOT_RUN", detail: "no completed review facts injected" };
+			}
+			const violations = facts.reviewViolationCount ?? 0;
+			if (facts.reviewVerdict === "PASS" && violations === 0) {
+				return { status: "PASS", detail: `latest review PASS — every worker path is within the approved contracts` };
+			}
+			return { status: "FAIL", detail: `${violations} worker path(s) outside the approved contracts (latest review ${facts.reviewVerdict ?? "FAIL"})` };
+		}
+		case "no-active-unexplained-lease": {
+			if (facts.leaseStatus === null) return { status: "NOT_RUN", detail: "no lease-status fact injected" };
+			if (facts.leaseStatus === "active") {
+				if (facts.leaseReason !== null) {
+					return { status: "PASS", detail: `active lease with audited fixed reason ${facts.leaseReason}` };
+				}
+				return { status: "FAIL", detail: "an active commander write lease has no audited fixed reason" };
+			}
+			return { status: "PASS", detail: `write lease is ${facts.leaseStatus}` };
+		}
+		case "commander-initiated-final-verification": {
+			if (facts.gateRunInitiatedByCommander === null) return { status: "NOT_RUN", detail: "no gate-run initiator fact injected" };
+			if (facts.gateRunInitiatedByCommander === true) {
+				return { status: "PASS", detail: "this gate run was initiated by the approved GPT-5.6 Sol commander" };
+			}
+			return { status: "FAIL", detail: "this gate run was not initiated by the approved Sol commander — final verification is a commander-owned act" };
+		}
+	}
+}
+
 async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext): Promise<EvaluatedCheck> {
 	const startedAt = ctx.now();
 	const entry: CheckRunEntry = {
@@ -344,30 +460,42 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 
 			case "recipe": {
 				const candidates = check.recipe ? [check.recipe] : (check.recipes ?? []);
-				const declared = await declaredRecipeName(ctx.projectRoot, candidates);
+				const declared = await declaredRecipe(ctx.projectRoot, candidates);
 				if (!declared) {
 					fail(`no declared recipe among: ${candidates.join(", ")}`, [
 						{ type: "config", source: ".pi/workbench/recipes.yaml", detail: `none of ${candidates.join(", ")} is declared` },
 					]);
 					break;
 				}
-				if (!(await recipeAllowedInMode(ctx.projectRoot, declared, ctx.mode))) {
+				if (!(await recipeAllowedInMode(ctx.projectRoot, declared.name, ctx.mode))) {
 					entry.status = "BLOCKED";
-					entry.blocked_reason = `recipe "${declared}" is not allowed in ${ctx.mode} mode`;
+					entry.blocked_reason = `recipe "${declared.name}" is not allowed in ${ctx.mode} mode`;
+					break;
+				}
+				// P7: gate-engine recipe checks apply the SAME shared mutation
+				// decision as direct recipe execution — strict Sol is denied
+				// mutation: source, workers run only mutation: none, other
+				// controllers keep prior behavior. A policy denial BLOCKs the
+				// check (it can never run), and runRecipe re-enforces it below.
+				const mutationBlock = recipeMutationBlockReason(ctx.actorFacts, declared.name, declared.mutation);
+				if (mutationBlock) {
+					entry.status = "BLOCKED";
+					entry.blocked_reason = mutationBlock;
 					break;
 				}
 				const result = await runRecipe({
 					projectRoot: ctx.projectRoot,
-					recipeName: declared,
+					recipeName: declared.name,
 					params: {},
 					mode: ctx.mode,
 					exec: ctx.exec,
 					signal: ctx.signal,
 					now: ctx.now,
+					actorFacts: ctx.actorFacts,
 				});
 				if (!result.ok && result.error) {
-					fail(`recipe "${declared}" could not run: ${result.error}`, [
-						{ type: "recipe_run", recipe: declared, detail: result.error },
+					fail(`recipe "${declared.name}" could not run: ${result.error}`, [
+						{ type: "recipe_run", recipe: declared.name, detail: result.error },
 					]);
 					break;
 				}
@@ -377,10 +505,10 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 					{
 						type: "recipe_run",
 						run_id: result.record?.run_id,
-						recipe: declared,
+						recipe: declared.name,
 						exit_code: result.record?.exit_code ?? null,
 						execution_source: result.record?.execution_source ?? "exec",
-						detail: ok ? `recipe "${declared}" exited ${result.record?.exit_code} as expected` : `recipe "${declared}" failed (exit ${result.record?.exit_code ?? "killed"}, timed_out=${result.record?.timed_out})`,
+						detail: ok ? `recipe "${declared.name}" exited ${result.record?.exit_code} as expected` : `recipe "${declared.name}" failed (exit ${result.record?.exit_code ?? "killed"}, timed_out=${result.record?.timed_out})`,
 					},
 				];
 				if (result.runDir) {
@@ -391,7 +519,7 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 					}
 				}
 				if (summary && summary.stderr.trim().length > 0) {
-					entry.warnings.push(`recipe "${declared}" wrote to stderr`);
+					entry.warnings.push(`recipe "${declared.name}" wrote to stderr`);
 				}
 				if (ok) pass(evidence);
 				else fail(evidence[0]!.detail, evidence);
@@ -563,6 +691,40 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 				break;
 			}
 
+			case "worker-first": {
+				const name = check.worker_first;
+				if (!name || !WORKER_FIRST_CHECK_NAMES.includes(name as WorkerFirstCheckName)) {
+					throw new GateSetupError(`${label}: kind=worker-first needs a valid "worker_first" assertion (one of ${WORKER_FIRST_CHECK_NAMES.join(", ")})`);
+				}
+				const facts = ctx.workerFirstFacts;
+				if (!facts) {
+					// Required facts were not injected: NOT_RUN — never PASS.
+					entry.status = "NOT_RUN";
+					entry.failure_reason = null;
+					ctx.log(`    ${check.id} NOT_RUN — worker-first compliance facts were not injected (runtime-only machine check)`);
+					break;
+				}
+				if (facts.blockedReason) {
+					// The runtime marks the evaluation blocked (e.g. a pending/stale
+					// review blocks final verification): every worker-first check
+					// is BLOCKED, never evaluated against partial facts.
+					entry.status = "BLOCKED";
+					entry.blocked_reason = facts.blockedReason;
+					ctx.log(`    ${check.id} BLOCKED — ${facts.blockedReason}`);
+					break;
+				}
+				const outcome = evaluateWorkerFirstAssertion(name, facts);
+				const evidence: EvidenceEntry = { type: "worker_first", detail: outcome.detail };
+				if (outcome.status === "PASS") pass([evidence]);
+				else if (outcome.status === "FAIL") fail(outcome.detail, [evidence]);
+				else {
+					entry.status = "NOT_RUN";
+					entry.failure_reason = outcome.detail;
+					ctx.log(`    ${check.id} NOT_RUN — ${outcome.detail}`);
+				}
+				break;
+			}
+
 			case "schema": {
 				const file = check.json_file as string;
 				const schemaName = check.schema_name ?? "quant-result";
@@ -650,10 +812,9 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 	return { entry, artifactPaths };
 }
 
-async function declaredRecipeName(projectRoot: string, candidates: readonly string[]): Promise<string | undefined> {
+async function declaredRecipe(projectRoot: string, candidates: readonly string[]): Promise<Recipe | undefined> {
 	const config = await loadProjectConfig(projectRoot, { trusted: true });
-	const declared = new Set(config.recipes.map((r) => r.name));
-	return candidates.find((c) => declared.has(c));
+	return config.recipes.find((r) => candidates.includes(r.name));
 }
 
 async function recipeAllowedInMode(projectRoot: string, recipeName: string, mode: WorkbenchMode): Promise<boolean> {
@@ -870,6 +1031,8 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 		signal: input.signal,
 		now,
 		manualEvidence: input.manualEvidence ?? {},
+		workerFirstFacts: input.workerFirstFacts,
+		actorFacts: input.actorFacts,
 		log,
 	};
 
