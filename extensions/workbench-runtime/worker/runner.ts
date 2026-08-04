@@ -19,6 +19,11 @@ import {
 	truncateHead,
 	truncateTail,
 } from "@earendil-works/pi-coding-agent";
+import { MAX_WORKER_REPORT_BYTES, workerCacheHitRatio } from "./handoff.ts";
+// The deterministic cache-summary presentation moved to worker/handoff.ts
+// (the bounded-handoff module); kept re-exported here for callers of the
+// runner module.
+export { formatWorkerCacheSummary, workerCacheHitRatio } from "./handoff.ts";
 
 import {
 	formatWorkerTask,
@@ -93,6 +98,19 @@ export interface WorkerRunResult {
 	stopReason?: string;
 	errorMessage?: string;
 	output: string;
+	/**
+	 * The COMPLETE final assistant text retained in process memory for the
+	 * durable worker-report.md artifact: bounded only by the JSON-event
+	 * input cap (MAX_JSON_LINE_BYTES = 2 MiB) — NEVER pre-truncated to the
+	 * report bound, so the ledger can redact FIRST and cap + marker only
+	 * after redaction (post-secret tail content survives when redaction
+	 * makes the report fit). Intermediate assistant texts never survive
+	 * (only the final text wins, exactly like `output`). This text never
+	 * enters onUpdate/WorkerProgress.
+	 */
+	reportText: string;
+	/** True when the final assistant text exceeded MAX_WORKER_REPORT_BYTES (raw-byte fact). */
+	reportTextOversized: boolean;
 	stderr: string;
 	aborted: boolean;
 	timedOut: boolean;
@@ -121,10 +139,10 @@ export interface WorkerRunResult {
 }
 
 export interface WorkerProgress {
+	/** Only turn count and provider/model are exposed to the parent — never text. */
 	turns: number;
 	provider?: string;
 	model?: string;
-	lastText?: string;
 }
 
 export interface PiInvocation {
@@ -161,27 +179,6 @@ function emptyUsage(): WorkerUsage {
 		totalTokens: 0,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
-}
-
-/**
- * cacheRead / (input + cacheRead) over the aggregated worker usage;
- * `null` on a zero denominator — never NaN or Infinity.
- */
-export function workerCacheHitRatio(usage: Pick<WorkerUsage, "input" | "cacheRead">): number | null {
-	const denominator = usage.input + usage.cacheRead;
-	if (!Number.isFinite(denominator) || denominator <= 0) return null;
-	return usage.cacheRead / denominator;
-}
-
-/**
- * Deterministic worker cache summary line — same inputs always produce the
- * same string (no locale/formatting dependence). The hit ratio renders N/A
- * when there is no input to hit against (zero denominator).
- */
-export function formatWorkerCacheSummary(usage: Pick<WorkerUsage, "input" | "cacheRead">): string {
-	const ratio = workerCacheHitRatio(usage);
-	const hit = ratio === null ? "N/A" : `${Math.round(ratio * 100)}%`;
-	return `uncached input ${usage.input} | cache read ${usage.cacheRead} | hit ratio ${hit}`;
 }
 
 function finiteNumber(value: unknown): number {
@@ -307,6 +304,8 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 		exitCode: 1,
 		turns: 0,
 		output: "",
+		reportText: "",
+		reportTextOversized: false,
 		stderr: "",
 		aborted: false,
 		timedOut: false,
@@ -415,8 +414,18 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 					result.output = view.truncated
 						? `${view.content}\n\n[Worker output truncated to ${DEFAULT_MAX_LINES} lines / ${DEFAULT_MAX_BYTES} bytes.]`
 						: view.content;
+					// Retain the COMPLETE final assistant text for worker-report.md
+					// persistence — bounded only by the bounded JSON-event input
+					// (MAX_JSON_LINE_BYTES = 2 MiB), NEVER pre-truncated to the
+					// report bound: redaction happens BEFORE any truncation in the
+					// ledger, so content after long secrets survives when redaction
+					// makes the report fit. The oversized flag is the raw-byte fact;
+					// this is a private child-local variable — it never enters
+					// onUpdate.
+					result.reportText = text;
+					result.reportTextOversized = Buffer.byteLength(text, "utf8") > MAX_WORKER_REPORT_BYTES;
 				}
-				options.onProgress?.({ turns: result.turns, provider: result.provider, model: result.model, lastText: text || undefined });
+				options.onProgress?.({ turns: result.turns, provider: result.provider, model: result.model });
 			};
 
 			child.stdout.on("data", (chunk: Buffer | string) => {

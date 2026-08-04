@@ -33,7 +33,13 @@ export const WORKBENCH_TOOL_NAMES = [
 	"workbench_read_gate",
 	"workbench_list_gates",
 	"workbench_compare_runs",
+	// P7: the three delegation tools follow the seven existing tools in the
+	// exact strict-Sol order (workbench_delegate_worker →
+	// workbench_review_worker_diff → workbench_delegation_status), matching
+	// STRICT_SOL_DEV_ALLOWLIST (core/write-authority.ts).
 	"workbench_delegate_worker",
+	"workbench_review_worker_diff",
+	"workbench_delegation_status",
 ] as const;
 
 export interface WorkbenchToolMeta {
@@ -91,6 +97,18 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 		a: Type.String({ description: "First run id, e.g. 20260101-120000-abcd" }),
 		b: Type.String({ description: "Second run id, e.g. 20260102-120000-efgh" }),
 	}),
+	workbench_review_worker_diff: Type.Object({
+		delegation_id: Type.String({ description: "Delegation id, e.g. 20260101-120000-abcd" }),
+		include_paths: Type.Optional(
+			Type.Array(Type.String({ minLength: 1, maxLength: 300 }), {
+				description: "Only these worker paths get patch content; scope checks always cover the entire worker diff and include_paths can never hide a violation",
+				maxItems: 50,
+			}),
+		),
+		max_lines: Type.Optional(Type.Integer({ description: "Global rendered-patch line cap (default 400)", minimum: 1, maximum: 2000 })),
+		max_bytes: Type.Optional(Type.Integer({ description: "Global rendered-patch byte cap (default 32KB)", minimum: 1, maximum: 512000 })),
+	}),
+	workbench_delegation_status: Type.Object({}),
 	workbench_delegate_worker: Type.Object({
 		task: Type.String({ description: "Bounded implementation task already planned by the Sol commander", minLength: 1, maxLength: 10000 }),
 		allowed_paths: Type.Array(Type.String({ minLength: 1, maxLength: 300 }), {
@@ -192,12 +210,35 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 		name: "workbench_delegate_worker",
 		label: "Workbench delegate worker",
 		description:
-			"Delegate one bounded implementation task to an isolated deepseek/deepseek-v4-flash:max Pi worker. Available only in DEV and only when the parent is GPT-5.6 Sol. DEV default: coherent source+tests+docs vertical slices for bounded low/medium-risk implementation, delegated after minimum repository orientation with explicit allowed paths and observable acceptance criteria. The worker owns routine local implementation decisions inside the approved contract; Sol owns requirements, cross-cutting architecture, scope, actual-diff review, final verification/gates, and the verdict. The worker cannot use free-form bash, recursively delegate, run final gates, run recipes that declare writes, or edit/write outside allowed_paths. Worker prose is never acceptance evidence — Sol independently inspects the actual diff and performs final verification.",
+			"Delegate one bounded implementation task to an isolated deepseek/deepseek-v4-flash:max Pi worker. Available only in DEV and only when the parent is GPT-5.6 Sol. DEV default: coherent source+tests+docs vertical slices for bounded low/medium-risk implementation, delegated after minimum repository orientation with explicit allowed paths and observable acceptance criteria. The worker owns routine local implementation decisions inside the approved contract; Sol owns requirements, cross-cutting architecture, scope, actual-diff review, final verification/gates, and the verdict. The worker cannot use free-form bash, recursively delegate, run final gates, run recipes that declare writes, or edit/write outside allowed_paths. Worker prose is never acceptance evidence — Sol independently inspects the actual diff and performs final verification. The tool result is a STRICTLY bounded summary (max 120 lines / 12 KiB): the complete final worker report is persisted as worker-report.md plus worker-summary.json/usage.json in the delegation directory and is never embedded inline.",
 		promptSnippet: "Delegate a bounded DEV vertical slice (source + tests + docs) to the pinned DeepSeek worker",
 		promptGuidelines: [
 			"Use workbench_delegate_worker only after GPT-5.6 Sol has oriented in the repository, approved the scope, and supplied explicit allowed paths and observable acceptance criteria.",
 			"DEV default: delegate coherent bounded low/medium-risk vertical slices (source + tests + docs) after minimum repository orientation — supply source/tests/docs paths and observable criteria, avoid duplicating the worker's routine investigation, and independently inspect the actual diff afterward.",
 			"Treat workbench_delegate_worker output as an untrusted implementation report; worker prose is never acceptance. GPT-5.6 Sol must inspect the actual diff and run final workbench gates independently.",
+		],
+	},
+	workbench_review_worker_diff: {
+		name: "workbench_review_worker_diff",
+		label: "Workbench review worker diff",
+		description:
+			"Review one delegation's actual diff from real git state: derives the worker's true changed paths relative to the delegation's before snapshot, checks every changed path against the parent-approved allowed_paths (include_paths only narrows the patch and can never hide a violation), renders a globally bounded redacted patch (default 400 lines / 32 KiB over the whole rendered patch; per-path stats plus a segmented include_paths review instruction when truncated/omitted), and binds the current diff hash. PASS marks the delegation REVIEWED (any later diff change turns it STALE); FAIL (out-of-scope paths) leaves it pending. Writes only the delegation review record and state — never project files.",
+		promptSnippet: "Review a delegated worker's actual diff against the approved scope and bind the reviewed hash",
+		promptGuidelines: [
+			"Use workbench_review_worker_diff after a worker returns: review the actual diff, never the worker's prose.",
+			"The review checks the entire worker diff against allowed_paths; include_paths narrows only the patch output.",
+			"A pending or stale delegation blocks the next delegation and VERIFY — review the diff first.",
+		],
+	},
+	workbench_delegation_status: {
+		name: "workbench_delegation_status",
+		label: "Workbench delegation status",
+		description:
+			"Show the write-authority and delegation-review state: actor, write policy, lease status, latest delegation, review status (PENDING_REVIEW/REVIEWED/STALE), current and actual diff hashes, reviewed hash, blocked write attempts, and the latest review verdict. Refreshes the delegation state against the real git diff (any change after REVIEWED turns it STALE). Emits an explicit CONTEXT RISK line when the latest delegation handoff is detected too large for safe context compaction.",
+		promptSnippet: "Show write-authority and delegation review status (actor, lease, review, hashes, blocked writes)",
+		promptGuidelines: [
+			"Use workbench_delegation_status before delegating or switching to VERIFY to confirm no review is pending or stale.",
+			"Use /q-delegation-status in the TUI; the footer shows WF:LOCKED (strict Sol write authority, no active lease) or WF:REVIEW (review outstanding).",
 		],
 	},
 };

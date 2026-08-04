@@ -102,6 +102,70 @@
  *     per-model commander breakdown from ctx.sessionManager.getEntries()
  *     in TUI and print/json modes
  *
+ * P7 additions (Worker-first write authority + delegation ledger, slice 2):
+ *   - strict Sol DEV tool matrix (core/write-authority.ts wired): the
+ *     approved GPT-5.6 Sol commander gets exactly the fixed
+ *     STRICT_SOL_DEV_ALLOWLIST in DEV (no bash/edit/write, no foreign
+ *     tools); delegated workers and other controllers keep the existing
+ *     DEV behavior before role filtering; AUDIT/VERIFY stay strict
+ *   - second-layer commander guard in the tool_call handler: bash is
+ *     always blocked for strict Sol; edit/write require a valid user-issued
+ *     temporary write lease (restored/revoked via custom entries); every
+ *     tool outside the allowlist is blocked despite re-enable; blocked
+ *     write attempts are counted in the delegation state
+ *   - delegation ledger (core/delegation-ledger.ts): each worker attempt
+ *     writes <CONFIG_DIR_NAME>/workbench/delegations/<id>/ with
+ *     manifest.json, before.json, after.json, worker-summary.json (and the
+ *     review service adds review.json) — bounded, atomic, redacted, no
+ *     transcripts/secrets; git facts come from argv-only exec calls; the
+ *     ledger's own directory never counts as a project change
+ *   - review lifecycle (core/delegation-state.ts wired): every delegation
+ *     starts PENDING_REVIEW (even on failure — no fallback); a pending or
+ *     stale review blocks the next delegation AND VERIFY; the review tool
+ *     (core/diff-review.ts) checks the real diff against allowed_paths
+ *     (include_paths narrows only the patch), binds the reviewed hash, and
+ *     any later diff change turns the delegation STALE
+ *   - bounded worker handoff (worker/handoff.ts + worker/context-
+ *     diagnostics.ts): the complete final worker text is persisted as the
+ *     redacted ≤512 KiB worker-report.md (mode 0600, atomic, UTF-8-safe,
+ *     explicit truncation marker) plus bounded worker-summary.json /
+ *     usage.json under the delegation directory on EVERY outcome; the
+ *     parent toolResult is a strictly bounded summary (≤120 lines / 12
+ *     KiB) that NEVER concatenates result.output/report/patch/test logs;
+ *     progress exposes only turns/provider/model (never text); pure
+ *     estimateLatestTurnTokens / detectSingleHugeRecentTurn /
+ *     compactablePrefixAvailable diagnostics flag the single-huge-recent-
+ *     turn shape via the exact `CONTEXT RISK: latest delegation handoff
+ *     too large` line in /q-status and /q-delegation-status (Pi compaction
+ *     is never reimplemented); diff review defaults are 400 lines / 32 KiB
+ *     enforced globally over the rendered patch with per-path stats and a
+ *     segmented include_paths review instruction
+ *   - workbench_review_worker_diff / workbench_delegation_status tools and
+ *     /q-delegation-status; footer appends WF:LEASE <used>/<max> (active
+ *     confirmed lease), WF:LOCKED (locked/pending/expired/exhausted/
+ *     revoked) or WF:REVIEW (review outstanding — appended independently)
+ *   - P7 slice 3 (user-only lease commands): /q-write-policy status,
+ *     /q-commander-write-unlock <reason> --paths ... --calls ... --minutes
+ *     ... and /q-commander-write-lock — unlock is Sol+DEV+strict only;
+ *     /q-write-policy accepts EXACTLY the trimmed `status` subcommand
+ *     (anything else prints usage and alters no state); the human inline
+ *     confirmation is TUI-only (branch on ctx.mode === "tui" — RPC/
+ *     print/json are non-TUI and always use the pending two-part token
+ *     flow even though RPC contexts carry hasUI); TUI requires an
+ *     explicit human confirmation (cancel leaves locked); non-TUI issues
+ *     a PENDING lease that visibly emits two distinct bounded token parts
+ *     and confirms on a second same-command invocation with both exact
+ *     parts (tokens never enter status/compact summaries); lock revokes
+ *     and persists the audit facts; an ACTIVE confirmed lease enables
+ *     exactly its edit/write tools on top of the canonical 14-tool
+ *     allowlist (lease-added tools are canonical, deduplicated edit then
+ *     write), and exhaustion/expiry/revocation restores the exact 14
+ *     (bash stays hard-blocked; the second-layer guard stays
+ *     authoritative); lease-lock synchronization is LAZY — before each
+ *     agent turn and inside the command/tool guards and the status
+ *     refresh, a lease that is no longer ACTIVE reverts the advertised
+ *     set to the exact canonical 14 (no timers, no background resources)
+ *
  * Registers native Pi commands:
  *   /q-mode-audit /q-mode-dev /q-mode-verify /q-status   — mode control (P0)
  *   /q-init <profile>                                    — project init (P1)
@@ -121,8 +185,12 @@
  *   /q-cache-validate <manifest-path>                  — quant contract validation (P6-D)
  *   /q-cache-lineage <run-id|action-key>               — quant cache lineage (P6-D)
  *   /q-cost-status                                     — split session cost (commander/worker/other)
+ *   /q-delegation-status                              — write authority + delegation review status (P7)
+ *   /q-write-policy status                           — P7 write policy status (P7)
+ *   /q-commander-write-unlock <reason> --paths ...   — temporary commander write lease (P7)
+ *   /q-commander-write-lock                          — revoke/lock the commander write lease (P7)
  *
- * Registers workbench custom tools (P1/P3/P4):
+ * Registers workbench custom tools (P1/P3/P4/P7):
  *   workbench_project_inspect — project root, git, stacks, profile, recipes,
  *                               config errors (no secrets)
  *   workbench_run_recipe      — run a declared recipe only; full output to
@@ -134,6 +202,8 @@
  *   workbench_compare_runs    — compare two run records (P4)
  *   workbench_delegate_worker — DEV-only bounded implementation delegation
  *                               from GPT-5.6 Sol to pinned DeepSeek max
+ *   workbench_review_worker_diff — review a delegation's actual diff (P7)
+ *   workbench_delegation_status — write authority + review status (P7)
  *
  * P4 UI (all Pi-native):
  *   - footer status via `ctx.ui.setStatus` (the Pi footer itself is never
@@ -190,10 +260,16 @@ import {
 	workerRecipeBlockReason,
 	workerRoleToolCallBlockReason,
 	WORKER_ALLOWED_PATHS_ENV,
+	WORKER_MODEL_ID,
+	WORKER_MODEL_SELECTOR,
 	WORKER_PROJECT_ROOT_ENV,
+	WORKER_PROVIDER,
 	WORKER_ROLE_ENV,
+	type RecipeMutationFacts,
 } from "./core/worker-policy.ts";
-import { assertWorkerSucceeded, formatWorkerCacheSummary, runDeepseekWorker, type WorkerRunResult } from "./worker/runner.ts";
+import { assertWorkerSucceeded, runDeepseekWorker, type WorkerRunResult } from "./worker/runner.ts";
+import { buildDelegateWorkerResult } from "./worker/handoff.ts";
+import { delegationContextRiskLine } from "./worker/context-diagnostics.ts";
 import { isWorkerPathAllowedRealpath } from "./worker/path-scope.ts";
 import {
 	WORKER_HARD_BUDGET,
@@ -201,7 +277,6 @@ import {
 	WORKER_SOFT_BUDGET,
 	WORKER_SOFT_STEER_MESSAGE_TYPE,
 	WORKER_SOFT_STEER_TEXT,
-	formatWorkerBudgetSummary,
 	workerBudgetBand,
 	workerContextTokens,
 } from "./core/worker-budget.ts";
@@ -230,7 +305,7 @@ import {
 	type GateRunEntry,
 } from "./core/gate-engine.ts";
 import { GATE_CATALOG } from "./core/gate-catalog.ts";
-import { QUANT_GATE_ID_RE, type Gate } from "./core/gate-schema.ts";
+import { QUANT_GATE_ID_RE, type Gate, type WorkerFirstGateFacts } from "./core/gate-schema.ts";
 import { isValidRunId, listRuns, readLogSnippet, readManifest, readSummary } from "./core/runs.ts";
 import { join } from "node:path";
 import { runStatusLabel, fitToWidth } from "./core/format.ts";
@@ -282,8 +357,69 @@ import { renderCacheExplain, renderPrune, renderClear, type ExplainFacts } from 
 import { validateQuantManifestCommand, renderQuantCacheValidate } from "./cache/quant-cache-validate.ts";
 import { buildQuantLineage, renderQuantLineage } from "./cache/quant-cache-lineage.ts";
 import type { ActionRecord } from "./cache/action-types.ts";
+import {
+	collectAfterFacts,
+	collectGitFacts,
+	computeDiffHash,
+	createDelegationLedger,
+	finishDelegationLedger,
+	makeDelegationId,
+	type AfterFacts,
+	type GitFacts,
+	type LedgerWorkerFacts,
+	type LedgerWorkerSummaryRecord,
+} from "./core/delegation-ledger.ts";
+import { readReviewRecord, reviewDelegation } from "./core/diff-review.ts";
+import {
+	blocksVerify,
+	DELEGATION_STATE_ENTRY_TYPE,
+	delegationCompactSummary,
+	emptyDelegationState,
+	hasPendingReview,
+	hasStaleReview,
+	loadDelegationStateFromEntries,
+	markReviewed,
+	observeDiffChange,
+	recordBlockedWriteAttempt,
+	recordDelegation,
+	reviewBlockReason,
+	serializeDelegationState,
+	type DelegationState,
+} from "./core/delegation-state.ts";
+import {
+	commanderToolCallBlockReason,
+	confirmLease,
+	consumeLeaseCall,
+	defaultWritePolicy,
+	detectActorRole,
+	issueLease,
+	LEASE_STATE_ENTRY_TYPE,
+	leaseCompactSummary,
+	leaseRevokeReason,
+	leaseStatus,
+	loadLeaseFromEntries,
+	revokeLease,
+	serializeLease,
+	type WriteLease,
+} from "./core/write-authority.ts";
+import {
+	makeLeaseId,
+	newConfirmationParts,
+	parseUnlockArgs,
+	parseWritePolicyArgs,
+	renderLeaseConfirmed,
+	renderLeaseIssued,
+	renderUnlockPreview,
+	renderWritePolicyStatus,
+	UNLOCK_USAGE,
+	writeAuthorityFooterSegment,
+} from "./core/lease-command.ts";
+import { collectSecretValues } from "./core/redact.ts";
 
 const STATUS_KEY = "workbench";
+
+/** Secret env values scrubbed from every ledger/review artifact. */
+const secrets = collectSecretValues(process.env);
 
 // ------------------------------------------------------------- P5 state
 
@@ -310,44 +446,20 @@ function rememberRunOutcome(toolName: string, details: Record<string, unknown>):
 	compactState.doNotRetry = collectDoNotRetry(recentOutcomes, MAX_DO_NOT_RETRY);
 }
 
-export function buildDelegateWorkerResult(result: WorkerRunResult, allowedPaths: readonly string[]) {
-	const text = [
-		result.output,
-		"",
-		`worker cache : ${formatWorkerCacheSummary(result.usage)}`,
-		`worker budget : ${formatWorkerBudgetSummary(result.maxContextTokens, result.maxContextRatio)}`,
-		"",
-		"--- Commander action required ---",
-		"This is an untrusted worker implementation report. GPT-5.6 Sol must inspect the actual diff and run final workbench verification/gates independently.",
-	].join("\n");
-	return {
-		content: [{ type: "text" as const, text }],
-		details: {
-			phase: "finished",
-			provider: result.provider,
-			model: result.model,
-			thinking_level: "max",
-			turns: result.turns,
-			stop_reason: result.stopReason,
-			exit_code: result.exitCode,
-			allowed_paths: allowedPaths,
-			final_judgment: "reserved_for_sol_commander",
-			usage: result.usage,
-			cache_hit_ratio: result.cacheHitRatio,
-			// Pinned worker context-budget and compaction facts (see core/worker-budget.ts).
-			max_context_tokens: result.maxContextTokens,
-			max_context_ratio: result.maxContextRatio,
-			soft_budget_reached: result.softBudgetReached,
-			hard_budget_exceeded: result.hardBudgetExceeded,
-			compaction_count: result.compactionCount,
-			compaction_reasons: result.compactionReasons,
-		},
-		usage: result.usage,
-	};
-}
-
 export default function workbenchRuntime(pi: ExtensionAPI): void {
 	let mode: WorkbenchMode = "DEV";
+	/**
+	 * P7 session-scoped write-authority state. The delegation review
+	 * lifecycle and the temporary commander write lease are persisted as Pi
+	 * custom entries (survive compaction and session replacement) and
+	 * restored on session_start. The lease is issued/confirmed/locked only
+	 * through the user-only slash commands (core/lease-command.ts + the
+	 * handlers below); it is never granted by prompts or config.
+	 */
+	let delegationState: DelegationState = emptyDelegationState();
+	let writeLease: WriteLease | undefined;
+	/** Latest known commander identity facts (updated on session_start/model_select). */
+	let currentModelFacts: { provider?: string; model?: string } = {};
 	const workerRoleContext = {
 		role: process.env[WORKER_ROLE_ENV],
 		projectRoot: process.env[WORKER_PROJECT_ROOT_ENV],
@@ -368,8 +480,196 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 
 	// ------------------------------------------------------------------ state
 
+	/** P7: persist the delegation review state as a Pi custom entry. */
+	function persistDelegationState(): void {
+		// P7 slice 3: keep the compaction mirror in step with every delegation
+		// state change (the mirror is a bounded summary — the persisted entry
+		// above stays authoritative for the hard guards).
+		refreshCompactP7Facts();
+		try {
+			pi.appendEntry(DELEGATION_STATE_ENTRY_TYPE, serializeDelegationState(delegationState));
+		} catch {
+			// non-interactive context: the in-memory state is still authoritative
+		}
+	}
+
+	/** P7: persist the commander write lease (or its absence) as a Pi custom entry. */
+	function persistLease(): void {
+		// P7 slice 3: the compaction mirror carries the bounded lease summary.
+		refreshCompactP7Facts();
+		try {
+			pi.appendEntry(LEASE_STATE_ENTRY_TYPE, writeLease ? serializeLease(writeLease) : undefined);
+		} catch {
+			// non-interactive context: the in-memory lease is still authoritative
+		}
+	}
+
+	// ------------------------------------------------------------------
+	// P7 slice 3 — compaction mirror + injected worker-first gate facts
+	// ------------------------------------------------------------------
+
+	/**
+	 * P7: bounded text for the next required delegation/review action. The
+	 * compact note and /q-delegation-status share this derivation.
+	 */
+	function nextDelegationActionText(state: DelegationState): string | undefined {
+		if (state.latestId === undefined) return "start the first worker delegation (no delegation yet)";
+		if (state.status === "PENDING_REVIEW") {
+			return `review delegation ${state.latestId} (PENDING_REVIEW) before the next delegation or VERIFY`;
+		}
+		if (state.status === "STALE") {
+			return `re-review delegation ${state.latestId} (STALE — the diff changed since the review)`;
+		}
+		return `delegation ${state.latestId} REVIEWED — start the next delegation or run final verification`;
+	}
+
+	/**
+	 * P7 slice 3: refresh the compaction mirror with the current worker-first
+	 * facts. The mirror is a bounded summary ONLY — the hard guards read the
+	 * lease/delegation custom entries directly and never depend on this text.
+	 */
+	function refreshCompactP7Facts(): void {
+		const now = new Date().toISOString();
+		const actor = detectActorRole({
+			roleEnv: workerRoleContext.role,
+			provider: currentModelFacts.provider,
+			model: currentModelFacts.model,
+		});
+		const policy = defaultWritePolicy(currentModelFacts.provider, currentModelFacts.model);
+		compactState.writePolicy = policy ?? undefined;
+		compactState.commanderWritesDenied =
+			actor === "sol-commander" ? leaseStatus(writeLease, now) !== "active" : undefined;
+		compactState.lastDelegationId = delegationState.latestId;
+		compactState.pendingDelegationReview =
+			delegationState.latestId !== undefined && (hasPendingReview(delegationState) || hasStaleReview(delegationState))
+				? true
+				: undefined;
+		compactState.reviewedDiffHash = delegationState.reviewedDiffHash;
+		compactState.activeWriteLease = writeLease ? leaseCompactSummary(writeLease, now) : undefined;
+		compactState.blockedCommanderWriteAttempts =
+			delegationState.blockedWriteAttempts > 0 ? delegationState.blockedWriteAttempts : undefined;
+		// The next required delegation/review action belongs to the
+		// worker-first flow: meaningful for the Sol commander (policy active)
+		// and for any session carrying a delegation.
+		compactState.nextDelegationAction =
+			actor === "sol-commander" || delegationState.latestId !== undefined
+				? nextDelegationActionText(delegationState)
+				: undefined;
+		touchCompactState();
+	}
+
+	/**
+	 * P7 slice 3: construct the bounded worker-first compliance facts for a
+	 * gate run from actor/policy/lease/delegation/latest-review facts. The
+	 * delegation state is refreshed against the REAL git diff first (any
+	 * change after REVIEWED turns it STALE here). When a pending/stale
+	 * review blocks final verification, the facts carry `blockedReason` and
+	 * every B6 check evaluates BLOCKED instead of being evaluated against
+	 * partial facts. Never reads model prose — missing facts are NOT_RUN.
+	 *
+	 * B6 diff freshness FAILS CLOSED: the injected current diff hash is only
+	 * ever refreshed from the real current git facts inside this call. When
+	 * that collection fails (git unavailable/broken or any collection
+	 * error), the authoritative delegation state is preserved untouched and
+	 * the injected facts carry a MISSING current hash, so the required
+	 * `reviewed-hash-matches-current` check evaluates NOT_RUN and can never
+	 * PASS from a stale in-memory reviewed/current pair.
+	 */
+	async function buildWorkerFirstGateFacts(projectRoot: string, now: string): Promise<WorkerFirstGateFacts> {
+		let injectedCurrentDiffHash: string | null = null;
+		try {
+			// The collector FAILS CLOSED: an unavailable `git status` (thrown
+			// exec error or non-zero exit) rejects collection, so the real
+			// current facts are not collectable — never a fabricated
+			// clean-tree hash. Each successful collection runs exactly ONE
+			// status command (inside the collector).
+			const git = await collectGitFacts(projectRoot, execFn);
+			const hash = computeDiffHash(git.changedPaths, git.pathDigests, git.pathStatuses);
+			delegationState = observeDiffChange(delegationState, hash, now);
+			persistDelegationState();
+			injectedCurrentDiffHash = delegationState.currentDiffHash ?? null;
+		} catch {
+			// Best-effort refresh failed: the in-memory/persisted delegation
+			// state stays authoritative and untouched, and the injected current
+			// hash stays MISSING — `reviewed-hash-matches-current` is NOT_RUN
+			// (a required NOT_RUN can never make B6 PASS).
+			injectedCurrentDiffHash = null;
+		}
+		const actor = detectActorRole({
+			roleEnv: workerRoleContext.role,
+			provider: currentModelFacts.provider,
+			model: currentModelFacts.model,
+		});
+		const policy = defaultWritePolicy(currentModelFacts.provider, currentModelFacts.model);
+		const leaseNow = leaseStatus(writeLease, now);
+		const reviewBlock = reviewBlockReason(delegationState, "verify");
+		let reviewVerdict: "PASS" | "FAIL" | null = null;
+		let reviewViolationCount: number | null = null;
+		if (delegationState.latestId !== undefined && reviewBlock === undefined) {
+			try {
+				const review = await readReviewRecord(projectRoot, delegationState.latestId);
+				if (review) {
+					reviewVerdict = review.verdict;
+					reviewViolationCount = review.violations.length;
+				}
+			} catch {
+				// no review record — facts stay null (NOT_RUN for review checks)
+			}
+		}
+		return {
+			schema_version: 1,
+			blockedReason: reviewBlock,
+			actor,
+			writePolicy: policy ?? null,
+			commanderWritesDenied: actor === "sol-commander" ? leaseNow !== "active" : null,
+			blockedCommanderWriteAttempts: delegationState.blockedWriteAttempts,
+			hasDelegation: delegationState.latestId !== undefined,
+			latestDelegationId: delegationState.latestId ?? null,
+			reviewStatus: delegationState.latestId !== undefined ? delegationState.status : null,
+			currentDiffHash: injectedCurrentDiffHash,
+			reviewedDiffHash: delegationState.reviewedDiffHash ?? null,
+			reviewVerdict,
+			reviewViolationCount,
+			leaseStatus: leaseNow,
+			leaseReason: writeLease?.reason ?? null,
+			leaseCallsUsed: writeLease?.callsUsed ?? 0,
+			leaseMaxCalls: writeLease?.maxCalls ?? 0,
+			gateRunInitiatedByCommander: actor === "sol-commander",
+		};
+	}
+
 	function applyModeTools(): void {
-		pi.setActiveTools(computeRoleActiveTools(computeActiveTools(mode, pi.getActiveTools()), workerRoleContext.role));
+		// P7: the strict Sol DEV allowlist depends on the resolved actor
+		// (env worker contract first, then provider/model); other actors keep
+		// the existing DEV behavior, which the worker role filter then narrows.
+		// An ACTIVE confirmed lease additionally enables exactly its edit/write
+		// tools on top of the canonical 14-tool allowlist; pending/expired/
+		// exhausted/revoked leases (or no lease) leave the exact 14.
+		const actorFacts = {
+			roleEnv: workerRoleContext.role,
+			provider: currentModelFacts.provider,
+			model: currentModelFacts.model,
+		};
+		const leaseTools =
+			writeLease && leaseStatus(writeLease, new Date().toISOString()) === "active" ? [...writeLease.tools] : [];
+		pi.setActiveTools(
+			computeRoleActiveTools(computeActiveTools(mode, pi.getActiveTools(), actorFacts, leaseTools), workerRoleContext.role),
+		);
+	}
+
+	/**
+	 * P7: lazy lease-lock synchronization — no timers, no background
+	 * resources. Called before an agent turn and before/within the relevant
+	 * command/tool guards and the status refresh: when the lease is no
+	 * longer ACTIVE (expired/exhausted/revoked — pending included), the
+	 * exact canonical strict-14 tool set is reapplied so stale edit/write
+	 * are never advertised. The second-layer tool_call guard stays
+	 * authoritative: a blocked write call also removes the stale tools.
+	 */
+	function syncLeaseLock(now?: string): void {
+		if (writeLease && leaseStatus(writeLease, now ?? new Date().toISOString()) !== "active") {
+			applyModeTools();
+		}
 	}
 
 	/**
@@ -412,6 +712,30 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		// session-entry facts only, deterministic, O omitted when zero.
 		const costSegment = costStatusSegment(buildCostBreakdown(ctx.sessionManager.getEntries(), pendingMessage));
 		if (costSegment) line = line ? `${line} | ${costSegment}` : costSegment;
+		// P7 write-authority segments: an ACTIVE confirmed lease renders the
+		// required compact `WF:LEASE <callsUsed>/<maxCalls>`; locked/pending/
+		// expired/exhausted/revoked render `WF:LOCKED`. WF:REVIEW (a review
+		// is pending or stale) is appended independently below — it never
+		// merges into the lease segment. In-memory facts only — the footer
+		// never runs git or touches the disk; the lazy lock sync keeps stale
+		// edit/write from ever being advertised.
+		syncLeaseLock();
+		const actor = detectActorRole({
+			roleEnv: workerRoleContext.role,
+			provider: currentModelFacts.provider,
+			model: currentModelFacts.model,
+		});
+		const policy = defaultWritePolicy(currentModelFacts.provider, currentModelFacts.model);
+		const writeSegment = writeAuthorityFooterSegment({
+			actor,
+			policy,
+			lease: writeLease,
+			now: new Date().toISOString(),
+		});
+		if (writeSegment) line = line ? `${line} | ${writeSegment}` : writeSegment;
+		if (hasPendingReview(delegationState) || hasStaleReview(delegationState)) {
+			line = line ? `${line} | WF:REVIEW` : "WF:REVIEW";
+		}
 		ctx.ui.setStatus(STATUS_KEY, line);
 	}
 
@@ -485,6 +809,21 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	}
 
 	function setMode(next: WorkbenchMode, ctx: ExtensionContext, label: string): void {
+		// P7: leaving DEV revokes any temporary commander write lease (the
+		// policy requires revocation on mode change; expiry/exhaustion are
+		// statuses that surface through leaseStatus instead).
+		if (next !== "DEV" && writeLease) {
+			const now = new Date().toISOString();
+			const reason = leaseRevokeReason(writeLease, {
+				mode: next,
+				provider: currentModelFacts.provider,
+				model: currentModelFacts.model,
+			});
+			if (reason) {
+				writeLease = revokeLease(writeLease, reason, now);
+				persistLease();
+			}
+		}
 		mode = next;
 		cacheTelemetry.observeModeChange(next);
 		pi.appendEntry(MODE_ENTRY_TYPE, { mode });
@@ -524,6 +863,69 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		return join(projectRoot, CONFIG_DIR_NAME, "workbench", "runs");
 	}
 
+	/**
+	 * P7: refresh the delegation state against the REAL git diff, then build
+	 * the status lines (actor, policy, lease, latest delegation, review
+	 * status, hashes, blocked write attempts, latest review verdict). Any
+	 * diff change after REVIEWED turns the delegation STALE here.
+	 *
+	 * Fail closed: when the real git facts cannot be collected, the
+	 * authoritative delegation state stays untouched (no observe, no
+	 * persist) and the report VISIBLY marks the real-git refresh
+	 * UNAVAILABLE — the persisted hashes are never presented as freshly
+	 * verified.
+	 */
+	async function delegationStatusLines(projectRoot: string): Promise<{ lines: string[]; gitRefresh: "fresh" | "unavailable" }> {
+		const now = new Date().toISOString();
+		let gitRefresh: "fresh" | "unavailable" = "fresh";
+		try {
+			const git = await collectGitFacts(projectRoot, execFn);
+			const hash = computeDiffHash(git.changedPaths, git.pathDigests, git.pathStatuses);
+			delegationState = observeDiffChange(delegationState, hash, now);
+			persistDelegationState();
+		} catch {
+			// Real-git refresh unavailable: the in-memory/persisted
+			// authoritative state is left untouched and reported as NOT
+			// freshly verified (never silently presented as fresh).
+			gitRefresh = "unavailable";
+		}
+		const actor = detectActorRole({
+			roleEnv: workerRoleContext.role,
+			provider: currentModelFacts.provider,
+			model: currentModelFacts.model,
+		});
+		const policy = defaultWritePolicy(currentModelFacts.provider, currentModelFacts.model);
+		const lines = [
+			`actor        : ${actor} (${currentModelFacts.provider ?? "(none)"}/${currentModelFacts.model ?? "(none)"})`,
+			`write policy : ${policy ?? "not-applicable"}`,
+			`write lease  : ${leaseCompactSummary(writeLease, now)}`,
+		];
+		if (delegationState.latestId !== undefined) {
+			lines.push(
+				`latest       : ${delegationState.latestId} ${delegationState.status}`,
+				`current hash : ${delegationState.currentDiffHash ?? "(none)"}`,
+				`reviewed hash: ${delegationState.reviewedDiffHash ?? "(none)"}`,
+				`blocked writes: ${delegationState.blockedWriteAttempts}`,
+			);
+			const block = reviewBlockReason(delegationState, "delegation");
+			if (block) lines.push(`blocked      : ${block}`);
+			const review = await readReviewRecord(projectRoot, delegationState.latestId);
+			if (review) {
+				lines.push(
+					`review       : ${review.verdict} at ${review.reviewed_at}${review.mismatch ? " (MISMATCH: current diff differs from the recorded after hash)" : ""}`,
+					`review bound : ${review.bound_diff_hash}`,
+				);
+			}
+		} else {
+			lines.push(`latest       : (no delegation)`);
+			lines.push(`blocked writes: ${delegationState.blockedWriteAttempts}`);
+		}
+		if (gitRefresh === "unavailable") {
+			lines.push(`git refresh  : UNAVAILABLE — git status failed; the hashes above are persisted state, NOT freshly verified`);
+		}
+		return { lines, gitRefresh };
+	}
+
 	function renderGateDefinition(gate: Gate, latestStatus?: string, latestRunId?: string): string[] {
 		const lines = [
 			`gate        : ${gate.id} — ${gate.title}`,
@@ -560,6 +962,30 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		const entries = ctx.sessionManager.getEntries();
 		mode = loadModeFromEntries(entries);
 		compactState = loadCompactStateFromEntries(entries, mode);
+		// P7: restore the delegation review lifecycle and the commander write
+		// lease from the same custom entries (they survive compaction and
+		// every session-replacement path). The lease is policy-bound: a
+		// restored lease is revoked when the current actor/model or mode no
+		// longer qualifies.
+		delegationState = loadDelegationStateFromEntries(entries);
+		writeLease = loadLeaseFromEntries(entries);
+		if (ctx.model) currentModelFacts = { provider: ctx.model.provider, model: ctx.model.id };
+		if (writeLease) {
+			const now = new Date().toISOString();
+			const reason = leaseRevokeReason(writeLease, {
+				mode,
+				provider: currentModelFacts.provider,
+				model: currentModelFacts.model,
+			});
+			if (reason) {
+				writeLease = revokeLease(writeLease, reason, now);
+				persistLease();
+			}
+		}
+		// P7 slice 3: mirror the restored authority facts into the compaction
+		// state (fresh derivation — the mirror never overrides the restored
+		// lease/delegation entries, which stay authoritative).
+		refreshCompactP7Facts();
 		applyModeTools();
 
 		// P6-A: restore the cache telemetry summary and lifecycle reasons.
@@ -623,6 +1049,13 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	// -------------------------------------------------------- widget events
 
 	pi.on("before_agent_start", async (event, ctx) => {
+		// P7: lazy lease-lock sync before every agent turn — an
+		// expired/exhausted lease is reverted to the exact canonical 14
+		// before the model can see stale edit/write tools. No timers or
+		// background resources.
+		syncLeaseLock();
+		// P7 slice 3: keep the compaction mirror fresh at every turn start.
+		refreshCompactP7Facts();
 		widgetTask = fitToWidth(event.prompt.trim().replace(/\s+/g, " ").slice(0, 120), 96) || "active task";
 		widgetPhase = "planning";
 		compactState.task = widgetTask;
@@ -683,6 +1116,24 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	// signals; the next message_end classifies them as such.
 	pi.on("model_select", (event) => {
 		cacheTelemetry.observeModelChange({ provider: event.model.provider, id: event.model.id, api: event.model.api });
+		// P7: the actor identity (and with it the strict Sol DEV tool set and
+		// the write lease validity) follows the provider/model pair — update
+		// the facts, revoke a lease bound to a different commander identity,
+		// and recompute the active tool set.
+		currentModelFacts = { provider: event.model.provider, model: event.model.id };
+		if (writeLease) {
+			const now = new Date().toISOString();
+			const reason = leaseRevokeReason(writeLease, {
+				mode,
+				provider: currentModelFacts.provider,
+				model: currentModelFacts.model,
+			});
+			if (reason) {
+				writeLease = revokeLease(writeLease, reason, now);
+				persistLease();
+			}
+		}
+		applyModeTools();
 	});
 
 	pi.on("thinking_level_select", (event) => {
@@ -791,6 +1242,17 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	// are already written per request; nothing is buffered here).
 	pi.on("session_shutdown", () => {
 		cacheTelemetry.flush();
+		// P7: a commander write lease never outlives its session.
+		if (writeLease) {
+			const now = new Date().toISOString();
+			const reason = leaseRevokeReason(writeLease, { mode, sessionEnded: true });
+			if (reason) {
+				writeLease = revokeLease(writeLease, reason, now);
+				persistLease();
+				// Reapply the locked tool set (back to the exact canonical 14).
+				applyModeTools();
+			}
+		}
 	});
 
 	// --------------------------------------------------------------- commands
@@ -808,12 +1270,23 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	pi.registerCommand("q-mode-verify", {
 		description:
 			"Switch workbench to VERIFY mode (read, grep, find, ls, workbench tools; no free bash/edit/write — declared recipes only)",
-		handler: async (_args, ctx) => setMode("VERIFY", ctx, "VERIFY mode"),
+		handler: async (_args, ctx) => {
+			// P7: a pending or stale review blocks VERIFY (final gate
+			// verification) until the current worker diff is reviewed — never
+			// falls back.
+			if (blocksVerify(delegationState)) {
+				output(ctx, [`/q-mode-verify: ${reviewBlockReason(delegationState, "verify")}`]);
+				return;
+			}
+			setMode("VERIFY", ctx, "VERIFY mode");
+		},
 	});
 
 	pi.registerCommand("q-status", {
 		description: "Show workbench mode, cwd, project trust, active tools, and workbench tools",
 		handler: async (_args, ctx) => {
+			// P7: lazy lease-lock sync — the /q-status facts are never stale.
+			syncLeaseLock();
 			const trust = ctx.isProjectTrusted() ? "trusted" : "not trusted";
 			const workbenchTools = pi
 				.getAllTools()
@@ -827,9 +1300,18 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 				`mode tool set  : ${MODE_TOOLS[mode].join(", ")}`,
 				`workbench tools: ${workbenchTools.length > 0 ? workbenchTools.join(", ") : "(none registered)"}`,
 				`agent role     : ${workerRoleContext.role ?? "commander"}`,
+				`actor identity : ${detectActorRole({ roleEnv: workerRoleContext.role, provider: currentModelFacts.provider, model: currentModelFacts.model })} (${currentModelFacts.provider ?? "(none)"}/${currentModelFacts.model ?? "(none)"})`,
+				`write policy   : ${defaultWritePolicy(currentModelFacts.provider, currentModelFacts.model) ?? "not-applicable"}`,
+				`write lease    : ${leaseCompactSummary(writeLease, new Date().toISOString())}`,
+				`delegation     : ${delegationCompactSummary(delegationState)}`,
 				`path policy    : write .env/.pem/.key/credentials.*/secrets.*/auth.json blocked in all modes; read blocked in AUDIT/VERIFY, allowed in DEV`,
 				`command guard  : rm -rf / or ~, git reset --hard, git clean -fd, git push --force, git checkout -- ., git restore ., git remote changes, rm .git, git config --global writes, sudo, npm/yarn/pnpm/bun publish`,
 			];
+			// P7 bounded-handoff diagnostics: visibly flag the single-huge-recent-
+			// turn hazard (a delegation tool-result turn too large for safe
+			// context compaction) with the exact CONTEXT RISK line.
+			const contextRisk = delegationContextRiskLine(ctx.sessionManager.getEntries());
+			if (contextRisk) lines.push(contextRisk);
 			output(ctx, lines);
 		},
 	});
@@ -843,6 +1325,226 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			// Session facts only — no project config, no trust gate; works in
 			// TUI and print/json modes through the shared output helper.
 			output(ctx, renderCostBreakdown(buildCostBreakdown(ctx.sessionManager.getEntries())));
+		},
+	});
+
+	// ------------------------------------------------------ /q-delegation-status
+
+	pi.registerCommand("q-delegation-status", {
+		description:
+			"Show write-authority and delegation review status: actor, write policy, lease, latest delegation, review status, current/reviewed diff hashes, blocked write attempts, latest review verdict (refreshes against the real git diff — any change after REVIEWED turns the delegation STALE)",
+		handler: async (_args, ctx) => {
+			// P7: lazy lease-lock sync — the reported lease state is never stale.
+			syncLeaseLock();
+			const trustError = trustedOrError(ctx);
+			if (trustError) {
+				output(ctx, [`/q-delegation-status: ${trustError}`]);
+				return;
+			}
+			const projectRoot = await projectRootFor(ctx);
+			const status = await delegationStatusLines(projectRoot);
+			// P7 bounded-handoff diagnostics: same exact CONTEXT RISK line as
+			// /q-status when the latest delegation tool-result turn is detected
+			// too large for safe context compaction.
+			const contextRisk = delegationContextRiskLine(ctx.sessionManager.getEntries());
+			output(ctx, contextRisk ? [...status.lines, contextRisk] : status.lines);
+			void refreshStatus(ctx);
+		},
+	});
+
+	// ------------------------------------------- P7 lease slash commands
+
+	pi.registerCommand("q-write-policy", {
+		description:
+			"Show the P7 write policy status: /q-write-policy status (actor, fixed worker-first-strict policy, direct-write lock/lease status, bounded active/pending lease summary — never any confirmation token)",
+		handler: async (args, ctx) => {
+			// The command accepts exactly the trimmed `status` subcommand;
+			// other/missing arguments print usage and alter no state.
+			const parsed = parseWritePolicyArgs(args);
+			if (!parsed.ok) {
+				output(ctx, [`/q-write-policy: ${parsed.error}`]);
+				return;
+			}
+			syncLeaseLock();
+			const now = new Date().toISOString();
+			const actor = detectActorRole({
+				roleEnv: workerRoleContext.role,
+				provider: currentModelFacts.provider,
+				model: currentModelFacts.model,
+			});
+			const policy = defaultWritePolicy(currentModelFacts.provider, currentModelFacts.model);
+			output(
+				ctx,
+				renderWritePolicyStatus({
+					actor,
+					provider: currentModelFacts.provider,
+					model: currentModelFacts.model,
+					policy,
+					lease: writeLease,
+					now,
+				}),
+			);
+		},
+	});
+
+	pi.registerCommand("q-commander-write-unlock", {
+		description:
+			"Temporary commander write lease (Sol + DEV + worker-first-strict only): /q-commander-write-unlock <reason> --paths <comma-list> --calls <N> --minutes <N> (reasons: bootstrap-policy|worker-unavailable|security-emergency|user-directed; TUI asks for explicit confirmation, non-TUI issues two token parts and confirms via /q-commander-write-unlock confirm <partA> <partB>)",
+		handler: async (args, ctx) => {
+			const now = new Date().toISOString();
+			// P7: lazy lease-lock sync — an expired/exhausted lease is
+			// reverted to the exact canonical 14 before any lease logic runs.
+			syncLeaseLock(now);
+			// Only the approved GPT-5.6 Sol commander under the fixed
+			// worker-first-strict policy may unlock, and only in DEV mode
+			// (leases never outlive DEV; leaving DEV revokes them).
+			const actor = detectActorRole({
+				roleEnv: workerRoleContext.role,
+				provider: currentModelFacts.provider,
+				model: currentModelFacts.model,
+			});
+			const policy = defaultWritePolicy(currentModelFacts.provider, currentModelFacts.model);
+			if (actor !== "sol-commander" || policy !== "worker-first-strict") {
+				output(ctx, [
+					`/q-commander-write-unlock: refused — only GPT-5.6 Sol on an approved provider under the fixed worker-first-strict policy may unlock (current actor: ${actor}, policy: ${policy ?? "not-applicable"})`,
+				]);
+				return;
+			}
+			if (mode !== "DEV") {
+				output(ctx, [
+					`/q-commander-write-unlock: refused — write leases exist only in DEV mode (current mode: ${mode}); leaving DEV revokes any lease`,
+				]);
+				return;
+			}
+			const parsed = parseUnlockArgs(args);
+			if (!parsed.ok) {
+				output(ctx, [`/q-commander-write-unlock: ${parsed.error}`, UNLOCK_USAGE]);
+				return;
+			}
+			if (parsed.kind === "confirm") {
+				if (!writeLease) {
+					output(ctx, [
+						`/q-commander-write-unlock: no pending lease to confirm — issue one first (${UNLOCK_USAGE})`,
+					]);
+					return;
+				}
+				if (parsed.leaseId !== undefined && parsed.leaseId !== writeLease.id) {
+					output(ctx, [`/q-commander-write-unlock: lease id mismatch — the pending lease is "${writeLease.id}"`]);
+					return;
+				}
+				const status = leaseStatus(writeLease, now);
+				if (status !== "pending") {
+					output(ctx, [`/q-commander-write-unlock: lease ${writeLease.id} is ${status}, not pending — it cannot be confirmed now`]);
+					return;
+				}
+				const confirmed = confirmLease(writeLease, parsed.partA, parsed.partB, now);
+				if (!confirmed.ok) {
+					output(ctx, [`/q-commander-write-unlock: ${confirmed.error} — the lease stays locked`]);
+					return;
+				}
+				writeLease = confirmed.lease;
+				persistLease();
+				applyModeTools();
+				output(ctx, renderLeaseConfirmed(writeLease, now));
+				void refreshStatus(ctx);
+				return;
+			}
+			// Issuance. A pending or active lease must be confirmed or locked
+			// first; terminal leases (expired/exhausted/revoked) may be replaced.
+			const existingStatus = writeLease ? leaseStatus(writeLease, now) : "locked";
+			if (existingStatus === "pending") {
+				output(ctx, [
+					`/q-commander-write-unlock: lease ${writeLease!.id} is already pending confirmation — confirm it or run /q-commander-write-lock first`,
+				]);
+				return;
+			}
+			if (existingStatus === "active") {
+				output(ctx, [
+					`/q-commander-write-unlock: lease ${writeLease!.id} is already active — run /q-commander-write-lock first to replace it`,
+				]);
+				return;
+			}
+			const leaseId = makeLeaseId(now);
+			const tokens = newConfirmationParts();
+			const issued = issueLease({
+				id: leaseId,
+				reason: parsed.reason,
+				paths: parsed.paths,
+				maxCalls: parsed.calls,
+				durationMs: parsed.minutes * 60_000,
+				confirmationTokenA: tokens.partA,
+				confirmationTokenB: tokens.partB,
+				now,
+			});
+			if (!issued.ok) {
+				output(ctx, [`/q-commander-write-unlock: ${issued.error}`]);
+				return;
+			}
+			if (ctx.mode === "tui") {
+				// Real TUI only: every scope/reason/calls/expiry fact is shown
+				// and an explicit human confirmation is required; cancel leaves
+				// the lease locked (nothing issued, nothing persisted).
+				// RPC/print/json are NON-TUI — they use the pending two-part
+				// token flow even though RPC contexts carry hasUI.
+				const preview = renderUnlockPreview({
+					leaseId,
+					reason: parsed.reason,
+					paths: parsed.paths,
+					calls: parsed.calls,
+					minutes: parsed.minutes,
+					now,
+				});
+				const yes = await ctx.ui.confirm("Grant temporary commander write lease?", preview.join("\n"));
+				if (!yes) {
+					output(ctx, [
+						"/q-commander-write-unlock: canceled — no lease issued (write authority stays locked)",
+					]);
+					return;
+				}
+				// The human TUI confirmation IS the confirmation: activate
+				// immediately with the freshly generated parts (never displayed).
+				const confirmed = confirmLease(issued.lease, tokens.partA, tokens.partB, now);
+				if (!confirmed.ok) {
+					output(ctx, [`/q-commander-write-unlock: ${confirmed.error}`]);
+					return;
+				}
+				writeLease = confirmed.lease;
+				persistLease();
+				applyModeTools();
+				output(ctx, renderLeaseConfirmed(writeLease, now));
+			} else {
+				// Non-TUI (print/json/RPC without a terminal): create the PENDING
+				// lease and visibly emit the two distinct bounded token parts;
+				// the SAME command confirms later with both exact parts. The
+				// pending lease enables nothing yet (still exactly 14 tools).
+				writeLease = issued.lease;
+				persistLease();
+				applyModeTools();
+				output(ctx, renderLeaseIssued(writeLease, now));
+			}
+			void refreshStatus(ctx);
+		},
+	});
+
+	pi.registerCommand("q-commander-write-lock", {
+		description:
+			"Explicitly revoke/lock the temporary commander write lease and persist the audit facts (edit/write return to the canonical 14-tool strict Sol DEV set)",
+		handler: async (_args, ctx) => {
+			const now = new Date().toISOString();
+			// P7: lazy lease-lock sync — the lock reflects the true state.
+			syncLeaseLock();
+			if (writeLease) {
+				writeLease = revokeLease(writeLease, "user-directed lock via /q-commander-write-lock", now);
+				persistLease();
+			}
+			applyModeTools();
+			output(ctx, [
+				writeLease
+					? `/q-commander-write-lock: lease ${writeLease.id} revoked (${writeLease.revokedReason}) — commander edit/write is blocked until a new user-issued lease is confirmed`
+					: "/q-commander-write-lock: already locked (no lease) — commander edit/write is blocked",
+				leaseCompactSummary(writeLease, now),
+			]);
+			void refreshStatus(ctx);
 		},
 	});
 
@@ -951,7 +1653,22 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			}
 			const projectRoot = await projectRootFor(ctx);
 			try {
-				const result = await runRecipe({ projectRoot, recipeName: recipe, params, mode, exec: execFn, signal: ctx.signal, cacheMode });
+				const result = await runRecipe({
+					projectRoot,
+					recipeName: recipe,
+					params,
+					mode,
+					exec: execFn,
+					signal: ctx.signal,
+					cacheMode,
+					// P7: the shared mutation policy applies to /q-run exactly like
+					// the model tool (strict Sol / delegated worker restrictions).
+					actorFacts: {
+						role: workerRoleContext.role,
+						provider: currentModelFacts.provider,
+						model: currentModelFacts.model,
+					},
+				});
 				if (!result.ok && result.error) {
 					output(ctx, [`/q-run: ${result.error}`]);
 					return;
@@ -1107,6 +1824,13 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 				output(ctx, ["/q-gate: usage: /q-gate <gate-id|base|quant|all> [manual:<check-id>=<evidence> ...]"]);
 				return;
 			}
+			// P7: final gate verification in VERIFY mode is blocked while a
+			// review is pending or stale (defense in depth — /q-mode-verify
+			// already refuses to enter VERIFY in that state).
+			if (mode === "VERIFY" && blocksVerify(delegationState)) {
+				output(ctx, [`/q-gate: ${reviewBlockReason(delegationState, "verify")}`]);
+				return;
+			}
 			const trustError = trustedOrError(ctx);
 			if (trustError) {
 				output(ctx, [`/q-gate: ${trustError}`]);
@@ -1114,7 +1838,24 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			}
 			const projectRoot = await projectRootFor(ctx);
 			try {
-				const result = await runGates({ projectRoot, selector, mode, exec: execFn, signal: ctx.signal, manualEvidence });
+				// P7 slice 3: every gate run receives the injected worker-first
+				// compliance facts (slash command AND model tool) plus the actor
+				// facts for the shared recipe mutation policy.
+				const workerFirstFacts = await buildWorkerFirstGateFacts(projectRoot, new Date().toISOString());
+				const result = await runGates({
+					projectRoot,
+					selector,
+					mode,
+					exec: execFn,
+					signal: ctx.signal,
+					manualEvidence,
+					workerFirstFacts,
+					actorFacts: {
+						role: workerRoleContext.role,
+						provider: currentModelFacts.provider,
+						model: currentModelFacts.model,
+					},
+				});
 				output(ctx, renderGateRun(result, projectRoot));
 				void refreshStatus(ctx);
 				void refreshWidget(ctx);
@@ -1680,6 +2421,15 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 					exec: execFn,
 					signal,
 					cacheMode: params.cache ?? "default",
+					// P7: the shared mutation policy applies inside the runner —
+					// strict Sol is denied mutation: source, workers run only
+					// mutation: none (the worker write-declaration check above
+					// stays as the earlier, writes-based guard).
+					actorFacts: {
+						role: workerRoleContext.role,
+						provider: currentModelFacts.provider,
+						model: currentModelFacts.model,
+					},
 				});
 				if (!result.ok && result.error) {
 					return { content: [{ type: "text", text: `workbench_run_recipe: ${result.error}` }], details: { ok: false, error: result.error } };
@@ -1818,12 +2568,24 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			if (trustError) {
 				return { content: [{ type: "text", text: `workbench_run_gate: ${trustError}` }], details: {} };
 			}
+			// P7: while a review is pending or stale, VERIFY (final gate
+			// verification) is blocked — never falls back to DEV gate runs as
+			// a substitute for a reviewed diff.
+			if (mode === "VERIFY" && blocksVerify(delegationState)) {
+				return {
+					content: [{ type: "text", text: `workbench_run_gate: ${reviewBlockReason(delegationState, "verify")}` }],
+					details: { ok: false, blocked_reason: reviewBlockReason(delegationState, "verify") },
+				};
+			}
 			const projectRoot = await projectRootFor(ctx);
 			onUpdate?.({
 				content: [{ type: "text", text: `Running gates "${params.gates}" (${mode} mode)...` }],
 				details: { phase: "started", gates: params.gates },
 			});
 			try {
+				// P7 slice 3: the model-tool gate run injects the same bounded
+				// worker-first compliance facts as the /q-gate slash command.
+				const workerFirstFacts = await buildWorkerFirstGateFacts(projectRoot, new Date().toISOString());
 				const result = await runGates({
 					projectRoot,
 					selector: params.gates,
@@ -1831,6 +2593,12 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 					exec: execFn,
 					signal,
 					manualEvidence: params.manual_evidence ?? {},
+					workerFirstFacts,
+					actorFacts: {
+						role: workerRoleContext.role,
+						provider: currentModelFacts.provider,
+						model: currentModelFacts.model,
+					},
 				});
 				const text = renderGateRun(result, projectRoot).join("\n");
 				const details: GateToolDetails = {
@@ -1963,6 +2731,8 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		...workbenchToolRenderer("compare", "workbench_compare_runs"),
 	});
 
+
+
 	pi.registerTool({
 		...WORKBENCH_TOOL_METADATA.workbench_delegate_worker,
 		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker,
@@ -1973,29 +2743,335 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			const commanderError = commanderBlockReason(ctx.model?.provider, ctx.model?.id);
 			if (commanderError) throw new Error(commanderError);
 			const projectRoot = await projectRootFor(ctx);
-			onUpdate?.({
-				content: [{ type: "text", text: "Starting pinned DeepSeek worker in an isolated Pi process..." }],
-				details: { phase: "starting", model: "deepseek/deepseek-v4-flash:max" },
-			});
-			const result = await runDeepseekWorker({
+
+			// P7: refresh the delegation state against the REAL git diff (any
+			// change after REVIEWED turns the delegation STALE), then refuse
+			// to start while a review is pending or stale — never falls back.
+			// The before snapshot is a security fact source: an unavailable
+			// `git status` REFUSES the delegation BEFORE any ledger is created
+			// or any worker is launched (fail closed).
+			const startedAt = new Date().toISOString();
+			let before: GitFacts;
+			try {
+				before = await collectGitFacts(projectRoot, execFn);
+			} catch (error) {
+				throw new Error(`workbench_delegate_worker: cannot collect the real git state before delegating: ${(error as Error).message}`);
+			}
+			const beforeHash = computeDiffHash(before.changedPaths, before.pathDigests, before.pathStatuses);
+			delegationState = observeDiffChange(delegationState, beforeHash, startedAt);
+			persistDelegationState();
+			const reviewBlock = reviewBlockReason(delegationState, "delegation");
+			if (reviewBlock) throw new Error(`workbench_delegate_worker: ${reviewBlock}`);
+
+			// P7: persist the bounded delegation ledger (atomic manifest +
+			// before facts) BEFORE the worker starts; the ledger's own
+			// directory never counts as a project change.
+			const delegationId = makeDelegationId(new Date());
+			const created = await createDelegationLedger(
 				projectRoot,
-				contract: {
+				delegationId,
+				{
 					task: params.task,
 					allowedPaths: params.allowed_paths,
 					acceptanceCriteria: params.acceptance_criteria,
 					verification: params.verification ?? [],
+					timeoutSeconds: params.timeout_seconds ?? 1800,
 				},
-				timeoutMs: (params.timeout_seconds ?? 1800) * 1000,
-				signal,
-				onProgress: (progress) => {
-					onUpdate?.({
-						content: [{ type: "text", text: `DeepSeek worker: ${progress.turns} turn(s), model ${progress.provider ?? "?"}/${progress.model ?? "?"}` }],
-						details: { phase: "running", turns: progress.turns, provider: progress.provider, model: progress.model },
-					});
-				},
+				before,
+				startedAt,
+			);
+			if (!created.ok) throw new Error(`workbench_delegate_worker: delegation ledger failed: ${created.error}`);
+			const recorded = recordDelegation(delegationState, { id: delegationId, diffHash: beforeHash, now: startedAt });
+			if (!recorded.ok) throw new Error(`workbench_delegate_worker: ${recorded.error}`);
+			delegationState = recorded.state;
+			persistDelegationState();
+			void refreshStatus(ctx);
+
+			onUpdate?.({
+				content: [{ type: "text", text: `DeepSeek worker: 0 turn(s), model ${WORKER_MODEL_SELECTOR}` }],
+				details: { phase: "starting", delegation_id: delegationId, turns: 0, provider: WORKER_PROVIDER, model: WORKER_MODEL_SELECTOR },
 			});
-			assertWorkerSucceeded(result);
-			return buildDelegateWorkerResult(result, params.allowed_paths);
+
+			// Run the worker; EVERY outcome (success and failure) is recorded
+			// in the ledger and stays PENDING_REVIEW.
+			let result: WorkerRunResult;
+			try {
+				result = await runDeepseekWorker({
+					projectRoot,
+					contract: {
+						task: params.task,
+						allowedPaths: params.allowed_paths,
+						acceptanceCriteria: params.acceptance_criteria,
+						verification: params.verification ?? [],
+					},
+					timeoutMs: (params.timeout_seconds ?? 1800) * 1000,
+					signal,
+					onProgress: (progress) => {
+						// The exact compact progress shape — turns and provider/model
+						// only. Intermediate/final worker text never enters onUpdate.
+						onUpdate?.({
+							content: [
+								{
+									type: "text",
+									text: `DeepSeek worker: ${progress.turns} turn(s), model ${progress.provider ?? WORKER_PROVIDER}/${progress.model ?? WORKER_MODEL_ID}`,
+								},
+							],
+							details: { phase: "running", turns: progress.turns, provider: progress.provider, model: progress.model },
+						});
+					},
+				});
+			} catch (error) {
+				result = {
+					exitCode: 1,
+					turns: 0,
+					output: "",
+					reportText: "",
+					reportTextOversized: false,
+					stderr: "",
+					aborted: true,
+					timedOut: false,
+					errorMessage: (error as Error).message,
+					usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+					cacheHitRatio: null,
+					maxContextTokens: 0,
+					maxContextRatio: 0,
+					softBudgetReached: false,
+					hardBudgetExceeded: false,
+					compactionCount: 0,
+					compactionReasons: [],
+				};
+			}
+			let failure: string | undefined;
+			try {
+				assertWorkerSucceeded(result);
+			} catch (error) {
+				result = { ...result, errorMessage: (error as Error).message };
+				failure = (error as Error).message;
+			}
+
+			// P7: finish the ledger with the true after facts (digest-based
+			// changed paths since before, after diff hash, pinned worker
+			// identity, status/exit, usage/budget, bounded redacted summary).
+			// Every outcome also atomically persists worker-report.md (the
+			// complete final worker text — the ledger redacts FIRST, then caps
+			// to 512 KiB with the explicit marker only when the REDACTED
+			// report still exceeds the bound), the extended worker-summary.json
+			// and usage.json. The returned worker-summary record is the SINGLE
+			// shared summary derivation for the parent handoff (no re-parse).
+			let after: AfterFacts;
+			let handoffSummary: LedgerWorkerSummaryRecord;
+			try {
+				after = await collectAfterFacts(projectRoot, before, execFn);
+				const finished = await finishDelegationLedger(projectRoot, delegationId, {
+					after,
+					worker: {
+						provider: result.provider ?? null,
+						model: result.model ?? null,
+						status: failure === undefined ? "success" : "failure",
+						exitCode: result.exitCode,
+						turns: result.turns,
+						stopReason: result.stopReason ?? null,
+						errorMessage: result.errorMessage ?? null,
+						usage: {
+							input: result.usage.input,
+							output: result.usage.output,
+							cacheRead: result.usage.cacheRead,
+							cacheWrite: result.usage.cacheWrite,
+							totalTokens: result.usage.totalTokens,
+							cost: { ...result.usage.cost },
+						},
+						cacheHitRatio: result.cacheHitRatio,
+						budget: {
+							maxContextTokens: result.maxContextTokens,
+							maxContextRatio: result.maxContextRatio,
+							softBudgetReached: result.softBudgetReached,
+							hardBudgetExceeded: result.hardBudgetExceeded,
+							compactionCount: result.compactionCount,
+							compactionReasons: [...result.compactionReasons],
+						},
+						reportSummary: result.output,
+					},
+					reportText: result.reportText,
+					secrets,
+					now: new Date().toISOString(),
+				});
+				if (!finished.ok) throw new Error(finished.error);
+				handoffSummary = finished.workerSummary;
+			} catch (error) {
+				throw new Error(
+					failure === undefined
+						? `workbench_delegate_worker: delegation ledger finish failed: ${(error as Error).message}`
+						: `workbench_delegate_worker: worker failed (${failure}) and the delegation ledger finish also failed: ${(error as Error).message}`,
+				);
+			}
+
+			if (failure) throw new Error(failure);
+			// The bounded parent handoff: never embeds result.output/report/
+			// patch/test logs, and renders the SAME bounded summary/parse-
+			// warning facts persisted in worker-summary.json — including the
+			// reported-vs-actual divergence warning and the parse-reliability
+			// flag (exactly one summary derivation; the parent never re-parses
+			// the report text). It shows the delegation id, provider/model,
+			// status, ACTUAL changed paths (collectAfterFacts.changedSinceBefore
+			// — never the report prose), bounded parsed section items (or the
+			// safe fallback), usage/cache/budget summary, the durable report
+			// path, parse/review warnings, and the explicit instruction that
+			// Sol must inspect the actual diff.
+			return buildDelegateWorkerResult({
+				delegationId,
+				provider: result.provider,
+				model: result.model,
+				status: "success",
+				turns: result.turns,
+				exitCode: result.exitCode,
+				stopReason: result.stopReason,
+				changedPaths: after.changedSinceBefore,
+				usage: result.usage,
+				cacheHitRatio: result.cacheHitRatio,
+				budget: {
+					maxContextTokens: result.maxContextTokens,
+					maxContextRatio: result.maxContextRatio,
+					softBudgetReached: result.softBudgetReached,
+					hardBudgetExceeded: result.hardBudgetExceeded,
+					compactionCount: result.compactionCount,
+					compactionReasons: [...result.compactionReasons],
+				},
+				reportPath: handoffSummary.report_path,
+				summary: handoffSummary,
+				reviewStatus: delegationState.status,
+			});
+		},
+	});
+
+	pi.registerTool({
+		...WORKBENCH_TOOL_METADATA.workbench_review_worker_diff,
+		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_review_worker_diff,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const trustError = trustedOrError(ctx);
+			if (trustError) {
+				return { content: [{ type: "text", text: `workbench_review_worker_diff: ${trustError}` }], details: {} };
+			}
+			// P7: lazy lease-lock sync — the review guard never runs against
+			// stale advertised edit/write tools.
+			syncLeaseLock();
+			const projectRoot = await projectRootFor(ctx);
+			const delegationId = params.delegation_id.trim();
+			// The review lifecycle is a single latest-delegation slot: only the
+			// latest delegation can be reviewed, and only while it is
+			// PENDING_REVIEW or STALE (REVIEWED refuses re-review).
+			if (delegationState.latestId === undefined) {
+				return { content: [{ type: "text", text: "workbench_review_worker_diff: no delegation to review" }], details: {} };
+			}
+			if (delegationState.latestId !== delegationId) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `workbench_review_worker_diff: delegation ${delegationId} is not the latest delegation (${delegationState.latestId}); only the latest delegation can be reviewed`,
+						},
+					],
+					details: {},
+				};
+			}
+			if (delegationState.status === "REVIEWED") {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `workbench_review_worker_diff: delegation ${delegationId} is already REVIEWED (bound to ${delegationState.reviewedDiffHash ?? "?"}); a diff change after review turns it STALE, which is when a re-review is allowed`,
+						},
+					],
+					details: {},
+				};
+			}
+			const result = await reviewDelegation({
+				projectRoot,
+				delegationId,
+				exec: execFn,
+				includePaths: params.include_paths,
+				maxLines: params.max_lines,
+				maxBytes: params.max_bytes,
+				secrets,
+			});
+			if (!result.ok || !result.record) {
+				return { content: [{ type: "text", text: `workbench_review_worker_diff: ${result.error ?? "review failed"}` }], details: { ok: false, error: result.error } };
+			}
+			// Bind the state to the REAL current hash (the review record binds
+			// it too), then mark REVIEWED only on PASS; FAIL leaves the
+			// delegation PENDING_REVIEW with the violations recorded.
+			const now = new Date().toISOString();
+			delegationState = observeDiffChange(delegationState, result.record.bound_diff_hash, now);
+			if (result.record.verdict === "PASS") {
+				const marked = markReviewed(delegationState, now);
+				if (!marked.ok) {
+					return {
+						content: [{ type: "text", text: `workbench_review_worker_diff: review record written but state refused REVIEWED: ${marked.error}` }],
+						details: { ok: false, error: marked.error },
+					};
+				}
+				delegationState = marked.state;
+			}
+			persistDelegationState();
+			void refreshStatus(ctx);
+			const record = result.record;
+			return {
+				content: [{ type: "text", text: result.lines.join("\n") }],
+				details: {
+					ok: true,
+					delegation_id: delegationId,
+					verdict: record.verdict,
+					review_status: delegationState.status,
+					bound_diff_hash: record.bound_diff_hash,
+					recorded_after_hash: record.recorded_after_hash,
+					mismatch: record.mismatch,
+					violations: record.violations,
+					drift_paths: record.drift_paths,
+					checked_paths: record.checked_paths,
+					patch_paths: record.patch_paths,
+					patch_truncated: record.patch_truncated,
+				},
+			};
+		},
+	});
+
+	pi.registerTool({
+		...WORKBENCH_TOOL_METADATA.workbench_delegation_status,
+		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_delegation_status,
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			const trustError = trustedOrError(ctx);
+			if (trustError) {
+				return { content: [{ type: "text", text: `workbench_delegation_status: ${trustError}` }], details: {} };
+			}
+			// P7: lazy lease-lock sync — the reported lease state is never stale.
+			syncLeaseLock();
+			const projectRoot = await projectRootFor(ctx);
+			const status = await delegationStatusLines(projectRoot);
+			// P7 bounded-handoff diagnostics: visibly include the exact CONTEXT
+			// RISK line when the latest delegation handoff is detected too large
+			// for safe context compaction (the new bounded handoff never
+			// triggers it).
+			const contextRisk = delegationContextRiskLine(ctx.sessionManager.getEntries());
+			void refreshStatus(ctx);
+			return {
+				content: [{ type: "text", text: contextRisk ? `${status.lines.join("\n")}\n${contextRisk}` : status.lines.join("\n") }],
+				details: {
+					actor: detectActorRole({
+						roleEnv: workerRoleContext.role,
+						provider: currentModelFacts.provider,
+						model: currentModelFacts.model,
+					}),
+					write_policy: defaultWritePolicy(currentModelFacts.provider, currentModelFacts.model) ?? null,
+					lease_status: leaseStatus(writeLease, new Date().toISOString()),
+					latest_delegation: delegationState.latestId ?? null,
+					review_status: delegationState.latestId !== undefined ? delegationState.status : null,
+					current_diff_hash: delegationState.currentDiffHash ?? null,
+					reviewed_diff_hash: delegationState.reviewedDiffHash ?? null,
+					blocked_write_attempts: delegationState.blockedWriteAttempts,
+					block_reason: reviewBlockReason(delegationState, "delegation") ?? null,
+					git_refresh: status.gitRefresh,
+					context_risk: contextRisk !== undefined,
+				},
+			};
 		},
 	});
 
@@ -2017,12 +3093,68 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 				return { block: true, reason: `Delegated worker path failed realpath/symlink scope validation: ${path}` };
 			}
 		}
+		// P7 second layer — strict Sol commander guard: bash is always
+		// blocked; edit/write require a valid user-issued temporary write
+		// lease; every tool outside the fixed allowlist is blocked despite
+		// any re-enable. Delegated workers and other controllers are outside
+		// this guard (the worker guards above remain authoritative). P7
+		// slice 3: EVERY blocked strict-Sol edit/write attempt increments
+		// the bounded blockedWriteAttempts audit counter (not only attempts
+		// while a review is outstanding) — the counter is persisted and
+		// mirrored into the compaction state.
+		const actor = detectActorRole({
+			roleEnv: workerRoleContext.role,
+			provider: currentModelFacts.provider,
+			model: currentModelFacts.model,
+		});
+		const now = new Date().toISOString();
+		// P7: lazy lease-lock sync inside the guard — an expired/exhausted
+		// edit/write call both BLOCKS (the second-layer decision below) and
+		// removes the stale edit/write from the advertised set, with no
+		// timer or background job.
+		syncLeaseLock(now);
+		if (actor === "sol-commander") {
+			const commanderReason = commanderToolCallBlockReason({
+				actor,
+				toolName: event.toolName,
+				input: event.input,
+				lease: writeLease,
+				now,
+			});
+			if (commanderReason) {
+				if (event.toolName === "edit" || event.toolName === "write") {
+					delegationState = recordBlockedWriteAttempt(delegationState, now);
+					persistDelegationState();
+				}
+				return { block: true, reason: commanderReason };
+			}
+		}
 		const check = checkToolCall(mode, event.toolName, event.input);
 		if (!check.allowed) {
 			return {
 				block: true,
 				reason: check.reason ?? `Blocked by workbench ${mode} mode`,
 			};
+		}
+		// Authorized commander write: consume exactly one lease call per
+		// proceeding call — AFTER the generic mode/path guard, so a call
+		// blocked by mode policy never burns a lease call (the lease gates
+		// the call itself; the counter enforces the bounded per-lease call
+		// budget). Exhaustion/expiry removes the lease's edit/write tools
+		// from the active set (back to the exact canonical 14).
+		if (actor === "sol-commander" && (event.toolName === "edit" || event.toolName === "write")) {
+			const path =
+				event.input && typeof event.input === "object" && typeof (event.input as { path?: unknown }).path === "string"
+					? (event.input as { path: string }).path
+					: "";
+			if (writeLease && leaseStatus(writeLease, now) === "active") {
+				const consumed = consumeLeaseCall(writeLease, event.toolName, path, now);
+				if (consumed.ok) {
+					writeLease = consumed.lease;
+					persistLease();
+					if (leaseStatus(writeLease, now) !== "active") applyModeTools();
+				}
+			}
 		}
 		// P5: remember which project files the agent modified (bounded) so the
 		// compaction supplement can point at them.

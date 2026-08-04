@@ -2,7 +2,112 @@
 
 All notable changes to pi-dev-workbench are documented here.
 
-## [Unreleased] — Controlled Sol/DeepSeek Worker Delegation
+## [0.9.1] — P7 Bounded Worker Handoff
+
+Replaces the oversized single-toolResult worker handoff with durable
+bounded report artifacts plus a strictly bounded structured parent summary.
+No commit, tag or npm publish is performed by this milestone.
+
+### Added
+
+- Centralized bounded-handoff constants in `worker/handoff.ts`:
+  `MAX_PARENT_HANDOFF_BYTES=12288`, `MAX_PARENT_HANDOFF_LINES=120`,
+  `MAX_WORKER_REPORT_BYTES=524288`, `MAX_SUMMARY_ITEMS_PER_SECTION=8`,
+  `MAX_SUMMARY_ITEM_CHARS=500` — UTF-8 BYTES govern every byte cap, and
+  truncation never splits a multibyte sequence.
+- Durable per-delegation artifacts for every finished outcome (success AND
+  failure) inside `<CONFIG_DIR_NAME>/workbench/delegations/<id>/`:
+  `worker-report.md` (the REDACTED complete final worker text, ≤ 512 KiB,
+  mode 0600, atomic temp+rename, explicit truncation marker when
+  oversized, persisted only — never part of any parent result/details),
+  `worker-summary.json` (actual digest-based `changed_paths` — never
+  worker prose — plus bounded parsed Completed / Verification commands
+  and observations / Remaining Risks items, report path, turns, context
+  budget facts, usage, cache hit ratio, and a parse warning when the
+  report sections are missing/unreliable or the Files Changed claims
+  diverge from the actual diff), and `usage.json` (bounded structured
+  usage/cache/budget/turn facts with the nested worker usage shape
+  preserved for cost accounting). The runner retains the COMPLETE final
+  assistant text in process memory (bounded only by the 2 MiB JSON-event
+  input — never pre-truncated to the report bound); the ledger redacts
+  FIRST and caps + appends the truncation marker only when the REDACTED
+  report still exceeds 512 KiB, so post-secret tail content survives when
+  redaction makes the report fit. worker-summary.json also persists the
+  parse-reliability and item-truncation facts and is the SINGLE summary
+  derivation the parent handoff renders (the runtime never re-parses the
+  report text for the parent).
+- Strictly bounded parent `workbench_delegate_worker` result: the content
+  never concatenates `result.output`/report/patch/test logs, is capped to
+  ≤ 120 lines / 12288 UTF-8 bytes by reserving every required fact line
+  (identity/status/turns, bounded actual changed paths with an omission
+  count, usage/cache/budget, report/summary/usage artifact paths,
+  parse/review/failure facts) and dropping optional summary items only as
+  WHOLE sanitized lines — a rendered line is never cut mid-item or
+  mid-code-point. Structured details are tightly bounded (changed paths
+  capped, failure/identity/stop strings bounded) and carry only delegation
+  id / report path / summary / verification observations / risks / turns /
+  usage / cache ratio / budget / status / identity —
+  `allowed_paths`/`output`/`full_report`/`transcript`/`patch` fields are
+  prohibited. Top-level nested worker usage is preserved.
+- Four-section report parser (`## Completed` / `## Files Changed` /
+  `## Verification` / `## Remaining Risks`) with at most 8 items per
+  section and 500 characters per item; MISSING required sections (or an
+  empty report) make parsing unreliable and the parent then contains no
+  partial parsed section items — only the parse warning + report path +
+  actual changed paths (never a raw-text fallback), while item-cap hits
+  alone keep otherwise-present sections reliable and render as bounded
+  items plus an explicit truncation fact (the distinction is persisted as
+  `parse_reliable`/`truncated_items`). `parseReportedPaths` now scans the
+  whole bounded report (its window equals the 512 KiB report artifact
+  bound) so the review's reported/actual comparison works on long reports
+  whose sections sit at the end.
+- Progress exposes only turns and provider/model: `lastText` removed from
+  the parent-facing `WorkerProgress` type and callback; the exact compact
+  shape `DeepSeek worker: N turn(s), model provider/model` (starting state
+  included); intermediate/final worker text never enters `onUpdate`.
+- Diff review defaults raised to 400 lines / 32 KiB, enforced GLOBALLY
+  over the rendered patch content (never independently per path); ANY
+  per-path truncated entry also sets `patch_truncated` — even when the
+  redaction-shrunk entry fits the global envelope — so the segmented
+  `include_paths` review instruction (max 50 paths per call) always
+  renders when any content was cut; bounded per-path patch stats
+  (`patch_paths`: source, bytes, truncated/omitted). Scope checks and the
+  bound diff hash always use the complete actual worker diff; an unbounded
+  full patch is never persisted or returned.
+- Pure context diagnostics in `worker/context-diagnostics.ts`:
+  `estimateLatestTurnTokens`, `compactablePrefixAvailable`, and
+  `detectSingleHugeRecentTurn` inspect bounded session-entry-like facts
+  defensively (Pi's char/4 heuristic and `prepareCompaction` boundary
+  structure — the latest compaction's `firstKeptEntryId` on ORIGINAL entry
+  indices with the compaction-index+1 fallback; historical entries before
+  the boundary never count — mirrored without implementing compaction) and
+  detect the problematic latest delegation tool-result turn; `/q-status`
+  and `/q-delegation-status` visibly include exactly `CONTEXT RISK: latest
+  delegation handoff too large` when detected. The default thresholds are
+  defined relative to the centralized 12 KiB parent cap (2× = 24576 bytes
+  / 6144 char/4 tokens): a valid new bounded handoff never triggers, the
+  pre-fix ~50 KiB runner-bounded handoff always does; malformed input
+  fails safe.
+- UTF-8 truncation is CODE-POINT safe: `truncateUtf8` binary-searches over
+  code points (never UTF-16 code units), so 4-byte astral characters are
+  never split into a lone surrogate and no replacement character can
+  appear; boundary tests cover astral emoji at byte caps 1-5.
+- Documentation (`docs/worker-delegation.md`: bounded handoff, artifact
+  paths and limits, review segmentation, diagnostics, Sol's mandatory
+  actual-diff/final-verification duties) and focused tests
+  (`tests/worker-handoff.test.ts` plus coverage in worker-runner /
+  delegation-ledger / diff-review suites) for report persistence,
+  atomicity/containment/redaction/oversize truncation, parser success and
+  fallback, item limits, UTF-8 parent caps, details and progress
+  exclusions, actual changed paths, bounded review/hash completeness, and
+  compactability diagnostics; existing worker budget/compaction fail-closed
+  regressions continue to pass.
+
+## [0.9.0] — P7: Worker-First Write Authority and Controlled Sol/DeepSeek Worker Delegation
+
+Worker-first write authority, controlled Sol/DeepSeek worker delegation,
+and the P7 release of the workbench. No commit, tag or npm publish is
+performed by this milestone.
 
 ### Added
 
@@ -84,9 +189,110 @@ All notable changes to pi-dev-workbench are documented here.
   `compaction_reasons` in structured `details` plus a deterministic
   `worker budget : max context N / 1000000 (P%) | soft 800000 | hard 900000`
   text line.
-- Focused tests: pure threshold/fallback/malformed-usage boundaries, runner
-  soft/hard/compaction fail-closed behavior, and worker-role lifecycle
-  (one-shot steer, compaction cancel) with commander compaction unchanged.
+- Worker-first write authority (P7): approved GPT-5.6 Sol in DEV resolves to
+  the fixed `worker-first-strict` policy — the exact canonical 14-tool
+  allowlist (read, grep, find, ls + all 10 workbench tools; no
+  bash/edit/write, no foreign tools) with no persisted/prompt/config opt-out;
+  actor identity comes only from the existing `WORKBENCH_AGENT_ROLE=worker`
+  env contract and the provider/model pair (project config can never
+  self-label a controller as Sol or as a worker); delegated workers and other
+  controllers keep their existing guards (the worker guards remain
+  authoritative; other controllers are not newly denied).
+- Second-layer commander guard: for strict Sol, `bash` is always blocked,
+  `edit`/`write` require an ACTIVE user-issued temporary write lease
+  authorizing the project-relative path and the remaining call, and every
+  tool outside the allowlist is blocked despite any re-enable; blocked
+  commander write attempts are counted while a review is outstanding.
+- User-only temporary commander write leases (commands, never model tools):
+  `/q-write-policy status` (accepts exactly the trimmed `status` subcommand),
+  `/q-commander-write-unlock <reason> --paths <comma-list> --calls <N>
+  --minutes <N>` plus the two-step confirmation forms
+  (`confirm <partA> <partB>` / `confirm <lease-id> <partA> <partB>`), and
+  `/q-commander-write-lock` (explicit revocation + persisted audit facts).
+  Fixed reasons (`bootstrap-policy`, `worker-unavailable`,
+  `security-emergency`, `user-directed`), project-relative exact or `/**`
+  subtree paths (absolute POSIX, Windows drive and backslash-root paths
+  rejected before normalization, `..` escapes refused), edit/write only
+  (never bash), max 10 calls / max 30 minutes, one call consumed per
+  successful authorized write, expiry/exhaustion/revocation (leaving DEV,
+  model/provider change, session end) restoring the exact canonical 14 tools;
+  TUI requires an explicit human confirmation dialog (cancel leaves locked),
+  non-TUI issues a PENDING lease with two bounded distinct token parts
+  displayed once and confirms on a second invocation with both exact parts
+  (both consumed on success; tokens never appear in status/compact
+  summaries); fail-closed restore of persisted leases.
+- Write-authority footer segments: `WF:LEASE <used>/<max>` for an ACTIVE
+  confirmed strict-Sol lease, `WF:LOCKED` for every other lease state, and
+  `WF:REVIEW` appended independently while a delegation review is pending or
+  stale; workers and other controllers render no WF segment.
+- Delegation ledger (P7): every delegation writes a bounded before/after
+  ledger at `<CONFIG_DIR_NAME>/workbench/delegations/<id>/` —
+  `manifest.json`, `before.json` (contract, git HEAD/dirty, before diff
+  hash, per-path porcelain status codes + bounded content digests), and on
+  every outcome (success AND failure) `after.json` (TRUE changed paths since
+  before incl. previously-dirty paths, after diff hash, pinned identity,
+  usage/budget facts, bounded redacted report summary, safe reported_paths
+  parsed from the worker's `## Files Changed` section), `worker-summary.json`
+  and a `review.json` PENDING_REVIEW placeholder. Atomic writes, redacted,
+  bounded; the ledger's own directory never counts as a project change;
+  argv-only git exec.
+- Review lifecycle (P7): `workbench_review_worker_diff` re-reads the REAL
+  git state, scope-checks every worker path against `allowed_paths`
+  (realpath/symlink-safe; `include_paths` narrows only the patch and can
+  never hide a violation), binds the CURRENT diff hash vs the recorded after
+  hash (mismatch/drift warnings), warns when the worker's `## Files Changed`
+  section is missing or inconsistent with the actual diff, writes the
+  completed `review.json`, and marks REVIEWED only on PASS (FAIL keeps
+  PENDING_REVIEW); `workbench_delegation_status` + `/q-delegation-status`
+  report actor, policy, lease, delegation, hashes, blocked-write counter and
+  latest verdict. PENDING_REVIEW/STALE blocks the next delegation AND VERIFY
+  (`/q-mode-verify` and VERIFY gate runs are refused); any diff change after
+  REVIEWED turns the delegation STALE (a diff returning to exactly the
+  reviewed hash re-validates); state persists via the
+  `workbench-delegation-state` custom entry with fail-closed restore.
+- Inventory: command surface 24 → 28 and workbench tool surface 8 → 10
+  (delegate → review → status), pinned by the inventory test; the three P7
+  delegation tools have no compact TUI renderers (the P4 five remain the
+  only ones).
+- Unit and spawn/integration tests: `tests/write-authority.test.ts`,
+  `tests/delegation-ledger.test.ts`, `tests/delegation-state.test.ts`,
+  `tests/diff-review.test.ts`, plus worker-policy and inventory updates —
+  actor identity, the exact 14-tool order, lease bounds/reasons/paths/
+  confirmation/revocation, ledger bounds/atomicity/self-exclusion, review
+  hash-binding invariants, delegation/VERIFY blocking, stale transitions,
+  and reported-vs-actual path notes.
+- Documentation: README, CHANGELOG, docs/architecture.md,
+  docs/security.md, docs/worker-delegation.md and docs/compatibility.md
+  updated for worker-first write authority, the user-only lease commands,
+  the delegation ledger and the review lifecycle (released as 0.9.0;
+  historical 0.8.0/P6 records unchanged).
+- Machine-backed B6 Worker-First Compliance gate: universal base gate with
+  eight `worker-first` checks (strict policy active, zero unauthorized
+  commander writes or hard denial active, no pending/stale review, reviewed
+  hash matches the current diff, worker paths within the approved
+  contracts, no active unexplained lease, Sol-initiated final
+  verification). The runtime injects bounded worker-first facts into every
+  gate run — missing facts are NOT_RUN (a required NOT_RUN never PASSes),
+  a pending/stale review BLOCKs B6, and model prose can never satisfy
+  B6.1-B6.8.
+- Recipe mutation policy: every recipe declares
+  `mutation: none | artifacts | source` (strict parsing; legacy inference
+  maps non-empty `writes` to `source`); strict Sol runs only
+  `none`/`artifacts` recipes and delegated workers only `none` (write-free)
+  recipes — `source`-mutating recipes are denied to both through one shared
+  pure decision enforced at the `tool_call` guard and in gate recipe
+  checks (other controllers are unaffected).
+- Worker-first workflow contract: `q-build`, the implementation-workflow
+  skill, and both project AGENTS templates explicitly state the seven
+  worker-first rules (Sol owns requirements/architecture/scope/criteria;
+  routine source/tests/docs/config writes are worker-owned by default;
+  high-risk decisions remain Sol-owned while the concrete writes are
+  bounded worker slices; worker defects are repaired by a fresh worker;
+  only a user-issued temporary write lease is an exception; worker reports
+  are never acceptance; Sol reviews the actual diff and runs the final
+  recipes/gates); focused package-content tests fail when any of the
+  delegation, fresh-worker repair, actual-diff review, lease exception or
+  commander final-gate language is removed.
 
 ### Changed
 
@@ -122,20 +328,35 @@ All notable changes to pi-dev-workbench are documented here.
 - `VERIFIED_API_KINDS` now includes `openai-codex-responses`; cache telemetry
   and worker-delegation docs describe Sol and worker cache observability
   accurately.
-- Reviewed policy corrections: high-risk work is Commander-led, not
-  categorically impossible to delegate — Sol owns requirements,
-  cross-cutting architecture, and core safety decisions and implements or
-  repairs high-risk work directly by default; only explicitly designed
-  bounded support slices (helper code, tests, docs) may be delegated, and
-  that is never the DEV default. The worker system prompt now requires
-  stopping and reporting instead of guessing or expanding scope when
-  completion needs an unapproved architecture, security/policy, destructive,
-  or out-of-scope decision.
+- Reviewed policy corrections: high-risk work remains Commander-led, not
+  categorically impossible to delegate — Sol owns requirements, cross-cutting
+  architecture, and core safety decisions and never delegates the decision
+  itself; under worker-first write authority Sol does NOT directly write by
+  default (implementation and repair writes go to a fresh bounded worker),
+  and only explicitly designed bounded support/implementation scopes are
+  delegated after the architecture is fixed — a temporary commander direct
+  write requires an explicit user-issued write lease and is never the DEV
+  default. The worker system prompt still requires stopping and reporting
+  instead of guessing or expanding scope when completion needs an unapproved
+  architecture, security/policy, destructive, or out-of-scope decision.
 - The worker-prompt focused test asserts the explicit
   no-final-PASS/acceptance prohibition instead of a banned substring, and
   the delegate parameter-schema regression pins the reviewed baseline hash
   `2cf1f563f78ffe2c85d142c1f40deea7bc658365345554db11c80b8af6b521d9`
   instead of comparing the schema to itself.
+
+### Released
+
+- Version 0.8.0 → 0.9.0 (package.json, package-lock.json root entries,
+  `EXTENSION_VERSION` in cache-types.ts, `compatibility/pi.json`
+  current-version manifest, README current version, deterministic banner
+  version chip + alt text); P7 is promoted from Unreleased to the 0.9.0
+  release section; historical 0.8.0/P6 release records stay historical.
+- Commander compaction re-enabled in `.pi/settings.json`
+  (`compaction.enabled: true`; `reserveTokens` 27200 and
+  `keepRecentTokens` 20000 unchanged); the local settings backup files
+  (`.pi/settings.json.backup-*`) and the `.p7-recovery/` directory are
+  gitignored so recovery artifacts are not release changes.
 
 ## [0.8.0] — P6-E: Cache Benchmark, Hardening, and Release Gate
 

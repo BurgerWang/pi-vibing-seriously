@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { buildDelegateWorkerResult } from "../extensions/workbench-runtime/index.ts";
+import { buildDelegateWorkerResult, MAX_WORKER_REPORT_BYTES, parsedReportToHandoffSummary, parseWorkerReport, type BuildDelegateWorkerResultInput } from "../extensions/workbench-runtime/worker/handoff.ts";
 import {
 	assertWorkerSucceeded,
 	formatWorkerCacheSummary,
@@ -226,6 +226,8 @@ function workerResult(overrides: Partial<WorkerRunResult> = {}): WorkerRunResult
 		turns: 1,
 		stopReason: "stop",
 		output: "## Completed\nImplemented.",
+		reportText: "## Completed\nImplemented.",
+		reportTextOversized: false,
 		stderr: "",
 		aborted: false,
 		timedOut: false,
@@ -261,18 +263,73 @@ function usageWith(totalTokens: number, overrides: Record<string, unknown> = {})
 	};
 }
 
-test("delegated worker presentation exposes usage and cache hit ratio", () => {
-	const result = buildDelegateWorkerResult(workerResult(), ["src/**"]);
+/**
+ * Standard bounded-handoff input for the presentation tests. The parsed
+ * summary comes from a report whose PREAMBLE prose is never an item — the
+ * parent summary must never embed it.
+ */
+const HANDOFF_REPORT = [
+	"PREAMBLE: internal implementation notes that must never be embedded inline.",
+	"## Completed",
+	"Implemented the slice",
+	"## Files Changed",
+	"- `src/main.ts` — core change",
+	"## Verification",
+	"- ran the unit-test recipe",
+	"## Remaining Risks",
+	"none",
+].join("\n");
+
+function handoffInput(overrides: Partial<BuildDelegateWorkerResultInput> = {}): BuildDelegateWorkerResultInput {
+	return {
+		delegationId: "20260601-120000-abcd",
+		provider: "deepseek",
+		model: "deepseek-v4-flash",
+		status: "success",
+		turns: 1,
+		exitCode: 0,
+		stopReason: "stop",
+		changedPaths: ["src/main.ts"],
+		usage: {
+			input: 10,
+			output: 5,
+			cacheRead: 20,
+			cacheWrite: 0,
+			totalTokens: 35,
+			cost: { input: 0.1, output: 0.2, cacheRead: 0.01, cacheWrite: 0, total: 0.31 },
+		},
+		cacheHitRatio: 2 / 3,
+		budget: {
+			maxContextTokens: 0,
+			maxContextRatio: 0,
+			softBudgetReached: false,
+			hardBudgetExceeded: false,
+			compactionCount: 0,
+			compactionReasons: [],
+		},
+		reportPath: ".pi/workbench/delegations/20260601-120000-abcd/worker-report.md",
+		summary: parsedReportToHandoffSummary(parseWorkerReport(HANDOFF_REPORT)),
+		reviewStatus: "PENDING_REVIEW",
+		...overrides,
+	};
+}
+
+test("delegated worker presentation exposes usage and cache hit ratio (bounded handoff, no report text)", () => {
+	const result = buildDelegateWorkerResult(handoffInput());
 	const text = result.content[0]?.text ?? "";
 	assert.match(text, /uncached input 10/);
 	assert.match(text, /cache read 20/);
 	assert.match(text, /hit ratio 67%/);
 	assert.equal(result.usage.input, 10, "top-level tool usage preserved");
 	assert.equal(result.usage.cacheRead, 20);
-	assert.equal(result.details.usage.input, 10, "aggregated usage in structured details");
-	assert.equal(result.details.usage.cacheRead, 20);
+	const detailsUsage = result.details.usage as { input: number; cacheRead: number };
+	assert.equal(detailsUsage.input, 10, "aggregated usage in structured details");
+	assert.equal(detailsUsage.cacheRead, 20);
 	assert.equal(result.details.cache_hit_ratio, 2 / 3);
-	assert.deepEqual(result.details.allowed_paths, ["src/**"]);
+	assert.equal(result.details.delegation_id, "20260601-120000-abcd");
+	assert.equal(result.details.report_path, ".pi/workbench/delegations/20260601-120000-abcd/worker-report.md");
+	assert.ok(text.includes("workbench_review_worker_diff"), "Sol must inspect the actual diff");
+	assert.ok(!text.includes("PREAMBLE"), "report prose is never embedded in the parent summary");
 });
 
 test("delegated worker zero-denominator usage renders N/A and null", () => {
@@ -284,7 +341,7 @@ test("delegated worker zero-denominator usage renders N/A and null", () => {
 		totalTokens: 5,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
-	const result = buildDelegateWorkerResult(workerResult({ usage, cacheHitRatio: null }), []);
+	const result = buildDelegateWorkerResult(handoffInput({ usage, cacheHitRatio: null }));
 	assert.match(result.content[0]?.text ?? "", /hit ratio N\/A/);
 	assert.equal(result.details.cache_hit_ratio, null);
 });
@@ -383,15 +440,18 @@ test("runner budget tracking ignores malformed usage defensively", async () => {
 });
 
 test("delegated worker presentation exposes budget and compaction facts", () => {
-	const result = workerResult({
-		maxContextTokens: 812_345,
-		maxContextRatio: 0.812345,
-		softBudgetReached: true,
-		hardBudgetExceeded: false,
-		compactionCount: 0,
-		compactionReasons: [],
-	});
-	const built = buildDelegateWorkerResult(result, ["src/**"]);
+	const built = buildDelegateWorkerResult(
+		handoffInput({
+			budget: {
+				maxContextTokens: 812_345,
+				maxContextRatio: 0.812345,
+				softBudgetReached: true,
+				hardBudgetExceeded: false,
+				compactionCount: 0,
+				compactionReasons: [],
+			},
+		}),
+	);
 	const text = built.content[0]?.text ?? "";
 	assert.match(text, /worker budget : max context 812345 \/ 1000000 \(81\.2%\)/);
 	assert.equal(built.details.max_context_tokens, 812_345);
@@ -403,16 +463,73 @@ test("delegated worker presentation exposes budget and compaction facts", () => 
 });
 
 test("delegated worker presentation reports a hard-budget stop factually", () => {
-	const result = workerResult({
-		maxContextTokens: 900_000,
-		maxContextRatio: 0.9,
-		softBudgetReached: true,
-		hardBudgetExceeded: true,
-		compactionCount: 0,
-		compactionReasons: [],
-	});
-	const built = buildDelegateWorkerResult(result, []);
+	const built = buildDelegateWorkerResult(
+		handoffInput({
+			budget: {
+				maxContextTokens: 900_000,
+				maxContextRatio: 0.9,
+				softBudgetReached: true,
+				hardBudgetExceeded: true,
+				compactionCount: 0,
+				compactionReasons: [],
+			},
+		}),
+	);
 	assert.match(built.content[0]?.text ?? "", /worker budget : max context 900000 \/ 1000000 \(90%\)/);
 	assert.equal(built.details.hard_budget_exceeded, true);
 	assert.equal(built.details.compaction_count, 0);
+});
+
+test("progress callbacks expose only turns and provider/model — never lastText or worker text", async () => {
+	const first = assistantEvent({ content: [{ type: "text", text: "working" }], stopReason: "toolUse" });
+	const final = assistantEvent({ content: [{ type: "text", text: "## Completed\nfinal report body" }] });
+	const updates: Array<Record<string, unknown>> = [];
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${first}\n${final}\n`)});`, async (invocation, dir) => {
+		const result = await runDeepseekWorker({
+			projectRoot: dir,
+			contract: CONTRACT,
+			timeoutMs: 2_000,
+			invocation,
+			onProgress: (progress) => updates.push({ ...progress }),
+		});
+		assertWorkerSucceeded(result);
+	});
+	assert.equal(updates.length, 2);
+	for (const update of updates) {
+		assert.equal(
+			Object.keys(update).sort().join(","),
+			"model,provider,turns",
+			"WorkerProgress exposes exactly turns/provider/model",
+		);
+		assert.ok(!("lastText" in update), "lastText is removed from progress");
+	}
+	assert.ok(
+		updates.every((u) => !JSON.stringify(u).includes("final report body") && !JSON.stringify(u).includes("working")),
+		"intermediate/final worker text never enters progress",
+	);
+});
+
+test("runner retains the complete final assistant text for the durable report artifact", async () => {
+	const body = "## Completed\n" + "detailed implementation narrative\n".repeat(199) + "detailed implementation narrative";
+	const final = assistantEvent({ content: [{ type: "text", text: body }] });
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${final}\n`)});`, async (invocation, dir) => {
+		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		assertWorkerSucceeded(result);
+		assert.equal(result.reportText, body, "complete final assistant text retained for worker-report.md");
+		assert.equal(result.reportTextOversized, false);
+	});
+});
+
+test("runner retains the COMPLETE final assistant text (never pre-truncated) and flags oversize from raw bytes", async () => {
+	const huge = assistantEvent({ content: [{ type: "text", text: "x".repeat(MAX_WORKER_REPORT_BYTES + 1000) }] });
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${huge}\n`)});`, async (invocation, dir) => {
+		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		assertWorkerSucceeded(result);
+		assert.equal(result.reportTextOversized, true, "oversized final text is flagged from the RAW bytes");
+		assert.equal(
+			result.reportText.length,
+			MAX_WORKER_REPORT_BYTES + 1000,
+			"the complete final text is retained in process memory — redaction first, cap + marker only in the ledger",
+		);
+	});
 });
