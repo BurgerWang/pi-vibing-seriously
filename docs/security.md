@@ -187,6 +187,57 @@ Commander/project compaction reserve):
   distinct reasons) and any compaction attempt fails the result closed even
   if the child exits 0.
 
+Cumulative spend-budget protection (Phases 1–5 of the approved worker
+token-budget repair; `core/worker-spend.ts` pure policy, **wired into the
+runtime since Phase 2**, public selection + ledger/handoff persistence
+since Phase 3, numeric-only progress since Phase 4, task-contract profile
+wording and granularity guidance since Phase 5):
+
+- operates independently of the per-message context budget above (which is
+  unchanged) and accumulates turns, total tokens and output tokens over
+  all assistant messages of a delegation run;
+- three fixed profiles — `low`, `standard` (the default), `extended`
+  (explicit opt-in only, never inferred) — with exact soft/hard turns,
+  total-token and output-token limits; "reached" means at or above (`>=`);
+- per-message totals reuse the context-budget semantics (positive
+  `totalTokens` authoritative, else the non-negative
+  `input + output + cacheRead + cacheWrite` sum; `cacheRead` counts); the
+  output dimension is normalized independently; malformed, non-finite or
+  negative values contribute zero — never NaN, never a crash;
+- band evaluation `ok | soft | hard` with hard-over-soft precedence and
+  the fixed reason order `turns`, `total_tokens`, `output_tokens`;
+- deterministic soft-steer text (one hidden steer per delegation), hard-stop
+  reason text, and spend summary formatters; the runner terminates the
+  child fail-closed on any hard dimension (the deterministic hard-stop
+  message names the winning dimension(s) and values) and the worker-role
+  lifecycle sends exactly one hidden cumulative soft steer (worker role
+  only — the commander session never receives it, its own one-shot flag
+  independent of the context steer, send failures swallowed);
+- the spend profile reaches the child through the fixed
+  `WORKBENCH_WORKER_SPEND_PROFILE` env contract (the runner always writes
+  a valid value; malformed/missing child env falls back to `standard`
+  defensively); public profile selection is an optional `budget_profile`
+  tool parameter (closed literal union `low | standard | extended`,
+  default `standard`, `extended` never inferred) validated fail-closed by
+  the pure contract check in `core/worker-policy.ts` BEFORE any ledger
+  creation or child launch; the resolved profile is recorded in the before
+  contract and the canonical cumulative `spend` object (profile, turns,
+  total/output tokens, band, per-dimension soft/hard flags, fixed-order
+  reasons) is persisted additively in `usage.json` / `worker-summary.json`
+  on every finished success and failure (schema_version stays 1;
+  pre-repair records read without migration and are never rewritten); the
+  bounded parent handoff renders the deterministic spend summary line and
+  nested spend details from the SAME persisted worker-summary spend
+  object;
+- progress events (Phase 4) expose numeric-only cumulative spend counters
+  (turns, total/output tokens, fixed `ok | soft | hard` band) plus the
+  pinned provider/model identity — never worker text, reasons, report
+  content, tool arguments, patches, logs, or error prose; the starting/
+  running onUpdate keeps the exact
+  `DeepSeek worker: N turn(s), model provider/model` text prefix and adds
+  only deterministic counters/band;
+- the 60-minute timeout remains an independent failure path.
+
 Only recipes with an empty declared `writes` list are available to a worker.
 Recipe mutation policy (P7): every recipe declares
 `mutation: none | artifacts | source`; delegated workers run only

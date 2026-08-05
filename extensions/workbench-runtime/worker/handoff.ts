@@ -38,12 +38,23 @@
  *     ledger persists in worker-summary.json (single derivation — the
  *     runtime never re-parses the report for the parent handoff).
  *
+ * Phase 3 (worker token-budget repair) adds the deterministic cumulative
+ * spend summary line (`spend budget : turns N/M | total X/Y | output A/B |
+ * profile P` via core/worker-spend.ts) and the tightly bounded nested
+ * `spend` details, both derived from the SAME canonical spend object the
+ * ledger persists in worker-summary.json/usage.json — never recomputed
+ * from runner internals or worker prose. The additive `spend` input is
+ * optional, so pre-Phase-3 callers keep the exact prior handoff shape;
+ * all line/byte caps and trust boundaries are unchanged.
+ *
  * This module owns the constants and the pure parsing/rendering; the
  * ledger (core/delegation-ledger.ts) persists the artifacts; the runtime
  * (index.ts) wires the tool result and the /q-status diagnostics.
  */
 
 import { formatWorkerBudgetSummary } from "../core/worker-budget.ts";
+import { formatWorkerSpendSummary } from "../core/worker-spend.ts";
+import type { WorkerSpendBand, WorkerSpendProfile, WorkerSpendReason } from "../core/worker-spend.ts";
 
 // ---------------------------------------------------------------------------
 // Bounds (P7 bounded worker handoff — single source of truth)
@@ -336,6 +347,27 @@ export interface HandoffBudgetFacts {
 	compactionReasons: readonly string[];
 }
 
+/**
+ * Phase 3 (worker token-budget repair): the canonical cumulative spend
+ * facts the parent handoff renders — the SAME object the ledger persists
+ * in worker-summary.json/usage.json (single derivation). The runtime
+ * passes the ledger's returned worker-summary `spend` object here
+ * directly; the renderer never recomputes spend from runner internals or
+ * worker prose. Every field is bounded by construction (three fixed
+ * literals, finite counters, three boolean pairs, ≤ 3 fixed reason
+ * strings).
+ */
+export interface HandoffSpendFacts {
+	profile: WorkerSpendProfile;
+	turns: number;
+	totalTokens: number;
+	outputTokens: number;
+	band: WorkerSpendBand;
+	softReached: { turns: boolean; totalTokens: boolean; outputTokens: boolean };
+	hardExceeded: { turns: boolean; totalTokens: boolean; outputTokens: boolean };
+	reasons: readonly WorkerSpendReason[];
+}
+
 export type HandoffReviewStatus = "PENDING_REVIEW" | "REVIEWED" | "STALE";
 
 /**
@@ -388,6 +420,14 @@ export interface BuildDelegateWorkerResultInput {
 	usage: HandoffUsage;
 	cacheHitRatio: number | null;
 	budget: HandoffBudgetFacts;
+	/**
+	 * Phase 3: the canonical cumulative spend facts object from the
+	 * persisted worker-summary record (optional additive — omitted keeps
+	 * the pre-Phase-3 handoff shape). When present, the deterministic
+	 * `spend budget : …` summary line becomes a required fact line and the
+	 * nested bounded `spend` details are rendered.
+	 */
+	spend?: HandoffSpendFacts;
 	/** Project-relative, normalized, contained in the validated delegation directory. */
 	reportPath: string;
 	/** The SAME bounded summary facts persisted in worker-summary.json (single derivation). */
@@ -472,6 +512,13 @@ export function buildDelegateWorkerResult(input: BuildDelegateWorkerResultInput)
 	required.push(changedPathsLine(input.changedPaths));
 	required.push(`worker cache  : ${formatWorkerCacheSummary(input.usage)}`);
 	required.push(`worker budget : ${formatWorkerBudgetSummary(input.budget.maxContextTokens, input.budget.maxContextRatio)}`);
+	// Phase 3: the deterministic spend summary line, derived from the SAME
+	// persisted worker-summary spend object (never recomputed, never from
+	// worker prose). The deterministic formatter renders the profile's HARD
+	// limits as denominators.
+	if (input.spend) {
+		required.push(formatWorkerSpendSummary({ turns: input.spend.turns, totalTokens: input.spend.totalTokens, outputTokens: input.spend.outputTokens }, input.spend.profile));
+	}
 	required.push(`report        : ${input.reportPath} (complete final worker report; bounded ${MAX_WORKER_REPORT_BYTES}-byte artifact, never embedded here)`);
 	required.push(`summary       : ${reportPathSibling(input.reportPath, WORKER_SUMMARY_FILE_NAME)}`);
 	required.push(`usage facts   : ${reportPathSibling(input.reportPath, WORKER_USAGE_FILE_NAME)}`);
@@ -538,38 +585,55 @@ export function buildDelegateWorkerResult(input: BuildDelegateWorkerResultInput)
 	}
 	const text = `${bodyLines.join("\n")}${tailText}`;
 
+	const details: Record<string, unknown> = {
+		delegation_id: input.delegationId,
+		status: input.status,
+		report_path: input.reportPath,
+		summary: {
+			completed: input.summary.parse_reliable ? items(input.summary.completed) : [],
+			verification_commands: input.summary.parse_reliable ? items(input.summary.verification_commands) : [],
+			verification_observations: input.summary.parse_reliable ? items(input.summary.verification_observations) : [],
+			remaining_risks: input.summary.parse_reliable ? items(input.summary.remaining_risks) : [],
+			parse_warning: input.summary.parse_warning,
+			parse_reliable: input.summary.parse_reliable,
+			truncated_items: input.summary.truncated_items,
+		},
+		changed_paths: input.changedPaths.slice(0, MAX_HANDOFF_DETAIL_PATHS),
+		provider: input.provider ? sanitizeSummaryItem(input.provider, MAX_HANDOFF_IDENTITY_CHARS).text : null,
+		model: input.model ? sanitizeSummaryItem(input.model, MAX_HANDOFF_IDENTITY_CHARS).text : null,
+		turns: input.turns,
+		exit_code: input.exitCode,
+		stop_reason: input.stopReason ? sanitizeSummaryItem(input.stopReason, MAX_HANDOFF_STOP_REASON_CHARS).text : null,
+		usage: input.usage,
+		cache_hit_ratio: input.cacheHitRatio,
+		max_context_tokens: input.budget.maxContextTokens,
+		max_context_ratio: input.budget.maxContextRatio,
+		soft_budget_reached: input.budget.softBudgetReached,
+		hard_budget_exceeded: input.budget.hardBudgetExceeded,
+		compaction_count: input.budget.compactionCount,
+		compaction_reasons: [...input.budget.compactionReasons],
+		review_status: input.reviewStatus,
+		failure_message: input.failureMessage ? sanitizeSummaryItem(input.failureMessage, MAX_HANDOFF_FAILURE_CHARS).text : null,
+	};
+	// Phase 3: the nested bounded spend details — the exact canonical spend
+	// object persisted in worker-summary.json (same fields, same values,
+	// single derivation). Only present when the ledger record carried it.
+	if (input.spend) {
+		details.spend = {
+			profile: input.spend.profile,
+			turns: input.spend.turns,
+			totalTokens: input.spend.totalTokens,
+			outputTokens: input.spend.outputTokens,
+			band: input.spend.band,
+			softReached: { ...input.spend.softReached },
+			hardExceeded: { ...input.spend.hardExceeded },
+			reasons: [...input.spend.reasons],
+		};
+	}
+
 	return {
 		content: [{ type: "text", text }],
-		details: {
-			delegation_id: input.delegationId,
-			status: input.status,
-			report_path: input.reportPath,
-			summary: {
-				completed: input.summary.parse_reliable ? items(input.summary.completed) : [],
-				verification_commands: input.summary.parse_reliable ? items(input.summary.verification_commands) : [],
-				verification_observations: input.summary.parse_reliable ? items(input.summary.verification_observations) : [],
-				remaining_risks: input.summary.parse_reliable ? items(input.summary.remaining_risks) : [],
-				parse_warning: input.summary.parse_warning,
-				parse_reliable: input.summary.parse_reliable,
-				truncated_items: input.summary.truncated_items,
-			},
-			changed_paths: input.changedPaths.slice(0, MAX_HANDOFF_DETAIL_PATHS),
-			provider: input.provider ? sanitizeSummaryItem(input.provider, MAX_HANDOFF_IDENTITY_CHARS).text : null,
-			model: input.model ? sanitizeSummaryItem(input.model, MAX_HANDOFF_IDENTITY_CHARS).text : null,
-			turns: input.turns,
-			exit_code: input.exitCode,
-			stop_reason: input.stopReason ? sanitizeSummaryItem(input.stopReason, MAX_HANDOFF_STOP_REASON_CHARS).text : null,
-			usage: input.usage,
-			cache_hit_ratio: input.cacheHitRatio,
-			max_context_tokens: input.budget.maxContextTokens,
-			max_context_ratio: input.budget.maxContextRatio,
-			soft_budget_reached: input.budget.softBudgetReached,
-			hard_budget_exceeded: input.budget.hardBudgetExceeded,
-			compaction_count: input.budget.compactionCount,
-			compaction_reasons: [...input.budget.compactionReasons],
-			review_status: input.reviewStatus,
-			failure_message: input.failureMessage ? sanitizeSummaryItem(input.failureMessage, MAX_HANDOFF_FAILURE_CHARS).text : null,
-		},
+		details,
 		usage: input.usage,
 	};
 }

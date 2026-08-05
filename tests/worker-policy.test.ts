@@ -12,6 +12,7 @@ import {
 	isWorkerPathAllowed,
 	parseWorkerAllowedPaths,
 	recipeMutationBlockReason,
+	resolveWorkerBudgetProfile,
 	workerRecipeBlockReason,
 	workerRoleToolCallBlockReason,
 	WORKER_ROLE,
@@ -157,6 +158,67 @@ test("formatted worker task carries the complete bounded contract in the user me
 	assert.ok(!text.includes("final PASS"));
 });
 
+// ---------------------------------------------------------------------------
+// Phase 3: budget-profile contract validation (worker token-budget repair)
+// ---------------------------------------------------------------------------
+
+test("budget-profile validation resolves omitted to standard and accepts exactly the three literals", () => {
+	assert.deepEqual(resolveWorkerBudgetProfile(undefined), { ok: true, profile: "standard" });
+	assert.deepEqual(resolveWorkerBudgetProfile("low"), { ok: true, profile: "low" });
+	assert.deepEqual(resolveWorkerBudgetProfile("standard"), { ok: true, profile: "standard" });
+	assert.deepEqual(resolveWorkerBudgetProfile("extended"), { ok: true, profile: "extended" });
+});
+
+test("budget-profile validation fails closed on unknown, empty, wrong types and case variants", () => {
+	// Unknown/empty/case-variant strings fail closed with the bounded error.
+	for (const bad of ["", "LOW", "Standard", "EXTENDED", "ultra", " low", "standard ", "low\n", "low\u0000"]) {
+		const r = resolveWorkerBudgetProfile(bad);
+		assert.equal(r.ok, false, `string ${JSON.stringify(bad)} must fail closed`);
+		if (!r.ok) assert.match(r.error, /budget_profile must be one of "low" \| "standard" \| "extended"/);
+	}
+	// Wrong types fail closed: null, numbers, booleans, objects, arrays.
+	for (const bad of [null, 0, 1, 3.5, true, false, {}, { profile: "low" }, [], ["low"]]) {
+		const r = resolveWorkerBudgetProfile(bad);
+		assert.equal(r.ok, false, `${JSON.stringify(bad)} must fail closed`);
+		if (!r.ok) assert.match(r.error, /budget_profile must be one of "low" \| "standard" \| "extended"/);
+	}
+	// The error stays bounded even for pathological values (never the full
+	// value embedded, never an unbounded message).
+	const r = resolveWorkerBudgetProfile("x".repeat(10_000));
+	assert.equal(r.ok, false);
+	if (!r.ok) {
+		assert.ok(r.error.length < 200, "error message stays bounded");
+		assert.ok(!r.error.includes("x".repeat(10_000)), "never the full pathological value");
+	}
+});
+
+test("formatted worker task names the resolved spend profile deterministically (Phase 5)", () => {
+	const base: WorkerTaskContract = {
+		task: "Implement the parser",
+		allowedPaths: ["src/**"],
+		acceptanceCriteria: ["Unit tests cover the new option"],
+		verification: [],
+	};
+	// Omitted budgetProfile resolves deterministically to standard.
+	const standardText = formatWorkerTask(base);
+	assert.match(standardText, /Worker spend-budget profile: standard/);
+	// Explicit low / extended profiles are named exactly when supplied.
+	assert.match(formatWorkerTask({ ...base, budgetProfile: "low" }), /Worker spend-budget profile: low/);
+	const extendedText = formatWorkerTask({ ...base, budgetProfile: "extended" });
+	assert.match(extendedText, /Worker spend-budget profile: extended/);
+	// The profile line states the profile bounds spend only — it never
+	// expands the parent-approved path/scope authority (informational
+	// wording; the runner/child env contract enforces the profile and
+	// thresholds are unchanged).
+	for (const text of [standardText, extendedText]) {
+		assert.match(text, /bounds cumulative spend only/);
+		assert.match(text, /never expands parent-approved path\/scope authority/);
+	}
+	// The rest of the contract still travels unchanged.
+	assert.match(standardText, /- src\/\*\*/);
+	assert.match(standardText, /- Unit tests cover the new option/);
+});
+
 test("the complete-slice task contract travels fully and stays acceptance-free", () => {
 	const contract: WorkerTaskContract = {
 		task: "Implement the parser slice with tests and docs",
@@ -194,6 +256,31 @@ test("delegate-tool metadata codifies the Sol/worker responsibility split and th
 	assert.match(text, /Worker prose is never acceptance evidence/);
 	assert.match(text, /untrusted implementation report/);
 	assert.match(text, /independently inspect the actual diff/);
+});
+
+test("delegate-tool metadata codifies profile choice and bounded-slicing granularity (Phase 5)", () => {
+	const meta = WORKBENCH_TOOL_METADATA.workbench_delegate_worker;
+	const text = [meta.description, meta.promptSnippet, ...meta.promptGuidelines].join("\n");
+	// Profile choice: standard is the deterministic default; low is an
+	// explicit tighter opt-in; extended is explicit Sol-approved only and
+	// is never inferred or auto-promoted.
+	assert.match(text, /standard is the deterministic default/);
+	assert.match(text, /low is an explicit tighter opt-in/);
+	assert.match(text, /extended is explicit Sol-approved only/);
+	assert.match(text, /never inferred or auto-promoted/);
+	// Granularity: one coherent source+tests+docs vertical slice with ample
+	// headroom BELOW its soft thresholds; soft is a handoff reserve and
+	// hard is failure — neither is a planning target.
+	assert.match(text, /ample headroom BELOW/);
+	assert.match(text, /soft is a handoff reserve/);
+	assert.match(text, /hard is failure/);
+	assert.match(text, /neither is a planning target/);
+	// Unknown root cause: bounded diagnosis → Sol architecture/scope
+	// decision → bounded implementation — never one open-ended worker task.
+	assert.match(text, /bounded diagnosis/);
+	assert.match(text, /Sol architecture\/scope decision/);
+	assert.match(text, /bounded implementation/);
+	assert.match(text, /never one open-ended worker task/);
 });
 
 test("worker-delegation documentation defines the risk rubric, worker-first high-risk delegation, fresh continuation, one writing worker, and the P7 ledger/review lifecycle", async () => {

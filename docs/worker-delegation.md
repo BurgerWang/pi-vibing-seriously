@@ -100,13 +100,17 @@ One invocation:
 8. verifies every assistant event reports `deepseek/deepseek-v4-flash`;
 9. tracks per-message context tokens against the pinned budget (soft
    handoff / hard stop, see below) and rejects any `compaction_start` event;
-10. terminates the child on completion, timeout, parent abort, hard-budget
-    stop, or a compaction attempt;
-11. finishes the ledger on EVERY outcome (success and failure —
+10. accumulates the cumulative delegation-spend state after every assistant
+    message (pure `core/worker-spend.ts` policy — turns / total tokens /
+    output tokens per the active profile) and terminates the child
+    fail-closed when any hard spend dimension is reached (see below);
+11. terminates the child on completion, timeout, parent abort, hard-budget
+    stop (context or spend), or a compaction attempt;
+12. finishes the ledger on EVERY outcome (success and failure —
     `after.json`, `worker-summary.json`, `review.json` placeholder, the
     bounded `worker-report.md` and `usage.json`, review_status
     PENDING_REVIEW);
-12. returns a STRICTLY bounded structured summary to the parent session
+13. returns a STRICTLY bounded structured summary to the parent session
     (delegation id, provider/model, status, actual changed paths, bounded
     parsed section items, usage/cache/budget facts, durable report path,
     parse/review warnings) — never the worker's report text, patch, or
@@ -264,13 +268,27 @@ alongside the existing `manifest.json` / `before.json` / `after.json` /
   Verification commands and observations / Remaining Risks), the ACTUAL
   changed paths (`changed_since_before`, digest-based — never worker
   prose), report path, turns, context-budget facts, usage, cache hit ratio,
-  the parse-reliability and item-truncation facts, and a parse warning
-  when the report sections are missing/unreliable or the Files Changed
-  claims diverge from the actual diff; this record is the SINGLE summary
-  derivation the parent handoff renders (the runtime never re-parses the
-  report text for the parent);
+  the parse-reliability and item-truncation facts, a parse warning when
+  the report sections are missing/unreliable or the Files Changed claims
+  diverge from the actual diff, and (Phase 3) the canonical cumulative
+  `spend` object; this record is the SINGLE summary derivation the parent
+  handoff renders (the runtime never re-parses the report text for the
+  parent);
 - `usage.json` — bounded structured usage/cache/budget/turn facts with the
-  nested worker usage shape preserved for cost accounting.
+  nested worker usage shape preserved for cost accounting, plus (Phase 3)
+  the SAME canonical cumulative `spend` object.
+
+The canonical cumulative spend object (Phase 3 of the worker token-budget
+repair) is `{ profile, turns, totalTokens, outputTokens, band,
+softReached: {turns, totalTokens, outputTokens}, hardExceeded: {turns,
+totalTokens, outputTokens}, reasons }` — `reasons` entries are exactly
+`"turns" | "total_tokens" | "output_tokens"` in the fixed order. It is
+persisted additively on `schema_version: 1` records (old records without
+it — and without the before contract's `budget_profile` — parse
+unchanged, no migration, no rewrite), deliberately NOT duplicated into
+`after.json` (usage.json / worker-summary.json are its records), and the
+parent handoff renders the deterministic spend summary line and nested
+spend details from the SAME persisted worker-summary spend object.
 
 The report parser scans the whole bounded report text for exactly the four
 required final headings (`## Completed`, `## Files Changed`,
@@ -289,22 +307,34 @@ the same facts.
 The parent toolResult content may show the delegation id, provider/model,
 status, bounded ACTUAL changed paths (with an explicit omission count when
 paths are not shown), up to 8 Completed items, up to 8 verification
-observations, up to 8 remaining risks, the usage/cache/budget summary, the
+observations, up to 8 remaining risks, the usage/cache/budget summary,
+the deterministic spend summary line (`spend budget : turns N/M | total
+X/Y | output A/B | profile P`, Phase 3 — hard limits as denominators), the
 durable report path, the parse warning, and the explicit instruction that
 Sol must inspect the actual diff. Rendering reserves every required fact
-line (identity/status/turns, changed paths, usage/cache/budget, the
+line (identity/status/turns, changed paths, usage/cache/budget/spend, the
 report/summary/usage artifact paths, parse/review/failure facts) and drops
 optional summary items only as WHOLE sanitized lines until both global
 caps hold — a rendered line is never cut mid-item or mid-code-point. It
 never contains the full report, patch, or test logs; `details` never carry
 `allowed_paths`/`output`/`full_report`/`transcript`/`patch` fields and
-never duplicate the report. Top-level nested worker usage is preserved
-unchanged.
+never duplicate the report (the nested `spend` details are the exact
+persisted canonical spend object — numbers and fixed literals only).
+Top-level nested worker usage is preserved unchanged.
 
-Progress callbacks expose only the turn count and provider/model — never
-`lastText` and never intermediate/final worker text. The compact progress
-shape is exactly `DeepSeek worker: N turn(s), model provider/model`
-(starting state included).
+Progress callbacks (Phase 4 of the worker token-budget repair) expose
+numeric-only cumulative spend counters — `turns`, `totalTokens`,
+`outputTokens` and the fixed `spendBand` (`ok | soft | hard`), evaluated
+after each processed assistant message — plus the pinned provider/model
+identity. Progress never carries `lastText`, worker text, reasons, tool
+arguments, patches, logs, or error prose, and the counters are always
+finite normalized numbers (malformed usage contributes zero, never NaN).
+The compact progress text keeps the exact
+`DeepSeek worker: N turn(s), model provider/model` prefix and appends the
+deterministic spend segment `| spend total X | output Y | band B`
+(starting state included with zero counters and band `ok`); every progress
+tuple matches the final ledger spend facts at the last event (soft and
+hard outcomes included).
 
 ### Context-risk diagnostics (P7)
 
@@ -363,6 +393,103 @@ and the structured `details` carry `max_context_tokens`,
 `max_context_ratio`, `soft_budget_reached`, `hard_budget_exceeded`,
 `compaction_count`, and `compaction_reasons`.
 
+## Worker cumulative spend-budget protection
+
+Independent of the per-message context budget above, the approved worker
+token-budget repair (`docs/plans/worker-token-budget-repair.md`) adds a
+**cumulative delegation-spend policy** in
+`extensions/workbench-runtime/core/worker-spend.ts` — pure logic, no Pi
+imports, reusing `workerContextTokens` from `core/worker-budget.ts` for the
+per-message total semantics. **Phases 2–4 status: runtime wiring, public profile selection,
+ledger persistence, handoff rendering and numeric-only progress
+landed; Phase 5 (task-contract profile wording and delegation-granularity
+guidance) landed.** The runner accumulates the cumulative
+spend state after every assistant message (same pure policy), records the
+final profile/state/band/reasons facts on every run result, and terminates
+the child fail-closed whenever any hard dimension is reached (`>=`,
+deterministic hard-stop message). The worker-role lifecycle reads the
+spend profile from the fixed child env contract
+(`WORKBENCH_WORKER_SPEND_PROFILE` — the runner always writes a valid
+`low`/`standard`/`extended` value; malformed/missing child env falls back
+to `standard` defensively), accumulates its own independent spend state
+on assistant `message_end` events, and sends exactly one hidden cumulative
+soft steer when the band first becomes soft or hard. **Phase 3 status:
+public selection, contract validation, ledger persistence and handoff
+rendering landed.** The optional `budget_profile` tool parameter (closed
+literal union `low | standard | extended`, default `standard`, `extended`
+never inferred) is resolved by the strict contract validation in
+`core/worker-policy.ts` BEFORE any ledger creation or child launch, the
+resolved profile is recorded in the before contract
+(`before.json` → `contract.budget_profile`) and passed to the runner (the
+same profile reaches the child env and every outcome's spend facts —
+exception fallbacks included), and the canonical cumulative `spend` object
+is persisted additively in `usage.json` / `worker-summary.json` on every
+finished success and failure and rendered into the bounded parent handoff.
+Per-message context safety (above) is unchanged.
+
+| Profile | Soft turns | Soft total | Soft output | Hard turns | Hard total | Hard output |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `low` | 8 | 750,000 | 40,000 | 12 | 1,250,000 | 75,000 |
+| `standard` (default) | 24 | 3,000,000 | 120,000 | 36 | 5,000,000 | 200,000 |
+| `extended` (explicit) | 48 | 8,000,000 | 200,000 | 64 | 12,000,000 | 300,000 |
+
+- **Per-message totals** reuse the context-budget semantics: a positive
+  `totalTokens` is authoritative; otherwise the non-negative
+  `input + output + cacheRead + cacheWrite` sum; `cacheRead` counts
+  (cache-hit input is billed, so it is real spend); malformed, non-finite
+  or negative values contribute zero — never NaN, never a crash.
+- **Output dimension** reads the per-message `output` component directly
+  (non-negative finite; malformed → 0), independent of which path the
+  per-message total took; a provider that omits `output` undercounts this
+  dimension (accepted heuristic guard). `total_tokens` is the primary
+  spend dimension.
+- **Cumulative dimensions** per delegation run: `turns` (processed
+  assistant messages), `total_tokens` (Σ per-message normalized total),
+  `output_tokens` (Σ per-message output). Updates are immutable and
+  deterministic.
+- **Band evaluation** on every processed message: any hard dimension
+  reached (`>=`) → `hard` (hard wins over soft, always); else any soft
+  dimension reached → `soft`; else `ok`. Triggered reasons are listed in
+  the fixed order `turns`, `total_tokens`, `output_tokens`.
+- **Soft steer (wired):** at most one hidden cumulative soft steer per
+  delegation (`WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE =
+  "workbench-worker-spend-soft-steer"`, `display: false`,
+  `deliverAs: "steer"`), sent by the worker-role lifecycle only — the
+  commander session never receives it — with its OWN one-shot flag,
+  independent of the context steer, naming the profile, the triggered
+  dimension(s) in the fixed reason order, and current vs. limit values; a
+  send failure is swallowed and never breaks a model request. The steer is
+  a request, not an enforcement.
+- **Hard stop (wired):** when any hard dimension is reached the runner
+  terminates the child and the invocation fails closed
+  (`assertWorkerSucceeded`), naming the winning dimension(s) and
+  current/limit values via the deterministic hard-stop formatter; the
+  ledger is finished on every outcome (the spend facts enter the
+  ledger/handoff as of Phase 3). The 60-minute timeout remains an
+  independent failure path.
+- **Profiles:** `standard` is the deterministic default for every
+  delegation without an explicit request; `low` is an explicit tighter
+  opt-in; `extended` is explicit Sol-approved only and is never inferred
+  or auto-promoted. The public `budget_profile` tool parameter
+  (optional, closed literal union `low | standard | extended`, default
+  `standard`) is validated by the pure contract check in
+  `core/worker-policy.ts` — omitted resolves to `standard`; unknown,
+  empty, wrong-type and case-variant values fail closed with a bounded
+  error before the ledger is created or the child starts. The pure
+  resolver defaults to `standard` only where a default is explicitly
+  requested, while strict validation rejects unknown values.
+- **Child env contract (wired):** the runner passes the resolved profile to
+  the worker child through the fixed `WORKBENCH_WORKER_SPEND_PROFILE` env
+  variable; the worker-role lifecycle strictly validates it and falls back
+  to `standard` on malformed/missing values (defensive — the runner always
+  writes a valid value).
+- **Deterministic summary** (rendered into the parent handoff and ledger):
+  `spend budget : turns N/M | total X/Y | output A/B | profile P` with the
+  profile's hard limits as denominators; the handoff derives the line and
+  the nested `spend` details from the SAME canonical spend object the
+  ledger persisted in worker-summary.json (never recomputed from runner
+  internals or worker prose).
+
 ## Review patch bounds (P7)
 
 `workbench_review_worker_diff` renders a redacted patch bounded by default
@@ -388,9 +515,20 @@ path-by-path `include_paths` re-reviews (max 50 paths per call).
     "Existing valid input remains compatible"
   ],
   "verification": ["Run the unit-test recipe"],
+  "budget_profile": "standard",
   "timeout_seconds": 1800
 }
 ```
+
+`budget_profile` is optional and selects the cumulative delegation-spend
+profile (`low | standard | extended`; omitted resolves to `standard`). The
+profile bounds cumulative spend only — it never expands the approved paths
+or scope. `standard` is the deterministic default; `low` is an explicit
+tighter opt-in for deliberately small slices; `extended` is explicit
+Sol-approved only for an approved larger slice and is never inferred or
+auto-promoted. The worker task text carries the resolved profile as one
+informational line; enforcement is the runner's fixed child-env contract,
+never task prose.
 
 Path rules are deliberately simple:
 
@@ -444,21 +582,35 @@ untrusted repositories or unattended automation.
    slice) and inspect the current git state.
 2. Define observable acceptance criteria and explicit allowed paths for the
    source, tests, and docs of one coherent vertical slice.
-3. Delegate bounded low/medium-risk vertical slices while in DEV; high-risk
+3. Size every delegation as ONE coherent source+tests+docs vertical slice
+   with ample headroom BELOW its soft thresholds — soft is a handoff
+   reserve and hard is failure; neither is a planning target. Never plan a
+   delegation that expects to consume its budget, and never batch
+   unrelated work into one task to amortize delegation overhead.
+4. Choose the spend profile explicitly: `standard` is the deterministic
+   default (omit `budget_profile`); pass `low` only when the slice is
+   deliberately tighter; pass `extended` only with explicit Sol approval
+   for an approved larger slice — it is never inferred or auto-promoted.
+5. When the root cause of a problem is unknown, never delegate one
+   open-ended "investigate and fix" task. Split the work into (a) a
+   bounded diagnosis delegation, (b) a Sol architecture/scope decision
+   from the diagnosis, and (c) a bounded implementation delegation for the
+   decided slice.
+6. Delegate bounded low/medium-risk vertical slices while in DEV; high-risk
    decisions remain Commander-led — Sol never delegates the decision itself,
    and only explicitly designed bounded support/implementation scopes are
    delegated after the architecture is fixed. Sol does not directly write by
    default: implementation and repair writes go to a fresh bounded worker;
    a temporary commander direct write requires an explicit human-issued
    write lease (`/q-commander-write-unlock`).
-4. Avoid duplicating the worker's routine investigation, but read the actual
+7. Avoid duplicating the worker's routine investigation, but read the actual
    files and diff after the worker returns — the report is never acceptance.
-5. Correct defects by issuing another bounded delegation to a fresh worker,
+8. Correct defects by issuing another bounded delegation to a fresh worker,
    or — only with an explicit human-issued temporary write lease — repair
    directly (see Worker-first write authority).
-6. Switch to VERIFY.
-7. Run declared recipes and the project validation gates.
-8. Make the final verdict from persisted evidence, not worker prose.
+9. Switch to VERIFY.
+10. Run declared recipes and the project validation gates.
+11. Make the final verdict from persisted evidence, not worker prose.
 
 ## Stable-prefix and cache behavior
 
@@ -466,7 +618,11 @@ The tool name, description, schema, prompt snippet, and guidelines are static
 and registered in `WORKBENCH_TOOL_NAMES` order. Dynamic task facts are sent
 in the child user message, not injected into the parent system prompt.
 Adding this tool intentionally changes the DEV tool-schema fingerprint once;
-after reload, same-mode fingerprints remain stable. DeepSeek usage is
+after reload, same-mode fingerprints remain stable. The Phase 3 additive
+`budget_profile` parameter caused the second (and final, for this repair)
+intentional one-time fingerprint transition — the cache telemetry records it
+as `UNEXPECTED_DRIFT` (expected, not a defect); see
+[docs/compatibility.md](compatibility.md). DeepSeek usage is
 returned as nested tool usage and the child workbench can continue using the
 existing hash-only cache telemetry.
 
@@ -519,6 +675,10 @@ The tool fails rather than silently falling back when:
 - the pinned model is unavailable;
 - an assistant event reports another provider/model;
 - an assistant event reaches the 900,000-token (90%) hard context budget;
+- any cumulative spend dimension reaches its hard limit (turns / total
+  tokens / output tokens per the active profile — `standard` by default,
+  `low`/`extended` explicit opt-ins via the optional `budget_profile`
+  parameter);
 - the child emits any `compaction_start` event (a compaction attempt);
 - the child exits non-zero, times out, or is aborted;
 - the child reports an error/aborted stop reason;

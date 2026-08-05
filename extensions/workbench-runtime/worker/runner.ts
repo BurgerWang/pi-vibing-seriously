@@ -43,6 +43,21 @@ import {
 	workerContextRatio,
 	workerContextTokens,
 } from "../core/worker-budget.ts";
+import {
+	addWorkerSpendUsage,
+	EMPTY_WORKER_SPEND_STATE,
+	formatWorkerSpendHardStop,
+	resolveWorkerSpendProfile,
+	workerSpendBand,
+	workerSpendDimensionFlags,
+	workerSpendReasons,
+	WORKER_SPEND_PROFILE_ENV,
+	type WorkerSpendBand,
+	type WorkerSpendDimensionFlags,
+	type WorkerSpendProfile,
+	type WorkerSpendReason,
+	type WorkerSpendState,
+} from "../core/worker-spend.ts";
 
 export const WORKER_SYSTEM_PROMPT = `You are the implementation worker in pi-dev-workbench.
 
@@ -136,11 +151,49 @@ export interface WorkerRunResult {
 	compactionCount: number;
 	/** Distinct compaction reasons in arrival order (manual|threshold|overflow). */
 	compactionReasons: string[];
+	// ---------------------------------------------------------------- Phase 2
+	// Cumulative delegation-spend facts (worker token-budget repair, Phase 2):
+	// the profile this run accumulated against, the final cumulative spend
+	// state (turns / total / output), the final band, the triggered reasons in
+	// the fixed order, and per-dimension soft/hard trigger flags. All facts
+	// derive from the pure policy in core/worker-spend.ts and are recorded on
+	// EVERY outcome (success, hard stop, compaction, drift, abort, timeout,
+	// spawn failure). The profile is the runner-resolved value (deterministic
+	// `standard` default when no profile was requested).
+	/** Spend profile this run accumulated against (deterministic default: standard). */
+	spendProfile: WorkerSpendProfile;
+	/** Final cumulative spend state (turns / totalTokens / outputTokens). */
+	spendState: WorkerSpendState;
+	/** Final cumulative spend band ("ok" | "soft" | "hard"). */
+	spendBand: WorkerSpendBand;
+	/** Triggered spend dimensions for the final band, fixed order. */
+	spendReasons: WorkerSpendReason[];
+	/** Per-dimension soft trigger flags at the final spend state. */
+	spendSoftReached: WorkerSpendDimensionFlags["soft"];
+	/** Per-dimension hard trigger flags at the final spend state. */
+	spendHardExceeded: WorkerSpendDimensionFlags["hard"];
 }
 
 export interface WorkerProgress {
-	/** Only turn count and provider/model are exposed to the parent — never text. */
+	/**
+	 * Phase 4 (worker token-budget repair): numeric-only cumulative spend
+	 * progress. Every callback carries exactly turns / totalTokens /
+	 * outputTokens / spendBand plus the pinned provider/model identity —
+	 * never worker text, reasons, report content, tool arguments, patches,
+	 * logs, or error prose. All three counters come from ONE cumulative
+	 * spend-state snapshot after that assistant message was accumulated and
+	 * evaluated (band via the same pure policy), so the final progress tuple
+	 * exactly equals the final WorkerRunResult spendState/spendBand facts.
+	 * Counters are always finite normalized non-negative numbers; spendBand
+	 * is always the fixed `ok` | `soft` | `hard` enum.
+	 */
 	turns: number;
+	/** Cumulative normalized total tokens after this assistant message. */
+	totalTokens: number;
+	/** Cumulative normalized output tokens after this assistant message. */
+	outputTokens: number;
+	/** Cumulative spend band after this assistant message (fixed enum). */
+	spendBand: WorkerSpendBand;
 	provider?: string;
 	model?: string;
 }
@@ -158,6 +211,16 @@ export interface RunWorkerOptions {
 	onProgress?: (progress: WorkerProgress) => void;
 	/** Test seam for a fake JSON-event subprocess. */
 	invocation?: PiInvocation;
+	/**
+	 * Internal cumulative spend profile for this delegation run (worker
+	 * token-budget repair, Phase 2). Optional and deterministic: omitted
+	 * values resolve to the `standard` profile. Only the typed
+	 * low/standard/extended profile is accepted. The resolved profile is
+	 * passed to the child through the fixed WORKER_SPEND_PROFILE_ENV env
+	 * contract, so the worker-role lifecycle enforces the SAME profile the
+	 * runner accumulates against. Public selection (tool schema) is Phase 3.
+	 */
+	spendProfile?: WorkerSpendProfile;
 }
 
 interface AssistantLike {
@@ -230,7 +293,7 @@ export function resolvePiInvocation(): PiInvocation {
 	return { command: "pi", argsPrefix: [] };
 }
 
-function childEnvironment(projectRoot: string, allowedPaths: readonly string[]): NodeJS.ProcessEnv {
+function childEnvironment(projectRoot: string, allowedPaths: readonly string[], spendProfile: WorkerSpendProfile): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = { ...process.env };
 	// Parent-session identity/model facts must never masquerade as child facts.
 	for (const key of ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL"]) {
@@ -240,6 +303,9 @@ function childEnvironment(projectRoot: string, allowedPaths: readonly string[]):
 	env[WORKER_DEPTH_ENV] = "1";
 	env[WORKER_PROJECT_ROOT_ENV] = projectRoot;
 	env[WORKER_ALLOWED_PATHS_ENV] = JSON.stringify(allowedPaths);
+	// Phase 2: the fixed spend-profile child env contract — the runner ALWAYS
+	// writes a valid resolved profile value here (never empty/malformed).
+	env[WORKER_SPEND_PROFILE_ENV] = spendProfile;
 	return env;
 }
 
@@ -252,6 +318,19 @@ function workerFailureReason(result: WorkerRunResult): string | undefined {
 	}
 	if (result.hardBudgetExceeded) {
 		return `DeepSeek worker exceeded the ${WORKER_HARD_BUDGET}-token hard context budget — fail closed`;
+	}
+	// Phase 2 cumulative spend hard stop: any hard spend dimension reached
+	// fails closed regardless of the child's eventual exit code, and the
+	// deterministic hard-stop formatter outranks the ordinary exit/timeout
+	// text. This check sits parallel to the existing 900k hard-context path
+	// (compaction and hard-context keep their existing precedence above it;
+	// model-drift/abort/timeout keep their existing relative order below it).
+	if (
+		result.spendHardExceeded.turns ||
+		result.spendHardExceeded.totalTokens ||
+		result.spendHardExceeded.outputTokens
+	) {
+		return formatWorkerSpendHardStop(result.spendState, result.spendProfile);
 	}
 	if (result.modelMismatch) return result.modelMismatch;
 	if (result.aborted) return "DeepSeek worker was aborted";
@@ -275,6 +354,10 @@ export function assertWorkerSucceeded(result: WorkerRunResult): void {
 }
 
 export async function runDeepseekWorker(options: RunWorkerOptions): Promise<WorkerRunResult> {
+	// Phase 2: deterministic profile resolution — omitted/undefined resolves
+	// to the `standard` profile; only the typed low/standard/extended value
+	// is accepted by the options contract.
+	const spendProfile = resolveWorkerSpendProfile(options.spendProfile);
 	const taskText = formatWorkerTask(options.contract);
 	if (Buffer.byteLength(taskText, "utf8") > MAX_TASK_ARGUMENT_BYTES) {
 		throw new Error(`Worker task contract exceeds ${MAX_TASK_ARGUMENT_BYTES} bytes`);
@@ -317,6 +400,12 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 		hardBudgetExceeded: false,
 		compactionCount: 0,
 		compactionReasons: [],
+		spendProfile,
+		spendState: { ...EMPTY_WORKER_SPEND_STATE },
+		spendBand: "ok",
+		spendReasons: [],
+		spendSoftReached: { turns: false, totalTokens: false, outputTokens: false },
+		spendHardExceeded: { turns: false, totalTokens: false, outputTokens: false },
 	};
 
 	try {
@@ -325,7 +414,7 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 				cwd: options.projectRoot,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
-				env: childEnvironment(options.projectRoot, options.contract.allowedPaths),
+				env: childEnvironment(options.projectRoot, options.contract.allowedPaths, spendProfile),
 			});
 			let stdoutBuffer = "";
 			let stderrBuffer = "";
@@ -398,6 +487,20 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 					result.errorMessage = `DeepSeek worker exceeded the ${WORKER_HARD_BUDGET}-token hard context budget — fail closed`;
 					terminate("error");
 				}
+				// Phase 2 cumulative spend accounting (independent of the per-message
+				// context safety above): every assistant message increments the
+				// cumulative spend state exactly once via the pure policy — turns + 1,
+				// normalized total/output added (positive totalTokens authoritative,
+				// else the non-negative component sum; cacheRead counts; malformed
+				// usage contributes zero but still counts the turn — never NaN). Any
+				// hard dimension reached (`>=`) terminates the child fail-closed with
+				// the deterministic hard-stop message; soft alone never fails.
+				result.spendState = addWorkerSpendUsage(result.spendState, message.usage);
+				const spendFlags = workerSpendDimensionFlags(result.spendState, spendProfile);
+				if (spendFlags.hard.turns || spendFlags.hard.totalTokens || spendFlags.hard.outputTokens) {
+					result.errorMessage = formatWorkerSpendHardStop(result.spendState, spendProfile);
+					terminate("error");
+				}
 				const provider = typeof message.provider === "string" ? message.provider : undefined;
 				const model = typeof message.model === "string" ? message.model : undefined;
 				if (provider) result.provider = provider;
@@ -425,7 +528,20 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 					result.reportText = text;
 					result.reportTextOversized = Buffer.byteLength(text, "utf8") > MAX_WORKER_REPORT_BYTES;
 				}
-				options.onProgress?.({ turns: result.turns, provider: result.provider, model: result.model });
+				// Phase 4: the progress tuple is built AFTER the message was
+				// accumulated/evaluated above, from the SAME cumulative spend
+				// state the final result facts derive from — every tuple matches
+				// the final ledger counters at the last event, hard stops
+				// included (the callback still runs after terminate()). Numeric
+				// counters only plus the pinned identity: never text of any kind.
+				options.onProgress?.({
+					turns: result.spendState.turns,
+					totalTokens: result.spendState.totalTokens,
+					outputTokens: result.spendState.outputTokens,
+					spendBand: workerSpendBand(result.spendState, spendProfile),
+					provider: result.provider,
+					model: result.model,
+				});
 			};
 
 			child.stdout.on("data", (chunk: Buffer | string) => {
@@ -457,6 +573,14 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 			});
 		});
 		result.cacheHitRatio = workerCacheHitRatio(result.usage);
+		// Phase 2: record the deterministic FINAL spend facts (profile, state,
+		// band, fixed-order reasons, per-dimension soft/hard flags) from the
+		// final cumulative state on every outcome.
+		const finalSpendFlags = workerSpendDimensionFlags(result.spendState, spendProfile);
+		result.spendBand = workerSpendBand(result.spendState, spendProfile);
+		result.spendReasons = workerSpendReasons(result.spendState, spendProfile);
+		result.spendSoftReached = finalSpendFlags.soft;
+		result.spendHardExceeded = finalSpendFlags.hard;
 		return result;
 	} finally {
 		await rm(promptDir, { recursive: true, force: true });

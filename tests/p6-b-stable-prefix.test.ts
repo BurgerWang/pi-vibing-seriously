@@ -303,14 +303,44 @@ test("workbench_delegate_worker metadata is static and carries the responsibilit
 	assert.match(text, /Worker prose is never acceptance evidence/);
 	// The registration-order/schema contract is untouched: same name, same
 	// position (the first P7 tool, after the seven existing tools), same
-	// parameter schema hash — pinned to the reviewed baseline (a
-	// self-comparison would prove nothing).
+	// parameter schema hash — pinned to the final Phase 3 baseline
+	// (a self-comparison would prove nothing). The hash changed exactly
+	// ONCE, intentionally, in Phase 3 of the worker token-budget repair
+	// (see docs/compatibility.md for the documented fingerprint
+	// transition): the additive optional `budget_profile` parameter (with
+	// the nested JSON Schema `default: "standard"` annotation) landed in
+	// one rollout transition directly from the pre-repair baseline
+	// 2cf1f563f78ffe2c85d142c1f40deea7bc658365345554db11c80b8af6b521d9 to
+	// the pinned final hash below. Phase 5 (task-contract wording /
+	// granularity) deliberately leaves the parameter schema byte-for-byte
+	// unchanged — the pin below stays the final Phase 3 baseline.
 	assert.equal(meta.name, "workbench_delegate_worker");
 	assert.equal(WORKBENCH_TOOL_NAMES.indexOf("workbench_delegate_worker"), WORKBENCH_TOOL_NAMES.length - 3, "delegate tool keeps its registration position (seven existing → delegate → review → status)");
+	// The canonical schema object itself (not only its hash): budget_profile
+	// stays OPTIONAL — absent from `required` — and its nested union carries
+	// the JSON Schema `default: "standard"` annotation plus the exact
+	// closed alternatives in the fixed low|standard|extended order. This
+	// inspects the real serialized shape so the pin below can never pass on
+	// a self-comparison or a drifted-but-self-consistent schema.
+	const delegateParameters = WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker as unknown as {
+		type: string;
+		required?: string[];
+		properties: Record<string, { default?: unknown; anyOf?: Array<{ const?: unknown }> }>;
+	};
+	assert.equal(delegateParameters.type, "object");
+	assert.ok(!(delegateParameters.required ?? []).includes("budget_profile"), "budget_profile stays optional — no required-list regression");
+	const budgetProfileSchema = delegateParameters.properties.budget_profile;
+	assert.ok(budgetProfileSchema, "budget_profile is present in the serialized parameter schema");
+	assert.equal(budgetProfileSchema.default, "standard", "the nested budget_profile schema carries the JSON Schema default annotation standard");
+	assert.deepEqual(
+		(budgetProfileSchema.anyOf ?? []).map((alternative) => alternative.const),
+		["low", "standard", "extended"],
+		"the exact closed alternatives in the fixed low|standard|extended order",
+	);
 	assert.equal(
 		canonicalHash(WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker),
-		"2cf1f563f78ffe2c85d142c1f40deea7bc658365345554db11c80b8af6b521d9",
-		"delegate parameter schema hash is pinned to the reviewed baseline (schema unchanged)",
+		"71707090d2da085b036c5879dd2fcb72558175ead8e596bf55406b65732b0c83",
+		"delegate parameter schema hash is pinned to the final Phase 3 baseline (optional budget_profile with the default: standard annotation)",
 	);
 });
 

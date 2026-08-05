@@ -87,6 +87,16 @@ function workerFacts(overrides: Partial<LedgerWorkerFacts> = {}): LedgerWorkerFa
 		usage: { input: 100, output: 50, cacheRead: 900, cacheWrite: 0, totalTokens: 1050, cost: { input: 0.001, output: 0.002, cacheRead: 0.0005, cacheWrite: 0, total: 0.0035 } },
 		cacheHitRatio: 900 / 1000,
 		budget: { maxContextTokens: 400_000, maxContextRatio: 0.4, softBudgetReached: false, hardBudgetExceeded: false, compactionCount: 0, compactionReasons: [] },
+		// Phase 3: the runner's cumulative spend facts (the canonical spend
+		// object persisted into usage.json / worker-summary.json derives from
+		// these). Defaults stay consistent with turns 3 / totalTokens 1050 /
+		// output 50 above.
+		spendProfile: "standard",
+		spendState: { turns: 3, totalTokens: 1050, outputTokens: 50 },
+		spendBand: "ok",
+		spendReasons: [],
+		spendSoftReached: { turns: false, totalTokens: false, outputTokens: false },
+		spendHardExceeded: { turns: false, totalTokens: false, outputTokens: false },
 		reportSummary: "Implemented the slice with tests and docs. My secret token is abc-secret-123.",
 		...overrides,
 	};
@@ -344,13 +354,15 @@ test("createDelegationLedger writes atomic bounded manifest + before records", a
 		assert.equal(manifest.git_dirty_before, before.gitDirty);
 		assert.equal(manifest.diff_hash_before, computeDiffHash(before.changedPaths, before.pathDigests, before.pathStatuses));
 		const beforeRecord = JSON.parse(await readFile(join(dirPath, "before.json"), "utf8")) as {
-			contract: { task: string; allowed_paths: string[]; acceptance_criteria: string[]; verification: string[]; timeout_seconds: number };
+			contract: { task: string; allowed_paths: string[]; acceptance_criteria: string[]; verification: string[]; timeout_seconds: number; budget_profile?: string };
 		};
 		assert.equal(beforeRecord.contract.task, "Implement the parser slice");
 		assert.deepEqual(beforeRecord.contract.allowed_paths, ["src/**", "tests/parser.test.ts"]);
 		assert.deepEqual(beforeRecord.contract.acceptance_criteria, ["Unit tests cover the new option", "Docs describe the new option"]);
 		assert.deepEqual(beforeRecord.contract.verification, ["Run the unit-test recipe"]);
 		assert.equal(beforeRecord.contract.timeout_seconds, 900);
+		assert.ok("budget_profile" in beforeRecord.contract, "new before records ALWAYS carry the resolved budget_profile");
+		assert.equal(beforeRecord.contract.budget_profile, "standard", "omitted budget_profile resolves deterministically to standard in the before contract");
 		// Atomic bounded writes: mode 0600 on the records.
 		const st = await stat(join(dirPath, "manifest.json"));
 		assert.equal(st.mode & 0o777, 0o600);
@@ -390,6 +402,189 @@ test("createDelegationLedger refuses invalid ids and unbounded contracts", async
 		assert.equal(record.contract.acceptance_criteria.length, 20, "acceptance criteria capped at 20");
 		assert.equal(record.contract.verification.length, 20, "verification steps capped at 20");
 		assert.equal(record.contract.timeout_seconds, 1800, "invalid timeout falls back to the default");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3: budget profile in the before contract + canonical spend records
+// (worker token-budget repair)
+// ---------------------------------------------------------------------------
+
+test("the before contract records the explicit budget profile and rejects invalid ones before creating anything", async () => {
+	await withTempDir(async (dir) => {
+		await cleanRepo(dir);
+		const before = await collectGitFacts(dir, spawnExec);
+		const id = makeDelegationId(new Date());
+		const created = await createDelegationLedger(
+			dir,
+			id,
+			{ task: "t", allowedPaths: ["src/**"], acceptanceCriteria: [], verification: [], timeoutSeconds: 1800, budgetProfile: "extended" },
+			before,
+			NOW,
+		);
+		assert.ok(created.ok, created.ok ? "" : created.error);
+		const record = JSON.parse(await readFile(join(delegationDirFor(dir, id), "before.json"), "utf8")) as { contract: { budget_profile: string } };
+		assert.equal(record.contract.budget_profile, "extended", "the resolved profile is persisted in the before contract");
+
+		// Unknown/empty/wrong-type profiles fail closed BEFORE any ledger
+		// record exists (boundLedgerContract refuses without writing).
+		for (const bad of ["", "LOW", "Standard", "ultra", null, 42, true, {}] as unknown[]) {
+			const refused = await createDelegationLedger(
+				dir,
+				makeDelegationId(new Date()),
+				{ task: "t", allowedPaths: ["src/**"], acceptanceCriteria: [], verification: [], timeoutSeconds: 1800, budgetProfile: bad as never },
+				before,
+				NOW,
+			);
+			assert.equal(refused.ok, false, `${JSON.stringify(bad)} must fail closed before ledger creation`);
+			if (!refused.ok) assert.match(refused.error, /budget_profile must be one of "low" \| "standard" \| "extended"/);
+		}
+	});
+});
+
+test("usage.json and worker-summary.json persist the exact canonical spend object (schema_version stays 1; after.json carries none)", async () => {
+	await withTempDir(async (dir) => {
+		const { id } = await finishedDelegation(dir);
+		const dirPath = delegationDirFor(dir, id);
+		const expected = {
+			profile: "standard",
+			turns: 3,
+			totalTokens: 1050,
+			outputTokens: 50,
+			band: "ok",
+			softReached: { turns: false, totalTokens: false, outputTokens: false },
+			hardExceeded: { turns: false, totalTokens: false, outputTokens: false },
+			reasons: [],
+		};
+		const usage = JSON.parse(await readFile(join(dirPath, "usage.json"), "utf8")) as { spend: unknown; schema_version: number };
+		assert.deepEqual(usage.spend, expected, "usage.json carries the exact canonical spend object");
+		assert.equal(usage.schema_version, 1, "schema_version stays 1 (additive only)");
+		const summary = JSON.parse(await readFile(join(dirPath, "worker-summary.json"), "utf8")) as { spend: unknown; schema_version: number };
+		assert.deepEqual(summary.spend, expected, "worker-summary.json carries the SAME canonical spend object");
+		assert.equal(summary.schema_version, 1);
+		// after.json deliberately carries no spend — usage.json /
+		// worker-summary.json are its records (single-derivation rule).
+		const after = JSON.parse(await readFile(join(dirPath, "after.json"), "utf8")) as { spend?: unknown };
+		assert.ok(!("spend" in after), "after.json has no spend object");
+	});
+});
+
+test("hard spend failures are ledgered as failure with the spend hard flags/reasons and the dimension-named error", async () => {
+	await withTempDir(async (dir) => {
+		await cleanRepo(dir);
+		const before = await collectGitFacts(dir, spawnExec);
+		const id = makeDelegationId(new Date());
+		const created = await createDelegationLedger(
+			dir,
+			id,
+			{ task: "t", allowedPaths: ["src/**"], acceptanceCriteria: [], verification: [], timeoutSeconds: 1800, budgetProfile: "standard" },
+			before,
+			NOW,
+		);
+		assert.ok(created.ok);
+		const after = await collectAfterFacts(dir, before, spawnExec);
+		const finished = await finishDelegationLedger(dir, id, {
+			after,
+			worker: workerFacts({
+				status: "failure",
+				exitCode: 1,
+				errorMessage: "Worker cumulative spend hard budget reached (profile standard): turns 36/36.",
+				spendState: { turns: 36, totalTokens: 4_999_999, outputTokens: 199_999 },
+				spendBand: "hard",
+				spendReasons: ["turns"],
+				spendSoftReached: { turns: true, totalTokens: false, outputTokens: false },
+				spendHardExceeded: { turns: true, totalTokens: false, outputTokens: false },
+			}),
+			secrets: [],
+			now: NOW,
+		});
+		assert.ok(finished.ok, finished.ok ? "" : finished.error);
+		const ledger = await readDelegationLedger(dir, id);
+		assert.ok(ledger && ledger.after && ledger.workerSummary);
+		assert.equal(ledger.after.status, "failure");
+		assert.match(ledger.workerSummary.error_message ?? "", /hard budget reached/);
+		assert.deepEqual(ledger.workerSummary.spend, {
+			profile: "standard",
+			turns: 36,
+			totalTokens: 4_999_999,
+			outputTokens: 199_999,
+			band: "hard",
+			softReached: { turns: true, totalTokens: false, outputTokens: false },
+			hardExceeded: { turns: true, totalTokens: false, outputTokens: false },
+			reasons: ["turns"],
+		}, "the failure record carries the spend hard flags and the fixed-order reasons");
+		assert.equal(ledger.after.review_status, "PENDING_REVIEW");
+	});
+});
+
+test("legacy-shaped worker facts (no spend facts) keep the pre-repair record shape: readable, no spend key, no rewrite", async () => {
+	await withTempDir(async (dir) => {
+		await cleanRepo(dir);
+		const before = await collectGitFacts(dir, spawnExec);
+		const id = makeDelegationId(new Date());
+		await createDelegationLedger(dir, id, { task: "t", allowedPaths: ["src/**"], acceptanceCriteria: [], verification: [], timeoutSeconds: 1800 }, before, NOW);
+		await mkdir(join(dir, "src"), { recursive: true });
+		await writeFile(join(dir, "src", "parser.ts"), "v1\n", "utf8");
+		const after = await collectAfterFacts(dir, before, spawnExec);
+		// Old-style caller: no spend facts at all.
+		const { spendProfile: _spendProfile, spendState: _spendState, spendBand: _spendBand, spendReasons: _spendReasons, spendSoftReached: _spendSoftReached, spendHardExceeded: _spendHardExceeded, ...legacyWorker } = workerFacts();
+		const finished = await finishDelegationLedger(dir, id, { after, worker: legacyWorker, secrets: [], now: NOW });
+		assert.ok(finished.ok, finished.ok ? "" : finished.error);
+		const dirPath = delegationDirFor(dir, id);
+		for (const file of ["usage.json", "worker-summary.json"]) {
+			const record = JSON.parse(await readFile(join(dirPath, file), "utf8")) as Record<string, unknown>;
+			assert.equal(record.schema_version, 1);
+			assert.ok(!("spend" in record), `${file} keeps the pre-repair shape when the caller omits spend facts`);
+		}
+		const ledger = await readDelegationLedger(dir, id);
+		assert.ok(ledger && ledger.workerSummary, "the legacy-shaped ledger remains readable");
+		assert.ok(!("spend" in ledger.workerSummary));
+	});
+});
+
+test("synthetic pre-repair schema_version 1 records without budget_profile/spend read successfully and are not rewritten", async () => {
+	await withTempDir(async (dir) => {
+		await cleanRepo(dir);
+		const before = await collectGitFacts(dir, spawnExec);
+		const id = makeDelegationId(new Date());
+		const created = await createDelegationLedger(dir, id, { task: "t", allowedPaths: ["src/**"], acceptanceCriteria: [], verification: [], timeoutSeconds: 1800 }, before, NOW);
+		assert.ok(created.ok);
+		const dirPath = delegationDirFor(dir, id);
+		// Strip the new additive field from the before contract to recreate
+		// the exact pre-repair shape (schema_version stays 1).
+		const beforeRecord = JSON.parse(await readFile(join(dirPath, "before.json"), "utf8")) as { contract: Record<string, unknown> };
+		assert.equal(beforeRecord.contract.budget_profile, "standard");
+		delete beforeRecord.contract.budget_profile;
+		await writeFile(join(dirPath, "before.json"), `${JSON.stringify(beforeRecord, null, 2)}\n`, "utf8");
+		// Finish normally, then strip spend from both records to recreate the
+		// pre-repair usage/worker-summary shapes.
+		await mkdir(join(dir, "src"), { recursive: true });
+		await writeFile(join(dir, "src", "parser.ts"), "v1\n", "utf8");
+		const after = await collectAfterFacts(dir, before, spawnExec);
+		const finished = await finishDelegationLedger(dir, id, { after, worker: workerFacts(), secrets: [], now: NOW });
+		assert.ok(finished.ok);
+		for (const file of ["usage.json", "worker-summary.json"]) {
+			const record = JSON.parse(await readFile(join(dirPath, file), "utf8")) as Record<string, unknown>;
+			assert.equal(record.schema_version, 1);
+			delete record.spend;
+			await writeFile(join(dirPath, file), `${JSON.stringify(record, null, 2)}\n`, "utf8");
+		}
+		// Reading succeeds without migration — the optional fields are simply
+		// absent, and the files are never rewritten by the read.
+		const ledger = await readDelegationLedger(dir, id);
+		assert.ok(ledger, "pre-repair records remain readable");
+		assert.ok(ledger.workerSummary);
+		assert.ok(!("spend" in ledger.workerSummary), "no spend on the pre-repair summary record");
+		assert.ok(!("budget_profile" in (ledger.before.contract as Record<string, unknown>)), "no budget_profile on the pre-repair before contract");
+		assert.equal(
+			(ledger.before.contract as { budget_profile?: string }).budget_profile,
+			undefined,
+			"the pre-repair before contract exposes budget_profile as undefined (optional field, never defaulted on read)",
+		);
+		const usageRaw = await readFile(join(dirPath, "usage.json"), "utf8");
+		assert.ok(!usageRaw.includes('"spend"'), "the pre-repair usage.json is not rewritten");
+		const beforeRaw = await readFile(join(dirPath, "before.json"), "utf8");
+		assert.ok(!beforeRaw.includes("budget_profile"), "the pre-repair before.json is not rewritten");
 	});
 });
 

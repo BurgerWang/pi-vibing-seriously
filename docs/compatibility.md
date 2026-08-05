@@ -5,6 +5,36 @@ environments that were actually exercised are listed; no untested
 compatibility is claimed. The machine-readable copy lives in
 [`compatibility/pi.json`](../compatibility/pi.json).
 
+## Tool-schema fingerprint transition (Phase 3, worker token-budget repair)
+
+`workbench_delegate_worker` gained exactly ONE additive parameter in Phase 3
+of the worker token-budget repair
+(`docs/plans/worker-token-budget-repair.md`): the optional `budget_profile`
+closed literal union `low | standard | extended` (default `standard`). The
+change is additive — every pre-repair call contract stays valid — and it
+intentionally changes the DEV tool-schema fingerprint exactly **once**:
+
+- the pinned delegate parameter-schema hash moved directly from
+  `2cf1f563f78ffe2c85d142c1f40deea7bc658365345554db11c80b8af6b521d9`
+  (pre-repair reviewed baseline) to
+  `71707090d2da085b036c5879dd2fcb72558175ead8e596bf55406b65732b0c83`
+  (final Phase 3 baseline — the additive `budget_profile` parameter with
+  the nested JSON Schema `default: "standard"` annotation, pinned in
+  `tests/p6-b-stable-prefix.test.ts`);
+- the cache telemetry records that one transition as `UNEXPECTED_DRIFT` —
+  **expected, not a defect** (documented stable-prefix behavior; the
+  schema is still static and registered in the same explicit order);
+- after reload, same-mode fingerprints are stable again; no further
+  fingerprint change is expected from this repair (Phases 4–6 do not touch
+  the delegate parameter schema).
+
+Ledger records written by the new code remain readable by old tooling and
+by the new code alike: the before contract's `budget_profile` and the
+canonical `spend` object in `usage.json` / `worker-summary.json` are
+additive fields on the unchanged `schema_version: 1` records; pre-repair
+records without them parse unchanged and are never rewritten (no
+migration).
+
 ## Tested environments
 
 | Component | Version | How it was exercised |

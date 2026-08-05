@@ -166,6 +166,37 @@
  *     refresh, a lease that is no longer ACTIVE reverts the advertised
  *     set to the exact canonical 14 (no timers, no background resources)
  *
+ *   - Phase 2 of the worker token-budget repair (docs/plans/worker-token-
+ *     budget-repair.md): the runner accumulates the pure cumulative spend
+ *     policy (core/worker-spend.ts) after every assistant message, records
+ *     final profile/state/band/reasons facts on the run result, and
+ *     terminates fail-closed on any hard spend dimension; the worker-role
+ *     lifecycle reads the spend profile from the fixed
+ *     WORKBENCH_WORKER_SPEND_PROFILE child env contract (malformed/missing
+ *     falls back to standard) and sends exactly one hidden cumulative soft
+ *     steer (its own flag, independent of the context steer)
+ *   - Phase 3 of the same repair: the optional public `budget_profile`
+ *     parameter (closed literal union low|standard|extended, default
+ *     standard) is resolved by the pure contract validation in
+ *     core/worker-policy.ts BEFORE ledger creation/child launch and the
+ *     resolved profile is passed consistently into the ledger contract
+ *     (before.json contract.budget_profile) and runDeepseekWorker (spend
+ *     facts preserved on every outcome, exception fallback included); the
+ *     canonical cumulative `spend` object is persisted additively in
+ *     usage.json and worker-summary.json (schema_version stays 1;
+ *     pre-repair records read without migration) and the bounded parent
+ *     handoff renders the deterministic spend summary line plus nested
+ *     spend details from the SAME persisted worker-summary spend object
+ *   - Phase 4 of the same repair (numeric-only progress): WorkerProgress
+ *     carries the cumulative spend counters (turns / totalTokens /
+ *     outputTokens) and the fixed ok|soft|hard band after every processed
+ *     assistant message — never worker text, reasons, tool arguments,
+ *     patches, logs, or error prose — and the starting/running onUpdate
+ *     keeps the exact `DeepSeek worker: N turn(s), model provider/model`
+ *     text prefix, appends the deterministic spend segment
+ *     (`| spend total X | output Y | band B`) and adds only the bounded
+ *     numeric counters and fixed band to the details
+ *
  * P8 additions (safe nested project support):
  *   - optional project.yaml `project_dir` (default "."): after config load
  *     the safe effective project root is resolved — POSIX/Windows absolute
@@ -272,6 +303,7 @@ import {
 	commanderBlockReason,
 	computeRoleActiveTools,
 	parseWorkerAllowedPaths,
+	resolveWorkerBudgetProfile,
 	workerRecipeBlockReason,
 	workerRoleToolCallBlockReason,
 	WORKER_ALLOWED_PATHS_ENV,
@@ -295,6 +327,18 @@ import {
 	workerBudgetBand,
 	workerContextTokens,
 } from "./core/worker-budget.ts";
+import {
+	addWorkerSpendUsage,
+	EMPTY_WORKER_SPEND_STATE,
+	formatWorkerSpendSteerText,
+	isWorkerSpendProfile,
+	workerSpendBand,
+	workerSpendReasons,
+	WORKER_SPEND_DEFAULT_PROFILE,
+	WORKER_SPEND_PROFILE_ENV,
+	WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE,
+	type WorkerSpendState,
+} from "./core/worker-spend.ts";
 import {
 	describeMode,
 	loadModeFromEntries,
@@ -479,9 +523,28 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		role: process.env[WORKER_ROLE_ENV],
 		projectRoot: process.env[WORKER_PROJECT_ROOT_ENV],
 		allowedPaths: parseWorkerAllowedPaths(process.env[WORKER_ALLOWED_PATHS_ENV]),
+		// Phase 2 (worker token-budget repair): the delegation spend profile
+		// from the fixed child env contract. The runner ALWAYS writes a valid
+		// low/standard/extended value; malformed/missing child env falls back
+		// to `standard` defensively (strict validation, never guessed).
+		spendProfile: isWorkerSpendProfile(process.env[WORKER_SPEND_PROFILE_ENV])
+			? process.env[WORKER_SPEND_PROFILE_ENV]
+			: WORKER_SPEND_DEFAULT_PROFILE,
 	};
 	/** One-shot worker soft-budget steer flag (worker role only, per process). */
 	let workerSoftSteerSent = false;
+	/**
+	 * Phase 2: one-shot worker cumulative spend soft-steer flag — its OWN
+	 * flag, fully independent of the context steer flag above.
+	 */
+	let workerSpendSoftSteerSent = false;
+	/**
+	 * Phase 2: independent cumulative spend state accumulated over assistant
+	 * `message_end` events (worker role only). Independent of the runner's
+	 * own copy and of the context-budget tracking; every assistant message
+	 * increments it exactly once via the pure policy.
+	 */
+	let workerSpendState: WorkerSpendState = { ...EMPTY_WORKER_SPEND_STATE };
 
 	const execFn: ExecFn = (command, args, options) =>
 		pi.exec(command, args, { cwd: options?.cwd, timeout: options?.timeout, signal: options?.signal });
@@ -1238,6 +1301,42 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 					}
 				} catch {
 					// a steer must never break a model request
+				}
+			}
+			// Phase 2 cumulative spend accounting (worker role only, independent
+			// of the context steer above): every assistant message_end increments
+			// the independent spend state exactly once via the pure policy
+			// (malformed usage contributes zero but still counts the turn — never
+			// NaN). When the cumulative band FIRST becomes soft or hard, send
+			// exactly ONE hidden steer (its own flag — independent of the context
+			// steer flag), naming the profile and the triggered dimension(s) in
+			// the fixed reason order with current/limit values. The commander
+			// session never receives it; a send failure is swallowed and never
+			// breaks a model request.
+			if (workerRoleContext.role === "worker") {
+				try {
+					workerSpendState = addWorkerSpendUsage(workerSpendState, message.usage);
+					if (!workerSpendSoftSteerSent && workerSpendBand(workerSpendState, workerRoleContext.spendProfile) !== "ok") {
+						pi.sendMessage(
+							{
+								customType: WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE,
+								content: formatWorkerSpendSteerText(workerSpendState, workerRoleContext.spendProfile),
+								display: false,
+								details: {
+									profile: workerRoleContext.spendProfile,
+									band: workerSpendBand(workerSpendState, workerRoleContext.spendProfile),
+									reasons: workerSpendReasons(workerSpendState, workerRoleContext.spendProfile),
+									turns: workerSpendState.turns,
+									total_tokens: workerSpendState.totalTokens,
+									output_tokens: workerSpendState.outputTokens,
+								},
+							},
+							{ deliverAs: "steer" },
+						);
+						workerSpendSoftSteerSent = true;
+					}
+				} catch {
+					// a spend steer must never break a model request
 				}
 			}
 		}
@@ -2759,6 +2858,14 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			if (trustError) throw new Error(`workbench_delegate_worker: ${trustError}`);
 			const commanderError = commanderBlockReason(ctx.model?.provider, ctx.model?.id);
 			if (commanderError) throw new Error(commanderError);
+			// Phase 3 (worker token-budget repair): resolve the public
+			// budget_profile BEFORE any ledger creation or child launch —
+			// omitted resolves to `standard`; the three literals are
+			// accepted; unknown/empty/wrong-type values fail closed with a
+			// bounded error (the tool schema enforces the same closed union;
+			// this pure contract check is the fail-closed decision).
+			const budgetProfile = resolveWorkerBudgetProfile(params.budget_profile);
+			if (!budgetProfile.ok) throw new Error(`workbench_delegate_worker: ${budgetProfile.error}`);
 			const projectRoot = await projectRootFor(ctx);
 
 			// P7: refresh the delegation state against the REAL git diff (any
@@ -2793,6 +2900,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 					acceptanceCriteria: params.acceptance_criteria,
 					verification: params.verification ?? [],
 					timeoutSeconds: params.timeout_seconds ?? 1800,
+					budgetProfile: budgetProfile.profile,
 				},
 				before,
 				startedAt,
@@ -2805,8 +2913,26 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			void refreshStatus(ctx);
 
 			onUpdate?.({
-				content: [{ type: "text", text: `DeepSeek worker: 0 turn(s), model ${WORKER_MODEL_SELECTOR}` }],
-				details: { phase: "starting", delegation_id: delegationId, turns: 0, provider: WORKER_PROVIDER, model: WORKER_MODEL_SELECTOR },
+				content: [
+					{
+						type: "text",
+						// Phase 4: the exact text prefix is preserved and the compact
+						// deterministic spend segment is appended — numeric counters
+						// and the fixed band only, starting state included (zero
+						// counters, band ok).
+						text: `DeepSeek worker: 0 turn(s), model ${WORKER_MODEL_SELECTOR} | spend total 0 | output 0 | band ok`,
+					},
+				],
+				details: {
+					phase: "starting",
+					delegation_id: delegationId,
+					turns: 0,
+					totalTokens: 0,
+					outputTokens: 0,
+					spendBand: "ok",
+					provider: WORKER_PROVIDER,
+					model: WORKER_MODEL_SELECTOR,
+				},
 			});
 
 			// Run the worker; EVERY outcome (success and failure) is recorded
@@ -2820,20 +2946,34 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 						allowedPaths: params.allowed_paths,
 						acceptanceCriteria: params.acceptance_criteria,
 						verification: params.verification ?? [],
+						budgetProfile: budgetProfile.profile,
 					},
 					timeoutMs: (params.timeout_seconds ?? 1800) * 1000,
 					signal,
+					// Phase 3: the SAME resolved profile the ledger recorded — the
+					// runner accumulates and enforces exactly this profile.
+					spendProfile: budgetProfile.profile,
 					onProgress: (progress) => {
-						// The exact compact progress shape — turns and provider/model
-						// only. Intermediate/final worker text never enters onUpdate.
+						// Phase 4: the exact compact progress shape — the cumulative
+						// numeric spend counters (turns / total / output) and the fixed
+						// band plus provider/model identity. Intermediate/final worker
+						// text never enters onUpdate.
 						onUpdate?.({
 							content: [
 								{
 									type: "text",
-									text: `DeepSeek worker: ${progress.turns} turn(s), model ${progress.provider ?? WORKER_PROVIDER}/${progress.model ?? WORKER_MODEL_ID}`,
+									text: `DeepSeek worker: ${progress.turns} turn(s), model ${progress.provider ?? WORKER_PROVIDER}/${progress.model ?? WORKER_MODEL_ID} | spend total ${progress.totalTokens} | output ${progress.outputTokens} | band ${progress.spendBand}`,
 								},
 							],
-							details: { phase: "running", turns: progress.turns, provider: progress.provider, model: progress.model },
+							details: {
+								phase: "running",
+								turns: progress.turns,
+								totalTokens: progress.totalTokens,
+								outputTokens: progress.outputTokens,
+								spendBand: progress.spendBand,
+								provider: progress.provider,
+								model: progress.model,
+							},
 						});
 					},
 				});
@@ -2856,6 +2996,14 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 					hardBudgetExceeded: false,
 					compactionCount: 0,
 					compactionReasons: [],
+					// Phase 3: exception fallback facts preserve the SAME resolved
+					// profile the ledger recorded (never re-defaulted).
+					spendProfile: budgetProfile.profile,
+					spendState: { ...EMPTY_WORKER_SPEND_STATE },
+					spendBand: "ok",
+					spendReasons: [],
+					spendSoftReached: { turns: false, totalTokens: false, outputTokens: false },
+					spendHardExceeded: { turns: false, totalTokens: false, outputTokens: false },
 				};
 			}
 			let failure: string | undefined;
@@ -2906,6 +3054,16 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 							compactionCount: result.compactionCount,
 							compactionReasons: [...result.compactionReasons],
 						},
+						// Phase 3: the runner's recorded cumulative spend facts feed
+						// the canonical ledger spend object (usage.json /
+						// worker-summary.json) on EVERY outcome — including hard
+						// spend failures with their hard flags/reasons.
+						spendProfile: result.spendProfile,
+						spendState: { ...result.spendState },
+						spendBand: result.spendBand,
+						spendReasons: [...result.spendReasons],
+						spendSoftReached: { ...result.spendSoftReached },
+						spendHardExceeded: { ...result.spendHardExceeded },
 						reportSummary: result.output,
 					},
 					reportText: result.reportText,
@@ -2955,6 +3113,10 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 				},
 				reportPath: handoffSummary.report_path,
 				summary: handoffSummary,
+				// Phase 3: the parent renders the SAME canonical spend object the
+				// ledger persisted in worker-summary.json (single derivation —
+				// never recomputed from runner internals or worker prose).
+				spend: handoffSummary.spend,
 				reviewStatus: delegationState.status,
 			});
 		},

@@ -15,6 +15,10 @@ import {
 	type WorkerRunResult,
 } from "../extensions/workbench-runtime/worker/runner.ts";
 import type { WorkerTaskContract } from "../extensions/workbench-runtime/core/worker-policy.ts";
+import {
+	WORKER_SPEND_DEFAULT_PROFILE,
+	WORKER_SPEND_PROFILE_ENV,
+} from "../extensions/workbench-runtime/core/worker-spend.ts";
 
 const CONTRACT: WorkerTaskContract = {
 	task: "Implement one bounded change",
@@ -79,6 +83,14 @@ test("runner consumes JSON events, pins model identity, and aggregates usage", a
 		assert.equal(result.usage.cost.total, 0.62);
 		assert.equal(result.cacheHitRatio, 2 / 3, "aggregated cache ratio cacheRead/(input+cacheRead) over both turns");
 		assert.deepEqual(progress, [1, 2]);
+		// Phase 2 cumulative spend facts: every assistant event increments the
+		// spend state exactly once (turns + 1, normalized total/output added).
+		assert.equal(result.spendProfile, WORKER_SPEND_DEFAULT_PROFILE, "omitted profile resolves deterministically to standard");
+		assert.deepEqual(result.spendState, { turns: 2, totalTokens: 70, outputTokens: 10 });
+		assert.equal(result.spendBand, "ok");
+		assert.deepEqual(result.spendReasons, []);
+		assert.deepEqual(result.spendSoftReached, { turns: false, totalTokens: false, outputTokens: false });
+		assert.deepEqual(result.spendHardExceeded, { turns: false, totalTokens: false, outputTokens: false });
 	});
 });
 
@@ -124,13 +136,13 @@ test("worker system prompt grants local implementation ownership inside the appr
 
 test("runner pins max model selector and passes a non-recursive worker role contract", async () => {
 	const script = `
-const facts = JSON.stringify({ argv: process.argv.slice(2), role: process.env.WORKBENCH_AGENT_ROLE, depth: process.env.WORKBENCH_WORKER_DEPTH, paths: JSON.parse(process.env.WORKBENCH_WORKER_ALLOWED_PATHS || "[]"), inheritedModel: process.env.PI_MODEL || null });
+const facts = JSON.stringify({ argv: process.argv.slice(2), role: process.env.WORKBENCH_AGENT_ROLE, depth: process.env.WORKBENCH_WORKER_DEPTH, paths: JSON.parse(process.env.WORKBENCH_WORKER_ALLOWED_PATHS || "[]"), inheritedModel: process.env.PI_MODEL || null, spendProfile: process.env.${WORKER_SPEND_PROFILE_ENV} || null });
 console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "deepseek", model: "deepseek-v4-flash", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
 `;
 	await withFakeWorker(script, async (invocation, dir) => {
 		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assertWorkerSucceeded(result);
-		const facts = JSON.parse(result.output) as { argv: string[]; role: string; depth: string; paths: string[]; inheritedModel: string | null };
+		const facts = JSON.parse(result.output) as { argv: string[]; role: string; depth: string; paths: string[]; inheritedModel: string | null; spendProfile: string | null };
 		const modelFlag = facts.argv.indexOf("--model");
 		assert.ok(modelFlag >= 0);
 		assert.equal(facts.argv[modelFlag + 1], "deepseek/deepseek-v4-flash:max");
@@ -139,6 +151,63 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 		assert.equal(facts.depth, "1");
 		assert.deepEqual(facts.paths, CONTRACT.allowedPaths);
 		assert.equal(facts.inheritedModel, null, "parent PI_MODEL must not masquerade as the child model");
+		assert.equal(facts.spendProfile, "standard", "the runner always writes a valid spend profile into the fixed child env contract");
+		assert.equal(result.spendProfile, "standard");
+	});
+});
+
+test("runner passes an explicit spend profile to the child env and records it on the result", async () => {
+	const script = `
+const facts = JSON.stringify({ spendProfile: process.env.${WORKER_SPEND_PROFILE_ENV} || null });
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "deepseek", model: "deepseek-v4-flash", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
+`;
+	await withFakeWorker(script, async (invocation, dir) => {
+		const result = await runDeepseekWorker({
+			projectRoot: dir,
+			contract: CONTRACT,
+			timeoutMs: 2_000,
+			invocation,
+			spendProfile: "extended",
+		});
+		assertWorkerSucceeded(result);
+		const facts = JSON.parse(result.output) as { spendProfile: string | null };
+		assert.equal(facts.spendProfile, "extended", "the explicit profile travels through the fixed child env contract");
+		assert.equal(result.spendProfile, "extended");
+	});
+});
+
+test("the contract budget profile and the runner spendProfile option are one resolved low profile — env, result, and task text all agree", async () => {
+	const script = `
+const facts = JSON.stringify({ spendProfile: process.env.${WORKER_SPEND_PROFILE_ENV} || null, argv: process.argv.slice(2) });
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "deepseek", model: "deepseek-v4-flash", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
+`;
+	await withFakeWorker(script, async (invocation, dir) => {
+		// Production invariant: the index handler resolves the budget profile
+		// ONCE and passes that same value into both the contract (ledger and
+		// task-text source) and the runner option (enforcement source) — the
+		// two can never disagree. This test pins that consistency on an
+		// explicit `low` profile.
+		const result = await runDeepseekWorker({
+			projectRoot: dir,
+			contract: { ...CONTRACT, budgetProfile: "low" },
+			timeoutMs: 2_000,
+			invocation,
+			spendProfile: "low",
+		});
+		assertWorkerSucceeded(result);
+		const facts = JSON.parse(result.output) as { spendProfile: string | null; argv: string[] };
+		// The task text (the final child argv element) names the SAME resolved
+		// profile: Phase 5 adds one deterministic informational line that
+		// bounds cumulative spend only and never expands the parent-approved
+		// path/scope authority — enforcement stays in the runner and the
+		// fixed child env contract.
+		const taskText = facts.argv[facts.argv.length - 1] ?? "";
+		const taskProfile = /Worker spend-budget profile: (low|standard|extended)/.exec(taskText)?.[1];
+		assert.equal(taskProfile, "low", "task text names the resolved low profile");
+		assert.match(taskText, /bounds cumulative spend only/, "profile wording bounds cumulative spend only");
+		assert.match(taskText, /never expands parent-approved path\/scope authority/, "profile wording never expands parent-approved path/scope authority");
+		assert.equal(facts.spendProfile, taskProfile, "child env profile equals the task-text profile");
+		assert.equal(result.spendProfile, taskProfile, "result profile equals the task-text profile");
 	});
 });
 
@@ -246,6 +315,12 @@ function workerResult(overrides: Partial<WorkerRunResult> = {}): WorkerRunResult
 		hardBudgetExceeded: false,
 		compactionCount: 0,
 		compactionReasons: [],
+		spendProfile: "standard",
+		spendState: { turns: 1, totalTokens: 35, outputTokens: 5 },
+		spendBand: "ok",
+		spendReasons: [],
+		spendSoftReached: { turns: false, totalTokens: false, outputTokens: false },
+		spendHardExceeded: { turns: false, totalTokens: false, outputTokens: false },
 		...overrides,
 	};
 }
@@ -436,7 +511,221 @@ test("runner budget tracking ignores malformed usage defensively", async () => {
 		assert.equal(result.maxContextRatio, 0.000005);
 		assert.equal(result.softBudgetReached, false);
 		assert.equal(result.hardBudgetExceeded, false);
+		// Phase 2: malformed usage contributes zero tokens to the cumulative
+		// spend state (never NaN) but the turn still counts exactly once.
+		assert.deepEqual(result.spendState, { turns: 1, totalTokens: 5, outputTokens: 0 });
+		assert.equal(result.spendBand, "ok");
+		assert.deepEqual(result.spendReasons, []);
+		assert.deepEqual(result.spendHardExceeded, { turns: false, totalTokens: false, outputTokens: false });
 	});
+});
+
+test("runner spend: cacheRead counts through the spend policy when totalTokens is missing", async () => {
+	// No totalTokens: the per-message total falls back to the non-negative
+	// input + output + cacheRead + cacheWrite sum — cacheRead is real spend.
+	const noTotal = assistantEvent({
+		usage: { input: 10, output: 5, cacheRead: 20, cacheWrite: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+	});
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${noTotal}\n`)});`, async (invocation, dir) => {
+		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		assertWorkerSucceeded(result);
+		assert.deepEqual(result.spendState, { turns: 1, totalTokens: 35, outputTokens: 5 }, "cacheRead counts in the fallback sum");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2: cumulative spend accumulation, exact soft/hard boundaries, and
+// fail-closed hard stops (worker token-budget repair)
+// ---------------------------------------------------------------------------
+
+test("runner spend: exact soft boundaries never fail (turns/total/output)", async () => {
+	// Standard soft turns = 24 exactly: band soft, still succeeds.
+	const turnsSoft = Array.from({ length: 24 }, () => assistantEvent()).join("\n");
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${turnsSoft}\n`)});`, async (invocation, dir) => {
+		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		assertWorkerSucceeded(result);
+		assert.equal(result.spendBand, "soft");
+		assert.deepEqual(result.spendReasons, ["turns"]);
+		assert.deepEqual(result.spendSoftReached, { turns: true, totalTokens: false, outputTokens: false });
+		assert.deepEqual(result.spendHardExceeded, { turns: false, totalTokens: false, outputTokens: false });
+	});
+	// Standard soft total = 3,000,000 exactly (5 x 600,000, per-message below
+	// the 800k context soft threshold so context safety stays quiet).
+	const totalSoft = Array.from({ length: 5 }, () => assistantEvent({ usage: usageWith(600_000) })).join("\n");
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${totalSoft}\n`)});`, async (invocation, dir) => {
+		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		assertWorkerSucceeded(result);
+		assert.equal(result.spendBand, "soft");
+		assert.deepEqual(result.spendReasons, ["total_tokens"]);
+		assert.equal(result.spendHardExceeded.totalTokens, false);
+	});
+	// Standard soft output = 120,000 exactly (4 x 30,000 output).
+	const outputSoft = Array.from({ length: 4 }, () => assistantEvent({ usage: usageWith(30_030, { output: 30_000 }) })).join("\n");
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${outputSoft}\n`)});`, async (invocation, dir) => {
+		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		assertWorkerSucceeded(result);
+		assert.equal(result.spendBand, "soft");
+		assert.deepEqual(result.spendReasons, ["output_tokens"]);
+		assert.equal(result.spendHardExceeded.outputTokens, false);
+	});
+});
+
+test("runner spend: hard turns boundary at exactly 36 terminates fail-closed; 35 stays soft", async () => {
+	const thirtyFive = Array.from({ length: 35 }, () => assistantEvent()).join("\n");
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${thirtyFive}\n`)});`, async (invocation, dir) => {
+		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		assertWorkerSucceeded(result);
+		assert.equal(result.spendBand, "soft");
+		assert.deepEqual(result.spendReasons, ["turns"]);
+	});
+	const thirtySix = Array.from({ length: 36 }, () => assistantEvent()).join("\n");
+	await withFakeWorker(
+		`process.stdout.write(${JSON.stringify(`${thirtySix}\n`)}); setInterval(() => {}, 1000);`,
+		async (invocation, dir) => {
+			const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+			assert.equal(result.exitCode, 1, "child terminated by the runner at the exact hard turns boundary");
+			assert.equal(result.spendBand, "hard");
+			assert.deepEqual(result.spendReasons, ["turns"]);
+			assert.equal(result.spendHardExceeded.turns, true);
+			assert.match(result.errorMessage ?? "", /turns 36\/36/);
+			assert.throws(() => assertWorkerSucceeded(result), /Worker cumulative spend hard budget reached \(profile standard\): turns 36\/36/);
+		},
+	);
+});
+
+test("runner spend: hard total boundary at exactly 5,000,000; one below stays soft", async () => {
+	// 9 x 500,000 + 499,999 = 4,999,999: at/above the soft total (3,000,000),
+	// one below the hard total — soft, no failure.
+	const below = [...Array.from({ length: 9 }, () => 500_000), 499_999].map((t) => assistantEvent({ usage: usageWith(t) })).join("\n");
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${below}\n`)});`, async (invocation, dir) => {
+		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		assertWorkerSucceeded(result);
+		assert.equal(result.spendBand, "soft");
+		assert.deepEqual(result.spendReasons, ["total_tokens"]);
+		assert.equal(result.spendHardExceeded.totalTokens, false);
+	});
+	// 10 x 500,000 = 5,000,000 exactly: hard total reached (`>=` semantics).
+	const exact = Array.from({ length: 10 }, () => assistantEvent({ usage: usageWith(500_000) })).join("\n");
+	await withFakeWorker(
+		`process.stdout.write(${JSON.stringify(`${exact}\n`)}); setInterval(() => {}, 1000);`,
+		async (invocation, dir) => {
+			const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+			assert.equal(result.exitCode, 1, "child terminated by the runner at the exact hard total boundary");
+			assert.equal(result.spendBand, "hard");
+			assert.deepEqual(result.spendReasons, ["total_tokens"]);
+			assert.equal(result.spendHardExceeded.totalTokens, true);
+			assert.match(result.errorMessage ?? "", /total_tokens 5000000\/5000000/);
+			assert.throws(() => assertWorkerSucceeded(result), /total_tokens 5000000\/5000000/);
+		},
+	);
+});
+
+test("runner spend: hard output boundary at exactly 200,000; one below stays soft", async () => {
+	// 2 x 99,999 output = 199,998: at/above soft output (120,000), one below
+	// the hard output (200,000) — soft, no failure.
+	const below = [99_999, 99_999].map((o) => assistantEvent({ usage: usageWith(100_030, { output: o }) })).join("\n");
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${below}\n`)});`, async (invocation, dir) => {
+		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		assertWorkerSucceeded(result);
+		assert.equal(result.spendBand, "soft");
+		assert.deepEqual(result.spendReasons, ["output_tokens"]);
+		assert.equal(result.spendHardExceeded.outputTokens, false);
+	});
+	// 2 x 100,000 output = 200,000 exactly: hard output reached.
+	const exact = [100_000, 100_000].map((o) => assistantEvent({ usage: usageWith(100_030, { output: o }) })).join("\n");
+	await withFakeWorker(
+		`process.stdout.write(${JSON.stringify(`${exact}\n`)}); setInterval(() => {}, 1000);`,
+		async (invocation, dir) => {
+			const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+			assert.equal(result.exitCode, 1, "child terminated by the runner at the exact hard output boundary");
+			assert.equal(result.spendBand, "hard");
+			assert.deepEqual(result.spendReasons, ["output_tokens"]);
+			assert.equal(result.spendHardExceeded.outputTokens, true);
+			assert.match(result.errorMessage ?? "", /output_tokens 200000\/200000/);
+			assert.throws(() => assertWorkerSucceeded(result), /output_tokens 200000\/200000/);
+		},
+	);
+});
+
+test("runner spend: multi-dimension hard stop lists reasons in the fixed order", async () => {
+	// 35 turns of 138,889 tokens each, then one final message that pushes
+	// turns to 36, cumulative total to exactly 5,000,000 and cumulative
+	// output to 200,175 — all three dimensions hard at the same message.
+	// Every per-message total stays below 800,000 so context safety stays
+	// quiet (per-message context never reaches the 80%/90% thresholds).
+	const small = Array.from({ length: 35 }, () => assistantEvent({ usage: usageWith(138_889) })).join("\n");
+	const final = assistantEvent({ usage: usageWith(138_885, { output: 200_000 }) });
+	await withFakeWorker(
+		`process.stdout.write(${JSON.stringify(`${small}\n${final}\n`)}); setInterval(() => {}, 1000);`,
+		async (invocation, dir) => {
+			const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+			assert.equal(result.spendBand, "hard");
+			assert.deepEqual(result.spendReasons, ["turns", "total_tokens", "output_tokens"], "fixed reason order — never alphabetical");
+			assert.deepEqual(result.spendHardExceeded, { turns: true, totalTokens: true, outputTokens: true });
+			assert.match(
+				result.errorMessage ?? "",
+				/turns 36\/36, total_tokens 5000000\/5000000, output_tokens 200175\/200000/,
+			);
+			assert.throws(() => assertWorkerSucceeded(result), /turns 36\/36, total_tokens 5000000\/5000000, output_tokens 200175\/200000/);
+		},
+	);
+});
+
+test("runner spend: hard stop fails closed even when the child would exit 0", async () => {
+	// The child emits 10 x 500,000 = exactly the hard total (5,000,000) and
+	// exits 0 on its own (natural completion). Per-message totals stay below
+	// 800,000 so the hard CONTEXT budget never fires. The runner may tear the
+	// child down first or observe the natural exit — either way the recorded
+	// spend facts are hard and assertWorkerSucceeded fails closed with the
+	// deterministic hard-stop message, outranking the ordinary exit text.
+	const hard = Array.from({ length: 10 }, () => assistantEvent({ usage: usageWith(500_000) })).join("\n");
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${hard}\n`)});`, async (invocation, dir) => {
+		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		assert.equal(result.spendBand, "hard");
+		assert.deepEqual(result.spendReasons, ["total_tokens"]);
+		assert.equal(result.spendHardExceeded.totalTokens, true);
+		assert.throws(() => assertWorkerSucceeded(result), /total_tokens 5000000\/5000000/);
+	});
+});
+
+test("runner spend: low and extended profiles enforce their exact limits", async () => {
+	// low hard turns = 12: the 12th turn terminates the child fail-closed.
+	const lowTurns = Array.from({ length: 12 }, () => assistantEvent()).join("\n");
+	await withFakeWorker(
+		`process.stdout.write(${JSON.stringify(`${lowTurns}\n`)}); setInterval(() => {}, 1000);`,
+		async (invocation, dir) => {
+			const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "low" });
+			assert.equal(result.spendProfile, "low");
+			assert.equal(result.spendBand, "hard");
+			assert.deepEqual(result.spendReasons, ["turns"]);
+			assert.match(result.errorMessage ?? "", /profile low.*turns 12\/12/);
+			assert.throws(() => assertWorkerSucceeded(result), /profile low.*turns 12\/12/);
+		},
+	);
+	// low hard total = 1,250,000 exactly (2 x 625,000).
+	const lowTotal = [625_000, 625_000].map((t) => assistantEvent({ usage: usageWith(t) })).join("\n");
+	await withFakeWorker(
+		`process.stdout.write(${JSON.stringify(`${lowTotal}\n`)}); setInterval(() => {}, 1000);`,
+		async (invocation, dir) => {
+			const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "low" });
+			assert.equal(result.spendBand, "hard");
+			assert.deepEqual(result.spendReasons, ["total_tokens"]);
+			assert.match(result.errorMessage ?? "", /total_tokens 1250000\/1250000/);
+		},
+	);
+	// extended hard turns = 64: the 64th turn terminates the child fail-closed.
+	const extTurns = Array.from({ length: 64 }, () => assistantEvent()).join("\n");
+	await withFakeWorker(
+		`process.stdout.write(${JSON.stringify(`${extTurns}\n`)}); setInterval(() => {}, 1000);`,
+		async (invocation, dir) => {
+			const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "extended" });
+			assert.equal(result.spendProfile, "extended");
+			assert.equal(result.spendBand, "hard");
+			assert.deepEqual(result.spendReasons, ["turns"]);
+			assert.match(result.errorMessage ?? "", /turns 64\/64/);
+			assert.throws(() => assertWorkerSucceeded(result), /profile extended.*turns 64\/64/);
+		},
+	);
 });
 
 test("delegated worker presentation exposes budget and compaction facts", () => {
@@ -480,7 +769,32 @@ test("delegated worker presentation reports a hard-budget stop factually", () =>
 	assert.equal(built.details.compaction_count, 0);
 });
 
-test("progress callbacks expose only turns and provider/model — never lastText or worker text", async () => {
+/**
+ * Phase 4: progress serialized content must be numeric-only — finite
+ * normalized counters, the fixed ok|soft|hard band, and the pinned
+ * provider/model identity; never worker text, report text, tool arguments,
+ * reasons, patches, logs, or error prose. `forbiddenTexts` are the assistant
+ * texts used by the test fixtures that must never appear in any tuple.
+ */
+function assertNumericOnlyProgress(updates: Array<Record<string, unknown>>, forbiddenTexts: string[]): void {
+	const serialized = JSON.stringify(updates);
+	for (const text of forbiddenTexts) {
+		assert.ok(!serialized.includes(text), `progress must never carry assistant text: ${text.slice(0, 40)}`);
+	}
+	for (const token of ["lastText", "## Completed", "toolUse", "argument", "patch", "stderr", "reason", "error"]) {
+		assert.ok(!serialized.includes(token), `progress must never carry ${token}`);
+	}
+	for (const update of updates) {
+		const band = update.spendBand;
+		assert.ok(band === "ok" || band === "soft" || band === "hard", `spendBand is only ok|soft|hard, got ${String(band)}`);
+		for (const key of ["turns", "totalTokens", "outputTokens"]) {
+			const value = update[key];
+			assert.ok(typeof value === "number" && Number.isFinite(value), `${key} is a finite number, got ${String(value)}`);
+		}
+	}
+}
+
+test("progress callbacks expose exactly turns/totalTokens/outputTokens/spendBand and provider/model — never lastText or worker text", async () => {
 	const first = assistantEvent({ content: [{ type: "text", text: "working" }], stopReason: "toolUse" });
 	const final = assistantEvent({ content: [{ type: "text", text: "## Completed\nfinal report body" }] });
 	const updates: Array<Record<string, unknown>> = [];
@@ -493,19 +807,146 @@ test("progress callbacks expose only turns and provider/model — never lastText
 			onProgress: (progress) => updates.push({ ...progress }),
 		});
 		assertWorkerSucceeded(result);
+		// Phase 4: the final progress tuple equals the final result spend facts.
+		const last = updates[updates.length - 1]!;
+		assert.deepEqual(
+			{ turns: last.turns, totalTokens: last.totalTokens, outputTokens: last.outputTokens, spendBand: last.spendBand },
+			{ turns: result.spendState.turns, totalTokens: result.spendState.totalTokens, outputTokens: result.spendState.outputTokens, spendBand: result.spendBand },
+			"final progress counters match the final WorkerRunResult spend facts",
+		);
 	});
 	assert.equal(updates.length, 2);
 	for (const update of updates) {
 		assert.equal(
 			Object.keys(update).sort().join(","),
-			"model,provider,turns",
-			"WorkerProgress exposes exactly turns/provider/model",
+			"model,outputTokens,provider,spendBand,totalTokens,turns",
+			"WorkerProgress exposes exactly turns/totalTokens/outputTokens/spendBand/provider/model",
 		);
 		assert.ok(!("lastText" in update), "lastText is removed from progress");
 	}
-	assert.ok(
-		updates.every((u) => !JSON.stringify(u).includes("final report body") && !JSON.stringify(u).includes("working")),
-		"intermediate/final worker text never enters progress",
+	// Exact cumulative values after each processed assistant message (each
+	// event carries totalTokens 35 / output 5, so totals accumulate 35→70 and
+	// 5→10; band stays ok under the standard profile).
+	assert.deepEqual(updates[0], {
+		turns: 1,
+		totalTokens: 35,
+		outputTokens: 5,
+		spendBand: "ok",
+		provider: "deepseek",
+		model: "deepseek-v4-flash",
+	});
+	assert.deepEqual(updates[1], {
+		turns: 2,
+		totalTokens: 70,
+		outputTokens: 10,
+		spendBand: "ok",
+		provider: "deepseek",
+		model: "deepseek-v4-flash",
+	});
+	assertNumericOnlyProgress(updates, ["working", "final report body"]);
+});
+
+test("progress counters stay finite and normalized under cacheRead fallback and malformed usage", async () => {
+	// No totalTokens: the per-message total falls back to the non-negative
+	// input + output + cacheRead + cacheWrite sum (35) — cacheRead counts.
+	const cacheFallback = assistantEvent({
+		usage: { input: 10, output: 5, cacheRead: 20, cacheWrite: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+	});
+	// Malformed counters: negative/Infinity/string values contribute zero
+	// (fallback total = cacheWrite 5 only; output = 0) — never NaN.
+	const malformed = assistantEvent({
+		usage: { input: -1, output: "x", cacheRead: Infinity, cacheWrite: 5, totalTokens: -3, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+	});
+	const updates: Array<Record<string, unknown>> = [];
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${cacheFallback}\n${malformed}\n`)});`, async (invocation, dir) => {
+		const result = await runDeepseekWorker({
+			projectRoot: dir,
+			contract: CONTRACT,
+			timeoutMs: 2_000,
+			invocation,
+			onProgress: (progress) => updates.push({ ...progress }),
+		});
+		assertWorkerSucceeded(result);
+		assert.deepEqual(result.spendState, { turns: 2, totalTokens: 40, outputTokens: 5 });
+		assert.equal(result.spendBand, "ok");
+	});
+	assert.deepEqual(updates[0], {
+		turns: 1,
+		totalTokens: 35,
+		outputTokens: 5,
+		spendBand: "ok",
+		provider: "deepseek",
+		model: "deepseek-v4-flash",
+	});
+	assert.deepEqual(updates[1], {
+		turns: 2,
+		totalTokens: 40,
+		outputTokens: 5,
+		spendBand: "ok",
+		provider: "deepseek",
+		model: "deepseek-v4-flash",
+	});
+	assertNumericOnlyProgress(updates, []);
+});
+
+test("progress band transitions ok → soft at the exact soft boundary and matches the final spend facts", async () => {
+	// Standard soft turns = 24 exactly: the 24th event's progress tuple is
+	// the first with band soft; every tuple before it is ok.
+	const events = Array.from({ length: 24 }, () => assistantEvent()).join("\n");
+	const updates: Array<Record<string, unknown>> = [];
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${events}\n`)});`, async (invocation, dir) => {
+		const result = await runDeepseekWorker({
+			projectRoot: dir,
+			contract: CONTRACT,
+			timeoutMs: 2_000,
+			invocation,
+			onProgress: (progress) => updates.push({ ...progress }),
+		});
+		assertWorkerSucceeded(result); // soft is a steer, not a failure
+		assert.equal(result.spendBand, "soft");
+		assert.equal(updates.length, 24);
+		assert.equal(updates[22]!.spendBand, "ok", "the 23rd tuple is still ok");
+		assert.equal(updates[23]!.spendBand, "soft", "the 24th tuple is the soft transition");
+		const last = updates[23]!;
+		assert.deepEqual(
+			{ turns: last.turns, totalTokens: last.totalTokens, outputTokens: last.outputTokens, spendBand: last.spendBand },
+			{ turns: result.spendState.turns, totalTokens: result.spendState.totalTokens, outputTokens: result.spendState.outputTokens, spendBand: result.spendBand },
+			"final soft progress tuple equals the final WorkerRunResult spend facts",
+		);
+	});
+	assertNumericOnlyProgress(updates, []);
+});
+
+test("progress at the exact hard boundary matches the final spend facts (fail-closed outcome)", async () => {
+	// Standard hard turns = 36 exactly: the runner terminates fail-closed on
+	// the 36th event, and the LAST progress tuple still reports the exact
+	// cumulative counters and the hard band of the final result.
+	const events = Array.from({ length: 36 }, () => assistantEvent()).join("\n");
+	const updates: Array<Record<string, unknown>> = [];
+	await withFakeWorker(
+		`process.stdout.write(${JSON.stringify(`${events}\n`)}); setInterval(() => {}, 1000);`,
+		async (invocation, dir) => {
+			const result = await runDeepseekWorker({
+				projectRoot: dir,
+				contract: CONTRACT,
+				timeoutMs: 2_000,
+				invocation,
+				onProgress: (progress) => updates.push({ ...progress }),
+			});
+			assert.equal(result.spendBand, "hard");
+			assert.deepEqual(result.spendReasons, ["turns"]);
+			assert.throws(() => assertWorkerSucceeded(result), /turns 36\/36/);
+			assert.equal(updates.length, 36);
+			const last = updates[35]!;
+			assert.deepEqual(
+				{ turns: last.turns, totalTokens: last.totalTokens, outputTokens: last.outputTokens, spendBand: last.spendBand },
+				{ turns: result.spendState.turns, totalTokens: result.spendState.totalTokens, outputTokens: result.spendState.outputTokens, spendBand: result.spendBand },
+				"final hard-boundary progress tuple equals the final WorkerRunResult spend facts",
+			);
+			assert.equal(last.turns, 36);
+			assert.equal(last.spendBand, "hard");
+			assertNumericOnlyProgress(updates, []);
+		},
 	);
 });
 

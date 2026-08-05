@@ -7,13 +7,17 @@
  *   manifest.json        — status + git/diff hash summary
  *   before.json          — bounded contract, git HEAD/dirty, before diff
  *                          hash and per-path status codes + content digests
+ *                          (Phase 3: the resolved spend-budget profile is
+ *                          recorded additively as contract.budget_profile)
  *   after.json           — success/failure outcome, pinned identity,
  *                          status/exit, TRUE paths changed since before
  *                          (including previously-dirty paths via digests),
  *                          after diff hash, usage/budget facts, bounded
  *                          redacted report summary, safe reported_paths
  *                          parsed from the worker's ## Files Changed
- *                          section, review PENDING_REVIEW
+ *                          section, review PENDING_REVIEW (spend facts are
+ *                          deliberately NOT duplicated here — usage.json /
+ *                          worker-summary.json are their records)
  *   worker-report.md     — the REDACTED complete final worker text (redacted
  *                          FIRST, then bounded to MAX_WORKER_REPORT_BYTES
  *                          (512 KiB) with the explicit truncation marker
@@ -25,8 +29,10 @@
  *                          changed paths + parsed section items + parse
  *                          reliability/truncation facts + report path +
  *                          cache ratio + parse warning (the SINGLE summary
- *                          derivation the parent handoff renders)
- *   usage.json           — bounded structured usage/cache/budget/turn facts
+ *                          derivation the parent handoff renders); Phase 3:
+ *                          carries the canonical cumulative `spend` object
+ *   usage.json           — bounded structured usage/cache/budget/turn facts;
+ *                          Phase 3: carries the same canonical `spend` object
  *   review.json          — bounded PENDING_REVIEW placeholder written at
  *                          finish; REPLACED by the review service
  *                          (core/diff-review.ts) with the completed record
@@ -52,6 +58,14 @@ import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { canonicalHash, sha256HexBytes } from "../cache/canonical-hash.ts";
 import { redactText } from "./redact.ts";
 import type { ExecFn } from "./config.ts";
+import type {
+	WorkerSpendBand,
+	WorkerSpendDimensionFlags,
+	WorkerSpendProfile,
+	WorkerSpendReason,
+	WorkerSpendState,
+} from "./worker-spend.ts";
+import { resolveWorkerBudgetProfile } from "./worker-policy.ts";
 import {
 	MAX_WORKER_REPORT_BYTES,
 	parseWorkerReport,
@@ -161,6 +175,13 @@ export interface LedgerContract {
 	acceptanceCriteria: readonly string[];
 	verification: readonly string[];
 	timeoutSeconds: number;
+	/**
+	 * Phase 3 (worker token-budget repair): the resolved cumulative
+	 * spend-budget profile (additive, optional). Omitted resolves to
+	 * `standard` in boundLedgerContract — new before records always carry
+	 * the resolved literal.
+	 */
+	budgetProfile?: WorkerSpendProfile;
 }
 
 export interface LedgerUsage {
@@ -181,6 +202,26 @@ export interface LedgerBudget {
 	compactionReasons: string[];
 }
 
+/**
+ * Phase 3 (worker token-budget repair): the canonical cumulative spend
+ * facts object persisted additively in usage.json and worker-summary.json
+ * for every newly finished delegation (success AND failure). `profile` is
+ * the resolved profile the run accumulated against; `reasons` entries are
+ * exactly `"turns" | "total_tokens" | "output_tokens"` in the fixed
+ * order. Old schema_version 1 records without this object remain readable
+ * (no migration, no rewrite).
+ */
+export interface LedgerSpendFacts {
+	profile: WorkerSpendProfile;
+	turns: number;
+	totalTokens: number;
+	outputTokens: number;
+	band: WorkerSpendBand;
+	softReached: { turns: boolean; totalTokens: boolean; outputTokens: boolean };
+	hardExceeded: { turns: boolean; totalTokens: boolean; outputTokens: boolean };
+	reasons: WorkerSpendReason[];
+}
+
 export interface LedgerWorkerFacts {
 	provider: string | null;
 	model: string | null;
@@ -193,6 +234,23 @@ export interface LedgerWorkerFacts {
 	/** cacheRead / (input + cacheRead) over the whole run; null on a zero denominator. */
 	cacheHitRatio: number | null;
 	budget: LedgerBudget;
+	/**
+	 * Phase 3 (worker token-budget repair): the cumulative spend facts of
+	 * the run (profile, final state, band, fixed-order reasons, per-
+	 * dimension soft/hard flags) — recorded on EVERY outcome exactly as the
+	 * runner produced them, so hard spend failures are ledgered with the
+	 * spend hard flags/reasons and the dimension-named error. Optional /
+	 * additive: legacy callers that omit the spend facts stay source-
+	 * compatible and their records keep the pre-repair shape (readable, no
+	 * migration); finishDelegationLedger writes the canonical `spend`
+	 * object only when ALL six facts are present.
+	 */
+	spendProfile?: WorkerSpendProfile;
+	spendState?: WorkerSpendState;
+	spendBand?: WorkerSpendBand;
+	spendReasons?: WorkerSpendReason[];
+	spendSoftReached?: WorkerSpendDimensionFlags["soft"];
+	spendHardExceeded?: WorkerSpendDimensionFlags["hard"];
 	/** Bounded final worker report text (redacted by the caller-provided secrets). */
 	reportSummary: string;
 }
@@ -227,6 +285,15 @@ export interface LedgerBeforeRecord {
 		acceptance_criteria: string[];
 		verification: string[];
 		timeout_seconds: number;
+		/**
+		 * Phase 3: the resolved spend-budget profile of the delegation.
+		 * OPTIONAL on the record type because pre-repair schema_version 1
+		 * records genuinely omit it — reads of those expose `undefined` and
+		 * they are never rewritten (additive, no migration). New before
+		 * records ALWAYS carry the resolved literal: boundLedgerContract
+		 * resolves omitted to `standard` before any write.
+		 */
+		budget_profile?: string;
 	};
 	git_head: string | null;
 	git_dirty: boolean;
@@ -295,6 +362,8 @@ export interface LedgerWorkerSummaryRecord {
 	usage: LedgerUsage;
 	cache_hit_ratio: number | null;
 	budget: LedgerBudget;
+	/** Phase 3: the canonical cumulative spend facts object (additive; absent on legacy-shaped records). */
+	spend?: LedgerSpendFacts;
 	report_summary: string;
 	// P7 bounded-handoff additions: the ACTUAL changed paths (digest-based
 	// changed_since_before — never worker prose) and the bounded parsed
@@ -337,6 +406,8 @@ export interface DelegationUsageRecord {
 	usage: LedgerUsage;
 	cache_hit_ratio: number | null;
 	budget: LedgerBudget;
+	/** Phase 3: the canonical cumulative spend facts object (additive; absent on legacy-shaped records). */
+	spend?: LedgerSpendFacts;
 }
 
 /** Everything the ledger knows about one delegation (review.json excluded — the review service owns it). */
@@ -742,9 +813,22 @@ export function boundLedgerContract(raw: LedgerContract): { ok: true; contract: 
 		.filter(Boolean)
 		.slice(0, MAX_VERIFICATION_STEPS);
 	const timeoutSeconds = Number.isInteger(raw.timeoutSeconds) && raw.timeoutSeconds >= 60 && raw.timeoutSeconds <= 3600 ? raw.timeoutSeconds : 1800;
+	// Phase 3: resolve the spend-budget profile deterministically — omitted
+	// resolves to `standard`; any other value must be exactly one of the
+	// three literals or the contract FAILS CLOSED (an unknown/empty/wrong-
+	// typed profile must never reach a ledger record or a child launch).
+	const profile = resolveWorkerBudgetProfile(raw.budgetProfile);
+	if (!profile.ok) return profile;
 	return {
 		ok: true,
-		contract: { task, allowed_paths: allowedPaths, acceptance_criteria: acceptanceCriteria, verification, timeout_seconds: timeoutSeconds },
+		contract: {
+			task,
+			allowed_paths: allowedPaths,
+			acceptance_criteria: acceptanceCriteria,
+			verification,
+			timeout_seconds: timeoutSeconds,
+			budget_profile: profile.profile,
+		},
 	};
 }
 
@@ -865,6 +949,34 @@ export async function finishDelegationLedger(
 	const reportedPaths = parseReportedPaths(safeReportText);
 	const afterSummary = safeReportText.slice(0, MAX_AFTER_SUMMARY_CHARS);
 	const reportPath = delegationReportPath(projectRoot, delegationId);
+	// Phase 3: the canonical cumulative spend facts object — the SINGLE
+	// derivation persisted identically into usage.json and
+	// worker-summary.json from the runner's recorded spend facts (profile,
+	// final state, band, fixed-order reasons, per-dimension soft/hard
+	// flags). Never recomputed from worker prose. ALL six facts must be
+	// present (the runtime always supplies them on every outcome — success
+	// and failure, exception fallback included); legacy-shaped callers that
+	// omit them keep the pre-repair record shape (readable, no migration).
+	let spend: LedgerSpendFacts | undefined;
+	if (
+		input.worker.spendProfile !== undefined &&
+		input.worker.spendState !== undefined &&
+		input.worker.spendBand !== undefined &&
+		input.worker.spendReasons !== undefined &&
+		input.worker.spendSoftReached !== undefined &&
+		input.worker.spendHardExceeded !== undefined
+	) {
+		spend = {
+			profile: input.worker.spendProfile,
+			turns: input.worker.spendState.turns,
+			totalTokens: input.worker.spendState.totalTokens,
+			outputTokens: input.worker.spendState.outputTokens,
+			band: input.worker.spendBand,
+			softReached: { ...input.worker.spendSoftReached },
+			hardExceeded: { ...input.worker.spendHardExceeded },
+			reasons: [...input.worker.spendReasons],
+		};
+	}
 
 	// Parse-warning: the report sections are unreliable (missing) or the
 	// Files Changed claims diverge from the ACTUAL digest-based diff.
@@ -931,6 +1043,7 @@ export async function finishDelegationLedger(
 		usage: input.worker.usage,
 		cache_hit_ratio: input.worker.cacheHitRatio,
 		budget: input.worker.budget,
+		spend,
 		report_summary: redact(safeReportText.slice(0, MAX_REPORT_SUMMARY_CHARS)),
 		changed_paths: [...input.after.changedSinceBefore],
 		completed: parsed.completed,
@@ -956,6 +1069,7 @@ export async function finishDelegationLedger(
 		usage: input.worker.usage,
 		cache_hit_ratio: input.worker.cacheHitRatio,
 		budget: input.worker.budget,
+		spend,
 	};
 
 	// The bounded durable report artifact: redacted FIRST, then capped

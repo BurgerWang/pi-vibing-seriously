@@ -39,6 +39,7 @@ import {
 	sanitizeSummaryItem,
 	truncateUtf8,
 	type BuildDelegateWorkerResultInput,
+	type HandoffSpendFacts,
 	type HandoffSummary,
 	type ParsedWorkerReport,
 } from "../extensions/workbench-runtime/worker/handoff.ts";
@@ -525,6 +526,103 @@ test("capped-but-reliable sections render bounded items plus the explicit trunca
 	assert.ok(text.includes("  - item 0") && text.includes("  - item 7"), "bounded items still rendered");
 	assert.ok(text.includes("PARSE WARNING : section item cap"), "parse warning line rendered");
 	assert.ok(!text.includes("parsed items  : suppressed"), "caps are NOT treated as missing sections");
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3: cumulative spend facts in the parent handoff (worker token-budget
+// repair) — deterministic spend summary line + tightly bounded spend details
+// derived from the SAME persisted worker-summary spend object
+// ---------------------------------------------------------------------------
+
+const SPEND_FACTS: HandoffSpendFacts = {
+	profile: "standard",
+	turns: 3,
+	totalTokens: 35,
+	outputTokens: 5,
+	band: "ok",
+	softReached: { turns: false, totalTokens: false, outputTokens: false },
+	hardExceeded: { turns: false, totalTokens: false, outputTokens: false },
+	reasons: [],
+};
+
+test("the parent handoff renders the deterministic spend summary line and the nested spend details from the persisted spend object", () => {
+	const result = buildDelegateWorkerResult(handoffInput({ spend: SPEND_FACTS }));
+	const text = result.content[0]?.text ?? "";
+	// The exact deterministic line (profile hard limits as denominators).
+	assert.ok(text.includes("spend budget : turns 3/36 | total 35/5000000 | output 5/200000 | profile standard"), "deterministic spend summary line rendered");
+	// The nested details carry the EXACT canonical spend object (single
+	// derivation — the persisted worker-summary spend object, verbatim).
+	assert.deepEqual(result.details.spend, SPEND_FACTS);
+	// Caps hold with the new fact line.
+	assert.ok(text.split("\n").length <= MAX_PARENT_HANDOFF_LINES, "line cap");
+	assert.ok(Buffer.byteLength(text, "utf8") <= MAX_PARENT_HANDOFF_BYTES, "UTF-8 byte cap");
+	// The context budget line and the top-level usage stay intact.
+	assert.ok(text.includes("worker budget : max context 400000 / 1000000 (40%)"), "context budget line preserved");
+	assert.equal(result.usage.input, 10, "top-level nested worker usage preserved for cost accounting");
+});
+
+test("a hard-band spend object renders the hard-limit summary line and the dimension-named failure line", () => {
+	const hardSpend: HandoffSpendFacts = {
+		profile: "standard",
+		turns: 36,
+		totalTokens: 5_000_000,
+		outputTokens: 200_000,
+		band: "hard",
+		softReached: { turns: true, totalTokens: true, outputTokens: true },
+		hardExceeded: { turns: true, totalTokens: true, outputTokens: true },
+		reasons: ["turns", "total_tokens", "output_tokens"],
+	};
+	const result = buildDelegateWorkerResult(
+		handoffInput({
+			spend: hardSpend,
+			failureMessage: "Worker cumulative spend hard budget reached (profile standard): turns 36/36, total_tokens 5000000/5000000, output_tokens 200000/200000.",
+		}),
+	);
+	const text = result.content[0]?.text ?? "";
+	assert.ok(text.includes("spend budget : turns 36/36 | total 5000000/5000000 | output 200000/200000 | profile standard"));
+	assert.ok(text.includes("failure       : Worker cumulative spend hard budget reached"), "dimension-named failure line rendered");
+	assert.deepEqual(result.details.spend, hardSpend);
+	assert.ok(text.split("\n").length <= MAX_PARENT_HANDOFF_LINES);
+	assert.ok(Buffer.byteLength(text, "utf8") <= MAX_PARENT_HANDOFF_BYTES);
+});
+
+test("the spend summary line is a required fact line that survives byte-cap pressure with CJK items (no split code points)", () => {
+	const summary: HandoffSummary = {
+		completed: Array.from({ length: 8 }, (_, i) => `已完成的任务项 ${i}：` + "实".repeat(480)),
+		verification_commands: [],
+		verification_observations: Array.from({ length: 8 }, (_, i) => `验证观察 ${i}：` + "验".repeat(480)),
+		remaining_risks: Array.from({ length: 8 }, (_, i) => `风险 ${i}：` + "险".repeat(480)),
+		parse_warning: null,
+		parse_reliable: true,
+		truncated_items: false,
+	};
+	const result = buildDelegateWorkerResult(handoffInput({ summary, spend: SPEND_FACTS }));
+	const text = result.content[0]?.text ?? "";
+	assert.ok(text.includes("spend budget : turns 3/36 | total 35/5000000 | output 5/200000 | profile standard"), "the spend line is a required fact line and survives the byte-cap pressure");
+	assert.ok(text.split("\n").length <= MAX_PARENT_HANDOFF_LINES, "line cap");
+	assert.ok(Buffer.byteLength(text, "utf8") <= MAX_PARENT_HANDOFF_BYTES, "UTF-8 byte cap");
+	assert.equal(Buffer.from(text, "utf8").toString("utf8"), text, "strict round trip — no split multibyte sequence");
+	assert.ok(!text.includes("\uFFFD"), "no replacement characters");
+});
+
+test("spend details are tightly bounded and leak no report text, tool arguments, patches or logs", () => {
+	const result = buildDelegateWorkerResult(handoffInput({ spend: SPEND_FACTS }));
+	const spend = result.details.spend as Record<string, unknown>;
+	assert.deepEqual(
+		Object.keys(spend).sort(),
+		["band", "hardExceeded", "outputTokens", "profile", "reasons", "softReached", "totalTokens", "turns"],
+		"the spend details are exactly the canonical spend object keys",
+	);
+	assert.equal(spend.profile, "standard");
+	assert.ok(Array.isArray(spend.reasons));
+	const serialized = JSON.stringify(result.details);
+	assert.ok(!serialized.includes("PREAMBLE"), "no report text in the details");
+	assert.ok(!serialized.includes("diff --git"), "no patch content in the details");
+	assert.ok(!serialized.includes("12 tests passed"), "no test logs in the details");
+	assert.ok(!serialized.includes("allowed_paths"), "no allowed_paths in the details");
+	// Omitted spend facts keep the exact pre-Phase-3 details shape.
+	const legacy = buildDelegateWorkerResult(handoffInput());
+	assert.ok(!("spend" in legacy.details), "no spend key when the ledger record carried none");
 });
 
 test("changedPathsLine shows whole paths with an omission count and never cuts mid-path", () => {

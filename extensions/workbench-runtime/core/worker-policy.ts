@@ -10,6 +10,8 @@
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
 import type { RecipeMutation } from "./recipe-schema.ts";
+import type { WorkerSpendProfile } from "./worker-spend.ts";
+import { WORKER_SPEND_DEFAULT_PROFILE } from "./worker-spend.ts";
 
 export const WORKER_TOOL_NAME = "workbench_delegate_worker";
 export const WORKER_ROLE_ENV = "WORKBENCH_AGENT_ROLE";
@@ -34,6 +36,17 @@ export interface WorkerTaskContract {
 	allowedPaths: readonly string[];
 	acceptanceCriteria: readonly string[];
 	verification: readonly string[];
+	/**
+	 * Phase 3 (worker token-budget repair): the resolved cumulative
+	 * spend-budget profile (additive, optional). Omitted resolves to
+	 * `standard`; `low`/`extended` are explicit opt-ins. The profile is
+	 * carried on the contract for ledger/record consistency — the runner
+	 * enforces it through the fixed WORKER_SPEND_PROFILE_ENV child env
+	 * contract, never through task prose (Phase 5 adds only a
+	 * deterministic informational profile line to the task text; it never
+	 * changes enforcement or thresholds).
+	 */
+	budgetProfile?: WorkerSpendProfile;
 }
 
 export interface WorkerRoleContext {
@@ -147,6 +160,37 @@ export function workerRecipeBlockReason(role: string | undefined, recipeName: st
 }
 
 // ---------------------------------------------------------------------------
+// Phase 3: budget-profile contract validation (worker token-budget repair)
+// ---------------------------------------------------------------------------
+
+/**
+ * Strict deterministic budget-profile validation/resolution for the
+ * delegation task contract (Phase 3 of the worker token-budget repair):
+ *
+ *   - omitted/undefined → `standard` (the only default path);
+ *   - exactly `low` | `standard` | `extended` accepted;
+ *   - everything else (unknown strings, empty strings, case variants,
+ *     null, numbers, objects, arrays) FAILS CLOSED with a bounded useful
+ *     error — before any ledger creation or child launch. `extended` is
+ *     never inferred.
+ *
+ * The tool schema enforces the same closed union at the boundary; this
+ * pure check is the contract layer's own fail-closed decision (defense in
+ * depth for any caller, schema or not). The error preview is bounded so a
+ * pathological value can never produce an unbounded message.
+ */
+export function resolveWorkerBudgetProfile(value: unknown): { ok: true; profile: WorkerSpendProfile } | { ok: false; error: string } {
+	if (value === undefined) return { ok: true, profile: WORKER_SPEND_DEFAULT_PROFILE };
+	if (value === "low" || value === "standard" || value === "extended") return { ok: true, profile: value };
+	if (typeof value === "string") {
+		const preview = value.length > 60 ? `${value.slice(0, 60)}…` : value;
+		return { ok: false, error: `budget_profile must be one of "low" | "standard" | "extended" (received string ${JSON.stringify(preview)})` };
+	}
+	const kind = value === null ? "null" : typeof value;
+	return { ok: false, error: `budget_profile must be one of "low" | "standard" | "extended" (received ${kind})` };
+}
+
+// ---------------------------------------------------------------------------
 // P7 shared recipe mutation policy (used by direct recipe execution AND by
 // gate-engine recipe checks — one pure decision, two enforcement points)
 // ---------------------------------------------------------------------------
@@ -199,11 +243,23 @@ export function recipeMutationBlockReason(
 	return undefined;
 }
 
-/** Stable task text: fixed instructions plus dynamic contract in the user message. */
+/**
+ * Stable task text: fixed instructions plus dynamic contract in the user
+ * message. Phase 5: the text includes one short deterministic
+ * spend-profile line naming the resolved `budgetProfile` (omitted →
+ * `standard`; explicit `low`/`extended` named when supplied) and stating
+ * that the profile bounds cumulative spend only — it never expands the
+ * parent-approved path/scope authority. The line is informational
+ * wording: enforcement stays in the runner and the fixed child env
+ * contract, and thresholds are unchanged.
+ */
 export function formatWorkerTask(contract: WorkerTaskContract): string {
+	const profile = contract.budgetProfile ?? WORKER_SPEND_DEFAULT_PROFILE;
 	const lines = [
 		"Delegated implementation task:",
 		contract.task.trim(),
+		"",
+		`Worker spend-budget profile: ${profile} — bounds cumulative spend only; never expands parent-approved path/scope authority.`,
 		"",
 		"Parent-approved paths (exact path, or subtree ending in / or /**):",
 		...contract.allowedPaths.map((path) => `- ${path}`),

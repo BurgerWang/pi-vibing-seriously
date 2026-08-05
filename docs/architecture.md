@@ -57,9 +57,22 @@ extensions/workbench-runtime/
     └── quant-cache-lineage.ts   # P6-D /q-cache-lineage service + renderer
 └── core/
     ├── mode-policy.ts       # AUDIT/DEV/VERIFY tool sets; combined tool_call check
-    ├── worker-policy.ts     # commander/model/role/path contract for controlled delegation
+    ├── worker-policy.ts     # commander/model/role/path contract for controlled delegation;
+    │                        #   Phase 3: fail-closed budget_profile validation/resolution
     ├── worker-budget.ts     # pinned worker context budget: 1,000,000 window, 80% soft
     │                        #   handoff / 90% hard stop, Pi-compatible context tokens
+    ├── worker-spend.ts      # pinned worker cumulative delegation-spend policy (worker
+    │                        #   token-budget repair; pure, no Pi imports): fixed
+    │                        #   low/standard/extended profiles, per-message total reuse of
+    │                        #   workerContextTokens, immutable cumulative turns/total/output
+    │                        #   accumulation, ok|soft|hard band + fixed reason ordering,
+    │                        #   deterministic steer/hard-stop/summary formatters — wired
+    │                        #   into the runtime since Phase 2 (runner accumulation + hard
+    │                        #   stop; worker-role one-shot hidden soft steer via the fixed
+    │                        #   WORKBENCH_WORKER_SPEND_PROFILE env contract; public profile
+    │                        #   selection and ledger/handoff persistence: Phase 3;
+    │                        #   numeric-only progress counters/band: Phase 4;
+    │                        #   task-contract profile wording + granularity guidance: Phase 5)
     ├── write-authority.ts   # P7 worker-first-strict policy: actor identity, exact
     │                        #   14-tool Sol DEV allowlist, commander guard, temporary
     │                        #   write lease (pure state, no Pi imports)
@@ -69,7 +82,9 @@ extensions/workbench-runtime/
     ├── delegation-ledger.ts # P7 bounded delegation records under
     │                        #   <CONFIG_DIR_NAME>/workbench/delegations/<id>/ —
     │                        #   manifest/before/after/worker-summary, atomic, redacted,
-    │                        #   argv-only git facts (pure + injected exec)
+    │                        #   argv-only git facts (pure + injected exec); Phase 3:
+    │                        #   resolved budget_profile in the before contract + canonical
+    │                        #   cumulative spend object in usage.json/worker-summary.json
     ├── delegation-state.ts  # P7 review lifecycle: PENDING_REVIEW → REVIEWED → STALE,
     │                        #   hash binding invariants, delegation/VERIFY blocking (pure)
     ├── diff-review.ts       # P7 workbench_review_worker_diff service: real-diff scope
@@ -172,6 +187,53 @@ No worker process survives its tool call. The pinned budget policy lives in
 (800,000), 90% hard stop (900,000) — model-specific, independent of the
 Commander/project compaction reserve. See
 [worker-delegation.md](worker-delegation.md).
+
+The cumulative delegation-spend policy (approved worker token-budget
+repair) lives in `core/worker-spend.ts` (pure, no Pi imports):
+fixed `low`/`standard`/`extended` profiles with exact soft/hard limits,
+per-message total normalization reusing `workerContextTokens` (positive
+`totalTokens` authoritative, else the non-negative
+`input + output + cacheRead + cacheWrite` sum; `cacheRead` counts),
+independent per-message output extraction, immutable cumulative
+turns/total/output accumulation, `ok | soft | hard` band evaluation with
+hard-over-soft precedence and the fixed reason order `turns`,
+`total_tokens`, `output_tokens`, and deterministic soft-steer, hard-stop
+and spend-summary formatters. The policy is **wired into the runtime
+(Phases 2–4)**: the runner accumulates the cumulative spend state after
+every assistant message, terminates the child fail-closed on any hard
+spend dimension with the deterministic hard-stop message, and records the
+final profile/state/band/reasons facts on every run result; the
+worker-role lifecycle reads the profile from the fixed
+`WORKBENCH_WORKER_SPEND_PROFILE` child env contract (malformed/missing
+falls back to `standard` defensively) and sends exactly one hidden
+cumulative soft steer when the band first becomes soft/hard. Phase 3 adds
+the public profile surface: the optional `budget_profile` tool parameter
+(closed literal union `low | standard | extended`, default `standard`,
+`extended` never inferred) is resolved fail-closed by the pure contract
+check in `core/worker-policy.ts` before ledger creation/child launch, the
+resolved profile travels into the before contract
+(`before.json` → `contract.budget_profile`) and the runner (child env +
+result facts, exception fallbacks included), and the canonical cumulative
+`spend` object is persisted additively in `usage.json` /
+`worker-summary.json` (schema_version stays 1; pre-repair records read
+without migration) and rendered into the bounded parent handoff (the
+deterministic `spend budget : …` line plus nested spend details, both
+derived from the SAME persisted worker-summary spend object). Phase 4 adds
+the numeric-only progress surface: `WorkerProgress` exposes the cumulative
+turns/total/output counters and the fixed `ok | soft | hard` band after
+every processed assistant message (evaluated from the same cumulative
+state the final result facts derive from — the last tuple matches the
+final ledger counters, soft and hard outcomes included) plus the pinned
+provider/model identity; progress never carries text, reasons, tool
+arguments, patches, logs, or error prose. The index handler keeps the
+exact `DeepSeek worker: N turn(s), model provider/model` onUpdate prefix
+and appends the deterministic spend segment (`| spend total X | output Y |
+band B`); the details add only bounded numeric counters and the fixed band
+next to the existing identity fields. Phase 5 adds the
+task-contract profile wording and delegation-granularity guidance (static
+tool metadata, the worker task-text line, and docs) — no behavior, schema,
+threshold, or enforcement change. Per-message
+context safety is unchanged.
 
 ### Recipe execution
 

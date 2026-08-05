@@ -46,6 +46,10 @@ import {
 	WORKER_SOFT_BUDGET,
 	WORKER_SOFT_STEER_MESSAGE_TYPE,
 } from "../extensions/workbench-runtime/core/worker-budget.ts";
+import {
+	WORKER_SPEND_PROFILE_ENV,
+	WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE,
+} from "../extensions/workbench-runtime/core/worker-spend.ts";
 import { spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
 
 interface StubAPI {
@@ -138,6 +142,25 @@ function withWorkerRole(fn: () => void): void {
 }
 
 /**
+ * Run a block with the worker role AND a spend-profile env value set
+ * (Phase 2: the fixed child env contract), restoring both after.
+ */
+function withWorkerRoleAndSpendProfile(profile: string, fn: () => void): void {
+	const previousRole = process.env[WORKER_ROLE_ENV];
+	const previousProfile = process.env[WORKER_SPEND_PROFILE_ENV];
+	process.env[WORKER_ROLE_ENV] = "worker";
+	process.env[WORKER_SPEND_PROFILE_ENV] = profile;
+	try {
+		fn();
+	} finally {
+		if (previousRole === undefined) delete process.env[WORKER_ROLE_ENV];
+		else process.env[WORKER_ROLE_ENV] = previousRole;
+		if (previousProfile === undefined) delete process.env[WORKER_SPEND_PROFILE_ENV];
+		else process.env[WORKER_SPEND_PROFILE_ENV] = previousProfile;
+	}
+}
+
+/**
  * Commander tests must never inherit a worker-role env from the harness
  * (the unit tests may run inside a delegated worker process, where
  * WORKBENCH_AGENT_ROLE=worker is set). Clear it before the suite; every
@@ -147,6 +170,7 @@ before(() => {
 	delete process.env[WORKER_ROLE_ENV];
 	delete process.env[WORKER_PROJECT_ROOT_ENV];
 	delete process.env[WORKER_ALLOWED_PATHS_ENV];
+	delete process.env[WORKER_SPEND_PROFILE_ENV];
 });
 
 // ---------------------------------------------------------------------------
@@ -257,14 +281,14 @@ test("worker session_before_compact cancels compaction (never silently continues
 	assert.deepEqual(again, { cancel: true });
 });
 
-function assistantUsage(totalTokens: number): Record<string, unknown> {
-	return { input: 10, output: 5, cacheRead: 20, cacheWrite: 0, totalTokens, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+function assistantUsage(totalTokens: number, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+	return { input: 10, output: 5, cacheRead: 20, cacheWrite: 0, totalTokens, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, ...overrides };
 }
 
-function messageEndEvent(totalTokens: number): never {
+function messageEndEvent(totalTokens: number, overrides: Record<string, unknown> = {}): never {
 	return {
 		type: "message_end",
-		message: { role: "assistant", provider: "deepseek", model: "deepseek-v4-flash", usage: assistantUsage(totalTokens) },
+		message: { role: "assistant", provider: "deepseek", model: "deepseek-v4-flash", usage: assistantUsage(totalTokens, overrides) },
 	} as never;
 }
 
@@ -280,7 +304,9 @@ test("worker role sends exactly one hidden soft-budget steer at/above 80%", asyn
 	await handler(messageEndEvent(799_999), ctx);
 	assert.equal(stub.messages.length, 0);
 
-	// At the soft threshold (80%): exactly one hidden steer.
+	// At the soft threshold (80%): exactly one hidden CONTEXT steer. The
+	// independent cumulative spend state (1,599,999) stays below the standard
+	// soft total (3,000,000), so no spend steer fires yet.
 	await handler(messageEndEvent(WORKER_SOFT_BUDGET), ctx);
 	assert.equal(stub.messages.length, 1);
 	const steer = stub.messages[0]!;
@@ -291,10 +317,27 @@ test("worker role sends exactly one hidden soft-budget steer at/above 80%", asyn
 	assert.match(steer.content, /handoff/i);
 	assert.match(steer.content, /remaining work/i);
 
-	// Above the soft threshold, even toward the hard stop: still exactly one.
+	// The context steer is one-shot: further per-message soft/hard context
+	// never re-sends it. The INDEPENDENT spend steer fires exactly once when
+	// the cumulative total first crosses the standard soft limit — the fourth
+	// message brings the cumulative total to 3,399,998 (>= 3,000,000).
 	await handler(messageEndEvent(899_999), ctx);
+	assert.equal(stub.messages.length, 1, "cumulative spend (2,499,998) still below the standard soft total");
 	await handler(messageEndEvent(WORKER_HARD_BUDGET), ctx);
-	assert.equal(stub.messages.length, 1, "the steer is one-shot");
+	assert.equal(stub.messages.length, 2, "one context steer + one independent spend steer");
+	const contextSteers = stub.messages.filter((m) => m.customType === WORKER_SOFT_STEER_MESSAGE_TYPE);
+	const spendSteers = stub.messages.filter((m) => m.customType === WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE);
+	assert.equal(contextSteers.length, 1, "the context steer is one-shot");
+	assert.equal(spendSteers.length, 1, "the spend steer is one-shot and fully independent of the context steer");
+	const spend = spendSteers[0]!;
+	assert.equal(spend.display, false, "spend steer is hidden from the TUI");
+	assert.deepEqual(spend.options, { deliverAs: "steer" });
+	assert.match(spend.content, /profile standard/);
+	assert.match(spend.content, /total_tokens 3399998\/3000000/);
+
+	// One-shot again: another soft/hard message re-sends neither steer.
+	await handler(messageEndEvent(899_999), ctx);
+	assert.equal(stub.messages.length, 2, "both steers stay one-shot");
 });
 
 test("commander session never receives the worker soft-budget steer", async () => {
@@ -304,6 +347,183 @@ test("commander session never receives the worker soft-budget steer", async () =
 	assert.ok(messageEnd && messageEnd.length > 0);
 	await messageEnd[0]!(messageEndEvent(WORKER_HARD_BUDGET), fakeCtx([]) as never);
 	assert.equal(stub.messages.length, 0, "the steer is worker-role only");
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2: worker cumulative spend steer wiring (worker token-budget repair)
+// ---------------------------------------------------------------------------
+
+test("worker role sends exactly one hidden cumulative spend steer at the standard soft total boundary", async () => {
+	const stub = makeStub();
+	withWorkerRole(() => workbenchRuntime(stub));
+	const messageEnd = stub.events.get("message_end");
+	assert.ok(messageEnd && messageEnd.length > 0);
+	const handler = messageEnd[0]!;
+	const ctx = fakeCtx([]) as never;
+
+	// 4 x 600,000 = 2,400,000: below the standard soft total (3,000,000) and
+	// below the per-message 80% context threshold (no context steer either).
+	for (let i = 0; i < 4; i++) await handler(messageEndEvent(600_000), ctx);
+	assert.equal(stub.messages.length, 0);
+
+	// The 5th message reaches exactly 3,000,000: the spend band first becomes
+	// soft and exactly one hidden spend steer fires (total_tokens dimension).
+	await handler(messageEndEvent(600_000), ctx);
+	assert.equal(stub.messages.length, 1);
+	const steer = stub.messages[0]!;
+	assert.equal(steer.customType, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE);
+	assert.equal(steer.display, false, "spend steer is hidden from the TUI");
+	assert.deepEqual(steer.options, { deliverAs: "steer" }, "delivered in the active tool loop, not deferred to a future user turn");
+	assert.match(steer.content, /profile standard/);
+	assert.match(steer.content, /total_tokens 3000000\/3000000/);
+	assert.match(steer.content, /Stop starting new implementation work now/);
+	assert.match(steer.content, /handoff/i);
+
+	// One-shot: further soft-band messages never re-send the steer.
+	await handler(messageEndEvent(600_000), ctx);
+	await handler(messageEndEvent(600_000), ctx);
+	assert.equal(stub.messages.length, 1, "the spend steer is one-shot");
+});
+
+test("worker role spend steer fires on the turns dimension (low profile, exact soft boundary)", async () => {
+	const stub = makeStub();
+	withWorkerRoleAndSpendProfile("low", () => workbenchRuntime(stub));
+	const messageEnd = stub.events.get("message_end");
+	assert.ok(messageEnd && messageEnd.length > 0);
+	const handler = messageEnd[0]!;
+	const ctx = fakeCtx([]) as never;
+
+	// 7 x 100 tokens: 7 turns stay below the low soft turns limit (8).
+	for (let i = 0; i < 7; i++) await handler(messageEndEvent(100), ctx);
+	assert.equal(stub.messages.length, 0);
+
+	// The 8th turn reaches the low soft turns limit exactly: one steer naming
+	// the low profile and the turns dimension.
+	await handler(messageEndEvent(100), ctx);
+	assert.equal(stub.messages.length, 1);
+	const steer = stub.messages[0]!;
+	assert.equal(steer.customType, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE);
+	assert.match(steer.content, /profile low/);
+	assert.match(steer.content, /turns 8\/8/);
+
+	// One-shot: two more turns re-send nothing.
+	await handler(messageEndEvent(100), ctx);
+	await handler(messageEndEvent(100), ctx);
+	assert.equal(stub.messages.length, 1);
+});
+
+test("worker role spend steer fires on the output dimension at the exact soft boundary", async () => {
+	const stub = makeStub();
+	withWorkerRole(() => workbenchRuntime(stub));
+	const messageEnd = stub.events.get("message_end");
+	assert.ok(messageEnd && messageEnd.length > 0);
+	const handler = messageEnd[0]!;
+	const ctx = fakeCtx([]) as never;
+
+	// 3 x 30,000 output = 90,000: below the standard soft output (120,000).
+	for (let i = 0; i < 3; i++) await handler(messageEndEvent(30_030, { output: 30_000 }), ctx);
+	assert.equal(stub.messages.length, 0);
+
+	// The 4th message reaches exactly 120,000 output: one steer naming the
+	// output_tokens dimension (cumulative total 120,120 stays below the
+	// standard soft total and 4 turns below the soft turns limit).
+	await handler(messageEndEvent(30_030, { output: 30_000 }), ctx);
+	assert.equal(stub.messages.length, 1);
+	const steer = stub.messages[0]!;
+	assert.equal(steer.customType, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE);
+	assert.match(steer.content, /profile standard/);
+	assert.match(steer.content, /output_tokens 120000\/120000/);
+});
+
+test("spend steer fires when the band first becomes hard (soft steer, hard band)", async () => {
+	const stub = makeStub();
+	// Low profile: soft total 750,000, hard total 1,250,000. Per-message
+	// totals stay below 800,000 so the context steer never fires.
+	withWorkerRoleAndSpendProfile("low", () => workbenchRuntime(stub));
+	const messageEnd = stub.events.get("message_end");
+	assert.ok(messageEnd && messageEnd.length > 0);
+	const handler = messageEnd[0]!;
+	const ctx = fakeCtx([]) as never;
+
+	// One message at 700,000: below the low soft total — band ok, no steer.
+	await handler(messageEndEvent(700_000), ctx);
+	assert.equal(stub.messages.length, 0);
+
+	// The second message jumps the cumulative total to 1,400,000: the FIRST
+	// non-ok band is HARD and still triggers exactly one soft steer.
+	await handler(messageEndEvent(700_000), ctx);
+	assert.equal(stub.messages.length, 1);
+	const steer = stub.messages[0]!;
+	assert.equal(steer.customType, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE);
+	assert.match(steer.content, /profile low/);
+	assert.match(steer.content, /total_tokens 1400000\/750000/, "the steer text renders soft-limit denominators");
+	await handler(messageEndEvent(700_000), ctx);
+	assert.equal(stub.messages.length, 1, "one-shot even when the band stays hard");
+});
+
+test("malformed spend-profile env falls back to standard defensively", async () => {
+	const stub = makeStub();
+	withWorkerRoleAndSpendProfile("bogus-profile", () => workbenchRuntime(stub));
+	const messageEnd = stub.events.get("message_end");
+	assert.ok(messageEnd && messageEnd.length > 0);
+	const handler = messageEnd[0]!;
+	const ctx = fakeCtx([]) as never;
+
+	// 5 x 600,000 = 3,000,000: the STANDARD soft total boundary. The fallback
+	// profile is standard (low would steer at 750,000, extended at 8,000,000).
+	for (let i = 0; i < 5; i++) await handler(messageEndEvent(600_000), ctx);
+	assert.equal(stub.messages.length, 1);
+	assert.equal(stub.messages[0]!.customType, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE);
+	assert.match(stub.messages[0]!.content, /profile standard/);
+});
+
+test("commander session never receives the spend steer even with a profile env set", async () => {
+	const stub = makeStub();
+	const previous = process.env[WORKER_SPEND_PROFILE_ENV];
+	process.env[WORKER_SPEND_PROFILE_ENV] = "low";
+	try {
+		// No WORKER role env: this is a commander session despite the env.
+		workbenchRuntime(stub);
+	} finally {
+		if (previous === undefined) delete process.env[WORKER_SPEND_PROFILE_ENV];
+		else process.env[WORKER_SPEND_PROFILE_ENV] = previous;
+	}
+	const messageEnd = stub.events.get("message_end");
+	assert.ok(messageEnd && messageEnd.length > 0);
+	const handler = messageEnd[0]!;
+	// 9 turns would cross the low soft turns limit (8) in a worker session.
+	for (let i = 0; i < 9; i++) await handler(messageEndEvent(100), fakeCtx([]) as never);
+	assert.equal(stub.messages.length, 0, "the spend steer never reaches a commander session");
+});
+
+test("a spend steer send failure is swallowed and never breaks a model request", async () => {
+	const stub = makeStub();
+	withWorkerRole(() => workbenchRuntime(stub));
+	const originalSend = stub.sendMessage;
+	stub.sendMessage = ((
+		message: Parameters<typeof stub.sendMessage>[0],
+		options?: Parameters<typeof stub.sendMessage>[1],
+	) => {
+		if (message.customType === WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE) throw new Error("steer send failed");
+		originalSend(message, options);
+	}) as typeof stub.sendMessage;
+	const messageEnd = stub.events.get("message_end");
+	assert.ok(messageEnd && messageEnd.length > 0);
+	const handler = messageEnd[0]!;
+	const ctx = fakeCtx([]) as never;
+
+	// 5 x 600,000 crosses the standard soft total on the 5th message; the
+	// send throws inside the handler and is swallowed — the handler resolves.
+	for (let i = 0; i < 5; i++) {
+		await assert.doesNotReject(handler(messageEndEvent(600_000), ctx) as Promise<unknown>);
+	}
+	assert.equal(stub.messages.length, 0, "the failing spend steer is never recorded as sent");
+	// The one-shot flag stays unset, so a later soft-band message retries; the
+	// failure is still swallowed and the request keeps working.
+	for (let i = 0; i < 3; i++) {
+		await assert.doesNotReject(handler(messageEndEvent(600_000), ctx) as Promise<unknown>);
+	}
+	assert.equal(stub.messages.length, 0);
 });
 
 // ---------------------------------------------------------------------------
