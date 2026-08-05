@@ -48,9 +48,13 @@ lease adds `edit`/`write` to Sol's strict set. Every delegation is recorded
 in a bounded before/after ledger that starts `PENDING_REVIEW`; a pending or
 stale review blocks the next delegation and VERIFY until Sol reviews the
 actual diff (`workbench_review_worker_diff`). The worker's context is
-budget-protected (1,000,000-token window; one hidden steer at 80%,
-fail-closed termination at 90%, worker
-compaction cancelled — commander compaction unchanged).
+budget-protected — per-message context safety, unchanged: 1,000,000-token
+window, one hidden steer at 80% (800k), fail-closed termination at 90%
+(900k), worker compaction cancelled, commander compaction unchanged. Every
+delegation additionally runs under a fixed **cumulative spend budget**
+(turns / total tokens / output tokens across the whole run; optional
+`budget_profile` — see
+[Worker cumulative spend budget](#worker-cumulative-spend-budget)).
 
 Documentation: [docs/architecture.md](docs/architecture.md) ·
 [docs/worker-delegation.md](docs/worker-delegation.md) ·
@@ -357,7 +361,7 @@ Custom tools (callable by the model):
 | `workbench_read_gate` | Read a gate run record by `run_id`, or a gate definition by `gate_id` (with latest status). |
 | `workbench_list_gates` | List the gates available for the current profile with their latest status. |
 | `workbench_compare_runs` | Compare two run records by `run_id`: exit code, duration, artifact changes, gate delta, quant metrics (read-only; also available in AUDIT). |
-| `workbench_delegate_worker` | DEV only: GPT-5.6 Sol delegates one scoped task to pinned `deepseek-v4-flash:max`; default is coherent source+tests+docs vertical slices for bounded low/medium-risk work after minimum repository orientation. The worker owns routine local implementation decisions inside the approved contract; Sol owns requirements, cross-cutting architecture, scope, actual-diff review, final gates, and the verdict — worker prose is never acceptance. Worker cannot recurse, use free bash, run final gates, or write outside approved paths. Worker context budget protected: hidden one-shot steer at 80% (800k/1M), fail-closed termination at 90% (900k), compaction cancelled in the worker role and any `compaction_start` event rejects the result. Every outcome (success **and** failure) is recorded in the delegation ledger (`.pi/workbench/delegations/<id>/`) and starts `PENDING_REVIEW`; a pending or stale review blocks the next delegation and VERIFY. |
+| `workbench_delegate_worker` | DEV only: GPT-5.6 Sol delegates one scoped task to pinned `deepseek-v4-flash:max`; default is coherent source+tests+docs vertical slices for bounded low/medium-risk work after minimum repository orientation. The worker owns routine local implementation decisions inside the approved contract; Sol owns requirements, cross-cutting architecture, scope, actual-diff review, final gates, and the verdict — worker prose is never acceptance. Worker cannot recurse, use free bash, run final gates, or write outside approved paths. Worker context safety (unchanged): hidden one-shot steer at 80% (800k/1M), fail-closed termination at 90% (900k), compaction cancelled in the worker role and any `compaction_start` event rejects the result. Cumulative spend budget: optional `budget_profile` (`low`/`standard`/`extended`; omitted → `standard`; `extended` explicit Sol-approved only, never inferred or auto-promoted) bounds turns/total/output tokens across the run — one hidden soft handoff steer, fail-closed hard stop, numeric-only progress. Every outcome (success **and** failure) is recorded in the delegation ledger (`.pi/workbench/delegations/<id>/`) and starts `PENDING_REVIEW`; a pending or stale review blocks the next delegation and VERIFY. |
 | `workbench_review_worker_diff` | Sol reviews one delegation's actual diff: real git state vs the recorded before snapshot, every worker path scope-checked against the parent-approved `allowed_paths` (realpath/symlink-safe — `include_paths` narrows only the patch and can never hide a violation), current vs recorded after diff hash (mismatch/drift are warnings), bounded redacted patch, notes on the worker's `## Files Changed` section vs the actual diff. Verdict `PASS` marks the delegation REVIEWED (bound to the reviewed hash); `FAIL` keeps it PENDING_REVIEW. |
 | `workbench_delegation_status` | Write authority + delegation review status: actor, fixed policy, lease status (bounded summary — never token parts), latest delegation, review status, current/reviewed diff hashes, blocked write attempts, latest review verdict. Refreshes against the real git diff — any change after REVIEWED turns the delegation STALE. |
 
@@ -420,6 +424,78 @@ exception is a **temporary commander write lease**, issued only by the human
   the trimmed `status` subcommand and prints actor, fixed policy, lock status
   and a bounded lease summary — never any token part.
 
+### Worker cumulative spend budget
+
+Beyond the unchanged per-message context safety (1,000,000-token window,
+800k soft steer, 900k hard stop), every delegation run is also bounded by a
+**cumulative spend budget** (`core/worker-spend.ts`): turns, cumulative
+total tokens, and cumulative output tokens accumulated across the whole
+run. The profile is fixed per delegation — never switched mid-run:
+
+| Profile | Soft — one hidden handoff steer (turns / total / output) | Hard — fail-closed stop (turns / total / output) |
+| ------- | ------------------------------------------------------- | ------------------------------------------------ |
+| `low` (explicit opt-in) | 8 / 750,000 / 40,000 | 12 / 1,250,000 / 75,000 |
+| `standard` (default) | 24 / 3,000,000 / 120,000 | 36 / 5,000,000 / 200,000 |
+| `extended` (explicit Sol-approved only) | 48 / 8,000,000 / 200,000 | 64 / 12,000,000 / 300,000 |
+
+Semantics:
+
+- **Counting.** `cacheRead` tokens count in the cumulative total (cache-hit
+  input is billed, so it is real spend); malformed, non-finite or negative
+  usage and state normalize defensively to zero — never NaN, never a throw.
+  "Reached" means at or above the limit (`>=`).
+- **Band.** Any hard dimension reached → `hard` (hard always wins over
+  soft); else any soft dimension → `soft`; else `ok`. Triggered reasons are
+  listed in the fixed order `turns`, `total_tokens`, `output_tokens`.
+- **Soft.** The first time the band is soft, the worker-role lifecycle
+  sends exactly one hidden worker-only handoff steer (`display: false`,
+  `deliverAs: "steer"`): stop new implementation, finish the change in
+  flight, write the concise handoff, and list the remaining work. The steer
+  is a request, not enforcement.
+- **Hard.** Any hard dimension → the runner terminates the child
+  fail-closed. The outcome is recorded in the delegation ledger and starts
+  `PENDING_REVIEW` exactly like every other outcome — the ledger/review
+  workflow is preserved; a hard stop never bypasses review.
+- **Selection.** `budget_profile` is an optional tool parameter (`low` |
+  `standard` | `extended`); omitted resolves deterministically to
+  `standard`. `low` is an explicit tighter opt-in; `extended` is explicit
+  Sol-approved only and is never inferred or auto-promoted. The profile
+  bounds cumulative spend only — it never expands parent-approved
+  path/scope authority:
+
+```json
+{
+  "task": "Implement the documented slice with source, tests and docs",
+  "allowed_paths": ["src/", "tests/", "README.md"],
+  "acceptance_criteria": ["Declared check recipe passes"],
+  "budget_profile": "low"
+}
+```
+
+- **Progress and records.** Progress callbacks carry numeric-only
+  cumulative spend facts (turns / totalTokens / outputTokens / band, plus
+  provider and model identity) — never worker text, reasons, report
+  content, patches, or logs. Final delegation records gain additive,
+  backward-compatible spend facts (resolved profile, final state, band,
+  triggered reasons) on every outcome; pre-repair records without them
+  still parse and are never rewritten.
+- **Collaboration guidance.** Size every delegation as ONE coherent
+  source+tests+docs vertical slice with ample headroom BELOW its soft
+  thresholds — soft is a handoff reserve, hard is failure; neither is a
+  planning target. Unknown-root-cause work is split into bounded diagnosis,
+  a Sol architecture/scope decision, then bounded implementation — never
+  one open-ended worker task. Budgets never expand approved paths or scope.
+- **Activation.** For an existing historical Commander session in this
+  project, run `/reload` while idle so future delegations use the new code;
+  completed or in-flight old delegations are not retroactively budgeted.
+  Workers remain fresh `--no-session` processes on every delegation.
+- **Deferred.** Adaptive reasoning (provider reasoning-effort control)
+  remains deferred and not scheduled pending provider capability evidence;
+  budget profiles remain fixed per delegation. Session
+  cost stays observational (the `COST S:…` status segment and
+  `/q-cost-status`) rather than enforced — the spend budget enforces
+  token/turn counters only.
+
 ### Run artifacts
 
 Each run writes `<project-root>/.pi/workbench/runs/<run-id>/`:
@@ -457,11 +533,16 @@ before.json          # bounded contract (task, allowed paths, acceptance criteri
 after.json           # outcome (success|failure), exit code, pinned identity,
                      # TRUE changed paths since before (digest-based, incl.
                      # previously-dirty paths), after diff hash, usage/budget
-                     # facts, bounded redacted report summary, safe
-                     # reported_paths parsed from the worker's ## Files Changed
-                     # section, review_status: PENDING_REVIEW
+                     # facts, cumulative spend facts (resolved profile, final
+                     # state, band, triggered reasons — bounded structured
+                     # additive facts: no worker text, tool arguments,
+                     # patches, or logs; on every outcome), bounded redacted
+                     # report summary, safe reported_paths parsed from the
+                     # worker's ## Files Changed section, review_status:
+                     # PENDING_REVIEW
 worker-summary.json  # bounded redacted worker facts (provider/model, status,
-                     # exit, turns, stop reason, error, usage, budget, summary)
+                     # exit, turns, stop reason, error, usage, budget, spend,
+                     # summary)
 review.json          # PENDING_REVIEW placeholder at finish; replaced by
                      # workbench_review_worker_diff with the completed record
 ```
@@ -734,8 +815,10 @@ Other versions are untested — no compatibility is claimed for them.
   session context**.
 - Inside a delegated worker process the same event is **cancelled** so a
   worker never silently continues through lossy compaction; the runner
-  also fails closed on any `compaction_start` event and on the pinned 90%
-  hard context budget. Commander compaction behavior is unchanged.
+  also fails closed on any `compaction_start` event, on the pinned 90%
+  hard context budget, and on any hard cumulative spend dimension (see
+  [Worker cumulative spend budget](#worker-cumulative-spend-budget)).
+  Commander compaction behavior is unchanged.
 
 ## Development
 
@@ -829,7 +912,10 @@ extensions/workbench-runtime/   # Pi extension
 └── core/
     ├── mode-policy.ts          # AUDIT/DEV/VERIFY tool sets + hard guard logic
     ├── worker-policy.ts        # commander/model/role/path contract for delegation
-    ├── worker-budget.ts        # pinned worker context budget: 1M window, 80% soft / 90% hard
+    ├── worker-budget.ts        # pinned per-message worker context budget: 1M window,
+    │                           #   80% soft / 90% hard
+    ├── worker-spend.ts         # cumulative delegation spend budget: low/standard/extended
+    │                           #   profiles, soft steer / hard fail-closed (pure)
     ├── write-authority.ts      # P7 worker-first-strict policy, 14-tool Sol allowlist,
     │                           #   commander guard + temporary write lease (pure)
     ├── lease-command.ts        # P7 user-only lease commands: parsing, token generation,
