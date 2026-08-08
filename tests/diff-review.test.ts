@@ -10,8 +10,19 @@
  * recorded-after snapshot to the current tree — same-path later edits are
  * detected, untouched preexisting dirty paths are ignored; later diff
  * changes turn the state STALE in core/delegation-state.ts), report/
- * actual ## Files Changed mismatch warnings, and refusal of
- * unknown/incomplete delegations.
+ * actual ## Files Changed mismatch warnings, refusal of
+ * unknown/incomplete delegations, and Slice B2 displayed-path coverage
+ * (segmented actual-diff review): globally omitted paths stay remaining,
+ * bounded/per-path-truncated entries count as displayed evidence, prior
+ * coverage merges only on the SAME bound hash with valid worker-path
+ * membership (legacy schema_version-1 records infer coverage only from
+ * their persisted patch entries), a hash change resets coverage (this
+ * call's actually rendered paths stay displayed under the new hash),
+ * rendering normalizes legacy/malformed coverage from valid checked
+ * worker paths (absent fields never render zero/zero COMPLETE), hidden
+ * out-of-scope paths always FAIL, same-hash complete PASS rerenders keep
+ * full coverage, and the next include_paths guidance is bounded to 50
+ * paths AND a fixed UTF-8 byte cap with an exact omitted count.
  */
 
 import assert from "node:assert/strict";
@@ -34,10 +45,14 @@ import {
 import {
 	DEFAULT_REVIEW_MAX_BYTES,
 	DEFAULT_REVIEW_MAX_LINES,
+	MAX_REVIEW_GUIDANCE_BYTES,
+	MAX_REVIEW_PATCH_PATHS,
 	readReviewRecord,
 	renderReviewLines,
 	reviewDelegation,
+	reviewRecordRelPath,
 	type ReviewInput,
+	type ReviewRecord,
 } from "../extensions/workbench-runtime/core/diff-review.ts";
 
 const NOW = "2026-06-01T12:00:00.000Z";
@@ -539,5 +554,455 @@ test("review patch defaults are 400 lines / 32 KiB, enforced GLOBALLY over the r
 		const rendered = renderReviewLines(record).join("\n");
 		assert.ok(rendered.includes("review segments via workbench_review_worker_diff include_paths"), "segmented include_paths instruction when truncated");
 		assert.ok(rendered.includes("patch paths (3)"), "bounded path/stat info rendered");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Slice B2 — displayed-path coverage (segmented actual-diff review)
+// ---------------------------------------------------------------------------
+
+test("Slice B2: globally omitted paths stay remaining; include_paths segments merge displayed coverage; bounded truncated entries count; complete only when every worker path rendered", async () => {
+	await withTempDir(async (dir) => {
+		const { id, afterHash } = await setupDelegation(dir, async (d) => {
+			for (const name of ["a.ts", "b.ts", "c.ts"]) {
+				await writeFile(join(d, "src", name), `// ${name}\n` + "line of content\n".repeat(1200), "utf8");
+			}
+		});
+		// Segment 1: the global envelope (default 400 lines / 32 KiB) renders
+		// ONLY a.ts — its entry is line-cut to the remaining budget, so the
+		// bounded entry COUNTS as a.ts's evidence segment; b.ts and c.ts are
+		// globally omitted and must stay remaining.
+		const first = await reviewDelegation(reviewInput(dir, id));
+		assert.ok(first.ok, first.error ?? "review failed");
+		let record = first.record!;
+		assert.equal(record.verdict, "PASS");
+		assert.equal(record.patch_truncated, true);
+		assert.deepEqual(record.patch.map((p) => p.path), ["src/a.ts"], "the global envelope drops b.ts/c.ts entirely");
+		assert.ok(record.patch[0]?.truncated, "the bounded line-cut entry is truncated");
+		assert.deepEqual(record.displayed_paths, ["src/a.ts"], "only actually rendered entries count as displayed");
+		assert.deepEqual(record.remaining_paths, ["src/b.ts", "src/c.ts"], "globally omitted paths stay remaining");
+		assert.equal(record.coverage_complete, false);
+		assert.equal(record.bound_diff_hash, afterHash, "the complete current diff hash binds every segment");
+		assert.equal(record.review_path, reviewRecordRelPath(id));
+		assert.equal(record.review_path, `.pi/workbench/delegations/${id}/review.json`);
+		// The durable review.json is written at the declared project-relative path.
+		const persisted = JSON.parse(await readFile(join(dir, record.review_path), "utf8"));
+		assert.equal(persisted.coverage_complete, false);
+		assert.deepEqual(persisted.displayed_paths, ["src/a.ts"]);
+		assert.ok(await readReviewRecord(dir, id));
+
+		// Segment 2: include_paths narrows the patch to b.ts; same hash merges
+		// the prior displayed coverage.
+		const second = await reviewDelegation(reviewInput(dir, id, { includePaths: ["src/b.ts"] }));
+		assert.ok(second.ok, second.error ?? "review failed");
+		record = second.record!;
+		assert.equal(record.bound_diff_hash, afterHash);
+		assert.deepEqual(record.displayed_paths, ["src/a.ts", "src/b.ts"]);
+		assert.deepEqual(record.remaining_paths, ["src/c.ts"]);
+		assert.equal(record.coverage_complete, false);
+		const rendered2 = renderReviewLines(record).join("\n");
+		assert.ok(rendered2.includes("displayed  : 2 of 3 worker path(s)"), rendered2);
+		assert.ok(rendered2.includes("remaining  : 1 worker path(s)"), rendered2);
+		assert.ok(rendered2.includes("coverage   : INCOMPLETE"), rendered2);
+		assert.ok(rendered2.includes(`next incl. : ["src/c.ts"] (max ${MAX_REVIEW_PATCH_PATHS} paths per call; ≤ ${MAX_REVIEW_GUIDANCE_BYTES} bytes)`), rendered2);
+
+		// Segment 3: the last path completes coverage.
+		const third = await reviewDelegation(reviewInput(dir, id, { includePaths: ["src/c.ts"] }));
+		assert.ok(third.ok, third.error ?? "review failed");
+		record = third.record!;
+		assert.deepEqual(record.displayed_paths, ["src/a.ts", "src/b.ts", "src/c.ts"]);
+		assert.deepEqual(record.remaining_paths, []);
+		assert.equal(record.coverage_complete, true, "no REVIEWED until every worker path is rendered");
+		assert.equal(record.bound_diff_hash, afterHash, "scope checks and the bound hash covered the complete diff in every segment");
+		assert.deepEqual(record.checked_paths.sort(), ["src/a.ts", "src/b.ts", "src/c.ts"]);
+		const rendered = renderReviewLines(record).join("\n");
+		assert.ok(rendered.includes("displayed  : 3 of 3 worker path(s)"), rendered);
+		assert.ok(rendered.includes("remaining  : 0 worker path(s)"), rendered);
+		assert.ok(rendered.includes("coverage   : COMPLETE"), rendered);
+		assert.ok(rendered.includes("next incl. : (none — every worker path displayed for this bound hash)"), rendered);
+		assert.ok(rendered.includes(`review path: .pi/workbench/delegations/${id}/review.json`), rendered);
+		// Deterministic: two renders of the same record are identical.
+		assert.deepEqual(renderReviewLines(record), renderReviewLines(record));
+	});
+});
+
+test("Slice B2: a changed diff hash resets prior displayed coverage; fresh coverage binds the new hash", async () => {
+	await withTempDir(async (dir) => {
+		const { id } = await setupDelegation(dir, async (d) => {
+			await writeFile(join(d, "src", "a.ts"), "a1\n", "utf8");
+			await writeFile(join(d, "src", "b.ts"), "b1\n", "utf8");
+		});
+		const first = await reviewDelegation(reviewInput(dir, id, { includePaths: ["src/a.ts"] }));
+		assert.ok(first.ok && first.record);
+		assert.deepEqual(first.record.displayed_paths, ["src/a.ts"]);
+		assert.deepEqual(first.record.remaining_paths, ["src/b.ts"]);
+
+		// The diff changes after the worker finished (e.g. a commander edit).
+		await writeFile(join(dir, "src", "b.ts"), "b2 — commander edit\n", "utf8");
+		const second = await reviewDelegation(reviewInput(dir, id, { includePaths: ["src/a.ts"] }));
+		assert.ok(second.ok && second.record);
+		assert.notEqual(second.record.bound_diff_hash, first.record.bound_diff_hash);
+		assert.deepEqual(second.record.displayed_paths, ["src/a.ts"], "coverage resets on a hash change — prior-hash coverage does not merge, but this call's rendered path stays displayed");
+		assert.deepEqual(second.record.remaining_paths, ["src/b.ts"], "a.ts was actually rendered under the new hash in THIS call, so it is displayed and NOT remaining");
+		assert.equal(second.record.coverage_complete, false);
+
+		// A full render under the new hash completes coverage.
+		const third = await reviewDelegation(reviewInput(dir, id));
+		assert.ok(third.ok && third.record);
+		assert.equal(third.record.coverage_complete, true);
+		assert.deepEqual(third.record.displayed_paths, ["src/a.ts", "src/b.ts"]);
+		assert.equal(third.record.bound_diff_hash, second.record.bound_diff_hash);
+	});
+});
+
+test("Slice B2: legacy schema_version-1 records stay readable and infer prior coverage only from their persisted patch entries (same hash, valid worker paths only)", async () => {
+	await withTempDir(async (dir) => {
+		const { id } = await setupDelegation(dir, async (d) => {
+			await writeFile(join(d, "src", "a.ts"), "a1\n", "utf8");
+			await writeFile(join(d, "src", "b.ts"), "b1\n", "utf8");
+		});
+		const current = await collectGitFacts(dir, spawnExec);
+		const hash = computeDiffHash(current.changedPaths, current.pathDigests, current.pathStatuses);
+		// Hand-written legacy review.json: schema_version 1 WITHOUT the
+		// additive coverage fields and WITHOUT review_path. Its patch entries
+		// cover a.ts plus a path that is NOT a worker path.
+		const legacy = {
+			schema_version: 1,
+			delegation_id: id,
+			reviewed_at: NOW,
+			verdict: "PASS",
+			bound_diff_hash: hash,
+			recorded_after_hash: hash,
+			mismatch: false,
+			drift_paths: [],
+			violations: [],
+			checked_paths: ["src/a.ts", "src/b.ts"],
+			include_paths: [],
+			patch: [
+				{ path: "src/a.ts", source: "git-diff", text: "diff a", truncated: false },
+				{ path: "not-a-worker-path.ts", source: "git-diff", text: "diff x", truncated: false },
+			],
+			patch_truncated: false,
+			patch_paths: [],
+			notes: [],
+		};
+		const legacyPath = join(dir, ".pi", "workbench", "delegations", id, "review.json");
+		await mkdir(join(dir, ".pi", "workbench", "delegations", id), { recursive: true });
+		await writeFile(legacyPath, JSON.stringify(legacy), "utf8");
+
+		// The legacy record stays readable as a completed review.
+		const readable = await readReviewRecord(dir, id);
+		assert.ok(readable, "legacy schema_version-1 records remain readable");
+		assert.equal(readable.verdict, "PASS");
+
+		// Same-hash segment: prior coverage is inferred ONLY from the legacy
+		// patch entries, filtered to valid worker paths — the foreign path
+		// never counts.
+		const result = await reviewDelegation(reviewInput(dir, id, { includePaths: ["src/b.ts"] }));
+		assert.ok(result.ok && result.record);
+		assert.equal(result.record.bound_diff_hash, hash);
+		assert.deepEqual(result.record.displayed_paths, ["src/a.ts", "src/b.ts"]);
+		assert.deepEqual(result.record.remaining_paths, []);
+		assert.equal(result.record.coverage_complete, true);
+	});
+});
+
+test("Slice B2: legacy coverage merges only on the SAME bound hash — a different hash resets", async () => {
+	await withTempDir(async (dir) => {
+		const { id } = await setupDelegation(dir, async (d) => {
+			await writeFile(join(d, "src", "a.ts"), "a1\n", "utf8");
+			await writeFile(join(d, "src", "b.ts"), "b1\n", "utf8");
+		});
+		const legacyDir = join(dir, ".pi", "workbench", "delegations", id);
+		await mkdir(legacyDir, { recursive: true });
+		// A legacy record binding a DIFFERENT hash with a.ts in its patch.
+		const legacy = {
+			schema_version: 1,
+			delegation_id: id,
+			reviewed_at: NOW,
+			verdict: "PASS",
+			bound_diff_hash: "0".repeat(64),
+			recorded_after_hash: "0".repeat(64),
+			mismatch: false,
+			drift_paths: [],
+			violations: [],
+			checked_paths: ["src/a.ts", "src/b.ts"],
+			include_paths: [],
+			patch: [{ path: "src/a.ts", source: "git-diff", text: "diff a", truncated: false }],
+			patch_truncated: false,
+			patch_paths: [],
+			notes: [],
+		};
+		await writeFile(join(legacyDir, "review.json"), JSON.stringify(legacy), "utf8");
+		const result = await reviewDelegation(reviewInput(dir, id, { includePaths: ["src/b.ts"] }));
+		assert.ok(result.ok && result.record);
+		assert.notEqual(result.record.bound_diff_hash, legacy.bound_diff_hash);
+		assert.deepEqual(result.record.displayed_paths, ["src/b.ts"], "different-hash legacy coverage is never merged — only this call's rendered path displays");
+		assert.deepEqual(result.record.remaining_paths, ["src/a.ts"], "b.ts was actually rendered in THIS call, so only a.ts remains under the new hash");
+		assert.equal(result.record.coverage_complete, false);
+	});
+});
+
+test("Slice B2: a hidden out-of-scope path always FAILs and is never hidden by include_paths narrowing", async () => {
+	await withTempDir(async (dir) => {
+		const { id } = await setupDelegation(
+			dir,
+			async (d) => {
+				await writeFile(join(d, "src", "main.ts"), "ok\n", "utf8");
+				// The worker wrote OUTSIDE the parent-approved scope.
+				await writeFile(join(d, "forbidden.ts"), "x\n", "utf8");
+			},
+			["src/**"],
+		);
+		// include_paths names ONLY the in-scope path — the hidden out-of-scope
+		// path must still FAIL and stay remaining (never displayed).
+		const result = await reviewDelegation(reviewInput(dir, id, { includePaths: ["src/main.ts"] }));
+		assert.ok(result.ok && result.record);
+		assert.equal(result.record.verdict, "FAIL");
+		assert.deepEqual(result.record.violations.map((v) => v.path), ["forbidden.ts"]);
+		assert.deepEqual(result.record.displayed_paths, ["src/main.ts"]);
+		assert.deepEqual(result.record.remaining_paths, ["forbidden.ts"]);
+		assert.equal(result.record.coverage_complete, false);
+		// Rendering every path can complete coverage — but the verdict stays
+		// FAIL: REVIEWED requires scope PASS AND complete coverage.
+		const full = await reviewDelegation(reviewInput(dir, id));
+		assert.ok(full.ok && full.record);
+		assert.equal(full.record.verdict, "FAIL");
+		assert.equal(full.record.coverage_complete, true);
+	});
+});
+
+test("Slice B2: a same-hash complete PASS rerender keeps full displayed coverage", async () => {
+	await withTempDir(async (dir) => {
+		const { id } = await setupDelegation(dir, async (d) => {
+			await writeFile(join(d, "src", "a.ts"), "a1\n", "utf8");
+		});
+		const first = await reviewDelegation(reviewInput(dir, id));
+		assert.ok(first.ok && first.record);
+		assert.equal(first.record.coverage_complete, true);
+		assert.deepEqual(first.record.displayed_paths, ["src/a.ts"]);
+		// A narrowed rerender of the SAME hash keeps the complete binding.
+		const rerender = await reviewDelegation(reviewInput(dir, id, { includePaths: ["src/a.ts"] }));
+		assert.ok(rerender.ok && rerender.record);
+		assert.equal(rerender.record.bound_diff_hash, first.record.bound_diff_hash);
+		assert.equal(rerender.record.coverage_complete, true, "same-hash merge keeps complete coverage");
+		assert.deepEqual(rerender.record.displayed_paths, ["src/a.ts"]);
+		assert.deepEqual(rerender.record.remaining_paths, []);
+	});
+});
+
+test("Slice B2: the next include_paths guidance is bounded to 50 paths with an explicit overflow marker", async () => {
+	await withTempDir(async (dir) => {
+		const names: string[] = [];
+		for (let i = 0; i < 100; i += 1) names.push(`f${String(i).padStart(2, "0")}.ts`);
+		const { id } = await setupDelegation(dir, async (d) => {
+			for (const name of names) await writeFile(join(d, "src", name), "x\n", "utf8");
+		});
+		// A single-path segment leaves 99 remaining paths; the guidance caps
+		// at MAX_REVIEW_PATCH_PATHS (50) with an explicit overflow marker.
+		const result = await reviewDelegation(reviewInput(dir, id, { includePaths: ["src/f00.ts"] }));
+		assert.ok(result.ok && result.record);
+		assert.equal(MAX_REVIEW_PATCH_PATHS, 50);
+		assert.equal(result.record.displayed_paths.length, 1);
+		assert.equal(result.record.remaining_paths.length, 99);
+		const rendered = renderReviewLines(result.record).join("\n");
+		const guidance = rendered.split("\n").find((line) => line.startsWith("next incl. : "));
+		assert.ok(guidance, rendered);
+		assert.ok(guidance!.includes(`(max ${MAX_REVIEW_PATCH_PATHS} paths per call; ≤ ${MAX_REVIEW_GUIDANCE_BYTES} bytes)`), guidance);
+		const quoted = /\[([^\]]*)\]/.exec(guidance!)?.[1] ?? "";
+		assert.equal(quoted.split(",").length, 50, "guidance lists exactly 50 paths");
+		assert.ok(guidance!.includes("+49 more"), guidance);
+		assert.ok(
+			Buffer.byteLength(guidance!, "utf8") <= MAX_REVIEW_GUIDANCE_BYTES + 256,
+			"the whole guidance line stays byte-bounded (fixed suffix over the capped path list)",
+		);
+	});
+});
+
+test("Slice B2: the next include_paths guidance is ALSO bounded by a fixed UTF-8 byte cap — complete usable paths only and an exact omitted count", () => {
+	assert.equal(MAX_REVIEW_GUIDANCE_BYTES, 1024, "the fixed guidance byte cap is 1024 UTF-8 bytes");
+	// Two valid ~400-byte paths and one path that alone exceeds the cap.
+	const longA = `src/${"d".repeat(60)}/${"e".repeat(60)}/${"f".repeat(60)}/${"g".repeat(60)}/${"h".repeat(60)}/${"i".repeat(60)}/${"j".repeat(50)}.ts`;
+	const longB = `src/${"k".repeat(60)}/${"l".repeat(60)}/${"m".repeat(60)}/${"n".repeat(60)}/${"o".repeat(60)}/${"p".repeat(60)}/${"q".repeat(50)}.ts`;
+	const huge = `src/${"r".repeat(200)}/${"s".repeat(200)}/${"t".repeat(200)}/${"u".repeat(200)}/${"v".repeat(200)}/${"w".repeat(200)}/${"x".repeat(300)}.ts`;
+	assert.ok(Buffer.byteLength(longA, "utf8") >= 400, "longA is a ~400-byte valid path");
+	assert.ok(Buffer.byteLength(longB, "utf8") >= 400, "longB is a ~400-byte valid path");
+	assert.ok(Buffer.byteLength(huge, "utf8") > MAX_REVIEW_GUIDANCE_BYTES, "huge alone exceeds the byte cap");
+	const record: ReviewRecord = {
+		schema_version: 1,
+		delegation_id: "20260601-120000-abcd",
+		reviewed_at: NOW,
+		verdict: "PASS",
+		bound_diff_hash: "0".repeat(64),
+		recorded_after_hash: "0".repeat(64),
+		mismatch: false,
+		drift_paths: [],
+		violations: [],
+		checked_paths: ["src/a.ts", longA, longB, huge],
+		include_paths: [],
+		patch: [{ path: "src/a.ts", source: "git-diff", text: "diff", truncated: false }],
+		patch_truncated: false,
+		patch_paths: [{ path: "src/a.ts", source: "git-diff", bytes: 4, truncated: false }],
+		notes: [],
+		displayed_paths: ["src/a.ts"],
+		remaining_paths: [longA, longB, huge],
+		coverage_complete: false,
+		review_path: ".pi/workbench/delegations/20260601-120000-abcd/review.json",
+	};
+	const rendered = renderReviewLines(record).join("\n");
+	const guidance = rendered.split("\n").find((line) => line.startsWith("next incl. : "));
+	assert.ok(guidance, rendered);
+	const quoted = /\[([^\]]*)\]/.exec(guidance!)?.[1] ?? "";
+	const listed = quoted.length === 0 ? [] : quoted.split(",").map((entry) => JSON.parse(entry) as string);
+	assert.ok(listed.length >= 2, `the two ~400-byte paths fit within the byte cap (listed ${listed.length})`);
+	// Every listed path is a COMPLETE usable path string — never truncated.
+	for (const path of listed) {
+		assert.ok([longA, longB].includes(path), `only complete remaining paths are listed, got ${path}`);
+	}
+	assert.ok(guidance!.includes("+1 more"), "the byte-exceeding path is counted exactly in the omitted count");
+	assert.ok(!guidance!.includes(huge.slice(0, 40)), "an overlong path is never truncated into the guidance");
+	// The path list itself never exceeds the fixed byte cap: an unbounded
+	// 50-path line is impossible even with 400-byte paths.
+	const bracketList = quoted.length === 0 ? "[]" : `[${quoted}]`;
+	assert.ok(Buffer.byteLength(bracketList, "utf8") <= MAX_REVIEW_GUIDANCE_BYTES, "guidance path list stays within the byte cap");
+
+	// A remaining path that ALONE exceeds the cap is omitted entirely and
+	// the omitted count stays exact (the guidance never fabricates a path).
+	const hugeFirst: ReviewRecord = { ...record, checked_paths: [huge, "src/a.ts"], displayed_paths: [], remaining_paths: [huge, "src/a.ts"], patch: [], patch_paths: [] };
+	const hugeRendered = renderReviewLines(hugeFirst).join("\n");
+	const hugeGuidance = hugeRendered.split("\n").find((line) => line.startsWith("next incl. : "));
+	assert.ok(hugeGuidance, hugeRendered);
+	assert.ok(!hugeGuidance!.includes(JSON.stringify(huge)), "the overlong path is never listed");
+	assert.ok(hugeGuidance!.includes("+2 more"), "both remaining paths are counted exactly when none fit the byte cap");
+	assert.ok(hugeGuidance!.includes("next incl. : []"), "the empty list stays explicit");
+});
+
+test("Slice B2: renderReviewLines normalizes legacy/malformed coverage from valid checked worker paths — absent fields never render zero/zero COMPLETE", () => {
+	const base: ReviewRecord = {
+		schema_version: 1,
+		delegation_id: "20260601-120000-abcd",
+		reviewed_at: NOW,
+		verdict: "PASS",
+		bound_diff_hash: "0".repeat(64),
+		recorded_after_hash: "0".repeat(64),
+		mismatch: false,
+		drift_paths: [],
+		violations: [],
+		checked_paths: ["src/a.ts", "src/b.ts"],
+		include_paths: [],
+		patch: [{ path: "src/a.ts", source: "git-diff", text: "diff a", truncated: false }],
+		patch_truncated: false,
+		patch_paths: [{ path: "src/a.ts", source: "git-diff", bytes: 6, truncated: false }],
+		notes: [],
+		displayed_paths: [],
+		remaining_paths: [],
+		coverage_complete: false,
+		review_path: ".pi/workbench/delegations/20260601-120000-abcd/review.json",
+	};
+
+	// Legacy schema_version-1 record WITHOUT the additive coverage fields:
+	// displayed is inferred from the persisted patch entries and remaining
+	// from checked_paths — never zero/zero COMPLETE.
+	const legacy: ReviewRecord = {
+		...base,
+		displayed_paths: undefined as unknown as string[],
+		remaining_paths: undefined as unknown as string[],
+		coverage_complete: undefined as unknown as boolean,
+	};
+	const legacyText = renderReviewLines(legacy).join("\n");
+	assert.ok(legacyText.includes("displayed  : 1 of 2 worker path(s)"), legacyText);
+	assert.ok(legacyText.includes("remaining  : 1 worker path(s)"), "remaining is recomputed from checked worker paths");
+	assert.ok(legacyText.includes("coverage   : INCOMPLETE"), "absent coverage fields never render zero/zero COMPLETE");
+
+	// A legacy record whose patch covered EVERY worker path renders COMPLETE.
+	const legacyFull: ReviewRecord = {
+		...base,
+		patch: [
+			{ path: "src/a.ts", source: "git-diff", text: "diff a", truncated: false },
+			{ path: "src/b.ts", source: "git-diff", text: "diff b", truncated: false },
+		],
+		patch_paths: [
+			{ path: "src/a.ts", source: "git-diff", bytes: 6, truncated: false },
+			{ path: "src/b.ts", source: "git-diff", bytes: 6, truncated: false },
+		],
+		displayed_paths: undefined as unknown as string[],
+		remaining_paths: undefined as unknown as string[],
+		coverage_complete: undefined as unknown as boolean,
+	};
+	const legacyFullText = renderReviewLines(legacyFull).join("\n");
+	assert.ok(legacyFullText.includes("displayed  : 2 of 2 worker path(s)"), legacyFullText);
+	assert.ok(legacyFullText.includes("coverage   : COMPLETE"), legacyFullText);
+
+	// Malformed persisted coverage: a foreign displayed path and a persisted
+	// coverage_complete=true with a non-empty remaining — recomputation from
+	// valid checked worker paths wins over both.
+	const malformed: ReviewRecord = {
+		...base,
+		displayed_paths: ["src/a.ts", "not-a-worker.ts"],
+		remaining_paths: [],
+		coverage_complete: true,
+	};
+	const malformedText = renderReviewLines(malformed).join("\n");
+	assert.ok(malformedText.includes("displayed  : 1 of 2 worker path(s)"), "foreign displayed paths are dropped");
+	assert.ok(malformedText.includes("remaining  : 1 worker path(s)"), "remaining is recomputed from checked worker paths");
+	assert.ok(malformedText.includes("coverage   : INCOMPLETE"), "persisted coverage_complete is never trusted over recomputation");
+
+	// Malformed empty displayed_paths but actually rendered patch entries:
+	// the patch entries still count as displayed evidence.
+	const patchOnly: ReviewRecord = {
+		...base,
+		displayed_paths: [],
+		remaining_paths: ["src/a.ts", "src/b.ts"],
+		coverage_complete: false,
+	};
+	const patchOnlyText = renderReviewLines(patchOnly).join("\n");
+	assert.ok(patchOnlyText.includes("displayed  : 1 of 2 worker path(s)"), "actually rendered patch entries count as displayed evidence");
+	assert.ok(patchOnlyText.includes("remaining  : 1 worker path(s)"), patchOnlyText);
+	assert.ok(patchOnlyText.includes("coverage   : INCOMPLETE"), patchOnlyText);
+});
+
+test("Slice B2: same-hash merge never trusts a malformed persisted displayed array — the prior record's actually rendered patch entries still count", async () => {
+	await withTempDir(async (dir) => {
+		const { id } = await setupDelegation(dir, async (d) => {
+			await writeFile(join(d, "src", "a.ts"), "a1\n", "utf8");
+			await writeFile(join(d, "src", "b.ts"), "b1\n", "utf8");
+		});
+		const current = await collectGitFacts(dir, spawnExec);
+		const hash = computeDiffHash(current.changedPaths, current.pathDigests, current.pathStatuses);
+		const legacyDir = join(dir, ".pi", "workbench", "delegations", id);
+		await mkdir(legacyDir, { recursive: true });
+		// Malformed persisted coverage: displayed_paths is EMPTY even though
+		// a.ts was ACTUALLY rendered in the persisted patch.
+		const prior = {
+			schema_version: 1,
+			delegation_id: id,
+			reviewed_at: NOW,
+			verdict: "PASS",
+			bound_diff_hash: hash,
+			recorded_after_hash: hash,
+			mismatch: false,
+			drift_paths: [],
+			violations: [],
+			checked_paths: ["src/a.ts", "src/b.ts"],
+			include_paths: [],
+			patch: [{ path: "src/a.ts", source: "git-diff", text: "diff a", truncated: false }],
+			patch_truncated: false,
+			patch_paths: [],
+			notes: [],
+			displayed_paths: [],
+			remaining_paths: ["src/a.ts", "src/b.ts"],
+			coverage_complete: false,
+		};
+		await writeFile(join(legacyDir, "review.json"), JSON.stringify(prior), "utf8");
+		const result = await reviewDelegation(reviewInput(dir, id, { includePaths: ["src/b.ts"] }));
+		assert.ok(result.ok && result.record);
+		assert.equal(result.record.bound_diff_hash, hash);
+		assert.deepEqual(
+			result.record.displayed_paths,
+			["src/a.ts", "src/b.ts"],
+			"prior patch entries are recomputed into coverage despite the empty malformed array",
+		);
+		assert.deepEqual(result.record.remaining_paths, []);
+		assert.equal(result.record.coverage_complete, true);
 	});
 });

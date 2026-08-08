@@ -1,0 +1,3 @@
+# Frozen fixture: ignore rules for this tree live in .ignore (which pins
+# search/ignored/ for ripgrep). This .gitignore intentionally ignores
+# nothing, so git and the workbench see every frozen file.

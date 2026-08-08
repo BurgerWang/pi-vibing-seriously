@@ -5,10 +5,12 @@
  * 1. Direct load: the extension module is imported and its default export is
  *    invoked with a stub ExtensionAPI — no Pi runtime needed. This is the
  *    "extension direct-load smoke test" as a repeatable unit test.
- * 2. Inventory: the registered command set must be EXACTLY the 28
- *    deterministic workbench commands, the 10 workbench tools, and the 7
- *    prompt templates — no missing, extra, or colliding names. The three
- *    P7 lease commands are user-only: they are commands, never model tools.
+ * 2. Inventory: the registered command set must be EXACTLY the 29
+ *    deterministic workbench commands, the registered tool surface exactly
+ *    the 14 tools (three fixed native read/grep/find overrides first, then
+ *    the 11 workbench catalog tools), and the 7 prompt templates — no
+ *    missing, extra, or colliding names. The P7 lease commands and the P5
+ *    milestone handoff are user-only: they are commands, never model tools.
  */
 
 import assert from "node:assert/strict";
@@ -19,6 +21,8 @@ import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 import workbenchRuntime from "../extensions/workbench-runtime/index.ts";
+import { NATIVE_OVERRIDE_NAMES } from "../extensions/workbench-runtime/core/native-tool-policy.ts";
+import { WORKBENCH_TOOL_NAMES } from "../extensions/workbench-runtime/core/tool-catalog.ts";
 
 /** The deterministic command surface (P5 requirement 七, extended by P6-A). */
 export const EXPECTED_COMMANDS = [
@@ -56,6 +60,8 @@ export const EXPECTED_COMMANDS = [
 	"q-write-policy",
 	"q-commander-write-unlock",
 	"q-commander-write-lock",
+	// P5: user-only milestone session-handoff command.
+	"q-milestone-handoff",
 ] as const;
 
 export const EXPECTED_TOOLS = [
@@ -71,6 +77,8 @@ export const EXPECTED_TOOLS = [
 	"workbench_delegate_worker",
 	"workbench_review_worker_diff",
 	"workbench_delegation_status",
+	// P8b: the public read-only recovery tool is appended LAST (10 → 11).
+	"workbench_recover_tool_result",
 ] as const;
 
 export const EXPECTED_PROMPTS = ["q-audit", "q-plan", "q-build", "q-debug", "q-verify", "q-optimize", "q-review"] as const;
@@ -103,7 +111,7 @@ function makeStub(): ExtensionAPI & Record<string, unknown> {
 	return stub as unknown as ExtensionAPI & Record<string, unknown>;
 }
 
-test("extension module direct-loads and registers exactly the 28 deterministic commands", () => {
+test("extension module direct-loads and registers exactly the 29 deterministic commands", () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	const registered = stub.commands as Map<string, unknown>;
@@ -114,12 +122,21 @@ test("extension module direct-loads and registers exactly the 28 deterministic c
 	);
 });
 
-test("extension registers exactly the 10 workbench tools", () => {
+test("extension registers exactly 14 tools: the three fixed native overrides first, then the 11 workbench catalog tools", () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	const tools = stub.tools as Map<string, unknown>;
-	assert.deepEqual([...tools.keys()].sort(), [...EXPECTED_TOOLS].sort());
-	for (const name of EXPECTED_TOOLS) {
+	// EXPECTED_TOOLS stays the unchanged 11-workbench-tool constant (NRO N1:
+	// the native overrides are same-name overrides, never catalog tools).
+	assert.deepEqual([...EXPECTED_TOOLS], [...WORKBENCH_TOOL_NAMES], "EXPECTED_TOOLS tracks WORKBENCH_TOOL_NAMES");
+	assert.deepEqual(
+		[...tools.keys()],
+		[...NATIVE_OVERRIDE_NAMES, ...EXPECTED_TOOLS],
+		"native read/grep/find fixed first, then the 11 catalog tools in order (14 total)",
+	);
+	const catalogTools = [...tools.keys()].filter((n) => n.startsWith("workbench_"));
+	assert.deepEqual(catalogTools, [...EXPECTED_TOOLS], "catalog subset unchanged");
+	for (const name of catalogTools) {
 		assert.ok(name.startsWith("workbench_"), name);
 	}
 });
@@ -147,12 +164,12 @@ test("extension registers the lifecycle events it relies on", () => {
 	}
 });
 
-test("the three P7 lease commands are user-only — never registered as model tools", () => {
+test("the P7 lease commands and the P5 milestone handoff are user-only — never registered as model tools", () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	const commands = stub.commands as Map<string, unknown>;
 	const tools = stub.tools as Map<string, unknown>;
-	for (const name of ["q-write-policy", "q-commander-write-unlock", "q-commander-write-lock"]) {
+	for (const name of ["q-write-policy", "q-commander-write-unlock", "q-commander-write-lock", "q-milestone-handoff"]) {
 		assert.ok(commands.has(name), `${name} must be registered as a command`);
 		assert.ok(!tools.has(name), `${name} must NOT be registered as a model tool`);
 	}

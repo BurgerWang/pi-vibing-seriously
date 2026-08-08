@@ -6,6 +6,10 @@
  *   PENDING_REVIEW -> REVIEWED -> (current diff hash changes) -> STALE
  *         ^                                                         |
  *         +------------------ re-review (markReviewed) -------------+
+ *   REVIEWED -> PENDING_REVIEW (demoteReviewedToPending): a scope FAIL
+ *   from a re-review of the SAME current diff invalidates a prior
+ *   same-hash REVIEWED state fail-closed (reviewed hash cleared);
+ *   PENDING_REVIEW and STALE are already blocking and are refused
  *
  *   - REVIEWED is always bound to the diff hash that was reviewed; any
  *     change of the current diff hash after a review automatically marks
@@ -156,6 +160,29 @@ export function markReviewed(state: DelegationState, now: string): DelegationTra
 	return {
 		ok: true,
 		state: { ...state, status: "REVIEWED", reviewedDiffHash: state.currentDiffHash, updatedAt: now },
+	};
+}
+
+/**
+ * Demote a REVIEWED delegation back to PENDING_REVIEW and clear the
+ * reviewed hash — the fail-closed invalidation transition for a scope
+ * FAIL that re-reviews the SAME current diff (a review record can no
+ * longer be trusted once the actual-diff review of that hash fails). The
+ * current diff hash is kept (it is still the current diff); PENDING_REVIEW
+ * and STALE are already safely blocking and are refused (unchanged);
+ * without a delegation there is nothing to demote.
+ */
+export function demoteReviewedToPending(state: DelegationState, now: string): DelegationTransitionResult {
+	if (state.latestId === undefined) return { ok: false, error: "no delegation to demote" };
+	if (state.status !== "REVIEWED") {
+		return {
+			ok: false,
+			error: `delegation ${state.latestId} is ${state.status}, not REVIEWED — only a REVIEWED state can be demoted (pending/stale stay blocking)`,
+		};
+	}
+	return {
+		ok: true,
+		state: { ...state, status: "PENDING_REVIEW", reviewedDiffHash: undefined, updatedAt: now },
 	};
 }
 

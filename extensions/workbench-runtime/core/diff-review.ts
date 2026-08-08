@@ -31,18 +31,42 @@
  *     also sets patch_truncated, even when every entry fits the global
  *     envelope. Scope checks and the bound hash always cover the complete
  *     actual worker diff.
+ *   - tracks displayed-path COVERAGE (Slice B2): a path is displayed
+ *     only when it appears in an actually rendered patch entry (a
+ *     globally omitted path never counts; a bounded/per-path-truncated
+ *     entry DOES count as that path's bounded evidence segment); prior
+ *     displayed coverage merges ONLY from the persisted review.json with
+ *     the SAME bound_diff_hash and valid worker-path membership — a hash
+ *     change resets coverage (only prior-hash coverage is dropped; THIS
+ *     call's actually rendered paths stay displayed under the new hash);
+ *     legacy schema_version-1 records without the additive coverage
+ *     fields infer prior coverage ONLY from their persisted patch
+ *     entries, and rendering always recomputes displayed/remaining from
+ *     the record's valid checked worker paths (absent or malformed
+ *     persisted coverage arrays or coverage_complete flags never render
+ *     a false COMPLETE); the record carries displayed_paths /
+ *     remaining_paths / coverage_complete and the durable review.json
+ *     path, and the render shows deterministic counts, a bounded next
+ *     include_paths guidance (max 50 paths AND a fixed UTF-8 byte cap,
+ *     complete paths only, exact omitted count) and the review-complete
+ *     fact. Every review segment still scope-checks EVERY worker path and
+ *     binds the COMPLETE current diff hash — include_paths narrows only
+ *     the rendered patch.
  *   - writes ONLY review.json in the delegation directory and returns the
  *     verdict; the runtime wiring (index.ts) is the only component that
  *     touches the delegation state entry.
  *
  * Verdicts: PASS when no worker path is outside the approved scope;
  * FAIL when any violation exists (the runtime then refuses to mark the
- * delegation REVIEWED). The review never modifies project files and never
- * computes business metrics.
+ * delegation REVIEWED, and a scope FAIL invalidates a prior same-hash
+ * REVIEWED state fail-closed via core/delegation-state.ts). The review
+ * never modifies project files and never computes business metrics.
  */
 
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
+
+import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import { truncateUtf8 } from "../worker/handoff.ts";
 
@@ -68,6 +92,28 @@ export const DEFAULT_REVIEW_MAX_LINES = 400;
 export const DEFAULT_REVIEW_MAX_BYTES = 32 * 1024;
 export const MAX_REVIEW_PATCH_PATHS = 50;
 export const MAX_REVIEW_NOTES = 20;
+
+/**
+ * Fixed UTF-8 byte cap for the rendered next-include guidance path list.
+ * The guidance is bounded by BOTH MAX_REVIEW_PATCH_PATHS and this byte
+ * cap, so an overlong (but valid) remaining path can never produce an
+ * unbounded 50-path line. Paths are only ever included WHOLE (a path
+ * that does not fit is omitted entirely and counted in the exact omitted
+ * count) — no path is ever truncated into the guidance.
+ */
+export const MAX_REVIEW_GUIDANCE_BYTES = 1024;
+
+/**
+ * Durable project-relative review record path, e.g.
+ * `.pi/workbench/delegations/<id>/review.json` — the deterministic
+ * location reviewDelegation writes and reads (Slice B2 renders it).
+ * Throws on an invalid delegation id (path-traversal guard, same as
+ * delegationDirFor).
+ */
+export function reviewRecordRelPath(delegationId: string): string {
+	if (!isValidDelegationId(delegationId)) throw new Error(`invalid delegation id "${delegationId}"`);
+	return `${CONFIG_DIR_NAME}/workbench/delegations/${delegationId}/review.json`;
+}
 
 export type ReviewVerdict = "PASS" | "FAIL";
 
@@ -121,6 +167,22 @@ export interface ReviewRecord {
 	patch_paths: ReviewPatchPathStat[];
 	/** Bounded human notes (mismatch/drift/not-in-diff path warnings). */
 	notes: string[];
+	/**
+	 * Slice B2 coverage facts (additive — schema_version stays 1; legacy
+	 * schema_version-1 records without these fields remain readable and
+	 * infer prior coverage ONLY from their persisted patch entries).
+	 * displayed_paths are the worker paths that appeared in an ACTUALLY
+	 * rendered patch entry (this segment merged with prior same-hash
+	 * persisted coverage); a globally omitted path never counts, while a
+	 * bounded/per-path-truncated entry counts as that path's bounded
+	 * evidence segment. remaining_paths are the not-yet-displayed worker
+	 * paths; coverage_complete is true exactly when remaining is empty.
+	 */
+	displayed_paths: string[];
+	remaining_paths: string[];
+	coverage_complete: boolean;
+	/** Durable project-relative review.json path (reviewRecordRelPath). */
+	review_path: string;
 }
 
 export interface ReviewResult {
@@ -259,6 +321,82 @@ function boundPatchEntries(
 }
 
 /**
+ * Slice B2 coverage facts for one review segment (deterministic).
+ */
+export interface ReviewCoverage {
+	/** Worker paths that appeared in an actually rendered patch entry (sorted). */
+	displayed_paths: string[];
+	/** Worker paths not yet displayed (sorted). */
+	remaining_paths: string[];
+	/** True exactly when every worker path has been displayed. */
+	coverage_complete: boolean;
+}
+
+/**
+ * Merge the displayed-path coverage of one review segment: the paths
+ * ACTUALLY rendered in this call's patch (a globally omitted path never
+ * counts; a bounded/per-path-truncated entry DOES count as that path's
+ * bounded evidence segment) merged with prior persisted coverage that
+ * binds the SAME bound diff hash. Prior coverage is adopted only when the
+ * persisted review.json carries the same bound_diff_hash and its paths
+ * are valid worker paths — on a hash change the coverage resets to this
+ * call's rendered paths only (this call's rendered paths are never
+ * discarded). Legacy schema_version-1 records without the additive
+ * displayed_paths field infer their prior coverage ONLY from their
+ * persisted patch entries; malformed persisted coverage arrays are never
+ * trusted over recomputation from the prior record's valid checked worker
+ * paths and its actually rendered patch entries. Output lists are sorted
+ * deterministically.
+ */
+export function mergeReviewCoverage(
+	workerPaths: readonly string[],
+	renderedPaths: readonly string[],
+	prior: ReviewRecord | null,
+	boundDiffHash: string,
+): ReviewCoverage {
+	const workerSet = new Set(workerPaths);
+	const displayed = new Set<string>();
+	for (const path of renderedPaths) {
+		if (workerSet.has(path)) displayed.add(path);
+	}
+	if (prior && prior.bound_diff_hash === boundDiffHash) {
+		// Prior coverage is RECOMPUTED from the prior record's valid worker
+		// paths: the union of its persisted displayed_paths (when present)
+		// and its ACTUALLY rendered patch entries, each filtered to the
+		// prior record's checked worker paths AND this call's worker paths.
+		// Malformed persisted coverage arrays are never trusted over this
+		// recomputation; a well-formed record is unaffected because its
+		// patch entries are always a subset of its displayed_paths. The
+		// merge stays same-hash only (checked above).
+		const priorChecked = Array.isArray(prior.checked_paths)
+			? prior.checked_paths.filter((p): p is string => typeof p === "string")
+			: [];
+		const priorCheckedSet = new Set(priorChecked);
+		const priorCandidates = Array.isArray(prior.displayed_paths)
+			? [
+					...prior.displayed_paths,
+					...(Array.isArray(prior.patch) ? prior.patch.map((entry) => entry.path) : []),
+				]
+			: // Legacy schema_version-1 record without the additive field:
+			  // prior coverage is inferred ONLY from its persisted patch
+			  // entries (the actually rendered ones).
+			  Array.isArray(prior.patch)
+				? prior.patch.map((entry) => entry.path)
+				: [];
+		for (const path of priorCandidates) {
+			if (typeof path === "string" && priorCheckedSet.has(path) && workerSet.has(path)) displayed.add(path);
+		}
+	}
+	const displayedPaths = [...displayed].sort();
+	const remainingPaths = workerPaths.filter((path) => !displayed.has(path));
+	return {
+		displayed_paths: displayedPaths,
+		remaining_paths: remainingPaths,
+		coverage_complete: remainingPaths.length === 0,
+	};
+}
+
+/**
  * Review one delegation against the real git state. Writes review.json
  * (atomic) and returns the verdict + bounded redacted patch. Never touches
  * the delegation state entry — the runtime does that.
@@ -281,6 +419,12 @@ export async function reviewDelegation(input: ReviewInput): Promise<ReviewResult
 	if (!ledger.after) {
 		return { ok: false, error: `delegation ${delegationId} has no recorded result (still running or incomplete)`, lines: [] };
 	}
+
+	// Slice B2: read the PRIOR persisted review record BEFORE this call
+	// overwrites it — same-hash segments merge displayed coverage; a hash
+	// change resets it. The finish-time PENDING_REVIEW placeholder and
+	// corrupt/foreign records read as null (no prior coverage).
+	const priorReview = await readReviewRecord(projectRoot, delegationId);
 
 	// Real git state NOW — the review inspects the actual tree, never the
 	// ledger's claims. Fail closed: an unavailable `git status` (thrown exec
@@ -413,6 +557,10 @@ export async function reviewDelegation(input: ReviewInput): Promise<ReviewResult
 	});
 
 	const verdict: ReviewVerdict = violations.length > 0 ? "FAIL" : "PASS";
+	// Slice B2 coverage: displayed = actually rendered patch entries this
+	// call, merged with prior same-hash persisted coverage (valid worker
+	// paths only; legacy records infer from their patch entries).
+	const coverage = mergeReviewCoverage(workerPaths, patch.map((entry) => entry.path), priorReview, boundDiffHash);
 	const record: ReviewRecord = {
 		schema_version: REVIEW_SCHEMA_VERSION,
 		delegation_id: delegationId,
@@ -429,6 +577,10 @@ export async function reviewDelegation(input: ReviewInput): Promise<ReviewResult
 		patch_truncated: patchTruncated,
 		patch_paths: patchPathsStat,
 		notes: notes.slice(0, MAX_REVIEW_NOTES),
+		displayed_paths: coverage.displayed_paths,
+		remaining_paths: coverage.remaining_paths,
+		coverage_complete: coverage.coverage_complete,
+		review_path: reviewRecordRelPath(delegationId),
 	};
 
 	try {
@@ -440,15 +592,112 @@ export async function reviewDelegation(input: ReviewInput): Promise<ReviewResult
 	return { ok: true, record, lines: renderReviewLines(record) };
 }
 
+/**
+ * Normalize a review record's coverage facts for rendering — the record's
+ * OWN fields are never trusted blindly: displayed coverage is derived from
+ * the union of its persisted displayed_paths (when present) and its
+ * ACTUALLY rendered patch entries, filtered to the record's valid checked
+ * worker paths; remaining is recomputed from those checked worker paths;
+ * coverage_complete is true exactly when remaining is empty. Legacy
+ * schema_version-1 records without the additive fields therefore render
+ * their persisted patch entries as displayed coverage and their checked
+ * paths as the full set — absent fields NEVER render as zero/zero
+ * COMPLETE, and a persisted coverage_complete flag never overrides the
+ * recomputation. When checked_paths itself is unusable, the persisted
+ * arrays degrade as-is and completeness is only claimed when BOTH arrays
+ * are present and coherent (never invented from absent fields).
+ */
+export function normalizeReviewCoverage(record: ReviewRecord): ReviewCoverage {
+	const checked = Array.isArray(record.checked_paths)
+		? record.checked_paths.filter((p): p is string => typeof p === "string")
+		: null;
+	if (checked !== null) {
+		const checkedSet = new Set(checked);
+		const rawDisplayed = Array.isArray(record.displayed_paths)
+			? [
+					...record.displayed_paths,
+					...(Array.isArray(record.patch) ? record.patch.map((entry) => entry.path) : []),
+				]
+			: // Legacy schema_version-1 record: displayed coverage is inferred
+			  // ONLY from its persisted patch entries (the actually rendered
+			  // ones).
+			  Array.isArray(record.patch)
+				? record.patch.map((entry) => entry.path)
+				: [];
+		const displayedSet = new Set<string>();
+		for (const path of rawDisplayed) {
+			if (typeof path === "string" && checkedSet.has(path)) displayedSet.add(path);
+		}
+		const displayedPaths = [...displayedSet].sort();
+		const remainingPaths = checked.filter((path) => !displayedSet.has(path));
+		return {
+			displayed_paths: displayedPaths,
+			remaining_paths: remainingPaths,
+			coverage_complete: remainingPaths.length === 0,
+		};
+	}
+	// checked_paths unusable: degrade to the persisted arrays when present,
+	// but never claim COMPLETE from absent fields.
+	const hasDisplayed = Array.isArray(record.displayed_paths);
+	const hasRemaining = Array.isArray(record.remaining_paths);
+	const displayedPaths = hasDisplayed
+		? record.displayed_paths.filter((p): p is string => typeof p === "string").sort()
+		: [];
+	const remainingPaths = hasRemaining
+		? record.remaining_paths.filter((p): p is string => typeof p === "string").sort()
+		: [];
+	return {
+		displayed_paths: displayedPaths,
+		remaining_paths: remainingPaths,
+		coverage_complete: hasDisplayed && hasRemaining && displayedPaths.length > 0 && remainingPaths.length === 0,
+	};
+}
+
 /** Plain-text rendering of a review record (print/json mode content). */
 export function renderReviewLines(record: ReviewRecord): string[] {
+	// Slice B2 coverage facts — normalized from the record's VALID checked
+	// worker paths: legacy records without the additive fields render their
+	// persisted patch entries as displayed and checked_paths as the full
+	// set; malformed persisted coverage arrays or a persisted
+	// coverage_complete flag are never trusted over the recomputation
+	// (absent fields never render zero/zero COMPLETE).
+	const coverage = normalizeReviewCoverage(record);
+	const displayedPaths = coverage.displayed_paths;
+	const remainingPaths = coverage.remaining_paths;
+	const coverageComplete = coverage.coverage_complete;
+	const checkedCount = Array.isArray(record.checked_paths) ? record.checked_paths.length : 0;
+	// Next-include guidance bounded by BOTH the path-count cap AND a fixed
+	// UTF-8 byte cap: paths are included WHOLE (never truncated mid-string)
+	// in remaining order while they fit; every path not listed — whether
+	// beyond the count cap or beyond the byte cap — is counted exactly in
+	// the omitted count.
+	const nextInclude: string[] = [];
+	let guidanceBytes = 0;
+	for (const path of remainingPaths) {
+		if (nextInclude.length >= MAX_REVIEW_PATCH_PATHS) break;
+		const quoted = JSON.stringify(path);
+		const entryBytes = Buffer.byteLength(quoted, "utf8") + (nextInclude.length > 0 ? 2 : 0);
+		if (guidanceBytes + entryBytes > MAX_REVIEW_GUIDANCE_BYTES) break;
+		nextInclude.push(path);
+		guidanceBytes += entryBytes;
+	}
+	const nextIncludeOmitted = remainingPaths.length - nextInclude.length;
+	const nextIncludeText =
+		remainingPaths.length === 0
+			? "(none — every worker path displayed for this bound hash)"
+			: `[${nextInclude.map((path) => JSON.stringify(path)).join(", ")}]${nextIncludeOmitted > 0 ? `, … +${nextIncludeOmitted} more` : ""} (max ${MAX_REVIEW_PATCH_PATHS} paths per call; ≤ ${MAX_REVIEW_GUIDANCE_BYTES} bytes)`;
 	const lines = [
 		`delegation : ${record.delegation_id}`,
 		`verdict    : ${record.verdict}`,
 		`reviewed   : ${record.reviewed_at}`,
 		`bound hash : ${record.bound_diff_hash}`,
 		`after hash : ${record.recorded_after_hash}${record.mismatch ? " (MISMATCH)" : ""}`,
-		`checked    : ${record.checked_paths.length} worker path(s)${record.include_paths.length > 0 && record.include_paths.length !== record.checked_paths.length ? `, patch narrowed to ${record.include_paths.length} path(s)` : ""}`,
+		`checked    : ${checkedCount} worker path(s)${record.include_paths.length > 0 && record.include_paths.length !== checkedCount ? `, patch narrowed to ${record.include_paths.length} path(s)` : ""}`,
+		`displayed  : ${displayedPaths.length} of ${checkedCount} worker path(s)`,
+		`remaining  : ${remainingPaths.length} worker path(s)`,
+		`coverage   : ${coverageComplete ? "COMPLETE" : "INCOMPLETE"}${coverageComplete ? " — every worker path displayed for this bound hash" : " — review incomplete until every worker path is displayed (per-path truncated entries count; globally omitted paths do not)"}`,
+		`next incl. : ${nextIncludeText}`,
+		`review path: ${typeof record.review_path === "string" && record.review_path ? record.review_path : reviewRecordRelPath(record.delegation_id)}`,
 	];
 	if (record.violations.length > 0) {
 		lines.push(`violations : ${record.violations.length}`);
@@ -465,7 +714,7 @@ export function renderReviewLines(record: ReviewRecord): string[] {
 		lines.push(`--- ${entry.path} (${entry.source}${entry.truncated ? ", truncated" : ""}) ---`);
 		lines.push(entry.text);
 	}
-	if (record.patch_truncated || record.patch.length === 0) {
+	if (record.patch_truncated || record.patch.length === 0 || remainingPaths.length > 0) {
 		lines.push(
 			"",
 			"Patch content truncated or omitted — review segments via workbench_review_worker_diff include_paths (max 50 paths per call); scope checks and the bound hash always cover the complete actual diff.",

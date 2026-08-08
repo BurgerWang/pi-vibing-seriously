@@ -1,0 +1,11 @@
+{
+  "schema_version": 2,
+  "checks": [
+    { "id": "build", "pattern": "build:\\s*alpha-42\\b" },
+    { "id": "unicode", "pattern": "unicode:\\s*α,\\s*水,\\s*🚀(?:\\s|$)" },
+    { "id": "token", "pattern": "token:\\s*delta-77\\b" },
+    { "id": "needle_occurrences", "pattern": "needle_occurrences:\\s*140\\b" },
+    { "id": "needle_lines", "pattern": "needle_lines:\\s*135\\b" },
+    { "id": "needle_files", "pattern": "needle_files:\\s*4\\b" }
+  ]
+}

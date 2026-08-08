@@ -33,6 +33,7 @@ import {
 	digestFromPrefix,
 	finishDelegationLedger,
 	isDelegationRecordPath,
+	isToolResultReceiptPath,
 	isValidDelegationId,
 	makeDelegationId,
 	normalizeStatusPath,
@@ -237,6 +238,71 @@ test("collectGitFacts fails closed on changed-path overflow: more than MAX_CHANG
 		);
 		assert.equal(facts.changedPaths.length, MAX_CHANGED_PATHS, "ledger records are excluded, never counted toward the cap");
 		assert.ok(facts.changedPaths.every((p) => !isDelegationRecordPath(dir, p)), "no ledger record ever lands in the fact set");
+	});
+});
+
+test("collectGitFacts excludes P8b tool-result receipts exactly (sibling-safe), before the cap, statuses and digests", async () => {
+	await withTempDir(async (dir) => {
+		const makeExec = (statusLines: string[]): ExecFn => {
+			return async (command, args) => {
+				if (command === "git" && args[0] === "rev-parse" && args[1] === "HEAD") {
+					return { stdout: "a".repeat(40), stderr: "", code: 0, killed: false };
+				}
+				if (command === "git" && args[0] === "status") {
+					return { stdout: statusLines.join("\n"), stderr: "", code: 0, killed: false };
+				}
+				return { stdout: "", stderr: "", code: 0, killed: false };
+			};
+		};
+		// The predicate itself is sibling-safe: only the exact receipts
+		// subtree (and the directory itself) matches — never the
+		// `tool-results-extra` sibling prefix nor other workbench subtrees.
+		assert.equal(isToolResultReceiptPath(dir, `${CONFIG_DIR_NAME}/workbench/tool-results`), true);
+		assert.equal(isToolResultReceiptPath(dir, `${CONFIG_DIR_NAME}/workbench/tool-results/x.json`), true);
+		assert.equal(isToolResultReceiptPath(dir, `${CONFIG_DIR_NAME}/workbench/tool-results/sub/dir/y.json`), true);
+		assert.equal(isToolResultReceiptPath(dir, `${CONFIG_DIR_NAME}/workbench/tool-results-extra/x.json`), false);
+		assert.equal(isToolResultReceiptPath(dir, `${CONFIG_DIR_NAME}/workbench/other/x.json`), false);
+		assert.equal(isToolResultReceiptPath(dir, `${CONFIG_DIR_NAME}/workbench/runs/x.json`), false);
+		assert.equal(isToolResultReceiptPath(dir, "src/main.ts"), false);
+
+		// A flood of receipt porcelain lines (beyond the cap alone) plus
+		// exactly MAX_CHANGED_PATHS ordinary paths: receipts are excluded
+		// BEFORE the cap — like delegation records — so the ordinary paths
+		// stay complete and no receipt ever enters changedPaths/statuses/
+		// digests (and thus never any diff-hash input).
+		const receipts = Array.from(
+			{ length: 3000 },
+			(_, i) => `?? ${CONFIG_DIR_NAME}/workbench/tool-results/20260601-120000-${String(i).padStart(4, "0")}.json`,
+		);
+		const ordinary = Array.from({ length: MAX_CHANGED_PATHS }, (_, i) => ` M src/regular-${i}.ts`);
+		const facts = await collectGitFacts(dir, makeExec([...receipts, ...ordinary]));
+		assert.equal(facts.changedPaths.length, MAX_CHANGED_PATHS, "receipts are excluded before the cap — ordinary paths stay complete");
+		assert.ok(facts.changedPaths.every((p) => p.startsWith("src/regular-")), "no receipt path ever lands in the changed path set");
+		assert.equal(Object.keys(facts.pathStatuses).length, MAX_CHANGED_PATHS, "no receipt path ever lands in the status map");
+		assert.ok(Object.keys(facts.pathStatuses).every((p) => p.startsWith("src/regular-")));
+		assert.ok(Object.keys(facts.pathDigests).every((p) => !isToolResultReceiptPath(dir, p)), "no receipt path ever lands in the digest map");
+		assert.equal(facts.gitDirty, true);
+
+		// The exclusion is exact: a nested receipt descendant is still
+		// excluded, while the `tool-results-extra` sibling prefix and other
+		// workbench subtrees stay fully visible with their statuses.
+		const siblingFacts = await collectGitFacts(
+			dir,
+			makeExec([
+				`?? ${CONFIG_DIR_NAME}/workbench/tool-results/x.json`,
+				`?? ${CONFIG_DIR_NAME}/workbench/tool-results/sub/dir/y.json`,
+				`?? ${CONFIG_DIR_NAME}/workbench/tool-results-extra/x.json`,
+				`?? ${CONFIG_DIR_NAME}/workbench/other/x.json`,
+				" M README.md",
+			]),
+		);
+		assert.deepEqual(siblingFacts.changedPaths, [
+			`${CONFIG_DIR_NAME}/workbench/other/x.json`,
+			`${CONFIG_DIR_NAME}/workbench/tool-results-extra/x.json`,
+			"README.md",
+		]);
+		assert.ok(siblingFacts.pathStatuses[`${CONFIG_DIR_NAME}/workbench/tool-results-extra/x.json`], "sibling-prefix path keeps its porcelain status");
+		assert.ok(siblingFacts.pathStatuses[`${CONFIG_DIR_NAME}/workbench/other/x.json`], "other workbench paths keep their porcelain status");
 	});
 });
 

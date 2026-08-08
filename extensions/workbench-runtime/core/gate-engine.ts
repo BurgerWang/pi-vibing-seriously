@@ -39,6 +39,7 @@ import {
 	type WorkerFirstGateFacts,
 	WORKER_FIRST_CHECK_NAMES,
 	QUANT_GATE_ID_RE,
+	GATE_STATUSES,
 } from "./gate-schema.ts";
 import { validateQuantResult } from "./quant-result.ts";
 import { validateQuantContract } from "../cache/quant-contracts.ts";
@@ -46,11 +47,55 @@ import { realpathContained } from "./path-guard.ts";
 import { runRecipe } from "./recipe-runner.ts";
 import type { Recipe } from "./recipe-schema.ts";
 import { recipeMutationBlockReason, type RecipeMutationFacts } from "./worker-policy.ts";
-import { listRuns, makeRunId, readManifest, RUN_SCHEMA_VERSION } from "./runs.ts";
+import { listRuns, makeRunId, readManifest, RUN_SCHEMA_VERSION, type RunRecord } from "./runs.ts";
 import type { WorkbenchMode } from "./mode-policy.ts";
 import { truncateTail } from "@earendil-works/pi-coding-agent";
+import { captureGateValidationEvidence, unavailableEvidenceBlock } from "./validation-evidence.ts";
 
 export const GATE_SCHEMA_VERSION = 1;
+
+/**
+ * P4b: the caller's manual-evidence map trimmed for EVALUATION — every
+ * note trimmed, empty-after-trim notes dropped (a check with an empty
+ * note is NOT_RUN and records NO evidence entry). This is what checks see
+ * and what type "manual" evidence entries persist; it may carry
+ * extra/unknown caller keys that no check consumes — those keys never
+ * reach the persisted evidence and therefore must never enter the
+ * validation binding (see persistedManualEvidence below).
+ */
+export function trimmedManualEvidence(raw: Readonly<Record<string, string>> | undefined): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const [checkId, note] of Object.entries(raw ?? {})) {
+		if (typeof note !== "string") continue;
+		const trimmed = note.trim();
+		if (trimmed.length === 0) continue;
+		out[checkId] = trimmed;
+	}
+	return out;
+}
+
+/**
+ * P4b: the manual evidence map EXACTLY as the persisted evidence.json
+ * records it — recovered from the ACTUAL type "manual" evidence entries of
+ * this run with the SAME check-id/note semantics and last-entry-wins
+ * recovery as readPersistedGateRunFacts (an entry must name its own check;
+ * the trimmed note must be non-empty). The gate binding hash must cover
+ * exactly this map so the persisted gate evidence can reproduce the
+ * privacy-safe hash at assessment time. Extra/unknown caller keys that no
+ * check consumed never appear in evidence.json — they must not enter the
+ * binding either.
+ */
+export function persistedManualEvidence(evidenceByCheck: Readonly<Record<string, CheckRunEntry>>): Record<string, string> {
+	const out: Record<string, string> = {};
+	for (const [checkId, check] of Object.entries(evidenceByCheck)) {
+		for (const entry of check.evidence) {
+			if (entry.type !== "manual" || entry.check_id !== checkId) continue;
+			const note = entry.detail.trim();
+			if (note.length > 0) out[checkId] = note;
+		}
+	}
+	return out;
+}
 
 export class GateSetupError extends Error {
 	constructor(message: string) {
@@ -187,6 +232,167 @@ export async function loadGates(projectRoot: string): Promise<Gate[]> {
 	if (parsed.errors.length > 0) throw new GateSetupError(parsed.errors.join("; "));
 	const config = await loadProjectConfig(projectRoot, { trusted: true });
 	return effectiveGates(config.profile, GATE_CATALOG, parsed.gates);
+}
+
+// ---------------------------------------------------------------------------
+// Persisted gate run record reader (P4b, fail-closed)
+// ---------------------------------------------------------------------------
+
+const MAX_MANUAL_NOTE_CHARS = 262_144;
+
+/**
+ * The bounded source facts a gate-run assessment recovers from the
+ * persisted gate artifacts — gate ids + their resolved prerequisite
+ * statuses (status ONLY; sources/run ids dropped) and the recovered manual
+ * evidence (check id → note, hashed, never rendered raw).
+ */
+export interface PersistedGateRunFacts {
+	/** selector-expanded requested gate ids (as persisted). */
+	requested: string[];
+	gates: Array<{ id: string; prerequisiteStatus: Record<string, GateStatus> }>;
+	/** check id → manual note, recovered from evidence.json type "manual" entries. */
+	manualEvidence: Record<string, string>;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isStringArray(value: unknown): value is string[] {
+	return Array.isArray(value) && value.length <= 500 && value.every((item) => typeof item === "string" && item.length <= 200);
+}
+
+/** Deterministic sorted-set identity of a string array (order-insensitive, duplicate-insensitive). */
+function sortedSetIdentity(values: readonly string[]): string {
+	return [...new Set(values)].sort().join("\u0000");
+}
+
+/** profile is OPTIONAL like the binding: absent or a bounded string — never null. */
+function isOptionalProfile(value: unknown): value is string | undefined {
+	return value === undefined || (typeof value === "string" && value.length <= 200);
+}
+
+/**
+ * Read the persisted gate run artifacts (gates.json + evidence.json) for a
+ * gate run, STRICTLY FAIL CLOSED — any missing/malformed artifact, foreign
+ * schema version, contradictory gates/evidence/manifest identity fact (run
+ * id, requested set, profile/mode), or malformed/extra gate/check shape
+ * returns null — the assessment then refuses reuse. Never throws.
+ *
+ * Strict reconstruction identity:
+ *   - BOTH artifacts must carry the exact current GATE_SCHEMA_VERSION and
+ *     the run id (a missing/foreign evidence schema version is never
+ *     accepted as source evidence);
+ *   - gates.json and evidence.json must agree on the requested set,
+ *     profile (both absent when the project has none) and mode, and both
+ *     must agree with the run manifest's own profile/mode identity;
+ *   - the manifest must identify the run as a gate run of the same id;
+ *   - every gate entry carries a bounded id and a well-formed
+ *     prerequisite_status (status enum only) and its checks array; every
+ *     evidence.json check key is a bounded id that EXACTLY equals its
+ *     check_id AND the gate entries' check-id set — extra (foreign) or
+ *     missing evidence checks are contradictory source evidence;
+ *   - only type "manual" evidence entries are recovered (the source facts
+ *     needed to reproduce the privacy-safe hash): the entry must name its
+ *     own check and carry a bounded note, trimmed exactly like
+ *     trimmedManualEvidence at capture time. Raw notes are hashed by the
+ *     caller and never rendered.
+ */
+export async function readPersistedGateRunFacts(
+	projectRoot: string,
+	runId: string,
+	manifest: Pick<RunRecord, "run_id" | "recipe" | "profile" | "mode">,
+): Promise<PersistedGateRunFacts | null> {
+	const dir = join(runsDir(projectRoot), runId);
+	try {
+		const gatesRaw = JSON.parse(await readFile(join(dir, "gates.json"), "utf8")) as unknown;
+		const evidenceRaw = JSON.parse(await readFile(join(dir, "evidence.json"), "utf8")) as unknown;
+		if (!isRecord(gatesRaw) || !isRecord(evidenceRaw)) return null;
+		if (gatesRaw.schema_version !== GATE_SCHEMA_VERSION || gatesRaw.run_id !== runId) return null;
+		// Strict evidence schema identity: a missing or foreign
+		// schema_version on the evidence artifact is never accepted.
+		if (evidenceRaw.schema_version !== GATE_SCHEMA_VERSION || evidenceRaw.run_id !== runId) return null;
+		if (!isStringArray(gatesRaw.requested) || !isStringArray(evidenceRaw.requested)) return null;
+		// Contradictory requested sets between the two persisted artifacts
+		// cannot be faithfully reconstructed.
+		if (sortedSetIdentity(gatesRaw.requested) !== sortedSetIdentity(evidenceRaw.requested)) return null;
+		// Profile/mode identity must agree across the manifest and BOTH
+		// artifacts (profile is optional — absent on every side when the
+		// project has none; mode is always present).
+		if (!isOptionalProfile(gatesRaw.profile) || !isOptionalProfile(evidenceRaw.profile)) return null;
+		if ((gatesRaw.profile ?? undefined) !== (evidenceRaw.profile ?? undefined)) return null;
+		if (manifest.profile !== (gatesRaw.profile ?? undefined)) return null;
+		if (typeof gatesRaw.mode !== "string" || typeof evidenceRaw.mode !== "string") return null;
+		if (gatesRaw.mode !== evidenceRaw.mode || manifest.mode !== gatesRaw.mode) return null;
+		// Manifest identity: the run must be a gate run of the same id.
+		if (manifest.recipe !== "gate" || manifest.run_id !== runId) return null;
+		if (!Array.isArray(gatesRaw.gates)) return null;
+
+		const gates: PersistedGateRunFacts["gates"] = [];
+		const knownCheckIds = new Set<string>();
+		for (const rawGate of gatesRaw.gates) {
+			if (!isRecord(rawGate) || typeof rawGate.id !== "string" || rawGate.id.length === 0 || rawGate.id.length > 200) return null;
+			const prerequisiteStatus: Record<string, GateStatus> = {};
+			const rawPrereq = rawGate.prerequisite_status;
+			if (rawPrereq !== undefined && rawPrereq !== null) {
+				if (!isRecord(rawPrereq)) return null;
+				for (const [prereqId, facts] of Object.entries(rawPrereq)) {
+					if (!isRecord(facts)) return null;
+					const status = facts.status;
+					if (typeof status !== "string" || !GATE_STATUSES.includes(status as GateStatus)) return null;
+					prerequisiteStatus[prereqId] = status as GateStatus;
+				}
+			}
+			// Gate/check shapes: every gate entry carries its checks array;
+			// each check must be a record with a bounded non-empty id.
+			const rawChecks = rawGate.checks;
+			if (!Array.isArray(rawChecks)) return null;
+			for (const rawCheck of rawChecks) {
+				if (!isRecord(rawCheck)) return null;
+				const checkId = rawCheck.check_id;
+				if (typeof checkId !== "string" || checkId.length === 0 || checkId.length > 200) return null;
+				knownCheckIds.add(checkId);
+			}
+			gates.push({ id: rawGate.id, prerequisiteStatus });
+		}
+
+		// Evidence check shapes: the checks map must be a record whose keys
+		// EXACTLY equal the gate entries' check-id set — extra (foreign) or
+		// missing checks are contradictory source evidence, never accepted.
+		const checks = isRecord(evidenceRaw.checks) ? evidenceRaw.checks : null;
+		if (!checks) return null;
+		if (Object.keys(checks).length !== knownCheckIds.size) return null;
+		// Recover ONLY the manual evidence needed to reproduce the
+		// privacy-safe hash: type "manual" evidence entries only, notes
+		// trimmed exactly like trimmedManualEvidence at capture time. Raw
+		// notes are hashed by the caller and never rendered.
+		const manualEvidence: Record<string, string> = {};
+		for (const [key, rawCheck] of Object.entries(checks)) {
+			if (!isRecord(rawCheck)) return null;
+			const checkId = rawCheck.check_id;
+			if (typeof checkId !== "string" || checkId.length === 0 || checkId.length > 200 || checkId !== key) return null;
+			if (!knownCheckIds.has(checkId)) return null;
+			const evidence = rawCheck.evidence;
+			if (!Array.isArray(evidence)) return null;
+			for (const entry of evidence) {
+				if (!isRecord(entry)) return null;
+				if (typeof entry.type !== "string") return null;
+				// A manual entry must name its own check — a contradictory
+				// check_id is malformed source evidence.
+				if (entry.type === "manual") {
+					if (entry.check_id !== checkId) return null;
+					if (typeof entry.detail !== "string" || entry.detail.length > MAX_MANUAL_NOTE_CHARS) return null;
+					const note = entry.detail.trim();
+					if (note.length > 0) manualEvidence[checkId] = note;
+				} else if (entry.check_id !== undefined && entry.check_id !== checkId) {
+					return null;
+				}
+			}
+		}
+		return { requested: gatesRaw.requested, gates, manualEvidence };
+	} catch {
+		return null;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,6 +1253,14 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 		logLines.push(line);
 	};
 
+	// P4b: the caller's manual evidence map is trimmed ONCE for evaluation
+	// (type "manual" entries persist the trimmed note). The map the
+	// validation binding hashes is derived AFTER evaluation from the ACTUAL
+	// persisted type "manual" entries — the exact map
+	// readPersistedGateRunFacts recovers at assessment time, so the
+	// persisted gate evidence can reproduce the privacy-safe hash.
+	const trimmedManual = trimmedManualEvidence(input.manualEvidence);
+
 	const ctx: CheckContext = {
 		projectRoot,
 		effectiveProjectRoot: config.effectiveProjectRoot,
@@ -1057,7 +1271,7 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 		exec,
 		signal: input.signal,
 		now,
-		manualEvidence: input.manualEvidence ?? {},
+		manualEvidence: trimmedManual,
 		workerFirstFacts: input.workerFirstFacts,
 		actorFacts: input.actorFacts,
 		log,
@@ -1090,6 +1304,12 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 	for (const gateEntry of gateEntries) {
 		for (const c of gateEntry.checks) evidenceByCheck[c.check_id] = c;
 	}
+	// P4b: the binding's manual-evidence map comes from the ACTUAL persisted
+	// type "manual" evidence entries (same last-entry-wins recovery as
+	// readPersistedGateRunFacts) — never from the raw caller map, whose
+	// extra/unknown keys (unselected checks, ghost ids) never persist and
+	// would make the persisted evidence unable to reproduce the hash.
+	const persistedManual = persistedManualEvidence(evidenceByCheck);
 	const evidenceFile = {
 		schema_version: GATE_SCHEMA_VERSION,
 		run_id: runId,
@@ -1109,6 +1329,35 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 	};
 
 	const stdoutView = truncateTail(stdoutFull, { maxLines: 2000, maxBytes: 51200 });
+
+	// P4a: capture the validation binding AFTER evaluation — both PASS and
+	// non-PASS manifests carry it, built from the exact selected/effective/
+	// manual/worker-first/prerequisite facts of THIS run. A capture failure
+	// preserves the gate result and persists bounded unavailable state
+	// (explicitly non-reusable). Prerequisite status facts are reduced to
+	// gateId → status: sources (which embed run ids) never enter the hash.
+	const prerequisiteStatus: Record<string, string> = {};
+	for (const entry of gateEntries) {
+		for (const [gateId, facts] of Object.entries(entry.prerequisite_status)) {
+			prerequisiteStatus[gateId] = facts.status;
+		}
+	}
+	const gateEvidence = await captureGateValidationEvidence({
+		projectRoot,
+		profile: config.profile,
+		mode,
+		exec,
+		selector,
+		requestedGates: requestedIds,
+		effectiveGates: gateEntries.map((g) => g.id),
+		projectGates: config.gates,
+		manualEvidence: persistedManual,
+		workerFirstFacts: input.workerFirstFacts,
+		prerequisiteStatus,
+		actorFacts: input.actorFacts,
+		successful: ok,
+	});
+
 	const manifest = {
 		schema_version: RUN_SCHEMA_VERSION,
 		run_id: runId,
@@ -1131,6 +1380,7 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 		expected_exit_codes: [0],
 		declared_writes: [],
 		environment_names: [],
+		validation_evidence: gateEvidence.ok ? gateEvidence.block : unavailableEvidenceBlock(gateEvidence.reason),
 	};
 
 	const gateSummary: Record<string, GateStatus> = {};

@@ -5,6 +5,9 @@
  * REVIEWED bound to the reviewed diff hash (auto-stale on diff change),
  * the fail-closed hash-binding invariants (REVIEWED reviewed===current,
  * PENDING_REVIEW without reviewed hash, STALE with reviewed !== current),
+ * the fail-closed demoteReviewedToPending invalidation (scope FAIL of the
+ * same current diff demotes REVIEWED to PENDING_REVIEW and clears the
+ * reviewed hash while pending/stale stay safely blocking),
  * blocking of the next delegation and VERIFY while pending/stale,
  * the blocked write-attempt counter, and fail-closed serialization/restore
  * plus the compact-safe summary.
@@ -17,6 +20,7 @@ import {
 	blocksNextDelegation,
 	blocksVerify,
 	delegationCompactSummary,
+	demoteReviewedToPending,
 	emptyDelegationState,
 	hasPendingReview,
 	hasStaleReview,
@@ -169,6 +173,53 @@ test("STALE is resolved by re-reviewing the current diff, which rebinds REVIEWED
 	const staleAgain = observeDiffChange(reReviewed, DIFF_A, LATER);
 	assert.equal(staleAgain.status, "STALE");
 	assert.equal(staleAgain.reviewedDiffHash, DIFF_B);
+});
+
+// ---------------------------------------------------------------------------
+// fail-closed REVIEWED invalidation (Slice B2)
+// ---------------------------------------------------------------------------
+
+test("demoteReviewedToPending invalidates a REVIEWED binding fail-closed: PENDING_REVIEW, reviewed hash cleared, blocking resumes", () => {
+	const reviewed = reviewedOk(recordOk(emptyDelegationState()));
+	const demoted = demoteReviewedToPending(reviewed, LATER);
+	assert.ok(demoted.ok, demoted.ok ? "" : demoted.error);
+	const state = demoted.state;
+	assert.equal(state.status, "PENDING_REVIEW");
+	assert.equal(state.reviewedDiffHash, undefined, "the reviewed hash is cleared");
+	assert.equal(state.currentDiffHash, DIFF_A, "the current diff hash is kept — it is still the current diff");
+	assert.equal(state.latestId, "dlg-1", "the delegation itself is kept");
+	assert.equal(hasPendingReview(state), true);
+	assert.equal(blocksNextDelegation(state), true);
+	assert.equal(blocksVerify(state), true);
+	assert.ok(reviewBlockReason(state, "delegation"));
+	assert.ok(reviewBlockReason(state, "verify"));
+	// The demoted state satisfies the PENDING_REVIEW hash-binding invariant
+	// (no reviewed hash) and round-trips through restore.
+	assert.deepEqual(restoreDelegationState(JSON.parse(JSON.stringify(serializeDelegationState(state)))), state);
+	// The blocked-write counter survives the demotion.
+	assert.equal(state.blockedWriteAttempts, reviewed.blockedWriteAttempts);
+});
+
+test("demoteReviewedToPending refuses PENDING_REVIEW / STALE / empty — those stay safely blocking and untouched", () => {
+	const pending = recordOk(emptyDelegationState());
+	const pendingResult = demoteReviewedToPending(pending, NOW);
+	assert.equal(pendingResult.ok, false);
+	assert.match(pendingResult.ok ? "" : pendingResult.error, /is PENDING_REVIEW, not REVIEWED/);
+	assert.equal(pending.status, "PENDING_REVIEW");
+	assert.equal(blocksNextDelegation(pending), true);
+
+	const reviewed = reviewedOk(recordOk(emptyDelegationState()));
+	const stale = observeDiffChange(reviewed, DIFF_B, LATER);
+	const staleResult = demoteReviewedToPending(stale, NOW);
+	assert.equal(staleResult.ok, false);
+	assert.match(staleResult.ok ? "" : staleResult.error, /is STALE, not REVIEWED/);
+	assert.equal(stale.status, "STALE");
+	assert.equal(stale.reviewedDiffHash, DIFF_A, "STALE keeps its reviewed hash");
+	assert.equal(blocksNextDelegation(stale), true);
+	assert.equal(blocksVerify(stale), true);
+
+	assert.equal(demoteReviewedToPending(emptyDelegationState(), NOW).ok, false);
+	assert.deepEqual(emptyDelegationState(), emptyDelegationState());
 });
 
 test("review block reasons name the target and the outstanding review", () => {

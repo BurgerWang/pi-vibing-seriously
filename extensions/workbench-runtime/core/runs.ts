@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { truncateTail } from "@earendil-works/pi-coding-agent";
 
 import { runsDir } from "./config.ts";
+import type { ValidationEvidenceBlock } from "./validation-evidence.ts";
 
 export const RUN_SCHEMA_VERSION = 1;
 
@@ -63,7 +64,8 @@ export interface RunRecord {
 	execution_source?: "exec" | "cache";
 	/** P6-C: action key when execution_source === "cache". */
 	action_key?: string;
-	/** P6-C: hash of the executed argv (values are never stored). */
+	/** P6-C: hash of the executed argv (values are never stored); set for
+	 * exec runs (executed-argv hash) and cache hits (action-key argv hash). */
 	argv_hash?: string;
 	/** P6-C: the run whose cached result was reused. */
 	reused_from_run_id?: string;
@@ -89,6 +91,14 @@ export interface RunRecord {
 	};
 	/** P6-C: evidence locations recorded for this run. */
 	evidence_paths?: string[];
+	/**
+	 * P4a: schema-versioned validation-evidence block. Absent on legacy v1
+	 * records (still parseable — comparison then refuses reuse with
+	 * missing-binding); a binding is present only when capture succeeded,
+	 * otherwise a bounded unavailable_reason marks the record explicitly
+	 * non-reusable.
+	 */
+	validation_evidence?: ValidationEvidenceBlock;
 }
 
 export async function readManifest(projectRoot: string, runId: string): Promise<RunRecord | null> {

@@ -24,6 +24,7 @@ import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { parseRecipesDocument, type Recipe } from "./recipe-schema.ts";
 import { DEFAULT_ACTION_CACHE_MAX_BYTES } from "../cache/action-types.ts";
 import { lexicalContain } from "./path-guard.ts";
+import { parseAdvisoryConfig, type AdvisoryConfig } from "./commander-advisory.ts";
 
 export const WORKBENCH_DIR = "workbench";
 export const RUNS_DIR = "runs";
@@ -69,6 +70,14 @@ export interface ProjectConfig {
 	cacheTelemetry: boolean;
 	/** P6-C: action-cache capacity limit (project.yaml cache.actionCache.maxBytes). */
 	actionCacheMaxBytes: number;
+	/**
+	 * P7 (commander-token-optimization plan §6): observation-only commander
+	 * advisory thresholds (project.yaml commander.advisory.soft/high). Always
+	 * fully resolved — every missing/invalid field inherits the documented
+	 * defaults; invalid fields/ordering are recorded as bounded project.yaml
+	 * ConfigIssue records and never disable observability.
+	 */
+	commanderAdvisory: AdvisoryConfig;
 }
 
 /** The workbench config directory for a project root. */
@@ -255,6 +264,33 @@ export async function loadProjectConfig(projectRoot: string, options: { trusted:
 		}
 	}
 
+	// P7 (commander-token-optimization plan §6): optional observation-only
+	// commander advisory thresholds. project.yaml:
+	//   commander:
+	//     advisory:
+	//       soft: { requests: 200, gross_tokens: 25000000, ... }
+	//       high: { requests: 300, gross_tokens: 40000000, ... }
+	// Each value must be a positive safe integer and each high value must be
+	// greater than its soft value; missing fields inherit the documented
+	// defaults; invalid fields/ordering become bounded project.yaml
+	// ConfigIssue records (hard-capped) and fall back to the defaults —
+	// observability is never disabled and nothing throws.
+	const commanderDoc = projectDoc?.commander;
+	if (commanderDoc !== undefined && (typeof commanderDoc !== "object" || commanderDoc === null || Array.isArray(commanderDoc))) {
+		issues.push({
+			file: "project.yaml",
+			message: '"commander" must be a mapping (e.g. commander: { advisory: { soft: {...}, high: {...} } })',
+		});
+	}
+	const advisoryDoc =
+		typeof commanderDoc === "object" && commanderDoc !== null
+			? (commanderDoc as Record<string, unknown>).advisory
+			: undefined;
+	const parsedAdvisory = parseAdvisoryConfig(advisoryDoc);
+	for (const message of parsedAdvisory.issues) {
+		issues.push({ file: "project.yaml", message });
+	}
+
 	const recipesDoc = documents.get("recipes.yaml");
 	const parsed = parseRecipesDocument(recipesDoc);
 	for (const message of parsed.errors) issues.push({ file: "recipes.yaml", message });
@@ -291,5 +327,6 @@ export async function loadProjectConfig(projectRoot: string, options: { trusted:
 		issues,
 		cacheTelemetry,
 		actionCacheMaxBytes,
+		commanderAdvisory: parsedAdvisory.config,
 	};
 }

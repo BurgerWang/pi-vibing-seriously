@@ -35,7 +35,7 @@ import { STRICT_SOL_DEV_ALLOWLIST } from "../extensions/workbench-runtime/core/w
 // of every mode's set)
 // ---------------------------------------------------------------------------
 
-test("AUDIT tool set is exactly read/grep/find/ls + read-only workbench tools (P3 adds workbench_read_gate/workbench_list_gates; no run tools)", () => {
+test("AUDIT tool set is exactly read/grep/find/ls + read-only workbench tools (P3 adds workbench_read_gate/workbench_list_gates; P8b adds workbench_recover_tool_result; no run tools)", () => {
 	assert.deepEqual(AUDIT_TOOLS, [
 		"read",
 		"grep",
@@ -46,6 +46,7 @@ test("AUDIT tool set is exactly read/grep/find/ls + read-only workbench tools (P
 		"workbench_read_gate",
 		"workbench_list_gates",
 		"workbench_compare_runs",
+		"workbench_recover_tool_result",
 	]);
 	for (const tool of AUDIT_TOOLS) {
 		assert.ok(isToolAllowedInMode("AUDIT", tool), `AUDIT should allow ${tool}`);
@@ -65,8 +66,8 @@ test("DEV tool set contains all local development tools plus all workbench tools
 	}
 });
 
-test("VERIFY tool set has no bash/edit/write/delegation and keeps verification tools", () => {
-	const expected = ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_run_recipe", "workbench_read_run", "workbench_run_gate", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs"];
+test("VERIFY tool set has no bash/edit/write/delegation and keeps verification tools (P8b adds workbench_recover_tool_result)", () => {
+	const expected = ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_run_recipe", "workbench_read_run", "workbench_run_gate", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs", "workbench_recover_tool_result"];
 	assert.deepEqual(VERIFY_TOOLS, expected);
 	for (const tool of expected) {
 		assert.ok(isToolAllowedInMode("VERIFY", tool), `VERIFY should allow ${tool}`);
@@ -237,8 +238,8 @@ test("DEV keeps non-managed custom tools from other extensions", () => {
 
 test("AUDIT and VERIFY tool sets are strict — only their declared tools are kept", () => {
 	const active = ["read", "bash", "workbench_run_recipe", "workbench_gate_check"];
-	assert.deepEqual(computeActiveTools("AUDIT", active), ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_read_run", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs"]);
-	assert.deepEqual(computeActiveTools("VERIFY", active), ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_run_recipe", "workbench_read_run", "workbench_run_gate", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs"]);
+	assert.deepEqual(computeActiveTools("AUDIT", active), ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_read_run", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs", "workbench_recover_tool_result"]);
+	assert.deepEqual(computeActiveTools("VERIFY", active), ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_run_recipe", "workbench_read_run", "workbench_run_gate", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs", "workbench_recover_tool_result"]);
 	assert.ok(!computeActiveTools("VERIFY", active).includes("workbench_delegate_worker"));
 });
 
@@ -265,10 +266,10 @@ const FULL_DEV_ACTIVE = [
 	"a_foreign",
 ];
 
-test("strict Sol DEV: computeActiveTools returns exactly the fixed 14-tool allowlist, no bash/edit/write/foreign", () => {
+test("strict Sol DEV: computeActiveTools returns exactly the fixed 15-tool allowlist, no bash/edit/write/foreign", () => {
 	const tools = computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS);
 	assert.deepEqual(tools, [...STRICT_SOL_DEV_ALLOWLIST], "exact canonical allowlist order");
-	assert.equal(tools.length, 14);
+	assert.equal(tools.length, 15);
 	assert.ok(!tools.includes("bash"));
 	assert.ok(!tools.includes("edit"));
 	assert.ok(!tools.includes("write"));
@@ -303,10 +304,10 @@ test("strict Sol allowlist applies only to the approved Sol identity; workers an
 // P7 slice 3: lease-aware active tool set (active lease enables edit/write)
 // ---------------------------------------------------------------------------
 
-test("strict Sol DEV with an ACTIVE confirmed lease enables exactly its edit/write tools after the canonical 14", () => {
+test("strict Sol DEV with an ACTIVE confirmed lease enables exactly its edit/write tools after the canonical 15", () => {
 	const tools = computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["edit", "write"]);
 	assert.deepEqual(tools, [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
-	assert.equal(tools.length, 16);
+	assert.equal(tools.length, 17);
 	// A write-only lease enables only write.
 	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["write"]), [...STRICT_SOL_DEV_ALLOWLIST, "write"]);
 	// Lease-added tools are CANONICAL and deduplicated: always `edit` then
@@ -318,10 +319,10 @@ test("strict Sol DEV with an ACTIVE confirmed lease enables exactly its edit/wri
 	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["write", "bash", "edit", "web_search", "write"]), [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
 });
 
-test("no lease / empty lease / pending / expired / exhausted / revoked lease returns to exactly the canonical 14", () => {
+test("no lease / empty lease / pending / expired / exhausted / revoked lease returns to exactly the canonical 15", () => {
 	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS), [...STRICT_SOL_DEV_ALLOWLIST], "no lease");
 	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, []), [...STRICT_SOL_DEV_ALLOWLIST], "empty lease tools");
-	assert.equal(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, []).length, 14);
+	assert.equal(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, []).length, 15);
 	// bash can never be enabled through the lease channel (second layer stays authoritative).
 	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["bash", "edit", "write"]), [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
 	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["bash"]), [...STRICT_SOL_DEV_ALLOWLIST]);

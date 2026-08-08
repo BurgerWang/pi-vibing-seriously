@@ -74,6 +74,8 @@ export const AUDIT_TOOLS: readonly string[] = [
 	"workbench_read_gate",
 	"workbench_list_gates",
 	"workbench_compare_runs",
+	// P8b: the read-only recovery tool joins the AUDIT read-only set.
+	"workbench_recover_tool_result",
 ];
 export const DEV_TOOLS: readonly string[] = [
 	"read",
@@ -97,6 +99,8 @@ export const VERIFY_TOOLS: readonly string[] = [
 	"workbench_read_gate",
 	"workbench_list_gates",
 	"workbench_compare_runs",
+	// P8b: the read-only recovery tool joins the VERIFY read-only set.
+	"workbench_recover_tool_result",
 ];
 
 export const MODE_TOOLS: Readonly<Record<WorkbenchMode, readonly string[]>> = {
@@ -161,9 +165,9 @@ export function isToolHardDenied(mode: WorkbenchMode, toolName: string): boolean
  * EXACTLY the fixed STRICT_SOL_DEV_ALLOWLIST in its canonical order — no
  * bash/edit/write, no foreign tools, never the order Pi or another
  * extension reports them in. An ACTIVE confirmed user-issued write lease
- * additionally enables exactly its edit/write tools AFTER the canonical 14
+ * additionally enables exactly its edit/write tools AFTER the canonical 15
  * (never bash; pending/expired/exhausted/revoked leases — or no lease —
- * leave the exact 14). Delegated workers and other controllers are OUTSIDE
+ * leave the exact 15). Delegated workers and other controllers are OUTSIDE
  * that policy: they keep the existing DEV behavior below (foreign tools
  * preserved in deterministic sorted order), which the worker role filter
  * (worker-policy.ts) then narrows. AUDIT and VERIFY remain strict for

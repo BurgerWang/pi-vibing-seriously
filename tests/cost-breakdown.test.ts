@@ -18,6 +18,14 @@
  *   - command inventory + behavior: the registered /q-cost-status handler
  *     prints exact commander/worker/other/total and per-model rows in TUI
  *     (notify) and print (stdout) modes
+ *   - P0 exact commander gross facts rendering: full unabridged digits
+ *     (exact gross = input + output + cacheRead + cacheWrite) even when the
+ *     compact bucket row shows k/M; deterministic one-decimal cacheRead
+ *     share (0.0%, 100.0%, explicit N/A on a zero gross); malformed /
+ *     non-finite / negative counts never render NaN/Infinity; above-bound
+ *     counts clamp to MAX_COMMANDER_COUNT_DISPLAY with an explicit note —
+ *     every rendered line stays under the per-line byte bound and output
+ *     is deterministic
  */
 
 import assert from "node:assert/strict";
@@ -30,8 +38,14 @@ import {
 	costStatusSegment,
 	formatCost,
 	formatTokens,
+	MAX_COMMANDER_COUNT_DISPLAY,
+	MAX_TOOL_NAME_BYTES,
+	MAX_TOOL_ROWS,
 	renderCostBreakdown,
+	toolResultTextBytes,
 	WORKER_TOOL_NAME,
+	type CostBreakdown,
+	type CostTotals,
 } from "../extensions/workbench-runtime/core/cost-breakdown.ts";
 import { buildStatusLine } from "../extensions/workbench-runtime/core/status.ts";
 import workbenchRuntime from "../extensions/workbench-runtime/index.ts";
@@ -531,4 +545,493 @@ test("q-cost-status works in print mode via the stdout fallback", async () => {
 	assert.equal(logs.length, 1, "print mode falls back to stdout");
 	assert.ok((logs[0] ?? "").includes("commander"), logs[0]);
 	assert.ok((logs[0] ?? "").includes("$19.195"), logs[0]);
+});
+
+// ------------------------------------------------ P0 session facts (additive)
+
+function byteLength(text: string): number {
+	return new TextEncoder().encode(text).length;
+}
+
+/** True when a string contains a lone (unpaired) UTF-16 surrogate. */
+function hasLoneSurrogate(text: string): boolean {
+	for (let i = 0; i < text.length; i++) {
+		const code = text.charCodeAt(i);
+		if (code >= 0xd800 && code <= 0xdbff) {
+			const next = text.charCodeAt(i + 1);
+			if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+			i++;
+		} else if (code >= 0xdc00 && code <= 0xdfff) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function textToolResult(toolName: string, content?: unknown, extra: Record<string, unknown> = {}) {
+	return { type: "message", message: { role: "toolResult", toolName, content, ...extra } };
+}
+
+test("commanderRequests counts every commander assistant turn exactly once, usage-independent", () => {
+	const entries = [
+		assistant("openai-codex", "gpt-5.6-sol", usage(100, 10, 0, 0, 0.5)),
+		assistant("openai", "gpt-5.6-sol", undefined), // no usage object
+		{ type: "message", message: { role: "assistant", provider: "openai", model: "gpt-5.6-sol", usage: null } },
+		{ type: "message", message: { role: "user", content: "hi" } },
+		toolResult("read", usage(1, 1, 0, 0, 0.01)),
+	];
+	const b = buildCostBreakdown(entries);
+	assert.equal(b.commanderRequests, 3, "turns count even when usage facts are missing");
+	assert.equal(b.commander.cost, 0.5, "cost semantics unchanged (usage-less turns add zero)");
+	assert.equal(b.commander.tokens, 110);
+	assert.equal(b.total.tokens, 112, "usage-less turns contribute zero tokens");
+});
+
+test("compactions counts exactly the compaction entries, usage-independent", () => {
+	const entries = [
+		compaction(usage(10, 5, 0, 0, 0.01)),
+		{ type: "compaction", summary: "s", firstKeptEntryId: "x", tokensBefore: 0 }, // no usage
+		compaction(usage(0, 0, 0, 0, 0)),
+		branchSummary(usage(1, 1, 0, 0, 0.02)), // branch summaries are NOT compactions
+	];
+	const b = buildCostBreakdown(entries);
+	assert.equal(b.compactions, 3);
+	assert.equal(b.other.cost, 0.01 + 0.02, "cost semantics unchanged");
+});
+
+test("pending assistant message counts exactly once in commanderRequests (never double-counted)", () => {
+	const pending = { role: "assistant", provider: "openai-codex", model: "gpt-5.6-sol", timestamp: 123, usage: usage(10, 5, 0, 0, 0.1) };
+	const beforePersistence = buildCostBreakdown([], pending);
+	assert.equal(beforePersistence.commanderRequests, 1, "pending turn visible before persistence");
+	assert.equal(beforePersistence.commander.cost, 0.1);
+	// timestamp+role dedupe: the persisted copy is never double-counted
+	const afterPersistence = buildCostBreakdown([{ type: "message", message: { ...pending } }], pending);
+	assert.equal(afterPersistence.commanderRequests, 1);
+	assert.equal(afterPersistence.commander.cost, 0.1);
+	// identity dedupe (no timestamp): the same object is counted once
+	const untimestamped = { role: "assistant", provider: "p", model: "m", usage: usage(1, 1, 0, 0, 0.01) };
+	const identity = buildCostBreakdown([{ type: "message", message: untimestamped }], untimestamped);
+	assert.equal(identity.commanderRequests, 1);
+	assert.equal(identity.commander.cost, 0.01);
+});
+
+test("toolResultEntries counts every toolResult entry, usage-independent", () => {
+	const entries = [
+		toolResult("read", usage(10, 5, 0, 0, 0.01)),
+		toolResult("workbench_run_recipe", undefined), // no usage object
+		{ type: "message", message: { role: "toolResult", toolName: "ls" } }, // no usage at all
+		{ type: "message", message: "not-an-object" }, // malformed -> never counted
+		{ type: "message", message: { role: "user", content: "x" } }, // not a toolResult
+		compaction(usage(1, 1, 0, 0, 0.02)),
+	];
+	const b = buildCostBreakdown(entries);
+	assert.equal(b.toolResultEntries, 3, "entries that enter context count even without usage");
+	assert.equal(b.other.cost, 0.01 + 0.02, "cost semantics unchanged (usage-less toolResults add zero)");
+});
+
+test("toolResultTextBytes: exact UTF-8 bytes for string and text-array content", () => {
+	const stringEntry = textToolResult("read", "héllo🧪");
+	assert.equal(toolResultTextBytes(stringEntry), byteLength("héllo🧪"));
+	const arrayEntry = textToolResult("read", [
+		{ type: "text", text: "abc" },
+		{ type: "text", text: "é" },
+		{ type: "image", image: "data:..." }, // non-text item ignored
+		{ type: "text", text: "🧪" },
+		"plain-string-item", // non-object item ignored
+	]);
+	assert.equal(toolResultTextBytes(arrayEntry), byteLength("abc") + byteLength("é") + byteLength("🧪"));
+	// end-to-end through buildCostBreakdown
+	const b = buildCostBreakdown([stringEntry, arrayEntry]);
+	assert.equal(b.toolTextBytesTotal, toolResultTextBytes(stringEntry) + toolResultTextBytes(arrayEntry));
+	assert.deepEqual(b.toolTextBytes, [{ toolName: "read", count: 2, textBytes: b.toolTextBytesTotal }]);
+	assert.equal(b.toolResultEntries, 2);
+});
+
+test("non-text and malformed content contributes zero bytes and never throws", () => {
+	const cases = [
+		textToolResult("t", 42),
+		textToolResult("t", null),
+		textToolResult("t"),
+		textToolResult("t", [{ type: "image", image: "x" }, { type: "text" }, 7, "s", null]),
+		{ type: "message", message: { role: "assistant", content: "assistant text is never counted" } },
+		{ type: "message", message: "broken" },
+		"garbage",
+		null,
+		undefined,
+	];
+	for (const entry of cases) {
+		assert.equal(toolResultTextBytes(entry), 0);
+	}
+	const b = buildCostBreakdown(cases);
+	assert.equal(b.toolTextBytesTotal, 0);
+	assert.equal(b.toolResultEntries, 4, "the four well-formed toolResult entries still count");
+});
+
+test("malformed tool results group under the (unknown) tool deterministically", () => {
+	const entries = [
+		textToolResult("", "empty name"),
+		{ type: "message", message: { role: "toolResult", content: "no name" } },
+		{ type: "message", message: { role: "toolResult", toolName: 42, content: "numeric name" } },
+		textToolResult("read", "a"),
+	];
+	const b = buildCostBreakdown(entries);
+	assert.deepEqual(b.toolTextBytes, [
+		{ toolName: "(unknown)", count: 3, textBytes: byteLength("empty name") + byteLength("no name") + byteLength("numeric name") },
+		{ toolName: "read", count: 1, textBytes: 1 },
+	]);
+	assert.equal(b.toolResultEntries, 4);
+});
+
+test("toolTextBytes structured ordering is stable and entry-order independent", () => {
+	const a = [textToolResult("zeta", "zz"), textToolResult("alpha", "aa"), textToolResult("zeta", "z")];
+	const b1 = buildCostBreakdown(a);
+	const b2 = buildCostBreakdown([a[2]!, a[0]!, a[1]!]);
+	assert.deepEqual(b1.toolTextBytes, b2.toolTextBytes, "toolName code-unit order, independent of entry order");
+	assert.deepEqual(b1.toolTextBytes, [
+		{ toolName: "alpha", count: 1, textBytes: 2 },
+		{ toolName: "zeta", count: 2, textBytes: 3 },
+	]);
+	assert.equal(b1.toolResultEntries, 3);
+	assert.equal(b1.toolTextBytesTotal, 5);
+});
+
+test("total reconciliation holds with the P0 facts", () => {
+	const entries = [
+		assistant("openai-codex", "gpt-5.6-sol", usage(12000, 800, 45000, 0, 19.195)),
+		toolResult(WORKER_TOOL_NAME, usage(5000, 300, 10000, 0, 0.063)),
+		textToolResult("workbench_run_recipe", "résultat🧪"),
+		textToolResult("read", [{ type: "text", text: "abc" }]),
+		compaction(usage(500, 60, 0, 0, 0.0)),
+	];
+	const b = buildCostBreakdown(entries);
+	assert.equal(b.toolResultEntries, b.toolTextBytes.reduce((acc, e) => acc + e.count, 0));
+	assert.equal(b.toolTextBytesTotal, b.toolTextBytes.reduce((acc, e) => acc + e.textBytes, 0));
+	const direct = entries.reduce((acc, e) => acc + toolResultTextBytes(e), 0);
+	assert.equal(b.toolTextBytesTotal, direct, "structured total equals the per-entry sum");
+	// the P0 facts never disturb the exact cost/token buckets
+	assert.equal(b.commander.cost, 19.195);
+	assert.equal(b.worker.cost, 0.063);
+	assert.equal(b.total.tokens, b.commander.tokens + b.worker.tokens + b.other.tokens);
+});
+
+test("ranked per-tool rendering: huge/control tool names bounded with omission facts; no result text leaks", () => {
+	const hugeName = "x".repeat(10_000);
+	const controlName = "evil\u0007name\nline2";
+	const entries = [
+		textToolResult(hugeName, "SECRET-RESULT-TEXT-1", { arguments: { path: "SECRET-ARG-MARKER-1" } }),
+		textToolResult(controlName, "SECRET-RESULT-TEXT-2"),
+	];
+	const b = buildCostBreakdown(entries);
+	const lines = renderCostBreakdown(b);
+	const text = lines.join("\n");
+	assert.ok(!text.includes("\u0007"), "control characters are sanitized");
+	assert.ok(lines.every((line) => !line.includes("\n")), "a tool name can never inject extra lines");
+	assert.ok(!text.includes(hugeName), "the 10KB raw name is never rendered");
+	assert.ok(!text.includes(controlName), "the raw control-character name is never rendered");
+	assert.ok(!text.includes("SECRET-RESULT-TEXT"), "result text is never rendered");
+	assert.ok(!text.includes("SECRET-ARG-MARKER"), "tool arguments are never rendered");
+	assert.ok(text.includes("(+2 tool name(s) bounded for display — exact names in the toolTextBytes fields)"), text);
+	assert.ok(lines.every((l) => byteLength(l) < 200), "every rendered line stays small");
+	// the exact structured facts are untouched by display bounding (toolName
+	// code-unit order: "evil…" sorts before "xxx…")
+	assert.equal(b.toolTextBytes[0]!.toolName, controlName);
+	assert.equal(b.toolTextBytes[1]!.toolName, hugeName);
+	assert.equal(b.toolTextBytesTotal, byteLength("SECRET-RESULT-TEXT-1") + byteLength("SECRET-RESULT-TEXT-2"));
+});
+
+test("bounded tool-name display is byte-exact and code-point safe", () => {
+	const astralName = "🧪".repeat(50);
+	const b = buildCostBreakdown([textToolResult(astralName, "abc")]);
+	const lines = renderCostBreakdown(b);
+	const row = lines.find((line) => line.includes(" calls, "))!;
+	assert.ok(row.includes("…"), `explicit marker on the truncated name: ${row}`);
+	// the rendered name portion is <= MAX_TOOL_NAME_BYTES UTF-8 bytes (29 + the
+	// 3-byte "…"; astral code points keep 4-byte granularity, never a split)
+	const namePortion = row.trim().split(" ")[0]!;
+	assert.ok(byteLength(namePortion) <= MAX_TOOL_NAME_BYTES, `name bounded to ${MAX_TOOL_NAME_BYTES} UTF-8 bytes`);
+	assert.ok(byteLength(namePortion) >= MAX_TOOL_NAME_BYTES - 4, "truncation keeps as much of the name as fits");
+	assert.ok(!hasLoneSurrogate(row), "no split surrogate pairs");
+});
+
+test("maxToolRows clamps: malformed/Infinity/huge options never produce unbounded output; exact omission counts", () => {
+	const entries: unknown[] = [];
+	for (let i = 0; i < 100; i++) {
+		entries.push(textToolResult(`tool-${String(i).padStart(3, "0")}`, "abc"));
+	}
+	const b = buildCostBreakdown(entries);
+	assert.equal(b.toolTextBytes.length, 100);
+	const rowsOf = (lines: string[]): number => lines.filter((l) => l.includes(" calls, ")).length;
+	for (const opts of [
+		undefined,
+		{ maxToolRows: Number.POSITIVE_INFINITY },
+		{ maxToolRows: Number.NaN },
+		{ maxToolRows: -7 },
+		{ maxToolRows: "12" as never },
+		{ maxToolRows: 1e9 },
+	]) {
+		const lines = renderCostBreakdown(b, opts);
+		assert.ok(rowsOf(lines) <= MAX_TOOL_ROWS, `rows bounded for ${String(opts)}: ${rowsOf(lines)}`);
+		assert.ok(
+			lines.some((l) => l.includes("more tools omitted — bounded display; exact facts in the toolTextBytes fields")),
+			String(opts),
+		);
+	}
+	// exact counts: default 12 rows / 88 omitted; 0 -> no rows / 100 omitted;
+	// valid 3 -> 3 rows / 97 omitted; huge -> clamped to MAX_TOOL_ROWS / 60 omitted
+	const def = renderCostBreakdown(b);
+	assert.equal(rowsOf(def), 12);
+	assert.ok(def.some((l) => l.includes("(+88 more tools omitted")));
+	const zero = renderCostBreakdown(b, { maxToolRows: 0 });
+	assert.equal(rowsOf(zero), 0);
+	assert.ok(zero.some((l) => l.includes("(+100 more tools omitted")));
+	const three = renderCostBreakdown(b, { maxToolRows: 3 });
+	assert.equal(rowsOf(three), 3);
+	assert.ok(three.some((l) => l.includes("(+97 more tools omitted")));
+	const maxed = renderCostBreakdown(b, { maxToolRows: 1e9 });
+	assert.equal(rowsOf(maxed), MAX_TOOL_ROWS);
+	assert.ok(maxed.some((l) => l.includes("(+60 more tools omitted")));
+	// ranked order: equal text bytes -> toolName ascending (deterministic)
+	const names = three
+		.filter((l) => l.includes(" calls, "))
+		.map((l) => l.trim().split(" ")[0]!);
+	assert.deepEqual(names, ["tool-000", "tool-001", "tool-002"]);
+});
+
+test("model keys are sanitized and bounded with an explicit omission fact", () => {
+	const entries = [
+		{ type: "message", message: { role: "assistant", provider: "p\u0007evil\nprovider", model: "m".repeat(500), usage: usage(1, 1, 0, 0, 0.01) } },
+	];
+	const b = buildCostBreakdown(entries);
+	assert.equal(b.commanderByModel.length, 1);
+	assert.equal(b.commanderByModel[0]!.key, "p\u0007evil\nprovider/" + "m".repeat(500), "structured key stays exact");
+	const lines = renderCostBreakdown(b);
+	const text = lines.join("\n");
+	assert.ok(lines.every((line) => !line.includes("\n") && !line.includes("\u0007")), "no injected lines/control chars");
+	assert.ok(!text.includes("m".repeat(500)), "the raw 500-char model never appears");
+	assert.ok(text.includes("(+1 model key(s) bounded for display — exact keys in the commanderByModel field)"), text);
+});
+
+test("renderCostBreakdown stays bounded and deterministic on a hand-crafted malformed breakdown", () => {
+	const b = {
+		commander: { cost: Number.NaN, tokens: Number.POSITIVE_INFINITY, input: 1, output: 2, cacheRead: 3, cacheWrite: 4 },
+		worker: { cost: -1, tokens: 5, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		other: { cost: 0, tokens: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		total: { cost: 0, tokens: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		commanderByModel: "not-an-array" as never,
+		commanderRequests: Number.POSITIVE_INFINITY,
+		compactions: -3,
+		toolTextBytes: [
+			{ toolName: "a\nb", count: Number.POSITIVE_INFINITY, textBytes: Number.NaN },
+			{ toolName: 42 as never, count: "x" as never, textBytes: 7 },
+			{ toolName: "c".repeat(5000), count: 1, textBytes: 3 },
+		],
+		toolResultEntries: Number.NaN,
+		toolTextBytesTotal: Number.POSITIVE_INFINITY,
+	} as unknown as CostBreakdown;
+	const lines = renderCostBreakdown(b);
+	const text = lines.join("\n");
+	assert.ok(lines.every((line) => !line.includes("\n")), "no injected newlines");
+	assert.ok(lines.every((line) => byteLength(line) < 200), "every line bounded");
+	assert.ok(text.includes("(invalid)"), "non-string names render as (invalid)");
+	assert.ok(text.includes("tool name(s) bounded for display"), text);
+	assert.ok(text.includes("(no assistant usage)"), "non-array commanderByModel degrades safely");
+	assert.equal(renderCostBreakdown(b).join("\n"), text, "deterministic");
+});
+
+// ---------------------------- P0 exact commander gross facts (rendering)
+
+/** Minimal well-formed breakdown for renderer-focused defensive tests. */
+function handCraftedBreakdown(commander: Record<string, unknown>): CostBreakdown {
+	const base: CostTotals = { cost: 0, tokens: 0, input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+	const commanderTotals = { ...base, ...commander } as unknown as CostTotals;
+	return {
+		commander: commanderTotals,
+		worker: { ...base },
+		other: { ...base },
+		total: { ...commanderTotals }, // coherent hand-crafted reconciliation
+		commanderByModel: [],
+		commanderRequests: 0,
+		compactions: 0,
+		toolTextBytes: [],
+		toolResultEntries: 0,
+		toolTextBytesTotal: 0,
+	};
+}
+
+/** The exact rendered commander gross-facts line for a breakdown. */
+function grossLineOf(lines: string[]): string {
+	const line = lines.find((l) => l.startsWith("  commander gross tokens"));
+	assert.ok(line, `gross line missing: ${lines.join("\n")}`);
+	return line;
+}
+
+/** The exact rendered commander cacheRead-share line for a breakdown. */
+function shareLineOf(lines: string[]): string {
+	const line = lines.find((l) => l.startsWith("  commander cacheRead share"));
+	assert.ok(line, `share line missing: ${lines.join("\n")}`);
+	return line;
+}
+
+test("P0 gross line keeps full unabridged digits (exact gross=sum) while the compact bucket row shows M", () => {
+	const entries = [assistant("openai-codex", "gpt-5.6-sol", usage(23_456_789, 1_234_567, 20_000_000, 0, 12.83))];
+	const b = buildCostBreakdown(entries);
+	const gross = b.commander.input + b.commander.output + b.commander.cacheRead + b.commander.cacheWrite;
+	assert.equal(gross, 44_691_356, "component sum is exact");
+	assert.equal(b.commander.tokens, gross);
+	const lines = renderCostBreakdown(b);
+	const text = lines.join("\n");
+	// the compact bucket row still uses Pi's k/M format
+	assert.ok(text.includes("45M tokens"), text);
+	// the P0 line is exact full digits — never k/M-compacted
+	assert.equal(
+		grossLineOf(lines),
+		"  commander gross tokens   : 44691356 (input 23456789 + output 1234567 + cacheRead 20000000 + cacheWrite 0)",
+	);
+	assert.ok(!text.includes("23M"), "input component is never rendered compactly: " + text);
+	assert.ok(!text.includes("1.2M"), "output component is never rendered compactly: " + text);
+	// exact share, deterministic one-decimal
+	assert.equal(
+		shareLineOf(lines),
+		"  commander cacheRead share : 44.8% (cacheRead 20000000 / gross 44691356)",
+	);
+	// the rendered gross equals the structured facts exactly (template check)
+	assert.equal(
+		grossLineOf(lines),
+		`  commander gross tokens   : ${gross} (input ${b.commander.input} + output ${b.commander.output} + cacheRead ${b.commander.cacheRead} + cacheWrite ${b.commander.cacheWrite})`,
+	);
+	// new lines stay under the existing per-line bound
+	assert.ok(byteLength(grossLineOf(lines)) < 200);
+	assert.ok(byteLength(shareLineOf(lines)) < 200);
+});
+
+test("P0 cacheRead share is a deterministic one-decimal percent through a real buildCostBreakdown", () => {
+	const b = buildCostBreakdown([assistant("openai-codex", "gpt-5.6-sol", usage(10_000, 4_000, 47_000, 600, 1))]);
+	assert.equal(b.commander.tokens, 61_600);
+	const lines = renderCostBreakdown(b);
+	assert.equal(
+		shareLineOf(lines),
+		"  commander cacheRead share : 76.3% (cacheRead 47000 / gross 61600)",
+	);
+	assert.equal(renderCostBreakdown(b).join("\n"), lines.join("\n"), "repeated renders are identical");
+});
+
+test("P0 cacheRead share renders 0.0%, 100.0%, and explicit N/A on a zero gross", () => {
+	// 0%: zero cacheRead with a positive gross
+	const zeroShare = renderCostBreakdown(buildCostBreakdown([assistant("p", "m", usage(100, 200, 0, 0, 1))]));
+	assert.ok(zeroShare.includes("  commander cacheRead share : 0.0% (cacheRead 0 / gross 300)"), zeroShare.join("\n"));
+	// 100%: all tokens are cacheRead
+	const fullShare = renderCostBreakdown(buildCostBreakdown([assistant("p", "m", usage(0, 0, 500, 0, 1))]));
+	assert.ok(fullShare.includes("  commander cacheRead share : 100.0% (cacheRead 500 / gross 500)"), fullShare.join("\n"));
+	// zero gross (empty session) -> explicit N/A with the no-denominator note
+	const emptyLines = renderCostBreakdown(buildCostBreakdown([]));
+	assert.ok(
+		emptyLines.includes("  commander cacheRead share : N/A (gross tokens 0 — no denominator)"),
+		emptyLines.join("\n"),
+	);
+	assert.equal(
+		grossLineOf(emptyLines),
+		"  commander gross tokens   : 0 (input 0 + output 0 + cacheRead 0 + cacheWrite 0)",
+	);
+	// hand-crafted all-zero commander -> same explicit N/A line
+	const crafted = renderCostBreakdown(handCraftedBreakdown({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }));
+	assert.ok(
+		crafted.includes("  commander cacheRead share : N/A (gross tokens 0 — no denominator)"),
+		crafted.join("\n"),
+	);
+});
+
+test("P0 malformed/non-finite/negative counts normalize to zero and never render NaN/Infinity", () => {
+	const b = handCraftedBreakdown({
+		input: Number.NaN,
+		output: Number.POSITIVE_INFINITY,
+		cacheRead: -5,
+		cacheWrite: "many" as never,
+		tokens: Number.POSITIVE_INFINITY,
+		cost: Number.NaN,
+	});
+	const lines = renderCostBreakdown(b);
+	const text = lines.join("\n");
+	assert.ok(!text.includes("NaN") && !text.includes("Infinity"), text);
+	assert.equal(
+		grossLineOf(lines),
+		"  commander gross tokens   : 0 (input 0 + output 0 + cacheRead 0 + cacheWrite 0)",
+	);
+	assert.ok(text.includes("  commander cacheRead share : N/A (gross tokens 0 — no denominator)"), text);
+	assert.ok(lines.every((l) => byteLength(l) < 200), "every line bounded");
+	assert.equal(renderCostBreakdown(b).join("\n"), text, "deterministic");
+	// negative cacheRead with positive components: cacheRead -> 0, share is 0.0%
+	const neg = renderCostBreakdown(handCraftedBreakdown({ input: 100, output: 100, cacheRead: -50, cacheWrite: 0, tokens: 200 }));
+	assert.equal(
+		shareLineOf(neg),
+		"  commander cacheRead share : 0.0% (cacheRead 0 / gross 200)",
+	);
+	assert.ok(!neg.join("\n").includes("NaN") && !neg.join("\n").includes("Infinity"));
+	// malformed usage entries through buildCostBreakdown normalize identically
+	const viaEntries = buildCostBreakdown([
+		assistant("openai-codex", "gpt-5.6-sol", {
+			input: Number.NaN,
+			output: Number.POSITIVE_INFINITY,
+			cacheRead: -5,
+			cacheWrite: "many",
+			totalTokens: 0,
+			cost: { total: Number.NaN },
+		}),
+	]);
+	const viaLines = renderCostBreakdown(viaEntries);
+	const viaText = viaLines.join("\n");
+	assert.equal(
+		grossLineOf(viaLines),
+		"  commander gross tokens   : 0 (input 0 + output 0 + cacheRead 0 + cacheWrite 0)",
+	);
+	assert.ok(!viaText.includes("NaN") && !viaText.includes("Infinity"), viaText);
+});
+
+test("P0 above-bound commander counts clamp with the explicit note and stay bounded", () => {
+	// a single absurd finite component clamps to MAX_COMMANDER_COUNT_DISPLAY
+	const single = renderCostBreakdown(
+		handCraftedBreakdown({ input: 1e308, output: 0, cacheRead: 0, cacheWrite: 0, tokens: MAX_COMMANDER_COUNT_DISPLAY }),
+	);
+	const singleText = single.join("\n");
+	assert.equal(
+		grossLineOf(single),
+		`  commander gross tokens   : ${MAX_COMMANDER_COUNT_DISPLAY} (input ${MAX_COMMANDER_COUNT_DISPLAY} + output 0 + cacheRead 0 + cacheWrite 0)`,
+	);
+	assert.ok(
+		single.includes(
+			`  (commander token count(s) above ${MAX_COMMANDER_COUNT_DISPLAY} clamped for display — exact values in the commander bucket)`,
+		),
+		singleText,
+	);
+	assert.ok(single.every((l) => byteLength(l) < 200), "clamped lines stay under the per-line bound");
+	assert.equal(renderCostBreakdown(handCraftedBreakdown({ input: 1e308, output: 0, cacheRead: 0, cacheWrite: 0, tokens: MAX_COMMANDER_COUNT_DISPLAY })).join("\n"), singleText, "deterministic");
+	// all four components above the bound clamp independently; gross is the
+	// exact integer sum of the clamped components (4 * 2^50 < 2^53 — exact)
+	const all = renderCostBreakdown(
+		handCraftedBreakdown({ input: 1e308, output: 1e308, cacheRead: 1e308, cacheWrite: 1e308, tokens: 4 * MAX_COMMANDER_COUNT_DISPLAY }),
+	);
+	const allText = all.join("\n");
+	assert.equal(
+		grossLineOf(all),
+		`  commander gross tokens   : ${4 * MAX_COMMANDER_COUNT_DISPLAY} (input ${MAX_COMMANDER_COUNT_DISPLAY} + output ${MAX_COMMANDER_COUNT_DISPLAY} + cacheRead ${MAX_COMMANDER_COUNT_DISPLAY} + cacheWrite ${MAX_COMMANDER_COUNT_DISPLAY})`,
+	);
+	assert.equal(
+		shareLineOf(all),
+		`  commander cacheRead share : 25.0% (cacheRead ${MAX_COMMANDER_COUNT_DISPLAY} / gross ${4 * MAX_COMMANDER_COUNT_DISPLAY})`,
+	);
+	assert.ok(all.some((l) => l.includes("clamped for display")), allText);
+	assert.ok(all.every((l) => byteLength(l) < 200), "all lines bounded");
+	// exact boundary: MAX_COMMANDER_COUNT_DISPLAY itself is NOT clamped; one above is
+	const boundary = renderCostBreakdown(
+		handCraftedBreakdown({ input: MAX_COMMANDER_COUNT_DISPLAY, output: 1, cacheRead: 0, cacheWrite: 0, tokens: MAX_COMMANDER_COUNT_DISPLAY + 1 }),
+	);
+	const boundaryText = boundary.join("\n");
+	assert.ok(boundaryText.includes(`(input ${MAX_COMMANDER_COUNT_DISPLAY} + output 1 + cacheRead 0 + cacheWrite 0)`), boundaryText);
+	assert.ok(!boundary.some((l) => l.includes("clamped for display")), boundaryText);
+	const over = renderCostBreakdown(
+		handCraftedBreakdown({ input: MAX_COMMANDER_COUNT_DISPLAY + 1, output: 0, cacheRead: 0, cacheWrite: 0, tokens: MAX_COMMANDER_COUNT_DISPLAY }),
+	);
+	assert.ok(over.some((l) => l.includes("clamped for display")), over.join("\n"));
+	// the structured bucket facts are never altered by display clamping
+	const structured = handCraftedBreakdown({ input: 1e308, output: 0, cacheRead: 0, cacheWrite: 0, tokens: MAX_COMMANDER_COUNT_DISPLAY });
+	assert.equal(structured.commander.input, 1e308);
 });

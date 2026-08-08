@@ -113,3 +113,324 @@ recipes:
     output_strategy: tail
     max_lines: 300
     max_bytes: 30720
+
+  # P9 evidence preparation (commander-token-optimization plan, Slice E P9
+  # prep) — offline, machine facts only. Takes exactly the eleven immutable
+  # source Pi Session JSONL paths (eight disclosed invalid collection
+  # attempts in fixed chronological order, then three corrected
+  # final-current sessions), commits byte-exact copies plus the strict
+  # manifest under `.pi/workbench/runs/` with exclusive-create semantics
+  # (refuses existing/racing outputs, ownership-tracked rollback).
+  # Artifact-only (mutation: artifacts) and intentionally UNCACHED — the
+  # evidence directory and manifest are real outputs, never cache entries.
+  - name: commander-token-p9-prepare
+    description: P9 evidence preparation (offline, machine facts only) — byte-exact copies of the 11 disclosed sources + strict manifest; exclusive-create commit, refuses existing outputs
+    command:
+      - npm
+      - run
+      - commander:prepare
+      - --
+      - "{{invalid1}}"
+      - "{{invalid2}}"
+      - "{{invalid3}}"
+      - "{{invalid4}}"
+      - "{{invalid5}}"
+      - "{{invalid6}}"
+      - "{{invalid7}}"
+      - "{{invalid8}}"
+      - "{{current1}}"
+      - "{{current2}}"
+      - "{{current3}}"
+    cwd: .
+    timeout_ms: 600000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes:
+      - .pi/workbench/runs/commander-token-p9-benchmark/**
+      - .pi/workbench/runs/commander-token-p9-manifest.json
+    mutation: artifacts
+    artifacts:
+      - .pi/workbench/runs/commander-token-p9-benchmark/**
+      - .pi/workbench/runs/commander-token-p9-manifest.json
+    environment: []
+    output_strategy: tail
+    max_lines: 200
+    max_bytes: 20480
+    params:
+      - name: invalid1
+        type: string
+        required: true
+        description: invalid-1 Pi Session JSONL source path
+      - name: invalid2
+        type: string
+        required: true
+        description: invalid-2 Pi Session JSONL source path
+      - name: invalid3
+        type: string
+        required: true
+        description: invalid-3 Pi Session JSONL source path
+      - name: invalid4
+        type: string
+        required: true
+        description: invalid-4 Pi Session JSONL source path
+      - name: invalid5
+        type: string
+        required: true
+        description: invalid-5 Pi Session JSONL source path
+      - name: invalid6
+        type: string
+        required: true
+        description: invalid-6 Pi Session JSONL source path
+      - name: invalid7
+        type: string
+        required: true
+        description: invalid-7 Pi Session JSONL source path
+      - name: invalid8
+        type: string
+        required: true
+        description: invalid-8 Pi Session JSONL source path
+      - name: current1
+        type: string
+        required: true
+        description: final-current-1 Pi Session JSONL source path
+      - name: current2
+        type: string
+        required: true
+        description: final-current-2 Pi Session JSONL source path
+      - name: current3
+        type: string
+        required: true
+        description: final-current-3 Pi Session JSONL source path
+
+  # P9 benchmark analysis (offline analyzer) — fixed JSON invocation of the
+  # manifest produced by commander-token-p9-prepare. Read-only: no writes,
+  # no artifacts, mutation none; intentionally UNCACHED so every benchmark
+  # run executes against the current evidence.
+  - name: commander-token-p9-benchmark
+    description: P9 benchmark analysis — offline analyzer over the prepared P9 manifest (fixed JSON invocation, read-only)
+    command:
+      - npm
+      - run
+      - commander:benchmark
+      - --
+      - .pi/workbench/runs/commander-token-p9-manifest.json
+      - --json
+    cwd: .
+    timeout_ms: 300000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: []
+    mutation: none
+    artifacts: []
+    environment: []
+    output_strategy: tail
+    max_lines: 300
+    max_bytes: 30720
+
+  # NRO evidence preparation (native-tool benchmark) — offline, machine
+  # facts only. Takes exactly one immutable chronological collection-record
+  # path; the package script freezes the production inputs. Commits
+  # byte-exact copies plus the strict manifest under `.pi/workbench/runs/`
+  # with exclusive-create semantics (refuses existing/racing outputs).
+  # Artifact-only (mutation: artifacts) and intentionally UNCACHED — the
+  # evidence directory and manifest are real outputs, never cache entries.
+  - name: commander-native-tool-benchmark-prepare
+    description: NRO evidence preparation (offline, machine facts only) — byte-exact copies of the immutable chronological collection record + strict manifest; exclusive-create commit, refuses existing outputs
+    command:
+      - npm
+      - run
+      - commander:nro:prepare
+      - --
+      - --collection
+      - "{{collection}}"
+    cwd: .
+    timeout_ms: 600000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes:
+      - .pi/workbench/runs/commander-native-tool-benchmark/**
+      - .pi/workbench/runs/commander-native-tool-benchmark-manifest.json
+    mutation: artifacts
+    artifacts:
+      - .pi/workbench/runs/commander-native-tool-benchmark/**
+      - .pi/workbench/runs/commander-native-tool-benchmark-manifest.json
+    environment: []
+    output_strategy: tail
+    max_lines: 200
+    max_bytes: 20480
+    params:
+      - name: collection
+        type: string
+        required: true
+        description: the immutable chronological collection-record path
+
+  # NRO benchmark analysis (offline analyzer) — fixed JSON invocation of the
+  # manifest produced by commander-native-tool-benchmark-prepare. Read-only:
+  # no writes, no artifacts, mutation none; intentionally UNCACHED so every
+  # benchmark run executes against the current evidence.
+  - name: commander-native-tool-benchmark
+    description: NRO benchmark analysis — offline analyzer over the prepared NRO manifest (fixed JSON invocation, read-only)
+    command:
+      - npm
+      - run
+      - commander:nro:benchmark
+    cwd: .
+    timeout_ms: 300000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: []
+    mutation: none
+    artifacts: []
+    environment: []
+    output_strategy: tail
+    max_lines: 300
+    max_bytes: 30720
+
+  # NRO protocol-v2 evidence preparation (frozen v2 prepare) — offline,
+  # machine facts only. Takes exactly one immutable chronological
+  # collection-record path; the package script freezes the v2 inputs
+  # (fixtures/commander-native-tool-benchmark-v2/inputs). Commits byte-exact
+  # copies plus the strict v2 manifest under `.pi/workbench/runs/` with
+  # exclusive-create semantics (refuses existing/racing outputs).
+  # Artifact-only (mutation: artifacts) and intentionally UNCACHED — the
+  # evidence directory and manifest are real outputs, never cache entries.
+  - name: commander-native-tool-benchmark-v2-prepare
+    description: NRO protocol-v2 evidence preparation (offline, machine facts only) — byte-exact copies of the frozen v2 inputs + immutable collection record + strict v2 manifest; exclusive-create commit, refuses existing outputs
+    command:
+      - npm
+      - run
+      - commander:nro:v2:prepare
+      - --
+      - --collection
+      - "{{collection}}"
+    cwd: .
+    timeout_ms: 600000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes:
+      - .pi/workbench/runs/commander-native-tool-benchmark-v2/**
+      - .pi/workbench/runs/commander-native-tool-benchmark-v2-manifest.json
+    mutation: artifacts
+    artifacts:
+      - .pi/workbench/runs/commander-native-tool-benchmark-v2/**
+      - .pi/workbench/runs/commander-native-tool-benchmark-v2-manifest.json
+    environment: []
+    output_strategy: tail
+    max_lines: 200
+    max_bytes: 20480
+    params:
+      - name: collection
+        type: string
+        required: true
+        description: the immutable chronological collection-record path
+
+  # NRO protocol-v2 benchmark analysis (frozen v2 analyzer) — fixed JSON
+  # invocation of the manifest produced by
+  # commander-native-tool-benchmark-v2-prepare (the package script carries
+  # the fixed v2 manifest path and --json). Read-only: no writes, no
+  # artifacts, mutation none; intentionally UNCACHED so every benchmark run
+  # executes against the current evidence.
+  - name: commander-native-tool-benchmark-v2
+    description: NRO protocol-v2 benchmark analysis — offline analyzer over the prepared v2 manifest (fixed JSON invocation, read-only)
+    command:
+      - npm
+      - run
+      - commander:nro:v2:benchmark
+    cwd: .
+    timeout_ms: 300000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: []
+    mutation: none
+    artifacts: []
+    environment: []
+    output_strategy: tail
+    max_lines: 300
+    max_bytes: 30720
+
+  # NRO DEV-pilot collection (reviewed pilot collector) — DEV-ONLY recipe.
+  # Performs PAID external provider/model calls: the pilot may make up to
+  # 12 attempts. Pilot artifacts are NEVER final/adoption evidence — they
+  # must not be used for acceptance, gates, or any final decision; only the
+  # reviewed production collection is adoption evidence. Intentionally
+  # UNCACHED (no cache block): every run executes live paid calls.
+  # Exit 0 = complete 8-valid pilot; exit 1 = truthful capped partial/
+  # runtime artifact. Writes exclusively under the pilot collection root
+  # (no staging globs).
+  - name: commander-native-tool-dev-pilot-collect
+    description: DEV-only NRO pilot collection — performs PAID external provider/model calls (up to 12 attempts); pilot artifacts are never final/adoption evidence; intentionally uncached
+    command:
+      - npm
+      - run
+      - commander:nro:pilot
+    cwd: .
+    timeout_ms: 7200000
+    allowed_modes: [DEV]
+    expected_exit_codes: [0, 1]
+    writes:
+      - .pi/workbench/runs/commander-native-tool-dev-pilot-collection/**
+    mutation: artifacts
+    artifacts:
+      - .pi/workbench/runs/commander-native-tool-dev-pilot-collection/**
+    environment: []
+    output_strategy: tail
+    max_lines: 100
+    max_bytes: 20480
+
+  # NRO FINAL validation collection (reviewed FINAL collector) — DEV-ONLY
+  # recipe. Performs PAID external provider/model calls: fixed 40 valid
+  # final sessions (ABBA repeated 10 times, 20 per arm), max 60
+  # successfully-started paid attempts, final evidence only, and requires
+  # a separate explicit user authorization before any run. Intentionally
+  # UNCACHED (no cache block): every run executes live paid calls.
+  # Exit 0 = complete 40-valid collection; exit 1 = truthful capped
+  # partial / runtime hard-fail. Writes exclusively under the final
+  # collection root (no staging globs).
+  - name: commander-native-tool-final-collect
+    description: DEV-only NRO FINAL collection — performs PAID external provider/model calls (fixed 40 valid final sessions, ABBAx10, 20 per arm, max 60 successfully-started paid attempts, final evidence only); requires separate explicit user authorization; intentionally uncached
+    command:
+      - npm
+      - run
+      - commander:nro:final
+    cwd: .
+    timeout_ms: 112500000
+    allowed_modes: [DEV]
+    expected_exit_codes: [0, 1]
+    writes:
+      - .pi/workbench/runs/commander-native-tool-final-collection/**
+    mutation: artifacts
+    artifacts:
+      - .pi/workbench/runs/commander-native-tool-final-collection/**
+    environment: []
+    output_strategy: tail
+    max_lines: 100
+    max_bytes: 20480
+
+  # NRO protocol-v2 FINAL validation collection (reviewed v2 FINAL
+  # collector) — DEV-ONLY recipe. Performs PAID external provider/model
+  # calls: fixed ABBAx10 40 valid final sessions (20 per arm), max 60
+  # successfully-started paid attempts, final evidence only, and
+  # requires a separate explicit user authorization before any run.
+  # Intentionally UNCACHED (no cache block): every run executes live
+  # paid calls. Exit 0 = complete 40-valid collection; exit 1 = truthful
+  # capped partial / runtime hard-fail. Writes exclusively under the
+  # independent v2 final collection root (no staging globs).
+  - name: commander-native-tool-v2-final-collect
+    description: DEV-only NRO protocol-v2 FINAL collection — performs PAID external provider/model calls (fixed ABBAx10 40 valid final sessions, 20 per arm, max 60 successfully-started paid attempts, final evidence only); requires separate explicit user authorization; intentionally uncached
+    command:
+      - npm
+      - run
+      - commander:nro:v2:final
+    cwd: .
+    timeout_ms: 112500000
+    allowed_modes: [DEV]
+    expected_exit_codes: [0, 1]
+    writes:
+      - .pi/workbench/runs/commander-native-tool-v2-final-collection/**
+    mutation: artifacts
+    artifacts:
+      - .pi/workbench/runs/commander-native-tool-v2-final-collection/**
+    environment: []
+    output_strategy: tail
+    max_lines: 100
+    max_bytes: 20480

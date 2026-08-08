@@ -56,6 +56,7 @@ import {
 	type CacheRequestMode,
 } from "../cache/action-cache.ts";
 import type { ActionKey, ActionRecord } from "../cache/action-types.ts";
+import { captureRecipeValidationEvidence, executedArgvHash, unavailableEvidenceBlock, type ValidationEvidenceBlock } from "./validation-evidence.ts";
 
 export interface RunRecipeInput {
 	projectRoot: string;
@@ -203,6 +204,60 @@ async function snapshotJsonArtifacts(projectRoot: string, runDir: string, artifa
 }
 
 /**
+ * P4a: capture the recipe validation binding for a terminal run and patch
+ * BOTH the in-memory record and the persisted manifest. NEVER masks the
+ * original recipe/cache outcome:
+ *   - a capture failure persists a bounded non-reusable unavailable block;
+ *   - if even that patch write fails, the persisted manifest stays exactly
+ *     as it was (original record without validation_evidence) and the
+ *     ORIGINAL record is returned — the returned and persisted records can
+ *     never disagree by claiming a binding that was not actually persisted.
+ * This function never throws.
+ */
+export async function captureAndPatchRunManifest(input: {
+	projectRoot: string;
+	runDir: string;
+	record: RunRecord;
+	profile: string | undefined;
+	mode: WorkbenchMode;
+	exec: ExecFn;
+	recipe: Recipe;
+	argv?: string[];
+	argvHash?: string;
+	projectGates: readonly unknown[];
+	actorFacts?: RecipeMutationFacts;
+	successful: boolean;
+	complete: boolean;
+	source: "exec" | "cache";
+}): Promise<RunRecord> {
+	const captured = await captureRecipeValidationEvidence({
+		projectRoot: input.projectRoot,
+		profile: input.profile,
+		mode: input.mode,
+		exec: input.exec,
+		recipe: input.recipe,
+		argv: input.argv,
+		argvHash: input.argvHash,
+		projectGates: input.projectGates,
+		actorFacts: input.actorFacts,
+		successful: input.successful,
+		complete: input.complete,
+		source: input.source,
+	});
+	const block: ValidationEvidenceBlock = captured.ok ? captured.block : unavailableEvidenceBlock(captured.reason);
+	const patched: RunRecord = { ...input.record, validation_evidence: block };
+	try {
+		await writeFile(join(input.runDir, "manifest.json"), JSON.stringify(patched, null, 2), "utf8");
+	} catch {
+		// The manifest patch could not be persisted: return the ORIGINAL
+		// record so returned and persisted records agree (both without the
+		// block) — the original outcome is never altered or masked.
+		return input.record;
+	}
+	return patched;
+}
+
+/**
  * Run one declared recipe end to end and persist all run artifacts.
  * Throws RecipeSetupError for setup violations; execution outcomes (non-zero
  * exit, timeout, cancellation) are reported in the result, not thrown.
@@ -288,22 +343,50 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		return { materialized, record: outcome.record };
 	};
 
+	// P4a: patch the materialized cache-hit run with its validation binding
+	// (source "cache", outcome from the reused action record) on BOTH hit
+	// paths — the materialized manifest was written by action-cache.ts and is
+	// patched here so the persisted and returned records stay consistent.
+	const hitResult = async (hit: NonNullable<Awaited<ReturnType<typeof tryHit>>>, actionKey: string, reason: string): Promise<RunRecipeResult> => {
+		const patched = await captureAndPatchRunManifest({
+			projectRoot,
+			runDir: hit.materialized.runDir,
+			record: hit.materialized.record,
+			profile: config.profile,
+			mode,
+			exec,
+			recipe,
+			argv: [],
+			argvHash: hit.materialized.record.argv_hash,
+			projectGates: config.gates,
+			actorFacts: input.actorFacts,
+			successful: hit.record.success,
+			complete: true,
+			source: "cache",
+		});
+		return {
+			ok: hit.record.success,
+			record: patched,
+			summary: hit.materialized.summary,
+			runDir: hit.materialized.runDir,
+			cache: {
+				status: "hit",
+				actionKey,
+				reusedFromRunId: hit.record.sourceRunId,
+				reason,
+			},
+		};
+	};
+
 	// Fast path: lookup without the lock.
 	if (plan.active && computed?.ok && cacheMode !== "refresh-cache") {
 		const hit = await tryHit(computed.key);
 		if (hit) {
-			return {
-				ok: hit.record.success,
-				record: hit.materialized.record,
-				summary: hit.materialized.summary,
-				runDir: hit.materialized.runDir,
-				cache: {
-					status: "hit",
-					actionKey: computed.key.key,
-					reusedFromRunId: hit.record.sourceRunId,
-					reason: "validated against the current action key (definition, inputs, env, toolchain, OS/arch, lockfiles, config, profile, gate schema)",
-				},
-			};
+			return hitResult(
+				hit,
+				computed.key.key,
+				"validated against the current action key (definition, inputs, env, toolchain, OS/arch, lockfiles, config, profile, gate schema)",
+			);
 		}
 	}
 
@@ -316,18 +399,7 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 			const hit = await tryHit(computed.key);
 			if (hit) {
 				await lock.release().catch(() => {});
-				return {
-					ok: hit.record.success,
-					record: hit.materialized.record,
-					summary: hit.materialized.summary,
-					runDir: hit.materialized.runDir,
-					cache: {
-						status: "hit",
-						actionKey: computed.key.key,
-						reusedFromRunId: hit.record.sourceRunId,
-						reason: "reused result written by a concurrent run (double-checked lock)",
-					},
-				};
+				return hitResult(hit, computed.key.key, "reused result written by a concurrent run (double-checked lock)");
 			}
 		}
 	}
@@ -337,6 +409,10 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 	const runDir = join(runsDir(projectRoot), runId);
 	const env = buildEnvironment(recipe);
 	const secrets = collectSecretValues(env);
+
+	// P4a: deterministic, privacy-safe identity of the EXECUTED argv — raw
+	// values are hashed, never persisted (manifest argv stays redacted).
+	const executedArgvHashValue = executedArgvHash(argv);
 
 	// Resolve the real cwd (also serves as the containment result).
 	const cwd = (await realpathContained(projectRoot, recipe.cwd)) as string;
@@ -380,6 +456,7 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 			expected_exit_codes: recipe.expected_exit_codes,
 			declared_writes: recipe.writes,
 			environment_names: recipe.environment,
+			argv_hash: executedArgvHashValue,
 		};
 		const environmentRecord: Record<string, string> = {};
 		for (const [name, value] of Object.entries(env)) {
@@ -391,6 +468,30 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		await writeFile(join(runDir, "stdout.log"), "", "utf8");
 		await writeFile(join(runDir, "stderr.log"), "", "utf8");
 		await writeFile(join(runDir, "summary.json"), JSON.stringify({ run_id: runId, recipe: recipe.name, error: (error as Error).message }, null, 2), "utf8");
+		// P4a: capture the validation binding for the spawn-failure terminal
+		// path too (outcome: unsuccessful + incomplete). A capture failure
+		// persists bounded unavailable state; the original spawn error always
+		// surfaces — the patch must never mask it.
+		try {
+			await captureAndPatchRunManifest({
+				projectRoot,
+				runDir,
+				record,
+				profile: config.profile,
+				mode,
+				exec,
+				recipe,
+				argv,
+				argvHash: executedArgvHashValue,
+				projectGates: config.gates,
+				actorFacts: input.actorFacts,
+				successful: false,
+				complete: false,
+				source: "exec",
+			});
+		} catch {
+			// never mask the spawn failure with a manifest-patch error
+		}
 		throw new Error(`recipe "${recipeName}" failed to spawn: ${(error as Error).message}`);
 	}
 
@@ -432,6 +533,7 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		declared_writes: recipe.writes,
 		environment_names: recipe.environment,
 		execution_source: "exec",
+		argv_hash: executedArgvHashValue,
 	};
 
 	const summary: RunSummaryRecord = {
@@ -548,7 +650,26 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 
 	if (lock) await lock.release().catch(() => {});
 
-	return { ok: exitOk, record, summary, runDir, cache: cacheStatus };
+	// P4a: capture the validation binding for the exec terminal path and
+	// patch the persisted + returned manifest (never alters the outcome).
+	const patched = await captureAndPatchRunManifest({
+		projectRoot,
+		runDir,
+		record,
+		profile: config.profile,
+		mode,
+		exec,
+		recipe,
+		argv,
+		argvHash: executedArgvHashValue,
+		projectGates: config.gates,
+		actorFacts: input.actorFacts,
+		successful: exitOk,
+		complete: !result.killed,
+		source: "exec",
+	});
+
+	return { ok: exitOk, record: patched, summary, runDir, cache: cacheStatus };
 }
 
 /** Project-relative form of a path for display (keeps messages portable). */

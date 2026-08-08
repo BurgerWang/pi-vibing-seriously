@@ -35,6 +35,299 @@ additive fields on the unchanged `schema_version: 1` records; pre-repair
 records without them parse unchanged and are never rewritten (no
 migration).
 
+## Commander Token Optimization Slice A (P0 + P1) — additive compatibility
+
+Slice A of `docs/plans/commander-token-optimization.md` (P0 session
+observability + P1 bounded parent-result summaries) is additive and
+backward compatible:
+
+- **P0 observability adds new numeric facts, never changes old ones.** The
+  commander/worker/other cost+token buckets mirroring Pi's footer
+  aggregation are byte-for-byte unchanged; `commanderRequests`,
+  `compactions` and the per-tool inline TEXT byte attribution are
+  additional fields of the in-memory breakdown, and `/q-cost-status` gains
+  compact numeric rows (counts, tool names, UTF-8 byte totals only — tool
+  arguments are not inspected, and textual toolResult content is read
+  solely to compute its UTF-8 byte length; it is never persisted,
+  retained, or rendered). No
+  persisted session/run record format changes and no migration: old
+  records read unchanged.
+- **P1 changes only the parent presentation.** `workbench_run_recipe` /
+  `workbench_run_gate` tool results and `/q-run` / `/q-gate` output are now
+  bounded machine-derived summaries (≤ 4096 bytes/40 lines success, ≤
+  12288 bytes/120 lines failure, failure-first precedence, full-log paths)
+  instead of inlined run output. The tool **parameter schemas are
+  unchanged** (no schema-fingerprint change, unlike the P7
+  `workbench_delegate_worker` transition above); run/gate records on disk
+  (`manifest.json`, `summary.json`, `stdout.log`, `stderr.log`, `gates.json`,
+  `evidence.json`) keep their schema and stay byte-for-byte unchanged —
+  full evidence remains readable by old tooling and by the new code alike.
+- Old run/session records, worker budget profiles/defaults, and the
+  review/gate responsibilities are unchanged. Slice A is PASS: the final
+  full `check` run `20260805-141013-i4lx` passed 879/879 and the
+  Commander gates run `20260805-141242-tyt8` passed b0-b6. The recorded
+  95.35% P1 reduction is an observational recipe-inline-byte-only figure
+  (docs/baselines/commander-token-p0.md) — not causal and not overall
+  savings; no benchmark savings are claimed before P9 measurement.
+
+## Commander Token Optimization Slice B1 (P2 + P3) — additive compatibility
+
+Slice B1 of `docs/plans/commander-token-optimization.md` (P2 layered
+`workbench_read_run` results + the P3 read-only batching guideline) is
+additive and backward compatible:
+
+- **The `workbench_read_run` runtime default changed from `all` to
+  `summary` (presentation only).** An omitted `include` now renders the
+  ordered Summary/Evidence/Persisted layers (≤ 4096 UTF-8 bytes / 40
+  lines, sanitized, code-point safe, never raw stdout/stderr, per-test
+  lines, or argv, durable project-relative run-dir/manifest/summary/
+  stdout/stderr paths, and a REQUIRED Evidence-layer logs/argv guidance
+  line with the exact `include=logs`/`include=all` opt-in instruction
+  for bounded tails that survives adversarial fields/lists and the
+  caps; dropped optional cache/quant lines and bounded/truncated
+  metadata/path/list displays are recorded in the aggregate with
+  durable sources — machine facts are never silently lost). Explicit
+  includes keep their semantics:
+  `manifest` shows bounded manifest metadata (incl. cwd/argv) without
+  tails; `logs`/`all` append the same caller-bounded log tails as before
+  (default 200 lines / 20 KB per stream; schema-bounded
+  max_lines/max_bytes honored). Run records on disk
+  (`manifest.json`, `summary.json`, `stdout.log`, `stderr.log`, …) keep
+  their schema and stay byte-for-byte unchanged; legacy records without
+  the P6-C/P6-D optional fields render identically; the structured
+  `details` payload (`ReadRunToolDetails`) is unchanged.
+- **One intentional tool-metadata/schema-wording transition.**
+  `workbench_read_run`'s description, promptSnippet, one added static
+  prompt guideline (the read-only batching guideline — exactly one
+  occurrence in the catalog) and the `include` parameter description now
+  declare the summary default. The parameter **shape is unchanged** (the
+  same `run_id` + optional `include|max_lines|max_bytes` keys, same
+  types, same `summary|manifest|logs|all` union order — no parameter
+  added or removed), but the description text is part of the hashed
+  tool-schema/metadata, so this intentionally shifts the DEV/AUDIT/VERIFY
+  tool-schema fingerprint exactly **once**, mirroring the documented
+  Phase 3 `workbench_delegate_worker` transition above: cache telemetry
+  records that one transition as `UNEXPECTED_DRIFT` — **expected, not a
+  defect** — and after reload same-mode fingerprints are stable again.
+- **Additive batching surface, no tool/order/mode change.**
+  `INDEPENDENT_READ_ONLY_ALLOWLIST` (pure classifier in
+  `core/run-result.ts`) contains exactly `read`/`grep`/`find`/`ls` and
+  `workbench_project_inspect` / `workbench_read_run` /
+  `workbench_read_gate` / `workbench_list_gates` /
+  `workbench_compare_runs` — at the Slice B1 time point this was the same
+  set as the AUDIT mode matrix (consistency, not a mode change); after P8b
+  the AUDIT read-only set additionally includes
+  `workbench_recover_tool_result`, deliberately NOT in this classifier
+  (see the P8b section below); `workbench_delegation_status` and
+  every execution/review/delegation/write tool are excluded, and the
+  classifier never infers independence. Tool registration order, mode
+  matrices, and the tool inventory are unchanged.
+- Worker budget profiles/defaults, delegation/review responsibilities,
+  and the durable plan document are unchanged; no benchmark savings are
+  claimed before P9 measurement.
+
+## Commander Token Optimization Slice B2 (P2 coverage-gated segmented actual-diff review) — additive compatibility
+
+- **Additive review-record fields, unchanged `schema_version`.** The
+  completed `review.json` records now carry the Slice B2 coverage facts
+  (`displayed_paths`, `remaining_paths`, `coverage_complete`, `review_path`)
+  as additive fields on the unchanged `schema_version: 1` record shape.
+  Legacy schema_version-1 review records without those fields remain
+  readable by the new code (and by old tooling) and are never rewritten
+  unless a new review segment is run; when they are merged into a new
+  segment's coverage, prior coverage is inferred ONLY from their persisted
+  patch entries — never invented. Rendering likewise recomputes
+  displayed/remaining from the record's valid checked worker paths, so
+  absent or malformed persisted coverage arrays or a persisted
+  `coverage_complete` flag never render a false COMPLETE. The finish-time
+  PENDING_REVIEW
+  placeholder and corrupt/foreign records still read as "no review yet".
+- **No tool/order/mode/schema change.** `workbench_review_worker_diff`
+  keeps its registration position, its parameter schema (byte-identical —
+  `include_paths` max 50, `max_lines`/`max_bytes` bounds and defaults 400
+  lines / 32 KiB unchanged), and its DEV-only mode placement; the tool
+  inventory, registration order, and mode matrices are unchanged. The
+  review writes stay `review.json` plus the existing
+  `workbench-delegation-state` custom entry — no other artifact, no
+  migration, no rewrite of old records. The tool description/prompt
+  wording is static text (no dynamic values) and now documents the
+  repeatable coverage-gated lifecycle.
+- **Lifecycle semantics are additive and fail-closed.** REVIEWED now
+  requires scope PASS AND complete displayed-path coverage (a same-hash
+  complete PASS rerender keeps a valid REVIEWED binding; a hash change
+  resets coverage — this call's rendered paths stay displayed; ANY
+  re-review of the same current diff that is not PASS with complete
+  coverage — a scope FAIL or an incomplete PASS, e.g. a legacy partial
+  review record — demotes a prior REVIEWED state to PENDING_REVIEW
+  fail-closed via the pure
+  `demoteReviewedToPending` transition). PENDING_REVIEW / STALE blocking
+  semantics, the hash-binding invariants, delegation/VERIFY blocking and
+  B6 Worker-First Compliance are unchanged for every reachable state.
+- **Worker delegation semantics, budgets/defaults, and the worker
+  token-budget repair plan are untouched**; the durable commander plan
+  records Slice A PASS, Slice B1 targeted verification, and Slice B2
+  implementation with its review/targeted/final evidence PENDING until
+  Sol runs it; no benchmark savings are claimed before P9 measurement.
+
+## Commander Token Optimization P8b (two-phase tool-result receipt lifecycle) — additive compatibility
+
+- **New repository-owned directory; nothing existing changes.** P8a added
+  `.pi/workbench/tool-results/<id>.started` + `<id>.json` (schema `wtr1` /
+  version 1) under the config dir — a new additive storage location. No
+  existing record format changes: legacy run/cache/delegation/domain
+  records and review/state entries are never read, migrated, or rewritten;
+  unknown-schema or malformed receipts fail closed as corrupt and are
+  never touched. Foreign files and temp leftovers in the receipt directory
+  are ignored. Receipts never touch run/cache/gate/delegation artifacts or
+  execution counts.
+- **P8b additive tool transition (recovery appended LAST).** P8b wires the
+  reviewed P8a core into the runtime: BEGIN at the END of the `tool_call`
+  guard (after every policy check, before execution) for every registered
+  workbench tool except the public recovery tool; exact toolCallId +
+  tool-name dual-match FINALIZE in the `tool_result` handler; capacity
+  pre-block at `MAX_IN_FLIGHT_RECEIPTS` (256) with no eviction; and the new
+  public read-only `workbench_recover_tool_result`. The inventory becomes
+  **11 custom tools** with recovery appended LAST in the
+  `WORKBENCH_TOOL_NAMES`/registration order — existing registration
+  positions and parameter schemas are unchanged; the strict Sol DEV
+  allowlist moves **14 → 15** and an ACTIVE user lease **15 → 17**
+  (edit/write); AUDIT and VERIFY gain the recovery tool in their read-only
+  sets. The recovery tool is deliberately NOT added to the existing
+  read-only batching classifier (P8b boundary, tested). Appending the tool
+  LAST is an intentional, one-time tool-metadata/schema fingerprint
+  transition: cache telemetry records it as `UNEXPECTED_DRIFT` —
+  **expected, not a defect** (documented stable-prefix behavior) — and
+  after reload same-mode fingerprints are stable again; nothing is loaded
+  dynamically.
+- **Determinism is session-identity-scoped.** Receipt ids are deterministic
+  (`wtr1-` + SHA-256 of bounded native Pi session identity + toolCallId):
+  the same result id is derived deterministically only when the input pair
+  is identical — the SAME valid native Pi session identity AND the SAME
+  toolCallId. There is no stability guarantee across different native
+  session IDs: different session IDs do NOT guarantee the same id, even
+  when the toolCallId is identical. Recovery by `result_id` is
+  session-independent; recovery by `tool_call_id` is current-session only
+  (the current native session identity AND the parameter are validated
+  before any hash — absent/invalid fails closed with the fixed `invalid`
+  code). Recovery is strictly read-only (repeated reads change no bytes or
+  mtimes) and never re-executes the original call.
+- **No migration/domain rewrite.** P8b adds one new public tool and the
+  receipt lifecycle; no existing record format, domain behavior, or
+  execution count changes, no migration, and no rewrite of legacy records.
+  Persisted receipts are presentation, never acceptance evidence.
+- **Platform notes.** POSIX permission modes (directory 0700, artifacts
+  0600) and symlink-containment behavior are exercised on POSIX platforms;
+  the permission/symlink assertions are skipped on Windows, where
+  containment is enforced by the same strict path/id validation and
+  lstat-based artifact checks.
+- **No transport claim.** This repository implements no WebSocket (or any
+  other) transport — receipts are plain local files with no network path;
+  the workbench owns no transport.
+
+## NRO N1/N2 (Commander Native Tool Optimization) — additive compatibility
+
+Slices N1+N2 of `docs/plans/commander-native-tool-optimization.md` (the
+`read` deterministic-preview slice and the `grep` exact-count slice of the
+Commander Native Tool Optimization (NRO) effort) are additive and backward
+compatible:
+
+- **Registration inventory: unchanged 11-tool catalog plus three same-name
+  native overrides.** `WORKBENCH_TOOL_NAMES` stays at exactly **11 catalog
+  tools in the unchanged order**. N1/N2 additionally registers three fixed
+  same-name overrides of the Pi built-in `read`/`grep`/`find` tools,
+  statically, in the fixed `read → grep → find` order BEFORE the catalog —
+  the registration surface is exactly `NATIVE_OVERRIDE_NAMES` +
+  `WORKBENCH_TOOL_NAMES` (14 `registerTool` blocks, pinned by the
+  native-tool-wiring / diff-review-wiring / p5-inventory tests). Because
+  the overrides replace the built-ins under the SAME names, the resolved
+  tool list the model sees (names and order) is unchanged; mode matrices
+  (AUDIT/DEV/VERIFY), the strict-Sol canonical 15-tool allowlist, the
+  write-authority/lease inventories and `WORKBENCH_TOOL_NAMES` are
+  unchanged. The one intentional tool-schema/metadata fingerprint
+  transition — the single combined N1/N2 delta (read adds exactly the one
+  §6.4 continuation/count guideline bullet; grep mirrors the same bullet,
+  appends the static count-mode description sentence and the two optional
+  count selectors; find keeps the built-in strings verbatim) — is recorded
+  as `UNEXPECTED_DRIFT` — **expected, not a defect** — and same-mode
+  fingerprints are stable again after reload (pinned in
+  tests/p6-b-stable-prefix.test.ts).
+- **Legacy parameter compatibility: old shapes and resumed calls stay
+  valid.** `read` and `find` parameter schemas are byte-identical to the
+  Pi 0.83.0 built-in schemas (read: `path` + optional `offset`/`limit`;
+  find: `pattern`/`path`/`limit`); the grep schema keeps the byte-identical
+  built-in property prefix (`pattern`/`path`/`glob`/`ignoreCase`/`literal`/
+  `context`/`limit`) and appends exactly the two optional count selectors
+  `output` (`"matches" | "count"`) and `count_kind` (`"matches" |
+  "lines"`), so every legacy parameter shape and every old-session resumed
+  call remains valid; P8 recovery replay is unaffected (dual tool-name +
+  call-id matching). **Additive grep semantics:** omitted `output`,
+  `output="matches"` and a `count_kind` without `output` delegate to
+  `createGrepToolDefinition(ctx.cwd)` byte-for-byte (matching lines with
+  paths/line numbers, context/limit/glob/ignoreCase/literal, `.gitignore`
+  respect, the 500-char line cap and the `matchLimitReached`/
+  `linesTruncated` details); `output="count"` runs the dedicated
+  abort-aware ripgrep adapter (`core/native-search-adapter.ts`) over the
+  full scan and returns ONE exact uncapped
+  `count kind=<matches|lines> value=<n> files=<n>` line with `details`
+  undefined — `count_kind` defaults to `matches` (occurrences), `lines`
+  counts matching lines, `files` counts distinct matching files, the
+  legacy `limit`/`context` never apply, zero is an exact result, and
+  malformed framing, execution failure, abort (pre-abort or mid-scan,
+  including Pi's timeout abort) or an unavailable rg fail explicitly —
+  never a partial count. The adapter executes rg directly with an explicit
+  argument vector and `shell:false` (no shell, no `pi.exec`, no
+  download/write), resolving the managed rg first (`PI_CODING_AGENT_DIR`
+  or `~/.pi/agent/bin/rg[.exe]`) and then the system rg on PATH, and
+  parses the strict `path\0count\n` framing (`--with-filename --null`).
+  `find` remains an exact legacy pass-through — `output`/`max_depth`
+  (find count/depth, staged N3) and grep `output="files"` (staged N2b)
+  are **NOT implemented**: no such parameters exist.
+- **read result-shape rules.** A **text** read WITHOUT `offset`/`limit`
+  returns either the complete file content byte-for-byte (the built-in's
+  content) plus the deterministic frozen nine-fact `nro-read-facts:`
+  trailer (`complete`, `returned_lines`, `returned_bytes`, `total_lines`,
+  `total_bytes`, `omitted_lines`, `omitted_bytes`, `next_offset`,
+  `line_truncated` — fixed order, single spaces, the exact form frozen in
+  the NRO benchmark protocol §8.4), or — when the content exceeds the fixed
+  static caps (240 lines / 12 KiB, 2048-byte per-line representation,
+  code-point-safe) — a deterministic preview of the first
+  `min(240 lines, 12 KiB)` cut at line boundaries plus the same facts
+  line. `details` is undefined when complete and otherwise carries exactly
+  a valid built-in `ReadToolDetails.truncation` object (a `TruncationResult`
+  derived from the same facts, so the inherited built-in renderer shows its
+  standard truncation warning); no additive `details` keys are ever added.
+  Determinism: same file bytes + same caps → identical preview text and
+  identical facts, independent of cwd/session/date; UTF-8-exact and
+  code-point-safe byte accounting on the built-in's own line-counting basis
+  (including the trailing-newline phantom-line handling).
+- **Legacy `read` delegation stays byte-identical to Pi 0.83.0.** Every
+  call with explicit `offset` and/or `limit`, every image read (attachment
+  content + note; also the text-only built-in image note from a failed
+  decode/resize or an unprocessed BMP — validated against the source's
+  magic bytes and passed through byte-identically), every error
+  (missing/unreadable file, `offset` beyond end) and abort (`"Operation
+  aborted"`) delegates to the captured built-in
+  `createReadToolDefinition(ctx.cwd)` execution path — content, `details`
+  and error text byte-for-byte.
+- **Only read-only second reads.** Beyond the delegated built-in path, the
+  `read` override performs exactly two additional reads of the target file,
+  both read-only, both through the policy module's Pi-equivalent path
+  normalization (unicode-space normalization, leading-`@` strip, tilde
+  expansion, `file://` handling, macOS AM/PM / NFD / curly-quote fallbacks
+  — so `@`/relative/absolute parity with the built-in is preserved): the
+  >50KB-first-line re-read (the built-in cannot return that content; the
+  deterministic preview is built from the full text) and the image-note
+  magic-byte sniff (≤ 4100 bytes). No writes, no shell, no `pi.exec`, no
+  model calls.
+- **`sourceInfo` provenance.** Overridden tools report the extension as
+  their source in `pi.getAllTools()` instead of `builtin` (expected,
+  documented consequence of same-name overriding); the underlying built-ins
+  remain available in any session where the extension is not loaded.
+- **NRO savings/adoption are NOT_MEASURED.** No token-savings or adoption
+  claim is made for the N1/N2 surface; the NRO benchmark's arms and
+  thresholds are pre-registered but unmeasured, and N4 (Commander-owned
+  measurement/verdict) has not run.
+
 ## Tested environments
 
 | Component | Version | How it was exercised |

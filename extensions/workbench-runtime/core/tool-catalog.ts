@@ -40,7 +40,15 @@ export const WORKBENCH_TOOL_NAMES = [
 	"workbench_delegate_worker",
 	"workbench_review_worker_diff",
 	"workbench_delegation_status",
+	// P8b: the public read-only tool-result recovery tool is appended LAST
+	// (intentional one-tool fingerprint transition — see
+	// docs/cache/stable-prefix-contract.md). It never starts a receipt for
+	// itself and is excluded from the begin step of the receipt lifecycle.
+	"workbench_recover_tool_result",
 ] as const;
+
+/** P8b: the public read-only tool-result recovery tool (appended LAST). */
+export const RECOVERY_TOOL_NAME = "workbench_recover_tool_result";
 
 export interface WorkbenchToolMeta {
 	name: string;
@@ -74,7 +82,7 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 		run_id: Type.String({ description: "Run id, e.g. 20260101-120000-abcd" }),
 		include: Type.Optional(
 			Type.Union([Type.Literal("summary"), Type.Literal("manifest"), Type.Literal("logs"), Type.Literal("all")], {
-				description: "What to include (default: all, with bounded log tails)",
+				description: "What to include (default: summary)",
 			}),
 		),
 		max_lines: Type.Optional(Type.Integer({ description: "Log snippet line cap (default 200)", minimum: 1, maximum: 2000 })),
@@ -109,6 +117,32 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 		max_bytes: Type.Optional(Type.Integer({ description: "Global rendered-patch byte cap (default 32KB)", minimum: 1, maximum: 512000 })),
 	}),
 	workbench_delegation_status: Type.Object({}),
+	// P8b: public read-only recovery tool. Both params are OPTIONAL in the
+	// schema, but the runtime requires EXACTLY ONE (result_id XOR
+	// tool_call_id); violating that fails closed with the fixed `invalid`
+	// code. result_id is the strict wtr1 shape; tool_call_id is resolved
+	// against the CURRENT native Pi session identity
+	// (ctx.sessionManager.getSessionId()) and fails closed when the session
+	// identity is absent or invalid (legacy no-receipt sessions).
+	workbench_recover_tool_result: Type.Object({
+		result_id: Type.Optional(
+			Type.String({
+				description:
+					"Strict wtr1 receipt id: wtr1- followed by exactly 64 lowercase hex characters (as shown by a blocked-replay reason or a previous recovery)",
+				minLength: 5,
+				maxLength: 69,
+				pattern: "^wtr1-[0-9a-f]{64}$",
+			}),
+		),
+		tool_call_id: Type.Optional(
+			Type.String({
+				description:
+					"Pi tool call id from the CURRENT native Pi session — resolved against ctx.sessionManager.getSessionId(); fails closed when the session identity is absent or invalid",
+				minLength: 1,
+				maxLength: 256,
+			}),
+		),
+	}),
 	workbench_delegate_worker: Type.Object({
 		task: Type.String({ description: "Bounded implementation task already planned by the Sol commander", minLength: 1, maxLength: 10000 }),
 		allowed_paths: Type.Array(Type.String({ minLength: 1, maxLength: 300 }), {
@@ -174,10 +208,12 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 		name: "workbench_read_run",
 		label: "Workbench read run",
 		description:
-			"Read a workbench run record by run_id: manifest metadata, summary, and bounded log snippets. Full logs are never sent inline; use the returned log paths with read/grep when more detail is needed.",
-		promptSnippet: "Read a workbench run record (manifest, summary, bounded logs) by run_id",
+			"Read a workbench run record by run_id: a bounded Summary/Evidence/Persisted summary by default (no raw logs, no argv), or manifest metadata and caller-bounded log tails on request. Every readable run also reports the current-state validation assessment — REUSABLE or RERUN_REQUIRED with fixed reason codes — as observation only: it never automatically skips recipe/gate execution and is never acceptance evidence. Full logs are never sent inline; use the returned log paths with read/grep when more detail is needed.",
+		promptSnippet: "Read a workbench run record (default: bounded summary; manifest/logs on request; current-state REUSABLE/RERUN_REQUIRED verdict) by run_id",
 		promptGuidelines: [
 			"Use workbench_read_run to inspect previous recipe runs; default output is deliberately bounded.",
+			"A REUSABLE/RERUN_REQUIRED validation verdict is a current-state observation only — it never skips recipe/gate execution and is never acceptance evidence; final recipe/gate runs remain required.",
+			"Batch 2+ known-independent read-only tool calls (read, grep, find, ls, workbench_project_inspect, workbench_read_run, workbench_read_gate, workbench_list_gates, workbench_compare_runs) in one host parallel turn; dependent calls, writes, delegations, reviews and final recipe/gate execution stay sequential.",
 		],
 	},
 	workbench_run_gate: {
@@ -239,12 +275,13 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 		name: "workbench_review_worker_diff",
 		label: "Workbench review worker diff",
 		description:
-			"Review one delegation's actual diff from real git state: derives the worker's true changed paths relative to the delegation's before snapshot, checks every changed path against the parent-approved allowed_paths (include_paths only narrows the patch and can never hide a violation), renders a globally bounded redacted patch (default 400 lines / 32 KiB over the whole rendered patch; per-path stats plus a segmented include_paths review instruction when truncated/omitted), and binds the current diff hash. PASS marks the delegation REVIEWED (any later diff change turns it STALE); FAIL (out-of-scope paths) leaves it pending. Writes only the delegation review record and state — never project files.",
-		promptSnippet: "Review a delegated worker's actual diff against the approved scope and bind the reviewed hash",
+			"Review one delegation's actual diff from real git state: derives the worker's true changed paths relative to the delegation's before snapshot, checks every changed path against the parent-approved allowed_paths (include_paths only narrows the patch and can never hide a violation), renders a globally bounded redacted patch (default 400 lines / 32 KiB over the whole rendered patch; per-path stats plus a segmented include_paths review instruction when truncated/omitted), and binds the current diff hash. Callable repeatedly on the latest delegation (PENDING_REVIEW / STALE / REVIEWED): every call re-runs the real git facts, scope and hash; displayed-path coverage merges across same-hash segments (per-path truncated entries count; globally omitted paths do not) and resets on a hash change. REVIEWED requires scope PASS plus complete displayed-path coverage; a scope FAIL invalidates a prior REVIEWED state fail-closed. Writes only the delegation review record and state — never project files.",
+		promptSnippet: "Review a delegated worker's actual diff against the approved scope (repeatable, coverage-gated) and bind the reviewed hash",
 		promptGuidelines: [
 			"Use workbench_review_worker_diff after a worker returns: review the actual diff, never the worker's prose.",
 			"The review checks the entire worker diff against allowed_paths; include_paths narrows only the patch output.",
 			"A pending or stale delegation blocks the next delegation and VERIFY — review the diff first.",
+			"REVIEWED requires a PASS verdict AND complete displayed-path coverage; re-call with include_paths for the remaining paths until coverage is COMPLETE (per-path truncated entries count; globally omitted paths do not).",
 		],
 	},
 	workbench_delegation_status: {
@@ -256,6 +293,17 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 		promptGuidelines: [
 			"Use workbench_delegation_status before delegating or switching to VERIFY to confirm no review is pending or stale.",
 			"Use /q-delegation-status in the TUI; the footer shows WF:LOCKED (strict Sol write authority, no active lease) or WF:REVIEW (review outstanding).",
+		],
+	},
+	workbench_recover_tool_result: {
+		name: "workbench_recover_tool_result",
+		label: "Workbench recover tool result",
+		description:
+			"Recover a persisted two-phase tool-result receipt (schema wtr1) for a workbench tool call in THIS native Pi session: provide EXACTLY ONE of result_id (strict wtr1-<64 lowercase hex>) or tool_call_id (resolved against the current session id; fails closed when the session identity is absent or invalid). Returns only the bounded persisted receipt facts (id, tool, status, project-relative receipt path, redacted bounded summary, omission facts) with a fixed disclaimer — the persisted summary is presentation, never acceptance evidence. Read-only and deterministic: never re-executes the original tool call, never reads raw logs or domain records, never refreshes any state, and never creates a receipt for itself. Fixed fail-closed codes: invalid, missing, incomplete, corrupt, conflict, storage_error.",
+		promptSnippet: "Recover a persisted tool-result receipt by result_id or current-session tool_call_id (exactly one; bounded, read-only, fail-closed)",
+		promptGuidelines: [
+			"Use workbench_recover_tool_result after a blocked replay or a reconnect/resume of the SAME native Pi session: pass exactly one of result_id or tool_call_id (never both, never neither — anything else is the fixed invalid code).",
+			"Recovery returns only the bounded persisted summary, never the original full output, and is never acceptance evidence; it never re-executes the original tool call.",
 		],
 	},
 };

@@ -146,6 +146,10 @@ export const STRICT_SOL_DEV_ALLOWLIST: readonly string[] = [
 	"workbench_delegate_worker",
 	"workbench_review_worker_diff",
 	"workbench_delegation_status",
+	// P8b: the public read-only recovery tool is appended LAST (14 → 15), in
+	// the same order as WORKBENCH_TOOL_NAMES / MODE_TOOLS (stable-prefix
+	// discipline: never reorder, never add tools implicitly).
+	"workbench_recover_tool_result",
 ];
 
 export const STRICT_ALLOWLIST_SET: ReadonlySet<string> = new Set(STRICT_SOL_DEV_ALLOWLIST);

@@ -99,8 +99,8 @@ Defense-in-depth controls:
 ### Worker-first write authority (P7)
 
 Approved GPT-5.6 Sol in DEV resolves to the fixed `worker-first-strict`
-policy: the active tool set is exactly the canonical 14-tool allowlist
-(`read`, `grep`, `find`, `ls` plus all ten `workbench_*` tools) — no
+policy: the active tool set is exactly the canonical 15-tool allowlist
+(`read`, `grep`, `find`, `ls` plus all eleven `workbench_*` tools) — no
 `bash`/`edit`/`write`, no foreign tools — and no persisted/prompt/config
 value can weaken or opt out of it. Actor identity comes only from the
 `WORKBENCH_AGENT_ROLE=worker` env contract and the provider/model pair;
@@ -128,7 +128,7 @@ appear in status/compact summaries or persisted summaries (`/q-write-policy
 status` and the footer show only `WF:LEASE used/max` / `WF:LOCKED` facts).
 Leases are revoked on leaving DEV, commander model/provider change, session
 end, explicit lock, and they expire (30 min) or exhaust (10 calls) —
-restoring the exact canonical 14 tools; restore is fail-closed (invalid
+restoring the exact canonical 15 tools; restore is fail-closed (invalid
 records restore to locked).
 
 ### Delegation ledger and review lifecycle (P7)
@@ -150,13 +150,38 @@ it scope-checks every worker path against the parent-approved `allowed_paths`
 hide a violation), compares the current diff hash with the recorded after
 hash (mismatch/drift are warnings), warns when the worker's `## Files
 Changed` section is missing or inconsistent with the actual diff, and writes
-the completed `review.json` (atomic). Verdict `PASS` marks the delegation
-REVIEWED bound to the CURRENT hash; `FAIL` keeps it PENDING_REVIEW. A
-pending or stale review blocks the next delegation AND VERIFY (mode entry
-and gate runs in VERIFY are refused); any diff change after REVIEWED turns
-the delegation STALE (a diff returning to exactly the reviewed hash
-re-validates). Blocked commander write attempts are counted while a review
-is outstanding. The review lifecycle and the lease persist as custom
+the completed `review.json` (atomic). The tool is callable repeatedly on
+the latest delegation (PENDING_REVIEW / STALE / REVIEWED) and EVERY call
+re-runs the real git facts, the full scope check over every worker path and
+the complete current diff hash — `include_paths` only narrows the rendered
+patch, so a segment can never skip a scope check or a hash binding.
+
+Displayed-path coverage (Commander Slice B2) is machine-derived from the
+actually rendered patch entries: a path counts as displayed only when it
+appears in a rendered `record.patch` entry — a globally omitted path never
+counts, while a bounded/per-path-truncated entry counts as that path's
+bounded evidence segment (the reviewer sees the segment, the omission
+facts and the remaining paths, never a silent skip). Prior displayed
+coverage merges ONLY from the persisted `review.json` with the SAME
+`bound_diff_hash` and valid worker-path membership; a hash change resets
+coverage (only prior-hash coverage is dropped — this call's rendered
+paths stay displayed). Rendered coverage counts are always recomputed
+from the record's valid checked worker paths: legacy schema_version-1
+records stay readable and infer prior coverage ONLY from their persisted
+patch entries, and absent or malformed persisted coverage arrays or a
+persisted `coverage_complete` flag never render a false COMPLETE. Verdict
+`PASS` combined with COMPLETE displayed-path coverage marks the delegation
+REVIEWED bound to the CURRENT hash; `FAIL` keeps it PENDING_REVIEW, and
+ANY re-review of the SAME current diff that is not PASS with complete
+coverage (a scope FAIL or an incomplete PASS, e.g. a legacy partial
+review record) invalidates a prior REVIEWED state fail-closed (demoted to
+PENDING_REVIEW with the reviewed hash cleared — pending/stale stay safely
+blocking). A pending or stale review blocks the next delegation
+AND VERIFY (mode entry and gate runs in VERIFY are refused); any diff
+change after REVIEWED turns the delegation STALE (a diff returning to
+exactly the reviewed hash re-validates). Blocked commander write attempts
+are counted while a review is outstanding. The review lifecycle and the
+lease persist as custom
 entries (`workbench-delegation-state`, `workbench-write-lease`) — durable
 across compaction and session replacement — and restore fail-closed on
 `session_start`.
@@ -294,6 +319,43 @@ only in the non-TUI issuance output and are never written into status or
 compact summaries; delegation ledger and review records are redacted and
 bounded.
 
+**P0 session observability is numeric-only (commander-token-optimization
+plan §6).** The split cost breakdown counts commander requests, compactions
+and per-tool inline TEXT bytes over session entries; tool **arguments are
+never inspected** and result text is counted as UTF-8 bytes only — it is
+never stored, rendered, or otherwise surfaced by the attribution
+(`/q-cost-status` shows counts, IDs and tool names only).
+
+**P1 parent-result summaries are bounded presentation (plan §8).** The
+`workbench_run_recipe` / `workbench_run_gate` tool results and `/q-run` /
+`/q-gate` output are bounded summaries (4096 bytes/40 lines success,
+12288 bytes/120 lines failure) that never inline raw successful
+stdout/stderr or per-test lines, inline bounded excerpts on failure only
+after the required facts, and always reference the full persisted logs by
+path. Summaries are never acceptance evidence and never rewrite persisted
+records.
+
+**Slice B1 run-result presentation is layered and bounded (plan P2).**
+`workbench_read_run` defaults to a machine-derived
+Summary/Evidence/Persisted view (≤ 4096 UTF-8 bytes / 40 lines,
+control characters sanitized — a field can never inject extra lines —
+and code-point-safe truncation) that never inlines raw stdout/stderr,
+per-test lines, or argv, always states the exact opt-in instruction for
+bounded tails (`include=logs` / `include=all`) in a REQUIRED
+Evidence-layer guidance line that survives adversarial fields/lists and
+the caps, and never silently loses machine facts: optional cache/quant
+lines that cannot fit the caps are dropped lowest-priority-first and
+recorded in the aggregate, and bounded/truncated metadata/path/list
+displays carry an explicit durable-source fact (manifest.json / run
+record / disk) precomputed before the aggregate omissions line is
+emitted. It always references the durable project-relative
+run-dir/manifest/summary/stdout/stderr paths. Explicit
+`manifest`/`logs`/`all` includes add bounded manifest metadata
+(cwd/argv) and, for `logs`/`all`, only the caller-bounded log tails
+(default 200 lines / 20 KB per stream; custom schema-bounded
+max_lines/max_bytes honored) — the renderer never reads or re-bounds
+logs. Records on disk are never rewritten.
+
 ## Path traversal and symlinks
 
 - Run ids are strictly validated (`^\d{8}-\d{6}-[A-Za-z0-9]{4}$`) before
@@ -305,11 +367,151 @@ bounded.
 - Evidence paths are containment-checked the same way; escaping paths abort
   the gate run with a setup error.
 
+## Tool-result receipt recovery (P8a core + P8b wiring)
+
+`core/tool-result-recovery.ts` persists two-phase tool-result receipts
+(`.pi/workbench/tool-results/<id>.started` + `<id>.json`, schema `wtr1`),
+wired into the Pi tool lifecycle in P8b. What it protects:
+
+- **Raw input never persists.** Only the exact tool name and a canonical
+  SHA-256 hash of the raw input are persisted; raw arguments, the native Pi
+  session identity, the toolCallId, env secrets and token-shaped values are
+  never written. Non-JSON inputs are rejected before any write.
+- **BEGIN only after every policy guard allows.** The started receipt is
+  created at the END of the `tool_call` guard — after every
+  worker/commander/mode/path/lease check has allowed — and BEFORE the tool
+  executes. A matching completed replay and every incomplete/corrupt/
+  conflict/invalid/storage outcome block the call fail-closed with a short
+  fixed reason (with a recover instruction); the tool never re-executes.
+- **Capacity blocks, never evicts.** At `MAX_IN_FLIGHT_RECEIPTS` (256)
+  in-flight in-memory handles, a new registered workbench call is blocked
+  BEFORE begin/execution with a fixed bounded reason; existing pending
+  handles are never evicted and nothing is begun for the blocked call, so
+  no started receipt is left orphaned.
+- **Finalize requires the EXACT dual match.** One `tool_result` handler
+  finalizes ONLY a handle begun by this runtime whose toolCallId AND tool
+  name both match exactly; a tool-name mismatch never finalizes (the
+  started receipt stays incomplete, the in-memory handle is consumed, and
+  only a bounded `tool_name_mismatch` fact is reported). Text blocks only,
+  env-secret values scrubbed, status success/error, bounded redacted
+  summary. Failure never claims availability and never rewrites or rolls
+  back the domain artifact.
+- **Redaction first, then caps.** Existing env/token redaction runs over
+  the FULL content before explicit UTF-8 byte/line caps apply (summary ≤
+  2048 bytes / 20 lines, error ≤ 512 bytes / 8 lines), so a secret at the
+  truncation boundary is already replaced; truncation is code-point safe,
+  the `\n[truncated]` marker's byte AND line space is reserved inside the
+  caps, and control characters are sanitized per line. The bounded
+  renderer carries a fixed disclaimer and never renders absolute
+  project/session paths.
+- **Path safety and permissions.** Receipt ids are strictly validated
+  (`^wtr1-[0-9a-f]{64}$`) before any path is built; the receipt directory
+  is realpath-containment-checked before AND after mkdir (an escaping
+  symlink at `.pi`/`.pi/workbench`/`tool-results` blocks every entry point
+  before any write); the directory is 0700, artifacts 0600; reads lstat
+  each artifact and reject symlinks, directories and oversized files.
+- **Fail closed, no overwrite.** Existing receipts are strictly parsed and
+  cross-checked; corruption, unsafe/oversized artifacts, missing-started
+  and cross-phase mismatches are never reported completed. Both phases
+  publish atomically with no-overwrite semantics (tmp + hard link); an
+  existing finalized artifact is never replaced. Recovery is strictly
+  read-only and deterministic.
+- **Recovery session validation.** The public
+  `workbench_recover_tool_result` tool (read-only, in AUDIT/VERIFY and the
+  strict Sol DEV allowlist; not receipted itself) accepts EXACTLY ONE of
+  `result_id` (strict `wtr1-` shape) or `tool_call_id`. The `tool_call_id`
+  path validates the CURRENT native Pi session identity AND the parameter
+  (absent/invalid/control-character/over-bound fails closed with the fixed
+  `invalid` code and hashes nothing) BEFORE deriving the id. Fixed
+  fail-closed codes: `invalid`, `missing`, `incomplete`, `corrupt`,
+  `conflict`, `storage_error`. Recovery never re-executes the original
+  call, reads no raw logs/domain records, and performs no refresh.
+- **Isolation and repository hygiene.** Receipts never touch
+  run/cache/gate/delegation artifacts or execution counts;
+  `.pi/workbench/tool-results/` is gitignored, and the delegation ledger
+  excludes the receipts subtree from the git facts it records exactly like
+  its own records (sibling-safe prefix match).
+- **Legacy additive.** Legacy run/cache/delegation/domain records are never
+  read, migrated, or rewritten; unknown-schema receipts fail closed.
+
+The receipt layer is a hygiene and recovery layer for receipt files, not a
+security boundary; persisted receipts are presentation, never acceptance
+evidence. This repository implements no WebSocket or any other transport —
+receipts are local files with no network path.
+
+## Native tool overrides (NRO N1/N2)
+
+Slices N1+N2 of `docs/plans/commander-native-tool-optimization.md` register
+three fixed same-name overrides of the Pi built-in `read`/`grep`/`find`
+tools (statically, fixed `read → grep → find` order, BEFORE the unchanged
+11-tool `WORKBENCH_TOOL_NAMES` catalog; the resolved tool list the model
+sees is unchanged). Security properties:
+
+- **Exact-name guards remain authoritative.** The layer-2 `tool_call` guard
+  intercepts by exact tool name BEFORE execution, so it still sees
+  `toolName === "read"` / `"grep"` / `"find"` exactly as for the built-ins:
+  AUDIT/VERIFY protected-path read blocking, VERIFY/AUDIT hard denials, DEV
+  allowances, the `PATH_ARG_TOOLS` path-policy set, the mode matrices and
+  the strict-Sol canonical 15-tool allowlist behave exactly as before. The
+  mode/write inventories and `WORKBENCH_TOOL_NAMES` (11) are unchanged —
+  the overrides are same-name replacements, never new tools, and never
+  enter the write-authority/lease lists.
+- **No new capability surface.** The overrides add **no write path, no
+  shell, no `pi.exec`, no model calls, and no cache/session/ledger
+  mutation**: `find` delegates to the built-in definition byte-for-byte,
+  `grep` delegates every legacy branch byte-for-byte and runs its
+  `output=count` branch through the dedicated read-only rg adapter, and
+  `read` delegates everything except the deterministic preview (explicit
+  `offset`/`limit`, images, errors, abort). There are exactly two read-only
+  second-read cases: the >50KB-first-line full-file fallback (`readFile` of
+  the whole target — read-only but not byte-bounded, since the built-in
+  cannot return that content) and the image-note magic-byte sniff (≤ 4100
+  bytes, validating a text-only built-in image note — failed decode/resize
+  or unprocessed BMP — against the source's magic bytes). Both go through
+  the policy module's Pi-equivalent path normalization and never mutate
+  files, caches, session state, or ledgers: the overrides are pure readers
+  like the built-ins they replace.
+- **Grep count execution is direct, read-only and fail-closed.**
+  `output=count` runs the installed ripgrep engine through the Pi-free
+  adapter (`core/native-search-adapter.ts`) with an explicit argument
+  vector and `shell:false` — no shell, no `pi.exec`, no downloads, no
+  writes, no model calls, no cache/session/ledger mutation. The binary is
+  resolved managed-first (`PI_CODING_AGENT_DIR` or `~/.pi/agent/bin/
+  rg[.exe]`) and then the system rg on PATH; an unavailable rg fails
+  explicitly (`ripgrep (rg) is not available`). Output is parsed strictly
+  from the `path\0count\n` framing (`--with-filename --null`): malformed
+  records, spawn/execution failure and abort (pre-abort or mid-scan,
+  including Pi's timeout abort) all fail explicitly — never a partial
+  count; zero matches is an exact `value=0` result, not an error. The
+  search path resolves with Pi 0.83.0 `resolveToCwd` parity (unicode-space
+  normalization, leading-`@` strip, tilde expansion, `file://` decoding)
+  and a missing path fails with the built-in's own `Path not found:` text,
+  so the exact-name guard, protected-path policy and mode semantics keep
+  behaving exactly as for the built-ins.
+- **No hidden truncation.** A preview is never presented as a complete
+  read: every no-offset text result states the frozen nine-fact
+  `nro-read-facts:` line (`complete` … `line_truncated`), and `details`
+  carries at most a valid built-in `ReadToolDetails.truncation` object —
+  no additive keys.
+- **Deterministic and static.** Preview text and facts are deterministic
+  functions of (file bytes, fixed caps); the count line is a deterministic
+  function of (search path, flags, rg output); override metadata contains
+  no dynamic facts. The one intentional metadata/schema transition (the
+  single combined N1/N2 delta) is a documented, one-time fingerprint
+  transition, not ongoing churn.
+- **NRO savings/adoption are NOT_MEASURED.** No token-savings or adoption
+  claim is made; N4 (Commander-owned measurement/verdict) has not run.
+
 ## Log growth
 
 - Run logs are truncated with Pi's official helpers (2000 lines / ~50 KB in
-  summaries; `workbench_read_run` returns 200-line / 20 KB tails by
-  default). Full content stays on disk at the run directory.
+  summaries; `workbench_read_run` returns a bounded
+  Summary/Evidence/Persisted summary by default (≤ 4096 bytes / 40 lines,
+  no raw log content, no argv, with the exact `include=logs`/`include=all`
+  opt-in instruction for bounded tails always stated in the Evidence
+  layer) and caller-bounded 200-line / 20 KB log
+  tails only for the explicit `logs`/`all` includes). Full content stays
+  on disk at the run directory.
 - The compaction supplement is bounded (40 lines / 2.4 KB), deduplicated,
   and never contains run log content — it only carries pointers (run ids,
   gate ids, evidence paths).
@@ -330,6 +532,61 @@ Inside a delegated worker process the same event is cancelled
 compaction; the runner additionally fails closed on any `compaction_start`
 event and on the 90% hard context budget (see Controlled worker delegation
 above).
+
+## Milestone session handoff (P5)
+
+`/q-milestone-handoff <next step>` is the user-only lifecycle command that
+carries workbench state into a fresh parent-linked session (an ordinary
+`/new` stays a fresh/DEV session that copies nothing). Privacy and safety
+properties:
+
+- **Explicit next step is redacted exactly once.** The user-supplied next
+  step is trimmed, passed through the env-secret redactor (secret-looking
+  env values plus well-known credential shapes) and re-capped AFTER
+  redaction (a `[REDACTED]` replacement can grow the text; caps are applied
+  code-point and UTF-8 safe). The SAME normalized value is stored in
+  `record.next_step` and in the copied `state.nextStep` — a pre-existing
+  compact snapshot's `nextStep` (possibly stale or undefined) never reaches
+  the record or the target, so a secret cannot persist via the snapshot or
+  reach model context twice. The command parser still rejects empty and
+  overlong raw user input up front; prepare only re-caps the redacted value
+  and never silently accepts unbounded input.
+- **The absolute source session path never enters model context.** The
+  hidden note renders only the fixed fact `source session: parent-linked
+  (pointer persisted outside model context)`. The parent link lives outside
+  LLM context: the custom lifecycle record (persisted pointer) and the
+  session parent linkage (`ctx.newSession` uses the original full session
+  file). The visible replacement-context user notification may show the
+  source path — that is a user notification, not model context.
+- **Every record string is bounded and redacted by `prepare`.** Milestone
+  id, next step, session pointer and timestamp are redacted against the
+  collected env secrets and truncated code-point-safely to their persisted
+  caps, so the handoff can never build a record that its own fail-closed
+  loader rejects or that violates record bounds.
+- **Hidden note bounds are hard and marked.** The note is limited to 40
+  lines / 2400 chars / 4096 UTF-8 bytes; every truncation mode (dropped
+  lines, char cuts, byte cuts) appends `[truncated]` with the marker's
+  space reserved INSIDE all three caps, so the final output never exceeds
+  any bound and truncation is never silent. The note is pointers/status
+  only — milestone id, lifecycle, the fixed parent-link fact, next step,
+  mode, delegation/run/gate/evidence pointers — never run logs.
+- **No lease transfer.** The target never receives a write-lease entry;
+  even a source with an ACTIVE commander lease yields a target whose
+  commander writes stay locked (exact canonical tool set restored).
+- **Fail-closed restore and legacy compatibility.** Unknown schema
+  versions, unknown lifecycles, missing/empty/overlong required fields and
+  malformed snapshots are ignored on load; other custom-entry types are
+  never touched; there is no migration or rewrite. Restoration normalizes
+  a present snapshot so `state.nextStep` equals the validated
+  `record.next_step`, keeping the explicit handoff next step through later
+  compaction/restoration.
+- **Cancellation.** A cancelled replacement records an additive `cancelled`
+  record in the still-valid source session and changes nothing else.
+- **No automation, no hard stop, no P6/P8 change.** The handoff never calls
+  a model/provider, never starts an agent turn, never runs recipes or
+  gates, and never changes worker budgets/defaults, the write-authority
+  policy, the command/tool inventory, the P6 cache contracts or the P8
+  effective-root resolution.
 
 ## Cache layer (P6)
 

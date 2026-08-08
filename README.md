@@ -35,7 +35,7 @@ short-lived, pinned, non-recursive DeepSeek Pi worker for a bounded
 implementation task; the process ends with the tool call and never owns final
 verification. The default is **worker-first write authority**: approved
 GPT-5.6 Sol resolves to the fixed `worker-first-strict` policy in DEV, which
-advertises exactly the canonical 14-tool allowlist — no `bash`/`edit`/`write`
+advertises exactly the canonical 15-tool allowlist — no `bash`/`edit`/`write`
 and no foreign tools — so implementation and repair writes go to a fresh
 bounded worker by default (coherent source+tests+docs vertical slices for
 bounded low/medium-risk work after minimum repository orientation: the worker
@@ -99,9 +99,9 @@ exchange order routing, live high-frequency execution, and colocation.
 
 | Mode   | Active tools                                                                 | Hard-blocked at tool_call          | Use case                        |
 | ------ | ---------------------------------------------------------------------------- | ---------------------------------- | ------------------------------- |
-| AUDIT  | read, grep, find, ls, workbench_project_inspect, workbench_read_run, workbench_read_gate, workbench_list_gates, workbench_compare_runs | bash, edit, write, workbench_run_recipe, workbench_run_gate, workbench_delegate_worker | Read-only inspection       |
-| DEV    | For approved GPT-5.6 Sol (`worker-first-strict`): the exact canonical 14-tool allowlist (read, grep, find, ls + all 10 `workbench_*` tools) — no bash/edit/write, no foreign tools; an ACTIVE user-issued lease additionally enables exactly its edit/write tools. Other controllers: read, grep, find, ls, bash, edit, write, all `workbench_*` tools. | For strict Sol: bash always; edit/write without an active lease or outside its paths; any tool outside the allowlist. | Implementing features and fixes |
-| VERIFY | read, grep, find, ls, workbench_project_inspect, workbench_run_recipe, workbench_read_run, workbench_run_gate, workbench_read_gate, workbench_list_gates, workbench_compare_runs | bash, edit, write, workbench_delegate_worker | Re-verifying completed work |
+| AUDIT  | read, grep, find, ls, workbench_project_inspect, workbench_read_run, workbench_read_gate, workbench_list_gates, workbench_compare_runs, workbench_recover_tool_result | bash, edit, write, workbench_run_recipe, workbench_run_gate, workbench_delegate_worker | Read-only inspection       |
+| DEV    | For approved GPT-5.6 Sol (`worker-first-strict`): the exact canonical 15-tool allowlist (read, grep, find, ls + all 11 `workbench_*` tools) — no bash/edit/write, no foreign tools; an ACTIVE user-issued lease additionally enables exactly its edit/write tools (15 → 17 active tools). Other controllers: read, grep, find, ls, bash, edit, write, all `workbench_*` tools. | For strict Sol: bash always; edit/write without an active lease or outside its paths; any tool outside the allowlist. | Implementing features and fixes |
+| VERIFY | read, grep, find, ls, workbench_project_inspect, workbench_run_recipe, workbench_read_run, workbench_run_gate, workbench_read_gate, workbench_list_gates, workbench_compare_runs, workbench_recover_tool_result | bash, edit, write, workbench_delegate_worker | Re-verifying completed work |
 
 - `/q-mode-audit` — switch to AUDIT
 - `/q-mode-dev` — switch to DEV (default)
@@ -140,13 +140,20 @@ WB:VERIFY | quant-research/stock-selection | Q3:FAIL | run:20260801-004
 task is active, when the latest gate run is not a PASS, or when forced with
 `/q-widget on`; it auto-clears otherwise. Content: task, phase, gate, last
 run, blocking reason. Plain ASCII, width-fitted for narrow terminals.
-- A **split-cost segment** in the status line — `COST S:$19.195 W:$0.063
+- **Split-cost segment** in the status line — `COST S:$19.195 W:$0.063
 O:$0.424` (O omitted when zero, S and W always shown) — splits session cost
 from session entries into commander (assistant usage), worker
 (`workbench_delegate_worker` tool results) and other (other tool results,
 branch summaries, compaction). The Pi footer itself is never replaced;
 `/q-cost-status` prints the exact amounts plus the per-model commander
 breakdown in TUI and print/json modes.
+- **Commander advisory segment** in the status line — `CMD:SOFT` or
+`CMD:HIGH` — appended only when the observation-only advisory band is
+triggered (an OK session adds no advisory segment). It is derived from the
+SAME current session breakdown as the COST segment (pending-message-aware,
+with the existing dedup semantics) against the documented defaults or the
+trusted project.yaml thresholds (see
+[Commander advisory](#commander-advisory-p7--observation-only-no-hard-stop)).
 - **Run reports**: `/q-report latest | <run-id>` — manifest facts, gates and
 failed checks for gate runs, declared quant facts for quant runs.
 - **Run comparison**: `/q-compare <run-id-a> <run-id-b>` (or the
@@ -217,7 +224,9 @@ like `git config --global --list`, and quoted text like
 Config lives in `<project-root>/<CONFIG_DIR_NAME>/workbench/` where
 `CONFIG_DIR_NAME` is Pi's official export (`.pi` by default — never hardcoded):
 
-- `project.yaml` — `name`, `description`, `profile`, optional `project_dir`
+- `project.yaml` — `name`, `description`, `profile`, optional `project_dir`,
+  optional `cache.telemetry`, optional `cache.actionCache.maxBytes`, optional
+  `commander.advisory` (see [Commander advisory](#commander-advisory-p7--observation-only-no-hard-stop))
 - `recipes.yaml` — declarative recipes
 - `gates.yaml` — gate declarations (enforced since P3; empty `gates: []` uses the built-in catalog)
 - `profiles.yaml` — profile definitions
@@ -264,6 +273,73 @@ Boundaries (P8):
 - **Default / compatibility.** Omitted (or `"."`), the effective root is
   the repository root — existing projects keep their exact behavior.
   `workbench_project_inspect` shows the effective root explicitly.
+
+### Commander advisory (P7 — observation-only, no hard stop)
+
+The workbench evaluates five **cumulative commander-session observability
+facts** from the existing session cost breakdown (the same facts the COST
+segment uses) against configurable soft/high advisory thresholds
+(`core/commander-advisory.ts`, pure — commander-token-optimization plan §6
+P7):
+
+| Dimension | Soft (default) | High (default) |
+| --------- | -------------- | -------------- |
+| `requests` (commander assistant turns) | 200 | 300 |
+| `gross_tokens` (input + output + cacheRead + cacheWrite) | 25,000,000 | 40,000,000 |
+| `output_tokens` (commander output) | 125,000 | 200,000 |
+| `tool_text_bytes` (inline TEXT bytes over tool results) | 3,500,000 | 5,000,000 |
+| `compactions` | 5 | 8 |
+
+Boundaries are **inclusive `>=`** (a dimension reaches `soft` exactly at its
+soft threshold and `high` exactly at its high threshold), and the overall
+band is the **highest per-dimension band** (HIGH overrides SOFT). Reasons
+are the triggered dimensions in the fixed order above, each carrying its own
+band.
+
+Optional thresholds come from trusted `project.yaml` (values inherit the
+documented defaults additively):
+
+```yaml
+# .pi/workbench/project.yaml
+name: research
+profile: quant-research/stock-selection
+commander:
+  advisory:
+    soft:
+      requests: 200
+      gross_tokens: 25000000
+      output_tokens: 125000
+      tool_text_bytes: 3500000
+      compactions: 5
+    high:
+      requests: 300
+      gross_tokens: 40000000
+      output_tokens: 200000
+      tool_text_bytes: 5000000
+      compactions: 8
+```
+
+Every value must be a **positive safe integer** and every `high` value must
+be **greater than** its `soft` value. Invalid values, unknown keys, and
+`high <= soft` ordering violations are recorded as bounded `project.yaml`
+ConfigIssue evidence (visible through `workbench_project_inspect`) and fall
+back safely to the documented defaults — a malformed config **never disables
+observability and never crashes the runtime**.
+
+**Display behavior.** When the band is not `ok`, the TUI footer appends
+`CMD:SOFT` or `CMD:HIGH` after the existing segments (an OK session adds
+nothing). `/q-cost-status` renders the full advisory facts — band, all five
+current values, effective soft/high thresholds, and the triggered reasons —
+after its existing cost output, in TUI and print/json modes alike; the
+trusted thresholds are loaded best-effort and the command is **never
+trust-gated** (defaults apply on untrusted/unavailable/error paths).
+
+**Advisory only — no hard stop.** This is pure observability: advisory
+paths never send steering messages, never cancel or terminate anything,
+never change active tools, modes, or write authority, never block recipes,
+reviews, gates, handoffs, or user responses, and create **no hard-stop
+path**. Malformed, non-finite, negative, or absurdly large session facts
+normalize defensively (never NaN/Infinity, bounded rendering).
 
 ### /q-init
 
@@ -364,6 +440,7 @@ Custom tools (callable by the model):
 | `workbench_delegate_worker` | DEV only: GPT-5.6 Sol delegates one scoped task to pinned `deepseek-v4-flash:max`; default is coherent source+tests+docs vertical slices for bounded low/medium-risk work after minimum repository orientation. The worker owns routine local implementation decisions inside the approved contract; Sol owns requirements, cross-cutting architecture, scope, actual-diff review, final gates, and the verdict — worker prose is never acceptance. Worker cannot recurse, use free bash, run final gates, or write outside approved paths. Worker context safety (unchanged): hidden one-shot steer at 80% (800k/1M), fail-closed termination at 90% (900k), compaction cancelled in the worker role and any `compaction_start` event rejects the result. Cumulative spend budget: optional `budget_profile` (`low`/`standard`/`extended`; omitted → `standard`; `extended` explicit Sol-approved only, never inferred or auto-promoted) bounds turns/total/output tokens across the run — one hidden soft handoff steer, fail-closed hard stop, numeric-only progress. Every outcome (success **and** failure) is recorded in the delegation ledger (`.pi/workbench/delegations/<id>/`) and starts `PENDING_REVIEW`; a pending or stale review blocks the next delegation and VERIFY. |
 | `workbench_review_worker_diff` | Sol reviews one delegation's actual diff: real git state vs the recorded before snapshot, every worker path scope-checked against the parent-approved `allowed_paths` (realpath/symlink-safe — `include_paths` narrows only the patch and can never hide a violation), current vs recorded after diff hash (mismatch/drift are warnings), bounded redacted patch, notes on the worker's `## Files Changed` section vs the actual diff. Verdict `PASS` marks the delegation REVIEWED (bound to the reviewed hash); `FAIL` keeps it PENDING_REVIEW. |
 | `workbench_delegation_status` | Write authority + delegation review status: actor, fixed policy, lease status (bounded summary — never token parts), latest delegation, review status, current/reviewed diff hashes, blocked write attempts, latest review verdict. Refreshes against the real git diff — any change after REVIEWED turns the delegation STALE. |
+| `workbench_recover_tool_result` | Read-only tool-result receipt recovery (P8b): recover a persisted two-phase receipt (schema `wtr1`) with EXACTLY ONE of `result_id` (strict `wtr1-` shape) or `tool_call_id` — the `tool_call_id` path validates the CURRENT native Pi session identity AND the parameter before deriving the id (absent/invalid/control-character/over-bound fails closed with the fixed `invalid` code). Returns only the bounded persisted receipt facts (id, tool, status, project-relative path, redacted summary, omission facts) with a fixed disclaimer; never re-executes the original call, never reads raw logs/domain records, never refreshes state, and is never acceptance evidence. Available in AUDIT/VERIFY and the strict Sol DEV allowlist; not receipted itself. |
 
 Commands (same services, no duplicated logic):
 
@@ -379,22 +456,26 @@ Commands (same services, no duplicated logic):
 /q-compare <run-id-a> <run-id-b>  # diff two run records
 /q-widget on|off                  # force the widget on/off (it auto-shows during tasks and gate failures)
 /q-cost-status                    # split session cost: commander / worker / other + per-model commander
+                                 #   + P7 advisory facts (band, values, thresholds, reasons — observation-only)
 /q-delegation-status              # write authority + delegation review status (real git diff refresh)
 /q-write-policy status            # actor, fixed worker-first-strict policy, lease lock status (user-only)
 /q-commander-write-unlock ...     # user-only temporary commander write lease (issue/confirm, see below)
 /q-commander-write-lock           # user-only revoke/lock of the commander write lease
+/q-milestone-handoff <next step>  # USER-ONLY milestone handoff: fresh parent-linked session resuming
+                                  #   mode/compact/delegation state with a hidden note (leases never carried)
 ```
 
-The deterministic inventory is **28 commands, 10 workbench tools, 7 prompt
+The deterministic inventory is **29 commands, 11 workbench tools, 7 prompt
 templates** (pinned by the inventory test). The three lease commands
 (`/q-write-policy`, `/q-commander-write-unlock`, `/q-commander-write-lock`)
-are **user-only**: slash commands that are never registered as model tools.
+and the milestone handoff (`/q-milestone-handoff`) are **user-only**: slash
+commands that are never registered as model tools.
 
 ### Worker-first workflow
 
 Approved GPT-5.6 Sol owns requirements, cross-cutting architecture, scope,
 actual-diff review, final gates, and the verdict — but **does not directly
-write by default**. In DEV, Sol's strict 14-tool allowlist has no
+write by default**. In DEV, Sol's strict 15-tool allowlist has no
 `bash`/`edit`/`write`; implementation and repair writes go to a fresh bounded
 worker via `workbench_delegate_worker`. High-risk decisions remain
 commander-led — Sol keeps the decision itself and delegates only bounded
@@ -419,7 +500,7 @@ exception is a **temporary commander write lease**, issued only by the human
   status/compact summaries.
 - Expiry (30 min), exhaustion (10 calls) and revocation (leaving DEV, model/
   provider change, session end, or `/q-commander-write-lock`) restore the
-  exact canonical 14 tools; the footer shows `WF:LEASE <used>/<max>` while
+  exact canonical 15 tools; the footer shows `WF:LEASE <used>/<max>` while
   active and `WF:LOCKED` otherwise. `/q-write-policy status` accepts exactly
   the trimmed `status` subcommand and prints actor, fixed policy, lock status
   and a bounded lease summary — never any token part.
@@ -495,6 +576,63 @@ Semantics:
   cost stays observational (the `COST S:…` status segment and
   `/q-cost-status`) rather than enforced — the spend budget enforces
   token/turn counters only.
+
+### Tool-result receipt recovery (P8b)
+
+Every registered workbench tool — the public recovery tool itself excepted —
+writes a durable two-phase **tool-result receipt** under the gitignored
+`.pi/workbench/tool-results/` directory (schema `wtr1`; 0700/0600, atomic
+no-overwrite publish), wired into Pi's native tool lifecycle:
+
+- **BEGIN (pre-execute).** At the END of the `tool_call` guard — after every
+  worker/commander/mode/path/lease policy check has allowed — the call
+  begins an exclusive `<id>.started` receipt and only then executes. The
+  result id is deterministic: `wtr1-` + SHA-256 of the canonical binding of
+  the CURRENT native Pi session identity and the exact Pi `toolCallId`; the
+  exact tool name and a canonical hash of the raw input are persisted
+  identity facts — raw arguments, session identity and toolCallId are never
+  persisted. A matching completed replay, an incomplete/corrupt/conflicting
+  receipt, an invalid identity, or a storage failure blocks the call
+  fail-closed with a short fixed reason and a recover instruction — the
+  tool never re-executes (exact same-toolCallId identity only).
+- **Capacity blocks, never evicts.** When the in-memory receipt handle map
+  is already at `MAX_IN_FLIGHT_RECEIPTS` (256), a new registered workbench
+  call is blocked BEFORE BEGIN/execution with a fixed bounded reason;
+  existing pending handles are never evicted and nothing is begun for the
+  blocked call, so no orphaned started receipt is left behind.
+- **FINALIZE (exact dual match).** One `tool_result` handler finalizes ONLY
+  a handle begun by this runtime with the EXACT same `toolCallId` AND the
+  exact same tool name — a mismatch never finalizes (the started receipt
+  stays incomplete on disk and only a bounded `tool_name_mismatch` fact is
+  reported). Text blocks only, env-secret values scrubbed, status
+  success/error, and a redaction-first bounded summary (≤ 2048 bytes / 20
+  lines; error ≤ 512 bytes / 8 lines) published atomically as `<id>.json`
+  with no-overwrite semantics before Pi emits the final result events. On
+  success, safe structured recovery metadata (available, result id,
+  project-relative receipt path/status) is merged into object details
+  without changing content/isError/caps; a finalize failure never claims
+  availability and never rewrites or rolls back the domain artifact.
+- **Public recovery tool.** `workbench_recover_tool_result` is read-only
+  and deterministic, present in AUDIT/VERIFY and the strict Sol DEV
+  allowlist, appended LAST in the registration order, and NOT receipted
+  itself. It takes EXACTLY ONE of `result_id` (strict `wtr1-` shape) or
+  `tool_call_id`; the `tool_call_id` path validates the CURRENT native Pi
+  session identity AND the parameter (absent/invalid/control-character/
+  over-bound fails closed with the fixed `invalid` code and hashes
+  nothing) BEFORE deriving the id. Fixed fail-closed codes: `invalid`,
+  `missing`, `incomplete`, `corrupt`, `conflict`, `storage_error`.
+  Recovery returns only the bounded persisted receipt facts (id, tool,
+  status, project-relative path, redacted summary, omission facts) with a
+  fixed disclaimer — it never re-executes the original call, never reads
+  raw logs/domain records, never refreshes state, and is never acceptance
+  evidence.
+- **Isolation.** Receipts never touch run/cache/gate/delegation artifacts
+  or execution counts; `.pi/workbench/tool-results/` is gitignored and the
+  delegation ledger excludes the receipts subtree from its git facts
+  exactly like its own records. Legacy no-receipt sessions (absent/invalid
+  native session identity) fail closed. This repository implements **NO
+  WebSocket or any other transport** — receipts are plain local files with
+  no network path.
 
 ### Run artifacts
 
@@ -795,9 +933,11 @@ Other versions are untested — no compatibility is claimed for them.
 ## State recovery and compaction (P5)
 
 - The mode and key task state are stored in Pi **custom session entries**
-  (`workbench-mode`, `workbench-state`) and restored on every
-  `session_start` — `/new`, `/resume`, `/fork`, `/clone` and `/reload` all
-  reach that handler; a fresh `/new` session falls back to DEV.
+  (`workbench-mode`, `workbench-state`). `/resume`, `/fork`, `/clone` and
+  `/reload` reach the `session_start` restore handler with the session's
+  existing entries; an ordinary `/new` starts a **fresh/DEV** session that
+  copies nothing — only the explicit user-only `/q-milestone-handoff`
+  command carries bounded approved state into a new session (see below).
 - **P7:** the delegation review lifecycle (`workbench-delegation-state`) and
   the temporary commander write lease (`workbench-write-lease`) are persisted
   as custom entries — durable across compaction and session replacement — and
@@ -813,6 +953,27 @@ Other versions are untested — no compatibility is claimed for them.
   do-not-retry warnings. Notes are capped (40 lines / 2.4 KB), redacted,
   deduplicated, and contain only pointers — **run logs never enter the
   session context**.
+- **Milestone handoff (user-only):** `/q-milestone-handoff <next step>` is
+  the ONLY path that carries workbench state into a fresh session. It waits
+  for idle, persists a bounded/redacted `prepared` milestone record
+  (`workbench-milestone-handoff`, additive schema v1) in the current
+  (source) session, then starts a fresh **parent-linked** session whose
+  setup appends a `resumed` record, a hidden pointer-only milestone note
+  (`workbench-milestone-handoff-note`, `display: false`, no trigger turn),
+  and copies of the mode, the bounded compact state and the delegation
+  state — **never** the commander write lease (the target write authority
+  stays locked even if the source held an active/pending lease). The next
+  step is explicitly bounded (240 chars / 1024 UTF-8 bytes; empty and
+  overlong values are rejected); records and the note are bounded, redacted
+  and fail-closed on restore (unknown schema/malformed records are
+  ignored, legacy entries untouched, no migration/rewrite). Because Pi's
+  `session_start` for the new session fires BEFORE setup, the handoff
+  announces via the replacement context and then reloads it so the copied
+  entries are active before the user continues. No model/provider call and
+  no agent turn; a cancelled replacement records an additive `cancelled`
+  record in the still-valid source. There is **no automation**: the
+  command never runs on its own, has no threshold trigger, and the
+  handoff is not a hard stop.
 - Inside a delegated worker process the same event is **cancelled** so a
   worker never silently continues through lossy compaction; the runner
   also fails closed on any `compaction_start` event, on the pinned 90%
@@ -865,8 +1026,9 @@ npm run cache:doctor           # offline cache health checks (exits non-zero on 
   `cache:report`/`cache:doctor`). See
   [docs/cache/P6_RELEASE_REPORT.md](docs/cache/P6_RELEASE_REPORT.md).
 - **P7 (this release):** worker-first write authority — approved GPT-5.6 Sol
-  resolves to the fixed `worker-first-strict` policy in DEV (exact canonical
-  14-tool allowlist, no bash/edit/write or foreign tools); user-only
+  resolves to the fixed `worker-first-strict` policy in DEV (at the P7
+  milestone / before P8b: exact canonical 14-tool allowlist, no
+  bash/edit/write or foreign tools); user-only
   temporary commander write leases (`/q-write-policy status`,
   `/q-commander-write-unlock`, `/q-commander-write-lock`; TUI explicit
   confirmation vs non-TUI two-part token confirmation; fixed reasons,
@@ -898,6 +1060,16 @@ npm run cache:doctor           # offline cache health checks (exits non-zero on 
   tools, project-defined JSON schemas for `schema` checks, all within the
   quantitative scope above.
 
+**Commander token optimization Slice D (P7 advisory portion):** the
+observation-only commander advisory is implemented in this worktree
+(defaults above, trusted `project.yaml` overrides with bounded ConfigIssue
+fallback, `CMD:SOFT`/`CMD:HIGH` footer segment, advisory facts in
+`/q-cost-status`, no hard-stop semantics). The P5 milestone session/handoff
+vertical slice (user-only `/q-milestone-handoff`, lifecycle records,
+hidden note, no lease transfer) is implemented in this worktree; the full
+Slice D exit, the Commander final check/gates and the P9 verdict remain
+**Commander-owned and are NOT claimed here**.
+
 ## Layout
 
 ```
@@ -916,7 +1088,7 @@ extensions/workbench-runtime/   # Pi extension
     │                           #   80% soft / 90% hard
     ├── worker-spend.ts         # cumulative delegation spend budget: low/standard/extended
     │                           #   profiles, soft steer / hard fail-closed (pure)
-    ├── write-authority.ts      # P7 worker-first-strict policy, 14-tool Sol allowlist,
+    ├── write-authority.ts      # P7 worker-first-strict policy, 15-tool Sol allowlist,
     │                           #   commander guard + temporary write lease (pure)
     ├── lease-command.ts        # P7 user-only lease commands: parsing, token generation,
     │                           #   TUI/non-TUI renderers, WF footer segment (pure)
@@ -924,6 +1096,9 @@ extensions/workbench-runtime/   # Pi extension
     │                           #   <CONFIG_DIR_NAME>/workbench/delegations/<id>/ (pure + exec)
     ├── delegation-state.ts     # P7 review lifecycle: PENDING_REVIEW → REVIEWED → STALE,
     │                           #   hash binding, delegation/VERIFY blocking (pure)
+    ├── milestone-handoff.ts    # P5 user-only milestone handoff: schema-v1 lifecycle records,
+    │                           #   bounded next-step parser, bounded/redacted snapshot,
+    │                           #   pointer-only hidden note, fail-closed restore (pure)
     ├── diff-review.ts          # P7 workbench_review_worker_diff: real-diff scope check,
     │                           #   hash binding, bounded redacted patch, review.json (pure + exec)
     ├── state.ts                # mode persistence (session entries)

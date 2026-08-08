@@ -22,6 +22,12 @@ import { test } from "node:test";
 import { parse as parseYaml } from "yaml";
 
 import {
+	createFindToolDefinition,
+	createGrepToolDefinition,
+	createReadToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+
+import {
 	canonicalHash,
 	sha256Hex,
 } from "../extensions/workbench-runtime/cache/canonical-hash.ts";
@@ -58,6 +64,17 @@ import {
 	WORKBENCH_TOOL_PARAMETERS,
 	workbenchToolMetadataOrdered,
 } from "../extensions/workbench-runtime/core/tool-catalog.ts";
+import {
+	GREP_COUNT_GUIDELINE,
+	NATIVE_OVERRIDE_METADATA,
+	NATIVE_OVERRIDE_NAMES,
+	NATIVE_OVERRIDE_PARAMETERS,
+	READ_PREVIEW_GUIDELINE,
+} from "../extensions/workbench-runtime/core/native-tool-policy.ts";
+import {
+	INDEPENDENT_READ_ONLY_ALLOWLIST,
+	isIndependentReadOnlyTool,
+} from "../extensions/workbench-runtime/core/run-result.ts";
 import { effectiveGates, type Gate } from "../extensions/workbench-runtime/core/gate-schema.ts";
 import { parseRecipesDocument, type Recipe } from "../extensions/workbench-runtime/core/recipe-schema.ts";
 import { loadProjectConfig } from "../extensions/workbench-runtime/core/config.ts";
@@ -69,27 +86,75 @@ import { withTempDir, writeConfigFile } from "./helpers.ts";
 
 const SYSTEM_PROMPT = "You are the pi-dev-workbench assistant. Follow the workbench mode policy and validation ladder.";
 
-const BUILTIN_TOOLS: readonly ToolInfoLike[] = [
-	{ name: "read", description: "Read the contents of a file", promptSnippet: "Read file contents", parameters: { type: "object", properties: { path: { type: "string" } } }, promptGuidelines: [] },
-	{ name: "grep", description: "Search file contents", promptSnippet: "Search for patterns", parameters: { type: "object" }, promptGuidelines: [] },
-	{ name: "find", description: "Find files by glob", promptSnippet: "Find files", parameters: { type: "object" }, promptGuidelines: [] },
+/**
+ * The four Pi built-ins that are NOT part of the workbench registration
+ * surface (NRO N1/N2 overrides read/grep/find; ls/bash/edit/write stay Pi
+ * built-ins). Generic static stand-ins: identical in the pre-NRO and
+ * current fixtures, so they never affect the N1/N2 transition proof.
+ */
+const OTHER_BUILTIN_TOOLS: readonly ToolInfoLike[] = [
 	{ name: "ls", description: "List directory contents", promptSnippet: "List a directory", parameters: { type: "object" }, promptGuidelines: [] },
 	{ name: "bash", description: "Execute a bash command", promptSnippet: "Run a command", parameters: { type: "object", properties: { command: { type: "string" } } }, promptGuidelines: [] },
 	{ name: "edit", description: "Edit a file", promptSnippet: "Make precise edits", parameters: { type: "object" }, promptGuidelines: [] },
 	{ name: "write", description: "Write a file", promptSnippet: "Create or overwrite a file", parameters: { type: "object" }, promptGuidelines: [] },
 ];
 
-/** All registered tool infos: built-ins + the workbench catalog (in registration order). */
+/**
+ * The three ACTUALLY REGISTERED N1/N2 read/grep/find overrides: tool info is
+ * built from the registered static metadata and parameter schemas
+ * (NATIVE_OVERRIDE_METADATA / NATIVE_OVERRIDE_PARAMETERS in
+ * core/native-tool-policy.ts) in the fixed read → grep → find order — never
+ * from generic built-in mocks.
+ */
+function nativeOverrideToolInfos(): ToolInfoLike[] {
+	return NATIVE_OVERRIDE_NAMES.map((name) => ({
+		name: NATIVE_OVERRIDE_METADATA[name].name,
+		description: NATIVE_OVERRIDE_METADATA[name].description,
+		promptSnippet: NATIVE_OVERRIDE_METADATA[name].promptSnippet,
+		parameters: NATIVE_OVERRIDE_PARAMETERS[name],
+		promptGuidelines: [...NATIVE_OVERRIDE_METADATA[name].promptGuidelines],
+	}));
+}
+
+/** The 11 workbench catalog tools in their explicit registration order. */
+function catalogToolInfos(): ToolInfoLike[] {
+	return workbenchToolMetadataOrdered().map((t) => ({
+		name: t.name,
+		description: t.description,
+		promptSnippet: t.promptSnippet,
+		parameters: t.parameters,
+		promptGuidelines: [...t.promptGuidelines],
+	}));
+}
+
+/** All registered tool infos: the three native overrides + the other built-ins + the 11-tool catalog (in active order). */
 function allToolInfos(): ToolInfoLike[] {
+	return [...nativeOverrideToolInfos(), ...OTHER_BUILTIN_TOOLS, ...catalogToolInfos()];
+}
+
+/**
+ * The PRE-NRO legacy fixture (NRO plan §10 control arm): pristine Pi 0.83.0
+ * built-in read/grep/find captured from the same create*ToolDefinition
+ * factories the overrides delegate to, plus the unchanged other built-ins
+ * and the 11-tool catalog. Same names and same active order as the current
+ * fixture — only the read/grep/find metadata and schema sources differ.
+ */
+function preNroToolInfos(): ToolInfoLike[] {
+	const builtins: ToolInfoLike[] = [
+		createReadToolDefinition(".") as unknown as ToolInfoLike,
+		createGrepToolDefinition(".") as unknown as ToolInfoLike,
+		createFindToolDefinition(".") as unknown as ToolInfoLike,
+	];
 	return [
-		...BUILTIN_TOOLS,
-		...workbenchToolMetadataOrdered().map((t) => ({
+		...builtins.map((t) => ({
 			name: t.name,
 			description: t.description,
 			promptSnippet: t.promptSnippet,
 			parameters: t.parameters,
-			promptGuidelines: [...t.promptGuidelines],
+			promptGuidelines: [...(t.promptGuidelines ?? [])],
 		})),
+		...OTHER_BUILTIN_TOOLS,
+		...catalogToolInfos(),
 	];
 }
 
@@ -302,8 +367,9 @@ test("workbench_delegate_worker metadata is static and carries the responsibilit
 	assert.match(text, /observable acceptance criteria/);
 	assert.match(text, /Worker prose is never acceptance evidence/);
 	// The registration-order/schema contract is untouched: same name, same
-	// position (the first P7 tool, after the seven existing tools), same
-	// parameter schema hash — pinned to the final Phase 3 baseline
+	// position (the first P7 tool, after the seven existing tools; P8b
+	// appends the recovery tool LAST), same parameter schema hash — pinned
+	// to the final Phase 3 baseline
 	// (a self-comparison would prove nothing). The hash changed exactly
 	// ONCE, intentionally, in Phase 3 of the worker token-budget repair
 	// (see docs/compatibility.md for the documented fingerprint
@@ -315,7 +381,7 @@ test("workbench_delegate_worker metadata is static and carries the responsibilit
 	// granularity) deliberately leaves the parameter schema byte-for-byte
 	// unchanged — the pin below stays the final Phase 3 baseline.
 	assert.equal(meta.name, "workbench_delegate_worker");
-	assert.equal(WORKBENCH_TOOL_NAMES.indexOf("workbench_delegate_worker"), WORKBENCH_TOOL_NAMES.length - 3, "delegate tool keeps its registration position (seven existing → delegate → review → status)");
+	assert.equal(WORKBENCH_TOOL_NAMES.indexOf("workbench_delegate_worker"), WORKBENCH_TOOL_NAMES.length - 4, "delegate tool keeps its registration position (seven existing → delegate → review → status → recovery)");
 	// The canonical schema object itself (not only its hash): budget_profile
 	// stays OPTIONAL — absent from `required` — and its nested union carries
 	// the JSON Schema `default: "standard"` annotation plus the exact
@@ -367,9 +433,89 @@ test("DEV / AUDIT / VERIFY tool hashes are stable and pairwise different", () =>
 	assert.notEqual(audit.toolOrderHash, verify.toolOrderHash);
 });
 
-test("mode matrix is exactly the P6-B spec matrix", () => {
-	assert.deepEqual(MODE_TOOLS.AUDIT, ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_read_run", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs"]);
-	assert.deepEqual(MODE_TOOLS.VERIFY, ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_run_recipe", "workbench_read_run", "workbench_run_gate", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs"]);
+test("NRO N1/N2 transition: override metadata/schemas shift the schema/mode fingerprints exactly once; names/order unchanged; same-mode fingerprints stay stable", () => {
+	const preNro = preNroToolInfos();
+	const current = allToolInfos();
+	// names and active order are IDENTICAL — the overrides replace the
+	// built-ins under the SAME names; nothing is added, removed or reordered
+	assert.deepEqual(
+		current.map((t) => t.name),
+		preNro.map((t) => t.name),
+		"the N1/N2 transition changes no tool names and no tool order",
+	);
+	const modes = [
+		["DEV", DEV_TOOLS],
+		["AUDIT", AUDIT_TOOLS],
+		["VERIFY", VERIFY_TOOLS],
+	] as const;
+	for (const [mode, modeToolNames] of modes) {
+		const before = modePrefixFingerprint(mode, SYSTEM_PROMPT, preNro, modeToolNames);
+		const after = modePrefixFingerprint(mode, SYSTEM_PROMPT, current, modeToolNames);
+		// the ONE intentional combined N1/N2 fingerprint transition (plan
+		// §7.1): the tool-schema hash and therefore the whole mode prefix
+		// change...
+		assert.notEqual(after.toolSchemaHash, before.toolSchemaHash, `${mode} tool-schema fingerprint changed by the N1/N2 transition`);
+		assert.notEqual(after.modeHash, before.modeHash, `${mode} mode prefix changed by the N1/N2 transition`);
+		// ...while the name set and the active order stay byte-identical
+		assert.equal(after.toolNamesHash, before.toolNamesHash, `${mode} tool NAMES unchanged by N1/N2`);
+		assert.equal(after.toolOrderHash, before.toolOrderHash, `${mode} tool ORDER unchanged by N1/N2`);
+		// stability after the transition: repeated same-mode builds of the
+		// CURRENT surface are deterministic
+		assert.deepEqual(after, modePrefixFingerprint(mode, SYSTEM_PROMPT, current, modeToolNames), `${mode} current fingerprint is deterministic across builds`);
+	}
+	// the transition is exactly the documented combined N1/N2 one (plan
+	// §7.1 / §6.4): read keeps the built-in schema and gains exactly the ONE
+	// continuation/count guideline bullet (N1); grep keeps the built-in
+	// metadata/schema PREFIX byte-identical, appends exactly the two
+	// optional count selectors, gains the intended static count-mode
+	// description sentence and mirrors the ONE guideline bullet (N2); find
+	// stays fully built-in-compatible (N3 not implemented)
+	const currentRead = nativeOverrideToolInfos()[0]!;
+	const builtinRead = createReadToolDefinition(".") as unknown as ToolInfoLike;
+	assert.equal(currentRead.name, builtinRead.name);
+	assert.equal(currentRead.description, builtinRead.description, "read description unchanged (built-in verbatim)");
+	assert.equal(currentRead.promptSnippet, builtinRead.promptSnippet, "read promptSnippet unchanged (built-in verbatim)");
+	assert.deepEqual(currentRead.parameters, builtinRead.parameters, "read parameter schema byte-identical to the Pi 0.83.0 built-in");
+	assert.deepEqual(
+		currentRead.promptGuidelines,
+		[...(builtinRead.promptGuidelines ?? []), READ_PREVIEW_GUIDELINE],
+		"read adds exactly the ONE §6.4 guideline bullet — nothing else",
+	);
+	// grep: the built-in description is the verbatim prefix of the current
+	// one, which then carries the intended static count-mode sentence; the
+	// schema keeps the byte-identical legacy property prefix and appends
+	// exactly output/count_kind
+	const currentGrep = nativeOverrideToolInfos().find((t) => t.name === "grep")!;
+	const builtinGrep = createGrepToolDefinition(".") as unknown as ToolInfoLike;
+	assert.ok((currentGrep.description ?? "").startsWith(builtinGrep.description ?? ""), "grep description keeps the built-in text verbatim as its prefix");
+	assert.ok((currentGrep.description ?? "").includes("Use output=count for an exact uncapped count"), "grep description carries the intended static count-mode sentence");
+	assert.equal(currentGrep.promptSnippet, builtinGrep.promptSnippet, "grep promptSnippet unchanged (built-in verbatim)");
+	assert.deepEqual(currentGrep.promptGuidelines, [GREP_COUNT_GUIDELINE], "grep carries exactly the one mirrored §6.4 guideline bullet");
+	const grepOverrideProps = (currentGrep.parameters as { properties: Record<string, unknown> }).properties;
+	const grepBuiltinProps = (builtinGrep.parameters as { properties: Record<string, unknown> }).properties;
+	const legacyKeys = ["pattern", "path", "glob", "ignoreCase", "literal", "context", "limit"];
+	assert.deepEqual(Object.keys(grepBuiltinProps), legacyKeys, "built-in grep property order (oracle sanity)");
+	assert.deepEqual(
+		Object.keys(grepOverrideProps),
+		[...legacyKeys, "output", "count_kind"],
+		"grep appends exactly output and count_kind after the byte-identical legacy prefix",
+	);
+	for (const key of legacyKeys) {
+		assert.deepEqual(grepOverrideProps[key], grepBuiltinProps[key], `grep legacy property ${key} byte-identical`);
+	}
+	// find: fully built-in-compatible — metadata verbatim, schema
+	// byte-identical (N3 count/max_depth are not implemented)
+	const currentFind = nativeOverrideToolInfos().find((t) => t.name === "find")!;
+	const builtinFind = createFindToolDefinition(".") as unknown as ToolInfoLike;
+	assert.equal(currentFind.description, builtinFind.description, "find description built-in verbatim");
+	assert.equal(currentFind.promptSnippet, builtinFind.promptSnippet, "find promptSnippet built-in verbatim");
+	assert.deepEqual(currentFind.promptGuidelines, builtinFind.promptGuidelines ?? [], "find promptGuidelines unchanged");
+	assert.deepEqual(currentFind.parameters, builtinFind.parameters, "find parameter schema byte-identical to the Pi 0.83.0 built-in");
+});
+
+test("mode matrix is exactly the P6-B spec matrix (P8b appends the read-only recovery tool)", () => {
+	assert.deepEqual(MODE_TOOLS.AUDIT, ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_read_run", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs", "workbench_recover_tool_result"]);
+	assert.deepEqual(MODE_TOOLS.VERIFY, ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_run_recipe", "workbench_read_run", "workbench_run_gate", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs", "workbench_recover_tool_result"]);
 	assert.deepEqual(MODE_TOOLS.DEV, ["read", "grep", "find", "ls", "bash", "edit", "write", ...WORKBENCH_TOOLS]);
 	// AUDIT has no mutating tools; VERIFY has no free bash/edit/write
 	for (const forbidden of ["bash", "edit", "write", "workbench_run_recipe", "workbench_run_gate", "workbench_delegate_worker"]) {
@@ -391,19 +537,21 @@ test("computeActiveTools: DEV foreign-tool order is deterministic (sorted by nam
 	assert.deepEqual(a, computeActiveTools("DEV", ["read", "bash", ...foreign]));
 });
 
-test("P7 tools keep the fixed seven→delegate→review→status order with static metadata", () => {
+test("P7 tools keep the fixed seven→delegate→review→status order with static metadata; P8b appends the recovery tool LAST", () => {
 	const names = [...WORKBENCH_TOOL_NAMES];
+	assert.equal(names.length, 11, "eleven workbench custom tools after P8b");
 	assert.deepEqual(
 		names.slice(0, 7),
 		["workbench_project_inspect", "workbench_run_recipe", "workbench_read_run", "workbench_run_gate", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs"],
 		"the seven existing tools keep their registration order",
 	);
 	assert.deepEqual(
-		names.slice(7),
+		names.slice(7, 10),
 		["workbench_delegate_worker", "workbench_review_worker_diff", "workbench_delegation_status"],
 		"the three P7 tools follow in strict delegate → review → status order",
 	);
-	// Every P7 tool's metadata stays free of dynamic values (no dates,
+	assert.deepEqual(names.slice(10), ["workbench_recover_tool_result"], "the P8b recovery tool is appended LAST");
+	// Every P7/P8b tool's metadata stays free of dynamic values (no dates,
 	// times, hashes, absolute paths, or concrete run/gate/task ids).
 	for (const name of names.slice(7)) {
 		const meta = WORKBENCH_TOOL_METADATA[name];
@@ -411,7 +559,7 @@ test("P7 tools keep the fixed seven→delegate→review→status order with stat
 			assert.deepEqual(findDynamicValueMarkers(field), [], `${name} metadata must be static: ${field.slice(0, 80)}`);
 		}
 	}
-	// Review/status parameter schemas are constructed in source order and
+	// Review/status/recovery parameter schemas are constructed in source order and
 	// stable across builds (identical hashes on repeat construction).
 	for (const name of names.slice(7)) {
 		assert.equal(canonicalHash(WORKBENCH_TOOL_PARAMETERS[name]), canonicalHash(WORKBENCH_TOOL_PARAMETERS[name]), name);
@@ -433,6 +581,104 @@ test("workbench tool catalog: registration order, static metadata, stable schema
 		assert.ok(WORKBENCH_TOOL_METADATA[name], name);
 		assert.ok(typeof WORKBENCH_TOOL_METADATA[name].description === "string", name);
 	}
+});
+
+test("the read-only batching guideline appears exactly once in static catalog metadata (Commander Slice B1)", () => {
+	const marker = "known-independent read-only";
+	let occurrences = 0;
+	for (const tool of workbenchToolMetadataOrdered()) {
+		for (const field of [tool.description, tool.promptSnippet, ...tool.promptGuidelines]) {
+			assert.deepEqual(findDynamicValueMarkers(field), [], `${tool.name} metadata must be static: ${field.slice(0, 80)}`);
+			occurrences += field.split(marker).length - 1;
+		}
+	}
+	assert.equal(occurrences, 1, "the batching guideline appears exactly once across all static tool metadata");
+	// it lives on workbench_read_run (the tool whose default became the bounded summary)
+	const readRun = WORKBENCH_TOOL_METADATA.workbench_read_run;
+	assert.ok(readRun.promptGuidelines.some((g) => g.includes(marker)), "guideline present on workbench_read_run");
+	// the guideline mirrors the explicit allowlist (the classifier's machine form)
+	const guideline = readRun.promptGuidelines.find((g) => g.includes(marker))!;
+	for (const name of INDEPENDENT_READ_ONLY_ALLOWLIST) {
+		assert.ok(guideline.includes(name), `guideline names ${name}`);
+	}
+	// the guideline stays static under the standard audit
+	assert.deepEqual(staticToolMetadataIssues(readRun), [], "workbench_read_run metadata stays static");
+});
+
+test("the independent read-only allowlist is the exact approved set and never infers (Commander Slice B1; P8b boundary documented)", () => {
+	assert.deepEqual(
+		[...INDEPENDENT_READ_ONLY_ALLOWLIST],
+		["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_read_run", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs"],
+		"exactly the four read built-ins plus the five read-only workbench tools",
+	);
+	// P8b deliberate boundary: the AUDIT mode matrix gains the read-only
+	// recovery tool, but the fixed P3 batching classifier (core/run-result.ts)
+	// is NOT part of the P8b scope and stays the exact five read-only
+	// workbench tools — the recovery tool is deliberately NOT classified as
+	// batchable yet (it is read-only and deterministic, but batching it is a
+	// separate reviewed decision).
+	assert.deepEqual(
+		[...AUDIT_TOOLS],
+		[...INDEPENDENT_READ_ONLY_ALLOWLIST, "workbench_recover_tool_result"],
+		"AUDIT = the batch allowlist + the P8b recovery tool (deliberate one-tool difference)",
+	);
+	assert.equal(isIndependentReadOnlyTool("workbench_recover_tool_result"), false, "P8b boundary: recovery tool is not (yet) batch-classified");
+	// delegation_status is excluded even though it only reads: it refreshes
+	// persisted delegation state; every execution/review/delegation/write
+	// tool is excluded too
+	for (const name of [
+		"bash",
+		"edit",
+		"write",
+		"workbench_run_recipe",
+		"workbench_run_gate",
+		"workbench_delegate_worker",
+		"workbench_review_worker_diff",
+		"workbench_delegation_status",
+	]) {
+		assert.equal(isIndependentReadOnlyTool(name), false, name);
+	}
+	// deterministic membership for every registered tool + the built-ins
+	const expected = new Set<string>([...INDEPENDENT_READ_ONLY_ALLOWLIST]);
+	for (const name of [...WORKBENCH_TOOL_NAMES, "read", "grep", "find", "ls", "bash", "edit", "write"]) {
+		assert.equal(isIndependentReadOnlyTool(name), expected.has(name), name);
+	}
+	// the classifier never infers independence for unknown tools
+	assert.equal(isIndependentReadOnlyTool("workbench_gate_check"), false);
+	assert.equal(isIndependentReadOnlyTool(""), false);
+});
+
+test("workbench_read_run schema/metadata wording declares the summary default and the P4b observation-only verdict semantics (Commander Slice B1 + P4b)", () => {
+	const params = WORKBENCH_TOOL_PARAMETERS.workbench_read_run as unknown as {
+		properties: Record<string, { description?: string }>;
+	};
+	assert.match(params.properties.include?.description ?? "", /default: summary/);
+	const meta = WORKBENCH_TOOL_METADATA.workbench_read_run;
+	assert.match(meta.description, /default/i);
+	assert.match(meta.description, /no raw logs, no argv/);
+	assert.match(meta.promptSnippet, /default: bounded summary/);
+	// the tool keeps its registration position and the union keeps its order
+	assert.equal(WORKBENCH_TOOL_NAMES.indexOf("workbench_read_run"), 2, "read_run stays the third registered tool");
+	const includeSchema = params.properties.include as unknown as { anyOf?: Array<{ const?: string }> };
+	assert.deepEqual(
+		(includeSchema.anyOf ?? []).map((alternative) => alternative.const),
+		["summary", "manifest", "logs", "all"],
+		"the include union keeps the fixed summary|manifest|logs|all order",
+	);
+	// P4b: the static metadata/guideline wording explicitly conveys the three
+	// validation-verdict semantics — the verdict is observation only, it
+	// never automatically skips recipe/gate execution, and it is never
+	// acceptance evidence.
+	assert.match(meta.description, /as observation only/, "the description frames the verdict as a current-state observation");
+	assert.match(meta.description, /never automatically skips recipe\/gate execution/, "the description says the verdict never skips execution");
+	assert.match(meta.description, /never acceptance evidence/, "the description says the verdict is never acceptance evidence");
+	assert.match(meta.promptSnippet, /current-state REUSABLE\/RERUN_REQUIRED verdict/, "the snippet names the current-state verdict");
+	const verdictGuideline = meta.promptGuidelines.find((g) => g.includes("validation verdict"));
+	assert.ok(verdictGuideline, "the static guidelines state the validation-verdict semantics");
+	assert.match(verdictGuideline!, /current-state observation only/, "the guideline frames the verdict as observation only");
+	assert.match(verdictGuideline!, /never skips recipe\/gate execution/, "the guideline says the verdict never skips execution");
+	assert.match(verdictGuideline!, /never acceptance evidence/, "the guideline says the verdict is never acceptance evidence");
+	assert.match(verdictGuideline!, /final recipe\/gate runs remain required/, "the guideline keeps final recipe/gate runs required");
 });
 
 // ---------------------------------------------------------------------------
@@ -572,23 +818,39 @@ async function extensionSources(): Promise<Record<string, string>> {
 	return sources;
 }
 
-test("no dynamic tool loader: tools are registered statically in WORKBENCH_TOOL_NAMES order", async () => {
+test("no dynamic tool loader: tools are registered statically — the three fixed native overrides first, then WORKBENCH_TOOL_NAMES order", async () => {
 	const index = await readFile(new URL("index.ts", EXTENSION_DIR), "utf8");
 	// exactly one setActiveTools call site (applyModeTools) — the tool set is
 	// swapped only on mode switches / session_start, never per turn
 	assert.equal(index.split("setActiveTools(").length - 1, 1, "setActiveTools called from exactly one place");
-	// exactly the 10 workbench tools are registered, in catalog order
+	// exactly the three fixed native overrides + the 11 workbench catalog
+	// tools are registered (14 total), in the fixed order
 	const registrations = index.split("pi.registerTool({").slice(1);
-	assert.equal(registrations.length, WORKBENCH_TOOL_NAMES.length, "one registerTool per catalog tool");
+	assert.equal(
+		registrations.length,
+		NATIVE_OVERRIDE_NAMES.length + WORKBENCH_TOOL_NAMES.length,
+		"one registerTool per native override and catalog tool (3 + 11 = 14)",
+	);
 	const registered: string[] = [];
 	for (const block of registrations) {
+		// NRO N1: the three fixed same-name overrides spread the policy
+		// module's static metadata (NATIVE_OVERRIDE_METADATA.<name>).
+		const nativeMatch = /\.\.\.NATIVE_OVERRIDE_METADATA\.(read|grep|find),/.exec(block);
+		if (nativeMatch) {
+			registered.push(nativeMatch[1] ?? "");
+			continue;
+		}
 		// P6-B: metadata is spread from the tool catalog — the name comes from
 		// the explicit WORKBENCH_TOOL_METADATA.<name> reference.
 		const match = /\.\.\.WORKBENCH_TOOL_METADATA\.(workbench_[a-z_]+),/.exec(block);
 		assert.ok(match, `registerTool block must spread catalog metadata: ${block.slice(0, 80)}`);
 		registered.push(match[1] ?? "");
 	}
-	assert.deepEqual(registered, [...WORKBENCH_TOOL_NAMES], "registration order == explicit constant order");
+	assert.deepEqual(
+		registered,
+		[...NATIVE_OVERRIDE_NAMES, ...WORKBENCH_TOOL_NAMES],
+		"registration order == NATIVE_OVERRIDE_NAMES + WORKBENCH_TOOL_NAMES (WORKBENCH_TOOL_NAMES itself unchanged)",
+	);
 	// no registerTool inside any loop construct (static registration only)
 	for (const line of index.split("\n")) {
 		if (line.includes("registerTool")) {

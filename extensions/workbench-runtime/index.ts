@@ -18,11 +18,38 @@
  *     quote-awareness so harmless commands never false-positive.
  *   - state recovery + compaction supplements (core/compact.ts): mode and
  *     key task state are persisted as Pi custom entries, restored on
- *     session_start (covers /new /resume /fork /clone /reload); on
+ *     session_start (covers /resume /fork /clone /reload; an ordinary /new
+ *     starts a fresh/DEV session that copies nothing); on
  *     session_before_compact a bounded ASCII note (task, mode, gates, runs,
  *     evidence paths, next step, do-not-retry) is persisted and injected as
  *     a hidden custom message. Pi compaction itself is never cancelled or
  *     reimplemented, and no run logs ever enter the session context.
+ *   - milestone handoff (core/milestone-handoff.ts, user-only):
+ *     /q-milestone-handoff <next step> is the ONLY path that carries
+ *     workbench state into a fresh session — it waits for idle, parses and
+ *     bounds the explicit next step (empty/overlong rejected up front),
+ *     redacts it against the collected env secrets and re-caps it
+ *     (code-point/UTF-8 safe), then persists a bounded/redacted schema-v1
+ *     `prepared` milestone record (workbench-milestone-handoff) in the
+ *     source session — every record string (milestone id, next step,
+ *     session pointer, timestamp) is bounded/redacted by prepare and the
+ *     SAME normalized next step is stored in `record.next_step` and the
+ *     copied `state.nextStep` (a stale/undefined snapshot nextStep never
+ *     reaches the record or the target) — then starts a fresh
+ *     parent-linked session whose setup appends a `resumed` record, a
+ *     hidden pointer-only note (display:false, workbench-milestone-handoff-
+ *     note; never the absolute source session path — only the fixed
+ *     parent-linked fact, the pointer stays outside model context) and
+ *     copies of the mode / bounded compact state / delegation
+ *     state — NEVER the commander write lease (the target write authority
+ *     stays locked even if the source held an active/pending lease).
+ *     session_start(new) fires BEFORE setup, so the replacement reloads
+ *     (withSession → replacementCtx.reload()) to restore the setup entries;
+ *     no model/provider call and no agent turn; a cancelled replacement
+ *     records an additive `cancelled` record in the source. Loading is
+ *     fail-closed (unknown schema/malformed records ignored, legacy entries
+ *     untouched, no migration/rewrite) and prepare can never build a
+ *     record its own fail-closed loader rejects.
  *
  * P6-A additions (DeepSeek prompt-cache telemetry — observability only):
  *   - hash-only telemetry of usage, context fingerprints and inferred cache
@@ -102,6 +129,141 @@
  *     per-model commander breakdown from ctx.sessionManager.getEntries()
  *     in TUI and print/json modes
  *
+ * NRO N1/N2 additions (commander-native-tool-optimization plan, slices N1
+ * and N2 — native read/grep/find overrides, additive):
+ *   - three fixed same-name overrides of the Pi built-in read/grep/find
+ *     tools, registered statically in the fixed read → grep → find order
+ *     BEFORE the 11 workbench catalog tools (the registration surface is
+ *     exactly NATIVE_OVERRIDE_NAMES + WORKBENCH_TOOL_NAMES); the override
+ *     metadata is static: read adds exactly the ONE §6.4 continuation/count
+ *     guideline bullet (N1), grep mirrors the same bullet and appends the
+ *     static count-mode sentence to its description (N2), find keeps the
+ *     built-in metadata verbatim (N3 not implemented)
+ *   - N1 read: explicit offset and/or limit, images, errors and abort
+ *     delegate byte-for-byte to the captured built-in definition
+ *     (createReadToolDefinition(ctx.cwd)); a text read WITHOUT
+ *     offset/limit returns the deterministic preview (240 lines / 12 KiB /
+ *     2048-byte per-line representation, core/native-tool-policy.ts; the
+ *     terminal newline of a trailing-newline file is reserved on the last
+ *     real line so returned_bytes can never exceed 12288, and a preview
+ *     over already-truncated built-in content is never complete) with
+ *     the frozen nine-fact `nro-read-facts:` line; complete small files
+ *     keep the built-in text byte-for-byte and append complete=true facts;
+ *     details stay undefined when complete or a valid
+ *     ReadToolDetails.truncation-only object when truncated; no custom
+ *     renderCall/renderResult (built-in slot renderer inheritance)
+ *   - N2 grep count: the parameter schema appends exactly the two optional
+ *     selectors `output` (matches|count) and `count_kind` (matches|lines)
+ *     after the byte-identical legacy property prefix; output=count runs a
+ *     dedicated abort-aware Pi-free adapter (core/native-search-adapter.ts)
+ *     over the installed rg — ONE compact exact uncapped
+ *     `count kind=<matches|lines> value=<n> files=<n>` line with details
+ *     undefined, legacy limit/context never applied, zero is an exact
+ *     result, missing paths fail with the built-in text and a pre-abort
+ *     rejects `Operation aborted`; output omitted or "matches" (and a
+ *     count_kind present while output is omitted) delegates byte-for-byte
+ *     to the built-in definition — the new selectors never reach it
+ *   - N3 find (count/max_depth) is NOT implemented: find remains an exact
+ *     legacy pass-through — schema, metadata and execute delegate to the
+ *     built-in definition byte-for-byte
+ *   - the overrides perform no writes, no pi.exec, no shell and no model
+ *     calls; the only second reads are read-only — the >50KB-first-line
+ *     re-read and the image-note magic-byte sniff, both through the
+ *     Pi-equivalent path normalization from the policy module (a text-only
+ *     built-in image note — failed decode/resize or unprocessed BMP — is
+ *     validated against the source's magic bytes and passes through
+ *     byte-identically, while genuine text starting the same phrase still
+ *     gets facts); the exact-name tool_call guard, MODE_TOOLS/write-
+ *     authority inventories and WORKBENCH_TOOL_NAMES are unchanged
+ *
+ * P0/P1 additions (commander-token-optimization plan, slice A — additive):
+ *   - P0 observability in core/cost-breakdown.ts: exact commander
+ *     assistant-request count, compaction count, and deterministic
+ *     per-tool inline TEXT UTF-8 byte attribution over session toolResult
+ *     entries (grouped by toolName, stable ordering, counts, total;
+ *     malformed/non-text content contributes zero and never throws;
+ *     descriptive only — never claims causal token savings);
+ *     /q-cost-status renders these facts compactly with bounded per-tool
+ *     rows, never rendering tool arguments or result text; the existing
+ *     commander/worker/other cost + token semantics are byte-for-byte
+ *     unchanged
+ *   - P1 bounded parent-result summaries (core/result-summary.ts, pure):
+ *     workbench_run_recipe, /q-run, workbench_run_gate and /q-gate now
+ *     emit success summaries <= 4096 UTF-8 bytes / 40 lines (status/exit,
+ *     duration, artifacts, cache, log paths, recognized Node TAP totals,
+ *     warning/anomaly facts, explicit omission facts — never raw
+ *     stdout/stderr, never per-test success lines) and failure summaries
+ *     <= 12288 UTF-8 bytes / 120 lines under the fixed precedence
+ *     (status/exit+command, failing tests, first root cause, timeout/
+ *     cancelled, warning count, full log paths, omission facts; bounded
+ *     excerpts only after required facts). Warning counts surface even on
+ *     exit 0; clean non-empty stderr is an explicit anomaly fact. Gate
+ *     summaries keep failing/blocked gate ids + reasons before passing
+ *     gates and always name the full record path. Full logs/records are
+ *     persisted exactly as before; summaries are presentation only and
+ *     never acceptance evidence. recipe/gate tool schemas, structured
+ *     details, run records and cache behavior are unchanged.
+ *
+ * Commander Slice B1 additions (commander-token-optimization plan,
+ * P2 layered run results + P3 read-only batching guideline — additive):
+ *   - layered workbench_read_run presentation (core/run-result.ts, pure):
+ *     the omitted `include` now resolves to `summary` and renders the
+ *     ordered Summary/Evidence/Persisted layers <= 4096 UTF-8 bytes / 40
+ *     lines (custom caps clamped to documented safe bounds), sanitized
+ *     and code-point safe, NEVER inlining raw stdout/stderr, per-test
+ *     lines, or argv, with durable project-relative run-dir/manifest/
+ *     summary/stdout/stderr paths; explicit `manifest` adds bounded
+ *     cwd/argv metadata without tails; explicit `logs`/`all` append only
+ *     the existing caller-bounded log tails; structured details and disk
+ *     records are unchanged (legacy records render identically)
+ *   - deterministic read-only batching classifier
+ *     (INDEPENDENT_READ_ONLY_ALLOWLIST in core/run-result.ts): exactly
+ *     read/grep/find/ls + workbench_project_inspect/read_run/read_gate/
+ *     list_gates/compare_runs — execution, review, delegation and write
+ *     tools (incl. workbench_delegation_status) are never classified, and
+ *     the classifier never infers independence; the single static prompt
+ *     guideline in core/tool-catalog.ts mirrors the allowlist (batch 2+
+ *     known-independent read-only calls in one host parallel turn;
+ *     dependent calls, writes, delegations, reviews and final
+ *     recipe/gate execution stay sequential). No tool/order/mode change.
+ *
+ * Commander Slice B2 additions (commander-token-optimization plan,
+ * P2 coverage-gated segmented actual-diff review — additive):
+ *   - displayed-path coverage facts on review records
+ *     (core/diff-review.ts): displayed_paths / remaining_paths /
+ *     coverage_complete / review_path — a path is displayed only when it
+ *     appears in an actually rendered patch entry (globally omitted paths
+ *     never count; bounded/per-path-truncated entries count as that
+ *     path's bounded evidence segment); prior displayed coverage merges
+ *     ONLY from the persisted review.json with the SAME bound_diff_hash
+ *     and valid worker-path membership (legacy schema_version-1 records
+ *     infer prior coverage ONLY from their persisted patch entries); a
+ *     hash change resets coverage (only prior-hash coverage is dropped —
+ *     this call's actually rendered paths stay displayed under the new
+ *     hash). Every review segment still
+ *     scope-checks EVERY worker path and binds the complete current diff
+ *     hash — include_paths narrows only the rendered patch; defaults 400
+ *     lines / 32 KiB, max 50 include_paths, redaction and the worker
+ *     scope are unchanged
+ *   - workbench_review_worker_diff is callable repeatedly on the latest
+ *     delegation (PENDING_REVIEW / STALE / REVIEWED): every call re-runs
+ *     the real git facts/scope/hash; a same-hash complete PASS rerender
+ *     keeps the valid REVIEWED binding, a changed hash resets coverage
+ *     (PASS stays blocking until fresh coverage is complete), and ANY
+ *     re-review that is not PASS with complete coverage (a scope FAIL or
+ *     an incomplete PASS — e.g. a legacy partial review record)
+ *     invalidates a prior same-hash REVIEWED state fail-closed
+ *     via the pure demoteReviewedToPending transition
+ *     (core/delegation-state.ts — REVIEWED → PENDING_REVIEW, reviewed
+ *     hash cleared; pending/stale stay safely blocking)
+ *   - deterministic rendered coverage counts, bounded next include_paths
+ *     guidance (max 50 paths / ≤ 1024 UTF-8 bytes, complete paths only
+ *     with an exact omitted count), the review-complete fact and the
+ *     durable project-relative review.json path; details expose
+ *     review_record + coverage facts; no caller/prose acknowledgement
+ *     API; no tool/order/mode/schema change; review writes stay
+ *     review.json + the existing state entry only
+ *
  * P7 additions (Worker-first write authority + delegation ledger, slice 2):
  *   - strict Sol DEV tool matrix (core/write-authority.ts wired): the
  *     approved GPT-5.6 Sol commander gets exactly the fixed
@@ -157,14 +319,14 @@
  *     and confirms on a second same-command invocation with both exact
  *     parts (tokens never enter status/compact summaries); lock revokes
  *     and persists the audit facts; an ACTIVE confirmed lease enables
- *     exactly its edit/write tools on top of the canonical 14-tool
+ *     exactly its edit/write tools on top of the canonical 15-tool
  *     allowlist (lease-added tools are canonical, deduplicated edit then
- *     write), and exhaustion/expiry/revocation restores the exact 14
+ *     write), and exhaustion/expiry/revocation restores the exact 15
  *     (bash stays hard-blocked; the second-layer guard stays
  *     authoritative); lease-lock synchronization is LAZY — before each
  *     agent turn and inside the command/tool guards and the status
  *     refresh, a lease that is no longer ACTIVE reverts the advertised
- *     set to the exact canonical 14 (no timers, no background resources)
+ *     set to the exact canonical 15 (no timers, no background resources)
  *
  *   - Phase 2 of the worker token-budget repair (docs/plans/worker-token-
  *     budget-repair.md): the runner accumulates the pure cumulative spend
@@ -197,6 +359,27 @@
  *     (`| spend total X | output Y | band B`) and adds only the bounded
  *     numeric counters and fixed band to the details
  *
+ * P7 commander advisory (commander-token-optimization plan §6 P7 —
+ * observation-only, no hard stop):
+ *   - pure core/commander-advisory.ts evaluates the five cumulative
+ *     dimensions (requests, gross_tokens, output_tokens, tool_text_bytes,
+ *     compactions — fixed order, inclusive >= boundaries, HIGH-over-soft
+ *     precedence) over the SAME current session breakdown as the COST
+ *     segment (pending-message-aware with the existing dedup semantics);
+ *     documented defaults soft 200 / 25M / 125k / 3.5M / 5 and high
+ *     300 / 40M / 200k / 5M / 8
+ *   - optional trusted project.yaml commander.advisory.soft/high overrides
+ *     (positive safe integers, high > soft per dimension); invalid values,
+ *     unknown keys and ordering violations become bounded project.yaml
+ *     ConfigIssue records and fall back to the documented defaults —
+ *     malformed config never disables observability and never throws
+ *   - presentation ONLY: the footer appends CMD:SOFT / CMD:HIGH when
+ *     triggered (OK adds no segment) and /q-cost-status renders the
+ *     deterministic bounded advisory facts (current values, thresholds,
+ *     band, reasons) with trusted config best-effort or defaults (never
+ *     trust-gated); no steering message, no cancel/terminate, no tool/
+ *     mode/write-authority change, no workflow blocking, no hard-stop path
+ *
  * P8 additions (safe nested project support):
  *   - optional project.yaml `project_dir` (default "."): after config load
  *     the safe effective project root is resolved — POSIX/Windows absolute
@@ -211,6 +394,74 @@
  *     persistence, recipe checks/execution, artifact run records and git
  *     stay repository-root based (recipe cwd semantics unchanged)
  *   - workbench_project_inspect and its renderer show the effective root
+ *
+ * P4b additions (current-state reuse assessment for workbench_read_run):
+ *   - core/validation-assessment.ts assesses the persisted P4a validation
+ *     evidence of a read run against the CURRENT trusted project/runtime
+ *     state and renders exactly one explicit status (REUSABLE or
+ *     RERUN_REQUIRED with fixed reason codes) in every include mode and
+ *     the additive details.validation field — observation only, it never
+ *     skips recipe/gate execution and is never acceptance evidence
+ *   - recipe targets are rebuilt from the CURRENTLY DECLARED recipe plus
+ *     the persisted privacy-safe invocation identity, cross-checked
+ *     against the manifest's argv_hash (valid 64-hex, exactly equal;
+ *     raw argv is never used or exposed); gate targets are reconstructed
+ *     from the CURRENT effective catalog plus the strictly validated
+ *     persisted gates.json/evidence.json artifacts (foreign schema
+ *     versions, contradictory identity facts and malformed/extra source
+ *     evidence fail closed via readPersistedGateRunFacts)
+ *   - the read path is STRICTLY read-only: no persistence/session
+ *     append, no in-memory delegation-state mutation (the worker-first
+ *     facts come from the read-only projection), no run-artifact writes,
+ *     no P6-C action-cache contact; gate execution keeps its existing
+ *     mutating refresh semantics
+ *
+ * P8b additions (two-phase tool-result receipt lifecycle wiring):
+ *   - the reviewed P8a receipt core is wired into Pi's native tool
+ *     lifecycle: at the END of the `tool_call` guard (after every
+ *     worker/commander/mode/path/lease check has allowed) every registered
+ *     workbench tool EXCEPT the public recovery tool begins an exclusive
+ *     started receipt (native Pi session id + event.toolCallId + exact
+ *     tool name + canonical input hash; effective project root resolved
+ *     like each tool's own execute); BEGIN completes before the tool
+ *     executes; a matching completed replay and every incomplete/corrupt/
+ *     conflict/invalid/storage outcome block fail-closed with a short
+ *     fixed reason and never execute (exact same-toolCallId identity only
+ *     — P4 validation evidence is never consulted); when the in-memory
+ *     handle map is already at MAX_IN_FLIGHT_RECEIPTS a new call is
+ *     blocked with a fixed bounded reason BEFORE begin/execution —
+ *     existing pending handles are never evicted
+ *   - one `tool_result` handler finalizes ONLY handles begun by this
+ *     runtime with the exact same toolCallId AND tool name (bounded
+ *     in-memory map, capacity-blocked at MAX_IN_FLIGHT_RECEIPTS): text
+ *     blocks only, env secrets scrubbed, status success/error, bounded
+ *     redacted summary — before Pi emits tool_execution_end/final result
+ *     events; the handle is removed after the attempt; success merges safe
+ *     structured recovery metadata (available, result id, project-relative
+ *     receipt path/status) into object details without changing
+ *     content/isError/caps; failure never claims availability, never
+ *     rewrites/rolls back domain artifacts, leaves the started receipt
+ *     incomplete and merges a bounded unavailable code; a tool-name
+ *     mismatch never finalizes, leaves the started receipt incomplete,
+ *     consumes the in-memory handle and merges the bounded
+ *     tool_name_mismatch fact; replay-blocked and recovery-tool results
+ *     never finalize anything
+ *   - public read-only `workbench_recover_tool_result` (appended LAST in
+ *     the catalog/registration order; strict Sol DEV allowlist 14 → 15;
+ *     AUDIT/VERIFY read-only sets; NOT receipted itself): exactly one of
+ *     result_id (strict wtr1 shape) or tool_call_id (current-session
+ *     derivation — the current native session identity AND the parameter
+ *     are validated/narrowed BEFORE any hash; absent/invalid/
+ *     control-char/over-bound identity fails closed with the fixed
+ *     `invalid` code and hashes nothing); calls only
+ *     recoverReceipt + the bounded renderer; fixed fail-closed codes
+ *     invalid/missing/incomplete/corrupt/conflict/storage_error; reads no
+ *     raw logs/domain records, runs no other tool, performs no refresh,
+ *     and labels persisted summaries non-acceptance evidence
+ *   - receipts never touch run/cache/gate/delegation artifacts or
+ *     execution counts; legacy no-receipt sessions (absent/invalid native
+ *     session identity) fail closed; this repository still implements NO
+ *     WebSocket (or any other) transport
  *
  * Registers native Pi commands:
  *   /q-mode-audit /q-mode-dev /q-mode-verify /q-status   — mode control (P0)
@@ -235,13 +486,15 @@
  *   /q-write-policy status                           — P7 write policy status (P7)
  *   /q-commander-write-unlock <reason> --paths ...   — temporary commander write lease (P7)
  *   /q-commander-write-lock                          — revoke/lock the commander write lease (P7)
+ *   /q-milestone-handoff <next step>                  — user-only milestone session handoff (P5)
  *
- * Registers workbench custom tools (P1/P3/P4/P7):
+ * Registers workbench custom tools (P1/P3/P4/P7/P8b):
  *   workbench_project_inspect — project root, git, stacks, profile, recipes,
  *                               config errors (no secrets)
  *   workbench_run_recipe      — run a declared recipe only; full output to
  *                               disk, truncated summary to the model
- *   workbench_read_run        — read run records by run_id (bounded logs)
+ *   workbench_read_run      — read run records by run_id (bounded layered
+ *                               summary default; manifest/logs on request)
  *   workbench_run_gate        — run the validation ladder (gates + checks)
  *   workbench_read_gate       — read a gate run record or gate definition
  *   workbench_list_gates      — list available gates with latest status
@@ -250,6 +503,7 @@
  *                               from GPT-5.6 Sol to pinned DeepSeek max
  *   workbench_review_worker_diff — review a delegation's actual diff (P7)
  *   workbench_delegation_status — write authority + review status (P7)
+ *   workbench_recover_tool_result — read-only tool-result receipt recovery (P8b)
  *
  * P4 UI (all Pi-native):
  *   - footer status via `ctx.ui.setStatus` (the Pi footer itself is never
@@ -281,8 +535,7 @@
  * routing/execution code is implemented or planned.
  */
 
-import { mkdir, writeFile } from "node:fs/promises";
-import { access } from "node:fs/promises";
+import { access, mkdir, open, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 import type {
@@ -290,7 +543,24 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
+import {
+	CONFIG_DIR_NAME,
+	createFindToolDefinition,
+	createGrepToolDefinition,
+	createReadToolDefinition,
+	type ReadToolDetails,
+} from "@earendil-works/pi-coding-agent";
+import {
+	buildReadPreview,
+	formatGrepCountLine,
+	IMAGE_SNIFF_BYTES,
+	imageMimeFromReadNote,
+	NATIVE_OVERRIDE_METADATA,
+	NATIVE_OVERRIDE_PARAMETERS,
+	nativeResolveReadPath,
+	sniffImageMimeType,
+} from "./core/native-tool-policy.ts";
+import { runGrepCount } from "./core/native-search-adapter.ts";
 
 import {
 	checkToolCall,
@@ -298,7 +568,23 @@ import {
 	MODE_TOOLS,
 	type WorkbenchMode,
 } from "./core/mode-policy.ts";
-import { WORKBENCH_TOOL_METADATA, WORKBENCH_TOOL_PARAMETERS } from "./core/tool-catalog.ts";
+import { RECOVERY_TOOL_NAME, WORKBENCH_TOOL_METADATA, WORKBENCH_TOOL_PARAMETERS, isWorkbenchToolName } from "./core/tool-catalog.ts";
+import {
+	beginBlockReason,
+	beginReceipt,
+	capacityBlockReason,
+	deriveResultId,
+	finalizeReceipt,
+	finalizeUnavailableCode,
+	isValidIdentity,
+	MAX_IN_FLIGHT_RECEIPTS,
+	receiptRelativePath,
+	recoverFailureText,
+	recoverReceipt,
+	renderReceiptRecovery,
+	type ReceiptHandle,
+	type RecoverOutcome,
+} from "./core/tool-result-recovery.ts";
 import {
 	commanderBlockReason,
 	computeRoleActiveTools,
@@ -365,11 +651,20 @@ import {
 } from "./core/gate-engine.ts";
 import { GATE_CATALOG } from "./core/gate-catalog.ts";
 import { QUANT_GATE_ID_RE, type Gate, type WorkerFirstGateFacts } from "./core/gate-schema.ts";
-import { isValidRunId, listRuns, readLogSnippet, readManifest, readSummary } from "./core/runs.ts";
+import { isValidRunId, listRuns, readLogSnippet, readManifest } from "./core/runs.ts";
 import { join } from "node:path";
 import { runStatusLabel, fitToWidth } from "./core/format.ts";
+import { renderRunResult } from "./core/run-result.ts";
+import { assessRunValidation } from "./core/validation-assessment.ts";
 import { buildStatusLine } from "./core/status.ts";
 import { buildCostBreakdown, costStatusSegment, renderCostBreakdown } from "./core/cost-breakdown.ts";
+import {
+	advisoryStatusSegment,
+	evaluateAdvisory,
+	renderAdvisoryFacts,
+	type AdvisoryConfig,
+} from "./core/commander-advisory.ts";
+import { buildGateParentSummary, buildRecipeParentSummary } from "./core/result-summary.ts";
 import { buildWidgetLines, widgetAction, type WidgetState } from "./core/widget.ts";
 import { buildRunReport, latestGateRunSummary, resolveRunTarget } from "./core/report.ts";
 import { compareRuns } from "./core/compare.ts";
@@ -438,6 +733,7 @@ import {
 	hasStaleReview,
 	loadDelegationStateFromEntries,
 	markReviewed,
+	demoteReviewedToPending,
 	observeDiffChange,
 	recordBlockedWriteAttempt,
 	recordDelegation,
@@ -474,6 +770,17 @@ import {
 	writeAuthorityFooterSegment,
 } from "./core/lease-command.ts";
 import { collectSecretValues } from "./core/redact.ts";
+import {
+	buildMilestoneHandoffNote,
+	makeMilestoneId,
+	MILESTONE_HANDOFF_ENTRY_TYPE,
+	MILESTONE_HANDOFF_NOTE_ENTRY_TYPE,
+	milestoneHandoffUsage,
+	parseNextStepArg,
+	prepareMilestoneHandoff,
+	toCancelledRecord,
+	toResumedRecord,
+} from "./core/milestone-handoff.ts";
 
 const STATUS_KEY = "workbench";
 
@@ -517,6 +824,16 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	 */
 	let delegationState: DelegationState = emptyDelegationState();
 	let writeLease: WriteLease | undefined;
+	/**
+	 * P8b: in-memory handles for receipts begun by THIS runtime
+	 * (toolCallId → handle + project root). CAPACITY-BLOCKING at
+	 * MAX_IN_FLIGHT_RECEIPTS: when the map is already full a new registered
+	 * workbench call is blocked fail-closed BEFORE begin/execution with a
+	 * fixed bounded reason — existing handles are never evicted and nothing
+	 * is begun for the blocked call. Only handles created here are ever
+	 * finalized; a replayed call or the recovery tool never enters this map.
+	 */
+	const pendingReceiptHandles = new Map<string, { handle: ReceiptHandle; projectRoot: string }>();
 	/** Latest known commander identity facts (updated on session_start/model_select). */
 	let currentModelFacts: { provider?: string; model?: string } = {};
 	const workerRoleContext = {
@@ -637,42 +954,30 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	}
 
 	/**
-	 * P7 slice 3: construct the bounded worker-first compliance facts for a
-	 * gate run from actor/policy/lease/delegation/latest-review facts. The
-	 * delegation state is refreshed against the REAL git diff first (any
-	 * change after REVIEWED turns it STALE here). When a pending/stale
-	 * review blocks final verification, the facts carry `blockedReason` and
-	 * every B6 check evaluates BLOCKED instead of being evaluated against
-	 * partial facts. Never reads model prose — missing facts are NOT_RUN.
-	 *
-	 * B6 diff freshness FAILS CLOSED: the injected current diff hash is only
-	 * ever refreshed from the real current git facts inside this call. When
-	 * that collection fails (git unavailable/broken or any collection
-	 * error), the authoritative delegation state is preserved untouched and
-	 * the injected facts carry a MISSING current hash, so the required
-	 * `reviewed-hash-matches-current` check evaluates NOT_RUN and can never
-	 * PASS from a stale in-memory reviewed/current pair.
+	 * P4b: collect the CURRENT real diff hash (fail-closed — null on any
+	 * collection error, so the injected facts never fabricate a clean-tree
+	 * hash). Each successful collection runs exactly ONE status command
+	 * (inside the collector). Read-only.
 	 */
-	async function buildWorkerFirstGateFacts(projectRoot: string, now: string): Promise<WorkerFirstGateFacts> {
-		let injectedCurrentDiffHash: string | null = null;
+	async function collectCurrentDiffHash(projectRoot: string): Promise<string | null> {
 		try {
-			// The collector FAILS CLOSED: an unavailable `git status` (thrown
-			// exec error or non-zero exit) rejects collection, so the real
-			// current facts are not collectable — never a fabricated
-			// clean-tree hash. Each successful collection runs exactly ONE
-			// status command (inside the collector).
 			const git = await collectGitFacts(projectRoot, execFn);
-			const hash = computeDiffHash(git.changedPaths, git.pathDigests, git.pathStatuses);
-			delegationState = observeDiffChange(delegationState, hash, now);
-			persistDelegationState();
-			injectedCurrentDiffHash = delegationState.currentDiffHash ?? null;
+			return computeDiffHash(git.changedPaths, git.pathDigests, git.pathStatuses);
 		} catch {
-			// Best-effort refresh failed: the in-memory/persisted delegation
-			// state stays authoritative and untouched, and the injected current
-			// hash stays MISSING — `reviewed-hash-matches-current` is NOT_RUN
-			// (a required NOT_RUN can never make B6 PASS).
-			injectedCurrentDiffHash = null;
+			return null;
 		}
+	}
+
+	/**
+	 * Shared facts builder over an explicit (possibly projected) delegation
+	 * state + the injected current diff hash. Never mutates anything itself.
+	 */
+	async function buildWorkerFirstGateFactsFromState(
+		projectRoot: string,
+		state: DelegationState,
+		injectedCurrentDiffHash: string | null,
+		now: string,
+	): Promise<WorkerFirstGateFacts> {
 		const actor = detectActorRole({
 			roleEnv: workerRoleContext.role,
 			provider: currentModelFacts.provider,
@@ -680,12 +985,12 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		});
 		const policy = defaultWritePolicy(currentModelFacts.provider, currentModelFacts.model);
 		const leaseNow = leaseStatus(writeLease, now);
-		const reviewBlock = reviewBlockReason(delegationState, "verify");
+		const reviewBlock = reviewBlockReason(state, "verify");
 		let reviewVerdict: "PASS" | "FAIL" | null = null;
 		let reviewViolationCount: number | null = null;
-		if (delegationState.latestId !== undefined && reviewBlock === undefined) {
+		if (state.latestId !== undefined && reviewBlock === undefined) {
 			try {
-				const review = await readReviewRecord(projectRoot, delegationState.latestId);
+				const review = await readReviewRecord(projectRoot, state.latestId);
 				if (review) {
 					reviewVerdict = review.verdict;
 					reviewViolationCount = review.violations.length;
@@ -700,12 +1005,12 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			actor,
 			writePolicy: policy ?? null,
 			commanderWritesDenied: actor === "sol-commander" ? leaseNow !== "active" : null,
-			blockedCommanderWriteAttempts: delegationState.blockedWriteAttempts,
-			hasDelegation: delegationState.latestId !== undefined,
-			latestDelegationId: delegationState.latestId ?? null,
-			reviewStatus: delegationState.latestId !== undefined ? delegationState.status : null,
+			blockedCommanderWriteAttempts: state.blockedWriteAttempts,
+			hasDelegation: state.latestId !== undefined,
+			latestDelegationId: state.latestId ?? null,
+			reviewStatus: state.latestId !== undefined ? state.status : null,
 			currentDiffHash: injectedCurrentDiffHash,
-			reviewedDiffHash: delegationState.reviewedDiffHash ?? null,
+			reviewedDiffHash: state.reviewedDiffHash ?? null,
 			reviewVerdict,
 			reviewViolationCount,
 			leaseStatus: leaseNow,
@@ -716,13 +1021,63 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		};
 	}
 
+	/**
+	 * P7 slice 3 (mutating gate-run path, unchanged behavior): construct the
+	 * bounded worker-first compliance facts for a gate run from
+	 * actor/policy/lease/delegation/latest-review facts. The delegation
+	 * state is refreshed against the REAL git diff first (any change after
+	 * REVIEWED turns it STALE here) and persisted — the mutating refresh
+	 * stays gate-execution-only. When a pending/stale review blocks final
+	 * verification, the facts carry `blockedReason` and every B6 check
+	 * evaluates BLOCKED instead of being evaluated against partial facts.
+	 * Never reads model prose — missing facts are NOT_RUN.
+	 *
+	 * B6 diff freshness FAILS CLOSED: the injected current diff hash is only
+	 * ever refreshed from the real current git facts inside this call. When
+	 * that collection fails (git unavailable/broken or any collection
+	 * error), the authoritative delegation state is preserved untouched and
+	 * the injected facts carry a MISSING current hash, so the required
+	 * `reviewed-hash-matches-current` check evaluates NOT_RUN and can never
+	 * PASS from a stale in-memory reviewed/current pair.
+	 */
+	async function buildWorkerFirstGateFacts(projectRoot: string, now: string): Promise<WorkerFirstGateFacts> {
+		const hash = await collectCurrentDiffHash(projectRoot);
+		if (hash === null) {
+			// Best-effort refresh failed: the in-memory/persisted delegation
+			// state stays authoritative and untouched, and the injected current
+			// hash stays MISSING — `reviewed-hash-matches-current` is NOT_RUN.
+			return buildWorkerFirstGateFactsFromState(projectRoot, delegationState, null, now);
+		}
+		delegationState = observeDiffChange(delegationState, hash, now);
+		persistDelegationState();
+		return buildWorkerFirstGateFactsFromState(projectRoot, delegationState, delegationState.currentDiffHash ?? null, now);
+	}
+
+	/**
+	 * P4b READ-ONLY projection for workbench_read_run's assessment: observes
+	 * the current real-diff freshness (a diff change after REVIEWED would
+	 * flip the PROJECTED status to STALE exactly like the mutating path, so
+	 * the gate-state facts hash refuses reuse) WITHOUT calling
+	 * persistDelegationState / pi.appendEntry and WITHOUT mutating the
+	 * authoritative in-memory delegation state. Collection failure stays
+	 * fail-closed (missing current hash).
+	 */
+	async function buildReadOnlyWorkerFirstGateFacts(projectRoot: string, now: string): Promise<WorkerFirstGateFacts> {
+		const hash = await collectCurrentDiffHash(projectRoot);
+		if (hash === null) {
+			return buildWorkerFirstGateFactsFromState(projectRoot, delegationState, null, now);
+		}
+		const projected = observeDiffChange(delegationState, hash, now);
+		return buildWorkerFirstGateFactsFromState(projectRoot, projected, projected.currentDiffHash ?? null, now);
+	}
+
 	function applyModeTools(): void {
 		// P7: the strict Sol DEV allowlist depends on the resolved actor
 		// (env worker contract first, then provider/model); other actors keep
 		// the existing DEV behavior, which the worker role filter then narrows.
 		// An ACTIVE confirmed lease additionally enables exactly its edit/write
-		// tools on top of the canonical 14-tool allowlist; pending/expired/
-		// exhausted/revoked leases (or no lease) leave the exact 14.
+		// tools on top of the canonical 15-tool allowlist; pending/expired/
+		// exhausted/revoked leases (or no lease) leave the exact 15.
 		const actorFacts = {
 			roleEnv: workerRoleContext.role,
 			provider: currentModelFacts.provider,
@@ -740,8 +1095,8 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	 * resources. Called before an agent turn and before/within the relevant
 	 * command/tool guards and the status refresh: when the lease is no
 	 * longer ACTIVE (expired/exhausted/revoked — pending included), the
-	 * exact canonical strict-14 tool set is reapplied so stale edit/write
-	 * are never advertised. The second-layer tool_call guard stays
+	 * exact canonical 15-tool set is reapplied so stale edit/write are
+	 * never advertised. The second-layer tool_call guard stays
 	 * authoritative: a blocked write call also removes the stale tools.
 	 */
 	function syncLeaseLock(now?: string): void {
@@ -762,10 +1117,14 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		// No status bar exists in print/json modes; skip silently.
 		if (ctx.mode === "print" || ctx.mode === "json") return;
 		let line = statusText(mode);
+		// P7: commander advisory thresholds — trusted project.yaml
+		// commander.advisory, best-effort (defaults on untrusted/error paths).
+		let advisoryConfig: AdvisoryConfig | undefined;
 		try {
 			if (ctx.isProjectTrusted()) {
 				const projectRoot = await projectRootFor(ctx);
 				const config = await loadProjectConfig(projectRoot, { trusted: true });
+				advisoryConfig = config.commanderAdvisory;
 				cacheTelemetry.setEnabled(config.cacheTelemetry);
 				cacheTelemetry.setProjectRoot(projectRoot);
 				const gate = await latestGateRunSummary(projectRoot);
@@ -787,9 +1146,16 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		const cacheSegment = cacheTelemetry.statusSegment();
 		if (cacheSegment) line = line ? `${line} | ${cacheSegment}` : cacheSegment;
 		// Unreleased: split session-cost segment (commander/worker/other) —
-		// session-entry facts only, deterministic, O omitted when zero.
-		const costSegment = costStatusSegment(buildCostBreakdown(ctx.sessionManager.getEntries(), pendingMessage));
+		// session-entry facts only, deterministic, O omitted when zero. P7:
+		// the SAME current breakdown (pending-message-aware with the existing
+		// dedup semantics) drives the observation-only commander advisory
+		// segment — CMD:SOFT / CMD:HIGH appended only when triggered, OK adds
+		// no segment. Thresholds: trusted config best-effort or defaults.
+		const breakdown = buildCostBreakdown(ctx.sessionManager.getEntries(), pendingMessage);
+		const costSegment = costStatusSegment(breakdown);
 		if (costSegment) line = line ? `${line} | ${costSegment}` : costSegment;
+		const advisorySegment = advisoryStatusSegment(evaluateAdvisory(breakdown, advisoryConfig));
+		if (advisorySegment) line = line ? `${line} | ${advisorySegment}` : advisorySegment;
 		// P7 write-authority segments: an ACTIVE confirmed lease renders the
 		// required compact `WF:LEASE <callsUsed>/<maxCalls>`; locked/pending/
 		// expired/exhausted/revoked render `WF:LOCKED`. WF:REVIEW (a review
@@ -1128,7 +1494,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		// P7: lazy lease-lock sync before every agent turn — an
-		// expired/exhausted lease is reverted to the exact canonical 14
+		// expired/exhausted lease is reverted to the exact canonical 15
 		// before the model can see stale edit/write tools. No timers or
 		// background resources.
 		syncLeaseLock();
@@ -1363,7 +1729,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			if (reason) {
 				writeLease = revokeLease(writeLease, reason, now);
 				persistLease();
-				// Reapply the locked tool set (back to the exact canonical 14).
+				// Reapply the locked tool set (back to the exact canonical 15).
 				applyModeTools();
 			}
 		}
@@ -1434,11 +1800,26 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 
 	pi.registerCommand("q-cost-status", {
 		description:
-			"Show the split session cost breakdown from session entries: commander (assistant usage), worker (workbench_delegate_worker tool results), other (tools/summaries), total, and per-model commander costs",
+			"Show the split session cost breakdown from session entries: commander (assistant usage), worker (workbench_delegate_worker tool results), other (tools/summaries), total, per-model commander costs, and the P7 commander advisory facts (observation-only — never a hard stop)",
 		handler: async (_args, ctx) => {
 			// Session facts only — no project config, no trust gate; works in
-			// TUI and print/json modes through the shared output helper.
-			output(ctx, renderCostBreakdown(buildCostBreakdown(ctx.sessionManager.getEntries())));
+			// TUI and print/json modes through the shared output helper. P7:
+			// the advisory facts append additively; the trusted project.yaml
+			// commander.advisory thresholds are loaded best-effort and the
+			// command NEVER becomes trust-gated (defaults on untrusted /
+			// unavailable / error paths).
+			const breakdown = buildCostBreakdown(ctx.sessionManager.getEntries());
+			let advisoryConfig: AdvisoryConfig | undefined;
+			try {
+				if (ctx.isProjectTrusted()) {
+					const projectRoot = await projectRootFor(ctx);
+					advisoryConfig = (await loadProjectConfig(projectRoot, { trusted: true })).commanderAdvisory;
+				}
+			} catch {
+				// defaults — the advisory section is never trust-gated
+			}
+			const facts = evaluateAdvisory(breakdown, advisoryConfig);
+			output(ctx, [...renderCostBreakdown(breakdown), "", ...renderAdvisoryFacts(facts)]);
 		},
 	});
 
@@ -1507,7 +1888,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		handler: async (args, ctx) => {
 			const now = new Date().toISOString();
 			// P7: lazy lease-lock sync — an expired/exhausted lease is
-			// reverted to the exact canonical 14 before any lease logic runs.
+			// reverted to the exact canonical 15 before any lease logic runs.
 			syncLeaseLock(now);
 			// Only the approved GPT-5.6 Sol commander under the fixed
 			// worker-first-strict policy may unlock, and only in DEV mode
@@ -1642,7 +2023,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 
 	pi.registerCommand("q-commander-write-lock", {
 		description:
-			"Explicitly revoke/lock the temporary commander write lease and persist the audit facts (edit/write return to the canonical 14-tool strict Sol DEV set)",
+			"Explicitly revoke/lock the temporary commander write lease and persist the audit facts (edit/write return to the canonical 15-tool strict Sol DEV set)",
 		handler: async (_args, ctx) => {
 			const now = new Date().toISOString();
 			// P7: lazy lease-lock sync — the lock reflects the true state.
@@ -1659,6 +2040,118 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 				leaseCompactSummary(writeLease, now),
 			]);
 			void refreshStatus(ctx);
+		},
+	});
+
+	// ------------------------------------------------ P5 milestone handoff
+
+	pi.registerCommand("q-milestone-handoff", {
+		description:
+			"USER-ONLY milestone handoff: /q-milestone-handoff <next step> — waits for idle, persists a bounded/redacted prepared milestone record in the current session, then starts a fresh parent-linked session that resumes the same mode/compact/delegation state with a hidden pointer-only note (commander write leases are NEVER carried — the target stays locked; no model/provider call and no agent turn)",
+		handler: async (args, ctx) => {
+			// The milestone handoff is a user-only session-lifecycle command:
+			// a delegated worker can never start a session replacement. Refusal
+			// happens FIRST, with no state touched and no entry appended.
+			if (workerRoleContext.role === "worker") {
+				output(ctx, [
+					"/q-milestone-handoff: refused — this command is user-only; a delegated worker cannot start a milestone handoff",
+				]);
+				return;
+			}
+			// Reject empty/overlong next steps BEFORE anything else happens
+			// (no state is touched on a parse failure).
+			const parsed = parseNextStepArg(args);
+			if (!parsed.ok) {
+				output(ctx, [`/q-milestone-handoff: ${parsed.error}`, milestoneHandoffUsage()]);
+				return;
+			}
+			// Wait for any in-flight agent work to finish before touching the
+			// session (a handoff mid-turn would lose the running turn).
+			await ctx.waitForIdle();
+			// A milestone handoff needs a persisted source session file: the
+			// prepared record and the parent link both point at it.
+			const sessionFile = ctx.sessionManager.getSessionFile();
+			if (!sessionFile) {
+				output(ctx, [
+					"/q-milestone-handoff: refused — the current session is not persisted yet (wait for the first assistant response before handing off)",
+				]);
+				return;
+			}
+			// P7: refresh the compaction mirror so the snapshot carries the
+			// current worker-first facts. Everything the target needs is
+			// CAPTURED here, BEFORE newSession: Pi fires session_start("new")
+			// BEFORE setup, which would otherwise reset the in-memory mode/
+			// compact/delegation state to the fresh session's defaults before
+			// setup runs.
+			refreshCompactP7Facts();
+			const now = new Date().toISOString();
+			const record = prepareMilestoneHandoff({
+				milestoneId: makeMilestoneId(new Date()),
+				nextStep: parsed.nextStep,
+				session: sessionFile,
+				state: compactState,
+				secrets,
+				now,
+			});
+			const sourceMode = mode;
+			const sourceDelegation = serializeDelegationState(delegationState);
+			const sourceDelegationSummary = delegationCompactSummary(delegationState);
+			// Persist-first: the additive prepared record lands in the SOURCE
+			// session before any replacement is attempted.
+			pi.appendEntry(MILESTONE_HANDOFF_ENTRY_TYPE, record);
+			const outcome = await ctx.newSession({
+				parentSession: sessionFile,
+				setup: async (sessionManager) => {
+					// Additive target records (schema v1, same custom types as
+					// the source). session_start("new") already ran BEFORE setup
+					// against the empty fresh session, so withSession reloads
+					// afterwards to restore these entries into the running
+					// session before the user continues.
+					const resumed = toResumedRecord(record, new Date().toISOString());
+					sessionManager.appendCustomEntry(MILESTONE_HANDOFF_ENTRY_TYPE, resumed);
+					sessionManager.appendCustomMessageEntry(
+						MILESTONE_HANDOFF_NOTE_ENTRY_TYPE,
+						buildMilestoneHandoffNote(resumed),
+						false,
+						{ milestone_id: resumed.milestone_id, lifecycle: "resumed", updated_at: resumed.updated_at },
+					);
+					sessionManager.appendCustomEntry(MODE_ENTRY_TYPE, { mode: sourceMode });
+					sessionManager.appendCustomEntry(COMPACT_STATE_ENTRY_TYPE, record.state);
+					sessionManager.appendCustomEntry(DELEGATION_STATE_ENTRY_TYPE, sourceDelegation);
+					// Deliberately NO write-lease entry: the target write
+					// authority stays locked even when the source held an
+					// active/pending lease.
+				},
+				withSession: async (replacementCtx) => {
+					// Use ONLY the replacement context here — the captured
+					// command ctx and pi are stale after the switch. Announce
+					// success visibly, then reload: reload re-fires
+					// session_start, which restores the setup-appended entries
+					// (mode/compact/delegation/note) before the user continues.
+					output(replacementCtx, [
+						`/q-milestone-handoff: milestone ${record.milestone_id} handed off to a fresh parent-linked session`,
+						`next step   : ${record.next_step}`,
+						`source      : ${record.session}`,
+						`mode        : ${record.state?.mode ?? sourceMode}`,
+						`delegation  : ${sourceDelegationSummary}`,
+						"write lease : NOT carried — target commander writes stay locked",
+						"hidden milestone note injected (pointers/status only); reloading to restore copied state…",
+					]);
+					await replacementCtx.reload();
+				},
+			});
+			if (outcome.cancelled) {
+				// The replacement was cancelled while the source session remains
+				// valid: record the cancellation additively in the source and
+				// report — nothing was replaced and no setup ran.
+				pi.appendEntry(MILESTONE_HANDOFF_ENTRY_TYPE, toCancelledRecord(record, new Date().toISOString()));
+				output(ctx, [
+					`/q-milestone-handoff: cancelled — no new session was started; the current session is unchanged (cancellation recorded for milestone ${record.milestone_id})`,
+				]);
+				return;
+			}
+			// Success: the session was replaced. The old ctx/pi must not be
+			// used anymore, so nothing further happens here.
 		},
 	});
 
@@ -1792,26 +2285,28 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 					output(ctx, ["/q-run: no summary produced"]);
 					return;
 				}
-				const cacheLine = result.cache
-					? `cache      : ${result.cache.status.toUpperCase()}${result.cache.actionKey ? ` (key ${result.cache.actionKey.slice(0, 16)}…)` : ""}${result.cache.reusedFromRunId ? `, reused ${result.cache.reusedFromRunId}` : ""}${result.cache.reason ? ` — ${result.cache.reason}` : ""}`
-					: "cache      : (no cache policy)";
-				const lines = [
-					`run        : ${summary.run_id}`,
-					`recipe     : ${summary.recipe}`,
-					`exit code  : ${summary.exit_code ?? "killed"} (expected: ${result.record?.expected_exit_codes.join(", ") ?? "?"})`,
-					`status     : ${summary.timed_out ? "TIMED OUT" : summary.cancelled ? "CANCELLED" : result.ok ? "OK" : "FAILED"}`,
-					`duration   : ${summary.duration_ms} ms`,
-					cacheLine,
-					`artifacts  : ${summary.artifact_paths.length > 0 ? summary.artifact_paths.join(", ") : "(none)"}`,
-					`stdout log : ${displayRelative(projectRoot, summary.stdout_log)}`,
-					`stderr log : ${displayRelative(projectRoot, summary.stderr_log)}`,
-					"",
-					"--- stdout (truncated) ---",
-					summary.stdout,
-					"--- stderr (truncated) ---",
-					summary.stderr,
-				];
-				output(ctx, lines);
+				// P1: /q-run renders the same bounded parent summary as
+				// workbench_run_recipe (plan §8) — never the raw output; full
+				// logs stay persisted and are named by path.
+				const parentSummary = buildRecipeParentSummary({
+					runId: summary.run_id,
+					recipe: summary.recipe,
+					command: summary.argv.join(" "),
+					ok: result.ok,
+					exitCode: summary.exit_code,
+					durationMs: summary.duration_ms,
+					timedOut: summary.timed_out,
+					cancelled: summary.cancelled,
+					stdout: summary.stdout,
+					stderr: summary.stderr,
+					stdoutLogPath: displayRelative(projectRoot, summary.stdout_log),
+					stderrLogPath: displayRelative(projectRoot, summary.stderr_log),
+					stdoutTruncated: summary.stdout_truncated,
+					stderrTruncated: summary.stderr_truncated,
+					artifactPaths: summary.artifact_paths,
+					cache: result.cache,
+				});
+				output(ctx, parentSummary.lines);
 				void refreshStatus(ctx);
 				void refreshWidget(ctx);
 			} catch (error) {
@@ -1913,21 +2408,27 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		return { selector, manualEvidence };
 	}
 
-	function renderGateRun(result: Awaited<ReturnType<typeof runGates>>, projectRoot: string): string[] {
-		const lines = [
-			`gate run   : ${result.runId}`,
-			`requested  : ${result.requested.join(", ")}`,
-			`profile    : ${result.profile ?? "(none)"}`,
-			`status     : ${result.status}`,
-			`exit code  : ${result.status === "PASS" ? 0 : 1}`,
-			"",
-		];
-		for (const g of result.gates) {
-			const reason = g.failure_reason ?? g.blocked_reason ?? "";
-			lines.push(`  ${g.id.padEnd(4)} ${g.status.padEnd(8)} ${g.title}${reason ? ` — ${reason}` : ""}`);
-		}
-		lines.push("", `full record: ${displayRelative(projectRoot, `${CONFIG_DIR_NAME}/workbench/runs/${result.runId}`)}`);
-		return lines;
+	/**
+	 * P1: bounded gate parent summary (plan §8) — status/exit, failing and
+	 * blocked gate identifiers + reasons BEFORE passing-gate detail, the
+	 * full persisted record path, and omission facts, under the same
+	 * success/failure caps as recipe summaries.
+	 */
+	function gateParentSummaryLines(result: Awaited<ReturnType<typeof runGates>>, projectRoot: string): string[] {
+		return buildGateParentSummary({
+			runId: result.runId,
+			requested: result.requested,
+			profile: result.profile,
+			status: result.status,
+			gates: result.gates.map((g) => ({
+				id: g.id,
+				status: g.status,
+				title: g.title,
+				failure_reason: g.failure_reason,
+				blocked_reason: g.blocked_reason,
+			})),
+			recordPath: displayRelative(projectRoot, `${CONFIG_DIR_NAME}/workbench/runs/${result.runId}`),
+		}).lines;
 	}
 
 	pi.registerCommand("q-gate", {
@@ -1970,7 +2471,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 						model: currentModelFacts.model,
 					},
 				});
-				output(ctx, renderGateRun(result, projectRoot));
+				output(ctx, gateParentSummaryLines(result, projectRoot));
 				void refreshStatus(ctx);
 				void refreshWidget(ctx);
 			} catch (error) {
@@ -2472,6 +2973,151 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		},
 	});
 
+	// --------------------------------------- NRO N1/N2 native tool overrides
+
+	/**
+	 * NRO N1: a text-only built-in read result whose text starts with the
+	 * built-in image note is validated against the source file's magic bytes
+	 * (read-only sniff through the Pi-equivalent path normalization). True
+	 * when the sniffed MIME agrees with the note's MIME — the result is an
+	 * image-path result and must pass through byte-identically. A genuine
+	 * text file starting with the same phrase has no matching magic bytes
+	 * and still gets the deterministic preview + facts. On any read failure
+	 * the built-in's own result is kept byte-identical (never invent facts
+	 * on an ambiguous image note).
+	 */
+	async function isReadImageNoteResult(path: string, cwd: string, note: string): Promise<boolean> {
+		const noteMime = imageMimeFromReadNote(note);
+		if (noteMime === null) return false;
+		const absolutePath = await nativeResolveReadPath(path, cwd);
+		try {
+			const handle = await open(absolutePath, "r");
+			try {
+				const buffer = Buffer.alloc(IMAGE_SNIFF_BYTES);
+				const { bytesRead } = await handle.read(buffer, 0, IMAGE_SNIFF_BYTES, 0);
+				return sniffImageMimeType(buffer.subarray(0, bytesRead)) === noteMime;
+			} finally {
+				await handle.close();
+			}
+		} catch {
+			return true;
+		}
+	}
+
+	pi.registerTool({
+		...NATIVE_OVERRIDE_METADATA.read,
+		parameters: NATIVE_OVERRIDE_PARAMETERS.read,
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			// NRO N1 (plan §6.1): the captured built-in definition owns path
+			// normalization (leading-@, relative/absolute, macOS variants),
+			// image handling, error text and abort semantics. Explicit offset
+			// and/or limit always take the LEGACY path: content/details/errors/
+			// abort are byte-identical to the built-in.
+			const builtin = createReadToolDefinition(ctx.cwd);
+			if (params.offset !== undefined || params.limit !== undefined) {
+				return builtin.execute(toolCallId, params, signal, onUpdate, ctx);
+			}
+			const result = await builtin.execute(toolCallId, params, signal, onUpdate, ctx);
+			// Images pass through unchanged (attachment content + note). A
+			// FAILED decode/resize (or an unprocessed BMP) is a TEXT-ONLY
+			// result that still starts with the built-in image note
+			// ("Read image file [<mime>]") — and a genuine text file can start
+			// with the same phrase. The source's magic bytes are sniffed
+			// (read-only) and compared against the note's MIME: an image-path
+			// result passes through byte-identically, genuine text still gets
+			// the deterministic preview + facts.
+			if (result.content.some((c) => c.type === "image")) return result;
+			const textBlock = result.content.find((c): c is { type: "text"; text: string } => c.type === "text");
+			if (!textBlock) return result;
+			if (textBlock.text.startsWith("Read image file [") && (await isReadImageNoteResult(params.path, ctx.cwd, textBlock.text))) {
+				return result;
+			}
+			const truncation = (result.details as ReadToolDetails | undefined)?.truncation;
+			if (truncation?.firstLineExceedsLimit) {
+				// The built-in cannot return a first line > 50KB; re-read the
+				// file read-only through the Pi-equivalent path normalization
+				// (policy module) to build the deterministic preview. No shell,
+				// no pi.exec, no writes.
+				if (signal?.aborted) throw new Error("Operation aborted");
+				const absolutePath = await nativeResolveReadPath(params.path, ctx.cwd);
+				const buffer = await readFile(absolutePath);
+				if (signal?.aborted) throw new Error("Operation aborted");
+				const preview = buildReadPreview(buffer.toString("utf-8"));
+				return { content: [{ type: "text", text: preview.content }], details: preview.details };
+			}
+			if (truncation?.truncated) {
+				// Built-in head truncation at 2000 lines / 50KB: the preview
+				// window (240 lines / 12 KiB) is always inside the built-in's
+				// returned content; the totals come from the built-in's own
+				// TruncationResult (same counting basis as the policy module).
+				const preview = buildReadPreview(truncation.content, {
+					totalLines: truncation.totalLines,
+					totalBytes: truncation.totalBytes,
+				});
+				return { content: [{ type: "text", text: preview.content }], details: preview.details };
+			}
+			// No built-in truncation: the text is the complete file content —
+			// keep it byte-for-byte and append the deterministic facts
+			// (complete=true, or line_truncated when a line exceeds 2048 bytes).
+			const preview = buildReadPreview(textBlock.text);
+			return { content: [{ type: "text", text: preview.content }], details: preview.details };
+		},
+	});
+
+	pi.registerTool({
+		...NATIVE_OVERRIDE_METADATA.grep,
+		parameters: NATIVE_OVERRIDE_PARAMETERS.grep,
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			// NRO N2 (plan §6.2): output=count is the exact uncapped count mode —
+			// a dedicated abort-aware Pi-free adapter runs the installed rg
+			// directly (explicit argument vector, shell:false, no pi.exec, no
+			// download/write); the result is ONE compact line with details
+			// undefined, and legacy limit/context never apply. Everything else
+			// (output omitted or "matches") delegates byte-for-byte to the
+			// captured built-in definition — the new selectors are simply not
+			// forwarded, so legacy content/details/errors/abort stay identical.
+			if (params.output === "count") {
+				const countKind = params.count_kind === "lines" ? "lines" : "matches";
+				const { value, files } = await runGrepCount(
+					{
+						pattern: params.pattern,
+						path: params.path,
+						glob: params.glob,
+						ignoreCase: params.ignoreCase,
+						literal: params.literal,
+						countKind,
+					},
+					{ cwd: ctx.cwd, signal },
+				);
+				return {
+					content: [{ type: "text", text: formatGrepCountLine(countKind, value, files) }],
+					details: undefined,
+				};
+			}
+			const legacyParams = {
+				pattern: params.pattern,
+				path: params.path,
+				glob: params.glob,
+				ignoreCase: params.ignoreCase,
+				literal: params.literal,
+				context: params.context,
+				limit: params.limit,
+			};
+			return createGrepToolDefinition(ctx.cwd).execute(toolCallId, legacyParams, signal, onUpdate, ctx);
+		},
+	});
+
+	pi.registerTool({
+		...NATIVE_OVERRIDE_METADATA.find,
+		parameters: NATIVE_OVERRIDE_PARAMETERS.find,
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			// NRO N1: exact legacy pass-through — the built-in definition owns
+			// schema, metadata and execution byte-for-byte; count/max_depth are
+			// staged N3 additions and are NOT exposed.
+			return createFindToolDefinition(ctx.cwd).execute(toolCallId, params, signal, onUpdate, ctx);
+		},
+	});
+
 	// --------------------------------------------------------- custom tools
 
 	pi.registerTool({
@@ -2555,27 +3201,29 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 					return { content: [{ type: "text", text: "workbench_run_recipe: no summary produced" }], details: { ok: false } };
 				}
 				const status = summary.timed_out ? "TIMED OUT" : summary.cancelled ? "CANCELLED" : result.ok ? "OK" : "FAILED";
-				const cacheText = result.cache
-					? `cache     : ${result.cache.status.toUpperCase()}${result.cache.actionKey ? ` (key ${result.cache.actionKey.slice(0, 16)}…)` : ""}${result.cache.reusedFromRunId ? `, reused run ${result.cache.reusedFromRunId}` : ""}${result.cache.reason ? ` — ${result.cache.reason}` : ""}`
-					: "";
-				const text = [
-					`run_id    : ${summary.run_id}`,
-					`recipe    : ${summary.recipe}`,
-					`status    : ${status}`,
-					`exit code : ${summary.exit_code ?? "killed"}`,
-					`duration  : ${summary.duration_ms} ms`,
-					`artifacts : ${summary.artifact_paths.length > 0 ? summary.artifact_paths.join(", ") : "(none)"}`,
-					`stdout log: ${displayRelative(projectRoot, summary.stdout_log)} (${summary.stdout_truncated ? "truncated below" : "complete below"})`,
-					`stderr log: ${displayRelative(projectRoot, summary.stderr_log)} (${summary.stderr_truncated ? "truncated below" : "complete below"})`,
-					cacheText,
-					"",
-					"--- stdout ---",
-					summary.stdout || "(empty)",
-					"--- stderr ---",
-					summary.stderr || "(empty)",
-					"",
-					`Full logs: read ${displayRelative(projectRoot, summary.stdout_log)} and ${displayRelative(projectRoot, summary.stderr_log)} (full output is never placed inline; use workbench_read_run or /q-run-show for bounded snippets).`,
-				].join("\n");
+				// P1: the parent result is a BOUNDED presentation summary (plan §8)
+				// — success: no raw stdout/stderr, no per-test lines; failure:
+				// fixed precedence with bounded excerpts after required facts.
+				// Full logs stay persisted and are always named by path.
+				const parentSummary = buildRecipeParentSummary({
+					runId: summary.run_id,
+					recipe: summary.recipe,
+					command: summary.argv.join(" "),
+					ok: result.ok,
+					exitCode: summary.exit_code,
+					durationMs: summary.duration_ms,
+					timedOut: summary.timed_out,
+					cancelled: summary.cancelled,
+					stdout: summary.stdout,
+					stderr: summary.stderr,
+					stdoutLogPath: displayRelative(projectRoot, summary.stdout_log),
+					stderrLogPath: displayRelative(projectRoot, summary.stderr_log),
+					stdoutTruncated: summary.stdout_truncated,
+					stderrTruncated: summary.stderr_truncated,
+					artifactPaths: summary.artifact_paths,
+					cache: result.cache,
+				});
+				const text = parentSummary.text;
 				const details: RecipeToolDetails = {
 					ok: result.ok,
 					run_id: summary.run_id,
@@ -2619,38 +3267,51 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			if (!manifest) {
 				return { content: [{ type: "text", text: `workbench_read_run: run ${params.run_id} not found` }], details: {} };
 			}
-			const include = params.include ?? "all";
-			const summary = include === "manifest" ? null : await readSummary(projectRoot, params.run_id);
+			const include = params.include ?? "summary";
 			const snippetOptions = { maxLines: params.max_lines, maxBytes: params.max_bytes };
-			const stdoutSnippet = include === "manifest" || include === "summary" ? null : await readLogSnippet(projectRoot, params.run_id, "stdout", snippetOptions);
-			const stderrSnippet = include === "manifest" || include === "summary" ? null : await readLogSnippet(projectRoot, params.run_id, "stderr", snippetOptions);
-			const lines = [
-				`run_id     : ${manifest.run_id}`,
-				`recipe     : ${manifest.recipe}`,
-				`profile    : ${manifest.profile ?? "(none)"}`,
-				`mode       : ${manifest.mode}`,
-				`started    : ${manifest.started_at}`,
-				`finished   : ${manifest.finished_at}`,
-				`duration   : ${manifest.duration_ms} ms`,
-				`cwd        : ${manifest.cwd}`,
-				`argv       : ${manifest.argv.join(" ")}`,
-				`exit code  : ${manifest.exit_code ?? "killed"}`,
-				`timed out  : ${manifest.timed_out}`,
-				`cancelled  : ${manifest.cancelled}`,
-				`git        : ${manifest.git_commit ? manifest.git_commit.slice(0, 12) : "(no git)"}${manifest.git_dirty ? " (dirty)" : ""}`,
-				`artifacts  : ${manifest.artifact_paths.length > 0 ? manifest.artifact_paths.join(", ") : "(none)"}`,
-				`declared writes: ${manifest.declared_writes.length > 0 ? manifest.declared_writes.join(", ") : "(none)"}`,
-			];
-			if (summary) {
-				lines.push(`stdout truncated: ${summary.stdout_truncated}`, `stderr truncated: ${summary.stderr_truncated}`);
-			}
-			if (stdoutSnippet) {
-				lines.push("", `--- stdout tail (${stdoutSnippet.truncated ? "truncated" : "full"}): ${displayRelative(projectRoot, stdoutSnippet.path)} ---`, stdoutSnippet.content || "(empty)");
-			}
-			if (stderrSnippet) {
-				lines.push("", `--- stderr tail (${stderrSnippet.truncated ? "truncated" : "full"}): ${displayRelative(projectRoot, stderrSnippet.path)} ---`, stderrSnippet.content || "(empty)");
-			}
-			lines.push("", `Full logs: ${displayRelative(projectRoot, `${CONFIG_DIR_NAME}/workbench/runs/${manifest.run_id}/stdout.log`)} (read the file for the complete output)`);
+			const stdoutSnippet = include === "logs" || include === "all" ? await readLogSnippet(projectRoot, params.run_id, "stdout", snippetOptions) : null;
+			const stderrSnippet = include === "logs" || include === "all" ? await readLogSnippet(projectRoot, params.run_id, "stderr", snippetOptions) : null;
+			// P4b: current-state validation assessment (strictly read-only —
+			// observation only: it never skips recipe/gate execution, never
+			// consults/alters the P6-C action cache, never rewrites run
+			// artifacts, and never appends session/delegation entries). The
+			// worker-first facts for gate runs come from the READ-ONLY
+			// projection, so the authoritative in-memory delegation state is
+			// never mutated and nothing is persisted.
+			const validation = await assessRunValidation({
+				projectRoot,
+				mode,
+				exec: execFn,
+				manifest,
+				actorFacts: {
+					role: workerRoleContext.role,
+					provider: currentModelFacts.provider,
+					model: currentModelFacts.model,
+				},
+				...(manifest.recipe === "gate"
+					? { workerFirstFacts: await buildReadOnlyWorkerFirstGateFacts(projectRoot, new Date().toISOString()) }
+					: {}),
+			});
+			// Commander Slice B1: the layered bounded renderer (core/run-result.ts)
+			// builds the ordered Summary/Evidence/Persisted output (plus the
+			// bounded cwd/argv metadata for explicit manifest/logs/all includes
+			// and the caller-bounded log tails for logs/all). All paths are
+			// durable project-relative; disk records stay untouched. P4b adds
+			// the REQUIRED bounded validation line to every include mode.
+			const runDirRel = `${CONFIG_DIR_NAME}/workbench/runs/${manifest.run_id}`;
+			const rendered = renderRunResult({
+				include,
+				manifest,
+				validation,
+				stdoutSnippet,
+				stderrSnippet,
+				runDir: runDirRel,
+				manifestPath: `${runDirRel}/manifest.json`,
+				summaryPath: `${runDirRel}/summary.json`,
+				stdoutPath: `${runDirRel}/stdout.log`,
+				stderrPath: `${runDirRel}/stderr.log`,
+			});
+			const text = rendered.text;
 			const details: ReadRunToolDetails = {
 				run_id: manifest.run_id,
 				recipe: manifest.recipe,
@@ -2665,11 +3326,15 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 				git_commit: manifest.git_commit,
 				git_dirty: manifest.git_dirty,
 				artifact_paths: manifest.artifact_paths,
+				// P4b additive structured details: bounded status + fixed reason
+				// codes only — never raw argv, manual evidence, unavailable
+				// reasons, secrets or worker-first facts.
+				validation: { status: validation.status, reasons: validation.reasons },
 				stdout_log: displayRelative(projectRoot, `${CONFIG_DIR_NAME}/workbench/runs/${manifest.run_id}/stdout.log`),
 				stderr_log: displayRelative(projectRoot, `${CONFIG_DIR_NAME}/workbench/runs/${manifest.run_id}/stderr.log`),
 			};
 			return {
-				content: [{ type: "text", text: lines.join("\n") }],
+				content: [{ type: "text", text }],
 				details,
 			};
 		},
@@ -2716,7 +3381,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 						model: currentModelFacts.model,
 					},
 				});
-				const text = renderGateRun(result, projectRoot).join("\n");
+				const text = gateParentSummaryLines(result, projectRoot).join("\n");
 				const details: GateToolDetails = {
 					ok: result.ok,
 					status: result.status,
@@ -3136,8 +3801,11 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			const projectRoot = await projectRootFor(ctx);
 			const delegationId = params.delegation_id.trim();
 			// The review lifecycle is a single latest-delegation slot: only the
-			// latest delegation can be reviewed, and only while it is
-			// PENDING_REVIEW or STALE (REVIEWED refuses re-review).
+			// latest delegation can be reviewed. Slice B2: the tool is callable
+			// repeatedly while the delegation is PENDING_REVIEW, STALE or
+			// REVIEWED — every call re-runs the real git facts, scope and hash
+			// (a same-hash complete PASS rerender keeps the valid REVIEWED
+			// binding; a changed hash resets coverage).
 			if (delegationState.latestId === undefined) {
 				return { content: [{ type: "text", text: "workbench_review_worker_diff: no delegation to review" }], details: {} };
 			}
@@ -3147,17 +3815,6 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 						{
 							type: "text",
 							text: `workbench_review_worker_diff: delegation ${delegationId} is not the latest delegation (${delegationState.latestId}); only the latest delegation can be reviewed`,
-						},
-					],
-					details: {},
-				};
-			}
-			if (delegationState.status === "REVIEWED") {
-				return {
-					content: [
-						{
-							type: "text",
-							text: `workbench_review_worker_diff: delegation ${delegationId} is already REVIEWED (bound to ${delegationState.reviewedDiffHash ?? "?"}); a diff change after review turns it STALE, which is when a re-review is allowed`,
 						},
 					],
 					details: {},
@@ -3176,19 +3833,34 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 				return { content: [{ type: "text", text: `workbench_review_worker_diff: ${result.error ?? "review failed"}` }], details: { ok: false, error: result.error } };
 			}
 			// Bind the state to the REAL current hash (the review record binds
-			// it too), then mark REVIEWED only on PASS; FAIL leaves the
-			// delegation PENDING_REVIEW with the violations recorded.
+			// it too). Slice B2: REVIEWED means scope PASS AND complete
+			// displayed-path coverage with NO exception. A changed hash resets
+			// coverage so PASS stays blocking until fresh coverage is
+			// complete; a same-hash complete PASS rerender keeps the valid
+			// REVIEWED binding (markReviewed refuses REVIEWED → REVIEWED, so
+			// the already-REVIEWED state is left untouched).
 			const now = new Date().toISOString();
 			delegationState = observeDiffChange(delegationState, result.record.bound_diff_hash, now);
-			if (result.record.verdict === "PASS") {
-				const marked = markReviewed(delegationState, now);
-				if (!marked.ok) {
-					return {
-						content: [{ type: "text", text: `workbench_review_worker_diff: review record written but state refused REVIEWED: ${marked.error}` }],
-						details: { ok: false, error: marked.error },
-					};
+			if (result.record.verdict === "PASS" && result.record.coverage_complete) {
+				if (delegationState.status !== "REVIEWED") {
+					const marked = markReviewed(delegationState, now);
+					if (!marked.ok) {
+						return {
+							content: [{ type: "text", text: `workbench_review_worker_diff: review record written but state refused REVIEWED: ${marked.error}` }],
+							details: { ok: false, error: marked.error },
+						};
+					}
+					delegationState = marked.state;
 				}
-				delegationState = marked.state;
+			} else if (delegationState.status === "REVIEWED") {
+				// Fail-closed invalidation: REVIEWED must never survive a
+				// re-review of the CURRENT diff that is anything other than
+				// PASS with complete coverage — a scope FAIL OR an incomplete
+				// PASS (e.g. a legacy partial review record) demotes to
+				// PENDING_REVIEW with the reviewed hash cleared, exactly like
+				// the scope-FAIL path.
+				const demoted = demoteReviewedToPending(delegationState, now);
+				if (demoted.ok) delegationState = demoted.state;
 			}
 			persistDelegationState();
 			void refreshStatus(ctx);
@@ -3206,6 +3878,10 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 					violations: record.violations,
 					drift_paths: record.drift_paths,
 					checked_paths: record.checked_paths,
+					displayed_paths: record.displayed_paths,
+					remaining_paths: record.remaining_paths,
+					coverage_complete: record.coverage_complete,
+					review_record: record.review_path,
 					patch_paths: record.patch_paths,
 					patch_truncated: record.patch_truncated,
 				},
@@ -3225,30 +3901,80 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			syncLeaseLock();
 			const projectRoot = await projectRootFor(ctx);
 			const status = await delegationStatusLines(projectRoot);
-			// P7 bounded-handoff diagnostics: visibly include the exact CONTEXT
-			// RISK line when the latest delegation handoff is detected too large
-			// for safe context compaction (the new bounded handoff never
-			// triggers it).
+			// P7 bounded-handoff diagnostics: same exact CONTEXT RISK line as
+			// /q-delegation-status when the latest delegation tool-result turn is
+			// detected too large for safe context compaction.
 			const contextRisk = delegationContextRiskLine(ctx.sessionManager.getEntries());
-			void refreshStatus(ctx);
 			return {
-				content: [{ type: "text", text: contextRisk ? `${status.lines.join("\n")}\n${contextRisk}` : status.lines.join("\n") }],
+				content: [{ type: "text", text: contextRisk ? [...status.lines, contextRisk].join("\n") : status.lines.join("\n") }],
+				details: { git_refresh: status.gitRefresh },
+			};
+		},
+	});
+
+	pi.registerTool({
+		...WORKBENCH_TOOL_METADATA.workbench_recover_tool_result,
+		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_recover_tool_result,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const trustError = trustedOrError(ctx);
+			if (trustError) {
+				return { content: [{ type: "text", text: `workbench_recover_tool_result: ${trustError}` }], details: {} };
+			}
+			// P8b exact-one runtime rule: the schema params are both OPTIONAL,
+			// but exactly one of result_id / tool_call_id is required — both or
+			// neither is the fixed `invalid` code.
+			const hasResultId = params.result_id !== undefined;
+			const hasToolCallId = params.tool_call_id !== undefined;
+			if (hasResultId === hasToolCallId) {
+				return {
+					content: [{ type: "text", text: `workbench_recover_tool_result: ${recoverFailureText("invalid")}` }],
+					details: { ok: false, available: false, code: "invalid" },
+				};
+			}
+			const projectRoot = await projectRootFor(ctx);
+			let id: string | undefined;
+			let outcome: RecoverOutcome;
+			if (hasResultId) {
+				id = params.result_id;
+				outcome = await recoverReceipt({ projectRoot, id });
+			} else {
+				// tool_call_id derives in the CURRENT native Pi session.
+				// BOTH the current native session identity and the parameter
+				// are validated/narrowed BEFORE any hash: missing/invalid/
+				// control-char/over-bound identity returns the fixed `invalid`
+				// code and hashes nothing.
+				const sessionIdentity = ctx.sessionManager.getSessionId();
+				const toolCallId = params.tool_call_id;
+				if (typeof sessionIdentity !== "string" || typeof toolCallId !== "string" || !isValidIdentity(sessionIdentity, toolCallId)) {
+					return {
+						content: [{ type: "text", text: `workbench_recover_tool_result: ${recoverFailureText("invalid")}` }],
+					details: { ok: false, available: false, code: "invalid" },
+					};
+				}
+				id = deriveResultId(sessionIdentity, toolCallId);
+				outcome = await recoverReceipt({ projectRoot, sessionIdentity, toolCallId });
+			}
+			if (!outcome.ok) {
+				const facts: Record<string, unknown> = { ok: false, available: false, code: outcome.kind };
+				if (outcome.kind === "missing" && id !== undefined) facts.result_id = id;
+				else if (outcome.kind === "incomplete") facts.result_id = outcome.started.id;
+				return {
+					content: [{ type: "text", text: `workbench_recover_tool_result: ${recoverFailureText(outcome.kind)}` }],
+					details: facts,
+				};
+			}
+			const receipt = outcome.receipt;
+			return {
+				content: [{ type: "text", text: renderReceiptRecovery(projectRoot, receipt) }],
 				details: {
-					actor: detectActorRole({
-						roleEnv: workerRoleContext.role,
-						provider: currentModelFacts.provider,
-						model: currentModelFacts.model,
-					}),
-					write_policy: defaultWritePolicy(currentModelFacts.provider, currentModelFacts.model) ?? null,
-					lease_status: leaseStatus(writeLease, new Date().toISOString()),
-					latest_delegation: delegationState.latestId ?? null,
-					review_status: delegationState.latestId !== undefined ? delegationState.status : null,
-					current_diff_hash: delegationState.currentDiffHash ?? null,
-					reviewed_diff_hash: delegationState.reviewedDiffHash ?? null,
-					blocked_write_attempts: delegationState.blockedWriteAttempts,
-					block_reason: reviewBlockReason(delegationState, "delegation") ?? null,
-					git_refresh: status.gitRefresh,
-					context_risk: contextRisk !== undefined,
+					ok: true,
+					available: true,
+					result_id: receipt.id,
+					tool: receipt.tool,
+					status: receipt.status,
+					path: receiptRelativePath(projectRoot, receipt.id),
+					summary_omitted_lines: receipt.summary_omitted_lines,
+					summary_omitted_bytes: receipt.summary_omitted_bytes,
 				},
 			};
 		},
@@ -3256,7 +3982,88 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 
 	// ------------------------------------------- second-layer tool_call guard
 
-	pi.on("tool_call", async (event) => {
+	/**
+	 * P8b: tool_result finalize — fires after the tool executed (and after
+	 * its own handler/domain persistence) and before Pi emits
+	 * tool_execution_end / the final toolResult message events. ONLY a
+	 * matching handle begun by THIS runtime is finalized (exact toolCallId
+	 * map lookup AND exact tool name match); text blocks only, env secret
+	 * values scrubbed, status success/error, bounded redacted summary
+	 * persisted. The in-memory handle is removed after the attempt. On
+	 * success, safe structured recovery metadata (available, result id,
+	 * project-relative receipt path/status) is merged into object details
+	 * without changing content/isError/caps; on failure availability is
+	 * never claimed, the domain artifact is never rewritten/rolled back,
+	 * the started receipt stays incomplete, and a bounded unavailable code
+	 * is merged into the details. A tool-name mismatch never finalizes: the
+	 * started receipt stays incomplete on disk, the in-memory handle is
+	 * consumed, and only a bounded tool_name_mismatch fact is merged.
+	 * Replay-blocked calls and recovery-tool calls have no newly-begun
+	 * handle and are never finalized or overwritten here.
+	 */
+	pi.on("tool_result", async (event) => {
+		const pending = pendingReceiptHandles.get(event.toolCallId);
+		if (!pending) return undefined;
+		const { handle, projectRoot } = pending;
+		// Exact identity: a tool_result finalizes ONLY when BOTH the
+		// toolCallId matches AND the reported tool name equals the begun
+		// handle's exact tool name. A name mismatch (another tool reusing
+		// the same id, or a mismatched id binding) never finalizes: the
+		// started receipt stays incomplete, the in-memory handle is
+		// consumed, and only a bounded unavailable fact is merged into
+		// mergeable details (a defined non-object details is left untouched).
+		if (event.toolName !== handle.toolName) {
+			pendingReceiptHandles.delete(event.toolCallId);
+			if (event.details !== undefined && (typeof event.details !== "object" || event.details === null || Array.isArray(event.details))) {
+				return undefined;
+			}
+			const merged: Record<string, unknown> = { ...((event.details as Record<string, unknown> | undefined) ?? {}) };
+			merged.receipt = { available: false, code: "tool_name_mismatch", result_id: handle.id, tool: handle.toolName };
+			return { details: merged };
+		}
+		try {
+			const text = event.content
+				.filter((block): block is { type: "text"; text: string } => block.type === "text")
+				.map((block) => block.text)
+				.join("\n");
+			const outcome = await finalizeReceipt({
+				projectRoot,
+				handle,
+				status: event.isError ? "error" : "success",
+				content: text,
+				error: event.isError ? text : undefined,
+				secrets,
+			});
+			// Object details only: merged in place, never replaced. A defined
+			// non-object details is left untouched (no patch).
+			if (event.details !== undefined && (typeof event.details !== "object" || event.details === null || Array.isArray(event.details))) {
+				return undefined;
+			}
+			const merged: Record<string, unknown> = { ...((event.details as Record<string, unknown> | undefined) ?? {}) };
+			merged.receipt = outcome.ok
+				? {
+						available: true,
+						result_id: outcome.receipt.id,
+						status: outcome.receipt.status,
+						path: receiptRelativePath(projectRoot, outcome.receipt.id),
+					}
+				: { available: false, code: finalizeUnavailableCode(outcome), result_id: handle.id };
+			return { details: merged };
+		} catch {
+			// A finalize failure must never break the tool result itself.
+			if (event.details !== undefined && (typeof event.details !== "object" || event.details === null || Array.isArray(event.details))) {
+				return undefined;
+			}
+			const merged: Record<string, unknown> = { ...((event.details as Record<string, unknown> | undefined) ?? {}) };
+			merged.receipt = { available: false, code: "storage_error", result_id: handle.id };
+			return { details: merged };
+		} finally {
+			// Remove the in-memory handle after the attempt.
+			pendingReceiptHandles.delete(event.toolCallId);
+		}
+	});
+
+	pi.on("tool_call", async (event, ctx) => {
 		const workerRoleReason = workerRoleToolCallBlockReason(workerRoleContext, event.toolName, event.input);
 		if (workerRoleReason) return { block: true, reason: workerRoleReason };
 		if (
@@ -3320,7 +4127,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		// blocked by mode policy never burns a lease call (the lease gates
 		// the call itself; the counter enforces the bounded per-lease call
 		// budget). Exhaustion/expiry removes the lease's edit/write tools
-		// from the active set (back to the exact canonical 14).
+		// from the active set (back to the exact canonical 15).
 		if (actor === "sol-commander" && (event.toolName === "edit" || event.toolName === "write")) {
 			const path =
 				event.input && typeof event.input === "object" && typeof (event.input as { path?: unknown }).path === "string"
@@ -3342,6 +4149,43 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			if (typeof path === "string" && path.length > 0) {
 				compactState.modifiedFiles = pushBounded(compactState.modifiedFiles, path, MAX_MODIFIED_FILES);
 			}
+		}
+		// P8b: two-phase tool-result receipt BEGIN — the LAST step of this
+		// guard, after every worker/commander/mode/path/lease check above has
+		// allowed. Every registered workbench tool EXCEPT the public recovery
+		// tool begins an exclusive started receipt here (native Pi session id
+		// + event.toolCallId + exact tool name + canonical input hash; the
+		// effective project root is resolved exactly like each tool's own
+		// execute). BEGIN completes BEFORE the tool executes. A matching
+		// completed replay blocks re-execution with a short fixed reason
+		// carrying the durable result id and a recover instruction; every
+		// other outcome (incomplete/corrupt/conflict/invalid/storage) blocks
+		// fail-closed and never executes. A full in-memory handle map blocks a
+		// new call BEFORE begin with a fixed bounded reason (existing handles
+		// are never evicted). This is exact same-toolCallId
+		// identity only — P4 validation evidence is never consulted.
+		if (isWorkbenchToolName(event.toolName) && event.toolName !== RECOVERY_TOOL_NAME) {
+			// P8b capacity: when the in-memory handle map is already at
+			// MAX_IN_FLIGHT_RECEIPTS a new registered workbench call is
+			// blocked fail-closed BEFORE beginReceipt/execution with a fixed
+			// bounded reason. Existing pending handles are NEVER evicted —
+			// nothing is begun for the blocked call, so no started receipt is
+			// left incomplete.
+			if (pendingReceiptHandles.size >= MAX_IN_FLIGHT_RECEIPTS) {
+				return { block: true, reason: capacityBlockReason() };
+			}
+			const projectRoot = await projectRootFor(ctx);
+			const begun = await beginReceipt({
+				projectRoot,
+				sessionIdentity: ctx.sessionManager.getSessionId(),
+				toolCallId: event.toolCallId,
+				toolName: event.toolName,
+				rawInput: event.input,
+			});
+			if (!begun.ok) {
+				return { block: true, reason: beginBlockReason(begun) };
+			}
+			pendingReceiptHandles.set(event.toolCallId, { handle: begun.handle, projectRoot });
 		}
 		return undefined;
 	});

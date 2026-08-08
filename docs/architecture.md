@@ -74,7 +74,7 @@ extensions/workbench-runtime/
     │                        #   numeric-only progress counters/band: Phase 4;
     │                        #   task-contract profile wording + granularity guidance: Phase 5)
     ├── write-authority.ts   # P7 worker-first-strict policy: actor identity, exact
-    │                        #   14-tool Sol DEV allowlist, commander guard, temporary
+    │                        #   15-tool Sol DEV allowlist, commander guard, temporary
     │                        #   write lease (pure state, no Pi imports)
     ├── lease-command.ts     # P7 user-only lease slash commands: argument parsing,
     │                        #   bounded id/token generation, TUI/non-TUI renderers,
@@ -88,20 +88,45 @@ extensions/workbench-runtime/
     ├── delegation-state.ts  # P7 review lifecycle: PENDING_REVIEW → REVIEWED → STALE,
     │                        #   hash binding invariants, delegation/VERIFY blocking (pure)
     ├── diff-review.ts       # P7 workbench_review_worker_diff service: real-diff scope
-    │                        #   check, bound hash vs recorded after hash, drift,
-    │                        #   bounded redacted patch, review.json (pure + injected exec)
+    │                        #   check over EVERY worker path, bound hash vs recorded
+    │                        #   after hash, drift, bounded redacted patch, displayed-
+    │                        #   path coverage facts (same-hash segment merge, hash-
+    │                        #   change reset, legacy patch-entry inference), review.json
+    │                        #   (pure + injected exec)
     ├── tool-catalog.ts      # P6-B static tool metadata + WORKBENCH_TOOL_NAMES order
     ├── command-guard.ts     # P5 token-based destructive-command detection (11 rules)
     ├── path-policy.ts       # P5 protected credential paths + per-mode read/write rules
     ├── path-guard.ts        # lexical + realpath containment for recipe paths
     ├── redact.ts            # secret-name/value detection and redaction
     ├── compact.ts           # P5 compaction supplement state + bounded note builder
+    ├── milestone-handoff.ts # P5 user-only milestone session handoff: explicit
+    │                        #   bounded next-step parser, normalized/redacted
+    │                        #   schema-v1 lifecycle records (the explicit next
+    │                        #   step is redacted once and mirrored into the
+    │                        #   copied CompactState.nextStep; every record
+    │                        #   string bounded/redacted by prepare), the
+    │                        #   pointers/status-only hidden note (never the
+    │                        #   source session path; every truncation mode
+    │                        #   marked inside the caps) and the fail-closed
+    │                        #   restore/load (pure)
     ├── state.ts             # mode persistence via Pi custom session entries
     ├── config.ts            # project root detection, config loading, trust gate,
     │                        #   safe project_dir → effective project root resolution (P8)
     ├── recipe-schema.ts     # strict recipe validation, argv construction
     ├── recipe-runner.ts     # the single execution service (tools + commands)
     ├── runs.ts              # run ids, manifests, bounded log reads
+    ├── validation-evidence.ts # P4a durable validation binding: COMPLETE
+    │                        #   content diff hashing (streamed, bounded
+    │                        #   memory), strict lstat-based lock/config
+    │                        #   collection, gate-state hashes, owner/
+    │                        #   outcome/target facts, pure fail-closed
+    │                        #   reuse comparison (capture + compare only)
+    ├── validation-assessment.ts # P4b current-state reuse assessment for
+    │                        #   workbench_read_run (read-only): strict
+    │                        #   manifest argv_hash ↔ binding invocation
+    │                        #   cross-check, strict persisted gate-artifact
+    │                        #   reconstruction, fail-closed REUSABLE /
+    │                        #   RERUN_REQUIRED with fixed reason codes
     ├── gate-schema.ts       # gate/check schema, gates.yaml parsing, catalog merge
     ├── gate-catalog.ts      # built-in gates B0-B6 and Q0-Q5
     ├── gate-engine.ts       # gate runs, evidence, persistence
@@ -110,10 +135,30 @@ extensions/workbench-runtime/
     ├── status.ts            # P4 footer status line builder
     ├── cost-breakdown.ts    # P7: split session cost (commander/worker/other)
     │                        #   — pure, mirrors Pi's footer aggregation, defensive
+    ├── commander-advisory.ts # P7: observation-only advisory policy (pure, no
+    │                         #   Pi imports) — five fixed dimensions with
+    │                         #   inclusive >= soft/high defaults, HIGH-over-soft
+    │                         #   precedence, fixed-order reasons, bounded config
+    │                         #   fallback, defensive rendering
     ├── widget.ts            # P4 widget visibility + lines
     ├── report.ts            # P4 run reports, gate-run summaries, quant artifacts
     ├── compare.ts           # P4 run comparison (generic + quant deltas)
     ├── render.ts            # P4 pure renderer line builders + details payloads
+    ├── run-result.ts        # Commander Slice B1: layered workbench_read_run renderer
+    │                        #   (Summary/Evidence/Persisted layers, caller-bounded tails)
+    │                        #   + the deterministic read-only batch allowlist (P3);
+    │                        #   P4b: REQUIRED bounded validation line in every include mode
+    ├── tool-result-recovery.ts # P8a receipt core (pure, no Pi imports) + P8b
+    │                        #   lifecycle wiring: deterministic wtr1- ids from
+    │                        #   bounded native Pi session identity + toolCallId,
+    │                        #   canonical input hash only, redaction-first
+    │                        #   bounded summaries, strict fail-closed two-phase
+    │                        #   replay, .pi/workbench/tool-results/<id>.started
+    │                        #   + <id>.json; P8b wires BEGIN (end of the
+    │                        #   tool_call guard, pre-execute), exact toolCallId
+    │                        #   + toolName FINALIZE, capacity pre-block with no
+    │                        #   eviction, and the read-only recovery tool (no
+    │                        #   WebSocket or any other transport)
     ├── templates.ts         # generic / stock-selection / market-timing templates
     ├── init.ts              # /q-init planning + application
     └── inspect.ts           # project inspection service
@@ -156,11 +201,24 @@ GPT-5.6 Sol parent in DEV
   → P7: ledger finished on EVERY outcome (success and failure) — after.json,
        worker-summary.json, review.json placeholder; review_status
        PENDING_REVIEW (never falls back)
-  → Sol reviews the ACTUAL diff (workbench_review_worker_diff): whole-worker-
-       diff scope check vs allowed_paths, current diff hash bound to the
-       reviewed hash, mismatch/drift warnings, bounded redacted patch
-  → PASS marks REVIEWED (any later diff change → STALE); FAIL stays
-       PENDING_REVIEW; pending/stale blocks the next delegation and VERIFY
+  → Sol reviews the ACTUAL diff (workbench_review_worker_diff, callable
+       repeatedly on the latest delegation): whole-worker-diff scope check
+       vs allowed_paths, current diff hash bound to the reviewed hash,
+       mismatch/drift warnings, bounded redacted patch with displayed-path
+       coverage facts — a path counts as displayed only when it appears in
+       an actually rendered patch entry (globally omitted paths never
+       count; bounded/per-path-truncated entries count), prior coverage
+       merges only on the SAME bound hash (a hash change resets: only
+       prior-hash coverage is dropped — this call's rendered paths stay
+       displayed), and every segment re-runs the full scope check and the
+       complete diff hash (include_paths narrows only the patch)
+  → REVIEWED requires scope PASS AND complete displayed-path coverage
+       (any later diff change → STALE); FAIL stays PENDING_REVIEW and ANY
+       re-review of the same current diff that is not PASS with complete
+       coverage (a scope FAIL or an incomplete PASS, e.g. a legacy partial
+       review record) invalidates a prior REVIEWED state fail-closed
+       (demoted to PENDING_REVIEW, reviewed hash cleared); pending/stale
+       blocks the next delegation and VERIFY
   → Sol runs final VERIFY recipes/gates → final judgment
 ```
 
@@ -171,7 +229,9 @@ delivers a complete source+tests+docs vertical slice (investigation,
 production changes, tests, docs, write-free recipe checks, in-scope repair).
 The DEV default is **worker-first write authority**: approved GPT-5.6 Sol
 resolves to the fixed `worker-first-strict` policy — exactly the canonical
-14-tool allowlist (no bash/edit/write, no foreign tools) — so implementation
+15-tool allowlist (read, grep, find, ls + all 11 `workbench_*` tools; an
+ACTIVE user-issued lease adds exactly its edit/write tools → 17 active; no
+bash/edit/write, no foreign tools) — so implementation
 and repair writes go to a fresh bounded worker; high-risk decisions remain
 Commander-led (Sol keeps the decision, delegates only bounded
 support/implementation scopes after the architecture is fixed, and never
@@ -330,6 +390,70 @@ do not participate in LLM context; the hidden note is the only context
 addition, and it is bounded (40 lines / 2.4 KB) and redacted — run logs never
 enter session context.
 
+### Milestone session handoff (P5)
+
+The user-only `/q-milestone-handoff <next step>` command is the ONLY path
+that carries workbench state into a fresh session. An ordinary `/new`
+starts a fresh/DEV session that copies nothing; only the milestone handoff
+starts a parent-linked replacement that resumes the source's mode, bounded
+compact state and delegation state.
+
+```
+/q-milestone-handoff <next step>   (user-only; a delegated worker is refused
+                                    before any state is touched)
+  → parseNextStepArg: empty/overlong raw input rejected up front
+      (no state touched, no entry appended)
+  → await ctx.waitForIdle()          (a handoff never interrupts a running turn)
+  → refreshCompactP7Facts()          (capture the current worker-first facts)
+  → prepareMilestoneHandoff(...)     (pure): the explicit next step is trimmed,
+       redacted against the collected env secrets and re-capped (code-point /
+       UTF-8 safe); the SAME value is stored in `record.next_step` and
+       `record.state.nextStep`, so a pre-existing snapshot nextStep (possibly
+       stale or undefined) never reaches the record or the target. Every
+       record string (milestone id, next step, session pointer, timestamp) is
+       bounded/redacted by prepare, so a prepared record always passes its
+       own fail-closed loader. The snapshot re-applies the compact caps,
+       redacts every string field and normalizes the mode.
+  → pi.appendEntry("workbench-milestone-handoff", prepared)
+       (SOURCE session, persist-first)
+  → ctx.newSession({ parentSession: <full source session file>, setup, withSession })
+       Parent linkage uses the ORIGINAL full session file; only the persisted
+       record pointer is bounded/redacted.
+       setup appends to the TARGET session, in order:
+         1. `resumed` milestone record (same milestone id / next step /
+            session pointer / snapshot, new lifecycle + timestamp)
+         2. hidden custom message (display:false, workbench-milestone-handoff-
+            note): deterministic pointers/status-only note, bounded 40 lines /
+            2400 chars / 4096 UTF-8 bytes with every truncation mode marked
+            `[truncated]` INSIDE the caps; it never carries the absolute
+            source session path — only the fixed fact `source session:
+            parent-linked (pointer persisted outside model context)` — and
+            never run logs
+         3. copied MODE entry, copied bounded COMPACT state entry (nextStep =
+            the redacted record next step), copied DELEGATION state entry
+         DELIBERATELY NO write-lease entry: the target write authority stays
+         locked even when the source held an active/pending lease.
+       withSession runs against the REPLACEMENT context only: visible announce
+       (may show the source path — a user notification, not model context),
+       then replacementCtx.reload().
+  → Pi ordering: session_start("new") fires BEFORE setup against the empty
+       fresh target (which would reset the in-memory mode/compact/delegation
+       state), so the reload re-fires session_start("reload") over the
+       setup-appended target entries and restores mode/compact/delegation /
+       note into the running session before the user continues.
+  → cancelled replacement: the source session stays valid and an additive
+       `cancelled` record (same milestone id / next step / session pointer) is
+       appended to the source; nothing was replaced and no setup ran.
+```
+
+No model/provider call and no agent turn happen anywhere in the handoff; the
+command never runs recipes or gates. Loading is fail-closed: unknown schema
+versions, unknown lifecycles, empty/overlong required fields and malformed
+snapshots are ignored; every other custom-entry type is never touched; there
+is no legacy migration or rewrite. Restoration normalizes a present snapshot
+so `state.nextStep` equals the validated `record.next_step`, so later
+compaction/restoration retains the explicit handoff next step.
+
 ## Prompt-cache telemetry (P6-A)
 
 ```
@@ -389,6 +513,252 @@ counting if persistence ordering changes in a future compatible Pi version.
 entries only — no project config, no trust gate — and works in TUI and
 print/json modes through the shared `output()` helper.
 
+**P0 additions (commander-token-optimization plan §6) — additive and
+backward compatible.** The cost/token buckets above are byte-for-byte
+unchanged; the breakdown additionally carries exact, usage-independent
+session observability facts, all numeric/structural only:
+
+- `commanderRequests` — exact commander assistant-message (turn) count;
+- `compactions` — exact `compaction` session-entry count;
+- `toolTextBytes` — deterministic per-tool inline **TEXT** byte attribution
+  over session toolResult entries (toolName-sorted, entry counts, UTF-8
+  text bytes, total). Only textual content that actually enters context is
+  counted (string `content` / `content[]` items of type `text`); malformed
+  or non-text content contributes zero and never throws. Tool **arguments
+  are never inspected**, and the inline text is counted as bytes only — it
+  is never stored, rendered, or otherwise surfaced. The attribution is
+  descriptive and never claims causal token savings.
+
+`/q-cost-status` renders these session facts (commander requests,
+compactions, total tool-result text bytes, bounded per-tool rows with an
+exact omitted count, and the exact commander gross-token facts); it never
+renders tool arguments or result text. The commander gross facts are
+rendered additively and unabridged: full-digit gross (`input + output +
+cacheRead + cacheWrite` — never k/M-compacted even when the compact bucket
+row shows M), the exact component counts, and the deterministic cacheRead
+share (`cacheRead / gross`, one-decimal percent, explicit `N/A` on a zero
+gross). Rendering is defensive: malformed / non-finite / negative
+hand-crafted counts normalize to zero, counts above
+`MAX_COMMANDER_COUNT_DISPLAY` clamp with an explicit note, and rendered
+lines are always finite, deterministic and bounded (never NaN/Infinity).
+A fresh `/reload` + `/q-cost-status` capture remains required before any
+later re-measurement. Slice A is PASS: the final full `check` run
+`20260805-141013-i4lx` passed 879/879 and the Commander gates run
+`20260805-141242-tyt8` passed b0-b6. The recorded 95.35% P1 reduction
+remains an observational recipe-inline-byte-only figure
+(docs/baselines/commander-token-p0.md) — not causal and not overall
+savings.
+
+## Commander advisory (P7)
+
+`core/commander-advisory.ts` is a pure, observation-only policy module (no
+Pi imports) that evaluates the five fixed commander observability
+dimensions over the SAME current session breakdown as the COST segment
+(`core/cost-breakdown.ts` — pending-message-aware with the existing dedup
+semantics) and returns a deterministic `ok | soft | high` band with
+per-dimension reasons.
+
+**Documented defaults (five fixed dimensions, inclusive `>=` boundaries —
+a dimension reaches `soft` at exactly its soft threshold and `high` at
+exactly its high threshold):**
+
+| dimension | soft | high |
+| --------- | ---- | ---- |
+| requests | 200 | 300 |
+| gross_tokens | 25,000,000 | 40,000,000 |
+| output_tokens | 125,000 | 200,000 |
+| tool_text_bytes | 3,500,000 | 5,000,000 |
+| compactions | 5 | 8 |
+
+The overall band is the highest per-dimension band (HIGH over SOFT over
+OK); reasons list the triggered dimensions in the fixed order `requests`,
+`gross_tokens`, `output_tokens`, `tool_text_bytes`, `compactions`, each
+with its own per-dimension band (a dimension at HIGH is a HIGH reason,
+never also a SOFT reason).
+
+**Configuration.** A trusted `project.yaml` may override individual
+thresholds additively (missing fields inherit the documented defaults):
+
+```yaml
+commander:
+  advisory:
+    soft:
+      requests: 200
+      gross_tokens: 25000000
+      output_tokens: 125000
+      tool_text_bytes: 3500000
+      compactions: 5
+    high:
+      requests: 300
+      gross_tokens: 40000000
+      output_tokens: 200000
+      tool_text_bytes: 5000000
+      compactions: 8
+```
+
+Every value must be a positive safe integer; unknown keys, invalid values
+and `high <= soft` ordering violations become bounded `project.yaml`
+ConfigIssue records (`parseAdvisoryConfig` issue evidence is hard-capped
+at `MAX_ADVISORY_CONFIG_ISSUES`), while the affected fields fall back to
+the documented defaults (a `high <= soft` violation falls back to BOTH
+defaults for that dimension). Malformed config never disables
+observability and never throws.
+
+**Presentation.** The footer (`refreshStatus` via `message_end`) appends a
+compact `CMD:SOFT` / `CMD:HIGH` segment only when triggered — an OK
+session adds no segment — driven by the same pending-message-aware session
+breakdown as the COST segment. `/q-cost-status` appends the deterministic,
+bounded advisory facts (band, the five current values with their effective
+thresholds, and the fixed-order reasons) additively after the existing
+cost output, in TUI (`ctx.ui.notify`) and print/json (stdout) modes.
+Trusted thresholds are loaded best-effort; the command is **never
+trust-gated** — untrusted, missing or error paths always fall back to the
+documented defaults. Rendering is defensive: current values normalize to
+finite non-negative integers clamped at `MAX_ADVISORY_COUNT_DISPLAY` with
+an explicit note (display clamping never changes the verdict — the band is
+evaluated on the normalized facts), unknown/malformed bands fail safe to
+OK, absent/null subobjects render the documented defaults, and hand-crafted
+malformed facts never produce NaN/Infinity, extra lines, or a throw.
+
+**Advisory-only guarantees (P7).** The advisory path never steers (no
+hidden or visible steering message), never cancels or terminates
+`message_end` processing (a HIGH-band session completes normal
+message_end/status processing unchanged), never changes tools, modes or
+write authority, never blocks the workflow, and creates no hard-stop or
+enforcement path. The write-authority, delegation/review and gate surfaces
+are governed by their own P7 policies — never by the advisory band.
+
+Only the P7 advisory portion described here is implemented; P5/full
+Slice D and the Commander check/gates verification remain unclaimed.
+
+## Bounded recipe/gate parent-result summaries (P1)
+
+`core/result-summary.ts` is a pure, deterministic module that builds the
+parent `toolResult` for `workbench_run_recipe` / `workbench_run_gate` and
+the rendered output of `/q-run` / `/q-gate` (commander-token-optimization
+plan §8). The parent result is a **bounded presentation summary**, never
+the raw run output:
+
+- success summaries are ≤ **4096 UTF-8 bytes / 40 lines** and inline NO raw
+  stdout/stderr and NO per-test success lines;
+- failure/timeout/cancelled summaries are ≤ **12288 UTF-8 bytes / 120
+  lines** under the fixed failure-information precedence: (1) status/exit
+  code + command, (2) failing test names/count (from Node TAP), (3) first
+  root-cause line, (4) timeout/cancelled, (5) warning count (exit-0
+  warnings stay visible), (6) full log paths and artifact paths, (7)
+  omission facts; bounded raw excerpts may follow ONLY after the
+  machine-summary disclaimer, into strictly remaining capacity, and are
+  the first thing dropped under pressure;
+- gate summaries pass through the same caps: status/exit, failing and
+  blocked gate identifiers + reasons BEFORE passing-gate detail, the full
+  persisted record path, and omission facts;
+- caps are measured in UTF-8 bytes and lines (newline separators counted);
+  truncation is code-point safe and deterministic; custom caps are
+  configurable only within documented safe bounds (malformed/tiny/huge
+  values resolve or clamp so the required facts always fit — `withinCaps`
+  is always true);
+- every untrusted display field (command, paths, test names, gate ids /
+  titles / reasons, cache facts, …) is sanitized (control characters
+  replaced — a field can never inject extra lines) and bounded with an
+  explicit omission fact; bounded lists show a bounded number of items
+  plus the EXACT omitted count.
+
+The module never reads files, never claims acceptance, and never rewrites
+persisted records — full logs/records stay on disk byte-for-byte unchanged
+and are always referenced by path. A summary is presentation only and is
+never acceptance evidence; `check`/gates remain commander-owned.
+
+## Layered run-result presentation (Commander Slice B1, P2 + P3)
+
+`core/run-result.ts` is a pure, deterministic module that builds the
+`workbench_read_run` parent `toolResult` (commander-token-optimization
+plan P2). The result is a **layered bounded presentation** of the persisted
+run record, never the raw run output, in the fixed order:
+
+1. **Summary layer** — machine-derived run facts (run id, recipe, profile,
+   mode, status, exit code, duration, started/finished, timed out,
+   cancelled, git, execution source);
+2. **Evidence layer** — artifact / evidence / declared-write paths
+   (bounded lists with the exact omitted count), truncation facts, the
+   REQUIRED logs/argv opt-in guidance line (raw stdout/stderr/tails/argv
+   omitted + the exact `include=logs`/`include=all` instruction — its
+   own required line, never only a tail of the truncatable aggregate
+   omissions line), P6-C cache and P6-D quant-contract facts, omission
+   facts (machine facts only);
+3. **Metadata layer** (explicit `manifest` / `logs` / `all` includes
+   only) — bounded `cwd`/`argv` from the manifest, NEVER in the default
+   summary;
+4. **Persisted layer** — durable project-relative paths to the run
+   directory, `manifest.json`, `summary.json`, `stdout.log` and
+   `stderr.log`, plus the machine-derived disclaimer;
+5. **Tail layer** (explicit `logs` / `all` includes only) — the existing
+   caller-bounded stdout/stderr tails (`readLogSnippet`'s
+   `max_lines`/`max_bytes`, schema-bounded), appended verbatim; the
+   renderer never reads logs and never re-bounds them.
+
+The omitted `include` now resolves to **`summary`** (registered default,
+changed from `all`): the default output is ≤ **4096 UTF-8 bytes / 40
+lines** and never inlines raw stdout/stderr, per-test lines, or argv.
+`summary` and `manifest` outputs are capped (custom caps clamp to the
+documented safe bounds `MIN_RUN_RESULT_CAPS` .. `MAX_RUN_RESULT_CAPS`);
+`logs`/`all` have no global cap — the tails are already caller-bounded.
+Every untrusted manifest field is sanitized (control characters replaced
+— a field can never inject extra lines) and bounded code-point-safely
+with explicit omission facts; lists render bounded items plus the exact
+omitted count; malformed values render defensively and never throw.
+Omission reporting never silently loses machine facts: optional
+cache/quant lines that cannot fit the resolved caps are dropped
+deterministically (lowest priority first) and recorded in the aggregate
+(`MAX_OMISSIONS_CHARS` 480, same as the P1 module), and
+bounded/truncated metadata/path/list displays carry an explicit
+durable-source fact (manifest.json / run record / disk) that is
+precomputed BEFORE the aggregate omissions line is emitted. The
+guaranteed-fit policy holds: `withinCaps` is always true.
+
+The structured `details` payload (`ReadRunToolDetails`) keeps its exact
+legacy shape with one P4b additive field: `validation` (status +
+`reasons` — the fixed reason codes only; never raw argv, manual evidence
+text, unavailable-reason prose, secrets or worker-first facts). All disk
+records are unchanged — legacy records (no cache/quant fields, no
+`validation_evidence`) render identically with the fail-closed
+`RERUN_REQUIRED — missing-binding` validation line. The tool
+schema/metadata wording now declares the summary default.
+
+**P4b required validation line.** Every include mode (`summary` /
+`manifest` / `logs` / `all`) and the defensive minimal fallback emit the
+REQUIRED `validation :` line: `REUSABLE` exactly when the current-state
+P4a comparison accepted a valid, successful, complete, Sol-owned binding
+with every component exactly equal; otherwise `RERUN_REQUIRED` with its
+fixed reason codes. A payload claiming REUSABLE with reasons is a
+contradiction and renders RERUN_REQUIRED with those reasons; an absent
+payload renders `RERUN_REQUIRED — missing-binding`. The WHOLE line —
+prefix, complete bounded codes and the exact omitted-count suffix
+(`…(+N more)`) — always fits the exported `MAX_VALIDATION_LINE_BYTES`
+(128 UTF-8 bytes); a code is shown complete or not at all, never
+partial/overflowing. The verdict is observation only: it never
+automatically skips recipe/gate execution and is never acceptance
+evidence.
+
+**Read-only batching (plan P3).** `INDEPENDENT_READ_ONLY_ALLOWLIST` is
+the deterministic, explicit allowlist of tools that MAY be batched as
+known-independent read-only calls in one host parallel turn: exactly
+`read`/`grep`/`find`/`ls` plus `workbench_project_inspect` /
+`workbench_read_run` / `workbench_read_gate` / `workbench_list_gates` /
+`workbench_compare_runs` — the classifier keeps this original 9-tool set
+unchanged; it is no longer the same set as the current AUDIT mode matrix,
+because P8b added `workbench_recover_tool_result` to the AUDIT read-only
+set — current AUDIT = this classifier set + `workbench_recover_tool_result`,
+and recovery is not yet batch-classified (deliberately not added to the
+classifier). `workbench_delegation_status` is excluded
+even though it only reads (it refreshes persisted delegation state), as
+are every execution/review/delegation/write tool. The classifier only
+answers membership — it never infers independence for concrete calls; the
+model decides which of its calls are known-independent. Exactly one
+static prompt guideline in `core/tool-catalog.ts` mirrors the allowlist:
+*“Batch 2+ known-independent read-only tool calls … in one host parallel
+turn; dependent calls, writes, delegations, reviews and final
+recipe/gate execution stay sequential.”* No tool, order, or mode changes.
+
 ## Stable prefix contract (P6-B)
 
 DeepSeek caches the FULL prefix, so the workbench keeps its side of the
@@ -417,6 +787,263 @@ with no Pi session: it never calls a model, never reads `auth.json` or
 Pi-dependent checks are skipped, never silently passed — and adds local
 hygiene checks (action-cache integrity, index consistency, stale locks).
 See docs/cache/cache-benchmark.md and P6_BENCHMARK_REPORT.md.
+
+## Validation evidence (P4a)
+
+`core/validation-evidence.ts` persists a durable, privacy-safe capture of
+the exact project state a run's validation claims rest on, as the additive
+`validation_evidence` field on the run manifest (`RunRecord`). The module
+is pure (no Pi imports) plus injected exec for git; it only captures and
+compares.
+
+**Schema and components.** The block is schema-versioned (`schema_version:
+1`): either a full `binding` (capture succeeded) or a bounded
+`unavailable_reason` (capture failed — the record is explicitly
+non-reusable, never a fabricated binding). A binding carries:
+
+- `commit` — exact git HEAD (null outside a repo / unborn HEAD)
+- `diff_hash` — a COMPLETE SHA-256 of every changed regular project file,
+  streamed in bounded memory, with path AND porcelain status preserved
+  through the delegation ledger's `computeDiffHash` (the same derivation
+  at capture and comparison time, so a status-only transition like `??` →
+  `A ` changes the hash even when bytes are identical, and a same-size
+  change beyond any prefix invalidates)
+- `lockfiles` — every `KNOWN_LOCKFILES` full-content hash (markers
+  `missing` / `not-a-file` / `too-large` preserved, P6-C compatible)
+- `config_hash` — the relevant workbench config under
+  `<root>/<CONFIG_DIR_NAME>/workbench` (`CONFIG_DIR_NAME` is Pi's official
+  config dir name, never a hardcoded `.pi`)
+- `gate_state_hash` — the effective gate schema for recipe bindings; for
+  gate bindings the schema plus hashed manual evidence, bounded
+  worker-first/actor facts and prerequisite statuses (gateId → status
+  only — no timestamps, no run ids, no sources)
+- `profile`, `mode`, `owner` (source actor: `sol` | `worker` | `other` |
+  `unknown`), `target` (recipe: name + definition hash + invocation hash
+  + normalized cwd; gate: selector + sorted requested/effective gate ids)
+  and terminal `outcome` facts (`successful`, `complete`, `source`)
+
+**Exact invalidation.** Reuse (`evaluateValidationReuse`) is a pure exact
+comparison: reusable ONLY for a valid, successful, complete, approved-Sol
+binding with every component exactly equal. Refusal reasons accumulate in
+a fixed order (missing → legacy → corrupt → unavailable → unsuccessful →
+incomplete → non-Sol → commit → diff → dependencies → config → gate-state
+→ profile → mode → target → collection-failure) with terminal
+short-circuits for missing/legacy/corrupt/unavailable, source refusals and
+collection failure. Safe misses are allowed; false reuse is forbidden.
+
+**Strict fail-closed / unavailable behavior.** Absence is proven with
+lstat: a genuine ENOENT is a deterministic `missing` marker only when the
+path itself is genuinely absent. A dangling symlink or any other existing
+path (symlink, directory, unreadable, ELOOP/EISDIR/I/O) aborts the capture
+or the current-state collection — an existing-but-unreadable file can
+never masquerade as missing. The diff identity is equally strict: a
+changed path that is a symlink, directory/submodule, unreadable, escaping,
+or otherwise not provable in full makes capture/current collection
+unavailable; only a deletion WITH a deletion status binds the `missing`
+marker. Any collection failure yields an `unavailable` block (capture) or
+a `collection-failure` refusal (comparison) — never a partial binding.
+
+**Privacy.** A binding persists ONLY bounded hashes, enums and ids: raw
+source/config/lockfile content, environment/secret values, manual
+evidence text, tool arguments and full worker-first facts never appear in
+the block. Executed argv is hashed immediately (`executedArgvHash`,
+identical to the P6-C action-key argv hash — exec and cache-hit runs bind
+the SAME invocation hash for the same argv).
+
+**Sol owner requirement.** Only an approved GPT-5.6 Sol commander source
+(`owner: "sol"`) can produce a reusable binding; worker/other/unknown
+sources are refused at comparison time (`non-sol-source`).
+
+**Recipe/gate persistence paths.** `recipe-runner.ts` patches BOTH the
+in-memory and the persisted manifest after every terminal recipe outcome
+(exec success, exec failure, spawn failure, cache hit) via
+`captureAndPatchRunManifest` — a capture failure persists bounded
+unavailable state, and a patch-write failure returns the original record,
+so the returned and persisted records can never disagree on a binding that
+was not actually persisted. `gate-engine.ts` persists the block inline for
+PASS and non-PASS gate runs. The field is additive on schema v1: legacy
+manifests without it remain readable (comparison then refuses reuse with
+`missing-binding`).
+
+**Action-cache separation.** P4 evidence is observation only: the P6-C
+action cache still decides execution (hit materialization, miss
+execution, `--no-cache`/`--refresh-cache` semantics, execution counts and
+statuses) exactly as before — evidence capture/patches never skip, block
+or re-route the cache and never alter recipe/gate outcomes.
+
+**P4b (implemented) — current-state reuse assessment and rendering.**
+`core/validation-assessment.ts` assesses a read run's persisted P4a
+evidence against the CURRENT trusted project/runtime state inside
+`workbench_read_run`; `core/run-result.ts` renders the verdict as the
+REQUIRED bounded `validation :` line in every include mode and the
+additive `details.validation` field. Strictly READ-ONLY: the assessment
+never rewrites run artifacts, never appends session/delegation entries,
+never mutates the authoritative in-memory delegation state (gate-run
+worker-first facts come from the caller's read-only projection — the
+mutating refresh stays gate-execution-only), and never contacts or
+alters the P6-C action cache. The verdict never skips recipe/gate
+execution and is never acceptance evidence.
+
+**Assessment inputs.** Recipe runs: the current target is rebuilt from
+the CURRENTLY DECLARED recipe definition + normalized cwd plus the
+persisted privacy-safe invocation identity, which is cross-checked
+against the persisted manifest's `argv_hash` (must be a valid 64-hex
+identity exactly equal to the binding's `invocation_hash` —
+missing/malformed/mismatched identities refuse reuse deterministically
+as `corrupt-binding`; raw argv is never read, re-derived, or rendered; a
+removed recipe is `target-mismatch`). Gate runs: the current
+selector/requested/effective target is reconstructed from the CURRENT
+effective catalog (removed gates / selector drift are `target-mismatch`)
+and the persisted source artifacts (gates.json + evidence.json) are
+STRICTLY validated by `readPersistedGateRunFacts` — both must carry the
+exact gate schema version and run id, agree with each other AND with the
+manifest on the requested set, profile (optional) and mode, every gate
+entry carries a bounded id + well-formed prerequisite statuses + a
+bounded checks array, and the evidence check map must EXACTLY equal the
+gate entries' check-id set (extra/foreign or missing checks are
+contradictory). Only type-`manual` evidence entries are recovered (the
+bounded, trimmed note is hashed and never rendered); missing/malformed/
+foreign/contradictory source evidence fails closed as
+`collection-failure`. Current prerequisite statuses are re-resolved from
+the latest persisted gate runs; current actor/worker-first facts are
+hashed in (worker-first facts come from the read-only projection).
+
+**Fail-closed and legacy semantics.** Missing/legacy/foreign/corrupt/
+unavailable bindings, failed/incomplete/non-Sol sources and collection
+failures stay READABLE and refuse reuse with the deterministic P4a
+reason codes (missing → legacy → corrupt → unavailable → unsuccessful →
+incomplete → non-Sol → commit → diff → dependencies → config →
+gate-state → profile → mode → target → collection-failure); a legacy
+record without `validation_evidence` renders
+`RERUN_REQUIRED — missing-binding`; a malformed `argv_hash` or a
+contradictory invocation identity is `corrupt-binding`. Privacy: only
+bounded status + fixed reason codes ever surface — raw argv, manual
+evidence text, unavailable-reason prose, secrets and full worker-first
+facts never leave the assessment or the renderer.
+
+## Tool-result receipt recovery (P8a core + P8b lifecycle wiring)
+
+`core/tool-result-recovery.ts` is the durable two-phase tool-result receipt
+core for the commander-token-optimization persist-first slice: pure (no Pi
+imports), repository-owned, session-level. The reviewed P8a core is the
+storage/identity primitive; **P8b wires the full lifecycle into `index.ts`**
+(BEGIN in the `tool_call` guard, FINALIZE in the `tool_result` handler, and
+the public read-only recovery tool — see "P8b lifecycle wiring (landed)"
+below).
+
+**Native Pi session dependency.** A result id is `wtr1-` + 64 lowercase hex
+= SHA-256 of the canonical binding of a bounded non-empty **native Pi
+session identity** and a bounded non-empty **Pi toolCallId**
+(`deriveResultId`, deterministic). The module never imports Pi: callers
+supply the identity values, and the P8b wiring in `index.ts` collects them
+from Pi session events (`ctx.sessionManager.getSessionId()` +
+`event.toolCallId`). Identities are validated (non-empty,
+length-bounded, no control characters) before any id derivation or path
+construction; ids are path-safe by construction.
+
+**Repository-owned two-phase storage.** Under the project config dir:
+
+```
+.pi/workbench/tool-results/<id>.started   phase 1 — exclusive create (tmp + hard link)
+.pi/workbench/tool-results/<id>.json      phase 2 — atomic publish, no-overwrite
+```
+
+Both artifacts are schema `wtr1` / version 1 with exact field sets: started
+carries id/tool/input_hash/nonce/status/created_at; finalized adds
+status/error/summary/omission facts/finalized_at. Strict parsing enforces
+the exact field set, caps, control-character and marker rules on every
+read, and a finalized receipt can only exist AFTER a matching started
+receipt (started-before-final is a parse-level invariant). Temp leftovers
+and foreign files in the directory are ignored.
+
+**Deterministic identity, privacy, bounds, permissions.**
+- The exact tool name and a canonical privacy-safe SHA-256 of the raw input
+  are persisted identity facts; raw input/arguments, session identity and
+  toolCallId are NEVER persisted. Non-JSON inputs (Date, functions, bigint,
+  Map, NaN) are rejected by `canonicalHash` and fail closed as
+  `invalid_identity` before anything is written.
+- Redaction (core/redact.ts) runs FIRST over the full result content, then
+  explicit UTF-8 byte/line caps apply (summary ≤ 2048 bytes / 20 lines,
+  error ≤ 512 bytes / 8 lines) with code-point-safe truncation and a
+  `\n[truncated]` marker whose byte AND line space is reserved inside the
+  caps; control characters are sanitized per line. Artifact reads are
+  strictly bounded (≤ 64 KiB via bounded fd reads).
+- The directory is created mode 0700, artifacts mode 0600; the directory is
+  realpath-containment-checked BEFORE and AFTER mkdir, so an escaping
+  symlink at `.pi`/`.pi/workbench`/`tool-results` can never redirect a
+  write outside the project root.
+
+**Fail-closed classification.** Existing receipts are strictly parsed and
+cross-checked — no overwrite, no guessing, no best-effort success.
+`begin` reports `completed_replay` ONLY when BOTH phases exist, strictly
+parse and agree on id/tool/input_hash/created_at; finalized-only,
+missing-started, malformed/unsafe/oversized and cross-phase-mismatched
+state fails closed as `corrupt_receipt` (recover: `corrupt`/`conflict`)
+and is NEVER reported completed. Missing → `missing`/`incomplete`,
+foreign identity → `identity_conflict` on begin (recover carries no
+requested identity facts beyond the id), environmental failures →
+`storage_error`/`write_error`. Recovery is strictly read-only,
+deterministic, and changes no bytes or mtimes.
+
+**Legacy additive behavior.** P8a adds a NEW directory under
+`.pi/workbench/`; legacy run/cache/delegation/domain records are never
+read, migrated, or rewritten, and unknown-schema receipts fail closed as
+corrupt. No existing record format changes; receipts never touch
+run/cache/gate/delegation artifacts or execution counts.
+
+**P8b lifecycle wiring (landed).** The P8b wiring in `index.ts`:
+
+- **BEGIN (pre-execute, policy-gated).** At the END of the `tool_call`
+  guard — after every worker/commander/mode/path/lease check has allowed —
+  every registered workbench tool EXCEPT the public recovery tool begins an
+  exclusive started receipt (native Pi session id + `event.toolCallId` +
+  exact tool name + canonical input hash; the effective project root is
+  resolved like each tool's own execute). BEGIN completes BEFORE the tool
+  executes. A matching `completed_replay` and every incomplete/corrupt/
+  conflict/invalid/storage outcome block fail-closed with a short fixed
+  reason (carrying the durable result id and a recover instruction) and the
+  tool never executes — exact same-toolCallId identity only; P4 validation
+  evidence is never consulted.
+- **Capacity blocks, never evicts.** When the in-memory handle map is
+  already at `MAX_IN_FLIGHT_RECEIPTS` (256), a new registered workbench
+  call is blocked BEFORE begin/execution with a fixed bounded reason;
+  existing pending handles are never evicted and nothing is begun for the
+  blocked call (no orphaned started receipt).
+- **FINALIZE (exact dual match).** One `tool_result` handler finalizes ONLY
+  a handle begun by this runtime with the EXACT same `toolCallId` AND the
+  exact same tool name — a tool-name mismatch never finalizes (the started
+  receipt stays incomplete, the in-memory handle is consumed, and only a
+  bounded `tool_name_mismatch` fact is merged). Text blocks only, env
+  secrets scrubbed, status success/error, bounded redacted summary —
+  before Pi emits `tool_execution_end`/final result events. The handle is
+  removed after the attempt; success merges safe structured recovery
+  metadata (available, result id, project-relative receipt path/status)
+  into object details without changing content/isError/caps; failure never
+  claims availability, never rewrites/rolls back domain artifacts, and
+  merges a bounded unavailable code. Replay-blocked and recovery-tool
+  results never finalize anything.
+- **Public read-only recovery tool.** `workbench_recover_tool_result` is
+  appended LAST in the catalog/registration order (strict Sol DEV
+  allowlist 14 → 15 = 11 workbench tools; an ACTIVE user lease adds
+  edit/write → 17; AUDIT/VERIFY read-only sets) and is NOT receipted
+  itself. It takes EXACTLY ONE of `result_id` (strict `wtr1-` shape) or
+  `tool_call_id`; the `tool_call_id` path validates the CURRENT native Pi
+  session identity AND the parameter BEFORE any hash (absent/invalid/
+  control-character/over-bound identity fails closed with the fixed
+  `invalid` code and hashes nothing), then derives the id. It calls only
+  `recoverReceipt` + the bounded renderer; fixed fail-closed codes
+  `invalid`/`missing`/`incomplete`/`corrupt`/`conflict`/`storage_error`;
+  it reads no raw logs/domain records, runs no other tool, performs no
+  refresh, never re-executes the original call, and labels persisted
+  summaries non-acceptance evidence.
+- **Isolation and repository hygiene.** `.pi/workbench/tool-results/` is
+  gitignored, and the delegation ledger excludes the receipts subtree from
+  the git facts it records exactly like its own records (sibling-safe
+  prefix match, so `.pi/workbench/tool-results-extra/...` never matches).
+  Legacy no-receipt sessions (absent/invalid native session identity) fail
+  closed. This repository implements **NO WebSocket (or any other)
+  transport** — receipts are plain files on disk with no network path;
+  the workbench owns no transport.
 
 ## Trust and identity
 
@@ -450,7 +1077,7 @@ See docs/cache/cache-benchmark.md and P6_BENCHMARK_REPORT.md.
 - P4 TUI status/widget, run reports, run comparison, tool renderers, JSON
   artifact snapshots
 - P5 path protection, token-based command guard, state recovery, compaction
-  supplements, compatibility docs
+  supplements, milestone session handoff, compatibility docs
 - P6-A DeepSeek prompt-cache telemetry and baseline: hash-only usage/context
   observability, inferred invalidations, JSONL store with rotation,
   /q-cache-status /q-cache-report /q-cache-doctor, footer cache segment
@@ -459,6 +1086,103 @@ See docs/cache/cache-benchmark.md and P6_BENCHMARK_REPORT.md.
   (commander/worker/other buckets mirroring Pi's footer aggregation), COST
   status segment, current assistant/tool-result message_end refresh,
   /q-cost-status
+- Commander token optimization Slice A (P0+P1): additive session
+  observability (exact commander request count, compactions, exact
+  unabridged commander gross-token facts with a deterministic one-decimal
+  cacheRead share — full digits, defensively normalized, never
+  k/M-compacted; per-tool
+  inline TEXT UTF-8 byte attribution — numeric/IDs/tool names only; tool
+  arguments are never inspected; textual toolResult content is read solely
+  to compute UTF-8 byte length and is never persisted, retained, or
+  rendered) and the
+  bounded recipe/gate parent-result summary policy
+  (`core/result-summary.ts`: 4096-byte/40-line success and
+  12288-byte/120-line failure summaries with failure-first precedence and
+  full-log path references, wired into `workbench_run_recipe`,
+  `workbench_run_gate`, `/q-run` and `/q-gate`); full logs/records stay
+  persisted; a fresh `/reload` + `/q-cost-status` capture remains
+  required before any later re-measurement. Slice A is PASS: the final
+  full `check` run `20260805-141013-i4lx` passed 879/879 and the
+  Commander gates run `20260805-141242-tyt8` passed b0-b6; the recorded
+  95.35% P1 reduction remains an observational recipe-inline-byte-only
+  figure (docs/baselines/commander-token-p0.md), never causal or overall
+  savings; worker budgets/defaults and review/gate
+  responsibilities unchanged
+- P4b (validation-assessment slice): `workbench_read_run` reports the
+  current-state reuse verdict (`REUSABLE` / `RERUN_REQUIRED` with fixed
+  P4a reason codes) as the REQUIRED bounded `validation :` line in every
+  include mode plus the additive `details.validation` — recipe targets
+  are rebuilt from the current declaration + the persisted invocation
+  identity cross-checked against the manifest `argv_hash`; gate targets
+  from the current effective catalog + strictly validated
+  gates.json/evidence.json source artifacts (`readPersistedGateRunFacts`
+  rejects foreign schema versions, contradictory gates/evidence/manifest
+  identity facts and malformed/extra source evidence); the read path is
+  strictly read-only (no run-artifact/session/delegation writes, no
+  in-memory delegation-state mutation, no P6-C action-cache contact —
+  gate execution keeps its mutating refresh); verdicts never auto-skip
+  recipe/gate execution and are never acceptance evidence
+- Commander token optimization Slice B1 (P2 layered workbench_read_run
+  results + P3 read-only batching guideline): `core/run-result.ts`
+  (pure) renders the ordered Summary/Evidence/Persisted layers — the
+  omitted `include` now defaults to `summary` (≤ 4096 UTF-8 bytes / 40
+  lines, sanitized and code-point safe, never raw stdout/stderr,
+  per-test lines, or argv, durable project-relative run-dir/manifest/
+  summary/stdout/stderr paths, and a REQUIRED Evidence-layer
+  logs/argv guidance line with the exact `include=logs`/`include=all`
+  opt-in instruction that survives adversarial fields/lists and the
+  caps; dropped optional cache/quant lines and bounded/truncated
+  metadata/path/list displays are recorded in the aggregate with
+  durable sources — machine facts are never silently lost; explicit
+  `manifest` adds bounded cwd/argv metadata without tails; explicit
+  `logs`/`all` append only the existing caller-bounded log tails); the
+  tool schema/metadata wording declares the summary default; the
+  deterministic
+  `INDEPENDENT_READ_ONLY_ALLOWLIST` classifier (read/grep/find/ls +
+  project_inspect/read_run/read_gate/list_gates/compare_runs only;
+  delegation_status and every execution/review/delegation/write tool
+  excluded; never infers independence) plus exactly one static batching
+  prompt guideline; structured details and disk records unchanged
+  (legacy records render identically); no tool/order/mode change;
+  worker budgets/defaults and the durable plan unchanged
+- Commander token optimization Slice B2 (P2 coverage-gated segmented
+  actual-diff review): additive displayed-path coverage facts on review
+  records (`core/diff-review.ts` displayed_paths / remaining_paths /
+  coverage_complete / review_path) — a worker path is displayed only
+  when it appears in an ACTUALLY rendered patch entry (a globally
+  omitted path never counts; a bounded/per-path-truncated entry counts
+  as that path's bounded evidence segment); prior displayed coverage
+  merges ONLY from the persisted review.json with the SAME
+  bound_diff_hash and valid worker-path membership (legacy
+  schema_version-1 records stay readable and infer prior coverage ONLY
+  from their persisted patch entries; rendering recomputes
+  displayed/remaining from valid checked worker paths, so absent or
+  malformed persisted coverage arrays or coverage_complete flags never
+  render a false COMPLETE); a hash change resets coverage (only
+  prior-hash coverage is dropped — this call's rendered paths stay
+  displayed); every review segment re-runs the full scope check over
+  EVERY worker path and binds the complete current diff hash
+  (include_paths narrows only the rendered patch; defaults 400 lines /
+  32 KiB, max 50 include_paths, redaction and the worker scope
+  unchanged);
+  `workbench_review_worker_diff` is callable repeatedly on the latest
+  delegation (PENDING_REVIEW / STALE / REVIEWED) — REVIEWED requires
+  scope PASS AND complete coverage, a same-hash complete PASS rerender
+  keeps the valid REVIEWED binding, a changed hash resets coverage
+  (PASS stays blocking until fresh coverage is complete), and ANY
+  re-review that is not PASS with complete coverage (a scope FAIL or an
+  incomplete PASS, e.g. a legacy partial review record) invalidates a
+  prior same-hash REVIEWED state fail-closed via the
+  pure `demoteReviewedToPending` transition
+  (`core/delegation-state.ts`: REVIEWED → PENDING_REVIEW, reviewed hash
+  cleared; pending/stale stay safely blocking); deterministic rendered
+  displayed/remaining counts, bounded next include_paths guidance (max
+  50 paths AND ≤ 1024 UTF-8 bytes, complete paths only with an exact
+  omitted count), the review-complete fact and the durable
+  project-relative review.json path; details expose review_record +
+  coverage facts; no caller/prose acknowledgement API; no
+  tool/order/mode/schema change; review writes stay review.json + the
+  existing state entry only
 - P7: worker context-budget protection — pure `core/worker-budget.ts`
   (1,000,000-token pinned window, 80% soft handoff / 90% hard stop,
   Pi-compatible context tokens), one-shot hidden soft-budget steer and
@@ -466,8 +1190,9 @@ See docs/cache/cache-benchmark.md and P6_BENCHMARK_REPORT.md.
   budget/compaction tracking with fail-closed hard stop and compaction
   rejection, budget/compaction facts in the worker report
 - P7 (this release): worker-first write authority — approved GPT-5.6 Sol
-  resolves to the fixed `worker-first-strict` policy in DEV (exact canonical
-  14-tool allowlist, no bash/edit/write or foreign tools; identity from the
+  resolves to the fixed `worker-first-strict` policy in DEV (at the P7
+  milestone / before P8b: exact canonical 14-tool allowlist, no
+  bash/edit/write or foreign tools; identity from the
   worker env contract + provider/model only); user-only temporary commander
   write leases (`/q-write-policy status`, `/q-commander-write-unlock`,
   `/q-commander-write-lock` — TUI explicit confirmation vs non-TUI two-part
@@ -508,3 +1233,30 @@ See docs/cache/cache-benchmark.md and P6_BENCHMARK_REPORT.md.
   unchanged); `workbench_project_inspect` exposes `effective_project_root`
   and the renderer shows the effective root; templates, README and
   onboarding docs updated.
+- Commander token optimization P8a: durable two-phase tool-result receipt
+  core (`core/tool-result-recovery.ts`, pure, no Pi imports) —
+  deterministic `wtr1-` ids from bounded native Pi session identity +
+  toolCallId, raw input canonical-hashed and never persisted,
+  redaction-first bounded summaries, strict fail-closed two-phase replay
+  (completed requires BOTH matching phases; corruption/symlink/missing/
+  incomplete fail closed), repository-owned
+  `.pi/workbench/tool-results/<id>.started` + `<id>.json` (0700/0600,
+  atomic no-overwrite publish), legacy-additive; no wiring at the P8a
+  milestone and no WebSocket transport.
+- Commander token optimization P8b (landed): public wiring of the reviewed
+  P8a core — BEGIN at the END of the `tool_call` guard (after every
+  worker/commander/mode/path/lease check, pre-execute) for every registered
+  workbench tool EXCEPT the public recovery tool, fail-closed
+  replay/corrupt/conflict/invalid/storage blocking, and capacity pre-block
+  at MAX_IN_FLIGHT_RECEIPTS (256) with no eviction; one `tool_result`
+  handler FINALIZES only handles begun by this runtime with the EXACT same
+  toolCallId AND tool name (mismatch never finalizes), redaction-first
+  bounded summaries, atomic no-overwrite publish, safe structured receipt
+  metadata merged into object details; public read-only
+  `workbench_recover_tool_result` appended LAST (strict Sol DEV allowlist
+  14 → 15 = 11 workbench tools; active lease 15 → 17; AUDIT/VERIFY
+  read-only sets; NOT receipted itself) with exactly-one
+  result_id/tool_call_id and current-session validation-before-derive;
+  `.pi/workbench/tool-results/` gitignored and excluded from delegation
+  git facts; no WebSocket (or any other) transport — receipts are plain
+  local files.

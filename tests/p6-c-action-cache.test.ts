@@ -7,12 +7,20 @@
  * corrupted action JSON, corrupted CAS, atomic writes, LRU dry-run/apply,
  * new run manifest on hit, gate evidence on hit, cache failure falls back
  * to execution, cache dir layout, secret-free records.
+ *
+ * P4b/P6-C separation (registered surface, additive): registered
+ * workbench_read_run reads around the action-cache lifecycle prove the
+ * read can never change the action key, the cache-store bytes/paths, the
+ * run history or the recipe execution counter, can never auto-execute or
+ * auto-skip (no-cache / refresh-cache / cached-failure semantics stay
+ * intact), and render the ACTUAL REUSABLE / fail-closed RERUN_REQUIRED
+ * assessment through the registered runtime tool.
  */
 
 import assert from "node:assert/strict";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { test } from "node:test";
+import { before, test } from "node:test";
 
 import { runRecipe, type RunRecipeResult } from "../extensions/workbench-runtime/core/recipe-runner.ts";
 import { runGates } from "../extensions/workbench-runtime/core/gate-engine.ts";
@@ -21,7 +29,26 @@ import { readManifest } from "../extensions/workbench-runtime/core/runs.ts";
 import type { ExecFn } from "../extensions/workbench-runtime/core/config.ts";
 import { withTempDir, writeConfigFile } from "./helpers.ts";
 
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+
+import workbenchRuntime from "../extensions/workbench-runtime/index.ts";
+import { WORKER_ALLOWED_PATHS_ENV, WORKER_PROJECT_ROOT_ENV, WORKER_ROLE_ENV } from "../extensions/workbench-runtime/core/worker-policy.ts";
+import { WORKER_SPEND_PROFILE_ENV } from "../extensions/workbench-runtime/core/worker-spend.ts";
+
 const CONFIG = ".pi";
+
+/**
+ * The registered-surface tests below must never inherit a worker-role env
+ * from the harness (unit tests can run inside a delegated worker process):
+ * the owner/actor resolution would flip the REUSABLE verdict. Clear it
+ * before the suite, like tests/run-result-wiring.test.ts.
+ */
+before(() => {
+	delete process.env[WORKER_ROLE_ENV];
+	delete process.env[WORKER_PROJECT_ROOT_ENV];
+	delete process.env[WORKER_ALLOWED_PATHS_ENV];
+	delete process.env[WORKER_SPEND_PROFILE_ENV];
+});
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -678,5 +705,600 @@ test("hit: expected-exit validation — cached run respects current recipe codes
 		const second = await run(root, exec);
 		assert.equal(second.cache?.status, "miss", "unexpected exit code -> miss, never a hit");
 		assert.equal(exec.recipeCalls, 2);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// P4a: validation evidence on exec + cache terminals (cache semantics unchanged)
+// ---------------------------------------------------------------------------
+
+test("P4a: exec and fast cache-hit runs persist matching bindings without changing cache semantics", async () => {
+	await withTempDir(async (root) => {
+		await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"]) });
+		const exec = fakeExec();
+		const first = await run(root, exec);
+		assert.equal(first.cache?.status, "miss");
+		const second = await run(root, exec);
+		assert.equal(second.cache?.status, "hit");
+		assert.equal(exec.recipeCalls, 1, "P4a evidence must not change P6-C execution counts");
+
+		const m1 = await readManifest(root, first.record!.run_id);
+		const m2 = await readManifest(root, second.record!.run_id);
+		assert.deepEqual(m1?.validation_evidence, first.record?.validation_evidence, "returned == persisted (exec)");
+		assert.deepEqual(m2?.validation_evidence, second.record?.validation_evidence, "returned == persisted (hit)");
+		// Profile-less project: the returned binding omits the own profile
+		// property exactly as the persisted JSON does — deep-equal above is
+		// the exact-shape match, not an undefined-vs-absent normalization.
+		assert.equal(Object.hasOwn(first.record!.validation_evidence!.binding!, "profile"), false, "returned exec binding has no own profile property");
+		assert.equal(Object.hasOwn(second.record!.validation_evidence!.binding!, "profile"), false, "returned hit binding has no own profile property");
+		assert.equal(Object.hasOwn(m1!.validation_evidence!.binding!, "profile"), false, "persisted exec binding has no own profile property");
+		assert.equal(Object.hasOwn(m2!.validation_evidence!.binding!, "profile"), false, "persisted hit binding has no own profile property");
+		const b1 = m1?.validation_evidence?.binding;
+		const b2 = m2?.validation_evidence?.binding;
+		assert.ok(b1 && b2, "both terminals persist a binding");
+		assert.deepEqual(b1.outcome, { successful: true, complete: true, source: "exec" });
+		assert.deepEqual(b2.outcome, { successful: true, complete: true, source: "cache" });
+		assert.equal(b1.owner, "unknown", "fact-less callers bind owner=unknown");
+		assert.equal(b2.owner, "unknown");
+		if (b1.target.kind === "recipe" && b2.target.kind === "recipe") {
+			assert.equal(b2.target.name, "hello");
+			assert.equal(b2.target.invocation_hash, b1.target.invocation_hash, "same argv binds the same invocation hash across exec and cache");
+			assert.equal(b2.target.invocation_hash, m2?.argv_hash, "cache binding uses the action-key argv hash");
+			assert.equal(b2.target.definition_hash, b1.target.definition_hash, "same definition hash across terminals");
+			assert.equal(b2.target.cwd, b1.target.cwd, "same normalized cwd across terminals");
+		}
+	});
+});
+
+test("P4a: concurrent locked/double-checked hit persists evidence on both terminals", async () => {
+	await withTempDir(async (root) => {
+		await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"]) });
+		const exec = fakeExec({ delayMs: 150 });
+		const [a, b] = await Promise.all([run(root, exec), run(root, exec)]);
+		const miss = [a, b].find((r) => r.cache?.status === "miss");
+		const hit = [a, b].find((r) => r.cache?.status === "hit");
+		assert.ok(miss && hit, "exactly one exec + one double-checked hit");
+		assert.equal(exec.recipeCalls, 1);
+		const missManifest = await readManifest(root, miss.record!.run_id);
+		const hitManifest = await readManifest(root, hit.record!.run_id);
+		assert.equal(missManifest?.validation_evidence?.binding?.outcome.source, "exec");
+		assert.equal(hitManifest?.validation_evidence?.binding?.outcome.source, "cache");
+		assert.deepEqual(missManifest?.validation_evidence, miss.record?.validation_evidence);
+		assert.deepEqual(hitManifest?.validation_evidence, hit.record?.validation_evidence);
+	});
+});
+
+test("P4a: a cached failure persists unsuccessful source=cache evidence and still reproduces the failure", async () => {
+	await withTempDir(async (root) => {
+		await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"], { successOnly: false }) });
+		const exec = fakeExec({ recipeCode: 1 });
+		const first = await run(root, exec);
+		assert.equal(first.ok, false);
+		assert.equal(first.cache?.status, "miss");
+		const second = await run(root, exec);
+		assert.equal(second.cache?.status, "hit");
+		assert.equal(second.ok, false, "P4 evidence must never flip a cached failure into a success");
+		const manifest = await readManifest(root, second.record!.run_id);
+		assert.deepEqual(manifest?.validation_evidence?.binding?.outcome, { successful: false, complete: true, source: "cache" });
+	});
+});
+
+// ---------------------------------------------------------------------------
+// P4b/P6-C separation: the registered workbench_read_run surface around the
+// action-cache lifecycle (reads must never consult, alter or skip the cache)
+// ---------------------------------------------------------------------------
+
+/** Documented read_run summary caps (asserted against the actual output). */
+const SUMMARY_MAX_BYTES = 4096;
+const SUMMARY_MAX_LINES = 40;
+
+/** GPT-5.6 Sol on an approved first-party provider (fresh-session actor). */
+const SOL_MODEL = { provider: "openai-codex", id: "gpt-5.6-sol" };
+
+interface StubAPI {
+	commands: Map<string, unknown>;
+	tools: Map<string, unknown>;
+	events: Map<string, Array<(event: never, ctx: never) => unknown>>;
+	entries: Array<{ type: string; customType: string; data?: unknown }>;
+	messages: Array<{ customType: string; content: string; display: boolean; options?: unknown }>;
+	activeTools: string[];
+	appendEntryCalls: Array<{ customType: string; data: unknown }>;
+}
+
+/**
+ * Same stub ExtensionAPI surface as tests/run-result-wiring.test.ts, with an
+ * injectable exec so recipe executions stay observable through fakeExec.
+ */
+function makeStub(exec: ExecFn): StubAPI & ExtensionAPI {
+	const stub: StubAPI & ExtensionAPI = {
+		commands: new Map(),
+		tools: new Map(),
+		events: new Map(),
+		entries: [],
+		messages: [],
+		activeTools: [],
+		appendEntryCalls: [],
+		registerCommand: (name: string, def: unknown) => {
+			stub.commands.set(name, def);
+		},
+		registerTool: (def: { name: string }) => {
+			stub.tools.set(def.name, def);
+		},
+		on: (event: string, handler: (event: never, ctx: never) => unknown) => {
+			const list = stub.events.get(event) ?? [];
+			list.push(handler);
+			stub.events.set(event, list);
+		},
+		appendEntry: (customType: string, data: unknown) => {
+			stub.entries.push({ type: "custom", customType, data });
+			stub.appendEntryCalls.push({ customType, data });
+		},
+		sendMessage: (message: { customType: string; content: string; display: boolean }, options?: unknown) => {
+			stub.messages.push({ ...message, options });
+		},
+		sendUserMessage: () => {},
+		setActiveTools: (tools: string[]) => {
+			stub.activeTools = [...tools];
+		},
+		getActiveTools: () => stub.activeTools,
+		getAllTools: () => [...stub.tools.values()] as never[],
+		getThinkingLevel: () => "high" as never,
+		exec,
+	} as unknown as StubAPI & ExtensionAPI;
+	return stub;
+}
+
+/** Trusted temp-project ctx for model-tool execution (optional actor model). */
+function trustedCtx(root: string, model?: { provider: string; id: string }): ExtensionCommandContext {
+	return {
+		mode: "tui",
+		hasUI: true,
+		cwd: root,
+		isProjectTrusted: () => true,
+		sessionManager: {
+			getEntries: () => [],
+			getSessionFile: () => `${root}/session.jsonl`,
+			getSessionId: () => "p6-c-separation-test",
+		} as unknown as ExtensionContext["sessionManager"],
+		model,
+		thinkingLevel: undefined,
+		ui: {
+			notify: () => {},
+			setStatus: () => {},
+			setWidget: () => {},
+			confirm: async () => false,
+		} as unknown as ExtensionContext["ui"],
+		signal: undefined,
+	} as unknown as ExtensionCommandContext;
+}
+
+/** Fire the registered session_start handler as fresh GPT-5.6 Sol. */
+async function fireSolSession(stub: StubAPI & ExtensionAPI, root: string): Promise<void> {
+	const handlers = stub.events.get("session_start") ?? [];
+	assert.ok(handlers.length > 0, "session_start handler registered");
+	for (const handler of handlers) {
+		await handler({ type: "session_start", reason: "new" } as never, trustedCtx(root, SOL_MODEL) as never);
+	}
+}
+
+interface RecipeTool {
+	execute: (
+		toolCallId: string,
+		params: { recipe: string; params?: Record<string, unknown>; cache?: string },
+		signal: unknown,
+		onUpdate: unknown,
+		ctx: ExtensionContext,
+	) => Promise<{ content: Array<{ type: string; text: string }>; details: Record<string, unknown> }>;
+}
+
+interface ReadRunTool {
+	execute: (
+		toolCallId: string,
+		params: { run_id: string; include?: string; max_lines?: number; max_bytes?: number },
+		signal: unknown,
+		onUpdate: unknown,
+		ctx: ExtensionContext,
+	) => Promise<{ content: Array<{ type: string; text: string }>; details: Record<string, unknown> }>;
+}
+
+interface ToolCacheDetails {
+	status: string;
+	actionKey?: string;
+	reusedFromRunId?: string;
+}
+
+interface RecipeToolDetails {
+	ok: boolean;
+	status: string;
+	exit_code: number | null;
+	run_id: string;
+	cache: ToolCacheDetails;
+}
+
+/** Text content of a tool result (the ACTUAL registered runtime output). */
+function toolText(result: { content: Array<{ type: string; text: string }> }): string {
+	return result.content.map((c) => c.text).join("\n");
+}
+
+/** Byte- AND line-aware assertion against the actual emitted text. */
+function assertWithinCaps(text: string, maxBytes: number, maxLines: number): void {
+	const bytes = new TextEncoder().encode(text).length;
+	assert.ok(bytes <= maxBytes, `bytes ${bytes} > ${maxBytes}`);
+	const lines = text.split("\n").length;
+	assert.ok(lines <= maxLines, `lines ${lines} > ${maxLines}`);
+}
+
+interface CacheStoreSnapshot {
+	/** Sorted relative paths of every cache-dir entry (files and dirs). */
+	entries: string[];
+	/** Relative path -> full file bytes. */
+	files: Map<string, Buffer>;
+}
+
+/** Recursive byte + entry snapshot of the WHOLE action-cache store dir. */
+async function snapshotCacheStore(root: string): Promise<CacheStoreSnapshot> {
+	const entries: string[] = [];
+	const files = new Map<string, Buffer>();
+	const walk = async (dir: string, prefix: string): Promise<void> => {
+		const dirents = await readdir(dir, { withFileTypes: true }).catch(() => null);
+		if (!dirents) return; // missing subtree = empty
+		for (const entry of dirents) {
+			const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+			const full = join(dir, entry.name);
+			if (entry.isDirectory()) await walk(full, rel);
+			else files.set(rel, await readFile(full));
+			entries.push(rel);
+		}
+	};
+	await walk(cacheDir(root), "");
+	entries.sort();
+	return { entries, files };
+}
+
+/** Assert two cache-store snapshots are entry-for-entry and byte-for-byte equal. */
+function assertStoreUnchanged(before: CacheStoreSnapshot, after: CacheStoreSnapshot, label: string): void {
+	assert.deepEqual(after.entries, before.entries, `${label}: cache-store paths changed`);
+	assert.deepEqual([...after.files.keys()], [...before.files.keys()], `${label}: cache-store file set changed`);
+	for (const [rel, bytes] of before.files) {
+		const now = after.files.get(rel);
+		assert.ok(now, `${label}: cache-store file disappeared: ${rel}`);
+		assert.deepEqual(now, bytes, `${label}: cache-store file changed: ${rel}`);
+	}
+}
+
+/** The runs-record directory entries of a temp project. */
+async function runsEntries(root: string): Promise<string[]> {
+	try {
+		return (await readdir(join(root, CONFIG, "workbench", "runs"))).filter((n) => !n.startsWith(".")).sort();
+	} catch {
+		return [];
+	}
+}
+
+/** JSON-safe snapshot of the stub's session-visible state. */
+function snapshotStubState(stub: StubAPI & ExtensionAPI): {
+	entries: string;
+	appendEntryCalls: string;
+	messages: string;
+	activeTools: string[];
+} {
+	return {
+		entries: JSON.stringify(stub.entries),
+		appendEntryCalls: JSON.stringify(stub.appendEntryCalls),
+		messages: JSON.stringify(stub.messages),
+		activeTools: [...stub.activeTools],
+	};
+}
+
+test("P4b/P6-C separation: a registered read (REUSABLE in text+details) leaves the action key, cache-store bytes/paths, run history and execution counter unchanged — the next explicit default invocation still hits with the same key and adds a new run manifest", async () => {
+	await withTempDir(async (root) => {
+		await makeProject(root, { "src/a.ts": "const a = 1;\n" }, { cache: cacheYaml(["src/**/*.ts"]) });
+		const exec = fakeExec();
+		const stub = makeStub(exec);
+		workbenchRuntime(stub);
+		await fireSolSession(stub, root);
+
+		const recipeTool = stub.tools.get("workbench_run_recipe") as unknown as RecipeTool;
+		assert.ok(recipeTool, "workbench_run_recipe registered");
+		const readRun = stub.tools.get("workbench_read_run") as unknown as ReadRunTool;
+		assert.ok(readRun, "workbench_read_run registered");
+
+		// exactly ONE explicit default invocation: miss -> execute -> cache write
+		const first = await recipeTool.execute("call-1", { recipe: "hello" }, undefined, undefined, trustedCtx(root) as never);
+		const firstDetails = first.details as unknown as RecipeToolDetails;
+		assert.equal(firstDetails.ok, true, toolText(first));
+		assert.equal(firstDetails.cache.status, "miss", toolText(first));
+		const actionKey = firstDetails.cache.actionKey;
+		assert.ok(actionKey, "miss exposes the action key");
+		assert.match(actionKey, /^[0-9a-f]{64}$/, "expected a 64-hex action key");
+		const firstRunId = firstDetails.run_id;
+		assert.equal(exec.recipeCalls, 1, "the explicit miss executed the recipe exactly once");
+
+		// the persisted exec terminal carries a successful SOL binding whose
+		// invocation identity agrees with the manifest argv_hash
+		const persisted = JSON.parse(await readFile(join(root, CONFIG, "workbench", "runs", firstRunId, "manifest.json"), "utf8")) as {
+			argv_hash?: string;
+			validation_evidence?: {
+				binding?: { owner?: string; outcome?: { successful?: boolean }; target?: { invocation_hash?: string } };
+			};
+		};
+		assert.equal(persisted.validation_evidence?.binding?.owner, "sol");
+		assert.equal(persisted.validation_evidence?.binding?.outcome?.successful, true);
+		assert.equal(persisted.argv_hash, persisted.validation_evidence?.binding?.target?.invocation_hash);
+
+		// snapshot the WHOLE cache store (entries + bytes), the runs dir, the
+		// first run manifest, the action record and the stub session state
+		const storeBefore = await snapshotCacheStore(root);
+		const runsBefore = await runsEntries(root);
+		const firstManifestBefore = await readFile(join(root, CONFIG, "workbench", "runs", firstRunId, "manifest.json"));
+		const recordBefore = await readFile(join(cacheDir(root), "actions", `${actionKey}.json`));
+		const stubBefore = snapshotStubState(stub);
+
+		// registered read, default include: the ACTUAL rendered assessment
+		const read1 = await readRun.execute("call-2", { run_id: firstRunId }, undefined, undefined, trustedCtx(root) as never);
+		const text1 = toolText(read1);
+		assert.ok(text1.split("\n").includes("validation : REUSABLE"), `exact REUSABLE line missing:\n${text1}`);
+		assert.deepEqual(read1.details.validation, { status: "REUSABLE", reasons: [] }, "details.validation exact shape");
+		assertWithinCaps(text1, SUMMARY_MAX_BYTES, SUMMARY_MAX_LINES);
+
+		// registered read, include=all (bounded tails): the same verdict
+		const read2 = await readRun.execute(
+			"call-3",
+			{ run_id: firstRunId, include: "all", max_lines: 5, max_bytes: 1024 },
+			undefined,
+			undefined,
+			trustedCtx(root) as never,
+		);
+		const text2 = toolText(read2);
+		assert.ok(text2.split("\n").includes("validation : REUSABLE"), text2);
+		assert.deepEqual(read2.details.validation, { status: "REUSABLE", reasons: [] });
+
+		// ---- the reads changed NOTHING: same key, same store bytes/paths, no
+		// run record, no execution, no implicit session append ----
+		assert.equal(exec.recipeCalls, 1, "reads never execute the recipe");
+		assertStoreUnchanged(storeBefore, await snapshotCacheStore(root), "after the reads");
+		assert.deepEqual(await readFile(join(cacheDir(root), "actions", `${actionKey}.json`)), recordBefore, "reads never touch the action record");
+		assert.deepEqual(await runsEntries(root), runsBefore, "reads added no run record");
+		assert.deepEqual(
+			await readFile(join(root, CONFIG, "workbench", "runs", firstRunId, "manifest.json")),
+			firstManifestBefore,
+			"reads never rewrite the run manifest",
+		);
+		const stubAfterReads = snapshotStubState(stub);
+		assert.equal(stubAfterReads.entries, stubBefore.entries, "reads appended no implicit session entries");
+		assert.equal(stubAfterReads.appendEntryCalls, stubBefore.appendEntryCalls, "reads appended no implicit appendEntry calls");
+		assert.equal(stubAfterReads.messages, stubBefore.messages, "reads sent no implicit messages");
+		assert.deepEqual(stubAfterReads.activeTools, stubBefore.activeTools, "reads changed no tool set");
+
+		// ---- the next explicit default invocation keeps normal cache semantics ----
+		const second = await recipeTool.execute("call-4", { recipe: "hello" }, undefined, undefined, trustedCtx(root) as never);
+		const secondDetails = second.details as unknown as RecipeToolDetails;
+		assert.equal(secondDetails.ok, true, toolText(second));
+		assert.equal(secondDetails.cache.status, "hit", "after the reads the same-input invocation still hits");
+		assert.equal(secondDetails.cache.actionKey, actionKey, "same inputs -> same action key across the reads");
+		assert.equal(secondDetails.cache.reusedFromRunId, firstRunId, "the hit reuses the original exec run");
+		assert.equal(exec.recipeCalls, 1, "the hit does not re-execute the recipe");
+
+		// run-record addition (explicit hit) vs cache-store state: the runs dir
+		// grew by EXACTLY one manifest; the action record is untouched and the
+		// only possible store change is the documented LRU index touch
+		const runsAfterHit = await runsEntries(root);
+		assert.equal(runsAfterHit.length, runsBefore.length + 1, "exactly one new run manifest from the explicit hit");
+		assert.ok(runsAfterHit.includes(secondDetails.run_id), "the new run record is the hit's");
+		const storeAfterHit = await snapshotCacheStore(root);
+		assert.deepEqual(storeAfterHit.entries, storeBefore.entries, "cache-store paths unchanged by the hit");
+		assert.equal(await countActionRecords(root), 1, "still exactly one action record");
+		assert.deepEqual(await readFile(join(cacheDir(root), "actions", `${actionKey}.json`)), recordBefore, "the hit never rewrites the action record");
+		for (const [rel, bytes] of storeBefore.files) {
+			if (rel === "cache-index.json") continue; // LRU lastUsedAt touch only
+			assert.deepEqual(storeAfterHit.files.get(rel), bytes, `store file changed by the hit: ${rel}`);
+		}
+		const indexBefore = JSON.parse(storeBefore.files.get("cache-index.json")!.toString("utf8")) as {
+			entries: Array<{ key: string; createdAt: string; sizeBytes: number }>;
+		};
+		const indexAfter = JSON.parse(storeAfterHit.files.get("cache-index.json")!.toString("utf8")) as {
+			entries: Array<{ key: string; createdAt: string; sizeBytes: number }>;
+		};
+		assert.equal(indexAfter.entries.length, 1, "index keeps exactly one entry");
+		assert.equal(indexAfter.entries[0]!.key, indexBefore.entries[0]!.key, "index entry key unchanged");
+		assert.equal(indexAfter.entries[0]!.createdAt, indexBefore.entries[0]!.createdAt, "index entry createdAt unchanged");
+		assert.equal(indexAfter.entries[0]!.sizeBytes, indexBefore.entries[0]!.sizeBytes, "index entry size unchanged");
+
+		// the hit materialized a REAL cache run record; prior history untouched
+		const hitManifest = JSON.parse(await readFile(join(root, CONFIG, "workbench", "runs", secondDetails.run_id, "manifest.json"), "utf8")) as {
+			execution_source?: string;
+			action_key?: string;
+			reused_from_run_id?: string;
+		};
+		assert.equal(hitManifest.execution_source, "cache");
+		assert.equal(hitManifest.action_key, actionKey);
+		assert.equal(hitManifest.reused_from_run_id, firstRunId);
+		assert.deepEqual(
+			await readFile(join(root, CONFIG, "workbench", "runs", firstRunId, "manifest.json")),
+			firstManifestBefore,
+			"prior run history is never overwritten",
+		);
+
+		// reads AFTER the explicit cache activity still render REUSABLE and
+		// still change nothing — the assessment stays cache-independent both ways
+		const read3 = await readRun.execute("call-5", { run_id: firstRunId }, undefined, undefined, trustedCtx(root) as never);
+		assert.ok(toolText(read3).split("\n").includes("validation : REUSABLE"), toolText(read3));
+		const read4 = await readRun.execute("call-6", { run_id: secondDetails.run_id }, undefined, undefined, trustedCtx(root) as never);
+		assert.ok(toolText(read4).split("\n").includes("validation : REUSABLE"), toolText(read4));
+		assert.deepEqual(read4.details.validation, { status: "REUSABLE", reasons: [] }, "the cached (hit) run also renders REUSABLE");
+		assertStoreUnchanged(storeAfterHit, await snapshotCacheStore(root), "after the post-hit reads");
+		assert.equal(exec.recipeCalls, 1, "reads after the hit still never execute");
+	});
+});
+
+test("P4b/P6-C separation: a read can neither auto-execute nor auto-skip — an explicit --no-cache invocation after the read still executes and never reads or writes the store", async () => {
+	await withTempDir(async (root) => {
+		await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"]) });
+		const exec = fakeExec();
+		const stub = makeStub(exec);
+		workbenchRuntime(stub);
+		await fireSolSession(stub, root);
+		const recipeTool = stub.tools.get("workbench_run_recipe") as unknown as RecipeTool;
+		const readRun = stub.tools.get("workbench_read_run") as unknown as ReadRunTool;
+		assert.ok(recipeTool && readRun, "workbench_run_recipe and workbench_read_run registered");
+
+		const first = await recipeTool.execute("call-1", { recipe: "hello" }, undefined, undefined, trustedCtx(root) as never);
+		const firstDetails = first.details as unknown as RecipeToolDetails;
+		assert.equal(firstDetails.cache.status, "miss", toolText(first));
+		assert.equal(exec.recipeCalls, 1);
+		const storeBefore = await snapshotCacheStore(root);
+		const runsBefore = await runsEntries(root);
+
+		// registered read
+		const read1 = await readRun.execute("call-2", { run_id: firstDetails.run_id }, undefined, undefined, trustedCtx(root) as never);
+		assert.ok(toolText(read1).split("\n").includes("validation : REUSABLE"), toolText(read1));
+		assertStoreUnchanged(storeBefore, await snapshotCacheStore(root), "after the read");
+		assert.deepEqual(await runsEntries(root), runsBefore, "the read added no run record");
+		assert.equal(exec.recipeCalls, 1, "the read never executed the recipe");
+
+		// explicit --no-cache after the read: still executes, never reads/writes
+		const noCache = await recipeTool.execute("call-3", { recipe: "hello", cache: "no-cache" }, undefined, undefined, trustedCtx(root) as never);
+		const noCacheDetails = noCache.details as unknown as RecipeToolDetails;
+		assert.equal(noCacheDetails.ok, true, toolText(noCache));
+		assert.equal(noCacheDetails.cache.status, "no-cache", toolText(noCache));
+		assert.equal(exec.recipeCalls, 2, "no-cache after the read still executes — the read never auto-skipped it");
+		assertStoreUnchanged(storeBefore, await snapshotCacheStore(root), "no-cache never reads or writes the store");
+		assert.equal(await countActionRecords(root), 1, "no-cache added no action record");
+		assert.equal((await runsEntries(root)).length, runsBefore.length + 1, "exactly one new run manifest from the explicit no-cache run");
+
+		// the read afterwards still renders REUSABLE and still changes nothing
+		const read2 = await readRun.execute("call-4", { run_id: firstDetails.run_id }, undefined, undefined, trustedCtx(root) as never);
+		assert.ok(toolText(read2).split("\n").includes("validation : REUSABLE"), toolText(read2));
+		assertStoreUnchanged(storeBefore, await snapshotCacheStore(root), "after the post-no-cache read");
+		assert.equal(exec.recipeCalls, 2, "reads never execute the recipe");
+	});
+});
+
+test("P4b/P6-C separation: a read never auto-executes — an explicit --refresh-cache invocation after the read still executes and replaces the record; the next default still hits", async () => {
+	await withTempDir(async (root) => {
+		await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"]) });
+		const exec = fakeExec();
+		const stub = makeStub(exec);
+		workbenchRuntime(stub);
+		await fireSolSession(stub, root);
+		const recipeTool = stub.tools.get("workbench_run_recipe") as unknown as RecipeTool;
+		const readRun = stub.tools.get("workbench_read_run") as unknown as ReadRunTool;
+		assert.ok(recipeTool && readRun, "workbench_run_recipe and workbench_read_run registered");
+
+		const first = await recipeTool.execute("call-1", { recipe: "hello" }, undefined, undefined, trustedCtx(root) as never);
+		const firstDetails = first.details as unknown as RecipeToolDetails;
+		assert.equal(firstDetails.cache.status, "miss", toolText(first));
+		const actionKey = firstDetails.cache.actionKey;
+		assert.ok(actionKey, "miss exposes the action key");
+		assert.equal(exec.recipeCalls, 1);
+		const storeBefore = await snapshotCacheStore(root);
+		const runsBefore = await runsEntries(root);
+
+		// registered read
+		const read1 = await readRun.execute("call-2", { run_id: firstDetails.run_id }, undefined, undefined, trustedCtx(root) as never);
+		assert.ok(toolText(read1).split("\n").includes("validation : REUSABLE"), toolText(read1));
+		assertStoreUnchanged(storeBefore, await snapshotCacheStore(root), "after the read");
+		assert.equal(exec.recipeCalls, 1, "the read never executed the recipe");
+
+		// explicit --refresh-cache after the read: still executes and REPLACES
+		const refresh = await recipeTool.execute("call-3", { recipe: "hello", cache: "refresh-cache" }, undefined, undefined, trustedCtx(root) as never);
+		const refreshDetails = refresh.details as unknown as RecipeToolDetails;
+		assert.equal(refreshDetails.cache.status, "refresh-executed", toolText(refresh));
+		assert.equal(refreshDetails.cache.actionKey, actionKey, "refresh keeps the same action key");
+		assert.equal(exec.recipeCalls, 2, "refresh after the read still executes — the read never auto-executed it");
+		assert.equal(await countActionRecords(root), 1, "refresh replaces, never duplicates");
+		assert.equal((await runsEntries(root)).length, runsBefore.length + 1, "exactly one new run manifest from the explicit refresh");
+		const actionStore = new ActionCacheStore(root);
+		const index = await actionStore.readIndex();
+		assert.equal(index.entries.length, 1, "index keeps exactly one entry after the replacement");
+		const { record } = await actionStore.readRecord(index.entries[0]!.key);
+		assert.equal(record?.sourceRunId, refreshDetails.run_id, "the replaced record points at the refreshed run");
+
+		// the read of the refreshed (exec) run stays REUSABLE and store-agnostic
+		const storeAfterRefresh = await snapshotCacheStore(root);
+		const read2 = await readRun.execute("call-4", { run_id: refreshDetails.run_id }, undefined, undefined, trustedCtx(root) as never);
+		assert.ok(toolText(read2).split("\n").includes("validation : REUSABLE"), toolText(read2));
+		assertStoreUnchanged(storeAfterRefresh, await snapshotCacheStore(root), "after the post-refresh read");
+
+		// the next default invocation still hits with the same key
+		const hit = await recipeTool.execute("call-5", { recipe: "hello" }, undefined, undefined, trustedCtx(root) as never);
+		const hitDetails = hit.details as unknown as RecipeToolDetails;
+		assert.equal(hitDetails.cache.status, "hit", toolText(hit));
+		assert.equal(hitDetails.cache.actionKey, actionKey, "same action key after the refresh");
+		assert.equal(exec.recipeCalls, 2, "the post-refresh hit does not re-execute");
+		const storeAfterHit = await snapshotCacheStore(root);
+		const read3 = await readRun.execute("call-6", { run_id: hitDetails.run_id }, undefined, undefined, trustedCtx(root) as never);
+		assert.ok(toolText(read3).split("\n").includes("validation : REUSABLE"), toolText(read3));
+		assertStoreUnchanged(storeAfterHit, await snapshotCacheStore(root), "after the post-hit read");
+	});
+});
+
+test("P4b/P6-C separation: failed/cached-failure outcomes are never flipped by a read — fail-closed RERUN_REQUIRED verdicts through the registered surface, the failure still reproduces on the next explicit invocation", async () => {
+	await withTempDir(async (root) => {
+		await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"], { successOnly: false }) });
+		const exec = fakeExec({ recipeCode: 1, recipeStdout: "boom" });
+		const stub = makeStub(exec);
+		workbenchRuntime(stub);
+		await fireSolSession(stub, root);
+		const recipeTool = stub.tools.get("workbench_run_recipe") as unknown as RecipeTool;
+		const readRun = stub.tools.get("workbench_read_run") as unknown as ReadRunTool;
+		assert.ok(recipeTool && readRun, "workbench_run_recipe and workbench_read_run registered");
+
+		// explicit failing invocation: miss that caches the failure (successOnly=false)
+		const first = await recipeTool.execute("call-1", { recipe: "hello" }, undefined, undefined, trustedCtx(root) as never);
+		const firstDetails = first.details as unknown as RecipeToolDetails;
+		assert.equal(firstDetails.status, "FAILED", toolText(first));
+		assert.equal(firstDetails.exit_code, 1, toolText(first));
+		assert.equal(firstDetails.cache.status, "miss", toolText(first));
+		const actionKey = firstDetails.cache.actionKey;
+		assert.ok(actionKey, "miss exposes the action key");
+		assert.equal(exec.recipeCalls, 1);
+		const storeBefore = await snapshotCacheStore(root);
+		const runsBefore = await runsEntries(root);
+		const recordBefore = await readFile(join(cacheDir(root), "actions", `${actionKey}.json`));
+
+		// registered read of the FAILED exec run: status stays FAILED and the
+		// exact fail-closed verdict renders through the registered surface
+		const read1 = await readRun.execute("call-2", { run_id: firstDetails.run_id }, undefined, undefined, trustedCtx(root) as never);
+		const text1 = toolText(read1);
+		assert.ok(text1.split("\n").includes("status     : FAILED"), text1);
+		assert.ok(
+			text1.split("\n").includes("validation : RERUN_REQUIRED — unsuccessful-source"),
+			`exact fail-closed line missing:\n${text1}`,
+		);
+		assert.deepEqual(
+			read1.details.validation,
+			{ status: "RERUN_REQUIRED", reasons: ["unsuccessful-source"] },
+			"details.validation exact shape",
+		);
+
+		// the read changed nothing
+		assertStoreUnchanged(storeBefore, await snapshotCacheStore(root), "after reading the failed run");
+		assert.deepEqual(await runsEntries(root), runsBefore, "the read added no run record");
+		assert.equal(exec.recipeCalls, 1, "the read never re-executed the failing recipe");
+
+		// the next explicit default invocation still HITS the cached failure and
+		// reproduces it — the read neither auto-executed nor flipped the outcome
+		const second = await recipeTool.execute("call-3", { recipe: "hello" }, undefined, undefined, trustedCtx(root) as never);
+		const secondDetails = second.details as unknown as RecipeToolDetails;
+		assert.equal(secondDetails.cache.status, "hit", toolText(second));
+		assert.equal(secondDetails.cache.actionKey, actionKey, "same action key for the cached failure");
+		assert.equal(secondDetails.status, "FAILED", "a cached failure reproduces the failure — never flipped by the read");
+		assert.equal(secondDetails.exit_code, 1);
+		assert.equal(exec.recipeCalls, 1, "the cached-failure hit does not re-execute");
+		assert.deepEqual(await readFile(join(cacheDir(root), "actions", `${actionKey}.json`)), recordBefore, "the hit never rewrites the failure record");
+		const storeAfterHit = await snapshotCacheStore(root);
+		assert.deepEqual(storeAfterHit.entries, storeBefore.entries, "no store paths changed by the cached-failure hit (index touch only)");
+		assert.equal((await runsEntries(root)).length, runsBefore.length + 1, "exactly one new run manifest from the explicit cached-failure hit");
+
+		// registered read of the CACHED-failure run: still FAILED, still the exact
+		// fail-closed verdict (unsuccessful source=cache evidence is never reusable)
+		const read2 = await readRun.execute("call-4", { run_id: secondDetails.run_id }, undefined, undefined, trustedCtx(root) as never);
+		const text2 = toolText(read2);
+		assert.ok(text2.split("\n").includes("status     : FAILED"), text2);
+		assert.ok(text2.split("\n").includes("validation : RERUN_REQUIRED — unsuccessful-source"), text2);
+		assert.deepEqual(read2.details.validation, { status: "RERUN_REQUIRED", reasons: ["unsuccessful-source"] });
+		assertStoreUnchanged(storeAfterHit, await snapshotCacheStore(root), "after reading the cached-failure run");
+		assert.equal(exec.recipeCalls, 1, "reads never executed anything");
 	});
 });

@@ -1,0 +1,3 @@
+greek_alpha: α
+cjk_water: 水
+emoji_rocket: 🚀

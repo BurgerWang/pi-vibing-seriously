@@ -8,11 +8,16 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { readFile, readdir } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { RecipeSetupError, runRecipe } from "../extensions/workbench-runtime/core/recipe-runner.ts";
-import { makeRunId, isValidRunId } from "../extensions/workbench-runtime/core/runs.ts";
+import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
+
+import { RecipeSetupError, captureAndPatchRunManifest, runRecipe } from "../extensions/workbench-runtime/core/recipe-runner.ts";
+import { makeRunId, isValidRunId, type RunRecord } from "../extensions/workbench-runtime/core/runs.ts";
+import { DEFAULT_RECIPE, type Recipe } from "../extensions/workbench-runtime/core/recipe-schema.ts";
+import { executedArgvHash } from "../extensions/workbench-runtime/core/validation-evidence.ts";
+import type { ExecFn } from "../extensions/workbench-runtime/core/config.ts";
 import { spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
 
 const BASE_RECIPES = [
@@ -355,6 +360,9 @@ test("timeout and cwd are forwarded to exec", async () => {
 			mode: "DEV",
 			params: { msg: "x" },
 			exec: async (cmd, args, opts) => {
+				// git calls (runner git state + P4a validation capture) carry no
+				// timeout/signal — only the recipe command is forwarded them.
+				if (cmd === "git") return { stdout: "", stderr: "", code: 0, killed: false };
 				seen = { timeout: opts?.timeout, cwd: opts?.cwd };
 				return { stdout: "ok", stderr: "", code: 0, killed: false };
 			},
@@ -397,4 +405,183 @@ test("run ids are unique, time-based and strictly validated", () => {
 	assert.ok(a !== b, "random suffix prevents collisions");
 	assert.ok(!isValidRunId("../../etc/passwd"));
 	assert.ok(!isValidRunId("20260101-120000-ab"));
+});
+
+// ---------------------------------------------------------------------------
+// P4a: validation-evidence wiring (git-backed projects)
+// ---------------------------------------------------------------------------
+
+const SOL_FACTS = { role: undefined, provider: "openai-codex", model: "gpt-5.6-sol" };
+
+/** Git-init the temp project (the .pi config dir stays ignored). */
+async function gitBacked(dir: string): Promise<void> {
+	await writeFile(join(dir, ".gitignore"), ".pi/\n", "utf8");
+	await spawnExec("git", ["init", "-q"], { cwd: dir });
+	await spawnExec("git", ["config", "user.email", "t@t"], { cwd: dir });
+	await spawnExec("git", ["config", "user.name", "t"], { cwd: dir });
+	await spawnExec("git", ["add", "-A"], { cwd: dir });
+	await spawnExec("git", ["commit", "-qm", "init"], { cwd: dir });
+}
+
+async function persistedManifest(runDir: string): Promise<any> {
+	return JSON.parse(await readFile(join(runDir, "manifest.json"), "utf8"));
+}
+
+test("P4a: successful exec run persists a sol binding; returned and persisted agree", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir);
+		await gitBacked(dir);
+		const result = await runRecipe({ projectRoot: dir, recipeName: "hello", mode: "DEV", exec: spawnExec, params: { msg: "world" }, actorFacts: SOL_FACTS });
+		assert.equal(result.ok, true);
+		assert.equal(result.record?.execution_source, "exec");
+		const persisted = await persistedManifest(result.runDir as string);
+		assert.deepEqual(persisted.validation_evidence, result.record?.validation_evidence, "returned and persisted blocks are identical");
+		const binding = persisted.validation_evidence.binding;
+		assert.ok(binding, "capture succeeded on a git-backed project");
+		assert.equal(binding.owner, "sol");
+		assert.deepEqual(binding.outcome, { successful: true, complete: true, source: "exec" });
+		assert.equal(binding.kind, "recipe");
+		assert.equal(binding.target.kind, "recipe");
+		assert.equal(binding.target.name, "hello");
+		assert.equal(binding.target.cwd, ".");
+		assert.equal(binding.target.invocation_hash, result.record?.argv_hash, "exec binding binds the executed-argv hash");
+		assert.match(binding.target.invocation_hash, /^[0-9a-f]{64}$/);
+		assert.ok(binding.commit, "git HEAD bound");
+		assert.match(binding.diff_hash, /^[0-9a-f]{64}$/);
+	});
+});
+
+test("P4a: failed exec run persists an unsuccessful binding without altering the outcome", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir);
+		await gitBacked(dir);
+		const result = await runRecipe({ projectRoot: dir, recipeName: "fail", mode: "DEV", exec: spawnExec, actorFacts: SOL_FACTS });
+		assert.equal(result.ok, false);
+		assert.equal(result.record?.exit_code, 3);
+		assert.equal(result.record?.execution_source, "exec");
+		const persisted = await persistedManifest(result.runDir as string);
+		assert.deepEqual(persisted.validation_evidence, result.record?.validation_evidence, "returned and persisted blocks are identical");
+		assert.deepEqual(persisted.validation_evidence.binding.outcome, { successful: false, complete: true, source: "exec" });
+		assert.equal(persisted.exit_code, 3, "the original outcome is never masked");
+	});
+});
+
+test("P4a: spawn failure persists incomplete evidence and still surfaces the error", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir);
+		const exec: ExecFn = async (cmd) => {
+			if (cmd === "git") return { stdout: "", stderr: "", code: 0, killed: false };
+			throw new Error("boom: cannot spawn");
+		};
+		await assert.rejects(runRecipe({ projectRoot: dir, recipeName: "hello", mode: "DEV", exec, actorFacts: SOL_FACTS }), /failed to spawn/);
+		const runsDir = join(dir, CONFIG_DIR_NAME, "workbench", "runs");
+		const runIds = await readdir(runsDir);
+		assert.equal(runIds.length, 1, "the spawn-failure run is persisted");
+		const manifest = await persistedManifest(join(runsDir, runIds[0]!));
+		assert.equal(manifest.exit_code, null);
+		const block = manifest.validation_evidence;
+		assert.ok(block, "spawn-failure runs persist validation evidence");
+		if (block.binding) {
+			assert.deepEqual(block.binding.outcome, { successful: false, complete: false, source: "exec" }, "spawn failure is unsuccessful AND incomplete");
+		} else {
+			assert.ok(block.unavailable_reason, "bounded unavailable reason when capture fails");
+		}
+	});
+});
+
+test("P4a: validation evidence never contains raw argv or env secret values", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir);
+		await gitBacked(dir);
+		const secret = "p4a-super-secret-param-value";
+		const envSecret = "p4a-super-secret-env-value";
+		process.env.SECRET_TOKEN = envSecret;
+		try {
+			const argvRun = await runRecipe({ projectRoot: dir, recipeName: "hello", mode: "DEV", exec: spawnExec, params: { msg: secret }, actorFacts: SOL_FACTS });
+			assert.equal(argvRun.ok, true);
+			const argvEvidence = JSON.stringify((await persistedManifest(argvRun.runDir as string)).validation_evidence);
+			assert.ok(!argvEvidence.includes(secret), "raw argv values never appear in the evidence block");
+
+			const envRun = await runRecipe({ projectRoot: dir, recipeName: "echo-secret", mode: "DEV", exec: spawnExec, actorFacts: SOL_FACTS });
+			assert.equal(envRun.ok, true);
+			const envEvidence = JSON.stringify((await persistedManifest(envRun.runDir as string)).validation_evidence);
+			assert.ok(!envEvidence.includes(envSecret), "raw env values never appear in the evidence block");
+			assert.ok(!envEvidence.includes("SECRET_TOKEN"), "env names are not part of the evidence block");
+		} finally {
+			delete process.env.SECRET_TOKEN;
+		}
+	});
+});
+
+test("P4a: capture-unavailable persists bounded unavailable evidence without masking the recipe outcome", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir);
+		const failingGit: ExecFn = async (cmd, args) => {
+			if (cmd === "git" && args[0] === "status") return { stdout: "", stderr: "fatal: not a git repository", code: 128, killed: false };
+			return { stdout: "", stderr: "", code: 0, killed: false };
+		};
+		const result = await runRecipe({ projectRoot: dir, recipeName: "hello", mode: "DEV", exec: failingGit, params: { msg: "x" }, actorFacts: SOL_FACTS });
+		assert.equal(result.ok, true, "the recipe outcome is never masked by a capture failure");
+		assert.equal(result.record?.exit_code, 0);
+		const persisted = await persistedManifest(result.runDir as string);
+		assert.equal(persisted.validation_evidence.binding, null);
+		assert.ok(persisted.validation_evidence.unavailable_reason.includes("capture failed"), persisted.validation_evidence.unavailable_reason ?? "");
+		assert.deepEqual(persisted.validation_evidence, result.record?.validation_evidence, "returned and persisted unavailable blocks agree");
+	});
+});
+
+test("P4a: a manifest-patch write failure returns the original record — never a binding that was not persisted", async () => {
+	await withTempDir(async (dir) => {
+		await gitBacked(dir);
+		const runId = "20260101-120000-abcd";
+		const runDir = join(dir, CONFIG_DIR_NAME, "workbench", "runs", runId);
+		await mkdir(runDir, { recursive: true });
+		const record: RunRecord = {
+			schema_version: 1,
+			run_id: runId,
+			recipe: "hello",
+			profile: "generic",
+			started_at: "2026-01-01T12:00:00.000Z",
+			finished_at: "2026-01-01T12:00:01.000Z",
+			duration_ms: 1000,
+			cwd: dir,
+			argv: ["node", "-e", "x"],
+			exit_code: 0,
+			timed_out: false,
+			cancelled: false,
+			git_commit: null,
+			git_dirty: false,
+			artifact_paths: [],
+			stdout_truncated: false,
+			stderr_truncated: false,
+			mode: "DEV",
+			expected_exit_codes: [0],
+			declared_writes: [],
+			environment_names: [],
+			execution_source: "exec",
+			argv_hash: executedArgvHash(["node", "-e", "x"]),
+		};
+		const recipe: Recipe = { ...DEFAULT_RECIPE, name: "hello", command: ["node", "-e", "x"] };
+		// manifest.json is a DIRECTORY: the patch writeFile fails (EISDIR) even
+		// though the capture itself succeeds.
+		await mkdir(join(runDir, "manifest.json"));
+		const patched = await captureAndPatchRunManifest({
+			projectRoot: dir,
+			runDir,
+			record,
+			profile: "generic",
+			mode: "DEV",
+			exec: spawnExec,
+			recipe,
+			argv: ["node", "-e", "x"],
+			argvHash: record.argv_hash,
+			projectGates: [],
+			actorFacts: SOL_FACTS,
+			successful: true,
+			complete: true,
+			source: "exec",
+		});
+		assert.equal(patched, record, "the ORIGINAL record is returned when the patch cannot be persisted");
+		assert.equal(patched.validation_evidence, undefined, "no binding is fabricated for a patch that was not persisted");
+	});
 });

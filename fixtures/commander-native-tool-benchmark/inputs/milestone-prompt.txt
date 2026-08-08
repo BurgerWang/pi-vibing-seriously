@@ -1,0 +1,14 @@
+You are an assistant operating from the fixture working directory. Use ONLY the read and grep tools — no other tools, no shell.
+
+Step 1 — Read meta/build.txt with no offset and no limit; note its value.
+Step 2 — Read meta/unicode.txt with no offset and no limit; note every Unicode value in file order.
+Step 3 — Read payloads/large-log.txt with NO offset and NO limit first. The first read returns a truncated preview plus a machine-readable continuation-facts line carrying exactly: complete, returned_lines, returned_bytes, total_lines, total_bytes, omitted_lines, omitted_bytes, next_offset, line_truncated. You MUST then continue with explicit offset and limit reads, following the returned continuation facts at each step, until you obtain the full content and find the fact FACT-TOKEN=delta-77, which appears only beyond the first preview.
+Step 4 — Grep for the literal lowercase string needle under search/, respecting the fixture's .gitignore and .ignore rules. Determine the exact number of occurrences, the exact number of matching lines, and the exact number of distinct matching files. Use the grep count mode when the tool schema exposes it (output=count with count_kind=matches and count_kind=lines); otherwise request enough legacy matches to avoid truncation.
+Step 5 — Finish with a concise final answer containing EXACTLY these six lines, in this order, with the values you found, and nothing else:
+
+build: <value from step 1>
+unicode: <values from step 2, comma-separated, in file order>
+token: <value from step 3>
+needle_occurrences: <exact occurrence count from step 4>
+needle_lines: <exact matching-line count from step 4>
+needle_files: <exact distinct-file count from step 4>

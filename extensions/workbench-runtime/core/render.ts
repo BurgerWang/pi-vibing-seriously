@@ -14,6 +14,10 @@ import {
 	type RunComparison,
 } from "./compare.ts";
 import { formatDelta, formatDuration, formatNumber, fitToWidth } from "./format.ts";
+import {
+	isValidationRefusalReason,
+	type ValidationRefusalReason,
+} from "./validation-evidence.ts";
 
 // ---------------------------------------------------------------------------
 // Structured details payloads returned by the workbench tools
@@ -69,6 +73,16 @@ export interface ReadRunToolDetails {
 	artifact_paths: string[];
 	stdout_log: string;
 	stderr_log: string;
+	/**
+	 * P4b additive current-state validation verdict (status + fixed reason
+	 * codes). Observation only — never claims acceptance and never skips
+	 * recipe/gate execution. The renderer boundary fails closed: only the
+	 * exact status/reasons consistency documented on `readRunValidation` is
+	 * accepted, and every reason must be a canonical fixed refusal code from
+	 * the single VALIDATION_REFUSAL_REASONS allowlist in
+	 * core/validation-evidence.ts.
+	 */
+	validation?: { status: "REUSABLE" | "RERUN_REQUIRED"; reasons: ValidationRefusalReason[] };
 }
 
 export interface InspectToolDetails {
@@ -182,9 +196,50 @@ export function renderGateLines(d: GateToolDetails, expanded: boolean): string[]
 }
 
 /** workbench_read_run */
+const MAX_VALIDATION_DISPLAY_CHARS = 160;
+
+/**
+ * P4b: bounded validation segment from the structured details. FAILS
+ * CLOSED at the renderer boundary — a payload is accepted ONLY when it is
+ * internally consistent:
+ *   - exact status REUSABLE with an actually-empty reasons array; or
+ *   - exact status RERUN_REQUIRED with a non-empty reasons array in which
+ *     EVERY entry is a canonical fixed refusal code (exact membership in
+ *     the single VALIDATION_REFUSAL_REASONS allowlist — the set is never
+ *     duplicated here, and a reason can never carry prose, newlines,
+ *     control characters or secret-like text).
+ * Anything absent, contradictory, unknown, non-array, non-string,
+ * control-containing or otherwise malformed renders as unavailable: the
+ * compact line omits the validation segment and the expanded view shows
+ * `(n/a)` — a malformed payload never fabricates a verdict.
+ */
+function readRunValidation(d: ReadRunToolDetails): { status: "REUSABLE" | "RERUN_REQUIRED"; reasons: ValidationRefusalReason[] } | null {
+	const v: unknown = d.validation;
+	// Absent or non-object payloads (including arrays) are unavailable.
+	if (typeof v !== "object" || v === null || Array.isArray(v)) return null;
+	const record = v as Record<string, unknown>;
+	// Exact verdict tokens only — casing/whitespace/foreign statuses never match.
+	if (record.status !== "REUSABLE" && record.status !== "RERUN_REQUIRED") return null;
+	// reasons must be an ACTUAL array...
+	const rawReasons: unknown = record.reasons;
+	if (!Array.isArray(rawReasons)) return null;
+	// ...of canonical fixed refusal codes ONLY. Exact membership means a
+	// non-string, unknown, control-containing or secret-like entry voids the
+	// WHOLE payload — nothing is filtered or partially rendered.
+	if (!rawReasons.every(isValidationRefusalReason)) return null;
+	// Internal consistency: REUSABLE is reason-less; RERUN_REQUIRED is never empty.
+	if (record.status === "REUSABLE" && rawReasons.length !== 0) return null;
+	if (record.status === "RERUN_REQUIRED" && rawReasons.length === 0) return null;
+	return { status: record.status, reasons: rawReasons as ValidationRefusalReason[] };
+}
+
 export function renderReadRunLines(d: ReadRunToolDetails, expanded: boolean): string[] {
-	const compact = `${(d.kind ?? "run").toUpperCase()} run:${d.run_id ?? "?"} ${d.recipe ?? "?"} ${d.status ?? "?"} exit=${fmtExit(d.exit_code)} ${formatDuration(d.duration_ms)}`;
+	const validation = readRunValidation(d);
+	const compact = `${(d.kind ?? "run").toUpperCase()} run:${d.run_id ?? "?"} ${d.recipe ?? "?"} ${d.status ?? "?"} exit=${fmtExit(d.exit_code)} ${formatDuration(d.duration_ms)}${validation ? ` validation=${validation.status}` : ""}`;
 	if (!expanded) return [compact];
+	const validationLine = validation
+		? `validation : ${validation.status}${validation.reasons.length > 0 ? ` — ${validation.reasons.join(", ").slice(0, MAX_VALIDATION_DISPLAY_CHARS)}` : ""}`
+		: "validation : (n/a)";
 	return [
 		compact,
 		`profile    : ${d.profile ?? "(none)"}`,
@@ -194,6 +249,7 @@ export function renderReadRunLines(d: ReadRunToolDetails, expanded: boolean): st
 		`duration   : ${formatDuration(d.duration_ms)} (${fmtMs(d.duration_ms)})`,
 		`exit code  : ${fmtExit(d.exit_code)}`,
 		`status     : ${d.status ?? "?"}`,
+		validationLine,
 		`git        : ${d.git_commit ? d.git_commit.slice(0, 12) : "(no git)"}${d.git_dirty ? " (dirty)" : ""}`,
 		`artifacts  : ${fmtArtifacts(d.artifact_paths)}`,
 		`stdout log : ${fmtPath(d.stdout_log)}`,

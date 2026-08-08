@@ -122,8 +122,8 @@ permissions and provider authentication, just like any other Pi process.
 ## Worker-first write authority (P7)
 
 Approved GPT-5.6 Sol resolves to the fixed `worker-first-strict` write policy
-in DEV: the active tool set is exactly the canonical 14-tool allowlist
-(`read`, `grep`, `find`, `ls` plus all ten `workbench_*` tools) — no
+in DEV: the active tool set is exactly the canonical 15-tool allowlist
+(`read`, `grep`, `find`, `ls` plus all eleven `workbench_*` tools) — no
 `bash`/`edit`/`write`, no foreign tools — and no persisted/prompt/config value
 can weaken or opt out of it. Actor identity comes only from the existing
 `WORKBENCH_AGENT_ROLE=worker` env contract and the provider/model pair;
@@ -157,7 +157,7 @@ Consequences for the commander workflow:
   status or compact summaries.
 - Expiry (30 min), exhaustion (10 calls) and revocation (leaving DEV, model/
   provider change, session end, or `/q-commander-write-lock`) restore the
-  exact canonical 14 tools. The footer shows `WF:LEASE <used>/<max>` while an
+  exact canonical 15 tools. The footer shows `WF:LEASE <used>/<max>` while an
   active confirmed lease exists and `WF:LOCKED` otherwise; `WF:REVIEW` is
   appended independently while a delegation review is pending or stale.
   `/q-write-policy status` (which accepts exactly the trimmed `status`
@@ -565,7 +565,7 @@ command can still write despite an empty declaration.
 7. **Existing command/path guards:** the normal workbench P5 protections
    still apply inside the child.
 8. **Worker-first write authority:** approved Sol in DEV gets exactly the
-   canonical 14-tool allowlist (no bash/edit/write, no foreign tools); the
+   canonical 15-tool allowlist (no bash/edit/write, no foreign tools); the
    second-layer `tool_call` guard blocks bash for Sol always, blocks
    edit/write without an active human-issued lease (and outside its paths),
    and blocks every tool outside the allowlist despite any re-enable.
@@ -625,6 +625,28 @@ as `UNEXPECTED_DRIFT` (expected, not a defect); see
 [docs/compatibility.md](compatibility.md). DeepSeek usage is
 returned as nested tool usage and the child workbench can continue using the
 existing hash-only cache telemetry.
+
+NRO N1/N2 (Commander Native Tool Optimization,
+`docs/plans/commander-native-tool-optimization.md`) adds the three fixed
+same-name `read`/`grep`/`find` overrides, registered statically BEFORE the
+unchanged 11-tool catalog; names, order and every mode/write inventory are
+unchanged, and the override metadata/schemas shift the tool-schema
+fingerprint exactly once (the single combined N1/N2 transition), after
+which same-mode fingerprints stay stable. In the worker child, a `read`
+without `offset`/`limit` returns the complete content byte-for-byte plus
+the deterministic `nro-read-facts:` trailer, or the deterministic preview
+with facts on oversized text — the worker therefore has a **complete-read
+continuation obligation**: when a read reports `complete=false` (or
+`line_truncated=true`), the worker must continue via `offset`/`limit`
+(following `next_offset`) until `complete=true` for every file whose
+complete content is required (SKILL.md, AGENTS.md, Pi docs, plans,
+baselines, run logs). `grep` adds the optional `output="count"` /
+`count_kind` selectors (one exact uncapped count line; every other call —
+omitted `output`, `output="matches"`, or `count_kind` without `output` —
+stays byte-identical to the equivalent Pi 0.83.0 legacy call), and `find`
+remains an exact legacy pass-through (find count/`max_depth` — staged N3 —
+and grep `output=files` — staged N2b — are NOT exposed); NRO token
+savings/adoption remain **NOT_MEASURED** (N4 is Commander-owned).
 
 The tool result is a strictly bounded structured summary (see Bounded
 worker handoff): the final text shows the delegation id, provider/model,

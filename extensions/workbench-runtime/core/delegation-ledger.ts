@@ -44,7 +44,10 @@
  *   - every JSON file is written atomically (tmp + rename), bounded, and
  *     never contains full worker transcripts, secrets, or unbounded logs
  *   - the ledger's own directory is excluded from the git facts it
- *     records, so its records can never pollute the diff they describe
+ *     records, so its records can never pollute the diff they describe;
+ *     the P8b tool-result receipts subtree is excluded the same way
+ *     (before the cap, digests and statuses), so recovery artifacts are
+ *     never part of the recorded diff either
  *   - the ledger only records facts; it never computes business metrics
  *     and never modifies project files
  */
@@ -436,6 +439,22 @@ export function isDelegationRecordPath(projectRoot: string, candidatePath: strin
 }
 
 /**
+ * True when a project-relative candidate is a P8b tool-result receipt
+ * (`.pi/workbench/tool-results/<descendant>`, or the receipts directory
+ * itself). Receipts are recovery artifacts, never project changes — the
+ * ledger excludes them from the git facts it records exactly like its own
+ * delegation records. The prefix match is sibling-safe by construction:
+ * the trailing `/` guard means `.pi/workbench/tool-results-extra/...` and
+ * `.pi/workbench/other/...` never match.
+ */
+export function isToolResultReceiptPath(projectRoot: string, candidatePath: string): boolean {
+	const rel = normalizeStatusPath(candidatePath);
+	if (!rel) return false;
+	const prefix = `${CONFIG_DIR_NAME}/workbench/tool-results`;
+	return rel === prefix || rel.startsWith(`${prefix}/`);
+}
+
+/**
  * Normalize a porcelain path to forward-slash project-relative form.
  * Absolute POSIX/Windows/backslash paths and `..` escapes are refused
  * (returns undefined). Empty and `.` segments are dropped.
@@ -656,6 +675,10 @@ export async function collectGitFacts(projectRoot: string, exec: ExecFn): Promis
 		// The workbench's own delegation records are never part of the diff
 		// (excluded before the cap, so they never trigger refusal either).
 		if (isDelegationRecordPath(root, normalized)) continue;
+		// P8b tool-result receipts are never part of the diff either — same
+		// before-the-cap exclusion, so recovery artifacts never trigger
+		// refusal and never enter changedPaths/statuses/digests/hash inputs.
+		if (isToolResultReceiptPath(root, normalized)) continue;
 		// FAIL CLOSED on overflow: a silently truncated path set could let
 		// diff hashing and scope review PASS on a partial diff, so a
 		// distinct non-ledger path beyond MAX_CHANGED_PATHS REJECTS

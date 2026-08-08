@@ -27,6 +27,9 @@ import {
 	runGates,
 	type CheckContext,
 } from "../extensions/workbench-runtime/core/gate-engine.ts";
+import { readManifest } from "../extensions/workbench-runtime/core/runs.ts";
+import type { ValidationEvidenceBlock } from "../extensions/workbench-runtime/core/validation-evidence.ts";
+import type { ExecFn } from "../extensions/workbench-runtime/core/config.ts";
 import { BASE_GATES } from "../extensions/workbench-runtime/core/gate-catalog.ts";
 import { runRecipe } from "../extensions/workbench-runtime/core/recipe-runner.ts";
 import type { GateCheck, WorkerFirstGateFacts } from "../extensions/workbench-runtime/core/gate-schema.ts";
@@ -1273,4 +1276,167 @@ test("built-in b0.4 is the only catalog check with internal repository-root meta
 	assert.equal(fileCheckRoot(ctx, b04 as GateCheck), "/repo", "file_root: repository selects the repository root");
 	const plain: GateCheck = { ...(b04 as GateCheck), file_root: undefined };
 	assert.equal(fileCheckRoot(ctx, plain), "/repo/research", "default file checks select the effective root");
+});
+
+// ---------------------------------------------------------------------------
+// P4a: gate validation-evidence wiring
+// ---------------------------------------------------------------------------
+
+const SOL_FACTS = { role: undefined, provider: "openai-codex", model: "gpt-5.6-sol" };
+const WORKER_FACTS = { role: "worker", provider: "deepseek", model: "deepseek-v4-flash" };
+
+/** Git-init the temp project (the .pi config dir stays ignored). */
+async function gitBacked(dir: string): Promise<void> {
+	await writeFile(join(dir, ".gitignore"), ".pi/\n", "utf8");
+	await spawnExec("git", ["init", "-q"], { cwd: dir });
+	await spawnExec("git", ["config", "user.email", "t@t"], { cwd: dir });
+	await spawnExec("git", ["config", "user.name", "t"], { cwd: dir });
+	await spawnExec("git", ["add", "-A"], { cwd: dir });
+	await spawnExec("git", ["commit", "-qm", "init"], { cwd: dir });
+}
+
+test("P4a: PASS and non-PASS gate runs persist valid bindings with exact Sol owner/outcome/gate target", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(
+				`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Audit, kind: manual, prompt: "audit" }`,
+			),
+		});
+		await gitBacked(dir);
+
+		const pass = await runGates({
+			projectRoot: dir,
+			selector: "g1",
+			mode: "DEV",
+			exec: spawnExec,
+			manualEvidence: { "g1.1": "audit ok" },
+			actorFacts: SOL_FACTS,
+		});
+		assert.equal(pass.ok, true);
+		const passManifest = (await readRunFile(pass.runDir, "manifest.json")) as { validation_evidence: ValidationEvidenceBlock };
+		const passBlock = passManifest.validation_evidence;
+		assert.ok(passBlock?.binding, "a PASS run persists a binding");
+		assert.equal(passBlock.binding.owner, "sol");
+		assert.deepEqual(passBlock.binding.outcome, { successful: true, complete: true, source: "gate" });
+		assert.equal(passBlock.binding.kind, "gate");
+		if (passBlock.binding.target.kind === "gate") {
+			assert.equal(passBlock.binding.target.selector, "g1");
+			assert.deepEqual(passBlock.binding.target.requested_gates, ["g1"]);
+			assert.deepEqual(passBlock.binding.target.effective_gates, ["g1"]);
+		}
+		assert.ok(passBlock.binding.commit, "git HEAD bound");
+		assert.match(passBlock.binding.diff_hash, /^[0-9a-f]{64}$/);
+
+		// Non-PASS: the required manual check is NOT_RUN without evidence.
+		const notPass = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec, actorFacts: SOL_FACTS });
+		assert.equal(notPass.ok, false);
+		const notPassManifest = (await readRunFile(notPass.runDir, "manifest.json")) as { validation_evidence: ValidationEvidenceBlock };
+		assert.ok(notPassManifest.validation_evidence?.binding, "a non-PASS run persists a binding");
+		assert.deepEqual(notPassManifest.validation_evidence.binding.outcome, { successful: false, complete: true, source: "gate" });
+		assert.equal(notPassManifest.validation_evidence.binding.owner, "sol");
+	});
+});
+
+test("P4a: worker and unknown owners are persisted exactly", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, { gatesYaml: gatesYaml(`  - id: g1\n    title: G1\n    checks:\n${CONFIG_CHECK}`) });
+		await gitBacked(dir);
+		const worker = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec, actorFacts: WORKER_FACTS });
+		const workerManifest = (await readRunFile(worker.runDir, "manifest.json")) as { validation_evidence: ValidationEvidenceBlock };
+		const workerBinding = workerManifest.validation_evidence.binding;
+		assert.ok(workerBinding, "worker run persists a binding");
+		assert.equal(workerBinding.owner, "worker");
+
+		const unknown = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
+		const unknownManifest = (await readRunFile(unknown.runDir, "manifest.json")) as { validation_evidence: ValidationEvidenceBlock };
+		const unknownBinding = unknownManifest.validation_evidence.binding;
+		assert.ok(unknownBinding, "fact-less run persists a binding");
+		assert.equal(unknownBinding.owner, "unknown");
+	});
+});
+
+test("P4a: gate validation_evidence carries no manual text, raw worker facts, or prerequisite run ids", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(
+				[
+					`  - id: g1\n    title: G1\n    checks:\n${CONFIG_CHECK}`,
+					`  - id: g2\n    title: G2\n    prerequisites: [g1]\n    checks:\n      - { id: g2.1, title: Audit, kind: manual, prompt: "audit" }\n      - { id: g2.2, title: WF, kind: worker-first, worker_first: strict-policy-active }`,
+				].join("\n"),
+			),
+		});
+		await gitBacked(dir);
+		// Persist g1's PASS so g2's prerequisite source embeds its run id.
+		const first = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
+		assert.equal(first.gates[0]!.status, "PASS");
+		const runId = first.runId;
+
+		const manualText = "super-secret-manual-note-text";
+		const blockedText = "super-secret-blocked-reason";
+		const delegationId = "20260101-120000-zzzz";
+		const result = await runGates({
+			projectRoot: dir,
+			selector: "g2",
+			mode: "DEV",
+			exec: spawnExec,
+			manualEvidence: { "g2.1": manualText },
+			workerFirstFacts: cleanWorkerFirstFacts({
+				blockedReason: blockedText,
+				hasDelegation: true,
+				latestDelegationId: delegationId,
+				reviewStatus: "REVIEWED",
+				currentDiffHash: "a".repeat(64),
+				reviewedDiffHash: "a".repeat(64),
+				reviewVerdict: "PASS",
+				reviewViolationCount: 0,
+				leaseStatus: "active",
+				leaseReason: "user-directed",
+			}),
+			actorFacts: SOL_FACTS,
+		});
+		assert.equal(result.gates[0]!.prerequisite_status["g1"]!.source, `run:${runId}`, "the prerequisite source embeds the run id");
+		const manifest = (await readRunFile(result.runDir, "manifest.json")) as { validation_evidence: ValidationEvidenceBlock };
+		const evidenceJson = JSON.stringify(manifest.validation_evidence);
+		assert.ok(!evidenceJson.includes(manualText), "manual evidence text never persists in the block");
+		assert.ok(!evidenceJson.includes(blockedText), "raw worker-first facts never persist in the block");
+		assert.ok(!evidenceJson.includes(delegationId), "raw delegation ids never persist in the block");
+		assert.ok(!evidenceJson.includes(runId), "prerequisite run ids/sources never persist in the block");
+		assert.ok(!evidenceJson.includes("run:"), "sources never persist in the block");
+	});
+});
+
+test("P4a: collection unavailable leaves the gate status/result unchanged and persists unavailable evidence", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, { gatesYaml: gatesYaml(`  - id: g1\n    title: G1\n    checks:\n${CONFIG_CHECK}`) });
+		const failingGit: ExecFn = async (cmd, args) => {
+			if (cmd === "git" && args[0] === "status") return { stdout: "", stderr: "fatal", code: 128, killed: false };
+			return { stdout: "", stderr: "", code: 0, killed: false };
+		};
+		const result = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: failingGit, actorFacts: SOL_FACTS });
+		assert.equal(result.status, "PASS", "the gate verdict is unchanged by a capture failure");
+		assert.equal(result.ok, true);
+		const manifest = (await readRunFile(result.runDir, "manifest.json")) as { validation_evidence: ValidationEvidenceBlock };
+		assert.equal(manifest.validation_evidence.binding, null);
+		assert.ok(manifest.validation_evidence.unavailable_reason?.includes("capture failed"), manifest.validation_evidence.unavailable_reason ?? "");
+	});
+});
+
+test("P4a: legacy manifests without validation_evidence stay readable (additive optional field)", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, { gatesYaml: gatesYaml(`  - id: g1\n    title: G1\n    checks:\n${CONFIG_CHECK}`) });
+		const result = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
+		// Strip the P4a field → the pre-P4a v1 shape.
+		const manifestPath = join(result.runDir, "manifest.json");
+		const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
+		delete manifest.validation_evidence;
+		await writeFile(manifestPath, JSON.stringify(manifest), "utf8");
+		const read = await readManifest(dir, result.runId);
+		assert.equal(read?.schema_version, 1, "schema v1 is unchanged");
+		assert.equal(read?.run_id, result.runId);
+		assert.equal(read.validation_evidence, undefined, "the field is optional — legacy records parse");
+
+		const fresh = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
+		const freshRead = await readManifest(dir, fresh.runId);
+		assert.ok(freshRead?.validation_evidence, "new runs persist the additive field");
+	});
 });
