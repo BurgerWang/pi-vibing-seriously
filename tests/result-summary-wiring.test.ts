@@ -15,6 +15,11 @@
  *     bounded gate summary (status, failing gate facts BEFORE passing
  *     detail, full persisted record path) — never per-check raw detail,
  *     never raw gate log lines;
+ *   - Phase 3B: workbench_run_gate {preflight:true} and /q-gate --preflight
+ *     are READ-ONLY — exact readiness/provided/missing manual facts, zero
+ *     run/recipe/status effects, never raw notes, never Gate status/run id;
+ *     the formal call afterwards is unchanged (creates the gate run,
+ *     executes the recipe check, returns NOT_RUN for missing evidence);
  *   - failure summaries keep the fixed failure-information precedence
  *     with bounded raw excerpts only AFTER the machine-summary
  *     disclaimer;
@@ -156,7 +161,7 @@ interface RecipeTool {
 interface GateTool {
 	execute: (
 		toolCallId: string,
-		params: { gates: string; manual_evidence?: Record<string, string> },
+		params: { gates: string; manual_evidence?: Record<string, string>; preflight?: boolean },
 		signal: unknown,
 		onUpdate: unknown,
 		ctx: ExtensionContext,
@@ -232,9 +237,56 @@ const GATES_FAIL_YAML = [
 	"",
 ].join("\n");
 
+// ---------------------------------------------------------------- Phase 3B
+
+/** Root marker the preflight fixture's recipe check writes ONLY when executed. */
+const PREFLIGHT_MARKER = "PREFLIGHT-MARKER.txt";
+
+/** Distinctive raw manual-evidence note that must never surface in preflight output. */
+const TOP_SECRET_NOTE = "TOP-SECRET-AUDIT-NOTE-77";
+
+/** Declared read-only (mutation: none) recipe that writes a root marker if executed. */
+const PREFLIGHT_RECIPES = [
+	"recipes:",
+	"  - name: mark",
+	"    mutation: none",
+	'    command: ["node", "-e", "require(\\"fs\\").writeFileSync(\\"PREFLIGHT-MARKER.txt\\", \\"executed\\")"]',
+	"",
+].join("\n");
+
+/**
+ * A gate with two REQUIRED manual checks, one OPTIONAL manual check and one
+ * recipe check (mark). Formal runs end NOT_RUN while g1.2 evidence is
+ * missing; the recipe check still executes and writes the root marker.
+ */
+const PREFLIGHT_GATES = [
+	"gates:",
+	"  - id: g1",
+	"    title: Phase 3B preflight gate",
+	"    checks:",
+	'      - { id: g1.1, title: "Prices audit", kind: manual, required: true, prompt: "audit the prices dataset" }',
+	'      - { id: g1.2, title: "Returns audit", kind: manual, required: true, prompt: "audit the returns dataset" }',
+	'      - { id: g1.3, title: "Optional cross-check", kind: manual, required: false, prompt: "optional sanity cross-check" }',
+	"      - { id: g1.4, title: Marker recipe, kind: recipe, recipe: mark }",
+	"",
+].join("\n");
+
 /** The run records directory of a temp project. */
 function runsDir(root: string): string {
 	return join(root, CONFIG_DIR_NAME, "workbench", "runs");
+}
+
+/**
+ * Non-hidden entries of a temp project's runs dir; a missing runs dir
+ * (zero runs ever created) normalizes to [].
+ */
+async function runsEntries(root: string): Promise<string[]> {
+	try {
+		return (await readdir(runsDir(root))).filter((name) => !name.startsWith("."));
+	} catch (error) {
+		assert.equal((error as { code?: string }).code, "ENOENT", "unexpected runs-dir read failure");
+		return [];
+	}
 }
 
 /** The single run record directory written by the last tool/command call. */
@@ -445,5 +497,135 @@ test("/q-gate renders the same bounded gate failure summary (status/record path;
 		assert.ok(!text.includes("==> gate g1"), "raw gate log never inlined");
 		assert.ok(!text.includes("no file matched"), "per-check detail never inlined");
 		assert.ok(!text.includes("checks passed"), text);
+	});
+});
+
+// --------------------------------------------------------------------------
+// Phase 3B: registered preflight surfaces (read-only, exact facts, zero
+// effects) + unchanged formal semantics afterwards
+// --------------------------------------------------------------------------
+
+test("Phase 3B preflight is read-only and exact: model {preflight:true} and /q-gate --preflight report provided/missing required manual checks with zero callbacks/runs/recipe execution; the formal call afterwards still creates the gate run, executes the recipe and stays NOT_RUN", async () => {
+	await withTempDir(async (root) => {
+		await setupProject(root, PREFLIGHT_RECIPES, PREFLIGHT_GATES);
+		const stub = makeStub();
+		workbenchRuntime(stub);
+		const tool = stub.tools.get("workbench_run_gate") as unknown as GateTool;
+		assert.ok(tool, "workbench_run_gate registered");
+		const ctx = trustedCtx(root);
+		const before = await runsEntries(root);
+		assert.deepEqual(before, [], "no run records before any preflight");
+
+		// ---- model tool: workbench_run_gate { preflight: true } -------------
+		const updates: unknown[] = [];
+		const model = await tool.execute(
+			"call-preflight",
+			{ gates: "g1", manual_evidence: { "g1.1": TOP_SECRET_NOTE }, preflight: true },
+			undefined,
+			(u: unknown) => {
+				updates.push(u);
+			},
+			ctx as never,
+		);
+		const text = toolText(model);
+		// bounded against the ACTUAL registered preflight output: 4096 bytes / 40 lines
+		assertWithinCaps(text, SUCCESS_MAX_BYTES, SUCCESS_MAX_LINES);
+		// exact readiness/missing/provided facts
+		assert.ok(text.includes("preflight g1 ready=no missing=1"), text);
+		assert.ok(text.includes("requested   : g1"), text);
+		assert.ok(text.includes("ready       : no"), text);
+		assert.ok(text.includes("provided    : g1.1"), text);
+		assert.ok(text.includes("missing     : g1.2"), text);
+		assert.ok(text.includes("required manual checks:"), text);
+		assert.ok(text.includes("provided:yes"), text);
+		assert.ok(text.includes("provided:no"), text);
+		// explicit zero facts
+		assert.ok(text.includes("no run created; 0 recipes executed; no gate status assigned"), text);
+		// raw evidence note and formal Gate status/run-id tokens excluded
+		assert.ok(!text.includes(TOP_SECRET_NOTE), "raw manual note never inlined");
+		for (const token of ["PASS", "FAIL", "BLOCKED", "NOT_RUN", "status     :", "run id", "run_id", "run:"]) {
+			assert.ok(!text.includes(token), `preflight text must not contain ${JSON.stringify(token)}`);
+		}
+		// exact structured preflight details — readiness, required checks,
+		// provided/missing ids, literal zero effects, NO formal Gate fields
+		const details = model.details as Record<string, unknown>;
+		assert.equal(details.preflight, true);
+		assert.equal(details.selector, "g1");
+		assert.deepEqual(details.requested, ["g1"]);
+		assert.equal(details.profile, "generic");
+		assert.equal(details.manual_evidence_ready, false);
+		assert.deepEqual(details.provided_manual_evidence, ["g1.1"]);
+		assert.deepEqual(details.missing_manual_evidence, ["g1.2"]);
+		assert.equal(details.gate_run_created, false);
+		assert.equal(details.recipes_executed, 0);
+		assert.equal(details.gate_status_assigned, false);
+		const checks = details.required_manual_checks as Array<{ gate_id: string; check_id: string; prompt: string | undefined; provided: boolean }>;
+		assert.deepEqual(
+			checks.map((c) => c.check_id),
+			["g1.1", "g1.2"],
+			"required manual checks in declaration order; optional/recipe checks excluded",
+		);
+		assert.equal(checks[0]!.gate_id, "g1");
+		assert.equal(checks[0]!.provided, true, "g1.1 satisfied by the supplied note");
+		assert.equal(checks[1]!.provided, false, "g1.2 has no evidence");
+		assert.ok(checks[0]!.prompt?.includes("prices dataset"), "declared prompt present");
+		for (const key of ["ok", "status", "run_id", "gates"]) {
+			assert.equal(Object.hasOwn(details, key), false, `preflight details never carry formal Gate field ${key}`);
+		}
+		// zero streaming updates, zero run records, recipe check never executed
+		assert.equal(updates.length, 0, "preflight never sends a streaming update");
+		assert.deepEqual(await runsEntries(root), before, "model preflight creates no run record");
+		await assert.rejects(readFile(join(root, PREFLIGHT_MARKER), "utf8"), { code: "ENOENT" }, "model preflight never executes the recipe check");
+
+		// ---- slash command: /q-gate g1 --preflight manual:g1.1=... ----------
+		const def = stub.commands.get("q-gate") as { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> };
+		assert.ok(def, "/q-gate registered");
+		await def.handler(`g1 --preflight manual:g1.1=${TOP_SECRET_NOTE}`, ctx as never);
+		const notify = ctx.notifyLines.join("\n");
+		// bounded notification with the same evidence syntax and facts
+		assertWithinCaps(notify, SUCCESS_MAX_BYTES, SUCCESS_MAX_LINES);
+		assert.ok(notify.includes("preflight g1 ready=no missing=1"), notify);
+		assert.ok(notify.includes("provided    : g1.1"), notify);
+		assert.ok(notify.includes("missing     : g1.2"), notify);
+		assert.ok(notify.includes("no run created; 0 recipes executed; no gate status assigned"), notify);
+		assert.ok(!notify.includes(TOP_SECRET_NOTE), "raw manual note never inlined in the notification");
+		for (const token of ["PASS", "FAIL", "BLOCKED", "NOT_RUN", "status     :", "run id", "run_id", "run:"]) {
+			assert.ok(!notify.includes(token), `notification must not contain ${JSON.stringify(token)}`);
+		}
+		assert.deepEqual(await runsEntries(root), before, "slash preflight creates no run record");
+		await assert.rejects(readFile(join(root, PREFLIGHT_MARKER), "utf8"), { code: "ENOENT" }, "slash preflight never executes the recipe check");
+
+		// ---- formal call: same tool, NO preflight, NO manual evidence -------
+		const formalUpdates: unknown[] = [];
+		const formal = await tool.execute(
+			"call-formal",
+			{ gates: "g1" },
+			undefined,
+			(u: unknown) => {
+				formalUpdates.push(u);
+			},
+			ctx as never,
+		);
+		const formalDetails = formal.details as Record<string, unknown>;
+		assert.equal(formalDetails.status, "NOT_RUN", "missing required manual evidence still leaves the gate NOT_RUN");
+		assert.match(String(formalDetails.run_id), RUN_ID_RE);
+		assert.equal(formalDetails.ok, false);
+		assert.equal(Object.hasOwn(formalDetails, "run_id"), true, "the formal path carries the Gate run id");
+		assert.ok(formalUpdates.length >= 1, "the formal path still streams updates");
+		// The formal call created exactly ONE GATE run — the record identified
+		// by details.run_id (manifest recipe "gate"). The only other runs-dir
+		// entry is the recipe-check run the gate engine executed (runRecipe
+		// persists its own record); the root marker proves it really ran.
+		const entries = await runsEntries(root);
+		assert.equal(entries.length, 2, `gate run + recipe-check run, got: ${entries.join(", ")}`);
+		const manifests: Array<{ recipe: string; run_id: string }> = [];
+		for (const entry of entries) {
+			manifests.push(JSON.parse(await readFile(join(runsDir(root), entry, "manifest.json"), "utf8")) as { recipe: string; run_id: string });
+		}
+		const gateManifests = manifests.filter((m) => m.recipe === "gate");
+		assert.equal(gateManifests.length, 1, "exactly one gate run record");
+		assert.equal(gateManifests[0]!.run_id, formalDetails.run_id, "details.run_id identifies the persisted gate run");
+		assert.equal(manifests.filter((m) => m.recipe === "mark").length, 1, "the recipe check ran and persisted its run record");
+		assert.equal(await readFile(join(root, PREFLIGHT_MARKER), "utf8"), "executed", "recipe check actually executed in the formal run");
 	});
 });

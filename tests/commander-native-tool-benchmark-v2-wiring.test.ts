@@ -6,10 +6,16 @@
  *   - package.json: exactly the three intended v2 scripts with the frozen
  *     v2 inputs path, the fixed v2 manifest path and the v2 FINAL
  *     collector entry; every pre-existing script and the version metadata
- *     stay byte-identical;
+ *     stay byte-identical (the later test:release-assets,
+ *     test:runtime-core, test:gate-preflight, test:worker-efficiency and
+ *     test:diff-review-efficiency scripts and the release-assets-test,
+ *     runtime-core-test, typecheck-feedback, gate-preflight-test,
+ *     worker-efficiency-test and diff-review-efficiency-test recipes are
+ *     additive and pinned in tests/execution-efficiency.test.ts);
  *   - recipes.yaml stays schema-valid (no parse errors/warnings) and the
  *     declared recipe set is exactly the pre-existing set plus the three v2
- *     recipes (nothing removed);
+ *     recipes, release-assets-test, runtime-core-test, typecheck-feedback
+ *     and gate-preflight-test (nothing removed);
  *   - commander-native-tool-benchmark-v2-prepare: exact argv through the
  *     package script (`--collection {{collection}}`), exactly one required
  *     string param, DEV+VERIFY, expected exit 0, mutation artifacts, the
@@ -55,11 +61,18 @@ test("package.json: exactly the three intended v2 scripts, frozen v2 inputs and 
 	assert.equal(pkg.scripts?.["commander:nro:v2:benchmark"], V2_BENCHMARK_SCRIPT);
 	assert.equal(pkg.scripts?.["commander:nro:v2:final"], V2_FINAL_SCRIPT);
 
-	// The complete scripts map is exactly the pre-existing 12 scripts plus
-	// the three v2 scripts — nothing changed, nothing added.
+	// The complete scripts map is exactly the pre-existing scripts plus the
+	// three v2 scripts and the additive test:release-assets,
+	// test:runtime-core, test:gate-preflight, test:worker-efficiency and
+	// test:diff-review-efficiency scripts — nothing changed, nothing removed.
 	assert.deepEqual(pkg.scripts, {
 		typecheck: "tsc --noEmit",
 		test: "tsx --test tests/*.test.ts",
+		"test:release-assets": "tsx --test tests/release-assets.test.ts",
+		"test:runtime-core": "tsx --test tests/recipe-schema.test.ts tests/recipe-runner.test.ts tests/p6-c-action-cache.test.ts tests/inspect.test.ts tests/p4-render.test.ts tests/execution-efficiency.test.ts tests/commander-native-tool-benchmark-v2-wiring.test.ts",
+		"test:gate-preflight": "tsx --test tests/gates.test.ts tests/p4-render.test.ts tests/result-summary-wiring.test.ts",
+		"test:worker-efficiency": "tsx --test tests/worker-policy.test.ts tests/worker-runner.test.ts tests/delegation-ledger.test.ts tests/p6-b-stable-prefix.test.ts",
+		"test:diff-review-efficiency": "tsx --test tests/diff-review.test.ts tests/diff-review-wiring.test.ts",
 		check: "npm run typecheck && npm test && git diff --check",
 		"commander:benchmark": "tsx scripts/commander-token-benchmark.ts",
 		"commander:prepare": "tsx scripts/commander-token-p9-prepare.ts",
@@ -89,19 +102,27 @@ async function loadRecipes(): Promise<ReturnType<typeof parseRecipesDocument>> {
 	return parseRecipesDocument(parseYaml(text));
 }
 
-test("recipes.yaml: schema-valid, declared recipe set is exactly the pre-existing set plus the three v2 recipes", async () => {
+test("recipes.yaml: schema-valid, declared recipe set is exactly the pre-existing set plus the three v2 recipes, release-assets-test, runtime-core-test, typecheck-feedback, gate-preflight-test, worker-efficiency-test and diff-review-efficiency-test", async () => {
 	const doc = await loadRecipes();
 	assert.deepEqual(doc.errors, []);
 	assert.deepEqual(doc.warnings, []);
 	// The declared recipe set is exactly the pre-existing set plus the three
-	// v2 recipes — the parser returns recipes sorted by name, so compare
-	// order-independently.
+	// v2 recipes, release-assets-test, runtime-core-test, typecheck-feedback,
+	// gate-preflight-test, worker-efficiency-test and
+	// diff-review-efficiency-test — the parser returns recipes sorted by
+	// name, so compare order-independently.
 	assert.deepEqual(
 		[...doc.recipes.map((r) => r.name)].sort(),
 		[
 			"typecheck",
 			"unit-test",
 			"check",
+			"release-assets-test",
+			"runtime-core-test",
+			"typecheck-feedback",
+			"gate-preflight-test",
+			"worker-efficiency-test",
+			"diff-review-efficiency-test",
 			"commander-token-p9-prepare",
 			"commander-token-p9-benchmark",
 			"commander-native-tool-benchmark-prepare",

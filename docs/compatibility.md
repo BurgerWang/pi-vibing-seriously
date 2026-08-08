@@ -24,9 +24,10 @@ intentionally changes the DEV tool-schema fingerprint exactly **once**:
 - the cache telemetry records that one transition as `UNEXPECTED_DRIFT` —
   **expected, not a defect** (documented stable-prefix behavior; the
   schema is still static and registered in the same explicit order);
-- after reload, same-mode fingerprints are stable again; no further
-  fingerprint change is expected from this repair (Phases 4–6 do not touch
-  the delegate parameter schema).
+- after reload, same-mode fingerprints are stable again; the only further
+  fingerprint change from this repair is the Phase 4A `repair_of` pointer
+  transition documented below (Phases 5–6 do not touch the delegate
+  parameter schema).
 
 Ledger records written by the new code remain readable by old tooling and
 by the new code alike: the before contract's `budget_profile` and the
@@ -34,6 +35,43 @@ canonical `spend` object in `usage.json` / `worker-summary.json` are
 additive fields on the unchanged `schema_version: 1` records; pre-repair
 records without them parse unchanged and are never rewritten (no
 migration).
+
+## Tool-schema fingerprint transition (Phase 4A, worker repair contract — `repair_of` pointer)
+
+`workbench_delegate_worker` gained exactly ONE additive parameter in Phase
+4A of the worker token-budget repair (public schema shape plus strict
+runtime resolution and the finished-ledger guard): the optional `repair_of`
+strict prior delegation-id provenance pointer — exactly 20 characters,
+`^\d{8}-\d{6}-[A-Za-z0-9]{4}$` — used only for known-root-cause repairs
+whose bounded root-cause/failure evidence the parent task itself carries.
+The change is additive and intentionally changes the DEV tool-schema
+fingerprint exactly **once**:
+
+- the pinned delegate parameter-schema hash moved from the historical
+  final Phase 3 value
+  `71707090d2da085b036c5879dd2fcb72558175ead8e596bf55406b65732b0c83` to the
+  machine-derived final Phase 4A value
+  `dc1db21e3590c7f57cfa88f042052964a92d495116966747918d72f2018176a7`
+  (derived by a focused commander no-cache run `20260808-114550-j4gd`,
+  pinned in `tests/p6-b-stable-prefix.test.ts`);
+- every pre-Phase-4A call contract stays valid: ordinary delegations omit
+  `repair_of` entirely (the key never appears in the resolved contract),
+  legacy `schema_version: 1` ledger records without the field parse
+  unchanged, and no migration or rewrite happens — the before contract
+  carries `repair_of` only when the pointer was supplied;
+- the cache telemetry records that one transition as `UNEXPECTED_DRIFT` —
+  **expected, not a defect** (documented stable-prefix behavior; the
+  schema is still static and registered in the same explicit order);
+- after reload, same-mode fingerprints are stable again; Phase 5
+  (task-contract wording / granularity) deliberately leaves the parameter
+  schema byte-for-byte unchanged.
+
+The pointer is provenance only: the runtime verifies the referenced prior
+delegation ledger is finished (manifest status `finished` with a non-null
+`after` record) before any new ledger is created or any worker is
+launched, inspects only those id/status/after facts, and the fresh worker
+inherits no prior report/session/scope/contract — `repair_of` adds no
+path/scope/authority.
 
 ## Commander Token Optimization Slice A (P0 + P1) — additive compatibility
 
@@ -163,6 +201,42 @@ additive and backward compatible:
   `demoteReviewedToPending` transition). PENDING_REVIEW / STALE blocking
   semantics, the hash-binding invariants, delegation/VERIFY blocking and
   B6 Worker-First Compliance are unchanged for every reachable state.
+- **Phase 5 compact/withheld entries: additive record surface,
+  unchanged schema and tool.** Review `schema_version` stays `1`; the
+  `patch[].source` literals `compact` and `withheld` (mirrored in the
+  per-path `patch_paths` stats) and the optional `patch[].compact`
+  structured facts (git_status, size_bytes, digest, digest_kind,
+  digest_max_bytes, digest_matches_after, generator_equality, the
+  head/tail previews and their byte/line/window fields) are additive —
+  legacy schema_version-1 review records without compact facts remain
+  readable and are never migrated, and are rewritten only when a new
+  review segment runs (the rewrite then carries the additive facts).
+  `workbench_review_worker_diff` keeps its name, registration order,
+  DEV-only mode placement and byte-identical parameter schema
+  (`delegation_id` + optional `include_paths`/`max_lines`/`max_bytes`
+  only — no compact or generated parameter), and the review writes stay
+  `review.json` plus the existing `workbench-delegation-state` custom
+  entry.
+- **Compact selection is deterministic and internal; caps unchanged.**
+  Eligibility is decided automatically by the review — a current
+  regular `.svg`/`.json` worker path strictly larger than the 32 KiB
+  default global byte cap — and never depends on the caller's
+  `max_bytes`: a larger caller bound does not disable the compact form.
+  Default/global caps (400 lines / 32 KiB) and caller bounds
+  (max_lines 1–2000, max_bytes 1–512000, max 50 include_paths) are
+  unchanged; ordinary/small/deleted/unreadable/non-regular paths keep
+  the existing git-diff/content/deleted presentation, and generator
+  execution is deliberately absent (`generator_equality` is always
+  `NOT_VERIFIED`, so independent current-state regeneration/byte
+  comparison remains required).
+- **Invariants are not weakened; no savings claim.** Worker-first
+  duties, the full scope check over every worker path, the current
+  complete diff-hash binding, coverage completion, later-change STALE
+  semantics and Gate duties are unchanged; scope-violating paths are
+  withheld fail-closed (fixed bounded marker) yet still fail the
+  verdict, and whole-diff facts still cover the complete actual worker
+  diff. No measured efficiency percentage or benchmark claim is made
+  here.
 - **Worker delegation semantics, budgets/defaults, and the worker
   token-budget repair plan are untouched**; the durable commander plan
   records Slice A PASS, Slice B1 targeted verification, and Slice B2

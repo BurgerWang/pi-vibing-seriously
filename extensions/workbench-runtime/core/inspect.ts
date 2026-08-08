@@ -11,6 +11,7 @@ import { access, readdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import { loadProjectConfig, workbenchDir, type ConfigIssue, type ExecFn } from "./config.ts";
+import type { ValidationComponent } from "./recipe-schema.ts";
 
 export interface DetectedStack {
 	language: string;
@@ -26,7 +27,14 @@ export interface ProjectInspectResult {
 	stacks: DetectedStack[];
 	profile: string | undefined;
 	project_name: string | undefined;
-	recipes: { name: string; description: string; allowed_modes: string[]; command: string[] }[];
+	recipes: {
+		name: string;
+		description: string;
+		allowed_modes: string[];
+		command: string[];
+		/** Phase 2B: the recipe's exact declared validation components (closed set, [] when none declared). */
+		validation_components: ValidationComponent[];
+	}[];
 	config_errors: ConfigIssue[];
 	config_files_present: string[];
 }
@@ -121,6 +129,7 @@ export async function inspectProject(projectRoot: string, options: { trusted: bo
 			description: r.description,
 			allowed_modes: r.allowed_modes,
 			command: r.command,
+			validation_components: r.validation_components,
 		})),
 		config_errors: config.issues,
 		config_files_present: configFilesPresent,

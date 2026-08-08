@@ -590,6 +590,7 @@ import {
 	computeRoleActiveTools,
 	parseWorkerAllowedPaths,
 	resolveWorkerBudgetProfile,
+	resolveWorkerRepairOf,
 	workerRecipeBlockReason,
 	workerRoleToolCallBlockReason,
 	WORKER_ALLOWED_PATHS_ENV,
@@ -646,6 +647,7 @@ import {
 	GateSetupError,
 	latestGateStatus,
 	loadGates,
+	preflightGateManualEvidence,
 	runGates,
 	type GateRunEntry,
 } from "./core/gate-engine.ts";
@@ -685,7 +687,9 @@ import {
 } from "./core/compact.ts";
 import {
 	renderCompareLines,
+	renderGatePreflightLines,
 	type CompareToolDetails,
+	type GatePreflightToolDetails,
 	type GateToolDetails,
 	type InspectToolDetails,
 	type ReadRunToolDetails,
@@ -718,6 +722,7 @@ import {
 	createDelegationLedger,
 	finishDelegationLedger,
 	makeDelegationId,
+	readDelegationLedger,
 	type AfterFacts,
 	type GitFacts,
 	type LedgerWorkerFacts,
@@ -2394,18 +2399,28 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 
 	// ------------------------------------------------------------ /q-gate
 
-	function parseGateArgs(args: string): { selector: string; manualEvidence: Record<string, string> } {
+	function parseGateArgs(args: string): { selector: string; manualEvidence: Record<string, string>; preflight: boolean } {
 		const tokens = args.trim().split(/\s+/).filter((t) => t.length > 0);
-		const selector = tokens[0] ?? "";
+		let selector = "";
+		let preflight = false;
 		const manualEvidence: Record<string, string> = {};
-		for (const token of tokens.slice(1)) {
+		for (const token of tokens) {
+			// Phase 3B: the --preflight flag is a read-only marker, never a
+			// selector and never evidence; it may appear anywhere in the args.
+			if (token === "--preflight") {
+				preflight = true;
+				continue;
+			}
 			const eq = token.indexOf("=");
-			if (eq <= 0) continue;
-			const key = token.slice(0, eq);
-			if (!key.startsWith("manual:")) continue;
-			manualEvidence[key.slice("manual:".length)] = token.slice(eq + 1);
+			if (eq > 0 && token.slice(0, eq).startsWith("manual:")) {
+				manualEvidence[token.slice("manual:".length, eq)] = token.slice(eq + 1);
+				continue;
+			}
+			// The selector is the first non-flag, non-evidence token (existing
+			// calls keep their selector-first semantics).
+			if (!selector) selector = token;
 		}
-		return { selector, manualEvidence };
+		return { selector, manualEvidence, preflight };
 	}
 
 	/**
@@ -2432,11 +2447,11 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	}
 
 	pi.registerCommand("q-gate", {
-		description: "Run gates: /q-gate <gate-id|base|quant|all> [manual:<check-id>=<evidence> ...]",
+		description: "Run gates: /q-gate <gate-id|base|quant|all> [--preflight] [manual:<check-id>=<evidence> ...]",
 		handler: async (args, ctx) => {
-			const { selector, manualEvidence } = parseGateArgs(args);
+			const { selector, manualEvidence, preflight } = parseGateArgs(args);
 			if (!selector) {
-				output(ctx, ["/q-gate: usage: /q-gate <gate-id|base|quant|all> [manual:<check-id>=<evidence> ...]"]);
+				output(ctx, ["/q-gate: usage: /q-gate <gate-id|base|quant|all> [--preflight] [manual:<check-id>=<evidence> ...]"]);
 				return;
 			}
 			// P7: final gate verification in VERIFY mode is blocked while a
@@ -2453,6 +2468,27 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			}
 			const projectRoot = await projectRootFor(ctx);
 			try {
+				// Phase 3B: read-only preflight — same core preflight and
+				// renderer as the model tool; no run, no exec, no recipe, no
+				// status/widget refresh.
+				if (preflight) {
+					const preflightResult = await preflightGateManualEvidence({ projectRoot, selector, manualEvidence });
+					const details: GatePreflightToolDetails = {
+						preflight: true,
+						selector: preflightResult.selector,
+						requested: preflightResult.requested,
+						profile: preflightResult.profile,
+						manual_evidence_ready: preflightResult.manual_evidence_ready,
+						required_manual_checks: preflightResult.required_manual_checks,
+						provided_manual_evidence: preflightResult.provided_required_ids,
+						missing_manual_evidence: preflightResult.missing_required_ids,
+						gate_run_created: false,
+						recipes_executed: 0,
+						gate_status_assigned: false,
+					};
+					output(ctx, renderGatePreflightLines(details, true));
+					return;
+				}
 				// P7 slice 3: every gate run receives the injected worker-first
 				// compliance facts (slash command AND model tool) plus the actor
 				// facts for the shared recipe mutation policy.
@@ -3139,6 +3175,13 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 				`config files : ${result.config_files_present.length > 0 ? result.config_files_present.join(", ") : "(none — run /q-init)"}`,
 				`config errors: ${result.config_errors.length > 0 ? result.config_errors.map((e) => `${e.file}: ${e.message}`).join("; ") : "(none)"}`,
 				`recipes      : ${result.recipes.length > 0 ? result.recipes.map((r) => `${r.name} [${r.allowed_modes.join(",")}]`).join(", ") : "(none)"}`,
+				// Phase 2B: annotate the declared nonempty validation coverage
+				// (recipe name -> exact declared components, in the config's
+				// name-sorted recipe order — never YAML declaration order; the
+				// components within each array keep their declared order).
+				...(result.recipes.some((r) => r.validation_components.length > 0)
+					? [`validation coverage: ${result.recipes.filter((r) => r.validation_components.length > 0).map((r) => `${r.name}=[${r.validation_components.join(", ")}]`).join(", ")}`]
+					: ["validation coverage: (none declared)"]),
 			];
 			const details: InspectToolDetails = {
 				project_root: result.project_root,
@@ -3147,6 +3190,9 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 				stacks: result.stacks.map((s) => `${s.language}${s.package_manager ? ` (${s.package_manager})` : ""}`),
 				profile: result.profile,
 				recipes: result.recipes.map((r) => r.name),
+				// Phase 2B: the FULL deterministic map — every recipe is a key,
+				// explicit empty arrays included.
+				recipe_validation_components: Object.fromEntries(result.recipes.map((r) => [r.name, r.validation_components])),
 				config_errors: result.config_errors.map((e) => `${e.file}: ${e.message}`),
 				config_files_present: result.config_files_present,
 			};
@@ -3235,6 +3281,16 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 					stdout_log: displayRelative(projectRoot, summary.stdout_log),
 					stderr_log: displayRelative(projectRoot, summary.stderr_log),
 					expected_exit_codes: result.record?.expected_exit_codes ?? [0],
+					// Phase 2B: BOTH facts are copied ONLY from the persisted/returned
+					// run record — a missing record leaves them absent (the renderer
+					// shows unavailable) and they are never inferred from the recipe
+					// declaration or cache defaults.
+					...(result.record
+						? {
+							validation_components: result.record.validation_components,
+							cache_request_mode: result.record.cache_request_mode,
+						}
+						: {}),
 					cache: result.cache,
 					phase: "finished",
 				};
@@ -3359,6 +3415,37 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 				};
 			}
 			const projectRoot = await projectRootFor(ctx);
+			// Phase 3B: read-only preflight branch — after trust/project
+			// resolution, BEFORE any start update, worker-first facts, runGates
+			// or widget/compact state refresh. Returns preflight lines/details
+			// ONLY: no run created, no recipe/exec executed, no gate status
+			// assigned, no running update sent.
+			if (params.preflight === true) {
+				try {
+					const preflight = await preflightGateManualEvidence({
+						projectRoot,
+						selector: params.gates,
+						manualEvidence: params.manual_evidence,
+					});
+					const details: GatePreflightToolDetails = {
+						preflight: true,
+						selector: preflight.selector,
+						requested: preflight.requested,
+						profile: preflight.profile,
+						manual_evidence_ready: preflight.manual_evidence_ready,
+						required_manual_checks: preflight.required_manual_checks,
+						provided_manual_evidence: preflight.provided_required_ids,
+						missing_manual_evidence: preflight.missing_required_ids,
+						gate_run_created: false,
+						recipes_executed: 0,
+						gate_status_assigned: false,
+					};
+					const text = renderGatePreflightLines(details, true).join("\n");
+					return { content: [{ type: "text", text }], details };
+				} catch (error) {
+					throw new Error(error instanceof GateSetupError ? error.message : `workbench_run_gate preflight failed: ${(error as Error).message}`);
+				}
+			}
 			onUpdate?.({
 				content: [{ type: "text", text: `Running gates "${params.gates}" (${mode} mode)...` }],
 				details: { phase: "started", gates: params.gates },
@@ -3531,7 +3618,26 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			// this pure contract check is the fail-closed decision).
 			const budgetProfile = resolveWorkerBudgetProfile(params.budget_profile);
 			if (!budgetProfile.ok) throw new Error(`workbench_delegate_worker: ${budgetProfile.error}`);
+			// Phase 4A (worker repair contract): resolve the strict repair-
+			// provenance pointer BEFORE any ledger creation or child launch —
+			// omitted stays undefined (ordinary delegation); anything malformed
+			// FAILS CLOSED with a bounded error exactly like the budget profile.
+			const repairOf = resolveWorkerRepairOf(params.repair_of);
+			if (!repairOf.ok) throw new Error(`workbench_delegate_worker: ${repairOf.error}`);
 			const projectRoot = await projectRootFor(ctx);
+
+			// Phase 4A: a repair pointer must reference a FINISHED prior
+			// delegation ledger (manifest status "finished" and a non-null after
+			// record) — verified BEFORE any new ledger is created or any worker
+			// is launched. Only the id/status/after facts are inspected; no other
+			// prior fields are read and no prose/scope is ever inherited from the
+			// referenced delegation.
+			if (repairOf.repairOf !== undefined) {
+				const prior = await readDelegationLedger(projectRoot, repairOf.repairOf);
+				if (prior === null || prior.manifest.status !== "finished" || prior.after === null) {
+					throw new Error(`workbench_delegate_worker: repair_of ${repairOf.repairOf} does not reference a finished delegation ledger`);
+				}
+			}
 
 			// P7: refresh the delegation state against the REAL git diff (any
 			// change after REVIEWED turns the delegation STALE), then refuse
@@ -3566,6 +3672,9 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 					verification: params.verification ?? [],
 					timeoutSeconds: params.timeout_seconds ?? 1800,
 					budgetProfile: budgetProfile.profile,
+					// Phase 4A: the SAME resolved repair pointer spreads into the
+					// ledger contract conditionally — the omitted path carries no key.
+					...(repairOf.repairOf !== undefined ? { repairOf: repairOf.repairOf } : {}),
 				},
 				before,
 				startedAt,
@@ -3612,6 +3721,9 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 						acceptanceCriteria: params.acceptance_criteria,
 						verification: params.verification ?? [],
 						budgetProfile: budgetProfile.profile,
+						// Phase 4A: the SAME resolved repair pointer spreads into the
+						// worker contract conditionally — the omitted path carries no key.
+						...(repairOf.repairOf !== undefined ? { repairOf: repairOf.repairOf } : {}),
 					},
 					timeoutMs: (params.timeout_seconds ?? 1800) * 1000,
 					signal,

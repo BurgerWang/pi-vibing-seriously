@@ -91,8 +91,9 @@ extensions/workbench-runtime/
     │                        #   check over EVERY worker path, bound hash vs recorded
     │                        #   after hash, drift, bounded redacted patch, displayed-
     │                        #   path coverage facts (same-hash segment merge, hash-
-    │                        #   change reset, legacy patch-entry inference), review.json
-    │                        #   (pure + injected exec)
+    │                        #   change reset, legacy patch-entry inference), Phase 5
+    │                        #   compact .svg/.json entries + withheld markers,
+    │                        #   review.json (pure + injected exec)
     ├── tool-catalog.ts      # P6-B static tool metadata + WORKBENCH_TOOL_NAMES order
     ├── command-guard.ts     # P5 token-based destructive-command detection (11 rules)
     ├── path-policy.ts       # P5 protected credential paths + per-mode read/write rules
@@ -327,6 +328,49 @@ model tool). Its `worker-first` checks only PASS from those facts — missing
 facts are NOT_RUN (a required NOT_RUN never PASSes), a pending/stale review
 BLOCKs B6, negative compliance facts FAIL it, and model prose can never
 satisfy B6.1-B6.8.
+
+### Validation composition (Phase 2)
+
+Validation is composed from declared recipe components, never assumed.
+Each recipe may declare `validation_components` from the closed set
+`typecheck` | `unit-test` | `whitespace` (default `[]`); the persisted run
+manifest records the exact declared components and the caller's
+`cache_request_mode` (`default` | `no-cache` | `refresh-cache`) as machine
+facts. `check` is the single aggregate: uncached, declaring
+`[typecheck, unit-test, whitespace]`. Focused cached recipes (`typecheck`,
+`unit-test`, `release-assets-test`, `runtime-core-test`) are
+development/isolation feedback only — they never substitute for the
+Commander-owned final no-cache `check` run, whose persisted manifest with
+exactly `[typecheck, unit-test, whitespace]` is the only aggregate final
+check evidence. Once that run executes, the final workflow does not
+separately rerun the full component recipes; no old run and no cache hit
+auto-skips execution, formal gates always execute, and manual gate
+evidence remains manual. See
+[cache/recipe-cache-schema.md](cache/recipe-cache-schema.md).
+
+### Gate preflight (Phase 3)
+
+```
+/q-gate <selector> --preflight / workbench_run_gate {preflight: true}
+  → preflightGateManualEvidence(): load project config + effective gate
+    catalog (trusted) → resolve the selector with the SAME fail-closed
+    rules as a formal run (empty/unknown/profile-invalid selectors and
+    prerequisite cycles refuse)
+  → trim the supplied manual_evidence → match required (kind: manual &&
+    required) check ids of the requested gates
+  → return preflight facts ONLY: selector, requested ids, profile,
+    required_manual_checks (gate_id/check_id/prompt/provided),
+    provided/missing required ids, manual_evidence_ready
+  → NO run id, NO recipe/exec, NO gate status, NO persisted record — and
+    NO PASS/FAIL/BLOCKED/NOT_RUN assignment; manual_evidence_ready is the
+    only readiness signal and raw evidence notes are never returned
+```
+
+Preflight is a pure read-only branch taken after trust/project resolution
+and BEFORE any formal gate start update: it reads config/gates.yaml only
+(no run records, no git/exec, no persistence). Formal gate semantics are
+unchanged — `preflight` omitted or `false` runs the gate formally, and
+manual evidence there is still recorded with type `"manual"`.
 
 ### Nested projects (P8)
 
@@ -1182,7 +1226,38 @@ run/cache/gate/delegation artifacts or execution counts.
   project-relative review.json path; details expose review_record +
   coverage facts; no caller/prose acknowledgement API; no
   tool/order/mode/schema change; review writes stay review.json + the
-  existing state entry only
+  existing state entry only. Phase 5 (Execution Efficiency
+  Optimization) adds compact/withheld presentation, still internal to
+  the same service: compact eligibility is automatic — a CURRENT
+  REGULAR `.svg`/`.json` worker path strictly LARGER than the default
+  global review byte cap (COMPACT_MIN_BYTES = DEFAULT_REVIEW_MAX_BYTES
+  = 32 KiB, case-insensitive extension) — with no public opt-in/
+  argument and no generated-marker inference; a compact entry is built
+  only from stat + bounded 8 KiB head/tail window reads (no per-path git
+  diff capture and no additional unbounded/full-file DISPLAY or preview
+  capture — the preserved EXISTING bounded content digest may read the
+  complete file through 4 MiB, with bounded prefix+size beyond), with
+  redacted, UTF-8-safe
+  previews bounded to ≤ 1 KiB / 12 complete lines each (head = bounded
+  PREFIX, tail = bounded SUFFIX, JSON-escaped single lines that can
+  never defeat the global line caps; a window holding no complete line
+  falls back to its bounded partial-line text, and every byte/line/
+  window field describes exactly the SHOWN preview), plus the path's
+  current porcelain status, real size and the EXISTING content digest
+  (full sha256 through 4 MiB; honestly labelled `sha256-prefix+size`
+  beyond — MAX_DIGEST_BYTES semantics unchanged) with recorded-after
+  equality; `generator_equality` is ALWAYS `NOT_VERIFIED` — the review
+  executes/imports no repository generator, so independent
+  current-state regeneration/byte comparison remains required; a
+  scope-violating/realpath-escaping worker path is represented ONLY by
+  the fixed bounded `withheld` marker, decided BEFORE any per-path git
+  diff/open/read/digest/render, while the whole-diff scope check and
+  the current complete diff-hash binding still cover the complete
+  actual worker diff; compact and withheld entries count as actually
+  rendered displayed-path segments (coverage) exactly like other
+  rendered entries, and full scope semantics,
+  include_paths-as-display-filter, coverage completion and later-change
+  STALE semantics are unchanged
 - P7: worker context-budget protection — pure `core/worker-budget.ts`
   (1,000,000-token pinned window, 80% soft handoff / 90% hard stop,
   Pi-compatible context tokens), one-shot hidden soft-budget steer and

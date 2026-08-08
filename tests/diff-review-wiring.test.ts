@@ -22,6 +22,12 @@
  *   - a hash change after REVIEWED resets coverage and turns the delegation
  *     STALE; fresh complete coverage re-binds REVIEWED; a same-hash
  *     complete PASS rerender keeps the valid REVIEWED binding;
+ *   - Phase 5 registered surface: one >32 KiB regular JSON renders as a
+ *     durable compact patch entry (source "compact", additive structured
+ *     facts, generator equality NOT_VERIFIED) when the registered tool is
+ *     called with ONLY the existing {delegation_id} argument — the active
+ *     tool set, registration order and parameter schema stay unchanged and
+ *     the result details patch_paths carries the honest compact stat;
  *   - the delegation state persists as the existing custom entry
  *     (workbench-delegation-state) and the review writes only review.json
  *     plus that entry — no tool/order/schema change (registration order
@@ -39,9 +45,11 @@ import workbenchRuntime from "../extensions/workbench-runtime/index.ts";
 import {
 	collectAfterFacts,
 	collectGitFacts,
+	contentDigest,
 	createDelegationLedger,
 	finishDelegationLedger,
 	makeDelegationId,
+	MAX_DIGEST_BYTES,
 	type LedgerWorkerFacts,
 } from "../extensions/workbench-runtime/core/delegation-ledger.ts";
 import { DELEGATION_STATE_ENTRY_TYPE, serializeDelegationState } from "../extensions/workbench-runtime/core/delegation-state.ts";
@@ -151,6 +159,8 @@ interface ReviewDetails {
 	remaining_paths: string[];
 	coverage_complete: boolean;
 	review_record: string;
+	/** Phase 5: bounded per-path stat of the rendered patch (source/bytes/truncated). */
+	patch_paths: Array<{ path: string; source: string; bytes: number; truncated: boolean }>;
 }
 
 /** The structured details of a registered review tool result. */
@@ -554,5 +564,139 @@ test("registered review tool: a repeated same-hash PASS with incomplete coverage
 		const fullDetails = reviewDetails(full);
 		assert.equal(fullDetails.review_status, "REVIEWED", "fresh complete coverage re-binds REVIEWED after the demotion");
 		assert.equal(fullDetails.coverage_complete, true);
+	});
+});
+
+test("registered review tool: Phase 5 — a single >32 KiB regular JSON renders as a durable compact entry (one-call PASS → REVIEWED, honest patch_paths stat, no schema/order/parameter change)", async () => {
+	await withTempDir(async (root) => {
+		// One regular JSON LARGER than the default global review byte cap
+		// (COMPACT_MIN_BYTES = 32 KiB), multi-line with distinct head/tail
+		// markers so both bounded preview windows hold complete lines.
+		const bigJson = [
+			"{",
+			'  "kind": "generated-manifest",',
+			'  "head_marker": "MANIFEST_HEAD_9d41c2f7",',
+			'  "pad": "' + "p".repeat(40_000) + '",',
+			'  "tail_marker": "MANIFEST_TAIL_8b2f9d51"',
+			"}",
+		].join("\n") + "\n";
+		const jsonBytes = Buffer.byteLength(bigJson, "utf8");
+		assert.ok(jsonBytes > 32 * 1024, "the JSON must exceed the compact threshold");
+		const { id, afterHash } = await setupDelegation(root, async (d) => {
+			await writeFile(join(d, "src", "manifest.json"), bigJson, "utf8");
+		});
+		const stub = makeStub();
+		workbenchRuntime(stub);
+		// Registration surface is the exact fixed surface — Phase 5 adds no
+		// tool, and the review schema still declares exactly the existing
+		// four parameters (no compact/generated parameter).
+		assert.deepEqual([...stub.tools.keys()], [...NATIVE_OVERRIDE_NAMES, ...WORKBENCH_TOOL_NAMES], "registration order == NATIVE_OVERRIDE_NAMES + WORKBENCH_TOOL_NAMES");
+		const registeredParameters = (stub.tools.get("workbench_review_worker_diff") as { parameters: { properties: Record<string, unknown> } }).parameters;
+		assert.deepEqual(registeredParameters, WORKBENCH_TOOL_PARAMETERS.workbench_review_worker_diff, "review parameter schema byte-identical to the catalog");
+		assert.deepEqual(
+			Object.keys(registeredParameters.properties),
+			["delegation_id", "include_paths", "max_lines", "max_bytes"],
+			"the review schema declares exactly the existing four parameters — no compact/generated parameter was added",
+		);
+		assert.ok(!("compact" in registeredParameters) && !("generator" in registeredParameters), "no compact/generated key anywhere in the schema object");
+		await fireSessionStart(stub, root, pendingStateEntry(id, afterHash));
+		const activeToolsBefore = [...stub.activeTools];
+		const review = reviewTool(stub);
+
+		// Execute the EXISTING tool with only the existing {delegation_id}
+		// argument — no new argument, no include_paths needed for one path.
+		const r1 = await review.execute("call-1", { delegation_id: id }, undefined, undefined, trustedCtx(root) as never);
+		const d1 = reviewDetails(r1);
+		assert.equal(d1.ok, true);
+		assert.equal(d1.verdict, "PASS");
+		assert.equal(d1.review_status, "REVIEWED");
+		assert.equal(d1.coverage_complete, true, "the single compact entry is complete displayed-path coverage");
+		assert.deepEqual(d1.displayed_paths, ["src/manifest.json"]);
+		assert.deepEqual(d1.remaining_paths, []);
+		assert.equal(d1.bound_diff_hash, afterHash);
+		assert.equal(d1.recorded_after_hash, afterHash);
+		assert.equal(d1.review_record, `${CONFIG_DIR_NAME}/workbench/delegations/${id}/review.json`);
+		assert.ok(toolText(r1).includes("coverage   : COMPLETE"), toolText(r1));
+		assert.ok(toolText(r1).includes("--- src/manifest.json (compact, truncated) ---"), toolText(r1));
+
+		// Durable review record: schema_version stays 1, the patch entry is
+		// the compact source with honest truncation, and the additive
+		// compact facts carry the expected status/size/digest facts, a
+		// recorded-after digest match and generator equality NOT_VERIFIED.
+		const onDisk = JSON.parse(await readFile(join(root, d1.review_record), "utf8")) as {
+			schema_version: number;
+			delegation_id: string;
+			verdict: string;
+			bound_diff_hash: string;
+			recorded_after_hash: string;
+			patch_truncated: boolean;
+			patch: Array<{ path: string; source: string; truncated: boolean; text: string; compact?: Record<string, unknown> }>;
+		};
+		assert.equal(onDisk.schema_version, 1);
+		assert.equal(onDisk.delegation_id, id);
+		assert.equal(onDisk.verdict, "PASS");
+		assert.equal(onDisk.bound_diff_hash, afterHash);
+		assert.equal(onDisk.recorded_after_hash, afterHash);
+		assert.equal(onDisk.patch.length, 1);
+		const entry = onDisk.patch[0]!;
+		assert.equal(entry.path, "src/manifest.json");
+		assert.equal(entry.source, "compact", "the >32 KiB regular JSON takes the compact source");
+		assert.equal(entry.truncated, true, "the compact entry honestly reports its bounded presentation as truncated");
+		assert.equal(onDisk.patch_truncated, true, "the per-path compact truncation sets patch_truncated");
+		const facts = entry.compact as {
+			git_status: string;
+			size_bytes: number;
+			digest: string;
+			digest_kind: string;
+			digest_max_bytes: number;
+			digest_matches_after: boolean;
+			generator_equality: string;
+			head_preview: string;
+			tail_preview: string;
+			head_lines: number;
+			tail_lines: number;
+			content_truncated: boolean;
+		};
+		assert.ok(facts, "the additive compact facts are persisted on the patch entry");
+		assert.equal(facts.git_status, "??", "the new untracked JSON reports its real porcelain status");
+		assert.equal(facts.size_bytes, jsonBytes);
+		const freshDigest = await contentDigest(root, "src/manifest.json");
+		assert.ok(freshDigest, "manifest.json is a current readable regular file");
+		assert.equal(facts.digest, freshDigest, "the compact digest is the fresh current content digest");
+		assert.match(facts.digest, /^[0-9a-f]{64}$/, "full sha256 digest form (file ≤ MAX_DIGEST_BYTES)");
+		assert.equal(facts.digest_kind, "sha256");
+		assert.equal(facts.digest_max_bytes, MAX_DIGEST_BYTES);
+		assert.equal(facts.digest_matches_after, true, "the current digest equals the worker's recorded-after digest");
+		assert.equal(facts.generator_equality, "NOT_VERIFIED", "generator equality is never verified by the review");
+		for (const preview of [facts.head_preview, facts.tail_preview]) {
+			const decoded = JSON.parse(preview) as string;
+			assert.ok(decoded.length > 0, "the preview is never empty for a non-empty window");
+		}
+		assert.ok(facts.head_lines > 0 && facts.tail_lines > 0, "the multi-line JSON bounded windows hold complete lines");
+		assert.equal(facts.content_truncated, true, "content beyond the shown previews is honestly reported");
+		assert.ok(entry.text.includes("generator equality NOT_VERIFIED"), entry.text);
+
+		// The result details patch_paths stat shows the same path with the
+		// compact source and honest truncation; its bytes match the durable
+		// rendered entry text.
+		assert.deepEqual(d1.patch_paths, [
+			{ path: "src/manifest.json", source: "compact", bytes: Buffer.byteLength(entry.text, "utf8"), truncated: true },
+		]);
+
+		// Review writes/state behavior unchanged: the persisted delegation
+		// state binds REVIEWED to the current hash, and registration order,
+		// the parameter object and the active tool set are untouched.
+		const state = lastDelegationStateEntry(stub);
+		assert.equal(state.latestId, id);
+		assert.equal(state.status, "REVIEWED");
+		assert.equal(state.reviewedDiffHash, afterHash);
+		assert.equal(state.currentDiffHash, afterHash);
+		assert.deepEqual([...stub.tools.keys()], [...NATIVE_OVERRIDE_NAMES, ...WORKBENCH_TOOL_NAMES], "registration order unchanged after execution");
+		assert.deepEqual(
+			(stub.tools.get("workbench_review_worker_diff") as { parameters: unknown }).parameters,
+			WORKBENCH_TOOL_PARAMETERS.workbench_review_worker_diff,
+			"parameter object unchanged after execution",
+		);
+		assert.deepEqual(stub.activeTools, activeToolsBefore, "review calls never change the active tool set");
 	});
 });

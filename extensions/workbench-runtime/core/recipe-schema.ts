@@ -38,6 +38,25 @@ export const RECIPE_MUTATIONS: readonly string[] = ["none", "artifacts", "source
 export type OutputStrategy = "head" | "tail";
 export type RecipeParamType = "string" | "number" | "boolean";
 
+/**
+ * Phase 2A: closed set of validation components a recipe may declare. The
+ * recipe schema accepts EXACTLY these values — anything else (unknown tool
+ * names, typos) is a parse error, never silently dropped.
+ */
+export const VALIDATION_COMPONENTS = ["typecheck", "unit-test", "whitespace"] as const;
+
+/** Literal union of the declared validation components — never `string`. */
+export type ValidationComponent = (typeof VALIDATION_COMPONENTS)[number];
+
+/**
+ * Narrow type guard: checks an arbitrary parsed string against the closed
+ * tuple and narrows it to the literal union. Runtime behavior is identical
+ * to `VALIDATION_COMPONENTS.includes(value)`.
+ */
+export function isValidationComponent(value: string): value is ValidationComponent {
+	return (VALIDATION_COMPONENTS as readonly string[]).includes(value);
+}
+
 export interface RecipeParam {
 	name: string;
 	type: RecipeParamType;
@@ -67,6 +86,12 @@ export interface Recipe {
 	artifacts: string[];
 	/** Env var names the process may inherit. Nothing else is passed. */
 	environment: string[];
+	/**
+	 * Phase 2A: declared validation components (closed set: typecheck,
+	 * unit-test, whitespace). Default [] — a recipe declares the validation
+	 * tooling it performs explicitly or declares none.
+	 */
+	validation_components: ValidationComponent[];
 	/**
 	 * P6-C action-cache policy (opt-in, default disabled). A cache
 	 * declaration that violates the safety rules disables caching for this
@@ -99,6 +124,7 @@ export const DEFAULT_RECIPE: Omit<Recipe, "name" | "command"> = {
 	mutation: "none",
 	artifacts: [],
 	environment: [],
+	validation_components: [],
 	output_strategy: "tail",
 	max_lines: DEFAULT_MAX_LINES,
 	max_bytes: DEFAULT_MAX_BYTES,
@@ -268,6 +294,34 @@ export function parseRecipe(raw: unknown, index: number): RecipeParseResult {
 	const writes = asStringArray(raw.writes, `recipe "${recipe}": "writes"`, errors);
 	const artifacts = asStringArray(raw.artifacts, `recipe "${recipe}": "artifacts"`, errors);
 
+	// Phase 2A: closed validation-components set (typecheck | unit-test |
+	// whitespace). Default []; a non-array, a non-string entry, an unknown
+	// value or a duplicate is a parse error — the recipe is rejected, the
+	// field is never silently normalized.
+	const validationComponentsRaw = raw.validation_components ?? [];
+	const validation_components: ValidationComponent[] = [];
+	if (!Array.isArray(validationComponentsRaw)) {
+		errors.push(`recipe "${recipe}": "validation_components" must be an array of strings`);
+	} else {
+		const seen = new Set<string>();
+		for (const component of validationComponentsRaw) {
+			if (typeof component !== "string") {
+				errors.push(`recipe "${recipe}": "validation_components" entries must be strings`);
+				continue;
+			}
+			if (!isValidationComponent(component)) {
+				errors.push(`recipe "${recipe}": invalid validation_components entry ${JSON.stringify(component)} (expected ${VALIDATION_COMPONENTS.join(", ")})`);
+				continue;
+			}
+			if (seen.has(component)) {
+				errors.push(`recipe "${recipe}": duplicate validation_components entry "${component}"`);
+				continue;
+			}
+			seen.add(component);
+			validation_components.push(component);
+		}
+	}
+
 	// P7: strict mutation validation with legacy inference. Explicit values
 	// must be exactly none|artifacts|source; a missing declaration infers
 	// none for writes=[] and source for non-empty writes. Every parsed
@@ -305,6 +359,7 @@ export function parseRecipe(raw: unknown, index: number): RecipeParseResult {
 				writes,
 				artifacts,
 				environment,
+				validation_components,
 				output_strategy: outputStrategyRaw as OutputStrategy,
 				max_lines: maxLines,
 				max_bytes: maxBytes,

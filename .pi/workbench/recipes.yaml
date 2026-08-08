@@ -19,6 +19,7 @@
 recipes:
   - name: typecheck
     description: TypeScript typecheck (tsc --noEmit) — cached (result-only)
+    validation_components: [typecheck]
     command: [npm, run, typecheck]
     cwd: .
     timeout_ms: 300000
@@ -36,19 +37,179 @@ recipes:
       version: 1
       mode: result-only
       successOnly: true
+      # EXACTLY the five content patterns that can change tsc's outcome:
+      # package/lock/tsconfig plus extension and test TypeScript. Unrelated
+      # repo content (docs, assets, skills, prompts, templates, tools,
+      # compatibility) is deliberately OUT of the action key — a docs-only
+      # or asset-only change never invalidates the cached typecheck result.
       inputs:
         - package.json
         - package-lock.json
         - tsconfig.json
         - extensions/**/*.ts
         - tests/**/*.ts
-        - prompts/**/*.md
-        - skills/**/SKILL.md
-        - templates/**
-        - assets/**
-        - tools/**
-        - compatibility/**
-        - docs/**/*.md
+      outputs: []
+      environment: []
+      toolchain: [node, npm]
+      maxAgeSeconds: null
+
+  # Development-only self-hosting feedback for the old in-memory recipe
+  # parser: directly runs `npm run typecheck`, intentionally UNCACHED, and
+  # declares NO validation_components field (old parser compatibility — the
+  # new parser defaults []; a focused feedback recipe never claims a
+  # component). DEVELOPMENT-ONLY feedback: never final check/Gate evidence.
+  - name: typecheck-feedback
+    description: TypeScript typecheck feedback (npm run typecheck) — dev-only, uncached, no validation component
+    command: [npm, run, typecheck]
+    cwd: .
+    timeout_ms: 300000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: []
+    mutation: none
+    artifacts: []
+    environment: []
+    output_strategy: tail
+    max_lines: 200
+    max_bytes: 20480
+
+  # Development-only self-hosting feedback for the new schema/runtime:
+  # runs the three Phase 3 test files (gates, p4 render, result-summary
+  # wiring) via the package script, cached result-only success-only with
+  # EXACTLY the conservative closure (config + gates + extensions + the
+  # shared helper + the three test files). Declares NO validation
+  # component — a focused feedback recipe never claims a component.
+  # DEVELOPMENT-ONLY feedback: never final check/Gate evidence.
+  - name: gate-preflight-test
+    description: Phase 3 gate preflight test suite (gates, p4-render, result-summary wiring) — dev-only cached feedback, no validation component
+    command: [npm, run, test:gate-preflight]
+    cwd: .
+    timeout_ms: 600000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: []
+    mutation: none
+    artifacts: []
+    environment: []
+    output_strategy: tail
+    max_lines: 300
+    max_bytes: 30720
+    cache:
+      enabled: true
+      version: 1
+      mode: result-only
+      successOnly: true
+      # EXACTLY the gate-preflight closure: shared config (package/lock/
+      # tsconfig), the recipe and gate definitions the tests parse, all
+      # extension TypeScript, the shared test helper, and the three Phase 3
+      # test files themselves.
+      inputs:
+        - package.json
+        - package-lock.json
+        - tsconfig.json
+        - .pi/workbench/recipes.yaml
+        - .pi/workbench/gates.yaml
+        - extensions/**/*.ts
+        - tests/helpers.ts
+        - tests/gates.test.ts
+        - tests/p4-render.test.ts
+        - tests/result-summary-wiring.test.ts
+      outputs: []
+      environment: []
+      toolchain: [node, npm]
+      maxAgeSeconds: null
+
+  # Worker-efficiency focused test suite (worker policy, worker runner,
+  # delegation ledger, P6-B stable-prefix) — focused, cached feedback via
+  # tests/worker-policy.test.ts, tests/worker-runner.test.ts,
+  # tests/delegation-ledger.test.ts and tests/p6-b-stable-prefix.test.ts.
+  # Focused cached recipes are DEVELOPMENT-ONLY feedback — never a
+  # substitute for the Commander-owned final no-cache `check` run and the
+  # formal gates. Declares NO validation_components field (old-parser
+  # compatibility — the new parser defaults []): a focused feedback recipe
+  # never claims a component.
+  - name: worker-efficiency-test
+    description: Worker-efficiency focused test suite (tsx --test tests/worker-policy.test.ts tests/worker-runner.test.ts tests/delegation-ledger.test.ts tests/p6-b-stable-prefix.test.ts) — cached (result-only), dev-only feedback, no validation component
+    command: [npm, run, test:worker-efficiency]
+    cwd: .
+    timeout_ms: 600000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: []
+    mutation: none
+    artifacts: []
+    environment: []
+    output_strategy: tail
+    max_lines: 300
+    max_bytes: 30720
+    cache:
+      enabled: true
+      version: 1
+      mode: result-only
+      successOnly: true
+      # EXACTLY the worker-efficiency closure, in package-script order: the
+      # shared config (package/lock/tsconfig), the recipe definitions the
+      # tests parse, all extension TypeScript, the shared test helper, the
+      # four focused test files themselves, and the worker-delegation doc
+      # the tests pin against.
+      inputs:
+        - package.json
+        - package-lock.json
+        - tsconfig.json
+        - .pi/workbench/recipes.yaml
+        - extensions/**/*.ts
+        - tests/helpers.ts
+        - tests/worker-policy.test.ts
+        - tests/worker-runner.test.ts
+        - tests/delegation-ledger.test.ts
+        - tests/p6-b-stable-prefix.test.ts
+        - docs/worker-delegation.md
+      outputs: []
+      environment: []
+      toolchain: [node, npm]
+      maxAgeSeconds: null
+
+  # Diff-review-efficiency focused test suite (P7 worker-diff review core +
+  # Slice B2 registered wiring) — focused, cached feedback via
+  # tests/diff-review.test.ts and tests/diff-review-wiring.test.ts. Focused
+  # cached recipes are DEVELOPMENT-ONLY feedback — never a substitute for
+  # the Commander-owned final no-cache `check` run and the formal gates.
+  # Declares NO validation_components field (old-parser compatibility —
+  # the new parser defaults []): a focused feedback recipe never claims a
+  # component.
+  - name: diff-review-efficiency-test
+    description: Diff-review focused test suite (tsx --test tests/diff-review.test.ts tests/diff-review-wiring.test.ts) — cached (result-only), dev-only feedback, no validation component
+    command: [npm, run, test:diff-review-efficiency]
+    cwd: .
+    timeout_ms: 600000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: []
+    mutation: none
+    artifacts: []
+    environment: []
+    output_strategy: tail
+    max_lines: 300
+    max_bytes: 30720
+    cache:
+      enabled: true
+      version: 1
+      mode: result-only
+      successOnly: true
+      # EXACTLY the diff-review-efficiency closure, in package-script
+      # order: the shared config (package/lock/tsconfig), the recipe
+      # definitions, all extension TypeScript, the shared test helper,
+      # and the two focused test files themselves. DEVELOPMENT-ONLY
+      # feedback: never final check/Gate evidence.
+      inputs:
+        - package.json
+        - package-lock.json
+        - tsconfig.json
+        - .pi/workbench/recipes.yaml
+        - extensions/**/*.ts
+        - tests/helpers.ts
+        - tests/diff-review.test.ts
+        - tests/diff-review-wiring.test.ts
       outputs: []
       environment: []
       toolchain: [node, npm]
@@ -56,6 +217,7 @@ recipes:
 
   - name: unit-test
     description: Unit test suite (tsx --test tests/*.test.ts) — cached (result-only)
+    validation_components: [unit-test]
     command: [npm, test]
     cwd: .
     timeout_ms: 600000
@@ -98,9 +260,13 @@ recipes:
   # `check` runs typecheck + unit tests + `git diff --check` in one chain.
   # Its outcome depends on git working-tree state, which is deliberately NOT
   # part of any action key — so it stays UNCACHED in this version. Run the
-  # cached typecheck/unit-test recipes for the fast path.
+  # cached typecheck/unit-test/release-assets-test recipes for the fast
+  # path. Cached focused recipes are DEVELOPMENT-ONLY feedback: they never
+  # substitute for the single Commander-owned final no-cache `check` run
+  # and the formal gates (a cached hit never skips recipe/gate execution).
   - name: check
     description: Full check (typecheck + unit tests + whitespace) — intentionally not cached
+    validation_components: [typecheck, unit-test, whitespace]
     command: [npm, run, check]
     cwd: .
     timeout_ms: 900000
@@ -113,6 +279,100 @@ recipes:
     output_strategy: tail
     max_lines: 300
     max_bytes: 30720
+
+  # Release-asset integrity (focused, cached feedback): LICENSE/README/
+  # banner/generator/cache-types consistency via
+  # tests/release-assets.test.ts. Focused cached recipes are DEVELOPMENT-ONLY
+  # feedback — never a substitute for the Commander-owned final no-cache
+  # `check` run and the formal gates.
+  - name: release-assets-test
+    description: Release-asset integrity test (tsx --test tests/release-assets.test.ts) — cached (result-only)
+    command: [npm, run, test:release-assets]
+    cwd: .
+    timeout_ms: 300000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: []
+    mutation: none
+    artifacts: []
+    environment: []
+    output_strategy: tail
+    max_lines: 200
+    max_bytes: 20480
+    cache:
+      enabled: true
+      version: 1
+      mode: result-only
+      successOnly: true
+      # Exactly the release-asset closure: package/lock/tsconfig, the test
+      # file itself, LICENSE, README.md, the banner, its generator and the
+      # EXTENSION_VERSION source the test pins against package.json.
+      inputs:
+        - package.json
+        - package-lock.json
+        - tsconfig.json
+        - tests/release-assets.test.ts
+        - LICENSE
+        - README.md
+        - assets/banner.svg
+        - tools/make-banner.mjs
+        - extensions/workbench-runtime/cache/cache-types.ts
+      outputs: []
+      environment: []
+      toolchain: [node, npm]
+      maxAgeSeconds: null
+
+  # Runtime-core focused test suite (recipe schema, runner, action cache,
+  # inspect, p4 render, execution efficiency, NRO v2 wiring) — focused,
+  # cached feedback via tests/recipe-schema.test.ts, recipe-runner.test.ts,
+  # p6-c-action-cache.test.ts, inspect.test.ts, p4-render.test.ts,
+  # execution-efficiency.test.ts and
+  # commander-native-tool-benchmark-v2-wiring.test.ts. Focused cached
+  # recipes are DEVELOPMENT-ONLY feedback — never a substitute for the
+  # Commander-owned final no-cache `check` run and the formal gates. It
+  # declares NO validation component: it is a focused suite, not the full
+  # unit-test component.
+  - name: runtime-core-test
+    description: Runtime-core focused test suite (tsx --test tests/recipe-schema.test.ts tests/recipe-runner.test.ts tests/p6-c-action-cache.test.ts tests/inspect.test.ts tests/p4-render.test.ts tests/execution-efficiency.test.ts tests/commander-native-tool-benchmark-v2-wiring.test.ts) — cached (result-only)
+    command: [npm, run, test:runtime-core]
+    cwd: .
+    timeout_ms: 600000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: []
+    mutation: none
+    artifacts: []
+    environment: []
+    output_strategy: tail
+    max_lines: 300
+    max_bytes: 30720
+    cache:
+      enabled: true
+      version: 1
+      mode: result-only
+      successOnly: true
+      # EXACTLY the runtime-core closure, in package-script order: the
+      # shared config (package/lock/tsconfig), the recipe definitions the
+      # tests parse, all extension TypeScript, the shared test helper, and
+      # the seven focused test files themselves.
+      inputs:
+        - package.json
+        - package-lock.json
+        - tsconfig.json
+        - .pi/workbench/recipes.yaml
+        - extensions/**/*.ts
+        - tests/helpers.ts
+        - tests/recipe-schema.test.ts
+        - tests/recipe-runner.test.ts
+        - tests/p6-c-action-cache.test.ts
+        - tests/inspect.test.ts
+        - tests/p4-render.test.ts
+        - tests/execution-efficiency.test.ts
+        - tests/commander-native-tool-benchmark-v2-wiring.test.ts
+      outputs: []
+      environment: []
+      toolchain: [node, npm]
+      maxAgeSeconds: null
 
   # P9 evidence preparation (commander-token-optimization plan, Slice E P9
   # prep) — offline, machine facts only. Takes exactly the eleven immutable

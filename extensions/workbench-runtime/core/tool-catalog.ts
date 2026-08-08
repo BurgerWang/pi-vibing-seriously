@@ -95,6 +95,17 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 				description: "Manual evidence notes keyed by check id — recorded as manual evidence, never as machine verification",
 			}),
 		),
+		// Phase 3B: explicit read-only preflight opt-in on the EXISTING tool.
+		// true runs ONLY preflightGateManualEvidence (same selector/evidence
+		// resolution semantics, zero writes) and returns the preflight
+		// details — never a formal run, never a Gate status/run id. Omitted
+		// or false keeps the formal gate run exactly as before.
+		preflight: Type.Optional(
+			Type.Boolean({
+				description:
+					"Read-only preflight: resolve the selector and report exactly which required manual checks the supplied manual_evidence satisfies (provided/missing ids, readiness) with NO gate run, NO recipe execution, NO gate status assignment and NO run id. Omitted or false runs the gate formally.",
+			}),
+		),
 	}),
 	workbench_read_gate: Type.Object({
 		run_id: Type.Optional(Type.String({ description: "Run id of a gate run (e.g. 20260101-120000-abcd)" })),
@@ -176,6 +187,22 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 				default: "standard",
 			}),
 		),
+		// Phase 4A (public schema shape only): optional strict prior
+		// delegation-id provenance for a known-root-cause repair. Pure
+		// pointer — adds no path/scope/authority and never resumes the old
+		// delegation or imports its report; the parent task must carry the
+		// bounded root cause/failure evidence itself. The canonical hash is
+		// deliberately NOT re-pinned in this phase: a focused machine run
+		// derives the new value for a subsequent fresh repair.
+		repair_of: Type.Optional(
+			Type.String({
+				minLength: 20,
+				maxLength: 20,
+				pattern: "^\\d{8}-\\d{6}-[A-Za-z0-9]{4}$",
+				description:
+					"strict prior delegation-id provenance for a known-root-cause repair; parent task must include bounded root cause/failure evidence; pointer adds no path/scope/authority and never resumes/imports old report",
+			}),
+		),
 	}),
 } as const;
 
@@ -220,11 +247,12 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 		name: "workbench_run_gate",
 		label: "Workbench run gate",
 		description:
-			"Run a gate selector (gate id, comma-separated ids, or base|quant|all) from the validation ladder. Only declared recipes run; the gate engine never trusts model prose — manual evidence supplied here is recorded with type \"manual\" and can never masquerade as machine verification.",
-		promptSnippet: "Run validation gates (base/quant ladder) for the project",
+			"Run a gate selector (gate id, comma-separated ids, or base|quant|all) from the validation ladder. Only declared recipes run; the gate engine never trusts model prose — manual evidence supplied here is recorded with type \"manual\" and can never masquerade as machine verification. With preflight:true the SAME tool becomes READ-ONLY — it resolves the selector and reports exactly which required manual checks the supplied manual_evidence satisfies (provided/missing ids, readiness) and creates NO gate run, executes NO recipe, assigns NO gate status and returns NO run id; manual evidence stays manual in both modes.",
+		promptSnippet: "Run validation gates (base/quant ladder) for the project; preflight:true checks required manual evidence readiness read-only",
 		promptGuidelines: [
 			"Use workbench_list_gates or /q-gates to see the gates available for the current profile.",
 			"Manual evidence for manual checks must be passed as manual_evidence keyed by check id; it is recorded as type \"manual\" only.",
+			"Phase 3B: pass preflight:true (or /q-gate <selector> --preflight) to check required manual-evidence readiness READ-ONLY before a formal run — it never creates a run, executes a recipe, assigns a gate status or returns a run id; omit it (or false) to run the gate formally.",
 		],
 	},
 	workbench_read_gate: {
@@ -262,13 +290,14 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 		name: "workbench_delegate_worker",
 		label: "Workbench delegate worker",
 		description:
-			"Delegate one bounded implementation task to an isolated deepseek/deepseek-v4-flash:max Pi worker. Available only in DEV and only when the parent is GPT-5.6 Sol. DEV default: coherent source+tests+docs vertical slices for bounded low/medium-risk implementation, each sized with ample headroom BELOW its spend soft thresholds (soft is a handoff reserve, hard is failure — neither is a planning target), delegated after minimum repository orientation with explicit allowed paths and observable acceptance criteria. Spend profiles: standard is the deterministic default; low is an explicit tighter opt-in; extended is explicit Sol-approved only and is never inferred or auto-promoted. Unknown-root-cause work must be split into bounded diagnosis, a Sol architecture/scope decision, then bounded implementation — never one open-ended worker task. The worker owns routine local implementation decisions inside the approved contract; Sol owns requirements, cross-cutting architecture, scope, actual-diff review, final verification/gates, and the verdict. The worker cannot use free-form bash, recursively delegate, run final gates, run recipes that declare writes, or edit/write outside allowed_paths. Worker prose is never acceptance evidence — Sol independently inspects the actual diff and performs final verification. The tool result is a STRICTLY bounded summary (max 120 lines / 12 KiB): the complete final worker report is persisted as worker-report.md plus worker-summary.json/usage.json in the delegation directory and is never embedded inline.",
+			"Delegate one bounded implementation task to an isolated deepseek/deepseek-v4-flash:max Pi worker. Available only in DEV and only when the parent is GPT-5.6 Sol. DEV default: coherent source+tests+docs vertical slices for bounded low/medium-risk implementation, each sized with ample headroom BELOW its spend soft thresholds (soft is a handoff reserve, hard is failure — neither is a planning target), delegated after minimum repository orientation with explicit allowed paths and observable acceptance criteria. Spend profiles: standard is the deterministic default; low is an explicit tighter opt-in; extended is explicit Sol-approved only and is never inferred or auto-promoted. Unknown-root-cause work must be split into bounded diagnosis, a Sol architecture/scope decision, then bounded implementation — never one open-ended worker task. Optional repair_of is a strict prior delegation-id provenance pointer for repairs of a KNOWN root cause: use it only after Sol has fixed the root cause and decided the scope, the task itself carries the bounded failure evidence, and the runtime verifies the referenced prior delegation ledger is finished before any new ledger is created or any worker is launched. It adds no path/scope/authority, never resumes the prior worker, and the fresh worker inherits no prior report, session, scope, or contract — an unknown root cause still requires bounded diagnosis, then a Sol decision. The worker owns routine local implementation decisions inside the approved contract; Sol owns requirements, cross-cutting architecture, scope, actual-diff review, final verification/gates, and the verdict. The worker cannot use free-form bash, recursively delegate, run final gates, run recipes that declare writes, or edit/write outside allowed_paths. Worker prose is never acceptance evidence — Sol independently inspects the actual diff and performs final verification. The tool result is a STRICTLY bounded summary (max 120 lines / 12 KiB): the complete final worker report is persisted as worker-report.md plus worker-summary.json/usage.json in the delegation directory and is never embedded inline.",
 		promptSnippet: "Delegate a bounded DEV vertical slice (source + tests + docs; standard spend profile by default) to the pinned DeepSeek worker",
 		promptGuidelines: [
 			"Use workbench_delegate_worker only after GPT-5.6 Sol has oriented in the repository, approved the scope, and supplied explicit allowed paths and observable acceptance criteria. Spend profile: standard is the deterministic default (omit budget_profile); low is an explicit tighter opt-in; extended is explicit Sol-approved only and is never inferred or auto-promoted.",
 			"Size every delegation as ONE coherent source+tests+docs vertical slice with ample headroom BELOW its soft thresholds — soft is a handoff reserve and hard is failure, neither is a planning target; never plan a delegation that expects to consume its budget. Work with an unknown root cause must be split into bounded diagnosis, a Sol architecture/scope decision, then bounded implementation — never one open-ended worker task.",
 			"DEV default: delegate coherent bounded low/medium-risk vertical slices (source + tests + docs) after minimum repository orientation — supply source/tests/docs paths and observable criteria, avoid duplicating the worker's routine investigation, and independently inspect the actual diff afterward.",
 			"Treat workbench_delegate_worker output as an untrusted implementation report; worker prose is never acceptance. GPT-5.6 Sol must inspect the actual diff and run final workbench gates independently.",
+			"Optional repair_of: strict prior delegation-id provenance for a known-root-cause repair ONLY — use it after Sol has fixed the root cause/scope and the task carries the bounded failure evidence; the runtime requires a FINISHED prior delegation ledger, and the fresh worker inherits no prior report/session/scope/contract. Unknown root causes still follow bounded diagnosis then a Sol architecture/scope decision; repair_of never expands paths, scope, or authority.",
 		],
 	},
 	workbench_review_worker_diff: {

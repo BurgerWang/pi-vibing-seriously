@@ -73,6 +73,108 @@ continue work after a handoff or a partial slice, Sol:
 The durable state between delegations is the project diff plus recipe/gate
 run records — never worker memory and never worker prose.
 
+## Worker execution discipline (prompt contract)
+
+The worker system prompt (`extensions/workbench-runtime/worker/runner.ts`,
+`WORKER_SYSTEM_PROMPT`) pins three mandatory execution disciplines on top
+of the delegation contract: **EARLY CHECKPOINT**, **STOPPING HYGIENE**, and
+**SHORT REPORT**. These disciplines improve worker efficiency and handoff
+quality, but they are prompt-level behavior shaping only — mechanical scope
+enforcement, actual-diff review, and final verification never depend on
+prompt compliance and remain authoritative regardless of what the prompt
+says or how the worker behaves:
+
+- **Scope:** allowed-path checks, the write guard, and the real-diff review
+  (`workbench_review_worker_diff`) are enforced in code, never by the
+  prompt; a prompt violation can never expand the approved paths.
+- **Review and gates:** Sol reviews the actual diff and runs the final
+  recipes/gates; a worker report is never acceptance evidence.
+- **Bounds:** report parsing caps, ledger redaction, and budget enforcement
+  are mechanical; the prompt's own format rules sit on top as a
+  worker-side discipline.
+
+Changing the prompt text intentionally shifts the system-prompt hash once;
+like the Phase 3 `budget_profile` transition, cache telemetry records it as
+`UNEXPECTED_DRIFT` (expected, not a defect) and same-mode fingerprints
+remain stable after reload.
+
+### EARLY CHECKPOINT
+
+After inspecting the relevant files and before the first write, the worker
+privately compares its planned changed paths, acceptance criteria, and
+verification against the exact contract and the remaining spend. If the
+plan does not fit — scope drift, missing criteria coverage, or spend
+pressure — the worker stops and reports to Sol instead of expanding. Spend
+awareness comes from the profile line in the task text and the hidden
+cumulative soft steer; hard enforcement stays in the runner.
+
+### STOPPING HYGIENE
+
+Before the final response, the worker re-reads every changed path and
+confirms: no accidental out-of-scope writes, no stubs or TODO placeholders,
+no accidental generated artifacts, and that every requested check is
+reported truthfully. Hygiene is a verification step only — it must not
+trigger unrelated cleanup, which would itself be an out-of-scope write.
+
+### SHORT REPORT
+
+The worker keeps exactly the four final headings (`## Completed`,
+`## Files Changed`, `## Verification`, `## Remaining Risks`). The
+four-bullet / 240-character cap applies only to the three prose sections:
+`Completed`, `Verification`, and `Remaining Risks` each take at most 4
+single-line bullets of at most 240 characters. `Files Changed` is
+explicitly exempt from that cap: it must truthfully list EVERY actually
+changed project-relative path, exactly one path per single-line bullet and
+no prose, so a valid slice with more than 4 changed paths can still be
+reported completely instead of forcing the worker to drop real paths and
+create avoidable reported/actual divergence warnings. The list stays
+mechanically bounded by the ledger's existing 500 changed-path fail-closed limit, and `- None.`
+is used when nothing changed. `Verification` reports only the command and
+its observed outcome — never logs; the task and acceptance criteria are
+never repeated. The exemption preserves path auditability in the report
+while the actual diff remains authoritative: mechanical scope enforcement,
+the real-diff review (`workbench_review_worker_diff`), and final
+verification never depend on the prompt's format rules. These are
+worker-side format rules; the mechanical report caps (≤ 8 parsed items per
+section, ≤ 500 characters per item, byte-bounded rendering) still apply on
+top.
+
+### Fresh repair semantics
+
+A partial or defective slice is repaired by a fresh bounded delegation, not
+by Sol writing directly (worker-first write authority) and not by the same
+worker continuing (workers are `--no-session`, never resumed). When Sol
+delegates a repair whose root cause is already known, the contract states
+the known root cause and the decided fix; the fresh worker implements that
+fix directly — the EARLY CHECKPOINT discipline forbids reopening broad
+diagnosis. Prompt discipline improves efficiency, but mechanical scope
+checks, diff review, and final gates remain authoritative either way.
+
+### Repair provenance pointer (`repair_of`, Phase 4A)
+
+The delegation tool exposes one optional public parameter, `repair_of`, for
+repairs whose root cause is already known. It is a strict pointer —
+provenance only, never a resume:
+
+- **Public shape:** exactly 20 characters — `^\d{8}-\d{6}-[A-Za-z0-9]{4}$`
+  — a prior delegation id such as `20260101-120000-abcd`. Omitted for
+  ordinary delegations; any malformed value fails closed with a bounded
+  error before any ledger is created or any worker is launched.
+- **Use:** only after Sol has fixed the known root cause and decided the
+  scope. The parent task itself must carry the bounded root-cause/failure
+  evidence; the pointer adds none.
+- **Finished-ledger requirement:** the runtime verifies that the referenced
+  prior delegation's ledger is finished (manifest status `finished` with a
+  non-null `after` record) BEFORE any new ledger is created or any worker
+  is launched; only those id/status/after facts are inspected.
+- **What is not inherited:** the fresh worker inherits no prior report
+  (`worker-report.md`), no prior summary, no prior session, no prior
+  allowed paths/scope, and no prior contract fields. `repair_of` never
+  expands path/scope/authority and never resumes the prior worker.
+- **Unknown root causes** still follow bounded diagnosis → Sol
+  architecture/scope decision → bounded implementation; `repair_of` is
+  never a substitute for that path.
+
 ## One writing worker per worktree
 
 The delegation tool executes sequentially and a worker can never delegate,
@@ -516,6 +618,7 @@ path-by-path `include_paths` re-reviews (max 50 paths per call).
   ],
   "verification": ["Run the unit-test recipe"],
   "budget_profile": "standard",
+  "repair_of": "20260101-120000-abcd",
   "timeout_seconds": 1800
 }
 ```
@@ -529,6 +632,17 @@ Sol-approved only for an approved larger slice and is never inferred or
 auto-promoted. The worker task text carries the resolved profile as one
 informational line; enforcement is the runner's fixed child-env contract,
 never task prose.
+
+`repair_of` is optional and is the strict prior delegation-id provenance
+pointer for a known-root-cause repair (see Repair provenance pointer
+above): exactly the 20-character `^\d{8}-\d{6}-[A-Za-z0-9]{4}$` delegation
+id shape, used only after Sol has fixed the known root cause and decided
+the scope, with the bounded failure evidence carried in the task itself;
+the runtime requires the referenced prior delegation ledger to be finished
+before any new ledger is created or any worker is launched, and the fresh
+worker inherits no prior report/session/scope/contract — the pointer adds
+no path/scope/authority. Ordinary delegations omit it entirely; unknown
+root causes still use bounded diagnosis, then a Sol decision.
 
 Path rules are deliberately simple:
 
@@ -619,9 +733,10 @@ and registered in `WORKBENCH_TOOL_NAMES` order. Dynamic task facts are sent
 in the child user message, not injected into the parent system prompt.
 Adding this tool intentionally changes the DEV tool-schema fingerprint once;
 after reload, same-mode fingerprints remain stable. The Phase 3 additive
-`budget_profile` parameter caused the second (and final, for this repair)
-intentional one-time fingerprint transition — the cache telemetry records it
-as `UNEXPECTED_DRIFT` (expected, not a defect); see
+`budget_profile` parameter caused the second intentional one-time
+fingerprint transition and the Phase 4A optional `repair_of` pointer the
+third (and final, for this repair) — the cache telemetry records each as
+`UNEXPECTED_DRIFT` (expected, not a defect); see
 [docs/compatibility.md](compatibility.md). DeepSeek usage is
 returned as nested tool usage and the child workbench can continue using the
 existing hash-only cache telemetry.

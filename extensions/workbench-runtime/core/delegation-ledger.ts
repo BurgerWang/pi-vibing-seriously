@@ -68,7 +68,7 @@ import type {
 	WorkerSpendReason,
 	WorkerSpendState,
 } from "./worker-spend.ts";
-import { resolveWorkerBudgetProfile } from "./worker-policy.ts";
+import { resolveWorkerBudgetProfile, resolveWorkerRepairOf } from "./worker-policy.ts";
 import {
 	MAX_WORKER_REPORT_BYTES,
 	parseWorkerReport,
@@ -185,6 +185,14 @@ export interface LedgerContract {
 	 * the resolved literal.
 	 */
 	budgetProfile?: WorkerSpendProfile;
+	/**
+	 * Phase 4A (worker repair contract): optional strict repair-provenance
+	 * pointer to the delegation id being repaired. Resolved by
+	 * resolveWorkerRepairOf in boundLedgerContract — omitted stays absent
+	 * (ordinary delegations never carry the key); anything malformed FAILS
+	 * CLOSED before any ledger record or child launch.
+	 */
+	repairOf?: string;
 }
 
 export interface LedgerUsage {
@@ -297,6 +305,14 @@ export interface LedgerBeforeRecord {
 		 * resolves omitted to `standard` before any write.
 		 */
 		budget_profile?: string;
+		/**
+		 * Phase 4A: optional strict repair-provenance pointer (the
+		 * delegation id being repaired). Absent on ordinary records;
+		 * present ONLY when the raw contract carried a valid id —
+		 * boundLedgerContract resolves it via resolveWorkerRepairOf and
+		 * fails closed on anything malformed.
+		 */
+		repair_of?: string;
 	};
 	git_head: string | null;
 	git_dirty: boolean;
@@ -842,6 +858,12 @@ export function boundLedgerContract(raw: LedgerContract): { ok: true; contract: 
 	// typed profile must never reach a ledger record or a child launch).
 	const profile = resolveWorkerBudgetProfile(raw.budgetProfile);
 	if (!profile.ok) return profile;
+	// Phase 4A: resolve the repair-provenance pointer AFTER the budget
+	// profile. Omitted stays undefined — the key is spread conditionally
+	// so ordinary records omit `repair_of` entirely; any malformed value
+	// FAILS CLOSED exactly like the profile.
+	const repair = resolveWorkerRepairOf(raw.repairOf);
+	if (!repair.ok) return repair;
 	return {
 		ok: true,
 		contract: {
@@ -851,6 +873,7 @@ export function boundLedgerContract(raw: LedgerContract): { ok: true; contract: 
 			verification,
 			timeout_seconds: timeoutSeconds,
 			budget_profile: profile.profile,
+			...(repair.repairOf !== undefined ? { repair_of: repair.repairOf } : {}),
 		},
 	};
 }

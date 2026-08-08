@@ -456,6 +456,8 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 			expected_exit_codes: recipe.expected_exit_codes,
 			declared_writes: recipe.writes,
 			environment_names: recipe.environment,
+			validation_components: recipe.validation_components,
+			cache_request_mode: cacheMode,
 			argv_hash: executedArgvHashValue,
 		};
 		const environmentRecord: Record<string, string> = {};
@@ -532,6 +534,8 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		expected_exit_codes: recipe.expected_exit_codes,
 		declared_writes: recipe.writes,
 		environment_names: recipe.environment,
+		validation_components: recipe.validation_components,
+		cache_request_mode: cacheMode,
 		execution_source: "exec",
 		argv_hash: executedArgvHashValue,
 	};

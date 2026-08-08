@@ -106,6 +106,8 @@ function makeManifest(overrides: Partial<RunRecord> = {}): RunRecord {
 		expected_exit_codes: [0],
 		declared_writes: [],
 		environment_names: [],
+		validation_components: ["typecheck"],
+		cache_request_mode: "no-cache",
 		...overrides,
 	};
 }

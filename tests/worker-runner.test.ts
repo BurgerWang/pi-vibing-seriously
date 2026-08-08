@@ -134,6 +134,72 @@ test("worker system prompt grants local implementation ownership inside the appr
 	assert.match(WORKER_SYSTEM_PROMPT, /instead of guessing or expanding scope/);
 });
 
+test("worker system prompt pins the three mandatory execution disciplines (early checkpoint, stopping hygiene, short report)", () => {
+	// Discipline 1 — EARLY CHECKPOINT: after relevant-file inspection and
+	// before the first write, privately compare planned changed paths /
+	// acceptance criteria / verification against the exact contract and the
+	// remaining spend; stop/report rather than expand; a known-root-cause
+	// repair must not reopen broad diagnosis.
+	assert.match(WORKER_SYSTEM_PROMPT, /EARLY CHECKPOINT/);
+	assert.match(WORKER_SYSTEM_PROMPT, /after inspecting the relevant files and before the first write/);
+	assert.match(WORKER_SYSTEM_PROMPT, /privately compare/);
+	assert.match(WORKER_SYSTEM_PROMPT, /planned changed paths, acceptance criteria, and verification/);
+	assert.match(WORKER_SYSTEM_PROMPT, /the exact contract and the remaining spend/);
+	assert.match(WORKER_SYSTEM_PROMPT, /if the plan does not fit, stop and report to Sol rather than expand/);
+	assert.match(WORKER_SYSTEM_PROMPT, /known root cause must not reopen broad diagnosis/);
+	// Discipline 2 — STOPPING HYGIENE: before the final response, re-read
+	// every changed path; no accidental out-of-scope writes, no stubs/TODO
+	// placeholders, no accidental generated artifacts; requested checks
+	// reported truthfully; hygiene never triggers unrelated cleanup.
+	assert.match(WORKER_SYSTEM_PROMPT, /STOPPING HYGIENE/);
+	assert.match(WORKER_SYSTEM_PROMPT, /before your final response, re-read every changed path/);
+	assert.match(WORKER_SYSTEM_PROMPT, /no accidental out-of-scope writes/);
+	assert.match(WORKER_SYSTEM_PROMPT, /no stubs or TODO placeholders/);
+	assert.match(WORKER_SYSTEM_PROMPT, /no accidental generated artifacts/);
+	assert.match(WORKER_SYSTEM_PROMPT, /every requested check is reported truthfully/);
+	assert.match(WORKER_SYSTEM_PROMPT, /hygiene must not trigger unrelated cleanup/);
+	// Discipline 3 — SHORT REPORT: exactly the four final headings; the
+	// four-bullet / 240-char cap applies ONLY to Completed, Verification,
+	// and Remaining Risks — Files Changed is explicitly exempt and must
+	// list EVERY actually changed project-relative path, one exact path per
+	// single-line bullet, with no prose (mechanically bounded by the
+	// ledger's existing 500 changed-path fail-closed limit; `- None.` when nothing changed);
+	// Verification reports only the command and its observed outcome, never
+	// logs; no task/criteria repetition.
+	assert.match(WORKER_SYSTEM_PROMPT, /SHORT REPORT/);
+	assert.match(WORKER_SYSTEM_PROMPT, /keep exactly the four final headings/);
+	// The four-bullet / 240-char cap is scoped to the three prose sections.
+	assert.match(WORKER_SYSTEM_PROMPT, /Completed, Verification, and Remaining Risks each take at most 4 single-line bullets of at most 240 characters/);
+	// Files Changed is explicitly exempt from the cap and must list every
+	// actually changed path truthfully, one per single-line bullet.
+	assert.match(WORKER_SYSTEM_PROMPT, /Files Changed is exempt from that cap/);
+	assert.match(WORKER_SYSTEM_PROMPT, /EVERY actually changed project-relative path/);
+	assert.match(WORKER_SYSTEM_PROMPT, /one exact project-relative path per single-line bullet/);
+	assert.match(WORKER_SYSTEM_PROMPT, /with no prose/);
+	assert.match(WORKER_SYSTEM_PROMPT, /ledger's existing 500 changed-path fail-closed limit/);
+	assert.match(WORKER_SYSTEM_PROMPT, /reports only the command and its observed outcome, never logs/);
+	assert.match(WORKER_SYSTEM_PROMPT, /never repeat the task or acceptance criteria/);
+	assert.match(WORKER_SYSTEM_PROMPT, /- None\./);
+	// Negative guard: a global four-bullet cap ("at most 4 single-line
+	// bullets per section") would re-impose the Files Changed cap and must
+	// fail this test.
+	assert.ok(
+		!/at most 4 single-line bullets per section/.test(WORKER_SYSTEM_PROMPT),
+		"the four-bullet cap must be scoped to Completed/Verification/Remaining Risks, never Files Changed",
+	);
+	// Structure: the three disciplines appear in fixed order before the final
+	// headings block, and the never-acceptance/final-gate rules survive
+	// unchanged beside them.
+	const indexOf = (needle: string) => WORKER_SYSTEM_PROMPT.indexOf(needle);
+	assert.ok(indexOf("EARLY CHECKPOINT") >= 0);
+	assert.ok(indexOf("EARLY CHECKPOINT") < indexOf("STOPPING HYGIENE"), "EARLY CHECKPOINT precedes STOPPING HYGIENE");
+	assert.ok(indexOf("STOPPING HYGIENE") < indexOf("SHORT REPORT"), "STOPPING HYGIENE precedes SHORT REPORT");
+	assert.ok(indexOf("SHORT REPORT") < indexOf("Finish with exactly these sections:"), "SHORT REPORT precedes the final headings block");
+	assert.match(WORKER_SYSTEM_PROMPT, /Never run final validation gates/);
+	assert.match(WORKER_SYSTEM_PROMPT, /do not claim final PASS or acceptance/);
+	assert.match(WORKER_SYSTEM_PROMPT, /## Completed\n## Files Changed\n## Verification\n## Remaining Risks/);
+});
+
 test("runner pins max model selector and passes a non-recursive worker role contract", async () => {
 	const script = `
 const facts = JSON.stringify({ argv: process.argv.slice(2), role: process.env.WORKBENCH_AGENT_ROLE, depth: process.env.WORKBENCH_WORKER_DEPTH, paths: JSON.parse(process.env.WORKBENCH_WORKER_ALLOWED_PATHS || "[]"), inheritedModel: process.env.PI_MODEL || null, spendProfile: process.env.${WORKER_SPEND_PROFILE_ENV} || null });

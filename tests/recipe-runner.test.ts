@@ -26,9 +26,11 @@ const BASE_RECIPES = [
 	'    command: ["node", "-e", "console.log(process.argv[1] || \\"hi\\")", "{{msg}}"]',
 	"    params:",
 	"      - { name: msg, type: string }",
+	"    validation_components: [typecheck, unit-test]",
 	"  - name: fail",
 	'    command: ["node", "-e", "process.exit(3)"]',
 	"    expected_exit_codes: [0]",
+	"    validation_components: [typecheck, unit-test]",
 	"  - name: fail-ok",
 	'    command: ["node", "-e", "process.exit(3)"]',
 	"    expected_exit_codes: [3]",
@@ -157,10 +159,37 @@ test("non-zero exit code is a failure unless expected", async () => {
 		const failed = await runRecipe({ projectRoot: dir, recipeName: "fail", mode: "DEV", exec: spawnExec });
 		assert.equal(failed.ok, false);
 		assert.equal(failed.record?.exit_code, 3);
+		// Phase 2A: the nonzero (failed) exec terminal still records the exact
+		// declared components and the default cache request mode, and the
+		// persisted manifest agrees with the returned record on both fields.
+		assert.deepEqual(failed.record?.validation_components, ["typecheck", "unit-test"], "exact declared components on a nonzero run");
+		assert.equal(failed.record?.cache_request_mode, "default", "default request mode on a nonzero run");
+		const failedManifest = await persistedManifest(failed.runDir as string);
+		assert.deepEqual(failedManifest.validation_components, failed.record?.validation_components, "returned == persisted validation_components");
+		assert.equal(failedManifest.cache_request_mode, failed.record?.cache_request_mode, "returned == persisted cache_request_mode");
 
 		const expected = await runRecipe({ projectRoot: dir, recipeName: "fail-ok", mode: "DEV", exec: spawnExec });
 		assert.equal(expected.ok, true);
 		assert.equal(expected.record?.exit_code, 3);
+	});
+});
+
+test("cache request mode is recorded exactly for default, no-cache and refresh-cache runs", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir);
+		const components = ["typecheck", "unit-test"];
+		const modes = ["default", "no-cache", "refresh-cache"] as const;
+		for (const mode of modes) {
+			const result = await runRecipe({ projectRoot: dir, recipeName: "hello", mode: "DEV", exec: spawnExec, cacheMode: mode });
+			assert.equal(result.ok, true);
+			assert.deepEqual(result.record?.validation_components, components, `${mode}: exact declared components returned`);
+			assert.equal(result.record?.cache_request_mode, mode, `${mode}: exact request mode returned`);
+			const manifest = await persistedManifest(result.runDir as string);
+			assert.deepEqual(manifest.validation_components, components, `${mode}: exact declared components persisted`);
+			assert.equal(manifest.cache_request_mode, mode, `${mode}: exact request mode persisted`);
+			assert.deepEqual(manifest.validation_components, result.record?.validation_components, `${mode}: returned == persisted validation_components`);
+			assert.equal(manifest.cache_request_mode, result.record?.cache_request_mode, `${mode}: returned == persisted cache_request_mode`);
+		}
 	});
 });
 
@@ -479,6 +508,10 @@ test("P4a: spawn failure persists incomplete evidence and still surfaces the err
 		assert.equal(runIds.length, 1, "the spawn-failure run is persisted");
 		const manifest = await persistedManifest(join(runsDir, runIds[0]!));
 		assert.equal(manifest.exit_code, null);
+		// Phase 2A: the spawn-failure terminal persists the exact declared
+		// components and the default cache request mode.
+		assert.deepEqual(manifest.validation_components, ["typecheck", "unit-test"], "spawn-failure manifest keeps the exact declared components");
+		assert.equal(manifest.cache_request_mode, "default", "spawn-failure manifest records the default cache request mode");
 		const block = manifest.validation_evidence;
 		assert.ok(block, "spawn-failure runs persist validation evidence");
 		if (block.binding) {
@@ -558,6 +591,8 @@ test("P4a: a manifest-patch write failure returns the original record — never 
 			expected_exit_codes: [0],
 			declared_writes: [],
 			environment_names: [],
+			validation_components: [],
+			cache_request_mode: "default",
 			execution_source: "exec",
 			argv_hash: executedArgvHash(["node", "-e", "x"]),
 		};

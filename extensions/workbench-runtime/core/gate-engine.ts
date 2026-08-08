@@ -25,7 +25,7 @@ import { isDeepStrictEqual } from "node:util";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { parse as parseYaml } from "yaml";
 
-import { loadProjectConfig, runsDir, type ConfigIssue, type ExecFn } from "./config.ts";
+import { loadProjectConfig, runsDir, type ConfigIssue, type ExecFn, type ProjectConfig } from "./config.ts";
 import { GATE_CATALOG } from "./gate-catalog.ts";
 import {
 	effectiveGates,
@@ -232,6 +232,134 @@ export async function loadGates(projectRoot: string): Promise<Gate[]> {
 	if (parsed.errors.length > 0) throw new GateSetupError(parsed.errors.join("; "));
 	const config = await loadProjectConfig(projectRoot, { trusted: true });
 	return effectiveGates(config.profile, GATE_CATALOG, parsed.gates);
+}
+
+// ---------------------------------------------------------------------------
+// Gate selection (shared, non-writing)
+// ---------------------------------------------------------------------------
+
+interface GateSelection {
+	config: ProjectConfig;
+	gates: Gate[];
+	/** Selector-expanded requested gate ids, in selector order. */
+	requestedIds: string[];
+	/** Requested gate ids in prerequisite (topological) execution order. */
+	ordered: string[];
+}
+
+/**
+ * Shared non-writing selection step for runGates and the Phase 3A preflight:
+ * load the project config + effective gate catalog, resolve the selector and
+ * fail closed (GateSetupError) on empty/unknown/profile-invalid selectors and
+ * prerequisite cycles — exactly the validation formal gate runs apply. Never
+ * writes, never executes anything, never reads run records.
+ */
+async function selectGates(projectRoot: string, selector: string): Promise<GateSelection> {
+	const config = await loadProjectConfig(projectRoot, { trusted: true });
+	const gates = await loadGates(projectRoot);
+
+	const requestedIds = resolveSelector(selector, gates);
+	if (requestedIds.length === 0) {
+		throw new GateSetupError(`selector "${selector}" matched no gates`);
+	}
+	const known = new Set(gates.map((g) => g.id));
+	const unknown = requestedIds.filter((id) => !known.has(id));
+	if (unknown.length > 0) {
+		const quantOnly = QUANT_GATE_ID_RE.test(unknown[0] ?? "");
+		throw new GateSetupError(
+			`gate(s) not available for profile ${config.profile ?? "(none)"}: ${unknown.join(", ")}${quantOnly ? " (quant gates load only for quant-research profiles)" : ""}`,
+		);
+	}
+
+	let ordered: string[];
+	try {
+		ordered = orderGates(requestedIds, gates);
+	} catch (error) {
+		throw new GateSetupError((error as Error).message);
+	}
+	return { config, gates, requestedIds, ordered };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3A: pure/read-only manual-evidence preflight
+// ---------------------------------------------------------------------------
+
+export interface RequiredManualCheckFacts {
+	gate_id: string;
+	check_id: string;
+	/** The declared manual_prompt (undefined when the gate sets none). */
+	prompt: string | undefined;
+	/** True iff the caller's evidence satisfies this check under exact trimmedManualEvidence semantics. */
+	provided: boolean;
+}
+
+export interface PreflightManualEvidenceResult {
+	/** The selector exactly as passed. */
+	selector: string;
+	/** Selector-expanded requested gate ids, in selector order. */
+	requested: string[];
+	profile: string | undefined;
+	/**
+	 * Required (kind=manual && required) checks of the requested gates, in
+	 * deterministic effective gate/check order (gates sorted by id, checks in
+	 * declaration order). Optional manual checks are excluded.
+	 */
+	required_manual_checks: RequiredManualCheckFacts[];
+	/** Required manual check ids the caller's evidence satisfies (trimmed, non-empty note). */
+	provided_required_ids: string[];
+	/** Required manual check ids with no satisfying evidence. */
+	missing_required_ids: string[];
+	/** True iff every required manual check of the requested gates is provided. */
+	manual_evidence_ready: boolean;
+}
+
+/**
+ * Phase 3A: pure/read-only manual-evidence preflight — machine facts only.
+ *
+ * Resolves the SAME selection as runGates (project config, effective gate
+ * catalog, selector expansion, unknown/profile validation, prerequisite
+ * ordering) and reports exactly which required manual checks the caller's
+ * evidence map satisfies — under the exact trimmedManualEvidence semantics
+ * formal runs evaluate with. Raw notes are never returned.
+ *
+ * PURE READ-ONLY: reads config/gates.yaml only — no run id, no mkdir, no
+ * git/exec, no recipe execution, no check evaluation, no latest-status read,
+ * no persistence. It assigns no Gate status and can never return
+ * PASS/FAIL/BLOCKED/NOT_RUN: `manual_evidence_ready` is the only readiness
+ * signal.
+ */
+export async function preflightGateManualEvidence(input: {
+	projectRoot: string;
+	selector: string;
+	manualEvidence?: Record<string, string>;
+}): Promise<PreflightManualEvidenceResult> {
+	const { config, gates, requestedIds } = await selectGates(input.projectRoot, input.selector);
+	const trimmed = trimmedManualEvidence(input.manualEvidence);
+	const requestedSet = new Set(requestedIds);
+
+	const requiredChecks: RequiredManualCheckFacts[] = [];
+	const providedRequiredIds: string[] = [];
+	const missingRequiredIds: string[] = [];
+	for (const gate of gates) {
+		if (!requestedSet.has(gate.id)) continue;
+		for (const check of gate.checks) {
+			if (check.kind !== "manual" || !check.required) continue;
+			const provided = trimmed[check.id] !== undefined;
+			requiredChecks.push({ gate_id: gate.id, check_id: check.id, prompt: check.manual_prompt, provided });
+			if (provided) providedRequiredIds.push(check.id);
+			else missingRequiredIds.push(check.id);
+		}
+	}
+
+	return {
+		selector: input.selector,
+		requested: requestedIds,
+		profile: config.profile,
+		required_manual_checks: requiredChecks,
+		provided_required_ids: providedRequiredIds,
+		missing_required_ids: missingRequiredIds,
+		manual_evidence_ready: missingRequiredIds.length === 0,
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -1215,28 +1343,7 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 	const now = input.now ?? (() => new Date());
 	const startedAt = now();
 
-	const config = await loadProjectConfig(projectRoot, { trusted: true });
-	const gates = await loadGates(projectRoot);
-
-	const requestedIds = resolveSelector(selector, gates);
-	if (requestedIds.length === 0) {
-		throw new GateSetupError(`selector "${selector}" matched no gates`);
-	}
-	const known = new Set(gates.map((g) => g.id));
-	const unknown = requestedIds.filter((id) => !known.has(id));
-	if (unknown.length > 0) {
-		const quantOnly = QUANT_GATE_ID_RE.test(unknown[0] ?? "");
-		throw new GateSetupError(
-			`gate(s) not available for profile ${config.profile ?? "(none)"}: ${unknown.join(", ")}${quantOnly ? " (quant gates load only for quant-research profiles)" : ""}`,
-		);
-	}
-
-	let ordered: string[];
-	try {
-		ordered = orderGates(requestedIds, gates);
-	} catch (error) {
-		throw new GateSetupError((error as Error).message);
-	}
+	const { config, gates, requestedIds, ordered } = await selectGates(projectRoot, selector);
 
 	const runId = makeRunId(startedAt);
 	const runDir = join(runsDir(projectRoot), runId);

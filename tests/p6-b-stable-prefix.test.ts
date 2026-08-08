@@ -369,17 +369,23 @@ test("workbench_delegate_worker metadata is static and carries the responsibilit
 	// The registration-order/schema contract is untouched: same name, same
 	// position (the first P7 tool, after the seven existing tools; P8b
 	// appends the recovery tool LAST), same parameter schema hash — pinned
-	// to the final Phase 3 baseline
+	// to the final Phase 4A optional repair_of schema baseline
 	// (a self-comparison would prove nothing). The hash changed exactly
-	// ONCE, intentionally, in Phase 3 of the worker token-budget repair
-	// (see docs/compatibility.md for the documented fingerprint
-	// transition): the additive optional `budget_profile` parameter (with
-	// the nested JSON Schema `default: "standard"` annotation) landed in
-	// one rollout transition directly from the pre-repair baseline
+	// TWICE, both intentionally, in the worker repair rollout: in Phase 3
+	// of the worker token-budget repair (see docs/compatibility.md for the
+	// documented fingerprint transition) the additive optional
+	// `budget_profile` parameter (with the nested JSON Schema
+	// `default: "standard"` annotation) landed in one rollout transition
+	// directly from the pre-repair baseline
 	// 2cf1f563f78ffe2c85d142c1f40deea7bc658365345554db11c80b8af6b521d9 to
-	// the pinned final hash below. Phase 5 (task-contract wording /
-	// granularity) deliberately leaves the parameter schema byte-for-byte
-	// unchanged — the pin below stays the final Phase 3 baseline.
+	// the historical final Phase 3 value
+	// 71707090d2da085b036c5879dd2fcb72558175ead8e596bf55406b65732b0c83;
+	// then Phase 4A (public schema shape only) added the optional
+	// `repair_of` pointer below, and a focused machine run (commander
+	// no-cache run 20260808-114550-j4gd) derived the new canonical hash
+	// pinned below: the final Phase 4A optional repair_of schema baseline.
+	// Phase 5 (task-contract wording / granularity) deliberately leaves the
+	// parameter schema byte-for-byte unchanged.
 	assert.equal(meta.name, "workbench_delegate_worker");
 	assert.equal(WORKBENCH_TOOL_NAMES.indexOf("workbench_delegate_worker"), WORKBENCH_TOOL_NAMES.length - 4, "delegate tool keeps its registration position (seven existing → delegate → review → status → recovery)");
 	// The canonical schema object itself (not only its hash): budget_profile
@@ -391,7 +397,7 @@ test("workbench_delegate_worker metadata is static and carries the responsibilit
 	const delegateParameters = WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker as unknown as {
 		type: string;
 		required?: string[];
-		properties: Record<string, { default?: unknown; anyOf?: Array<{ const?: unknown }> }>;
+		properties: Record<string, { default?: unknown; anyOf?: Array<{ const?: unknown }>; type?: string; minLength?: number; maxLength?: number; pattern?: string; description?: string }>;
 	};
 	assert.equal(delegateParameters.type, "object");
 	assert.ok(!(delegateParameters.required ?? []).includes("budget_profile"), "budget_profile stays optional — no required-list regression");
@@ -403,10 +409,30 @@ test("workbench_delegate_worker metadata is static and carries the responsibilit
 		["low", "standard", "extended"],
 		"the exact closed alternatives in the fixed low|standard|extended order",
 	);
+	// Phase 4A (public schema shape only): repair_of stays OPTIONAL —
+	// absent from `required` — and is an exactly-20-character string pinned
+	// to the strict delegation-id pattern ^\d{8}-\d{6}-[A-Za-z0-9]{4}$.
+	// The description preserves the fresh-worker/no-authority semantics:
+	// strict prior delegation-id provenance for a known-root-cause repair
+	// only; the parent task itself must carry the bounded root cause /
+	// failure evidence; and the pointer adds no path/scope/authority and
+	// never resumes or imports the old report.
+	const repairOfSchema = delegateParameters.properties.repair_of;
+	assert.ok(repairOfSchema, "repair_of is present in the serialized parameter schema");
+	assert.ok(!(delegateParameters.required ?? []).includes("repair_of"), "repair_of stays optional — no required-list regression");
+	assert.equal(repairOfSchema.type, "string", "repair_of is a string");
+	assert.equal(repairOfSchema.minLength, 20, "repair_of minLength is exactly 20");
+	assert.equal(repairOfSchema.maxLength, 20, "repair_of maxLength is exactly 20");
+	assert.equal(repairOfSchema.pattern, "^\\d{8}-\\d{6}-[A-Za-z0-9]{4}$", "repair_of matches the strict delegation-id pattern");
+	assert.equal(
+		repairOfSchema.description,
+		"strict prior delegation-id provenance for a known-root-cause repair; parent task must include bounded root cause/failure evidence; pointer adds no path/scope/authority and never resumes/imports old report",
+		"repair_of description preserves the fresh-worker/no-authority semantics",
+	);
 	assert.equal(
 		canonicalHash(WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker),
-		"71707090d2da085b036c5879dd2fcb72558175ead8e596bf55406b65732b0c83",
-		"delegate parameter schema hash is pinned to the final Phase 3 baseline (optional budget_profile with the default: standard annotation)",
+		"dc1db21e3590c7f57cfa88f042052964a92d495116966747918d72f2018176a7",
+		"delegate parameter schema hash literal is the final Phase 4A optional repair_of schema baseline — machine-derived (commander no-cache run 20260808-114550-j4gd), superseding the historical final Phase 3 value 71707090d2da085b036c5879dd2fcb72558175ead8e596bf55406b65732b0c83",
 	);
 });
 
@@ -880,6 +906,60 @@ test("slash commands are not registered as model-callable tools", async () => {
 	assert.ok(commandNames.length >= 15, `expected the /q-* command set, got ${commandNames.length}`);
 	for (const name of commandNames) assert.ok(name.startsWith("q-"), name);
 	for (const tool of WORKBENCH_TOOL_NAMES) assert.ok(!commandNames.includes(tool), tool);
+});
+
+test("delegate wiring: strict repair resolver and finished-ledger guard precede ledger create / worker run; the repair pointer spreads exactly twice and reads only id/status/after facts (Phase 4D)", async () => {
+	const index = await readFile(new URL("index.ts", EXTENSION_DIR), "utf8");
+	const blockStart = index.indexOf("...WORKBENCH_TOOL_METADATA.workbench_delegate_worker,");
+	const blockEnd = index.indexOf("...WORKBENCH_TOOL_METADATA.workbench_review_worker_diff,");
+	assert.ok(blockStart !== -1 && blockEnd !== -1 && blockEnd > blockStart, "delegate registerTool block is delimited by the catalog spreads");
+	const block = index.slice(blockStart, blockEnd);
+	// 1. The strict repair resolver runs BEFORE projectRoot resolution and
+	// before any new ledger is created (malformed pointers fail closed
+	// before any write or child launch).
+	const resolver = "const repairOf = resolveWorkerRepairOf(params.repair_of);";
+	const projectRootLine = "const projectRoot = await projectRootFor(ctx);";
+	const createLedger = "createDelegationLedger(";
+	assert.ok(block.includes(resolver), "strict repair resolver is present");
+	assert.ok(block.includes(projectRootLine), "projectRoot resolution is present");
+	assert.ok(block.indexOf(resolver) < block.indexOf(projectRootLine), "strict resolver precedes projectRoot resolution");
+	assert.ok(block.indexOf(resolver) < block.indexOf(createLedger), "strict resolver precedes any new ledger creation");
+	// 2. The finished-ledger check (manifest status finished + non-null
+	// after record) happens BEFORE any new ledger is created and before any
+	// worker is launched.
+	const finishedCheck = 'prior.manifest.status !== "finished" || prior.after === null';
+	const runWorker = "runDeepseekWorker({";
+	assert.ok(block.includes("readDelegationLedger(projectRoot, repairOf.repairOf)"), "the prior ledger is read for the finished check");
+	assert.ok(block.includes(finishedCheck), "the finished-ledger guard checks manifest status and the after record");
+	assert.ok(block.indexOf(finishedCheck) < block.indexOf(createLedger), "finished-ledger guard precedes any new ledger creation");
+	assert.ok(block.indexOf(finishedCheck) < block.indexOf(runWorker), "finished-ledger guard precedes any worker launch");
+	// 3. The SAME conditional repairOf spread appears exactly twice — the
+	// ledger contract and the worker contract — and the omitted path
+	// carries no key.
+	const spread = "...(repairOf.repairOf !== undefined ? { repairOf: repairOf.repairOf } : {})";
+	assert.equal(block.split(spread).length - 1, 2, "the conditional repairOf spread appears exactly twice (ledger contract + worker contract)");
+	// 4. The delegate block reads ONLY the prior id/status/after facts: it
+	// never accesses prior.before, prior.workerSummary, the prior
+	// worker-report artifact, or any prior contract field (no prose/scope
+	// inheritance, no authority expansion).
+	const priorAccesses = [...block.matchAll(/prior\.\w+/g)].map((m) => m[0]);
+	assert.deepEqual([...new Set(priorAccesses)], ["prior.manifest", "prior.after"], "only the prior manifest status and after record are inspected");
+	assert.ok(!block.includes("prior.before"), "the delegate block never accesses prior.before");
+	assert.ok(!block.includes("prior.workerSummary"), "the delegate block never accesses prior.workerSummary");
+	assert.ok(!block.includes("prior.contract"), "the delegate block never accesses prior contract fields");
+	// The prior delegation's report artifact (worker-report.md) is never
+	// read: the block resolves no delegation directory itself, never uses
+	// the report constant, and its only worker-report mention is the
+	// finish-step comment about the CURRENT delegation's OWN artifact —
+	// never on a line touching the prior id or the repair pointer.
+	assert.ok(!block.includes("delegationDirFor("), "the delegate block never resolves a delegation directory itself");
+	assert.ok(!block.includes("WORKER_REPORT_FILE_NAME"), "the delegate block never reads the report artifact constant");
+	assert.ok(block.split("worker-report").length - 1 >= 1, "the finish-step comment names the current delegation's own worker-report.md");
+	for (const line of block.split("\n")) {
+		if (line.includes("worker-report")) {
+			assert.ok(!line.includes("prior") && !line.includes("repairOf"), `worker-report mention must never touch the prior delegation: ${line.trim()}`);
+		}
+	}
 });
 
 // ---------------------------------------------------------------------------

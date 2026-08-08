@@ -71,6 +71,16 @@ export type CacheMode = "result-only" | "artifacts";
  */
 export type CacheDomain = "default" | "quant";
 
+/**
+ * P6-C: per-run cache REQUEST mode — how a caller asks the action cache to
+ * behave for ONE run (distinct from the recipe-declared cache policy).
+ * "default" reads and writes per recipe policy; "no-cache" neither reads
+ * nor writes; "refresh-cache" never reads but executes and rewrites on
+ * success. Canonical definition — re-exported by action-cache.ts for
+ * existing importers.
+ */
+export type CacheRequestMode = "default" | "no-cache" | "refresh-cache";
+
 export interface ToolchainDecl {
 	name: string;
 	/** Safe version-query argv (shell=false, no pipes/redirection). */

@@ -52,6 +52,35 @@
  *     fact. Every review segment still scope-checks EVERY worker path and
  *     binds the COMPLETE current diff hash — include_paths narrows only
  *     the rendered patch.
+ *   - Phase 5 (Execution Efficiency Optimization): CURRENT REGULAR
+ *     `.svg`/`.json` worker paths LARGER than the default global review
+ *     byte cap (COMPACT_MIN_BYTES = DEFAULT_REVIEW_MAX_BYTES = 32 KiB)
+ *     render as a deterministic COMPACT entry (bounded redacted
+ *     UTF-8-safe head/tail previews — never empty for a non-empty
+ *     window: the head is a bounded PREFIX and the tail a bounded
+ *     SUFFIX of the redacted capture, so the tail preview represents
+ *     the actual end of the file even for the bounded partial-line
+ *     fallback of minified/single-line JSON — plus status/size/digest/
+ *     recorded-after-equality facts and generator equality
+ *     NOT_VERIFIED — the review never executes or imports repository
+ *     generators), counting as displayed-path coverage, with no per-path
+ *     git diff capture and no additional unbounded/full-file DISPLAY or
+ *     preview capture — the existing bounded content digest is preserved
+ *     (it may read the complete file through MAX_DIGEST_BYTES = 4 MiB and
+ *     uses prefix+size beyond); ordinary source/small/
+ *     deleted/unreadable paths keep the existing behavior; scope/hash/
+ *     include_paths/coverage/STALE invariants are unchanged.
+ *   - Phase 5 hardening: a worker path the authoritative scope/realpath
+ *     check finds outside the parent-approved scope is WITHHELD — the
+ *     review's per-path content pipeline (git diff capture, bounded file
+ *     reads, display digests, rendering) never touches it, and its patch
+ *     entry is a deterministic bounded `withheld` marker instead; the
+ *     path still counts as an actually displayed entry and the verdict
+ *     stays FAIL. Compact reads re-verify project-root realpath
+ *     containment immediately before opening, so no compact read can
+ *     follow an escaping symlink; the whole-diff hash binding
+ *     (collectGitFacts) is unchanged and still covers the complete
+ *     actual diff.
  *   - writes ONLY review.json in the delegation directory and returns the
  *     verdict; the runtime wiring (index.ts) is the only component that
  *     touches the delegation state entry.
@@ -63,7 +92,7 @@
  * never modifies project files and never computes business metrics.
  */
 
-import { readFile } from "node:fs/promises";
+import { open, readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
@@ -77,12 +106,14 @@ import {
 	contentDigest,
 	delegationDirFor,
 	isValidDelegationId,
+	MAX_DIGEST_BYTES,
 	normalizeStatusPath,
 	readBoundedFilePrefix,
 	readDelegationLedger,
 	writeJsonAtomic,
 	type GitFacts,
 } from "./delegation-ledger.ts";
+import { realpathContained } from "./path-guard.ts";
 import { redactText } from "./redact.ts";
 import { isWorkerPathAllowedRealpath } from "../worker/path-scope.ts";
 import type { ExecFn } from "./config.ts";
@@ -103,6 +134,57 @@ export const MAX_REVIEW_NOTES = 20;
  */
 export const MAX_REVIEW_GUIDANCE_BYTES = 1024;
 
+// ---------------------------------------------------------------------------
+// Phase 5 (Execution Efficiency Optimization): compact review bounds
+// ---------------------------------------------------------------------------
+
+/**
+ * Deterministic compact-eligibility rule (internal presentation, no public
+ * tool parameter/schema change): the path must end in one of these
+ * extensions (case-insensitive). Ordinary source/text files are never
+ * eligible — their diffs are never hidden.
+ */
+export const COMPACT_ELIGIBLE_EXTENSIONS = [".svg", ".json"] as const;
+/**
+ * A path is compact-eligible only when its CURRENT REGULAR file is
+ * LARGER than this size. The threshold is tied to the existing default
+ * global review byte cap (DEFAULT_REVIEW_MAX_BYTES = 32 KiB): a file at
+ * or above the default review envelope could never fit a global-budget
+ * git diff, so the compact form is the deterministic bounded
+ * presentation for it.
+ */
+export const COMPACT_MIN_BYTES = DEFAULT_REVIEW_MAX_BYTES;
+/**
+ * Bounded head/tail read windows — display capture is stat + two bounded
+ * 8 KiB window reads, with no additional unbounded/full-file DISPLAY or
+ * preview capture. The existing bounded content digest is computed
+ * separately and may read the complete file through MAX_DIGEST_BYTES
+ * (4 MiB), with bounded prefix+size beyond — the digest bound is
+ * unchanged.
+ */
+export const COMPACT_READ_BYTES = 8 * 1024;
+/** Maximum complete lines captured per preview. */
+export const COMPACT_PREVIEW_LINES = 12;
+/** Maximum UTF-8 bytes of each redacted preview text (before JSON escaping). */
+export const COMPACT_PREVIEW_MAX_BYTES = 1024;
+/**
+ * Generator equality is NEVER verified by the diff-review service — it
+ * never executes or imports repository generators. The compact entry
+ * always states this literal; MATCH is never fabricated.
+ */
+export const COMPACT_GENERATOR_EQUALITY = "NOT_VERIFIED";
+
+/**
+ * Deterministic bounded marker text rendered as the COMPLETE patch entry
+ * of a worker path the authoritative scope/realpath check found outside
+ * the parent-approved scope. The review fails closed BEFORE any content
+ * open/read/digest/display of the path: the entry carries no git diff, no
+ * file content and no digest — only this fixed literal. The path still
+ * counts as an actually displayed entry (coverage) and the verdict stays
+ * FAIL; the full reason is recorded in the review's `violations`.
+ */
+export const WITHHELD_MARKER = "(withheld: content not rendered — the path is outside the parent-approved scope; the review fails closed and presents no git diff, file content or per-path digest for this path)";
+
 /**
  * Durable project-relative review record path, e.g.
  * `.pi/workbench/delegations/<id>/review.json` — the deterministic
@@ -122,11 +204,89 @@ export interface ReviewViolation {
 	reason: string;
 }
 
+export type ReviewDigestKind = "sha256" | "sha256-prefix+size";
+
+/**
+ * Phase 5 (Execution Efficiency Optimization): deterministic structured
+ * compact facts for one sufficiently large current regular `.svg` /
+ * `.json` worker path. Additive on the review record — schema_version
+ * stays 1; legacy records without the field remain readable. The digest
+ * is the EXISTING bounded current path content digest (full SHA-256 up to
+ * 4 MiB, bounded-prefix+size beyond — never weakened, honestly labelled
+ * via digest_kind). Preview texts are redacted, UTF-8-safe, stored as
+ * JSON-escaped single lines (they can never defeat the global line caps)
+ * and NEVER empty for a non-empty window: a window that holds no
+ * complete line (minified/single-line JSON) falls back to its bounded
+ * text as a partial-line preview, and every byte/line/window field
+ * describes exactly the SHOWN preview text. generator_equality is always
+ * NOT_VERIFIED: the review never executes or imports repository
+ * generators, so generator equality is never claimed and requires
+ * independent current-state generator validation.
+ */
+export interface ReviewCompactFacts {
+	/** Current porcelain status code of the path (" M", "??", "A ", "D "...). */
+	git_status: string;
+	/** Real byte size of the current regular file. */
+	size_bytes: number;
+	/** Current content digest (the existing digest form — see digest_kind). */
+	digest: string;
+	/** "sha256" full form (≤ 4 MiB) or "sha256-prefix+size" bounded form (> 4 MiB). */
+	digest_kind: ReviewDigestKind;
+	/** Fixed byte boundary of the existing digest form (MAX_DIGEST_BYTES). */
+	digest_max_bytes: number;
+	/** True when the current digest exactly equals the worker's recorded-after digest. */
+	digest_matches_after: boolean;
+	/** Always "NOT_VERIFIED" — never fabricated, never claimed by review. */
+	generator_equality: "NOT_VERIFIED";
+	/** JSON-escaped single-line head preview (redacted, UTF-8-safe, bounded). */
+	head_preview: string;
+	/**
+	 * JSON-escaped single-line tail preview (redacted, UTF-8-safe,
+	 * bounded) — a UTF-8-safe bounded SUFFIX of the redacted tail
+	 * capture, so it represents the actual end of the file for both
+	 * complete-line captures and the partial-line minified/single-line
+	 * JSON fallback.
+	 */
+	tail_preview: string;
+	/** Complete head lines in the preview; 0 when the head window held no complete line (head_partial_line). */
+	head_lines: number;
+	/** Complete tail lines in the preview; 0 when the tail window held no complete line (tail_partial_line). */
+	tail_lines: number;
+	/**
+	 * True when the head preview is the head window's bounded partial-line
+	 * text (the window held NO complete line — e.g. minified/single-line
+	 * JSON); false when the preview consists of head_lines complete lines.
+	 */
+	head_partial_line: boolean;
+	/**
+	 * True when the tail preview is the tail window's bounded partial-line
+	 * text (the window held NO complete line — e.g. minified/single-line
+	 * JSON); false when the preview consists of tail_lines complete lines.
+	 */
+	tail_partial_line: boolean;
+	/** Byte size of the SHOWN head preview text (redacted, truncated to the preview bound, before JSON escaping). */
+	head_bytes: number;
+	/** Byte size of the SHOWN tail preview text (redacted, truncated to the preview bound, before JSON escaping). */
+	tail_bytes: number;
+	/**
+	 * True exactly when the file holds content beyond the shown head+tail
+	 * preview bytes or a line cap cut complete lines — exact, and always
+	 * true for eligible files (their size exceeds the shown preview bytes).
+	 */
+	content_truncated: boolean;
+}
+
 export interface ReviewPatchEntry {
 	path: string;
-	source: "git-diff" | "file-content" | "deleted";
+	/** "compact" and "withheld" are Phase 5 additive source literals. */
+	source: "git-diff" | "file-content" | "deleted" | "compact" | "withheld";
 	text: string;
 	truncated: boolean;
+	/**
+	 * Phase 5: additive structured compact facts — present exactly when
+	 * source === "compact"; legacy records without the field stay readable.
+	 */
+	compact?: ReviewCompactFacts;
 }
 
 /** Bounded per-path patch stat (bytes of the rendered entry text; 0 when omitted). */
@@ -206,16 +366,73 @@ export interface ReviewInput {
 	now?: string;
 }
 
+/**
+ * Deterministic compact eligibility: the project-relative worker path ends
+ * in `.svg` or `.json` (case-insensitive). Ordinary source/text files are
+ * never eligible — their diffs are never hidden by compactness.
+ */
+export function isCompactEligiblePath(path: string): boolean {
+	const lower = path.toLowerCase();
+	return COMPACT_ELIGIBLE_EXTENSIONS.some((ext) => lower.endsWith(ext));
+}
+
+/**
+ * Honest label of the existing digest form: a 64-hex SHA-256 is the full
+ * form (file ≤ MAX_DIGEST_BYTES); `sha256:size` is the bounded
+ * prefix+size form (file > MAX_DIGEST_BYTES). The 4 MiB digest semantics
+ * are unchanged — only the label is explicit.
+ */
+export function digestKindOf(digest: string): ReviewDigestKind {
+	return /^[0-9a-f]{64}:\d+$/.test(digest) ? "sha256-prefix+size" : "sha256";
+}
+
 function boundInt(raw: number | undefined, fallback: number, min: number, max: number): number {
 	if (typeof raw !== "number" || !Number.isInteger(raw)) return fallback;
 	return Math.min(Math.max(raw, min), max);
 }
 
 /**
+ * Largest UTF-8-safe SUFFIX of `text` whose byte length does not exceed
+ * `maxBytes` — the tail mirror of truncateUtf8 (prefix): the cut walks
+ * CODE POINTS from the end (never UTF-16 code units), so it can never
+ * split a surrogate pair — a lone high/low surrogate (which Buffer would
+ * encode as U+FFFD) is impossible and no replacement character can
+ * appear in the result. Malformed inputs (non-string text, non-finite or
+ * negative maxBytes) fail safe and return the input unchanged / an empty
+ * string respectively — never a throw, never a partial code point. Each
+ * examined code point is O(1) and the walk stops once the limit is
+ * reached, so the bound is deterministic and cheap for the fixed
+ * 1024-byte preview bound.
+ */
+export function suffixUtf8(text: string, maxBytes: number): string {
+	if (typeof text !== "string") return "";
+	const limit = Number.isFinite(maxBytes) && maxBytes >= 0 ? Math.floor(maxBytes) : 0;
+	if (limit <= 0) return "";
+	if (Buffer.byteLength(text, "utf8") <= limit) return text;
+	let end = text.length;
+	let used = 0;
+	while (end > 0) {
+		let codePointLength = 1;
+		const last = text.charCodeAt(end - 1);
+		if (last >= 0xdc00 && last <= 0xdfff && end >= 2) {
+			const prev = text.charCodeAt(end - 2);
+			if (prev >= 0xd800 && prev <= 0xdbff) codePointLength = 2;
+		}
+		const bytes = Buffer.byteLength(text.slice(end - codePointLength, end), "utf8");
+		if (used + bytes > limit) break;
+		used += bytes;
+		end -= codePointLength;
+	}
+	return text.slice(end);
+}
+
+/**
  * Bounded redacted patch text for one path: git diff + staged diff for
  * tracked changes; bounded-prefix file content for untracked files
- * (the file is never read in full — first maxBytes bytes plus the real
- * size, exactly like the digest reads); "(deleted)" marker when the path
+ * (the display capture never reads beyond the first maxBytes bytes —
+ * stat reports the real size; the existing bounded content digest
+ * computed for the path may read the complete file through 4 MiB and
+ * uses prefix+size beyond); "(deleted)" marker when the path
  * is gone. Per-path text is redacted and pre-bounded to maxBytes; the
  * GLOBAL line/byte caps over the rendered patch are enforced later by
  * boundPatchEntries (never independently per path).
@@ -226,7 +443,7 @@ async function patchTextFor(
 	exec: ExecFn,
 	secrets: readonly string[],
 	maxBytes: number,
-): Promise<{ text: string; source: ReviewPatchEntry["source"]; truncated: boolean }> {
+): Promise<{ text: string; source: ReviewPatchEntry["source"]; truncated: boolean; compact?: ReviewCompactFacts }> {
 	try {
 		const worktree = await exec("git", ["diff", "--", path], { cwd: projectRoot });
 		const staged = await exec("git", ["diff", "--cached", "--", path], { cwd: projectRoot });
@@ -261,6 +478,249 @@ async function patchTextFor(
 }
 
 /**
+ * Bounded head+tail read of a regular file: two window reads plus stat —
+ * this display capture NEVER reads the file in full (the existing
+ * bounded content digest, computed separately, may read the complete
+ * file through 4 MiB and uses prefix+size beyond). Returns null for
+ * missing/unreadable/non-regular paths; the caller then falls back to the
+ * existing git-diff/content behavior. headEndsAtLineBoundary is true when
+ * the byte right after the head window is a newline or the file ends
+ * inside the window (the window's final line is complete);
+ * tailStartsAtLineBoundary is true when the byte right before the tail
+ * window is a newline (the window starts at a line boundary).
+ */
+async function readBoundedHeadTail(
+	absolutePath: string,
+	windowBytes: number,
+): Promise<{ head: Buffer; tail: Buffer; headEndsAtLineBoundary: boolean; tailStartsAtLineBoundary: boolean; size: number } | null> {
+	try {
+		const handle = await open(absolutePath, "r");
+		try {
+			const st = await handle.stat();
+			if (!st.isFile()) return null;
+			const size = st.size;
+			const headBuf = Buffer.alloc(Math.min(size, windowBytes));
+			let head = headBuf;
+			if (headBuf.length > 0) {
+				const { bytesRead } = await handle.read(headBuf, 0, headBuf.length, 0);
+				// The file may have shrunk between stat and read — never render
+				// zero-filled bytes beyond the actual read.
+				if (bytesRead < headBuf.length) head = headBuf.subarray(0, bytesRead);
+			}
+			// The head window's final line is complete exactly when the file
+			// ends inside the window or the byte right after the window is a
+			// newline — a one-byte probe read, never a full read.
+			let headEndsAtLineBoundary = true;
+			if (size > head.length) {
+				const next = Buffer.alloc(1);
+				const { bytesRead } = await handle.read(next, 0, 1, head.length);
+				headEndsAtLineBoundary = bytesRead === 0 || next[0] === 0x0a;
+			}
+			let tail = Buffer.alloc(0);
+			let tailStartsAtLineBoundary = true;
+			if (size > windowBytes) {
+				const tailBuf = Buffer.alloc(windowBytes);
+				const { bytesRead } = await handle.read(tailBuf, 0, windowBytes, size - windowBytes);
+				tail = bytesRead < tailBuf.length ? tailBuf.subarray(0, bytesRead) : tailBuf;
+				if (size > windowBytes + 1) {
+					const lead = Buffer.alloc(1);
+					await handle.read(lead, 0, 1, size - windowBytes - 1);
+					tailStartsAtLineBoundary = lead[0] === 0x0a;
+				}
+			}
+			return { head, tail, headEndsAtLineBoundary, tailStartsAtLineBoundary, size };
+		} finally {
+			await handle.close();
+		}
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * One bounded preview window capture. `lines` holds the complete lines
+ * captured (bounded by the line cap); `partial` is the window's partial
+ * line — non-empty exactly when the window holds NO complete line
+ * (minified/single-line JSON) — so the preview is never empty for a
+ * non-empty window; `moreLines` reports complete lines cut by the line
+ * cap.
+ */
+interface CapturedPreview {
+	lines: string[];
+	partial: string;
+	moreLines: boolean;
+}
+
+/**
+ * Complete lines captured from the HEAD window with the exact boundary
+ * fact: the window's final fragment is a complete line exactly when the
+ * file ends inside the window or the byte right after the window is a
+ * newline (headEndsAtLineBoundary). A partial final fragment is dropped
+ * (its content belongs to the middle), a trailing empty element after a
+ * final newline is dropped. When the window holds NO complete line, the
+ * bounded window text itself is returned as `partial`. Returns the first
+ * `maxLines` complete lines and whether more complete lines were cut by
+ * the line cap.
+ */
+function captureHeadLines(text: string, headEndsAtLineBoundary: boolean, maxLines: number): CapturedPreview {
+	if (text.length === 0) return { lines: [], partial: "", moreLines: false };
+	const parts = text.split("\n");
+	if (text.endsWith("\n")) {
+		parts.pop();
+	} else if (!headEndsAtLineBoundary) {
+		// The window cut the final fragment — it is a partial line whose
+		// content belongs to the middle.
+		parts.pop();
+	}
+	if (parts.length === 0) return { lines: [], partial: text, moreLines: false };
+	const lines = parts.slice(0, maxLines);
+	return { lines, partial: "", moreLines: parts.length > maxLines };
+}
+
+/**
+ * Complete lines captured from the TAIL window: a leading partial-line
+ * fragment (the window starts mid-line) is dropped, a trailing empty
+ * element after a final newline is dropped, and the file's final line
+ * (even without a trailing newline) is kept. When the window holds NO
+ * complete line, the bounded window text itself is returned as
+ * `partial`. Returns the last `maxLines` complete lines and whether more
+ * complete lines were cut by the line cap. The caller applies a
+ * UTF-8-safe SUFFIX bound to the tail preview, so the partial-line
+ * fallback shows the window's END fragment — the actual end of the file.
+ */
+function captureTailLines(text: string, startsAtLineBoundary: boolean, maxLines: number): CapturedPreview {
+	if (text.length === 0) return { lines: [], partial: "", moreLines: false };
+	const parts = text.split("\n");
+	if (!startsAtLineBoundary) parts.shift();
+	if (text.endsWith("\n")) parts.pop();
+	if (parts.length === 0) return { lines: [], partial: text, moreLines: false };
+	const lines = parts.slice(-maxLines);
+	return { lines, partial: "", moreLines: parts.length > maxLines };
+}
+
+/**
+ * Deterministic compact facts for one eligible path, or null when the
+ * path is not a current readable regular file, not large enough, or not
+ * project-root realpath-contained — the caller then falls back to the
+ * existing git-diff/content behavior. Only bounded head/tail window reads
+ * plus the existing bounded content digest are performed: no per-path git
+ * diff capture, no additional unbounded/full-file DISPLAY or preview
+ * capture, and no repository generator is ever executed or imported. The
+ * existing digest itself may read the complete file through 4 MiB
+ * (bounded prefix+size beyond) — the digest bound is unchanged. The
+ * project-root realpath containment defense is
+ * re-verified immediately before the reads: the path already passed the
+ * authoritative scope/realpath check, and a compact read must never
+ * follow an escaping symlink (e.g. a path swapped after the scope
+ * check). Preview texts are redacted, UTF-8-safe and non-empty for
+ * non-empty windows: a window with no complete line (minified/
+ * single-line JSON) shows its bounded text as a partial-line preview;
+ * the head preview is a bounded PREFIX of the redacted head capture and
+ * the tail preview a bounded SUFFIX of the redacted tail capture, so the
+ * shown tail text is the window's END — the actual end of the file. The
+ * structured byte/line/window fields describe exactly the SHOWN preview
+ * text (content_truncated is exact: shown bytes + line caps vs file
+ * size).
+ */
+async function compactFactsFor(
+	projectRoot: string,
+	path: string,
+	secrets: readonly string[],
+	afterDigests: Readonly<Record<string, string>>,
+	currentStatus: string,
+): Promise<ReviewCompactFacts | null> {
+	const real = await realpathContained(projectRoot, path);
+	if (real === undefined) return null;
+	const read = await readBoundedHeadTail(real, COMPACT_READ_BYTES);
+	if (!read || read.size <= COMPACT_MIN_BYTES) return null;
+	const digest = await contentDigest(projectRoot, path);
+	if (digest === undefined) return null;
+	const head = captureHeadLines(read.head.toString("utf8"), read.headEndsAtLineBoundary, COMPACT_PREVIEW_LINES);
+	const tail = captureTailLines(read.tail.toString("utf8"), read.tailStartsAtLineBoundary, COMPACT_PREVIEW_LINES);
+	const headRaw = head.lines.length > 0 ? head.lines.join("\n") : head.partial;
+	const tailRaw = tail.lines.length > 0 ? tail.lines.join("\n") : tail.partial;
+	// Head preview: UTF-8-safe bounded PREFIX of the redacted head capture.
+	const headShown = truncateUtf8(redactText(headRaw, secrets), COMPACT_PREVIEW_MAX_BYTES);
+	// Tail preview: UTF-8-safe bounded SUFFIX of the redacted tail capture
+	// — the shown text is the END of the window, so it represents the
+	// actual end of the file for BOTH complete-line captures and the
+	// partial-line minified/single-line JSON fallback.
+	const tailShown = suffixUtf8(redactText(tailRaw, secrets), COMPACT_PREVIEW_MAX_BYTES);
+	const headBytes = Buffer.byteLength(headShown, "utf8");
+	const tailBytes = Buffer.byteLength(tailShown, "utf8");
+	const afterDigest = afterDigests[path];
+	return {
+		git_status: currentStatus,
+		size_bytes: read.size,
+		digest,
+		digest_kind: digestKindOf(digest),
+		digest_max_bytes: MAX_DIGEST_BYTES,
+		digest_matches_after: afterDigest !== undefined && afterDigest === digest,
+		generator_equality: COMPACT_GENERATOR_EQUALITY,
+		head_preview: JSON.stringify(headShown),
+		tail_preview: JSON.stringify(tailShown),
+		head_lines: head.lines.length,
+		tail_lines: tail.lines.length,
+		head_partial_line: head.lines.length === 0 && head.partial.length > 0,
+		tail_partial_line: tail.lines.length === 0 && tail.partial.length > 0,
+		head_bytes: headBytes,
+		tail_bytes: tailBytes,
+		content_truncated: read.size > headBytes + tailBytes || head.moreLines || tail.moreLines,
+	};
+}
+
+/**
+ * Deterministic bounded rendered text of one compact entry — the rendered
+ * facts mirror the persisted structured facts exactly, and the head/tail
+ * previews are JSON-escaped single lines that can never defeat the global
+ * line caps.
+ */
+export function renderCompactFacts(facts: ReviewCompactFacts): string {
+	const digestKindNote = facts.digest_kind === "sha256-prefix+size" ? ` beyond ${facts.digest_max_bytes} bytes` : "";
+	const headDetail = facts.head_partial_line ? "partial line — no complete line in the head window" : `${facts.head_lines} complete line(s)`;
+	const tailDetail = facts.tail_partial_line ? "partial line — no complete line in the tail window" : `${facts.tail_lines} complete line(s)`;
+	return [
+		`compact   : status=${JSON.stringify(facts.git_status)} size=${facts.size_bytes} bytes digest=${facts.digest} (${facts.digest_kind}${digestKindNote})`,
+		`digest    : ${facts.digest_matches_after ? "matches the worker's recorded-after digest" : "DIFFERS from the worker's recorded-after digest (or no recorded-after digest exists)"}`,
+		`head      : ${facts.head_preview} (${headDetail}, ${facts.head_bytes} bytes)`,
+		`tail      : ${facts.tail_preview} (${tailDetail}, ${facts.tail_bytes} bytes)`,
+		`truncated : content beyond the shown head+tail preview bytes is not rendered (content_truncated=${facts.content_truncated})`,
+		`generator : generator equality ${facts.generator_equality} — the diff-review service never executes or imports repository generators; independent current-state generator validation is required`,
+	].join("\n");
+}
+
+/**
+ * Bounded redacted patch entry for ONE path. Phase 5: a sufficiently
+ * large CURRENT REGULAR `.svg`/`.json` worker path takes the compact path
+ * FIRST — no per-path git diff capture and no additional unbounded/
+ * full-file DISPLAY or preview capture (the existing bounded content
+ * digest may read the complete file through 4 MiB and uses prefix+size
+ * beyond); every other path (ordinary source, small files,
+ * deleted/unreadable/non-regular) keeps the existing
+ * git-diff/content/deleted behavior. Scope-violating
+ * paths are withheld by the review loop BEFORE this function is reached —
+ * no content operation (git diff, open, read, digest, render) ever runs
+ * for them.
+ */
+async function patchEntryFor(
+	projectRoot: string,
+	path: string,
+	exec: ExecFn,
+	secrets: readonly string[],
+	maxBytes: number,
+	afterDigests: Readonly<Record<string, string>>,
+	currentStatus: string,
+): Promise<RawPatchEntry> {
+	if (isCompactEligiblePath(path)) {
+		const compact = await compactFactsFor(projectRoot, path, secrets, afterDigests, currentStatus);
+		if (compact) {
+			return { path, source: "compact", text: renderCompactFacts(compact), perPathTruncated: compact.content_truncated, compact };
+		}
+	}
+	return patchTextFor(projectRoot, path, exec, secrets, maxBytes).then((entry) => ({ path, ...entry, perPathTruncated: entry.truncated }));
+}
+
+/**
  * Slice one patch text to a remaining line AND byte budget (UTF-8-safe;
  * the line cut wins, then the byte cut may end the last kept line early).
  */
@@ -274,6 +734,8 @@ interface RawPatchEntry {
 	source: ReviewPatchEntry["source"];
 	text: string;
 	perPathTruncated: boolean;
+	/** Phase 5: additive structured compact facts (source === "compact"). */
+	compact?: ReviewCompactFacts;
 }
 
 /**
@@ -304,10 +766,10 @@ function boundPatchEntries(
 			}
 			const cut = sliceTextToBudgets(entry.text, remainingLines, remainingBytes);
 			if (cut !== entry.text || entry.perPathTruncated) truncated = true;
-			out.push({ path: entry.path, source: entry.source, text: cut, truncated: true });
+			out.push({ path: entry.path, source: entry.source, text: cut, truncated: true, compact: entry.compact });
 			break;
 		}
-		out.push({ path: entry.path, source: entry.source, text: entry.text, truncated: entry.perPathTruncated });
+		out.push({ path: entry.path, source: entry.source, text: entry.text, truncated: entry.perPathTruncated, compact: entry.compact });
 		lines += entryLines + 1;
 		bytes += entryBytes + markerBytes;
 		// ANY per-path truncation makes the rendered patch incomplete, even
@@ -426,11 +888,35 @@ export async function reviewDelegation(input: ReviewInput): Promise<ReviewResult
 	// corrupt/foreign records read as null (no prior coverage).
 	const priorReview = await readReviewRecord(projectRoot, delegationId);
 
+	// Worker paths = TRUE paths changed between before and after (the ledger
+	// derived them digest-based; previously-dirty paths are included).
+	const workerPaths = [...ledger.after.changed_since_before].sort();
+	const allowedPaths = ledger.before.contract.allowed_paths;
+
+	// Scope check over ALL worker paths — include_paths can never hide a
+	// violation. The check is realpath-safe: a symlink inside an approved
+	// subtree that resolves OUTSIDE the subtree (or the project) is a
+	// violation. It runs FIRST — before any git/content collection —
+	// because it gates the review's entire per-path content pipeline: a
+	// violating path is withheld below (deterministic bounded marker) and
+	// is never git-diffed, opened, read, digested or rendered.
+	const violations: ReviewViolation[] = [];
+	for (const path of workerPaths) {
+		if (!(await isWorkerPathAllowedRealpath(projectRoot, path, allowedPaths))) {
+			violations.push({
+				path,
+				reason: `changed path "${path}" is outside the parent-approved scope (realpath/symlink check): ${allowedPaths.join(", ")}`,
+			});
+		}
+	}
+	const violationSet = new Set(violations.map((v) => v.path));
+
 	// Real git state NOW — the review inspects the actual tree, never the
 	// ledger's claims. Fail closed: an unavailable `git status` (thrown exec
 	// error or non-zero exit) returns a structured failure and writes NO
 	// review record — a fabricated clean tree could never be reviewed as
-	// PASS.
+	// PASS. The whole-diff hash binding (collectGitFacts) is unchanged and
+	// always covers the complete actual diff, violating paths included.
 	let current: GitFacts;
 	try {
 		current = await collectGitFacts(projectRoot, input.exec);
@@ -444,11 +930,6 @@ export async function reviewDelegation(input: ReviewInput): Promise<ReviewResult
 	const boundDiffHash = computeDiffHash(current.changedPaths, current.pathDigests, current.pathStatuses);
 	const recordedAfterHash = ledger.after.diff_hash;
 	const mismatch = boundDiffHash !== recordedAfterHash;
-
-	// Worker paths = TRUE paths changed between before and after (the ledger
-	// derived them digest-based; previously-dirty paths are included).
-	const workerPaths = [...ledger.after.changed_since_before].sort();
-	const allowedPaths = ledger.before.contract.allowed_paths;
 
 	// Include paths narrow only the patch and may name ONLY worker-diff
 	// paths. Unsafe entries (absolute, drive-letter, ".." escape, overlong)
@@ -477,20 +958,6 @@ export async function reviewDelegation(input: ReviewInput): Promise<ReviewResult
 		includeSet.add(normalized);
 	}
 	const patchPaths = includeSet.size > 0 ? [...includeSet] : workerPaths;
-
-	// Scope check over ALL worker paths — include_paths can never hide a
-	// violation. The check is realpath-safe: a symlink inside an approved
-	// subtree that resolves OUTSIDE the subtree (or the project) is a
-	// violation.
-	const violations: ReviewViolation[] = [];
-	for (const path of workerPaths) {
-		if (!(await isWorkerPathAllowedRealpath(projectRoot, path, allowedPaths))) {
-			violations.push({
-				path,
-				reason: `changed path "${path}" is outside the parent-approved scope (realpath/symlink check): ${allowedPaths.join(", ")}`,
-			});
-		}
-	}
 
 	// Drift: paths whose state differs from the recorded-after snapshot
 	// (new paths, same-path later edits via digest/status comparison,
@@ -538,10 +1005,24 @@ export async function reviewDelegation(input: ReviewInput): Promise<ReviewResult
 	// line AND byte caps are enforced over the whole rendered patch content
 	// (never independently per path). Scope checks and the bound hash always
 	// cover the complete actual diff — truncation affects only the display.
+	// Fail closed: a violating path is withheld BEFORE any content open/
+	// read/digest/display — its entry is the deterministic bounded marker,
+	// never a git diff, file read, digest or rendered content.
 	const rawEntries: RawPatchEntry[] = [];
 	for (const path of patchPaths.slice(0, MAX_REVIEW_PATCH_PATHS)) {
-		const { text, source, truncated } = await patchTextFor(projectRoot, path, input.exec, secrets, maxBytes);
-		rawEntries.push({ path, source, text, perPathTruncated: truncated });
+		if (violationSet.has(path)) {
+			// Fail closed BEFORE any content open/read/digest/display: the
+			// authoritative scope/realpath check found this worker path
+			// outside the parent-approved scope — no git diff capture, no
+			// file open/read, no digest, no content render. The deterministic
+			// bounded withheld marker is the path's COMPLETE evidence
+			// segment: it still counts as an actually displayed entry
+			// (coverage) and the verdict stays FAIL.
+			rawEntries.push({ path, source: "withheld", text: WITHHELD_MARKER, perPathTruncated: false });
+			continue;
+		}
+		const entry = await patchEntryFor(projectRoot, path, input.exec, secrets, maxBytes, ledger.after.path_digests, current.pathStatuses[path] ?? "");
+		rawEntries.push(entry);
 	}
 	const bounded = boundPatchEntries(rawEntries, maxLines, maxBytes);
 	const patch = bounded.entries;

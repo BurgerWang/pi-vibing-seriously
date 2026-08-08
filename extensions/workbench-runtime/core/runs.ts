@@ -15,7 +15,9 @@ import { join } from "node:path";
 import { truncateTail } from "@earendil-works/pi-coding-agent";
 
 import { runsDir } from "./config.ts";
+import type { ValidationComponent } from "./recipe-schema.ts";
 import type { ValidationEvidenceBlock } from "./validation-evidence.ts";
+import type { CacheRequestMode } from "../cache/action-types.ts";
 
 export const RUN_SCHEMA_VERSION = 1;
 
@@ -60,6 +62,19 @@ export interface RunRecord {
 	expected_exit_codes: number[];
 	declared_writes: string[];
 	environment_names: string[];
+	/**
+	 * Phase 2A: the recipe's declared validation components (closed set:
+	 * typecheck | unit-test | whitespace) — the exact recipe declaration,
+	 * required on every manifest.
+	 */
+	validation_components: ValidationComponent[];
+	/**
+	 * P6-C: cache request mode of this run. "default" reads/writes per the
+	 * recipe cache policy; "no-cache" never touches the cache;
+	 * "refresh-cache" never reads but rewrites on success. Cache-hit
+	 * materialized runs are always "default" — only default mode reads hits.
+	 */
+	cache_request_mode: CacheRequestMode;
 	/** P6-C: how this run was produced. Absent = executed normally. */
 	execution_source?: "exec" | "cache";
 	/** P6-C: action key when execution_source === "cache". */

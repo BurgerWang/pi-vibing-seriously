@@ -13,6 +13,7 @@ import {
 	parseWorkerAllowedPaths,
 	recipeMutationBlockReason,
 	resolveWorkerBudgetProfile,
+	resolveWorkerRepairOf,
 	workerRecipeBlockReason,
 	workerRoleToolCallBlockReason,
 	WORKER_ROLE,
@@ -283,6 +284,36 @@ test("delegate-tool metadata codifies profile choice and bounded-slicing granula
 	assert.match(text, /never one open-ended worker task/);
 });
 
+test("delegate-tool metadata codifies the bounded repair_of provenance contract (Phase 4D)", () => {
+	const meta = WORKBENCH_TOOL_METADATA.workbench_delegate_worker;
+	const text = [meta.description, meta.promptSnippet, ...meta.promptGuidelines].join("\n");
+	// The optional repair_of pointer is named as strict prior delegation-id
+	// provenance for repairs of a KNOWN root cause only.
+	assert.match(text, /repair_of/);
+	assert.match(text, /known-root-cause repair/);
+	assert.match(text, /after Sol has fixed the root cause and decided the scope/);
+	// The parent task itself must carry the bounded failure evidence; the
+	// pointer adds none of its own.
+	assert.match(text, /bounded failure evidence/);
+	// The runtime requires a FINISHED prior delegation ledger before any new
+	// ledger is created or any worker is launched.
+	assert.match(text, /FINISHED prior delegation ledger/);
+	assert.match(text, /before any new ledger is created or any worker is launched/);
+	// Fresh worker, nothing inherited: the pointer never resumes the prior
+	// worker and the fresh worker inherits no prior report, session, scope,
+	// or contract.
+	assert.match(text, /never resumes the prior worker/);
+	assert.match(text, /inherits no prior report, session, scope, or contract/);
+	// No authority expansion: the pointer adds no path/scope/authority and
+	// never expands paths, scope, or authority.
+	assert.match(text, /adds no path\/scope\/authority/);
+	assert.match(text, /never expands paths, scope, or authority/);
+	// Unknown root causes still use bounded diagnosis then a Sol decision —
+	// repair_of never replaces that path.
+	assert.match(text, /unknown root cause still requires bounded diagnosis/);
+	assert.match(text, /Sol architecture\/scope decision/);
+});
+
 test("worker-delegation documentation defines the risk rubric, worker-first high-risk delegation, fresh continuation, one writing worker, and the P7 ledger/review lifecycle", async () => {
 	const doc = await readFile(new URL("../docs/worker-delegation.md", import.meta.url), "utf8");
 	// Risk rubric with low/medium/high tiers.
@@ -316,4 +347,103 @@ test("worker-delegation documentation defines the risk rubric, worker-first high
 	assert.match(doc, /PENDING_REVIEW → REVIEWED → \(current diff hash changes\) → STALE/);
 	assert.match(doc, /a pending or stale review blocks BOTH the next delegation/);
 	assert.match(doc, /and VERIFY \(`\/q-mode-verify`\s+refuses/);
+});
+
+// ---------------------------------------------------------------------------
+// Phase 4A: repair-provenance contract validation (worker repair slices)
+// ---------------------------------------------------------------------------
+
+const VALID_REPAIR_ID = "20250101-120000-abcd";
+
+test("repair-of validation accepts omitted and exact delegation ids only", () => {
+	assert.deepEqual(resolveWorkerRepairOf(undefined), { ok: true, repairOf: undefined });
+	assert.deepEqual(resolveWorkerRepairOf(VALID_REPAIR_ID), { ok: true, repairOf: VALID_REPAIR_ID });
+	// The 4-character suffix is alphanumeric in either case.
+	assert.deepEqual(resolveWorkerRepairOf("20250101-120000-ABCD"), { ok: true, repairOf: "20250101-120000-ABCD" });
+	assert.deepEqual(resolveWorkerRepairOf("20250101-120000-9aZ0"), { ok: true, repairOf: "20250101-120000-9aZ0" });
+});
+
+test("repair-of validation fails closed on malformed strings and wrong types", () => {
+	// Whitespace-padded, wrong-length, wrong-separator, traversal-shaped,
+	// non-ASCII, and case-pattern violations all fail closed — only the
+	// exact 20-character id shape (8 digits-6 digits-4 alphanumerics) is
+	// accepted.
+	const malformed = [
+		"",
+		" 20250101-120000-abcd",
+		"20250101-120000-abcd ",
+		"20250101-120000-abcd\n",
+		"20250101-120000-abcd/",
+		"../20250101-120000-abcd",
+		"20250101/120000/abcd",
+		"20250101-120000-ab c",
+		"2025010-120000-abcd", // 19 characters
+		"20250101-120000-abcdE", // 21 characters
+		"2025O1O1-12OOOO-abcd", // letters in digit positions
+		"ABCDEFGH-120000-abcd", // letters in the date part
+		"２０２５０１０１-１２００００-ａｂｃｄ", // full-width non-ASCII
+		"20250101-120000-абвг", // non-ASCII suffix
+	];
+	for (const bad of malformed) {
+		const r = resolveWorkerRepairOf(bad);
+		assert.equal(r.ok, false, `string ${JSON.stringify(bad)} must fail closed`);
+		if (!r.ok) assert.match(r.error, /repair_of must be a valid 20-character delegation id/);
+	}
+	// Wrong types fail closed too.
+	for (const bad of [null, 0, 42, 3.5, true, false, {}, { repairOf: VALID_REPAIR_ID }, [], [VALID_REPAIR_ID]]) {
+		const r = resolveWorkerRepairOf(bad);
+		assert.equal(r.ok, false, `${JSON.stringify(bad)} must fail closed`);
+		if (!r.ok) assert.match(r.error, /repair_of must be a valid 20-character delegation id/);
+	}
+	// The error stays bounded even for pathological values: never the full
+	// value, and never an unbounded message (raw and escaped preview caps).
+	for (const pathological of ["x".repeat(10_000), "\u0000".repeat(10_000)]) {
+		const r = resolveWorkerRepairOf(pathological);
+		assert.equal(r.ok, false);
+		if (!r.ok) {
+			assert.ok(r.error.length < 200, "error message stays bounded");
+			assert.ok(!r.error.includes(pathological), "never the full pathological value");
+		}
+	}
+});
+
+test("formatted worker task carries the repair provenance pointer line only when present (Phase 4A)", () => {
+	const base: WorkerTaskContract = {
+		task: "Repair the parser slice",
+		allowedPaths: ["src/parser/**", "tests/parser.test.ts"],
+		acceptanceCriteria: ["Unit tests cover the repaired option"],
+		verification: ["Run unit-test recipe"],
+	};
+	// Omitted: no provenance line at all; the rest of the contract travels
+	// unchanged.
+	const without = formatWorkerTask(base);
+	assert.ok(!without.includes("Repair provenance"), "no provenance line when repairOf is omitted");
+	assert.match(without, /Worker spend-budget profile: standard/);
+	assert.match(without, /- src\/parser\/\*\*/);
+	assert.match(without, /- Unit tests cover the repaired option/);
+	assert.match(without, /Requested verification:/);
+	// Present: the exact deterministic line precedes the spend-profile line.
+	const withRepair = formatWorkerTask({ ...base, repairOf: VALID_REPAIR_ID });
+	const repairLine = `Repair provenance: ${VALID_REPAIR_ID} — pointer only; fresh worker; no prior session/report inherited.`;
+	assert.ok(withRepair.includes(repairLine), "exact provenance line is present");
+	const repairIndex = withRepair.indexOf("Repair provenance:");
+	const profileIndex = withRepair.indexOf("Worker spend-budget profile:");
+	assert.ok(repairIndex !== -1 && repairIndex < profileIndex, "provenance line precedes the spend-profile line");
+	// Informational only: paths, criteria, verification, and the budget
+	// profile line all remain unchanged.
+	for (const path of base.allowedPaths) assert.ok(withRepair.includes(path), `allowed path missing: ${path}`);
+	for (const criterion of base.acceptanceCriteria) assert.ok(withRepair.includes(criterion), `criterion missing: ${criterion}`);
+	for (const step of base.verification) assert.ok(withRepair.includes(step), `verification step missing: ${step}`);
+	assert.match(withRepair, /Worker spend-budget profile: standard/);
+	// Adding repairOf changes nothing but the inserted line.
+	assert.equal(
+		withRepair,
+		without.replace("Worker spend-budget profile:", `${repairLine}\nWorker spend-budget profile:`),
+		"the only difference is the provenance line",
+	);
+	// Combined with an explicit budget profile, both lines coexist with the
+	// provenance pointer first and the profile rendering unchanged.
+	const combined = formatWorkerTask({ ...base, repairOf: VALID_REPAIR_ID, budgetProfile: "low" });
+	assert.ok(combined.indexOf("Repair provenance:") < combined.indexOf("Worker spend-budget profile: low"));
+	assert.match(combined, /Worker spend-budget profile: low — bounds cumulative spend only/);
 });

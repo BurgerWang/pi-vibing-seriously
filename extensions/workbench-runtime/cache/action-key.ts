@@ -62,6 +62,7 @@ export function recipeDefinitionHash(recipe: Recipe): string {
 		writes: recipe.writes,
 		artifacts: recipe.artifacts,
 		environment: recipe.environment,
+		validation_components: recipe.validation_components,
 		output_strategy: recipe.output_strategy,
 		max_lines: recipe.max_lines,
 		max_bytes: recipe.max_bytes,

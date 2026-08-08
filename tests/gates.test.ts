@@ -16,7 +16,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdir, readFile, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, symlink, writeFile } from "node:fs/promises";
 import { join, sep } from "node:path";
 
 import {
@@ -24,6 +24,7 @@ import {
 	fileCheckRoot,
 	latestGateStatus,
 	loadGates,
+	preflightGateManualEvidence,
 	runGates,
 	type CheckContext,
 } from "../extensions/workbench-runtime/core/gate-engine.ts";
@@ -1438,5 +1439,232 @@ test("P4a: legacy manifests without validation_evidence stay readable (additive 
 		const fresh = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
 		const freshRead = await readManifest(dir, fresh.runId);
 		assert.ok(freshRead?.validation_evidence, "new runs persist the additive field");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Phase 3A: pure/read-only manual-evidence preflight
+// ---------------------------------------------------------------------------
+
+test("preflight reports required manual checks in deterministic effective order with exact provided flags", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(
+				[
+					`  - id: g2\n    title: G2\n    checks:\n      - { id: g2.1, title: Audit A, kind: manual, prompt: "audit a" }\n      - { id: g2.2, title: Optional audit, kind: manual, required: false, prompt: "optional audit" }\n      - { id: g2.3, title: Config, kind: config }`,
+					`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Audit B, kind: manual, prompt: "audit b" }`,
+					`  - id: g3\n    title: G3\n    checks:\n      - { id: g3.1, title: Optional only, kind: manual, required: false }`,
+				].join("\n"),
+			),
+		});
+
+		const result = await preflightGateManualEvidence({
+			projectRoot: dir,
+			selector: "g1,g2",
+			manualEvidence: {
+				"g2.1": "  performed  ", // provided after trim
+				"g1.1": "   \n\t ", // whitespace-only → missing
+				"g2.3": "not a manual check", // key of a non-manual check → ignored
+				ghost: "anything", // unknown check id → ignored
+			},
+		});
+		assert.equal(result.selector, "g1,g2");
+		assert.deepEqual(result.requested, ["g1", "g2"]);
+		assert.equal(result.profile, "generic");
+		// Deterministic effective order: gates by id, checks in declaration order;
+		// optional manual checks (g2.2) and non-manual checks (g2.3) excluded.
+		assert.deepEqual(result.required_manual_checks, [
+			{ gate_id: "g1", check_id: "g1.1", prompt: "audit b", provided: false },
+			{ gate_id: "g2", check_id: "g2.1", prompt: "audit a", provided: true },
+		]);
+		assert.deepEqual(result.provided_required_ids, ["g2.1"]);
+		assert.deepEqual(result.missing_required_ids, ["g1.1"]);
+		assert.equal(result.manual_evidence_ready, false);
+		// Machine facts only: raw notes are never returned, and no gate status
+		// or run identity can ever appear.
+		const serialized = JSON.stringify(result);
+		assert.ok(!serialized.includes("performed"), "raw evidence notes must never be returned");
+		assert.ok(!serialized.includes("anything"), "unknown-key notes must never be returned");
+		for (const status of ["PASS", "FAIL", "BLOCKED", "NOT_RUN"] as const) {
+			assert.ok(!serialized.includes(status), `preflight must never return gate status ${status}`);
+		}
+		assert.ok(!serialized.includes("run_id") && !serialized.includes("runId"), "preflight must never carry a run id");
+
+		// All required provided → ready.
+		const ready = await preflightGateManualEvidence({
+			projectRoot: dir,
+			selector: "g1,g2",
+			manualEvidence: { "g1.1": "ok", "g2.1": "ok" },
+		});
+		assert.equal(ready.manual_evidence_ready, true);
+		assert.deepEqual(ready.provided_required_ids, ["g1.1", "g2.1"]);
+		assert.deepEqual(ready.missing_required_ids, []);
+
+		// Optional-only selector is ready with no evidence at all.
+		const optionalOnly = await preflightGateManualEvidence({ projectRoot: dir, selector: "g3" });
+		assert.deepEqual(optionalOnly.required_manual_checks, []);
+		assert.deepEqual(optionalOnly.missing_required_ids, []);
+		assert.equal(optionalOnly.manual_evidence_ready, true, "optional manual checks never make readiness false");
+	});
+});
+
+test("preflight is pure read-only: no run directory/record/log/artifact is created and nothing ever executes", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			recipesYaml: [
+				"recipes:",
+				"  - name: check:lint",
+				'    command: ["node", "-e", "require(\\"fs\\").writeFileSync(\\"marker.txt\\", \\"ran\\")"]',
+				"",
+			].join("\n"),
+			gatesYaml: gatesYaml(
+				[
+					`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Audit, kind: manual, prompt: "audit" }`,
+					`  - id: g2\n    title: G2\n    checks:\n      - { id: g2.1, title: Lint, kind: recipe, recipe: check:lint }`,
+				].join("\n"),
+			),
+		});
+		const workbenchDir = join(dir, ".pi", "workbench");
+		const before = (await readdir(workbenchDir)).sort();
+		assert.deepEqual(before, ["gates.yaml", "project.yaml", "recipes.yaml"]);
+
+		// preflightGateManualEvidence has NO exec parameter — nothing can be
+		// injected or called. The recipe check below would run `node` and write
+		// marker.txt in a formal run; the preflight must never reach it.
+		const result = await preflightGateManualEvidence({
+			projectRoot: dir,
+			selector: "g1,g2",
+			manualEvidence: { "g1.1": "audit performed" },
+		});
+		assert.deepEqual(result.requested, ["g1", "g2"]);
+		assert.deepEqual(result.missing_required_ids, []);
+		assert.equal(result.manual_evidence_ready, true);
+
+		// No file or directory was created anywhere under .pi/workbench.
+		const after = (await readdir(workbenchDir)).sort();
+		assert.deepEqual(after, before, "preflight must not create any file or directory");
+		// No run record/log/artifact exists — the runs directory itself is absent.
+		const runsDirPath = join(workbenchDir, "runs");
+		for (const file of ["manifest.json", "gates.json", "evidence.json", "summary.json", "stdout.log", "stderr.log"]) {
+			await assert.rejects(readFile(join(runsDirPath, file), "utf8"), { code: "ENOENT" });
+		}
+		// The recipe check never executed.
+		await assert.rejects(readFile(join(dir, "marker.txt"), "utf8"), { code: "ENOENT" });
+	});
+});
+
+test("preflight fails closed exactly like runGates for unknown/empty/profile-invalid/cyclic selectors", async () => {
+	const expectSameSetupError = async (dir: string, selector: string): Promise<void> => {
+		let formalError: unknown;
+		let preflightError: unknown;
+		try {
+			await runGates({ projectRoot: dir, selector, mode: "DEV", exec: spawnExec });
+		} catch (error) {
+			formalError = error;
+		}
+		try {
+			await preflightGateManualEvidence({ projectRoot: dir, selector });
+		} catch (error) {
+			preflightError = error;
+		}
+		assert.ok(formalError instanceof GateSetupError, `runGates must reject selector "${selector}" with GateSetupError`);
+		assert.ok(preflightError instanceof GateSetupError, `preflight must reject selector "${selector}" with GateSetupError`);
+		assert.equal(
+			(preflightError as Error).message,
+			(formalError as Error).message,
+			`selector "${selector}": preflight and runGates must fail identically`,
+		);
+	};
+
+	await withTempDir(async (dir) => {
+		await setupProject(dir, { profile: "generic" });
+		await expectSameSetupError(dir, "nope"); // unknown id → matched no gates
+		await expectSameSetupError(dir, ""); // empty selector → matched no gates
+		await expectSameSetupError(dir, "   "); // blank selector → matched no gates
+		await expectSameSetupError(dir, "q0"); // quant gate not available for generic
+	});
+
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(
+				[
+					`  - id: g1\n    title: G1\n    prerequisites: [g2]\n    checks:\n${CONFIG_CHECK}`,
+					`  - id: g2\n    title: G2\n    prerequisites: [g1]\n    checks:\n${CONFIG_CHECK}`,
+				].join("\n"),
+			),
+		});
+		await expectSameSetupError(dir, "g1,g2"); // prerequisite cycle
+	});
+
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(
+				`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: X, kind: made-up-kind }`,
+			),
+		});
+		await expectSameSetupError(dir, "g1"); // invalid gates.yaml
+	});
+});
+
+test("preflight returns the resolved profile and selector-expanded requested ids", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, { profile: "generic" });
+		const base = await preflightGateManualEvidence({ projectRoot: dir, selector: "all" });
+		assert.equal(base.profile, "generic");
+		assert.deepEqual(base.requested, ["b0", "b1", "b2", "b3", "b4", "b5", "b6"]);
+		const subset = await preflightGateManualEvidence({ projectRoot: dir, selector: "b2,b0" });
+		assert.deepEqual(subset.requested, ["b2", "b0"], "explicit ids keep selector order");
+	});
+
+	await withTempDir(async (dir) => {
+		await setupProject(dir, { profile: "quant-research/stock-selection" });
+		const quant = await preflightGateManualEvidence({ projectRoot: dir, selector: "quant" });
+		assert.equal(quant.profile, "quant-research/stock-selection");
+		assert.deepEqual(quant.requested, ["q0", "q1", "q2", "q3", "q4", "q5"]);
+	});
+});
+
+test("formal runs after preflight keep NOT_RUN/PASS and type-manual persistence semantics unchanged", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(
+				`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Audit, kind: manual, prompt: "audit" }`,
+			),
+		});
+		// Read-only preflight first — it must not influence the formal run.
+		const pre = await preflightGateManualEvidence({ projectRoot: dir, selector: "g1" });
+		assert.equal(pre.manual_evidence_ready, false);
+		assert.deepEqual(pre.missing_required_ids, ["g1.1"]);
+
+		// A subsequent formal run WITHOUT evidence still evaluates NOT_RUN.
+		const withoutEvidence = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
+		assert.equal(withoutEvidence.gates[0]!.status, "NOT_RUN");
+		assert.equal(withoutEvidence.gates[0]!.checks[0]!.status, "NOT_RUN");
+		assert.equal(withoutEvidence.ok, false);
+
+		// Supplied evidence still persists type "manual" and PASSes.
+		const withEvidence = await runGates({
+			projectRoot: dir,
+			selector: "g1",
+			mode: "DEV",
+			exec: spawnExec,
+			manualEvidence: { "g1.1": "  audit performed  " },
+		});
+		assert.equal(withEvidence.gates[0]!.status, "PASS");
+		assert.equal(withEvidence.ok, true);
+		const evidenceJson = (await readRunFile(withEvidence.runDir, "evidence.json")) as {
+			checks: Record<string, { evidence: { type: string; provided_by: string; detail: string }[] }>;
+		};
+		const evidence = evidenceJson.checks["g1.1"]!.evidence;
+		assert.equal(evidence[0]!.type, "manual");
+		assert.equal(evidence[0]!.provided_by, "manual-input");
+		assert.equal(evidence[0]!.detail, "audit performed", "the persisted note is the trimmed note");
+
+		// Even with persisted runs present, the preflight still reads no latest
+		// status and never reports run records.
+		const afterFormal = await preflightGateManualEvidence({ projectRoot: dir, selector: "g1", manualEvidence: { "g1.1": "x" } });
+		assert.deepEqual(afterFormal.requested, ["g1"]);
+		assert.deepEqual(afterFormal.missing_required_ids, []);
+		assert.ok(!JSON.stringify(afterFormal).includes(withoutEvidence.runId), "preflight never reads or reports run records");
 	});
 });

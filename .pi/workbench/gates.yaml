@@ -1,14 +1,17 @@
 # Workbench gates for the pi-dev-workbench repository itself.
 #
 # The built-in ladder loads automatically. This project (the workbench's own
-# repo) declares exactly three recipes — typecheck, unit-test, check — and
-# has no formatter/linter/static-analyzer configured, so the built-in
-# checks that look for other recipe names (check:format/check:lint,
-# test:unit, test:integration) are overridden by id to the recipes this
-# repo actually declares. The `check` recipe (typecheck + unit tests + git
-# diff --check) exercises the full surface; the unit-test suite includes
-# the spawn/integration-style tests (real exec, real cache store, real
-# telemetry files). Everything else stays built-in.
+# repo) declares a recipe set whose base gates use exactly three recipes —
+# typecheck, unit-test, check — and has no formatter/linter/static-analyzer
+# configured, so the built-in checks that look for other recipe names
+# (check:format/check:lint, test:unit, test:integration) are overridden by
+# id to the recipes this repo actually declares. The `check` recipe
+# (typecheck + unit tests + git diff --check) exercises the full surface;
+# the unit-test suite includes the spawn/integration-style tests (real exec,
+# real cache store, real telemetry files). Additional declared recipes
+# (benchmark/collection/prepare and the focused cached
+# release-assets-test) are auxiliary tooling, not gate recipes. Everything
+# else stays built-in.
 #
 # Convention (see templates/project/*/gates.yaml): a project gate with a
 # built-in id replaces the built-in gate entirely.

@@ -25,7 +25,9 @@ import { before, test } from "node:test";
 import { runRecipe, type RunRecipeResult } from "../extensions/workbench-runtime/core/recipe-runner.ts";
 import { runGates } from "../extensions/workbench-runtime/core/gate-engine.ts";
 import { ActionCacheStore } from "../extensions/workbench-runtime/cache/action-store.ts";
+import { recipeDefinitionHash } from "../extensions/workbench-runtime/cache/action-key.ts";
 import { readManifest } from "../extensions/workbench-runtime/core/runs.ts";
+import { DEFAULT_RECIPE, type Recipe } from "../extensions/workbench-runtime/core/recipe-schema.ts";
 import type { ExecFn } from "../extensions/workbench-runtime/core/config.ts";
 import { withTempDir, writeConfigFile } from "./helpers.ts";
 
@@ -114,6 +116,7 @@ async function makeProject(root: string, files: Record<string, string>, recipeOv
 		output_strategy: "tail",
 		max_lines: 100,
 		max_bytes: 4096,
+		validation_components: ["typecheck", "unit-test"],
 		...recipeOverrides,
 	};
 	await writeConfigFile(root, "recipes.yaml", `recipes:\n${yamlInline(recipe)}\n`);
@@ -225,7 +228,21 @@ test("lifecycle: recipe definition change -> miss", async () => {
 		const second = await run(root, exec);
 		assert.equal(second.cache?.status, "miss");
 		assert.equal(exec.recipeCalls, 2);
+		// Definition change with ONLY validation_components differing from the
+		// original recipe (timeout_ms back to 60_000): still a miss.
+		await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"]), validation_components: ["whitespace"] });
+		const third = await run(root, exec);
+		assert.equal(third.cache?.status, "miss", "validation_components-only definition change -> miss");
+		assert.equal(exec.recipeCalls, 3);
 	});
+});
+
+test("recipeDefinitionHash: ONLY validation_components differ -> different hash", () => {
+	const base: Recipe = { ...DEFAULT_RECIPE, name: "hello", command: ["hello-cli", "run"], validation_components: ["typecheck", "unit-test"] };
+	const same: Recipe = { ...base };
+	const different: Recipe = { ...base, validation_components: ["whitespace"] };
+	assert.equal(recipeDefinitionHash(same), recipeDefinitionHash(base), "identical recipes hash equal");
+	assert.notEqual(recipeDefinitionHash(different), recipeDefinitionHash(base), "changing only validation_components must change the definition hash");
 });
 
 test("lifecycle: argv change -> miss", async () => {
@@ -275,8 +292,14 @@ test("lifecycle: --no-cache never reads or writes", async () => {
 		assert.equal(first.cache?.status, "no-cache");
 		assert.equal(exec.recipeCalls, 1);
 		assert.equal(await countActionRecords(root), 0, "no-cache must not write");
+		assert.equal(first.record?.cache_request_mode, "no-cache", "exec record keeps the exact request mode");
+		assert.deepEqual(first.record?.validation_components, ["typecheck", "unit-test"], "exec record keeps the exact declared components");
+		const firstPersisted = await readManifest(root, first.record!.run_id);
+		assert.equal(firstPersisted?.cache_request_mode, "no-cache", "persisted manifest agrees on the request mode");
+		assert.deepEqual(firstPersisted?.validation_components, first.record?.validation_components, "persisted manifest agrees on the components");
 		const second = await run(root, exec, { cacheMode: "no-cache" });
 		assert.equal(second.cache?.status, "no-cache");
+		assert.equal(second.record?.cache_request_mode, "no-cache", "every no-cache run executes and records no-cache");
 		assert.equal(exec.recipeCalls, 2, "no-cache must not read (always executes)");
 	});
 });
@@ -292,6 +315,11 @@ test("lifecycle: --refresh-cache never reads, executes and replaces the record",
 		const refreshed = await run(root, exec, { cacheMode: "refresh-cache" });
 		assert.equal(refreshed.cache?.status, "refresh-executed");
 		assert.equal(exec.recipeCalls, 2, "refresh always executes");
+		assert.equal(refreshed.record?.cache_request_mode, "refresh-cache", "refresh exec record keeps the exact request mode");
+		assert.deepEqual(refreshed.record?.validation_components, ["typecheck", "unit-test"], "refresh exec record keeps the exact declared components");
+		const refreshedPersisted = await readManifest(root, refreshed.record!.run_id);
+		assert.equal(refreshedPersisted?.cache_request_mode, "refresh-cache", "persisted manifest agrees on the request mode");
+		assert.deepEqual(refreshedPersisted?.validation_components, refreshed.record?.validation_components, "persisted manifest agrees on the components");
 		const after = await readdir(join(cacheDir(root), "actions"));
 		assert.equal(after.length, 1, "refresh replaces, never duplicates");
 
@@ -344,6 +372,19 @@ test("hit: new run manifest with executionSource=cache and all P6-C fields", asy
 		assert.equal(manifest?.artifact_validation?.artifacts_restored, false);
 		assert.equal(manifest?.argv.length, 0, "argv values are never stored on hit runs");
 		assert.ok(manifest?.argv_hash);
+		// Phase 2A: materialized hit records use the CURRENT recipe components
+		// and default request mode — returned record and disk manifest agree,
+		// and the exec terminal matches.
+		assert.deepEqual(manifest?.validation_components, ["typecheck", "unit-test"], "hit record keeps the CURRENT recipe components");
+		assert.equal(manifest?.cache_request_mode, "default", "materialized hit runs are always default-mode");
+		assert.deepEqual(first.record?.validation_components, ["typecheck", "unit-test"], "exec terminal keeps the same components");
+		assert.equal(first.record?.cache_request_mode, "default", "exec terminal ran in default mode");
+		const persistedManifest = JSON.parse(await readFile(join(root, CONFIG, "workbench", "runs", manifest.run_id, "manifest.json"), "utf8")) as {
+			validation_components: string[];
+			cache_request_mode: string;
+		};
+		assert.deepEqual(persistedManifest.validation_components, manifest?.validation_components, "disk manifest == returned record components");
+		assert.equal(persistedManifest.cache_request_mode, manifest?.cache_request_mode, "disk manifest == returned record mode");
 		// execution.json evidence marker exists in the run directory.
 		const execution = JSON.parse(await readFile(join(root, CONFIG, "workbench", "runs", manifest.run_id, "execution.json"), "utf8")) as { execution_source: string };
 		assert.equal(execution.execution_source, "cache");
@@ -500,6 +541,16 @@ test("store: concurrent same-key runs execute once or wait safely", async () => 
 		assert.equal(misses, 1, "exactly one run executed");
 		assert.equal(hits, 1, "the other reused the result (double-checked lock)");
 		assert.equal(exec.recipeCalls, 1);
+		// Phase 2A: BOTH terminals (exec miss + double-checked hit) materialize
+		// records with the current recipe components and default request mode,
+		// and the on-disk manifests agree with the returned records.
+		for (const result of [a, b]) {
+			assert.deepEqual(result.record?.validation_components, ["typecheck", "unit-test"], "current recipe components on every materialized record");
+			assert.equal(result.record?.cache_request_mode, "default", "materialized records are always default-mode");
+			const onDisk = await readManifest(root, result.record!.run_id);
+			assert.deepEqual(onDisk?.validation_components, result.record?.validation_components, "disk manifest == returned record components");
+			assert.equal(onDisk?.cache_request_mode, result.record?.cache_request_mode, "disk manifest == returned record mode");
+		}
 	});
 });
 
@@ -913,6 +964,9 @@ interface RecipeToolDetails {
 	exit_code: number | null;
 	run_id: string;
 	cache: ToolCacheDetails;
+	/** Phase 2B: exact declared components / request mode from the run record. */
+	validation_components?: string[];
+	cache_request_mode?: string;
 }
 
 /** Text content of a tool result (the ACTUAL registered runtime output). */
@@ -1014,6 +1068,13 @@ test("P4b/P6-C separation: a registered read (REUSABLE in text+details) leaves t
 		const firstRunId = firstDetails.run_id;
 		assert.equal(exec.recipeCalls, 1, "the explicit miss executed the recipe exactly once");
 
+		// Phase 2B: the top-level tool details carry the exact record facts —
+		// validation components and cache request mode equal the persisted manifest.
+		const firstRecord = await readManifest(root, firstRunId);
+		assert.ok(firstRecord, "exec run manifest exists");
+		assert.deepEqual(firstDetails.validation_components, firstRecord.validation_components, "exec details == persisted components");
+		assert.equal(firstDetails.cache_request_mode, firstRecord.cache_request_mode, "exec details == persisted request mode");
+
 		// the persisted exec terminal carries a successful SOL binding whose
 		// invocation identity agrees with the manifest argv_hash
 		const persisted = JSON.parse(await readFile(join(root, CONFIG, "workbench", "runs", firstRunId, "manifest.json"), "utf8")) as {
@@ -1078,6 +1139,12 @@ test("P4b/P6-C separation: a registered read (REUSABLE in text+details) leaves t
 		assert.equal(secondDetails.cache.actionKey, actionKey, "same inputs -> same action key across the reads");
 		assert.equal(secondDetails.cache.reusedFromRunId, firstRunId, "the hit reuses the original exec run");
 		assert.equal(exec.recipeCalls, 1, "the hit does not re-execute the recipe");
+
+		// Phase 2B: the cache-hit terminal agrees with its materialized manifest too.
+		const hitRecord = await readManifest(root, secondDetails.run_id);
+		assert.ok(hitRecord, "hit run manifest exists");
+		assert.deepEqual(secondDetails.validation_components, hitRecord.validation_components, "hit details == persisted components");
+		assert.equal(secondDetails.cache_request_mode, hitRecord.cache_request_mode, "hit details == persisted request mode");
 
 		// run-record addition (explicit hit) vs cache-store state: the runs dir
 		// grew by EXACTLY one manifest; the action record is untouched and the

@@ -38,6 +38,7 @@ import {
 	MAX_RECORD_INPUT_ENTRIES,
 	type ActionKey,
 	type ActionRecord,
+	type CacheRequestMode,
 	type CachedSummary,
 	type InputEntry,
 	type QuantContractRecordInfo,
@@ -46,7 +47,10 @@ import {
 import { computeActionKey, declaredEnvironmentHash, type ComputedActionKey } from "./action-key.ts";
 import { resolveQuantContract, verifyBacktestResultArtifact } from "./quant-files.ts";
 
-export type CacheRequestMode = "default" | "no-cache" | "refresh-cache";
+// Re-exported to preserve the existing `action-cache.ts` import API
+// (index.ts and recipe-runner.ts import CacheRequestMode from here); the
+// canonical definition lives in action-types.ts.
+export type { CacheRequestMode } from "./action-types.ts";
 
 export interface ActionCacheContext {
 	projectRoot: string;
@@ -383,6 +387,10 @@ export async function materializeCachedRun(input: MaterializeInput): Promise<Mat
 		expected_exit_codes: recipe.expected_exit_codes,
 		declared_writes: recipe.writes,
 		environment_names: recipe.environment,
+		validation_components: recipe.validation_components,
+		// Only "default" mode reads cache hits — materialized runs are always
+		// produced from a default-mode read.
+		cache_request_mode: "default",
 		execution_source: "cache",
 		action_key: key.key,
 		reused_from_run_id: record.sourceRunId,

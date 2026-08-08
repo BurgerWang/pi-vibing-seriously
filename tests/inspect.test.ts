@@ -1,10 +1,15 @@
 /**
- * Inspect service tests (P8 safe nested project support).
+ * Inspect service tests (P8 safe nested project support + Phase 2B
+ * per-recipe validation-component observability).
  *
  * Covers: stack detection reads ONLY the effective project root's top level
  * (project.yaml `project_dir`, repo root by default), while git and
  * config-files-present stay repository-root based, and the inspect result
- * exposes the effective project root explicitly.
+ * exposes the effective project root explicitly. Phase 2B: recipe entries
+ * carry the exact declared validation_components arrays (explicit empty and
+ * omitted/default included); recipes are exposed in deterministic
+ * name-sorted order (never YAML declaration order), while component order
+ * within each array stays exactly as declared.
  */
 
 import assert from "node:assert/strict";
@@ -79,5 +84,44 @@ test("a bad project_dir falls back to the repo root and surfaces as a config err
 			result.config_errors.some((e) => e.file === "project.yaml" && e.message.includes("project_dir")),
 			JSON.stringify(result.config_errors),
 		);
+	});
+});
+
+test("recipe entries preserve exact validation arrays in name-sorted order (Phase 2B)", async () => {
+	await withTempDir(async (dir) => {
+		const root = await realpath(dir);
+		// Deliberately NON-alphabetical declaration order: zeta (declared
+		// aggregate, two components), alpha (explicit empty), beta (omitted ->
+		// default). Config loading deterministically sorts recipes by name, so
+		// the exposed order must be alpha, beta, zeta — never YAML order.
+		await writeConfigFile(
+			root,
+			"recipes.yaml",
+			[
+				"recipes:",
+				"  - name: zeta",
+				"    description: declared aggregate (two components)",
+				"    command: [echo, z]",
+				"    validation_components: [typecheck, unit-test]",
+				"  - name: alpha",
+				"    description: explicit empty",
+				"    command: [echo, a]",
+				"    validation_components: []",
+				"  - name: beta",
+				"    description: omitted -> default",
+				"    command: [echo, b]",
+				"",
+			].join("\n"),
+		);
+		const result = await inspectProject(root, { trusted: true, exec: spawnExec });
+		assert.deepEqual(result.config_errors, [], JSON.stringify(result.config_errors));
+		assert.deepEqual(
+			result.recipes.map((r) => r.name),
+			["alpha", "beta", "zeta"],
+			"recipes are deterministically sorted by name (never YAML declaration order)",
+		);
+		assert.deepEqual(result.recipes[0]!.validation_components, [], "explicit empty stays exactly []");
+		assert.deepEqual(result.recipes[1]!.validation_components, [], "omitted field defaults to [] — never undefined");
+		assert.deepEqual(result.recipes[2]!.validation_components, ["typecheck", "unit-test"], "aggregate declaration preserved exactly");
 	});
 });

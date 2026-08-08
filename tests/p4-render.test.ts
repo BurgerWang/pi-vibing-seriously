@@ -16,17 +16,20 @@ import {
 	renderCompareLines,
 	renderErrorLine,
 	renderGateLines,
+	renderGatePreflightLines,
 	renderInspectLines,
 	renderPartialLine,
 	renderReadRunLines,
 	renderRecipeLines,
 	renderToolCallLine,
+	type GatePreflightToolDetails,
 	type GateToolDetails,
 	type InspectToolDetails,
 	type ReadRunToolDetails,
 	type RecipeToolDetails,
 } from "../extensions/workbench-runtime/core/render.ts";
 import { fitToWidth } from "../extensions/workbench-runtime/core/format.ts";
+import { utf8Bytes } from "../extensions/workbench-runtime/core/result-summary.ts";
 import { widgetAction, type WidgetState } from "../extensions/workbench-runtime/core/widget.ts";
 import { workbenchToolRenderer } from "../extensions/workbench-runtime/ui/tool-renderers.ts";
 
@@ -41,6 +44,8 @@ const RECIPE: RecipeToolDetails = {
 	stdout_log: ".pi/workbench/runs/20260801-004/stdout.log",
 	stderr_log: ".pi/workbench/runs/20260801-004/stderr.log",
 	expected_exit_codes: [0],
+	validation_components: ["typecheck", "unit-test"],
+	cache_request_mode: "default",
 };
 
 const GATE: GateToolDetails = {
@@ -61,6 +66,23 @@ const GATE: GateToolDetails = {
 	],
 	counts: { pass: 0, fail: 1, blocked: 0, not_run: 0 },
 	log_path: ".pi/workbench/runs/20260801-005",
+};
+
+const PREFLIGHT: GatePreflightToolDetails = {
+	preflight: true,
+	selector: "g1,g2",
+	requested: ["g1", "g2"],
+	profile: "quant-research/stock-selection",
+	manual_evidence_ready: false,
+	required_manual_checks: [
+		{ gate_id: "g1", check_id: "g1.1", prompt: "Audit the price source", provided: false },
+		{ gate_id: "g2", check_id: "g2.1", prompt: "Confirm the returns file", provided: true },
+	],
+	provided_manual_evidence: ["g2.1"],
+	missing_manual_evidence: ["g1.1"],
+	gate_run_created: false,
+	recipes_executed: 0,
+	gate_status_assigned: false,
 };
 
 const READ_RUN: ReadRunToolDetails = {
@@ -87,6 +109,7 @@ const INSPECT: InspectToolDetails = {
 	stacks: ["JavaScript/TypeScript (npm)"],
 	profile: "quant-research/stock-selection",
 	recipes: ["test", "backtest"],
+	recipe_validation_components: { test: ["typecheck", "unit-test"], backtest: [] },
 	config_errors: [],
 	config_files_present: ["project.yaml", "recipes.yaml"],
 };
@@ -175,6 +198,52 @@ test("expanded recipe renderer shows recipe, duration, exit code, artifacts and 
 	assert.ok(lines.includes("artifacts  : results/out.json"));
 	assert.ok(lines.includes("stdout log : .pi/workbench/runs/20260801-004/stdout.log"));
 	assert.ok(lines.includes("stderr log : .pi/workbench/runs/20260801-004/stderr.log"));
+	assert.ok(lines.includes("validation : typecheck, unit-test"));
+	assert.ok(lines.includes("cache mode : default"));
+});
+
+test("Phase 2B: recipe renderer shows declared components and cache mode, fails closed when absent", () => {
+	// Declared facts render exactly as declared.
+	const expanded = renderRecipeLines(RECIPE, true).join("\n");
+	assert.ok(expanded.includes("validation : typecheck, unit-test"), expanded);
+	assert.ok(expanded.includes("cache mode : default"), expanded);
+
+	// Explicit empty declaration -> "none declared", never a fabricated list.
+	const empty = renderRecipeLines({ ...RECIPE, validation_components: [] }, true).join("\n");
+	assert.ok(empty.includes("validation : (none declared)"), empty);
+	assert.ok(empty.includes("cache mode : default"), empty);
+
+	// Missing facts -> unavailable, never []/default (fails closed).
+	const missing = renderRecipeLines({ ...RECIPE, validation_components: undefined, cache_request_mode: undefined }, true).join("\n");
+	assert.ok(missing.includes("validation : (unavailable)"), missing);
+	assert.ok(missing.includes("cache mode : (unavailable)"), missing);
+	assert.ok(!missing.includes("typecheck"), missing);
+	assert.ok(!missing.includes("default"), missing);
+
+	// Compact contract: exactly one line in every variant.
+	assert.equal(renderRecipeLines(RECIPE, false).length, 1);
+	assert.equal(renderRecipeLines({ ...RECIPE, validation_components: [] }, false).length, 1);
+	assert.equal(renderRecipeLines({ ...RECIPE, validation_components: undefined, cache_request_mode: undefined }, false).length, 1);
+});
+
+test("Phase 2B: expanded inspect shows per-recipe validation coverage for every recipe", () => {
+	// Every recipe is a key — explicit empty arrays included, in declaration order.
+	const lines = renderInspectLines(INSPECT, true);
+	assert.ok(lines.includes("validation coverage: test=[typecheck, unit-test]"), lines.join("\n"));
+	assert.ok(lines.includes("validation coverage: backtest=[]"), lines.join("\n"));
+
+	// Missing map -> unavailable (never inferred from the recipes list).
+	const missing = renderInspectLines({ ...INSPECT, recipe_validation_components: undefined }, true).join("\n");
+	assert.ok(missing.includes("validation coverage: (n/a)"), missing);
+	assert.ok(!missing.includes("validation coverage: test="), missing);
+
+	// Empty map -> none declared.
+	const none = renderInspectLines({ ...INSPECT, recipe_validation_components: {} }, true).join("\n");
+	assert.ok(none.includes("validation coverage: (none declared)"), none);
+
+	// Compact contract: exactly one line in every variant.
+	assert.equal(renderInspectLines(INSPECT, false).length, 1);
+	assert.equal(renderInspectLines({ ...INSPECT, recipe_validation_components: undefined }, false).length, 1);
 });
 
 test("expanded gate renderer shows per-gate rows, failed checks and the log path", () => {
@@ -184,6 +253,118 @@ test("expanded gate renderer shows per-gate rows, failed checks and the log path
 	assert.ok(lines.includes("check(s) failed: b1.3"));
 	assert.ok(lines.includes("failed checks: b1.3"));
 	assert.ok(lines.includes("log path    : .pi/workbench/runs/20260801-005"));
+});
+
+// ------------------------------------------- Phase 3B: read-only preflight
+
+test("Phase 3B: compact preflight is a single line with selector, readiness and the exact missing count", () => {
+	const lines = renderGatePreflightLines(PREFLIGHT, false);
+	assert.equal(lines.length, 1);
+	assert.equal(lines[0], "preflight g1,g2 ready=no missing=1");
+	// The compact line stays bounded even for a huge selector.
+	const huge = renderGatePreflightLines({ ...PREFLIGHT, selector: "x".repeat(5000) }, false);
+	assert.equal(huge.length, 1);
+	assert.ok(huge[0]!.length <= 200, huge[0]);
+});
+
+test("Phase 3B: renderGateLines dispatches preflight payloads to the preflight renderer and leaves formal output untouched", () => {
+	assert.deepEqual(renderGateLines(PREFLIGHT, true), renderGatePreflightLines(PREFLIGHT, true));
+	assert.deepEqual(renderGateLines(PREFLIGHT, false), renderGatePreflightLines(PREFLIGHT, false));
+	// Formal GateToolDetails keep the formal rendering — no preflight facts.
+	const formal = renderGateLines(GATE, true);
+	assert.ok(formal.some((l) => l.includes("run:20260801-005")), formal.join("\n"));
+	assert.ok(formal.some((l) => l.includes("log path")), formal.join("\n"));
+	assert.ok(!formal.some((l) => l.includes("no run created")), formal.join("\n"));
+});
+
+test("Phase 3B: expanded preflight lists exact provided/missing ids, per-check readiness rows and the explicit zero facts", () => {
+	const lines = renderGatePreflightLines(PREFLIGHT, true);
+	assert.ok(lines.includes("requested   : g1, g2"), lines.join("\n"));
+	assert.ok(lines.includes("profile     : quant-research/stock-selection"), lines.join("\n"));
+	assert.ok(lines.includes("ready       : no"), lines.join("\n"));
+	assert.ok(lines.includes("provided    : g2.1"), lines.join("\n"));
+	assert.ok(lines.includes("missing     : g1.1"), lines.join("\n"));
+	assert.ok(/  g1\s+g1\.1\s+provided:no — Audit the price source/.test(lines.join("\n")), lines.join("\n"));
+	assert.ok(/  g2\s+g2\.1\s+provided:yes — Confirm the returns file/.test(lines.join("\n")), lines.join("\n"));
+	assert.ok(lines.includes("no run created; 0 recipes executed; no gate status assigned"), lines.join("\n"));
+	// Ready variant: every required check provided -> ready yes, empty missing.
+	const ready = renderGatePreflightLines(
+		{
+			...PREFLIGHT,
+			manual_evidence_ready: true,
+			required_manual_checks: PREFLIGHT.required_manual_checks.map((c) => ({ ...c, provided: true })),
+			provided_manual_evidence: ["g1.1", "g2.1"],
+			missing_manual_evidence: [],
+		},
+		true,
+	);
+	assert.ok(ready.includes("preflight g1,g2 ready=yes missing=0"), ready.join("\n"));
+	assert.ok(ready.includes("provided    : g1.1, g2.1"), ready.join("\n"));
+	assert.ok(ready.includes("missing     : (none)"), ready.join("\n"));
+	// Zero required checks -> (none) rows.
+	const none = renderGatePreflightLines(
+		{ ...PREFLIGHT, required_manual_checks: [], provided_manual_evidence: [], missing_manual_evidence: [], manual_evidence_ready: true },
+		true,
+	);
+	assert.ok(none.includes("required manual checks:"), none.join("\n"));
+	assert.ok(none.includes("  (none)"), none.join("\n"));
+});
+
+test("Phase 3B: preflight never renders ok/status/run id or a Gate status", () => {
+	const text = renderGatePreflightLines(PREFLIGHT, true).join("\n");
+	for (const forbidden of ["ok:", "status     :", "run_id", "run:", "gates:", "PASS", "FAIL", "BLOCKED", "NOT_RUN"]) {
+		assert.ok(!text.includes(forbidden), `forbidden token "${forbidden}" rendered: ${text}`);
+	}
+});
+
+test("Phase 3B: adversarial long/control/Unicode preflight payload stays within 4096 UTF-8 bytes and 40 lines with exact omission markers", () => {
+	const long = "x".repeat(5000);
+	const control = "line1\nline2\t\u0000\u001b";
+	const unicode = "日本語テスト".repeat(2000);
+	const checks = Array.from({ length: 500 }, (_, i) => ({
+		gate_id: `g${i}-${long}${control}`,
+		check_id: `c${i}-${unicode}${long}`,
+		prompt: `prompt-${i} ${unicode} ${control} ${long}`,
+		provided: i % 2 === 0,
+	}));
+	const details: GatePreflightToolDetails = {
+		preflight: true,
+		selector: `${unicode} ${control} ${long}`,
+		requested: Array.from({ length: 200 }, (_, i) => `req-${i}-${unicode}-${long}`),
+		profile: `${long}${control}${unicode}`,
+		manual_evidence_ready: false,
+		required_manual_checks: checks,
+		provided_manual_evidence: checks.filter((c) => c.provided).map((c) => c.check_id),
+		missing_manual_evidence: checks.filter((c) => !c.provided).map((c) => c.check_id),
+		gate_run_created: false,
+		recipes_executed: 0,
+		gate_status_assigned: false,
+	};
+	const lines = renderGatePreflightLines(details, true);
+	const text = lines.join("\n");
+	assert.ok(utf8Bytes(text) <= 4096, `bytes ${utf8Bytes(text)} > 4096`);
+	assert.ok(lines.length <= 40, `lines ${lines.length} > 40`);
+	// Exact row omission marker: 500 checks, 8 rows shown.
+	assert.ok(lines.includes("  ... 492 more"), text);
+	// No line can carry a control character (no injected lines/bytes).
+	for (const line of lines) assert.ok(!/[\x00-\x1f\x7f]/.test(line), `control char survived: ${JSON.stringify(line)}`);
+	// Exact id-list omission counts: shown + omitted == total, with "…" markers.
+	for (const [prefix, total] of [
+		["provided    : ", 250],
+		["missing     : ", 250],
+	] as const) {
+		const listLine = lines.find((l) => l.startsWith(prefix));
+		assert.ok(listLine, `missing ${prefix.trim()} line`);
+		const body = listLine!.slice(prefix.length);
+		const m = /\(\+(\d+) more (provided|missing) id\(s\) omitted/.exec(body);
+		assert.ok(m, `${prefix.trim()} line must carry an exact omitted count: ${body}`);
+		const shown = body.split(" (+")[0]!.split(", ").length;
+		assert.equal(shown + Number(m[1]!), total, body);
+		assert.ok(body.includes("…"), `bounded ids truncate with a marker: ${body}`);
+	}
+	// Readiness and the zero facts survive the adversarial payload.
+	assert.ok(lines.some((l) => l.startsWith("preflight ") && l.includes(" ready=no missing=250")), text);
+	assert.ok(lines.includes("no run created; 0 recipes executed; no gate status assigned"), text);
 });
 
 test("expanded compare renderer lists all deltas and the neutrality note", () => {

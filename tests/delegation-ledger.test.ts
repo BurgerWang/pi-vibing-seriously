@@ -49,6 +49,7 @@ import {
 	MAX_WORKER_REPORT_BYTES,
 	WORKER_REPORT_TRUNCATION_MARKER,
 } from "../extensions/workbench-runtime/worker/handoff.ts";
+import { resolveWorkerRepairOf } from "../extensions/workbench-runtime/core/worker-policy.ts";
 
 const NOW = "2026-06-01T12:00:00.000Z";
 
@@ -608,7 +609,7 @@ test("legacy-shaped worker facts (no spend facts) keep the pre-repair record sha
 	});
 });
 
-test("synthetic pre-repair schema_version 1 records without budget_profile/spend read successfully and are not rewritten", async () => {
+test("synthetic pre-repair schema_version 1 records without budget_profile/spend/repair_of read successfully and are not rewritten", async () => {
 	await withTempDir(async (dir) => {
 		await cleanRepo(dir);
 		const before = await collectGitFacts(dir, spawnExec);
@@ -647,11 +648,111 @@ test("synthetic pre-repair schema_version 1 records without budget_profile/spend
 			undefined,
 			"the pre-repair before contract exposes budget_profile as undefined (optional field, never defaulted on read)",
 		);
+		assert.ok(!("repair_of" in (ledger.before.contract as Record<string, unknown>)), "no repair_of on the pre-repair before contract");
+		assert.equal(
+			(ledger.before.contract as { repair_of?: string }).repair_of,
+			undefined,
+			"the pre-repair before contract exposes repair_of as undefined (optional field, never defaulted on read)",
+		);
 		const usageRaw = await readFile(join(dirPath, "usage.json"), "utf8");
 		assert.ok(!usageRaw.includes('"spend"'), "the pre-repair usage.json is not rewritten");
 		const beforeRaw = await readFile(join(dirPath, "before.json"), "utf8");
 		assert.ok(!beforeRaw.includes("budget_profile"), "the pre-repair before.json is not rewritten");
+		assert.ok(!beforeRaw.includes("repair_of"), "the pre-repair before.json is never rewritten with repair_of");
 	});
+});
+
+// ---------------------------------------------------------------------------
+// Phase 4A: repair-provenance pointer persisted in the before contract
+// (worker repair contract — strict fail-closed validation, exact id)
+// ---------------------------------------------------------------------------
+
+test("ordinary creates omit repair_of entirely; a valid repair id persists exactly", async () => {
+	await withTempDir(async (dir) => {
+		await cleanRepo(dir);
+		const before = await collectGitFacts(dir, spawnExec);
+		const contract = { task: "t", allowedPaths: ["src/**"], acceptanceCriteria: [], verification: [], timeoutSeconds: 1800 };
+
+		// Ordinary create: no repairOf — the before contract must not carry
+		// the own property at all (additive key, spread conditionally).
+		const ordinaryId = makeDelegationId(new Date());
+		const created = await createDelegationLedger(dir, ordinaryId, contract, before, NOW);
+		assert.ok(created.ok, created.ok ? "" : created.error);
+		const ordinary = JSON.parse(await readFile(join(delegationDirFor(dir, ordinaryId), "before.json"), "utf8")) as {
+			contract: Record<string, unknown>;
+		};
+		assert.ok(!("repair_of" in ordinary.contract), "ordinary creates omit the own property repair_of");
+
+		// Explicit valid repair id: persisted EXACTLY as supplied.
+		const repairedId = makeDelegationId(new Date());
+		const repaired = await createDelegationLedger(dir, repairedId, { ...contract, repairOf: "20250101-120000-abcd" }, before, NOW);
+		assert.ok(repaired.ok, repaired.ok ? "" : repaired.error);
+		const repairRecord = JSON.parse(await readFile(join(delegationDirFor(dir, repairedId), "before.json"), "utf8")) as {
+			contract: { repair_of?: string };
+		};
+		assert.equal(repairRecord.contract.repair_of, "20250101-120000-abcd", "the exact repair id is persisted");
+	});
+});
+
+test("malformed repair_of values fail closed before any delegation directory or file exists", async () => {
+	await withTempDir(async (dir) => {
+		await cleanRepo(dir);
+		const before = await collectGitFacts(dir, spawnExec);
+		const contract = { task: "t", allowedPaths: ["src/**"], acceptanceCriteria: [], verification: [], timeoutSeconds: 1800 };
+		// Padded, traversal, wrong separators, short/empty strings, and
+		// non-string values (null/number/object/array via the typed escape)
+		// all fail closed before any ledger record exists.
+		const badValues: unknown[] = [
+			" 20250101-120000-abcd",
+			"20250101-120000-abcd ",
+			"20250101-120000-abcd\n",
+			"../../etc/passwd",
+			"20250101-120000-abcd/extra",
+			"2025/01/01-120000-abcd",
+			"20250101_120000_abcd",
+			"20250101-120000",
+			"",
+			null,
+			42,
+			{ repairOf: "20250101-120000-abcd" },
+			["20250101-120000-abcd"],
+		];
+		for (const bad of badValues) {
+			const result = await createDelegationLedger(dir, makeDelegationId(new Date()), { ...contract, repairOf: bad as never }, before, NOW);
+			assert.equal(result.ok, false, `${JSON.stringify(bad)} must fail closed before ledger creation`);
+			if (!result.ok) assert.match(result.error, /repair_of must be a valid 20-character delegation id/);
+		}
+		// Fail-closed semantics: not one delegation directory (nor any file)
+		// exists — the delegations root itself was never created.
+		await assert.rejects(readdir(delegationsDir(dir)), /ENOENT/, "no delegation directory or files are created");
+	});
+});
+
+test("resolveWorkerRepairOf and isValidDelegationId agree on representative id strings", () => {
+	// Both validators share the exact run-id shape (YYYYMMDD-HHMMSS-XXXX);
+	// for every string input the repair resolver's boolean MUST equal the
+	// ledger id validator — one strict rule, two enforcement points.
+	const ids = [
+		"20250101-120000-abcd",
+		"20260601-120000-ABCD",
+		"20250101-120000-9aZ0",
+		"",
+		"20250101-120000",
+		"20250101-120000-abcd/extra",
+		"../../etc/passwd",
+		" 20250101-120000-abcd",
+		"20250101-120000-abcd ",
+		"2025/01/01-120000-abcd",
+		"20250101_120000_abcd",
+		"20250101-120000-ab!d",
+	];
+	for (const id of ids) {
+		assert.equal(
+			resolveWorkerRepairOf(id).ok,
+			isValidDelegationId(id),
+			`repair-of acceptance agrees with the ledger id validator on ${JSON.stringify(id)}`,
+		);
+	}
 });
 
 test("finishDelegationLedger records success with true changed paths, after hash, usage/budget and PENDING_REVIEW", async () => {

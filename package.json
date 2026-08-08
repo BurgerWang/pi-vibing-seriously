@@ -17,6 +17,11 @@
 	"scripts": {
 		"typecheck": "tsc --noEmit",
 		"test": "tsx --test tests/*.test.ts",
+		"test:release-assets": "tsx --test tests/release-assets.test.ts",
+		"test:runtime-core": "tsx --test tests/recipe-schema.test.ts tests/recipe-runner.test.ts tests/p6-c-action-cache.test.ts tests/inspect.test.ts tests/p4-render.test.ts tests/execution-efficiency.test.ts tests/commander-native-tool-benchmark-v2-wiring.test.ts",
+		"test:gate-preflight": "tsx --test tests/gates.test.ts tests/p4-render.test.ts tests/result-summary-wiring.test.ts",
+		"test:worker-efficiency": "tsx --test tests/worker-policy.test.ts tests/worker-runner.test.ts tests/delegation-ledger.test.ts tests/p6-b-stable-prefix.test.ts",
+		"test:diff-review-efficiency": "tsx --test tests/diff-review.test.ts tests/diff-review-wiring.test.ts",
 		"check": "npm run typecheck && npm test && git diff --check",
 		"commander:benchmark": "tsx scripts/commander-token-benchmark.ts",
 		"commander:prepare": "tsx scripts/commander-token-p9-prepare.ts",

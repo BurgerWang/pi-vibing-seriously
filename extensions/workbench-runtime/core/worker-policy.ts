@@ -47,6 +47,17 @@ export interface WorkerTaskContract {
 	 * changes enforcement or thresholds).
 	 */
 	budgetProfile?: WorkerSpendProfile;
+	/**
+	 * Phase 4A (repair provenance): optional delegation id of the original
+	 * task this worker repairs. Strictly validated as an exact
+	 * 20-character `YYYYMMDD-HHMMSS-XXXX` id before any ledger creation
+	 * (see resolveWorkerRepairOf); present only as a pointer — a repair is
+	 * always a fresh worker with no prior session/report inherited. The
+	 * rendering adds a deterministic informational provenance line to the
+	 * task text (Phase 4A); it never changes paths, criteria, verification,
+	 * budget, or authority. Omitted for ordinary (non-repair) delegations.
+	 */
+	repairOf?: string;
 }
 
 export interface WorkerRoleContext {
@@ -191,6 +202,67 @@ export function resolveWorkerBudgetProfile(value: unknown): { ok: true; profile:
 }
 
 // ---------------------------------------------------------------------------
+// Phase 4A: repair-provenance contract validation (worker repair slices)
+// ---------------------------------------------------------------------------
+
+/**
+ * Delegation ids share the run-id shape (8 digits-6 digits-4 alphanumerics,
+ * 20 characters total), strictly validated. Defined locally rather than
+ * imported from delegation-ledger to keep worker-policy dependency-free and
+ * avoid an import cycle.
+ */
+const WORKER_REPAIR_OF_RE = /^\d{8}-\d{6}-[A-Za-z0-9]{4}$/;
+
+const REPAIR_PREVIEW_MAX_RAW = 40;
+const REPAIR_PREVIEW_MAX_ESCAPED = 90;
+
+/** Single-line JSON preview of a rejected value head, bounded in raw AND escaped length. */
+function boundedRepairPreview(value: string): string {
+	const head = value.slice(0, REPAIR_PREVIEW_MAX_RAW);
+	let escaped = JSON.stringify(head);
+	const truncated = value.length > REPAIR_PREVIEW_MAX_RAW || escaped.length > REPAIR_PREVIEW_MAX_ESCAPED;
+	if (escaped.length > REPAIR_PREVIEW_MAX_ESCAPED) {
+		escaped = `${escaped.slice(0, REPAIR_PREVIEW_MAX_ESCAPED - 1)}…`;
+	} else if (truncated) {
+		escaped = `${escaped}…`;
+	}
+	return escaped;
+}
+
+/**
+ * Strict deterministic repair-provenance validation/resolution for the
+ * delegation task contract (Phase 4A of the worker repair contract):
+ *
+ *   - omitted/undefined → no provenance pointer (the only default path);
+ *   - exactly a 20-character delegation id (`YYYYMMDD-HHMMSS-XXXX`,
+ *     `/^\d{8}-\d{6}-[A-Za-z0-9]{4}$/`) accepted;
+ *   - everything else (whitespace-padded or otherwise malformed strings,
+ *     non-ASCII/case-pattern violations, traversal-shaped input, null,
+ *     numbers, booleans, objects, arrays) FAILS CLOSED with a bounded
+ *     useful error — before any ledger creation or child launch.
+ *
+ * The error preview is bounded twice (raw characters and JSON-escaped
+ * length), so a pathological value can never produce an unbounded message.
+ */
+export function resolveWorkerRepairOf(
+	value: unknown,
+): { ok: true; repairOf: string | undefined } | { ok: false; error: string } {
+	if (value === undefined) return { ok: true, repairOf: undefined };
+	if (typeof value === "string" && WORKER_REPAIR_OF_RE.test(value)) return { ok: true, repairOf: value };
+	if (typeof value === "string") {
+		return {
+			ok: false,
+			error: `repair_of must be a valid 20-character delegation id (YYYYMMDD-HHMMSS-XXXX) (received string ${boundedRepairPreview(value)})`,
+		};
+	}
+	const kind = value === null ? "null" : typeof value;
+	return {
+		ok: false,
+		error: `repair_of must be a valid 20-character delegation id (YYYYMMDD-HHMMSS-XXXX) (received ${kind})`,
+	};
+}
+
+// ---------------------------------------------------------------------------
 // P7 shared recipe mutation policy (used by direct recipe execution AND by
 // gate-engine recipe checks — one pure decision, two enforcement points)
 // ---------------------------------------------------------------------------
@@ -249,9 +321,13 @@ export function recipeMutationBlockReason(
  * spend-profile line naming the resolved `budgetProfile` (omitted →
  * `standard`; explicit `low`/`extended` named when supplied) and stating
  * that the profile bounds cumulative spend only — it never expands the
- * parent-approved path/scope authority. The line is informational
- * wording: enforcement stays in the runner and the fixed child env
- * contract, and thresholds are unchanged.
+ * parent-approved path/scope authority. Phase 4A: when and only when
+ * `repairOf` is present, a deterministic `Repair provenance:` line
+ * precedes the spend-profile line — a pointer only, stating the repair
+ * runs on a fresh worker with no prior session/report inherited. Both
+ * lines are informational wording: enforcement stays in the runner and
+ * the fixed child env contract; paths, criteria, verification, budget,
+ * and authority are unchanged.
  */
 export function formatWorkerTask(contract: WorkerTaskContract): string {
 	const profile = contract.budgetProfile ?? WORKER_SPEND_DEFAULT_PROFILE;
@@ -259,6 +335,11 @@ export function formatWorkerTask(contract: WorkerTaskContract): string {
 		"Delegated implementation task:",
 		contract.task.trim(),
 		"",
+	];
+	if (contract.repairOf !== undefined) {
+		lines.push(`Repair provenance: ${contract.repairOf} — pointer only; fresh worker; no prior session/report inherited.`);
+	}
+	lines.push(
 		`Worker spend-budget profile: ${profile} — bounds cumulative spend only; never expands parent-approved path/scope authority.`,
 		"",
 		"Parent-approved paths (exact path, or subtree ending in / or /**):",
@@ -266,7 +347,7 @@ export function formatWorkerTask(contract: WorkerTaskContract): string {
 		"",
 		"Acceptance criteria:",
 		...contract.acceptanceCriteria.map((criterion) => `- ${criterion}`),
-	];
+	);
 	if (contract.verification.length > 0) {
 		lines.push("", "Requested verification:", ...contract.verification.map((step) => `- ${step}`));
 	}

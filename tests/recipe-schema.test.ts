@@ -6,7 +6,15 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { parseRecipe, parseRecipesDocument, buildArgv, RecipeParamError } from "../extensions/workbench-runtime/core/recipe-schema.ts";
+import {
+	buildArgv,
+	isValidationComponent,
+	parseRecipe,
+	parseRecipesDocument,
+	RecipeParamError,
+	VALIDATION_COMPONENTS,
+} from "../extensions/workbench-runtime/core/recipe-schema.ts";
+import type { ValidationComponent } from "../extensions/workbench-runtime/core/recipe-schema.ts";
 
 const FULL_RECIPE = {
 	name: "backtest",
@@ -140,6 +148,59 @@ test("recipes.yaml accepts a top-level list or a recipes key", () => {
 	const broken = parseRecipesDocument({ recipes: "nope" });
 	assert.equal(broken.recipes.length, 0);
 	assert.ok(broken.errors.some((e) => e.includes("recipes.yaml root")));
+});
+
+// ---------------------------------------------------------------------------
+// Phase 2A validation components (typecheck | unit-test | whitespace)
+// ---------------------------------------------------------------------------
+
+// Compile-time assertions (type-level only, erased at runtime):
+// ValidationComponent is EXACTLY the literal union, never `string`.
+type _Equal<X, Y> = (<T>() => T extends X ? 1 : 2) extends (<T>() => T extends Y ? 1 : 2) ? true : false;
+type _Expect<T extends true> = T;
+type _ValidationComponentIsExactUnion = _Expect<_Equal<ValidationComponent, "typecheck" | "unit-test" | "whitespace">>;
+type _ValidationComponentIsNotPlainString = _Expect<_Equal<ValidationComponent, string> extends true ? false : true>;
+
+test("VALIDATION_COMPONENTS is the exact closed tuple in declaration order", () => {
+	assert.deepEqual(VALIDATION_COMPONENTS, ["typecheck", "unit-test", "whitespace"]);
+	// Iterating the tuple yields narrowed literal values, and the guard
+	// accepts every declared component.
+	for (const component of VALIDATION_COMPONENTS) {
+		assert.equal(isValidationComponent(component), true);
+	}
+});
+
+test("validation_components defaults to []", () => {
+	const result = parseRecipe({ name: "min", command: ["npm", "test"] }, 0);
+	assert.deepEqual(result.errors, []);
+	assert.deepEqual(result.recipes[0]?.validation_components, []);
+});
+
+test("legal validation_components parse and preserve declaration order", () => {
+	const result = parseRecipe(
+		{ name: "r", command: ["ls"], validation_components: ["whitespace", "typecheck", "unit-test"] },
+		0,
+	);
+	assert.deepEqual(result.errors, []);
+	assert.deepEqual(result.recipes[0]?.validation_components, ["whitespace", "typecheck", "unit-test"]);
+});
+
+test("non-array, non-string, unknown and duplicate validation_components are rejected", () => {
+	const nonArray = parseRecipe({ name: "r", command: ["ls"], validation_components: "typecheck" }, 0);
+	assert.equal(nonArray.recipes.length, 0);
+	assert.ok(nonArray.errors.some((e) => e.includes('"validation_components" must be an array of strings')), nonArray.errors.join("; "));
+
+	const nonString = parseRecipe({ name: "r", command: ["ls"], validation_components: ["typecheck", 42] }, 0);
+	assert.equal(nonString.recipes.length, 0);
+	assert.ok(nonString.errors.some((e) => e.includes('"validation_components" entries must be strings')), nonString.errors.join("; "));
+
+	const unknown = parseRecipe({ name: "r", command: ["ls"], validation_components: ["lint"] }, 0);
+	assert.equal(unknown.recipes.length, 0);
+	assert.ok(unknown.errors.some((e) => e.includes('invalid validation_components entry "lint"')), unknown.errors.join("; "));
+
+	const duplicate = parseRecipe({ name: "r", command: ["ls"], validation_components: ["typecheck", "typecheck"] }, 0);
+	assert.equal(duplicate.recipes.length, 0);
+	assert.ok(duplicate.errors.some((e) => e.includes('duplicate validation_components entry "typecheck"')), duplicate.errors.join("; "));
 });
 
 // ---------------------------------------------------------------------------
