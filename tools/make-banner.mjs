@@ -7,6 +7,12 @@
  * identically everywhere (GitHub included). The version chip is read from
  * package.json, so the banner can never drift from the package version.
  *
+ * Design (v0.9 refresh): a "workbench terminal" — solid dark background with
+ * top/bottom accent bars, the three mode chips (AUDIT / DEV / VERIFY), the
+ * WORKBENCH title with a terminal cursor, and a bottom row carrying a
+ * checkmark and the package version chip. No scripts, no external
+ * references, no foreignObject, no event handlers — only <rect> elements.
+ *
  * Usage:
  *   node tools/make-banner.mjs            # write assets/banner.svg
  *   node tools/make-banner.mjs --out /tmp/banner.svg
@@ -17,7 +23,7 @@
  */
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -68,6 +74,8 @@ const FONT = {
 	".": [0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x0c],
 	"_": [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1f],
 	">": [0x08, 0x04, 0x02, 0x01, 0x02, 0x04, 0x08],
+	"·": [0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00],
+	"✓": [0x00, 0x01, 0x01, 0x02, 0x04, 0x18, 0x10],
 	" ": [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
 };
 
@@ -82,87 +90,88 @@ function glyphRows(ch) {
 // banner model
 // ---------------------------------------------------------------------------
 
-// pi TUI accent color (rgb(138,190,183)) as the theme.
+// Pi TUI palette: teal accents on a dark navy background.
 const COLORS = {
-	bgA: "#0e1628", // checkerboard tone A
-	bgB: "#121c33", // checkerboard tone B
-	border: "#8abeb7",
-	titleA: "#8abeb7", // "PI-DEV"
-	titleB: "#d9f2ee", // "WORKBENCH"
-	tag: "#7d93b5", // tagline
-	cursor: "#e8b64c", // amber terminal cursor
-	corner: "#8abeb7",
+	bg: "#0e1628", // solid background (no checkerboard)
+	chipBg: "#121c33", // mode chip fill
+	accent: "#8abeb7", // pi teal — bars, title, VERIFY chip, checkmark
+	tag: "#7d93b5", // slate — tagline, AUDIT chip
+	cursor: "#e8b64c", // amber — terminal cursor, DEV chip, version chip
 };
 
+// The three mode chips mirror the workbench's AUDIT / DEV / VERIFY policy.
+const MODES = [
+	{ label: "AUDIT", color: "#7d93b5" },
+	{ label: "DEV", color: "#e8b64c" },
+	{ label: "VERIFY", color: "#8abeb7" },
+];
+
 export function buildBanner(version) {
-	const title1 = "PI-DEV";
-	const title2 = "WORKBENCH";
-	const tag = "PI-NATIVE DEV WORKBENCH";
+	const title = "WORKBENCH";
+	const tag = "RECIPES · GATES · EVIDENCE";
 	const versionChip = `V${version}`;
 
 	const titleScale = 9;
 	const titlePitchX = (GLYPH_W + 1) * titleScale; // 54
-	const titlePitchY = (GLYPH_H + 1) * titleScale; // 72
 	const tagScale = 3;
 	const tagPitchX = (GLYPH_W + 1) * tagScale; // 18
-	const tagPitchY = (GLYPH_H + 1) * tagScale; // 24
-	const chipScale = 3;
-
 	const margin = 26;
-	const innerW = Math.max(title1.length, title2.length) * titlePitchX;
-	const tagW = tag.length * tagPitchX;
-	const chipW = versionChip.length * tagPitchX;
-	const width = Math.max(innerW, tagW + chipW + 12) + 2 * margin;
-	const titleTop = margin + 10;
-	const line2Top = titleTop + titlePitchY;
-	const tagTop = line2Top + titlePitchY + 8;
-	const height = tagTop + GLYPH_H * tagScale + margin + 8;
+	const barH = 3;
+	const cursorW = titleScale * 2; // 2px-wide terminal cursor block
+
+	const titleW = title.length * titlePitchX; // 486
+	const tagW = tag.length * tagPitchX; // 468
+	const chipW = versionChip.length * tagPitchX; // 108
+	const checkW = GLYPH_W * tagScale; // 15
+
+	// The bottom row (tagline + checkmark + version chip) is the widest band.
+	const bottomRowW = margin + tagW + 12 + checkW + 6 + chipW + margin;
+	const titleRowW = titleW + 12 + cursorW;
+	const width = Math.max(bottomRowW, titleRowW); // 661
+
+	// Vertical layout: chips / title / bottom row.
+	const chipTop = 24;
+	const chipH = GLYPH_H * tagScale + 12; // 33
+	const titleTop = chipTop + chipH + 20; // 77
+	const bottomTop = titleTop + GLYPH_H * titleScale + 18; // 158
+	const height = bottomTop + GLYPH_H * tagScale + margin + 2 + barH; // 210
 
 	const rects = [];
 
-	// checkerboard background via a 24x24 pattern tile (keeps the SVG small)
-	const cell = 12;
-	rects.push(`<defs><pattern id="checker" width="${cell * 2}" height="${cell * 2}" patternUnits="userSpaceOnUse">`);
-	rects.push(`<rect width="${cell}" height="${cell}" fill="${COLORS.bgA}"/>`);
-	rects.push(`<rect x="${cell}" width="${cell}" height="${cell}" fill="${COLORS.bgB}"/>`);
-	rects.push(`<rect y="${cell}" width="${cell}" height="${cell}" fill="${COLORS.bgB}"/>`);
-	rects.push(`<rect x="${cell}" y="${cell}" width="${cell}" height="${cell}" fill="${COLORS.bgA}"/>`);
-	rects.push(`</pattern></defs>`);
-	rects.push(`<rect width="${width}" height="${height}" fill="url(#checker)"/>`);
-	// border (1px inside the canvas)
-	rects.push(`<rect x="1" y="1" width="${width - 2}" height="${height - 2}" fill="none" stroke="${COLORS.border}" stroke-opacity="0.45" stroke-width="2"/>`);
+	// solid background + top/bottom accent bars
+	rects.push(`<rect width="${width}" height="${height}" fill="${COLORS.bg}"/>`);
+	rects.push(`<rect width="${width}" height="${barH}" fill="${COLORS.accent}" fill-opacity="0.5"/>`);
+	rects.push(`<rect y="${height - barH}" width="${width}" height="${barH}" fill="${COLORS.accent}" fill-opacity="0.5"/>`);
 
-	// corner blocks
-	const corner = 7;
-	for (const [cx, cy] of [
-		[5, 5],
-		[width - 5 - corner, 5],
-		[5, height - 5 - corner],
-		[width - 5 - corner, height - 5 - corner],
-	]) {
-		rects.push(`<rect x="${cx}" y="${cy}" width="${corner}" height="${corner}" fill="${COLORS.corner}"/>`);
+	// mode chips (AUDIT / DEV / VERIFY)
+	const chipPadX = 7;
+	const chipGap = 16;
+	const chipRowW = MODES.reduce((w, m) => w + m.label.length * tagPitchX + 2 * chipPadX, 0) + (MODES.length - 1) * chipGap;
+	let chipX = Math.round((width - chipRowW) / 2);
+	for (const mode of MODES) {
+		const w = mode.label.length * tagPitchX + 2 * chipPadX;
+		rects.push(`<rect x="${chipX}" y="${chipTop}" width="${w}" height="${chipH}" fill="${COLORS.chipBg}"/>`);
+		rects.push(`<rect x="${chipX + 1}" y="${chipTop + 1}" width="${w - 2}" height="${chipH - 2}" fill="none" stroke="${mode.color}" stroke-width="2"/>`);
+		putText(rects, mode.label, tagScale, chipX + chipPadX, chipTop + 6, mode.color);
+		chipX += w + chipGap;
 	}
 
-	// title lines
-	putText(rects, title1, titleScale, centerX(width, title1.length * titlePitchX), titleTop, COLORS.titleA);
-	putText(rects, title2, titleScale, centerX(width, title2.length * titlePitchX), line2Top, COLORS.titleB);
+	// title + terminal cursor
+	const titleX = Math.round((width - titleW) / 2);
+	putText(rects, title, titleScale, titleX, titleTop, COLORS.accent);
+	rects.push(`<rect x="${titleX + titleW + 12}" y="${titleTop}" width="${cursorW}" height="${GLYPH_H * titleScale}" fill="${COLORS.cursor}"/>`);
 
-	// tagline (left) + version chip (right) on the same baseline
-	putText(rects, tag, tagScale, centerX(width - chipW - 12, tagW), tagTop, COLORS.tag);
-	putText(rects, versionChip, chipScale, width - margin - chipW, tagTop, COLORS.cursor);
-
-	// terminal cursor block after the tagline
-	const cursorX = centerX(width - chipW - 12, tagW) + tagW + 2;
-	rects.push(`<rect x="${cursorX}" y="${tagTop}" width="${tagScale * 3}" height="${GLYPH_H * tagScale}" fill="${COLORS.cursor}"/>`);
+	// tagline (left) + checkmark + version chip (right) on one baseline
+	const versionChipX = width - margin - chipW;
+	const checkX = versionChipX - 6 - checkW;
+	putText(rects, tag, tagScale, margin, bottomTop, COLORS.tag);
+	putText(rects, "✓", tagScale, checkX, bottomTop, COLORS.accent);
+	putText(rects, versionChip, tagScale, versionChipX, bottomTop, COLORS.cursor);
 
 	const viewBox = `0 0 ${width} ${height}`;
 	const body = rects.join("\n");
-	const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" width="${width}" height="${height}" shape-rendering="crispEdges" role="img" aria-label="pi-dev-workbench v${version} — a Pi-native development workbench">\n${body}\n</svg>\n`;
+	const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" width="${width}" height="${height}" shape-rendering="crispEdges" role="img" aria-label="pi-dev-workbench v${version} — Pi-native workbench: AUDIT / DEV / VERIFY modes, recipes, gates and evidence">\n${body}\n</svg>\n`;
 	return { svg, width, height, version };
-}
-
-function centerX(canvasW, textW) {
-	return Math.round((canvasW - textW) / 2);
 }
 
 function putText(rects, text, scale, x0, y0, color) {
@@ -186,13 +195,12 @@ function putText(rects, text, scale, x0, y0, color) {
 // ---------------------------------------------------------------------------
 
 function asciiPreview(version) {
-	const title1 = "PI-DEV";
-	const title2 = "WORKBENCH";
-	const tag = "PI-NATIVE DEV WORKBENCH";
+	const title = "WORKBENCH";
+	const tag = "RECIPES · GATES · EVIDENCE";
 	const chip = `V${version}`;
-	const scale = 1;
-	const px = (GLYPH_W + 1) * scale;
-	const width = Math.max(title2.length, tag.length + chip.length) * px;
+	const px = GLYPH_W + 1; // 6
+	const modesRowW = MODES.reduce((w, m) => w + m.label.length * px, 0) + (MODES.length - 1) * 3;
+	const width = Math.max(modesRowW, tag.length * px + 4 + chip.length * px);
 	const grid = Array.from({ length: (GLYPH_H + 1) * 3 + 1 }, () => Array(width).fill(" "));
 	const draw = (text, row0, col0) => {
 		let x = col0;
@@ -207,10 +215,14 @@ function asciiPreview(version) {
 			x += px;
 		}
 	};
-	draw(title1, 0, 0);
-	draw(title2, 8, 0);
+	let col = 0;
+	for (const mode of MODES) {
+		draw(mode.label, 0, col);
+		col += mode.label.length * px + 3;
+	}
+	draw(title, 8, 0);
 	draw(tag, 16, 0);
-	draw(chip, 16, tag.length * px + 2);
+	draw(chip, 16, tag.length * px + 4);
 	return grid.map((row) => row.join("").replace(/\s+$/, "")).join("\n");
 }
 
@@ -239,6 +251,10 @@ function main() {
 	process.stdout.write(`wrote ${out} (${width}x${height}, v${version})\n`);
 }
 
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
-	main();
-}
+// Import-safe CLI entry: importing this module (e.g. from the release-asset
+// tests) must not execute the CLI. Only a direct `node tools/make-banner.mjs`
+// invocation (with or without --preview/--out) runs main().
+const isDirectRun =
+	process.argv[1] !== undefined && fileURLToPath(import.meta.url) === resolve(process.argv[1]);
+
+if (isDirectRun) main();
