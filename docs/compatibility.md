@@ -21,17 +21,24 @@ cannot be safely bounded after execution starts. Before every call, the
 workbench re-reads Pi's effective tool registry and permits only a tool wrapped
 by this exact runtime entry or one of Pi 0.83's seven exact synthetic built-ins
 (`bash`, `edit`, `find`, `grep`, `ls`, `read`, `write`). The runtime-entry proof
-accepts two exact Pi source tuples: explicit temporary local loading of
-`extensions/workbench-runtime/index.ts`, and this repository's checked-in
-`.pi/settings.json` package load (`packages: [".."]`, project scope, package
-origin, exact repository base directory and exact entry path). It does not
-generalize trust to other project packages. A matching SDK/foreign/collided/
-malformed source is blocked before `execute` with one fixed bounded reason.
+accepts explicit temporary local loading of
+`extensions/workbench-runtime/index.ts` and Pi package loading in either
+project or user scope. Package proof requires the exact runtime entry path,
+exact resolved repository package root as `baseDir`, package origin, exactly
+the five Pi `sourceInfo` keys, a registered wrapper with the requested tool
+name, and a non-empty package-source string bounded to 4096 UTF-8 bytes. The
+source spelling itself is not identity: both the checked-in project setting
+`packages: [".."]` and the non-`..` relative value written to user settings by
+`pi install -l .` resolve to the same trusted package tuple. No arbitrary
+project/user package is trusted: a foreign base directory or entry path, a
+name collision, an extra/missing metadata key, a non-package origin, or an
+empty/oversized source is blocked before `execute` with one fixed bounded
+reason.
 Foreign tools can remain in the advertised inventory, so tool order/schema
 fingerprints do not drift, but they are not executable while this control plane
 is active. An absent name is left to Pi's non-executing unknown-tool path.
 Nonstandard inline or aliased loading that does not preserve one of those exact
-source tuples is intentionally unsupported and also fails closed.
+identity tuples is intentionally unsupported and also fails closed.
 
 The continuation wire transition is explicit rather than an in-place v1
 reinterpretation: newly minted real-file read/gate cursors use `wbcur2` with

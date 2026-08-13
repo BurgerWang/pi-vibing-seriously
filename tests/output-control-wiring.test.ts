@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join, relative } from "node:path";
 import { before, test } from "node:test";
 
 import {
@@ -648,6 +648,149 @@ test("the real project package loader provenance passes only this workbench entr
 			{ block: true, reason: "Tool streaming output boundary is unavailable" },
 			"an arbitrary project package cannot borrow trust by colliding with a workbench name",
 		);
+	});
+});
+
+test("the real user package loader accepts relative and absolute source spellings while rejecting hostile provenance", async () => {
+	await withTempDir(async (fixtureRoot) => {
+		const projectRoot = process.cwd();
+		const userCwd = join(fixtureRoot, "user-cwd");
+		await mkdir(userCwd, { recursive: true });
+		const relativeAgentDir = join(fixtureRoot, ".pi", "relative-agent");
+		const absoluteAgentDir = join(fixtureRoot, ".pi", "absolute-agent");
+		const relativeInstalledSource = relative(relativeAgentDir, projectRoot);
+		assert.notEqual(relativeInstalledSource, "");
+		assert.notEqual(relativeInstalledSource, "..", "the fixture exercises pi install -l . from outside the package root");
+		assert.equal(isAbsolute(relativeInstalledSource), false);
+		assert.equal(isAbsolute(projectRoot), true);
+
+		for (const { label, agentDir, installedSource } of [
+			{ label: "relative", agentDir: relativeAgentDir, installedSource: relativeInstalledSource },
+			{ label: "absolute", agentDir: absoluteAgentDir, installedSource: projectRoot },
+		]) {
+			await mkdir(agentDir, { recursive: true });
+			await writeFile(join(agentDir, "settings.json"), `${JSON.stringify({ packages: [installedSource] }, null, 2)}\n`, "utf8");
+
+			const settingsManager = SettingsManager.create(userCwd, agentDir, { projectTrusted: true });
+			const loader = new DefaultResourceLoader({
+				cwd: userCwd,
+				agentDir,
+				settingsManager,
+				noSkills: true,
+				noPromptTemplates: true,
+				noThemes: true,
+				noContextFiles: true,
+			});
+			await loader.reload();
+			const loaded = loader.getExtensions();
+			assert.deepEqual(loaded.errors, []);
+			const extension = loaded.extensions.find((candidate) => candidate.resolvedPath === WORKBENCH_SOURCE_PATH);
+			assert.ok(extension, `PackageManager + ResourceLoader load the ${label} user-installed workbench entry`);
+			const expectedSourceInfo: RegisteredTool["sourceInfo"] = {
+				path: WORKBENCH_SOURCE_PATH,
+				source: installedSource,
+				scope: "user",
+				origin: "package",
+				baseDir: projectRoot,
+			};
+			assert.deepEqual(extension.sourceInfo, expectedSourceInfo, `the test consumes Pi's actual ${label} user package source tuple`);
+			assert.deepEqual(extension.tools.get("read")?.sourceInfo, expectedSourceInfo);
+
+			const effective = new Map<string, RegisteredTool>();
+			for (const loadedExtension of loaded.extensions) {
+				for (const registered of loadedExtension.tools.values()) {
+					if (!effective.has(registered.definition.name)) effective.set(registered.definition.name, registered);
+				}
+			}
+			loaded.runtime.getAllTools = () => [...effective.values()].map(({ definition, sourceInfo }) => ({
+				name: definition.name,
+				description: definition.description,
+				parameters: definition.parameters,
+				promptGuidelines: definition.promptGuidelines,
+				sourceInfo,
+			}));
+			const ctx = trustedCtx(userCwd, `real-user-package-${label}-provenance-session`) as ExtensionContext;
+			const emitLoadedGuard = async (toolCallId: string, toolName: string): Promise<{ block?: boolean; reason?: string }> => {
+				let result: { block?: boolean; reason?: string } = {};
+				for (const handler of extension.handlers.get("tool_call") ?? []) {
+					const next = await handler({ type: "tool_call", toolCallId, toolName, input: {} }, ctx) as typeof result | undefined;
+					if (next !== undefined) result = next;
+					if (result.block) break;
+				}
+				return result;
+			};
+			assert.deepEqual(await emitLoadedGuard(`real-user-package-${label}-read`, "read"), {}, `the exact ${label} user-installed read override remains executable`);
+
+			const inspect = effective.get("workbench_project_inspect");
+			assert.ok(inspect);
+			assert.deepEqual(
+				await emitLoadedGuard(`real-user-package-${label}-inspect`, "workbench_project_inspect"),
+				{},
+				`the exact ${label} user-installed normal workbench tool remains executable`,
+			);
+			if (label !== "absolute") continue;
+
+			for (const code of [...Array.from({ length: 0x20 }, (_, index) => index), 0x7f]) {
+				effective.set("workbench_project_inspect", {
+					definition: inspect.definition,
+					sourceInfo: { ...expectedSourceInfo, source: `${installedSource}${String.fromCharCode(code)}` },
+				});
+				assert.deepEqual(
+					await emitLoadedGuard(`control-user-package-source-${code}`, "workbench_project_inspect"),
+					{ block: true, reason: "Tool streaming output boundary is unavailable" },
+					`ASCII control source U+${code.toString(16).padStart(4, "0")} cannot borrow the exact user-package identity`,
+				);
+			}
+
+			let sourceGetterCalls = 0;
+			const accessorSourceInfo = Object.defineProperty({
+				path: WORKBENCH_SOURCE_PATH,
+				scope: "user",
+				origin: "package",
+				baseDir: projectRoot,
+			}, "source", {
+				enumerable: true,
+				get: () => {
+					sourceGetterCalls += 1;
+					return installedSource;
+				},
+			}) as typeof expectedSourceInfo;
+			effective.set("workbench_project_inspect", {
+				definition: inspect.definition,
+				sourceInfo: accessorSourceInfo,
+			});
+			assert.deepEqual(
+				await emitLoadedGuard("accessor-user-package-source", "workbench_project_inspect"),
+				{ block: true, reason: "Tool streaming output boundary is unavailable" },
+				"an accessor source cannot borrow the exact user-package identity",
+			);
+			assert.equal(sourceGetterCalls, 0, "provenance inspection never invokes a source getter");
+
+			effective.set("workbench_project_inspect", {
+				definition: inspect.definition,
+				sourceInfo: { ...expectedSourceInfo, source: "x".repeat(4_097) },
+			});
+			assert.deepEqual(
+				await emitLoadedGuard("oversized-user-package-source", "workbench_project_inspect"),
+				{ block: true, reason: "Tool streaming output boundary is unavailable" },
+				"an oversized source string cannot borrow the exact user-package identity",
+			);
+			effective.set("workbench_project_inspect", {
+				definition: inspect.definition,
+				sourceInfo: {
+					path: join(fixtureRoot, "foreign-package/index.ts"),
+					source: installedSource,
+					scope: "user",
+					origin: "package",
+					baseDir: join(fixtureRoot, "foreign-package"),
+				},
+			});
+			assert.deepEqual(
+				await emitLoadedGuard("foreign-user-package-collision", "workbench_project_inspect"),
+				{ block: true, reason: "Tool streaming output boundary is unavailable" },
+				"an arbitrary user package cannot borrow trust by colliding with a workbench name",
+			);
+		}
 	});
 });
 

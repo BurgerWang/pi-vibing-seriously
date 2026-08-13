@@ -27,8 +27,12 @@
   registry proves an exact workbench-wrapped definition or pinned Pi built-in;
   foreign/SDK/collided tools cannot publish immutable oversized updates. Tool
   inventory and schema fingerprints remain unchanged. Exact provenance includes
-  both explicit temporary loading and this repository's `packages: [".."]`
-  project-package tuple; it does not trust arbitrary project packages.
+  explicit temporary loading plus project- or user-scoped local package loading
+  (`packages: [".."]` and the equivalent relative source written by
+  `pi install -l .`). Package trust still requires the wrapped tool name, exact
+  runtime entry, exact repository package root, exact package origin/metadata
+  keys, and a bounded non-empty source; arbitrary foreign or collided packages
+  remain denied.
 
 ### Breaking
 

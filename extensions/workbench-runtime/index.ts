@@ -1054,6 +1054,7 @@ const WORKBENCH_RUNTIME_SOURCE_DIR = dirname(WORKBENCH_RUNTIME_SOURCE_PATH);
 const WORKBENCH_PACKAGE_ROOT = dirname(dirname(WORKBENCH_RUNTIME_SOURCE_DIR));
 const TRUSTED_PI_BUILTIN_NAMES = new Set(["bash", "edit", "find", "grep", "ls", "read", "write"]);
 const SOURCE_INFO_KEYS = ["baseDir", "origin", "path", "scope", "source"] as const;
+const MAX_PACKAGE_SOURCE_BYTES = 4_096;
 
 type StreamingToolTrust = "trusted" | "absent" | "unproven";
 
@@ -1070,6 +1071,14 @@ function hasExactSourceInfoKeys(value: unknown): boolean {
 	}
 }
 
+function hasAsciiControlCharacter(value: string): boolean {
+	for (let index = 0; index < value.length; index += 1) {
+		const code = value.charCodeAt(index);
+		if (code <= 0x1f || code === 0x7f) return true;
+	}
+	return false;
+}
+
 function isExactWorkbenchSourceInfo(value: unknown): boolean {
 	if (!hasExactSourceInfoKeys(value) || ownDataValue(value, "path") !== WORKBENCH_RUNTIME_SOURCE_PATH) return false;
 	const source = ownDataValue(value, "source");
@@ -1080,13 +1089,21 @@ function isExactWorkbenchSourceInfo(value: unknown): boolean {
 		&& scope === "temporary"
 		&& origin === "top-level"
 		&& baseDir === WORKBENCH_RUNTIME_SOURCE_DIR;
-	// The repository's checked-in `.pi/settings.json` loads this package via
-	// `packages: [".."]`. Pi preserves that literal source and assigns the
-	// resolved package root as baseDir. Keep this acceptance tuple exact: a
-	// different project package, source spelling, entry path, or base directory
-	// remains foreign even if it collides with a workbench tool name.
-	const exactRepositoryPackageSource = source === ".."
-		&& scope === "project"
+	// Pi preserves the settings spelling for a local package source: the same
+	// package root is therefore `".."` in this repository's project settings
+	// and a different relative string after `pi install -l .` writes user
+	// settings. The spelling is not the identity proof. Trust remains pinned to
+	// this exact loaded entry and resolved package root, with Pi's exact package
+	// origin/keys and one of the two settings scopes. Bounding the non-empty
+	// source keeps malformed metadata fail-closed without rejecting an
+	// equivalent relative spelling.
+	const boundedPackageSource = typeof source === "string"
+		&& source.length > 0
+		&& source.length <= MAX_PACKAGE_SOURCE_BYTES
+		&& Buffer.byteLength(source, "utf8") <= MAX_PACKAGE_SOURCE_BYTES
+		&& !hasAsciiControlCharacter(source);
+	const exactRepositoryPackageSource = boundedPackageSource
+		&& (scope === "project" || scope === "user")
 		&& origin === "package"
 		&& baseDir === WORKBENCH_PACKAGE_ROOT;
 	return exactTemporarySource || exactRepositoryPackageSource;
