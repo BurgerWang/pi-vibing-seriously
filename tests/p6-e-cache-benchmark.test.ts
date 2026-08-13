@@ -29,7 +29,7 @@ function record(overrides: Record<string, unknown> = {}): Record<string, unknown
 		schemaVersion: "1.1",
 		timestamp: "2026-08-02T01:57:35.263Z",
 		extensionVersion: "0.8.0",
-		hashedSessionId: "sess-a",
+		hashedSessionId: "a".repeat(16),
 		provider: "deepseek",
 		model: "deepseek-v4-flash",
 		apiKind: "openai-completions",
@@ -66,7 +66,7 @@ async function makeProject(root: string): Promise<void> {
 		join(cache, "telemetry.jsonl"),
 		[
 			JSON.stringify(record({})),
-			JSON.stringify(record({ timestamp: "2026-08-02T01:58:00.000Z", usage: { input: 2000, output: 200, cacheRead: 8000, cacheWrite: 0, totalTokens: 10200, cost: 0.002 } })),
+			JSON.stringify(record({ timestamp: "2026-08-02T01:58:00.000Z", usage: { input: 2000, output: 200, cacheRead: 8000, cacheWrite: 0, totalTokens: 10200, cost: 0.002 }, cacheHitRatio: 0.8 })),
 			"{this is not json",
 			"",
 		].join("\n"),
@@ -109,8 +109,69 @@ test("readTelemetry: valid lines parsed, corrupt lines skipped and counted, rota
 		const result = await readTelemetry(root);
 		assert.equal(result.records.length, 2);
 		assert.equal(result.skipped, 1);
+		assert.equal(result.sourceIncomplete, true);
 		assert.ok(result.file?.endsWith("telemetry.jsonl"));
 		assert.equal(result.rotatedFiles, 0);
+	});
+});
+
+test("readTelemetry: rotations are strict oldest-to-current and the retained window is bounded", async () => {
+	await withTempDir(async (root) => {
+		const cache = join(root, ".pi", "workbench", "cache");
+		await mkdir(cache, { recursive: true });
+		await writeFile(join(cache, "telemetry.2.jsonl"), `${JSON.stringify(record({ timestamp: "2026-08-02T00:00:00.000Z" }))}\n`, "utf8");
+		await writeFile(join(cache, "telemetry.1.jsonl"), `${JSON.stringify(record({ timestamp: "2026-08-02T01:00:00.000Z" }))}\n`, "utf8");
+		await writeFile(join(cache, "telemetry.jsonl"), `${JSON.stringify(record({ timestamp: "2026-08-02T02:00:00.000Z" }))}\n`, "utf8");
+
+		const result = await readTelemetry(root, { maxRecords: 2 });
+		assert.deepEqual(result.records.map((item) => item.timestamp), ["2026-08-02T01:00:00.000Z", "2026-08-02T02:00:00.000Z"]);
+		assert.equal(result.rotatedFiles, 2);
+		assert.equal(result.filesRead, 3);
+		assert.equal(result.truncatedRecords, 1);
+		assert.equal(result.sourceIncomplete, false);
+		assert.ok(result.telemetryBytes > 0);
+	});
+});
+
+test("readTelemetry: schema-shaped JSON is rejected unless it satisfies the strict telemetry contract", async () => {
+	await withTempDir(async (root) => {
+		const cache = join(root, ".pi", "workbench", "cache");
+		await mkdir(cache, { recursive: true });
+		await writeFile(join(cache, "telemetry.jsonl"), `${JSON.stringify({ timestamp: "2026-08-02T00:00:00.000Z", usage: {} })}\n`, "utf8");
+		const result = await readTelemetry(root);
+		assert.equal(result.records.length, 0);
+		assert.equal(result.skipped, 1);
+		assert.equal(result.sourceIncomplete, true);
+	});
+});
+
+test("readTelemetry: invalid UTF-8 is unavailable evidence and cannot contribute records or estimates", async () => {
+	await withTempDir(async (root) => {
+		const cache = join(root, ".pi", "workbench", "cache");
+		await mkdir(cache, { recursive: true });
+		const payload = Buffer.from(`${JSON.stringify(record())}\n`, "utf8");
+		const providerMarkerOffset = payload.indexOf(Buffer.from('"provider":"deepseek"', "utf8"));
+		assert.notEqual(providerMarkerOffset, -1, "fixture must contain the provider value");
+		const providerValueOffset = providerMarkerOffset + '"provider":"'.length;
+		payload[providerValueOffset] = 0xff;
+		await writeFile(join(cache, "telemetry.jsonl"), payload);
+
+		const telemetry = await readTelemetry(root);
+		assert.equal(telemetry.records.length, 0);
+		assert.equal(telemetry.skipped, 0);
+		assert.equal(telemetry.sourceIncomplete, true);
+		assert.equal(telemetry.unavailable, "read_error");
+
+		const report = await buildBenchmarkReport({
+			projectRoot: root,
+			scope: "project",
+			costMap: { "deepseek/deepseek-v4-flash": { cacheRead: 2.8 } },
+		});
+		assert.equal(report.requestCount, 0);
+		assert.equal(report.cacheHitRatio, null);
+		assert.equal(report.estimatedAvoidedCost, null);
+		assert.equal(report.telemetrySourceIncomplete, true);
+		assert.ok(renderBenchmarkReport(report).some((line) => line.includes("incomplete telemetry observation")));
 	});
 });
 
@@ -120,6 +181,8 @@ test("readTelemetry: missing file is a friendly empty result", async () => {
 		assert.equal(result.records.length, 0);
 		assert.equal(result.skipped, 0);
 		assert.equal(result.file, null);
+		assert.equal(result.sourceIncomplete, false);
+		assert.equal(result.filesRead, 0);
 	});
 });
 
@@ -177,13 +240,15 @@ test("buildBenchmarkReport: all required fields with correct aggregation", async
 			"cacheStorageSize",
 			"corruptionCount",
 			"fallbackCount",
+			"telemetrySourceIncomplete",
+			"truncatedTelemetryRecords",
 		];
 		for (const key of expected) assert.ok(key in report, key);
 		assert.equal(report.requestCount, 2);
 		assert.equal(report.uncachedInputTokens, 3000);
 		assert.equal(report.cacheReadTokens, 17000);
 		assert.equal(report.outputTokens, 300);
-		assert.equal(report.cacheHitRatio, 17000 / 20000);
+		assert.equal(report.cacheHitRatio, null);
 		assert.equal(report.usageSemanticStatus, "verified");
 		assert.equal(report.providerReportedCost, 0.003);
 		assert.equal(report.estimatedAvoidedCost, null); // no cost-map -> null, never hardcoded
@@ -196,15 +261,27 @@ test("buildBenchmarkReport: all required fields with correct aggregation", async
 		assert.ok(report.corruptionCount >= 3); // badkey + corrupt copy + bad telemetry line
 		assert.equal(report.fallbackCount, 1);
 		assert.equal(report.skippedTelemetryLines, 1);
+		assert.equal(report.telemetrySourceIncomplete, true);
+		assert.equal(report.truncatedTelemetryRecords, 0);
 	});
 });
 
 test("estimatedAvoidedCost: computed only from an explicit cost-map", async () => {
 	await withTempDir(async (root) => {
 		await makeProject(root);
+		const telemetryPath = join(root, ".pi", "workbench", "cache", "telemetry.jsonl");
+		const cleanTelemetry = [
+			JSON.stringify(record({})),
+			JSON.stringify(record({ timestamp: "2026-08-02T01:58:00.000Z", usage: { input: 2000, output: 200, cacheRead: 8000, cacheWrite: 0, totalTokens: 10200, cost: 0.002 }, cacheHitRatio: 0.8 })),
+		].join("\n") + "\n";
+		await writeFile(telemetryPath, cleanTelemetry, "utf8");
 		const costMap = { "deepseek/deepseek-v4-flash": { cacheRead: 2.8 } }; // USD per 1M tokens
 		const report = await buildBenchmarkReport({ projectRoot: root, scope: "project", costMap });
 		assert.equal(report.estimatedAvoidedCost, (17000 * 2.8) / 1_000_000);
+		await writeFile(telemetryPath, `${cleanTelemetry}{not-json}\n`, "utf8");
+		const incomplete = await buildBenchmarkReport({ projectRoot: root, scope: "project", costMap });
+		assert.equal(incomplete.estimatedAvoidedCost, null, "a cost map cannot make partial source evidence complete");
+		await writeFile(telemetryPath, cleanTelemetry, "utf8");
 		// Unknown model voids the whole estimate (strict).
 		const partial = await buildBenchmarkReport({
 			projectRoot: root,
@@ -218,7 +295,7 @@ test("estimatedAvoidedCost: computed only from an explicit cost-map", async () =
 test("session scoping filters telemetry by hashed session id", async () => {
 	await withTempDir(async (root) => {
 		await makeProject(root);
-		const report = await buildBenchmarkReport({ projectRoot: root, scope: "session", sessionId: "sess-a" });
+		const report = await buildBenchmarkReport({ projectRoot: root, scope: "session", sessionId: "a".repeat(16) });
 		assert.equal(report.requestCount, 2);
 		const none = await buildBenchmarkReport({ projectRoot: root, scope: "session", sessionId: "nope" });
 		assert.equal(none.requestCount, 0);
@@ -235,6 +312,7 @@ test("renderBenchmarkReport: human-readable lines carry the same facts, never se
 		assert.ok(lines.some((l) => l.includes("cache hit ratio")));
 		assert.ok(lines.some((l) => l.includes("estimated avoided cost")));
 		assert.ok(lines.some((l) => l.includes("corruption")));
+		assert.ok(lines.some((l) => l.includes("data quality") && l.includes("PARTIAL")));
 		const joined = lines.join("\n");
 		assert.ok(!joined.includes("auth.json"));
 		assert.ok(!joined.includes("apiKey"));
@@ -325,7 +403,7 @@ test("CLI: friendly exit when telemetry is missing, JSON and text modes", async 
 	});
 });
 
-test("CLI: report --json carries the full contract, doctor exits 0 on healthy data", async () => {
+test("CLI: report and doctor expose corrupt-source quality without a hard failure", async () => {
 	await withTempDir(async (root) => {
 		await makeProject(root);
 		const tsx = join(process.cwd(), "node_modules", ".bin", "tsx");
@@ -335,16 +413,47 @@ test("CLI: report --json carries the full contract, doctor exits 0 on healthy da
 		const parsed = JSON.parse(report.stdout) as BenchmarkReport;
 		assert.equal(parsed.requestCount, 2);
 		assert.equal(parsed.recipeCacheHits, 1);
+		assert.equal(parsed.cacheHitRatio, null);
+		assert.equal(parsed.telemetrySourceIncomplete, true);
 		const doctor = await spawnExec(tsx, [script, "doctor", "--project", root, "--json"], { timeout: 60000 });
 		assert.equal(doctor.code, 0);
-		const checks = JSON.parse(doctor.stdout) as { checks: Array<{ id: string; status: string }>; fail_count: number };
+		const checks = JSON.parse(doctor.stdout) as {
+			checks: Array<{ id: string; status: string; message: string }>;
+			fail_count: number;
+			telemetry_quality: { sourceIncomplete: boolean; skippedRecords: number };
+		};
 		assert.equal(checks.fail_count, 0);
 		const ids = checks.checks.map((c) => c.id);
 		assert.ok(ids.includes("forbidden_fields"));
+		assert.equal(checks.telemetry_quality.sourceIncomplete, true);
+		assert.equal(checks.telemetry_quality.skippedRecords, 1);
+		assert.equal(checks.checks.find((item) => item.id === "telemetry_source_quality")?.status, "warn");
+		assert.ok(checks.checks.find((item) => item.id === "same_mode_drift")?.message.includes("prevents a no-drift conclusion"));
 		assert.ok(ids.includes("action_cache_integrity"));
 		// Offline context skips Pi-dependent checks honestly.
 		const skipped = checks.checks.filter((c) => c.status === "skip").map((c) => c.id);
 		assert.ok(skipped.includes("tool_stability"));
+	});
+});
+
+test("CLI: an all-corrupt telemetry source is reported as partial evidence, not as missing telemetry", async () => {
+	await withTempDir(async (root) => {
+		const cache = join(root, ".pi", "workbench", "cache");
+		await mkdir(cache, { recursive: true });
+		await writeFile(join(cache, "telemetry.jsonl"), "{not-json}\n", "utf8");
+		const tsx = join(process.cwd(), "node_modules", ".bin", "tsx");
+		const script = join(process.cwd(), "scripts", "cache-benchmark.ts");
+		const report = await spawnExec(tsx, [script, "report", "--project", root, "--json"], { timeout: 60000 });
+		assert.equal(report.code, 0);
+		const parsedReport = JSON.parse(report.stdout) as BenchmarkReport;
+		assert.equal(parsedReport.requestCount, 0);
+		assert.equal(parsedReport.telemetrySourceIncomplete, true);
+		assert.equal(parsedReport.cacheHitRatio, null);
+
+		const doctor = await spawnExec(tsx, [script, "doctor", "--project", root, "--json"], { timeout: 60000 });
+		assert.equal(doctor.code, 0);
+		const parsedDoctor = JSON.parse(doctor.stdout) as { checks: Array<{ id: string; status: string }> };
+		assert.equal(parsedDoctor.checks.find((item) => item.id === "telemetry_source_quality")?.status, "warn");
 	});
 });
 

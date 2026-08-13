@@ -5,15 +5,19 @@ import {
 	COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES,
 	HISTORY_DESCRIPTOR_MAX_BYTES,
 	HISTORY_MAX_BUNDLES,
+	HISTORY_PROJECTION_ENTRY_TYPE,
+	HistoryProjectionController,
 	OTHER_HISTORY_TOOL_TEXT_MAX_BYTES,
 	WORKER_HISTORY_TOOL_TEXT_MAX_BYTES,
 	collapseHistoricalToolResult,
 	historyProjectionFailureMessages,
 	historyToolTextBytes,
 	projectContextHistory,
+	safeHistoryProjectionFailureMessages,
 	validateContextToolPairing,
 	type AgentMessage,
 } from "../extensions/workbench-runtime/core/context-history-budget.ts";
+import { convertToLlm } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/messages.js";
 
 interface CallInput {
 	id: string;
@@ -470,6 +474,8 @@ test("absolute projection failures yield one fixed hidden custom message instead
 
 	const publicFailure = historyProjectionFailureMessages([hostile as AgentMessage], 0, 0);
 	assert.equal((publicFailure[0] as { customType?: unknown }).customType, "workbench-history-projection-failure");
+	const terminalFailure = safeHistoryProjectionFailureMessages();
+	assert.equal((terminalFailure[0] as { customType?: unknown }).customType, "workbench-history-projection-failure");
 });
 
 test("seeded exact-pairing fuzz remains reproducible through projection and corruption", () => {
@@ -515,4 +521,188 @@ test("seeded exact-pairing fuzz remains reproducible through projection and corr
 		assert.equal(validateContextToolPairing(failedClosed.messages), true, `seed=${seed} iteration=${iteration}`);
 		assert.ok(historyToolTextBytes(failedClosed.messages) <= cap, `seed=${seed} iteration=${iteration}`);
 	}
+});
+
+test("history projection epochs preserve Pi provider-visible append-only payloads with hysteresis", () => {
+	const controller = new HistoryProjectionController();
+	const raw: AgentMessage[] = [user("epoch-start")];
+	for (let index = 0; index < 24; index += 1) raw.push(...bundle(`epoch-seed-${index}`, "x".repeat(220)));
+	const config = {
+		maxToolTextBytes: 4_096,
+		maxBundles: 128,
+		descriptorMaxBytes: 32,
+		role: "worker" as const,
+	};
+
+	let projected = controller.project({ messages: raw, ...config });
+	assert.equal(projected.epochTransitioned, true);
+	assert.equal(projected.epoch, 1);
+	assert.ok(historyToolTextBytes(projected.messages) <= 4_096);
+	assert.equal(validateContextToolPairing(projected.messages), true);
+	let providerVisible = convertToLlm(projected.messages);
+	let transitionCount = 1;
+	let collapsedDelta = projected.newlyCollapsedResults;
+	let removedDelta = projected.newlyRemovedBundles;
+
+	for (let turn = 0; turn < 25; turn += 1) {
+		raw.push(user(`suffix-user-${turn}`), ...bundle(`epoch-suffix-${turn}`, "s".repeat(12)));
+		const next = controller.project({ messages: raw, ...config });
+		if (next.epochTransitioned) transitionCount += 1;
+		collapsedDelta += next.newlyCollapsedResults;
+		removedDelta += next.newlyRemovedBundles;
+		const nextProviderVisible = convertToLlm(next.messages);
+		assert.deepEqual(
+			nextProviderVisible.slice(0, providerVisible.length),
+			providerVisible,
+			`turn ${turn} rewrote the Pi provider-visible epoch prefix`,
+		);
+		assert.ok(historyToolTextBytes(next.messages) <= 4_096, `turn=${turn}`);
+		assert.ok(next.projectedBundleCount <= 128, `turn=${turn}`);
+		assert.equal(validateContextToolPairing(next.messages), true, `turn=${turn}`);
+		providerVisible = nextProviderVisible;
+		projected = next;
+	}
+
+	assert.equal(transitionCount, 1, "25 suffix turns stay inside one low-watermark epoch");
+	assert.equal(collapsedDelta, projected.facts.collapsedResults, "same epoch never re-counts collapsed results");
+	assert.equal(removedDelta, projected.facts.removedBundles, "same epoch never re-counts removed bundles");
+});
+
+test("history projection state restores strictly and reset invalidates the frozen boundary", () => {
+	const raw: AgentMessage[] = [];
+	for (let index = 0; index < 30; index += 1) raw.push(...bundle(`restore-${index}`, "r".repeat(200)));
+	const config = {
+		maxToolTextBytes: 4_096,
+		maxBundles: 128,
+		descriptorMaxBytes: 48,
+		role: "worker" as const,
+	};
+	const first = new HistoryProjectionController();
+	const initial = first.project({ messages: raw, ...config });
+	assert.equal(initial.epochTransitioned, true);
+	const persisted = first.serialize();
+	assert.deepEqual(Object.keys(persisted).sort(), [
+		"active", "epoch", "epochHash", "hardBundles", "hardToolTextBytes", "lowBundles",
+		"lowToolTextBytes", "prefixHash", "prefixMessageCount", "projectedBundles", "projectedPrefixHash",
+		"projectedToolTextBytes", "rawBundles", "rawToolTextBytes", "schemaVersion",
+		"transitionCollapsedResults", "transitionRemovedBundles",
+	].sort());
+	for (const [key, value] of Object.entries(persisted)) {
+		if (key === "epochHash" || key === "prefixHash" || key === "projectedPrefixHash") assert.match(String(value), /^[0-9a-f]{64}$/);
+		else assert.ok(typeof value === "number" && Number.isSafeInteger(value) && value >= 0, key);
+	}
+
+	raw.push(user("after-reload"), ...bundle("restore-suffix", "suffix"));
+	const restored = new HistoryProjectionController();
+	assert.equal(restored.restoreFromEntries([
+		{ type: "custom", customType: HISTORY_PROJECTION_ENTRY_TYPE, data: persisted },
+	]), true);
+	const continued = restored.project({ messages: raw, ...config });
+	assert.equal(continued.epochTransitioned, false);
+	assert.deepEqual(
+		convertToLlm(continued.messages).slice(0, convertToLlm(initial.messages).length),
+		convertToLlm(initial.messages),
+	);
+
+	const hostile = new HistoryProjectionController();
+	assert.equal(hostile.restoreFromEntries([
+		{ type: "custom", customType: HISTORY_PROJECTION_ENTRY_TYPE, data: { ...persisted, extra: "secret" } },
+	]), false);
+	hostile.reset();
+	const afterReset = hostile.project({ messages: raw, ...config });
+	assert.equal(afterReset.epochTransitioned, true);
+	assert.notEqual(afterReset.epochHash, initial.epochHash, "changed raw boundary derives a new epoch hash");
+});
+
+test("history epoch hashing executes no getters, toJSON hooks, or proxy traps and fails closed", () => {
+	const rawSecret = `RAW-HASH-SECRET-${"z".repeat(5_000)}`;
+	const config = {
+		maxToolTextBytes: 1_024,
+		maxBundles: 128,
+		descriptorMaxBytes: 32,
+		role: "worker" as const,
+	};
+	const assertTerminalFailure = (messages: AgentMessage[], label: string): void => {
+		const projected = new HistoryProjectionController().project({ messages, ...config });
+		assert.equal(projected.messages.length, 1, label);
+		assert.equal((projected.messages[0] as { customType?: unknown }).customType, "workbench-history-projection-failure", label);
+		assert.equal(historyToolTextBytes(projected.messages), 0, label);
+		assert.equal(validateContextToolPairing(projected.messages), true, label);
+		assert.doesNotMatch(textOf(projected.messages[0]!), /RAW-HASH-SECRET|HOSTILE-HASH/, label);
+	};
+
+	let getterCalls = 0;
+	const getterMessage: Record<string, unknown> = { role: "user", timestamp: 1 };
+	Object.defineProperty(getterMessage, "content", {
+		enumerable: true,
+		get(): never {
+			getterCalls += 1;
+			throw new Error("HOSTILE-HASH-GETTER");
+		},
+	});
+	assertTerminalFailure([
+		getterMessage as unknown as AgentMessage,
+		...bundle("hash-getter", rawSecret),
+	], "getter");
+	assert.equal(getterCalls, 0, "canonical hashing must inspect descriptors without invoking getters");
+
+	let toJsonCalls = 0;
+	const toJsonMessage = {
+		role: "user",
+		content: "safe",
+		timestamp: 2,
+		toJSON(): never {
+			toJsonCalls += 1;
+			throw new Error("HOSTILE-HASH-TOJSON");
+		},
+	} as unknown as AgentMessage;
+	assertTerminalFailure([toJsonMessage, ...bundle("hash-tojson", rawSecret)], "toJSON");
+	assert.equal(toJsonCalls, 0, "canonical hashing must reject toJSON without invoking it");
+
+	let proxyTrapCalls = 0;
+	const proxyMessage = new Proxy({ role: "user", content: "HOSTILE-HASH-PROXY" }, {
+		get(): never { proxyTrapCalls += 1; throw new Error("HOSTILE-HASH-PROXY"); },
+		ownKeys(): never { proxyTrapCalls += 1; throw new Error("HOSTILE-HASH-PROXY"); },
+		getOwnPropertyDescriptor(): never { proxyTrapCalls += 1; throw new Error("HOSTILE-HASH-PROXY"); },
+	});
+	assertTerminalFailure([proxyMessage as AgentMessage, ...bundle("hash-proxy", rawSecret)], "proxy");
+	assert.equal(proxyTrapCalls, 0, "proxy detection must precede every proxy trap");
+
+	const revoked = Proxy.revocable({ role: "user", content: "HOSTILE-HASH-REVOKED" }, {});
+	revoked.revoke();
+	assertTerminalFailure([revoked.proxy as AgentMessage, ...bundle("hash-revoked", rawSecret)], "revoked proxy");
+});
+
+test("history projection restore considers only the latest matching strict state entry", () => {
+	const raw: AgentMessage[] = [];
+	for (let index = 0; index < 12; index += 1) raw.push(...bundle(`latest-${index}`, "l".repeat(180)));
+	const source = new HistoryProjectionController();
+	const projected = source.project({
+		messages: raw,
+		maxToolTextBytes: 1_024,
+		maxBundles: 128,
+		descriptorMaxBytes: 32,
+		role: "worker",
+	});
+	assert.equal(projected.epochTransitioned, true);
+	const valid = source.serialize();
+	const malformed = { ...valid, extra: "must-not-poison-newer-valid-state" };
+
+	const latestValid = new HistoryProjectionController();
+	assert.equal(latestValid.restoreFromEntries([
+		{ type: "custom", customType: HISTORY_PROJECTION_ENTRY_TYPE, data: malformed },
+		{ type: "custom", customType: "unrelated", data: malformed },
+		{ type: "custom", customType: HISTORY_PROJECTION_ENTRY_TYPE, data: valid },
+	]), true);
+	assert.deepEqual(latestValid.serialize(), valid);
+
+	const latestMalformed = new HistoryProjectionController();
+	assert.equal(latestMalformed.restoreFromEntries([
+		{ type: "custom", customType: HISTORY_PROJECTION_ENTRY_TYPE, data: valid },
+		{ type: "custom", customType: HISTORY_PROJECTION_ENTRY_TYPE, data: malformed },
+	]), false);
+	const reset = latestMalformed.serialize();
+	assert.equal(reset.active, 0);
+	assert.equal(reset.epoch, 0);
+	assert.equal(reset.rawToolTextBytes, 0);
 });

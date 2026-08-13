@@ -53,6 +53,8 @@ re-hashes the prefix and silently defeats caching.
 6. **Context projection** — a deterministic runtime transform may replace
    older complete assistant-tool bundles with bounded descriptors before a
    provider request. It never changes the system prompt or tool definitions.
+   The projection is frozen into a discrete epoch: inside that epoch the
+   provider-visible history is append-only.
 
 ## What the workbench audited (and what it does not do)
 
@@ -79,10 +81,16 @@ discovery.
   carries task/mode/gates/runs/evidence pointers only (tested).
 - **`before_provider_request` stays read-only.** It produces a structural
   digest in memory; the payload and headers are never mutated (tested).
-- **The `context` event is enforcement, not cache observation.** Its output
-  can intentionally change the message-history prefix when old bundles are
-  collapsed; this is expected cache invalidation. Tool/system stable-zone
-  hashes remain unchanged after the one-time public schema transition.
+- **The `context` event is enforcement, not cache observation.** Below the
+  hard ceiling it returns the raw history unchanged. A hard-ceiling crossing
+  starts one projection epoch at the 75% tool-text / 96-bundle low watermark;
+  later requests replay that exact frozen projection and append the untouched
+  raw suffix. A new epoch begins only when the combined projected prefix and
+  suffix reaches a hard ceiling, or when a branch/compaction/policy mismatch
+  invalidates the frozen boundary. The epoch transition is one expected cache
+  invalidation (`HISTORY_PROJECTION_EPOCH_CHANGED`); ordinary append-only
+  turns inside it are not `CONTEXT_PREFIX_DIVERGED`. Tool/system stable-zone
+  hashes are unaffected.
 
 Old session JSONL remains readable but can carry large legacy details before
 Pi clones it. Use `npm run session:sanitize -- ...` to create a separate
@@ -197,8 +205,34 @@ The hashes are pinned by `tests/p6-b-stable-prefix.test.ts`; the baseline is
 derived read-only from the frozen commit, while the current hash is computed
 from the registered static sources. Reloading v0.10.0 therefore produces one
 expected `TOOL_SCHEMA` drift and cold cache prefix. Repeated builds in the same
-mode must then be stable. Runtime history collapse may still change the normal
-message-history prefix, but never these stable-zone tool hashes.
+mode must then be stable. Runtime history projection changes the normal
+message-history prefix only at a discrete epoch transition. Within that epoch
+the provider-visible prefix is append-only; neither a normal appended message
+nor replaying the frozen projection is classified as prefix divergence. These
+guarantees do not alter the stable-zone tool hashes.
+
+## History-projection epochs
+
+The active-history hard ceilings remain **96 KiB for Commander**, **64 KiB
+for worker/other roles**, and **128 complete assistant/tool-result bundles**.
+The projection controller adds hysteresis without weakening those limits:
+
+| Role | Hard tool text | Epoch low-water tool text | Hard bundles | Epoch low-water bundles |
+| --- | ---: | ---: | ---: | ---: |
+| Commander | 96 KiB | 72 KiB (75%) | 128 | 96 |
+| Worker / other | 64 KiB | 48 KiB (75%) | 128 | 96 |
+
+When raw history first exceeds a hard ceiling, the complete current prefix is
+projected once to the low watermark and its numeric/hash-only epoch state is
+stored as `workbench-history-projection-state-v1`. The runtime deterministically
+recreates that same prefix and appends new raw messages until another hard
+crossing. Reload/resume restores a strict state entry; branching and completed
+compaction reset it. Invalid call/result pairing still fails closed and never
+emits an orphaned tool message.
+
+This is a structural cache-cooperation contract, not evidence of a recovered
+provider hit rate. Provider cache reuse remains best-effort and must be
+measured from subsequent real requests.
 
 ## Hashing rules
 
@@ -235,6 +269,10 @@ message-history prefix, but never these stable-zone tool hashes.
   `same_mode_drift` (same-mode mutation count), `expected_vs_unexpected`,
   `churn` (model/thinking/mode/reload/compaction counts),
   `tool_metadata_static` (dynamic values in tool metadata), plus the P6-A
-  checks.
+  checks. Historical checks scan a bounded oldest-archive-to-current window
+  across the telemetry rotation set. If a source is corrupt/unavailable or
+  oldest records were omitted by the bound, source quality and absence-based
+  checks warn; `same_mode_drift` cannot claim a clean stable history from that
+  partial observation.
 - `/q-cache-report` — `same-mode mutat.` line plus the existing
   expected/unexpected counts.

@@ -38,8 +38,13 @@ import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import { buildCacheReport, type CacheReport } from "../extensions/workbench-runtime/cache/cache-report.ts";
 import { runDoctor, renderDoctor, doctorToJson, type DoctorFacts } from "../extensions/workbench-runtime/cache/cache-doctor.ts";
-import { DEFAULT_MAX_TELEMETRY_BYTES } from "../extensions/workbench-runtime/cache/cache-store.ts";
-import { CACHE_DIR_NAME } from "../extensions/workbench-runtime/cache/cache-store.ts";
+import {
+	CACHE_DIR_NAME,
+	CacheStore,
+	DEFAULT_MAX_TELEMETRY_BYTES,
+	type ChronologicalReadOptions,
+	type StoreReadResult,
+} from "../extensions/workbench-runtime/cache/cache-store.ts";
 import { LOCK_STALE_MS } from "../extensions/workbench-runtime/cache/action-types.ts";
 import type { TelemetryRecord } from "../extensions/workbench-runtime/cache/cache-types.ts";
 
@@ -68,66 +73,34 @@ export interface TelemetryReadResult {
 	telemetryBytes: number;
 	rotatedFiles: number;
 	file: string | null;
+	sourceIncomplete: boolean;
+	truncatedRecords: number;
+	filesRead: number;
+	unavailable?: StoreReadResult["unavailable"];
 }
 
 /**
- * Read telemetry.jsonl plus rotated archives (telemetry.N.jsonl), in
- * chronological order (current file first, then archives by N). Corrupted
- * lines are skipped and counted — never fatal. A missing file is a valid
- * empty result (callers decide how to report it).
+ * Read telemetry.jsonl plus the bounded rotation set through CacheStore's
+ * strict schema validator. Rotations are read oldest-first and the current
+ * file last; only the newest bounded record window is retained. Corrupted
+ * lines and unavailable sources are surfaced as incomplete evidence.
  */
-export async function readTelemetry(projectRoot: string): Promise<TelemetryReadResult> {
-	const dir = cacheDir(projectRoot);
-	const current = join(dir, "telemetry.jsonl");
-	const records: TelemetryRecord[] = [];
-	let skipped = 0;
-	let telemetryBytes = 0;
-	let rotatedFiles = 0;
-
-	async function readInto(path: string): Promise<void> {
-		let text: string;
-		try {
-			text = await readFile(path, "utf8");
-		} catch {
-			return;
-		}
-		telemetryBytes += text.length;
-		for (const line of text.split("\n")) {
-			const trimmed = line.trim();
-			if (trimmed.length === 0) continue;
-			try {
-				const parsed = JSON.parse(trimmed) as TelemetryRecord;
-				if (parsed && typeof parsed === "object" && typeof parsed.timestamp === "string" && parsed.usage && typeof parsed.usage === "object") {
-					records.push(parsed);
-				} else {
-					skipped += 1;
-				}
-			} catch {
-				skipped += 1;
-			}
-		}
-	}
-
-	await readInto(current);
-	let names: string[] = [];
-	try {
-		names = await readdir(dir);
-	} catch {
-		names = [];
-	}
-	const rotated = names
-		.filter((name) => /^telemetry\.(\d+)\.jsonl$/.test(name))
-		.sort((a, b) => {
-			const na = Number(/^telemetry\.(\d+)\.jsonl$/.exec(a)?.[1] ?? 0);
-			const nb = Number(/^telemetry\.(\d+)\.jsonl$/.exec(b)?.[1] ?? 0);
-			return na - nb;
-		});
-	rotatedFiles = rotated.length;
-	for (const name of rotated) {
-		await readInto(join(dir, name));
-	}
-
-	return { records, skipped, telemetryBytes, rotatedFiles, file: existsSync(current) ? current : null };
+export async function readTelemetry(projectRoot: string, options: ChronologicalReadOptions = {}): Promise<TelemetryReadResult> {
+	const store = new CacheStore(projectRoot);
+	const current = store.telemetryPath();
+	const history = await store.readRecordsChronological(options);
+	const [telemetryBytes, rotatedFiles] = await Promise.all([store.telemetryBytesAll(), store.rotatedFileCount()]);
+	return {
+		records: history.records as TelemetryRecord[],
+		skipped: history.skipped,
+		telemetryBytes,
+		rotatedFiles,
+		file: existsSync(current) ? current : null,
+		sourceIncomplete: history.sourceIncomplete,
+		truncatedRecords: history.truncatedRecords,
+		filesRead: history.filesRead,
+		...(history.unavailable === undefined ? {} : { unavailable: history.unavailable }),
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -378,6 +351,7 @@ export interface BenchmarkReport {
 	cacheHitRatio: number | null;
 	usageSemanticStatus: "verified" | "partial" | "unverified" | null;
 	providerReportedCost: number;
+	/** Null unless rates resolve and the full telemetry observation is complete. */
 	estimatedAvoidedCost: number | null;
 	expectedInvalidations: number;
 	unexpectedDrifts: number;
@@ -397,6 +371,8 @@ export interface BenchmarkReport {
 	corruptionCount: number;
 	fallbackCount: number;
 	skippedTelemetryLines: number;
+	telemetrySourceIncomplete: boolean;
+	truncatedTelemetryRecords: number;
 }
 
 export interface BenchmarkInput {
@@ -428,7 +404,11 @@ export async function buildBenchmarkReport(input: BenchmarkInput): Promise<Bench
 	// Telemetry aggregation reuses the extension's exact aggregation
 	// (buildCacheReport) so CLI numbers equal /q-cache-report numbers.
 	const rateLookup = (provider: string, model: string): { cacheRead: number } | undefined => input.costMap?.[`${provider}/${model}`];
-	const report = buildCacheReport(records, scope, rateLookup);
+	const report = buildCacheReport(records, scope, rateLookup, {
+		skippedRecords: telemetry.skipped,
+		sourceIncomplete: telemetry.sourceIncomplete,
+		truncatedRecords: telemetry.truncatedRecords,
+	});
 
 	// Recipe cache dimensions from run manifests + action records.
 	const hits = runs.manifests.filter((m) => m.executionSource === "cache");
@@ -485,6 +465,8 @@ export async function buildBenchmarkReport(input: BenchmarkInput): Promise<Bench
 		corruptionCount: actionCache.corruptQuarantined + telemetry.skipped + runs.corrupt,
 		fallbackCount: actionCache.staleLocks,
 		skippedTelemetryLines: telemetry.skipped,
+		telemetrySourceIncomplete: report.sourceIncomplete === true,
+		truncatedTelemetryRecords: report.truncatedRecords ?? 0,
 	};
 }
 
@@ -511,6 +493,12 @@ function bytes(value: number): string {
 
 /** Human-readable rendering — plain facts, never sensitive content. */
 export function renderBenchmarkReport(report: BenchmarkReport): string[] {
+	const telemetryObservationIncomplete = report.telemetrySourceIncomplete || report.truncatedTelemetryRecords > 0;
+	const qualityLabel = report.telemetrySourceIncomplete
+		? "PARTIAL"
+		: report.truncatedTelemetryRecords > 0
+			? "bounded retained window"
+			: "complete";
 	const lines = [
 		`cache benchmark (${report.scope} scope)`,
 		`time range      : ${report.timeRange.from ?? "(no records)"} → ${report.timeRange.to ?? "now"}`,
@@ -523,7 +511,11 @@ export function renderBenchmarkReport(report: BenchmarkReport): string[] {
 		`cache hit ratio : ${pct(report.cacheHitRatio)} (cacheRead/(input+cacheRead); only when usage semantics are verified)`,
 		`usage semantics : ${report.usageSemanticStatus ?? "(no records)"}`,
 		`reported cost   : $${report.providerReportedCost.toFixed(6)} (Pi usage.cost.total)`,
-		`estimated avoided cost: ${report.estimatedAvoidedCost === null ? "n/a (no --cost-map — never hardcoded)" : `$${report.estimatedAvoidedCost.toFixed(6)}`}`,
+		`estimated avoided cost: ${report.estimatedAvoidedCost === null
+			? telemetryObservationIncomplete
+				? "n/a (incomplete telemetry observation)"
+				: "n/a (no compatible --cost-map — never hardcoded)"
+			: `$${report.estimatedAvoidedCost.toFixed(6)}`}`,
 		`invalidations   : expected=${report.expectedInvalidations} unexpected=${report.unexpectedDrifts}`,
 		`changes         : mode=${report.modeChanges} model=${report.modelChanges} thinking=${report.thinkingChanges} reload=${report.reloads} compaction=${report.compactions}`,
 		`recipes         : executed=${report.recipeExecutions} hits=${report.recipeCacheHits} misses=${report.recipeCacheMisses} hit=${pct(report.recipeHitRatio)}`,
@@ -532,6 +524,7 @@ export function renderBenchmarkReport(report: BenchmarkReport): string[] {
 		`corruption      : ${report.corruptionCount}`,
 		`lock fallback   : ${report.fallbackCount} stale lock(s) broken`,
 		`telemetry file  : ${report.sources.telemetryFile ?? "(none)"} (${report.sources.rotatedFiles} rotated, ${report.skippedTelemetryLines} bad line(s) skipped)`,
+		`data quality    : ${qualityLabel}; bounded oldest omitted=${report.truncatedTelemetryRecords}`,
 		`run manifests   : ${report.sources.runManifests} (action records: ${report.sources.actionRecords})`,
 	];
 	return lines;
@@ -647,6 +640,11 @@ export async function buildDoctorFacts(projectRoot: string): Promise<DoctorFacts
 		telemetryBytes: telemetry.telemetryBytes,
 		telemetryMaxBytes: DEFAULT_MAX_TELEMETRY_BYTES,
 		rotatedFiles: telemetry.rotatedFiles,
+		sourceIncomplete: telemetry.sourceIncomplete,
+		skippedRecords: telemetry.skipped,
+		truncatedRecords: telemetry.truncatedRecords,
+		filesRead: telemetry.filesRead,
+		sourceUnavailable: telemetry.unavailable ?? null,
 		context: "cli",
 	};
 }
@@ -755,7 +753,15 @@ export async function main(argv: readonly string[]): Promise<number> {
 	try {
 		if (options.command === "report") {
 			const telemetry = await readTelemetry(options.projectRoot);
-			if (telemetry.records.length === 0 && !options.session && !options.since && !options.until) {
+			if (
+				telemetry.records.length === 0 &&
+				telemetry.file === null &&
+				telemetry.rotatedFiles === 0 &&
+				!telemetry.sourceIncomplete &&
+				!options.session &&
+				!options.since &&
+				!options.until
+			) {
 				// Friendly exit: no telemetry at all.
 				const message =
 					`no cache telemetry found at ${WORKBENCH_CACHE_DIR}/telemetry.jsonl — ` +
@@ -795,7 +801,7 @@ export async function main(argv: readonly string[]): Promise<number> {
 
 		if (options.command === "doctor") {
 			const telemetry = await readTelemetry(options.projectRoot);
-			if (telemetry.records.length === 0) {
+			if (telemetry.records.length === 0 && telemetry.file === null && telemetry.rotatedFiles === 0 && !telemetry.sourceIncomplete) {
 				const message = `no cache telemetry found at ${WORKBENCH_CACHE_DIR}/telemetry.jsonl — run the workbench first; nothing to check.`;
 				if (options.json) process.stdout.write(`${JSON.stringify({ ok: true, checks: [], fail_count: 0, warn_count: 0, note: message }, null, 2)}\n`);
 				else process.stdout.write(`${message}\n`);

@@ -1,7 +1,8 @@
 /** Formal context-output stress evidence; ordinary `npm test` stays light and write-free. */
 
 import assert from "node:assert/strict";
-import { lstat, mkdtemp, readFile, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { lstat, mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { test } from "node:test";
@@ -16,6 +17,7 @@ import { OUTPUT_HARD_CAPS } from "../extensions/workbench-runtime/core/output-po
 
 export const CONTEXT_OUTPUT_STRESS_ARTIFACT = ".pi/workbench/runs/context-output-stress/context-output-evidence.json";
 const FORMAL_STRESS = process.env.npm_lifecycle_event === "test:context-output-stress";
+const TELEMETRY_FILE_PATTERN = /^telemetry(?:\.\d+)?\.jsonl$/;
 
 async function fingerprint(path: string): Promise<string> {
 	try {
@@ -24,6 +26,38 @@ async function fingerprint(path: string): Promise<string> {
 	} catch (error) {
 		return (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "error";
 	}
+}
+
+async function telemetrySnapshot(projectRoot: string): Promise<Record<string, { bytes: number; sha256: string }>> {
+	const cacheDir = join(projectRoot, ".pi", "workbench", "cache");
+	let names: string[];
+	try {
+		names = (await readdir(cacheDir)).filter((name) => TELEMETRY_FILE_PATTERN.test(name)).sort();
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+		throw error;
+	}
+	return Object.fromEntries(await Promise.all(names.map(async (name) => {
+		const content = await readFile(join(cacheDir, name));
+		return [name, { bytes: content.length, sha256: createHash("sha256").update(content).digest("hex") }];
+	})));
+}
+
+async function readTelemetryRecords(projectRoot: string): Promise<Array<Record<string, unknown>>> {
+	const content = await readFile(join(projectRoot, ".pi", "workbench", "cache", "telemetry.jsonl"), "utf8");
+	return content.split("\n").filter((line) => line.trim().length > 0).map((line) => JSON.parse(line) as Record<string, unknown>);
+}
+
+function isOfflineFakeTelemetryRecord(record: Record<string, unknown>): boolean {
+	const usage = record.usage as Record<string, unknown> | undefined;
+	return record.provider === "deepseek"
+		&& record.model === "deepseek-v4-flash"
+		&& record.apiKind === "openai-completions"
+		&& usage?.input === 100
+		&& usage.output === 10
+		&& usage.cacheRead === 50
+		&& usage.cacheWrite === 0
+		&& usage.totalTokens === 160;
 }
 
 test("ordinary npm test leaves formal stress disabled and does not touch its evidence artifact", { skip: FORMAL_STRESS }, async () => {
@@ -37,15 +71,30 @@ test("ordinary npm test leaves formal stress disabled and does not touch its evi
 
 test("formal stress runs all nine offline scenarios and atomically persists hard-cap evidence", { skip: !FORMAL_STRESS }, async () => {
 	const temporary = await mkdtemp(join(tmpdir(), "pi-context-output-stress-"));
+	const repositoryRoot = resolve(".");
+	const repositoryTelemetryBefore = await telemetrySnapshot(repositoryRoot);
 	try {
 		const evidence = await runContextOutputEvidence(temporary);
+		assert.deepEqual(Object.keys(await telemetrySnapshot(temporary)), ["telemetry.jsonl"], "the temporary project must own the only stress telemetry sink");
+		const isolatedRecords = await readTelemetryRecords(temporary);
+		assert.equal(isolatedRecords.length, 25, "the isolated real AgentSession must persist one fake-usage record per provider response");
+		assert.ok(isolatedRecords.every(isOfflineFakeTelemetryRecord), "the isolated telemetry sink must contain only deterministic fake-provider records");
 		const artifact = resolve(CONTEXT_OUTPUT_STRESS_ARTIFACT);
 		await writeJsonAtomic(artifact, evidence);
 		const persisted = JSON.parse(await readFile(artifact, "utf8")) as ContextOutputEvidence;
 		assert.deepEqual(persisted, evidence);
 		assertEvidence(evidence);
 	} finally {
-		await rm(temporary, { recursive: true, force: true });
+		try {
+			const repositoryTelemetryAfter = await telemetrySnapshot(repositoryRoot);
+			assert.deepEqual(
+				repositoryTelemetryAfter,
+				repositoryTelemetryBefore,
+				"offline formal stress must not create, append, or rotate repository cache telemetry",
+			);
+		} finally {
+			await rm(temporary, { recursive: true, force: true });
+		}
 	}
 });
 
@@ -97,6 +146,13 @@ function assertEvidence(evidence: ContextOutputEvidence): void {
 	assert.equal(worker?.metrics.projections_after_completed_tool_turns, 24);
 	assert.equal(worker?.metrics.child_context_handler_count, 1);
 	assert.equal(worker?.metrics.child_before_provider_handler_count, 1);
+	assert.equal(worker?.metrics.child_project_trusted, true);
+	assert.equal(worker?.metrics.production_runtime_package_provenance_valid, true);
+	assert.equal(worker?.metrics.session_project_root_isolated, true);
+	assert.equal(worker?.metrics.isolated_telemetry_records, 25);
+	assert.ok(Number(worker?.metrics.isolated_telemetry_bytes) > 0);
+	assert.match(String(worker?.metrics.isolated_telemetry_sha256), /^[0-9a-f]{64}$/);
+	assert.equal(worker?.metrics.isolated_telemetry_only_fake_records, true);
 	assert.equal(worker?.metrics.child_canonical_telemetry_entries_before_final_response, 24);
 	assert.equal(worker?.metrics.child_facts_consistent, true);
 	assert.equal(worker?.metrics.preflight_before_every_provider_response, true);

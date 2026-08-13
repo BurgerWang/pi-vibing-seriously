@@ -5,12 +5,13 @@
  * prompt cache likely missed for this request — never DeepSeek's internal
  * verdict. DeepSeek does not expose cache-miss reasons; the workbench
  * triangulates from explicit Pi events (model/thinking/mode/reload/
- * compaction) and hash diffs (system prompt, tool set/order/schema, payload
- * shape). Reports always label these `inferred`.
+ * compaction/session-tree navigation) and hash diffs (system prompt, tool
+ * set/order/schema, payload shape). Reports always label these `inferred`.
  *
  * Expected vs unexpected (P6-B stable-prefix contract):
  *   - expected invalidation: mode switch, model switch, thinking level
- *     switch, reload, new session, compaction, first request, provider-side
+ *     switch, reload, new session, compaction, session-tree navigation,
+ *     history-projection epoch transition, first request, provider-side
  *     best-effort miss — normal lifecycle events that legitimately change
  *     the context prefix.
  *   - UNEXPECTED_DRIFT: the system prompt or the active tool set/order/
@@ -19,10 +20,10 @@
  *     defeats caching. The specific source is recorded in the record's
  *     `driftSource` field (SYSTEM_PROMPT / TOOL_SET / TOOL_ORDER /
  *     TOOL_SCHEMA).
- *   - CONTEXT_PREFIX_DIVERGED: the payload structure changed while the
- *     system/tool fingerprints stayed identical (e.g. a genuinely new
- *     message segment the workbench cannot attribute) — treated as
- *     unexpected drift too.
+ *   - CONTEXT_PREFIX_DIVERGED: a previously observed payload prefix item was
+ *     rewritten, deleted, or reordered while the system/tool fingerprints
+ *     stayed identical and no explicit lifecycle event attributed it —
+ *     treated as unexpected drift too. Ordinary append-only growth is healthy.
  *
  * The P6-A specific reasons (SYSTEM_PROMPT_CHANGED, TOOL_SET_CHANGED,
  * TOOL_ORDER_CHANGED, TOOL_SCHEMA_CHANGED) are kept in INVALIDATION_REASONS
@@ -46,6 +47,8 @@ export const INVALIDATION_REASONS = [
 	"UNEXPECTED_DRIFT",
 	"PACKAGE_RELOADED",
 	"COMPACTION",
+	"SESSION_TREE_CHANGED",
+	"HISTORY_PROJECTION_EPOCH_CHANGED",
 	"CONTEXT_PREFIX_DIVERGED",
 	"PROVIDER_BEST_EFFORT_MISS",
 	"UNKNOWN",
@@ -70,6 +73,8 @@ const EXPECTED_REASONS: ReadonlySet<CacheInvalidationReason> = new Set([
 	"MODE_CHANGED",
 	"PACKAGE_RELOADED",
 	"COMPACTION",
+	"SESSION_TREE_CHANGED",
+	"HISTORY_PROJECTION_EPOCH_CHANGED",
 	"PROVIDER_BEST_EFFORT_MISS",
 ]);
 
@@ -105,6 +110,10 @@ export interface InvalidationInput {
 	packageReloaded: boolean;
 	/** compaction observed since the last request. */
 	compactionOccurred: boolean;
+	/** Pi's post-navigation session_tree event occurred since the last request. */
+	sessionTreeChanged?: boolean;
+	/** An explicit history-projection epoch transition was observed. */
+	historyProjectionEpochChanged?: boolean;
 	systemPromptChanged: boolean;
 	toolSetChanged: boolean;
 	toolOrderChanged: boolean;
@@ -141,6 +150,8 @@ export function classifyInvalidation(input: InvalidationInput): InvalidationVerd
 	if (input.isFirstRequest) return { reason: "FIRST_OBSERVED_REQUEST", confidence: "high", driftSource: null };
 	if (input.packageReloaded) return { reason: "PACKAGE_RELOADED", confidence: "high", driftSource: null };
 	if (input.compactionOccurred) return { reason: "COMPACTION", confidence: "high", driftSource: null };
+	if (input.sessionTreeChanged) return { reason: "SESSION_TREE_CHANGED", confidence: "high", driftSource: null };
+	if (input.historyProjectionEpochChanged) return { reason: "HISTORY_PROJECTION_EPOCH_CHANGED", confidence: "high", driftSource: null };
 	if (input.modelChanged) return { reason: "MODEL_CHANGED", confidence: "high", driftSource: null };
 	if (input.thinkingChanged) return { reason: "THINKING_LEVEL_CHANGED", confidence: "high", driftSource: null };
 	if (input.modeChanged) return { reason: "MODE_CHANGED", confidence: "high", driftSource: null };

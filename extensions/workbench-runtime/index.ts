@@ -782,11 +782,11 @@ import {
 	COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES,
 	HISTORY_DESCRIPTOR_MAX_BYTES,
 	HISTORY_MAX_BUNDLES,
+	HISTORY_PROJECTION_ENTRY_TYPE,
+	HistoryProjectionController,
 	OTHER_HISTORY_TOOL_TEXT_MAX_BYTES,
 	WORKER_HISTORY_TOOL_TEXT_MAX_BYTES,
-	historyProjectionFailureMessages,
-	historyToolTextBytes,
-	projectContextHistory,
+	safeHistoryProjectionFailureMessages,
 	type HistoryProjectionFacts,
 } from "./core/context-history-budget.ts";
 import {
@@ -863,6 +863,7 @@ import {
 
 const STATUS_KEY = "workbench";
 const OUTPUT_TURN_TELEMETRY_ENTRY_TYPE = "workbench-output-turn-telemetry-v1";
+const CONTEXT_PRESSURE_ENTRY_TYPE = "workbench-context-pressure-v1";
 
 /** Secret env values scrubbed from every ledger/review artifact. */
 const secrets = collectSecretValues(process.env);
@@ -1437,6 +1438,13 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		removedBundles: 0,
 		protectedLatestBundles: 0,
 	};
+	const historyProjectionController = new HistoryProjectionController();
+	let latestHistoryPressure = {
+		epoch: 0,
+		rawBundleCount: 0,
+		hardHistoryBytes: OTHER_HISTORY_TOOL_TEXT_MAX_BYTES,
+		hardBundleCount: HISTORY_MAX_BUNDLES,
+	};
 	let currentTurnSerial = 0;
 
 	function outputTurnRole(): TurnRole {
@@ -1467,6 +1475,53 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	function persistOutputControlTelemetry(): void {
 		const snapshot = serializeOutputControlTelemetry(ensureOutputControlTelemetry().snapshot());
 		pi.appendEntry(OUTPUT_CONTROL_TELEMETRY_ENTRY_TYPE, snapshot);
+	}
+
+	function persistHistoryProjectionState(): void {
+		try {
+			pi.appendEntry(HISTORY_PROJECTION_ENTRY_TYPE, historyProjectionController.serialize());
+		} catch {
+			// Projection persistence is advisory; hard caps are re-established on the next context event.
+		}
+	}
+
+	function persistContextPressure(): void {
+		try {
+			pi.appendEntry(CONTEXT_PRESSURE_ENTRY_TYPE, {
+				schema: CONTEXT_PRESSURE_ENTRY_TYPE,
+				role: outputTurnRole(),
+				epoch: latestHistoryPressure.epoch,
+				rawToolTextBytes: latestHistoryProjectionFacts.originalToolTextBytes,
+				projectedToolTextBytes: latestHistoryProjectionFacts.finalToolTextBytes,
+				rawBundleCount: latestHistoryPressure.rawBundleCount,
+				hardHistoryBytes: latestHistoryPressure.hardHistoryBytes,
+				hardBundleCount: latestHistoryPressure.hardBundleCount,
+				timestampMs: Date.now(),
+			});
+		} catch {
+			// Raw-pressure telemetry must never affect enforcement or the provider path.
+		}
+	}
+
+	function resetHistoryProjection(): void {
+		historyProjectionController.reset();
+		latestHistoryProjectionFacts = {
+			originalToolTextBytes: 0,
+			finalToolTextBytes: 0,
+			collapsedResults: 0,
+			removedBundles: 0,
+			protectedLatestBundles: 0,
+		};
+		latestHistoryPressure = {
+			epoch: historyProjectionController.serialize().epoch,
+			rawBundleCount: 0,
+			hardHistoryBytes: outputTurnRole() === "commander"
+				? COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES
+				: outputTurnRole() === "worker"
+					? WORKER_HISTORY_TOOL_TEXT_MAX_BYTES
+					: OTHER_HISTORY_TOOL_TEXT_MAX_BYTES,
+			hardBundleCount: HISTORY_MAX_BUNDLES,
+		};
 	}
 
 	function observeOutputEnvelope(toolName: unknown, facts: unknown): void {
@@ -2244,6 +2299,13 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		delegationState = loadDelegationStateFromEntries(entries);
 		writeLease = loadLeaseFromEntries(entries);
 		if (ctx.model) currentModelFacts = { provider: ctx.model.provider, model: ctx.model.id };
+		if (event.reason === "new" || event.reason === "fork") {
+			resetHistoryProjection();
+			persistHistoryProjectionState();
+			persistContextPressure();
+		} else {
+			historyProjectionController.restoreFromEntries(entries);
+		}
 		// Restore only the latest strict numeric/fixed-enum snapshot for the
 		// resolved role. Malformed matching entries reset the accumulator.
 		outputControlTelemetry = undefined;
@@ -2283,6 +2345,19 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		void refreshCacheConfig(ctx);
 		void refreshStatus(ctx);
 		void refreshWidget(ctx); // a previously failed gate keeps the widget visible
+	});
+
+	pi.on("session_compact", () => {
+		resetHistoryProjection();
+		persistHistoryProjectionState();
+		persistContextPressure();
+	});
+
+	pi.on("session_tree", () => {
+		resetHistoryProjection();
+		persistHistoryProjectionState();
+		persistContextPressure();
+		cacheTelemetry.observeSessionTreeChange();
 	});
 
 	// ----------------------------------------------------- P5 compaction
@@ -2369,6 +2444,8 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		} catch {
 			// Session telemetry persistence is advisory and never breaks closure.
 		}
+		persistHistoryProjectionState();
+		persistContextPressure();
 		pendingOutputAuthorizations.clear();
 		trustedReadContinuations.clear();
 		trustedRunLogContinuations.clear();
@@ -2485,7 +2562,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				? WORKER_HISTORY_TOOL_TEXT_MAX_BYTES
 				: OTHER_HISTORY_TOOL_TEXT_MAX_BYTES;
 		try {
-			const projection = projectContextHistory({
+			const projection = historyProjectionController.project({
 				messages: event.messages,
 				maxToolTextBytes,
 				maxBundles: HISTORY_MAX_BUNDLES,
@@ -2493,24 +2570,47 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				role,
 			});
 			latestHistoryProjectionFacts = { ...projection.facts };
-			ensureOutputControlTelemetry().recordHistory(projection.facts, role);
+			latestHistoryPressure = {
+				epoch: projection.epoch,
+				rawBundleCount: projection.rawBundleCount,
+				hardHistoryBytes: maxToolTextBytes,
+				hardBundleCount: HISTORY_MAX_BUNDLES,
+			};
+			ensureOutputControlTelemetry().recordHistory({
+				...projection.facts,
+				collapsedResults: projection.newlyCollapsedResults,
+				removedBundles: projection.newlyRemovedBundles,
+			}, role);
+			if (projection.epochTransitioned && projection.epochHash) {
+				cacheTelemetry.observeHistoryProjectionEpoch(projection.epochHash);
+			}
 			mirrorOutputControlCompactFacts();
 			return { messages: projection.messages };
 		} catch {
-			const messages = historyProjectionFailureMessages(
-				event.messages,
-				maxToolTextBytes,
-				HISTORY_DESCRIPTOR_MAX_BYTES,
-			);
+			// Do not inspect event.messages again here. It may be a revoked proxy,
+			// an accessor that already threw, or another hostile structured value.
+			// Pi falls back to raw context if this handler throws, so the terminal
+			// catch path must be fixed, bounded, and independently no-throw.
+			const messages = safeHistoryProjectionFailureMessages();
 			latestHistoryProjectionFacts = {
 				originalToolTextBytes: 0,
-				finalToolTextBytes: historyToolTextBytes(messages),
+				finalToolTextBytes: 0,
 				collapsedResults: 0,
 				removedBundles: 0,
 				protectedLatestBundles: 0,
 			};
-			ensureOutputControlTelemetry().recordHistory(latestHistoryProjectionFacts, role);
-			mirrorOutputControlCompactFacts();
+			latestHistoryPressure = {
+				epoch: 0,
+				rawBundleCount: 0,
+				hardHistoryBytes: maxToolTextBytes,
+				hardBundleCount: HISTORY_MAX_BUNDLES,
+			};
+			try {
+				ensureOutputControlTelemetry().recordHistory(latestHistoryProjectionFacts, role);
+				mirrorOutputControlCompactFacts();
+			} catch {
+				// Advisory telemetry cannot reopen the raw-context fallback path.
+			}
 			return { messages };
 		}
 	});
@@ -3797,9 +3897,9 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			await refreshCacheConfig(ctx);
 			cacheTelemetry.setProjectRoot(projectRoot);
 			const store = new CacheStore(projectRoot);
-			const { records, skipped } = await store.readRecords();
+			const history = await store.readRecordsChronological();
 			const scope = scopeArg;
-			let scoped = records as TelemetryRecord[];
+			let scoped = history.records as TelemetryRecord[];
 			if (scope === "session") {
 				const hashed = cacheTelemetry.snapshot().hashedSessionId;
 				scoped = scoped.filter((r) => r.hashedSessionId === hashed);
@@ -3809,8 +3909,11 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				if (!m || typeof m.cost?.cacheRead !== "number" || !Number.isFinite(m.cost.cacheRead)) return undefined;
 				return { cacheRead: m.cost.cacheRead };
 			};
-			const report = buildCacheReport(scoped, scope, rateLookup);
-			report.skippedRecords = skipped;
+			const report = buildCacheReport(scoped, scope, rateLookup, {
+				skippedRecords: history.skipped,
+				sourceIncomplete: history.sourceIncomplete,
+				truncatedRecords: history.truncatedRecords,
+			});
 			const lines = renderCacheReport(report);
 			if (saveName) {
 				const saved = await store.saveReport(saveName, report);
@@ -3820,7 +3923,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 					lines.push("", `report save failed: ${saved.error ?? "unknown error"}`);
 				}
 			}
-			if (skipped > 0) lines.push(`(note: ${skipped} corrupted line(s) skipped in telemetry.jsonl)`);
+			if (history.skipped > 0) lines.push(`(note: ${history.skipped} corrupted line(s) skipped in telemetry history)`);
 			output(ctx, lines);
 		},
 	});
@@ -3839,7 +3942,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			await refreshCacheConfig(ctx);
 			cacheTelemetry.setProjectRoot(projectRoot);
 			const store = new CacheStore(projectRoot);
-			const { records } = await store.readRecords();
+			const history = await store.readRecordsChronological();
 			const model = ctx.model;
 			const facts: DoctorFacts = {
 				provider: model?.provider ?? null,
@@ -3858,11 +3961,16 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 					parameters: t.parameters,
 					promptGuidelines: t.promptGuidelines,
 				})),
-				records: records as TelemetryRecord[],
+				records: history.records as TelemetryRecord[],
 				telemetryEnabled: cacheTelemetry.isEnabled(),
-				telemetryBytes: await store.telemetryBytes(),
+				telemetryBytes: await store.telemetryBytesAll(),
 				telemetryMaxBytes: DEFAULT_MAX_TELEMETRY_BYTES,
 				rotatedFiles: await store.rotatedFileCount(),
+				sourceIncomplete: history.sourceIncomplete,
+				skippedRecords: history.skipped,
+				truncatedRecords: history.truncatedRecords,
+				filesRead: history.filesRead,
+				sourceUnavailable: history.unavailable ?? null,
 			};
 			const checks = runDoctor(facts);
 			output(ctx, jsonMode ? [JSON.stringify(doctorToJson(checks, facts), null, 2)] : renderDoctor(checks));

@@ -476,6 +476,25 @@ blocked calls and history collapse; raw worker/tool text is never telemetry.
 These controls are independent of the per-message context and cumulative
 spend limits below.
 
+History projection is epoch-based. A worker stays raw and append-only until it
+crosses the unchanged 64 KiB or 128-bundle hard limit; the transition projects
+the frozen prefix to the 48 KiB (75%) / 96-bundle low watermark. That projected
+prefix then remains provider-visible and append-only while new raw suffixes are
+added. The next hard crossing starts another expected epoch invalidation.
+Branching or completed compaction resets the frozen boundary; reload restores
+only the strict numeric/hash-only state.
+
+The shared runtime writes a `workbench-context-pressure-v1` custom entry with
+exactly nine numeric/fixed fields (`schema`, `role`, `epoch`, raw/projected
+tool-text bytes, raw bundle count, both hard limits, and `timestampMs`). The
+separate Commander auto-compaction companion accepts only strict Commander
+entries as epoch/churn and raw-versus-projected diagnostics. Its automatic
+trigger percentage comes solely from Pi 0.83 `getContextUsage()`, which already
+measures raw session messages; it never adds a raw-minus-projected token delta.
+Worker-role entries are deliberately ignored and never alter the worker's
+independent 80% soft / 90% hard policy. This repository publishes the contract
+but does not install or deploy the companion extension.
+
 The pinned worker runs on a 1,000,000-token context window. The workbench
 protects that budget with two thresholds that are model-specific and
 independent of the Commander/project compaction reserve:

@@ -15,12 +15,15 @@ import {
 	type ExtensionContext,
 	type RegisteredTool,
 } from "@earendil-works/pi-coding-agent";
+import { convertToLlm } from "../node_modules/@earendil-works/pi-coding-agent/dist/core/messages.js";
 
 import workbenchRuntime from "../extensions/workbench-runtime/index.ts";
 import { COMPARISON_PERSIST_ERROR } from "../extensions/workbench-runtime/core/comparison-record.ts";
 import { runsDir, workbenchDir } from "../extensions/workbench-runtime/core/config.ts";
 import {
 	COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES,
+	HISTORY_MAX_BUNDLES,
+	HISTORY_PROJECTION_ENTRY_TYPE,
 	OTHER_HISTORY_TOOL_TEXT_MAX_BYTES,
 	WORKER_HISTORY_TOOL_TEXT_MAX_BYTES,
 	historyToolTextBytes,
@@ -386,8 +389,187 @@ test("runtime registers one fail-closed context projector before provider teleme
 	assert.equal((source.match(/pi\.on\("context"/g) ?? []).length, 1);
 	const handler = source.slice(handlerStart, providerStart);
 	assert.match(handler, /catch\s*\{/);
-	assert.match(handler, /historyProjectionFailureMessages\(\s*event\.messages,\s*maxToolTextBytes,\s*HISTORY_DESCRIPTOR_MAX_BYTES/);
+	assert.match(handler, /historyProjectionController\.project\(/);
+	assert.match(handler, /safeHistoryProjectionFailureMessages\(\)/);
+	assert.doesNotMatch(handler, /historyProjectionFailureMessages|historyToolTextBytes\(\s*event\.messages/);
 	assert.doesNotMatch(handler, /appendEntry|sessionManager|getEntries|event\.messages\s*=/);
+});
+
+test("runtime context terminal fallback never re-inspects hostile messages or exposes raw context", async () => {
+	const stub = makeRoleRuntime("other");
+	const ctx = trustedCtx(process.cwd(), "history-hostile-runtime") as ExtensionContext;
+	const handler = stub.events.get("context")?.[0];
+	assert.ok(handler);
+	const invoke = async (event: unknown): Promise<AgentMessage[]> => {
+		const result = (await handler(event, ctx)) as { messages?: AgentMessage[] } | undefined;
+		assert.ok(result?.messages);
+		assert.equal(result.messages.length, 1);
+		assert.equal((result.messages[0] as { customType?: unknown }).customType, "workbench-history-projection-failure");
+		assert.equal(validateContextToolPairing(result.messages), true);
+		assert.ok(historyToolTextBytes(result.messages) <= OTHER_HISTORY_TOOL_TEXT_MAX_BYTES);
+		assert.doesNotMatch(JSON.stringify(result.messages), /RAW-CONTEXT-SECRET|HOSTILE-CONTEXT/);
+		return result.messages;
+	};
+
+	let eventGetterCalls = 0;
+	const accessorEvent: Record<string, unknown> = { type: "context" };
+	Object.defineProperty(accessorEvent, "messages", {
+		enumerable: true,
+		get(): never {
+			eventGetterCalls += 1;
+			throw new Error("RAW-CONTEXT-SECRET-EVENT");
+		},
+	});
+	await invoke(accessorEvent);
+	assert.equal(eventGetterCalls, 1, "terminal catch must not read event.messages a second time");
+
+	let proxyTrapCalls = 0;
+	const hostileMessages = new Proxy([] as AgentMessage[], {
+		get(): never {
+			proxyTrapCalls += 1;
+			throw new Error("RAW-CONTEXT-SECRET-PROXY");
+		},
+	});
+	await invoke({ type: "context", messages: hostileMessages });
+	assert.equal(proxyTrapCalls, 1, "controller failure must not inspect a hostile messages proxy twice");
+
+	const revoked = Proxy.revocable([] as AgentMessage[], {});
+	revoked.revoke();
+	await invoke({ type: "context", messages: revoked.proxy });
+});
+
+test("runtime freezes history epochs, counts omissions once, and persists exact pressure/reset state", async () => {
+	const stub = makeRoleRuntime("other");
+	const ctx = trustedCtx(process.cwd(), "history-epoch-runtime") as ExtensionContext;
+	const raw: AgentMessage[] = [];
+	for (let index = 0; index < 30; index += 1) {
+		const id = `runtime-epoch-${index}`;
+		raw.push(
+			{ role: "assistant", content: [{ type: "toolCall", id, name: "read", arguments: {} }], timestamp: index * 2 + 1 } as unknown as AgentMessage,
+			{ role: "toolResult", toolCallId: id, toolName: "read", content: [{ type: "text", text: "x".repeat(3_000) }], isError: false, timestamp: index * 2 + 2 } as unknown as AgentMessage,
+		);
+	}
+	await emitEvent(stub, "turn_start", { type: "turn_start", turnIndex: 51, timestamp: 1 }, ctx);
+	const first = await emitContext(stub, raw, ctx);
+	const firstCollapsed = first.filter((message) => (
+		(message as { role?: unknown }).role === "toolResult"
+		&& textOf((message as { content?: Array<Record<string, unknown>> }).content ?? []).includes("[historical tool result collapsed]")
+	)).length;
+	assert.ok(firstCollapsed > 0);
+	let previousProviderVisible = convertToLlm(first);
+	for (let index = 0; index < 25; index += 1) {
+		const id = `runtime-suffix-${index}`;
+		raw.push(
+			{ role: "user", content: `suffix-${index}`, timestamp: 1_000 + index * 3 } as unknown as AgentMessage,
+			{ role: "assistant", content: [{ type: "toolCall", id, name: "read", arguments: {} }], timestamp: 1_001 + index * 3 } as unknown as AgentMessage,
+			{ role: "toolResult", toolCallId: id, toolName: "read", content: [{ type: "text", text: "s".repeat(12) }], isError: false, timestamp: 1_002 + index * 3 } as unknown as AgentMessage,
+		);
+		const next = await emitContext(stub, raw, ctx);
+		const nextProviderVisible = convertToLlm(next);
+		assert.deepEqual(
+			nextProviderVisible.slice(0, previousProviderVisible.length),
+			previousProviderVisible,
+			`runtime context request ${index} rewrote the Pi provider-visible epoch prefix`,
+		);
+		previousProviderVisible = nextProviderVisible;
+	}
+	await emitEvent(stub, "turn_end", { type: "turn_end", turnIndex: 51, message: {}, toolResults: [] }, ctx);
+
+	const outputEntry = [...stub.appendedEntries].reverse().find((entry) => entry.customType === OUTPUT_CONTROL_TELEMETRY_ENTRY_TYPE);
+	const outputSnapshot = parseOutputControlTelemetry(outputEntry?.data);
+	assert.ok(outputSnapshot);
+
+	const stateEntry = [...stub.appendedEntries].reverse().find((entry) => entry.customType === HISTORY_PROJECTION_ENTRY_TYPE);
+	const state = stateEntry?.data as Record<string, unknown>;
+	assert.equal(state.active, 1);
+	assert.match(String(state.epochHash), /^[0-9a-f]{64}$/);
+	assert.match(String(state.prefixHash), /^[0-9a-f]{64}$/);
+	assert.equal(JSON.stringify(state).includes("runtime-epoch"), false);
+	assert.equal(outputSnapshot.totals.historyCollapsedResults, state.transitionCollapsedResults, "25 same-epoch requests do not re-count collapsed results");
+	assert.equal(outputSnapshot.totals.historyRemovedBundles, state.transitionRemovedBundles, "25 same-epoch requests do not re-count removed bundles");
+	const resumedStub = makeRoleRuntime("other");
+	const resumedBase = trustedCtx(process.cwd(), "history-epoch-resume") as ExtensionContext;
+	const resumedCtx = {
+		...resumedBase,
+		sessionManager: {
+			...resumedBase.sessionManager,
+			getEntries: () => [{ type: "custom", customType: HISTORY_PROJECTION_ENTRY_TYPE, data: state }],
+		},
+	} as ExtensionContext;
+	await emitEvent(resumedStub, "session_start", { type: "session_start", reason: "reload" }, resumedCtx);
+	const resumedRaw = [...raw, { role: "user", content: "bounded suffix", timestamp: 999 } as unknown as AgentMessage];
+	const resumed = await emitContext(resumedStub, resumedRaw, resumedCtx);
+	assert.deepEqual(
+		convertToLlm(resumed).slice(0, convertToLlm(first).length),
+		convertToLlm(first),
+		"reload restores the exact provider-visible epoch prefix",
+	);
+
+	const pressureEntry = [...stub.appendedEntries].reverse().find((entry) => entry.customType === "workbench-context-pressure-v1");
+	const pressure = pressureEntry?.data as Record<string, unknown>;
+	assert.deepEqual(Object.keys(pressure).sort(), [
+		"epoch", "hardBundleCount", "hardHistoryBytes", "projectedToolTextBytes", "rawBundleCount",
+		"rawToolTextBytes", "role", "schema", "timestampMs",
+	].sort());
+	assert.equal(pressure.schema, "workbench-context-pressure-v1");
+	assert.equal(pressure.role, "other");
+	assert.equal(pressure.rawBundleCount, 55);
+	assert.equal(pressure.hardHistoryBytes, OTHER_HISTORY_TOOL_TEXT_MAX_BYTES);
+	assert.equal(pressure.hardBundleCount, HISTORY_MAX_BUNDLES);
+	assert.ok(typeof pressure.timestampMs === "number" && Number.isSafeInteger(pressure.timestampMs));
+
+	await emitEvent(stub, "session_tree", { type: "session_tree", newLeafId: "new", oldLeafId: "old" }, ctx);
+	const treeReset = [...stub.appendedEntries].reverse().find((entry) => entry.customType === HISTORY_PROJECTION_ENTRY_TYPE)?.data as Record<string, unknown>;
+	assert.equal(treeReset.active, 0);
+	await emitContext(stub, raw, ctx);
+	await emitEvent(stub, "session_compact", { type: "session_compact", compactionEntry: {}, fromExtension: false, reason: "manual", willRetry: false }, ctx);
+	const compactReset = [...stub.appendedEntries].reverse().find((entry) => entry.customType === HISTORY_PROJECTION_ENTRY_TYPE)?.data as Record<string, unknown>;
+	assert.equal(compactReset.active, 0);
+});
+
+test("runtime session_tree marks exactly the next cache record expected and preserves later drift detection", async () => {
+	await withTempDir(async (root) => {
+		const stub = makeRoleRuntime("other");
+		const base = trustedCtx(root, "cache-session-tree-runtime") as ExtensionContext;
+		const ctx = {
+			...base,
+			model: { provider: "deepseek", id: "deepseek-v4-flash", api: "openai-completions" },
+			thinkingLevel: "high",
+			getSystemPrompt: () => "stable workbench system prompt",
+		} as ExtensionContext;
+		const payload = (text: string) => ({
+			model: "deepseek-v4-flash",
+			messages: [{ role: "system", content: "stable workbench system prompt" }, { role: "user", content: text }],
+		});
+		const assistant = (timestamp: number) => ({
+			role: "assistant",
+			content: [],
+			provider: "deepseek",
+			model: "deepseek-v4-flash",
+			api: "openai-completions",
+			usage: { input: 100, output: 10, cacheRead: 900, cacheWrite: 0, totalTokens: 1010, cost: { total: 0.001 } },
+			stopReason: "stop",
+			timestamp,
+		});
+
+		await emitEvent(stub, "session_start", { type: "session_start", reason: "new" }, ctx);
+		await emitEvent(stub, "before_provider_request", { type: "before_provider_request", payload: payload("original branch") }, ctx);
+		await emitMessageEnd(stub, assistant(1), ctx);
+		await emitEvent(stub, "session_tree", { type: "session_tree", newLeafId: "selected", oldLeafId: "original" }, ctx);
+		await emitEvent(stub, "before_provider_request", { type: "before_provider_request", payload: payload("selected branch") }, ctx);
+		await emitMessageEnd(stub, assistant(2), ctx);
+		await emitEvent(stub, "before_provider_request", { type: "before_provider_request", payload: payload("unattributed rewrite") }, ctx);
+		await emitMessageEnd(stub, assistant(3), ctx);
+
+		const telemetryPath = join(root, CONFIG_DIR_NAME, "workbench", "cache", "telemetry.jsonl");
+		const records = (await readFile(telemetryPath, "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as { inferredInvalidationReason?: string });
+		assert.equal(records.length, 3);
+		assert.equal(records[1]?.inferredInvalidationReason, "SESSION_TREE_CHANGED", "Pi's actual post-navigation event attributes the next branch rewrite");
+		assert.equal(records[2]?.inferredInvalidationReason, "CONTEXT_PREFIX_DIVERGED", "the lifecycle marker is consumed once and later drift stays visible");
+	});
 });
 
 test("context success and fail-closed projections update latest numeric history telemetry", async () => {

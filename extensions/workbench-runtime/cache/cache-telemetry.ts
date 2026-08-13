@@ -9,6 +9,7 @@
  *   - before_provider_request -> observePayload (READ-ONLY structural peek)
  *   - message_end          -> observeMessageEnd (assistant messages only)
  *   - session_before_compact -> observeCompaction
+ *   - session_tree         -> observeSessionTreeChange (completed navigation)
  *   - session_shutdown     -> flush (safe state entry write)
  *
  * Failure discipline: every public method catches its own errors and returns
@@ -16,12 +17,17 @@
  *
  * Session state is persisted as a Pi custom entry (customType
  * "workbench-cache-state") holding only: schemaVersion, requestCount,
- * aggregate usage, last hashes, last invalidation reason and the telemetry
- * file reference. No message bodies, no large arrays.
+ * aggregate usage, a bounded pending-write-gap bit, last hashes, last
+ * invalidation reason and the telemetry file reference. No message bodies,
+ * no large arrays.
  */
+
+import { types as nodeTypes } from "node:util";
 
 import {
 	addUsageTotals,
+	cacheHitRatioFromTotals,
+	combineUsageSemanticStatus,
 	emptyUsageTotals,
 	EXTENSION_VERSION,
 	TELEMETRY_SCHEMA_VERSION,
@@ -31,8 +37,9 @@ import {
 	type UsageSemanticStatus,
 	type UsageTotalsLike,
 } from "./cache-types.ts";
-import { hashSessionId } from "./canonical-hash.ts";
+import { hashSessionId, sha256Hex } from "./canonical-hash.ts";
 import {
+	classifyPayloadRelationship,
 	fingerprintTools,
 	payloadShapeHash,
 	summarizePayload,
@@ -43,12 +50,55 @@ import {
 } from "./prompt-fingerprint.ts";
 import {
 	classifyInvalidation,
+	INVALIDATION_REASONS,
 	type CacheInvalidationReason,
 	type InferenceConfidence,
 } from "./invalidation-classifier.ts";
 import { CacheStore } from "./cache-store.ts";
 
 export const CACHE_STATE_ENTRY_TYPE = "workbench-cache-state";
+
+const CACHE_STATE_KEYS = [
+	"schemaVersion",
+	"hashedSessionId",
+	"requestCount",
+	"usage",
+	"usageSemanticStatus",
+	"telemetryWriteGapPending",
+	"lastHashes",
+	"lastInvalidationReason",
+	"telemetryFile",
+	"updatedAt",
+] as const;
+const CACHE_STATE_REQUIRED_KEYS = [
+	"schemaVersion",
+	"hashedSessionId",
+	"requestCount",
+	"usage",
+	"lastHashes",
+	"updatedAt",
+] as const;
+const CACHE_STATE_USAGE_KEYS = ["input", "output", "cacheRead", "cacheWrite", "totalTokens", "cost"] as const;
+const CACHE_STATE_HASH_KEYS = [
+	"systemPromptHash",
+	"toolNamesHash",
+	"toolOrderHash",
+	"toolSchemaHash",
+	"contextShapeHash",
+] as const;
+const CACHE_STATE_SESSION_HASH = /^[0-9a-f]{16}$/;
+const CACHE_STATE_SHA256 = /^[0-9a-f]{64}$/;
+const CACHE_STATE_INVALIDATION_REASONS: ReadonlySet<string> = new Set(INVALIDATION_REASONS);
+const CACHE_STATE_SEMANTIC_STATUSES: ReadonlySet<UsageSemanticStatus> = new Set([
+	"verified",
+	"partial",
+	"unverified",
+]);
+const CACHE_STATE_TELEMETRY_FILE = ".pi/workbench/cache/telemetry.jsonl";
+const TELEMETRY_WRITE_GAP_EVENT = "telemetry_write_gap";
+const MAX_CACHE_STATE_ENTRIES = 100_000;
+const MAX_CACHE_STATE_REQUESTS = 1_000_000_000;
+const MAX_CACHE_STATE_NUMERIC_VALUE = 1_000_000_000_000_000;
 
 /** Structural shape of the Pi custom entry (mirrors CustomEntry). */
 export interface CacheStateEntryLike {
@@ -63,6 +113,10 @@ export interface CacheStateEntryData {
 	hashedSessionId: string;
 	requestCount: number;
 	usage: UsageTotalsLike;
+	/** Aggregate trust level for all usage included in `usage`. */
+	usageSemanticStatus?: UsageSemanticStatus | null;
+	/** Strict bounded flag: 1 until a durable telemetry gap marker is appended. */
+	telemetryWriteGapPending: 0 | 1;
 	lastHashes: {
 		systemPromptHash?: string;
 		toolNamesHash?: string;
@@ -108,8 +162,12 @@ export interface CacheSnapshot {
 	thinkingLevel: string | null;
 	requestCount: number;
 	usage: UsageTotalsLike;
-	hitRatio: number | null;
-	semanticStatus: UsageSemanticStatus | null;
+	/** Ratio for the most recently observed request only. */
+	lastRequestHitRatio: number | null;
+	/** Ratio across `usage`; null unless every included request is verified. */
+	cumulativeHitRatio: number | null;
+	lastRequestSemanticStatus: UsageSemanticStatus | null;
+	cumulativeSemanticStatus: UsageSemanticStatus | null;
 	lastInvalidationReason: CacheInvalidationReason | null;
 	lastInvalidationConfidence: InferenceConfidence | null;
 	telemetryFile: string | null;
@@ -127,15 +185,253 @@ export interface CacheTelemetry {
 	observeModeChange(mode: string): void;
 	observeReload(): void;
 	observeCompaction(): void;
+	/** Mark Pi's completed session-tree navigation for the next cache record. */
+	observeSessionTreeChange(): void;
+	/**
+	 * Observe a stable history-projection epoch identifier. The identifier is
+	 * hashed in memory and never persisted; a changed hash marks one expected
+	 * invalidation for the next recorded request. index.ts calls this only when
+	 * the context projector crosses an epoch boundary.
+	 */
+	observeHistoryProjectionEpoch(epoch: string | number): void;
 	observeNewSession(): void;
 	/** READ-ONLY structural peek at the provider payload. Never mutates. */
 	observePayload(payload: unknown): void;
 	restoreFromEntries(entries: readonly CacheStateEntryLike[]): void;
 	observeMessageEnd(facts: MessageEndFacts): Promise<TelemetryRecord | null>;
 	flush(): void;
-	/** Compact TUI contribution: "CACHE 72% | read 184k | miss 71k". */
+	/** Compact TUI contribution: "CACHE last=72% cum=68% | read 184k | miss 71k". */
 	statusSegment(): string | undefined;
 	snapshot(): CacheSnapshot;
+}
+
+interface ExactOwnDataRecord {
+	readonly values: Readonly<Record<string, unknown>>;
+}
+
+/** Copy a plain record without invoking accessors or proxy traps. */
+function exactOwnDataRecord(
+	value: unknown,
+	allowedKeys: readonly string[],
+	requiredKeys: readonly string[] = allowedKeys,
+): ExactOwnDataRecord | undefined {
+	try {
+		if (value === null || typeof value !== "object" || Array.isArray(value) || nodeTypes.isProxy(value)) return undefined;
+		const prototype = Object.getPrototypeOf(value);
+		if (prototype !== Object.prototype && prototype !== null) return undefined;
+		if (Object.getOwnPropertySymbols(value).length !== 0) return undefined;
+		const descriptors = Object.getOwnPropertyDescriptors(value);
+		const names = Object.keys(descriptors);
+		const allowed = new Set(allowedKeys);
+		if (names.some((name) => !allowed.has(name))) return undefined;
+		for (const required of requiredKeys) {
+			if (!Object.prototype.hasOwnProperty.call(descriptors, required)) return undefined;
+		}
+		const values: Record<string, unknown> = Object.create(null);
+		for (const name of names) {
+			const descriptor = descriptors[name];
+			if (!descriptor || descriptor.enumerable !== true || !Object.prototype.hasOwnProperty.call(descriptor, "value")) {
+				return undefined;
+			}
+			values[name] = descriptor.value;
+		}
+		return { values };
+	} catch {
+		return undefined;
+	}
+}
+
+/** Snapshot a bounded dense entry array without indexing untrusted input. */
+function strictEntryArray(value: unknown): readonly unknown[] | undefined {
+	try {
+		if (!Array.isArray(value) || nodeTypes.isProxy(value)) return undefined;
+		if (Object.getPrototypeOf(value) !== Array.prototype || Object.getOwnPropertySymbols(value).length !== 0) return undefined;
+		const descriptors = Object.getOwnPropertyDescriptors(value);
+		const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+		if (!lengthDescriptor || !Object.prototype.hasOwnProperty.call(lengthDescriptor, "value")) return undefined;
+		const length = lengthDescriptor.value;
+		if (!Number.isSafeInteger(length) || length < 0 || length > MAX_CACHE_STATE_ENTRIES) return undefined;
+		const output = new Array<unknown>(length);
+		for (const [key, descriptor] of Object.entries(descriptors)) {
+			if (key === "length") continue;
+			if (!/^(?:0|[1-9][0-9]*)$/.test(key)) return undefined;
+			const index = Number(key);
+			if (!Number.isSafeInteger(index) || index < 0 || index >= length) return undefined;
+			if (descriptor.enumerable !== true || !Object.prototype.hasOwnProperty.call(descriptor, "value")) return undefined;
+			output[index] = descriptor.value;
+		}
+		for (let index = 0; index < length; index += 1) {
+			if (!Object.prototype.hasOwnProperty.call(descriptors, String(index))) return undefined;
+		}
+		return output;
+	} catch {
+		return undefined;
+	}
+}
+
+type StateEntryCandidate =
+	| { readonly kind: "unrelated" }
+	| { readonly kind: "unsafe" }
+	| { readonly kind: "matched"; readonly data: unknown };
+
+/** Identify a cache-state entry using own data descriptors only. */
+function cacheStateEntryCandidate(value: unknown): StateEntryCandidate {
+	try {
+		if (value === null || typeof value !== "object") return { kind: "unrelated" };
+		if (nodeTypes.isProxy(value)) return { kind: "unsafe" };
+		const prototype = Object.getPrototypeOf(value);
+		if (prototype !== Object.prototype && prototype !== null) return { kind: "unsafe" };
+		if (Object.getOwnPropertySymbols(value).length !== 0) return { kind: "unsafe" };
+		const descriptors = Object.getOwnPropertyDescriptors(value);
+		const typeDescriptor = descriptors.type;
+		if (!typeDescriptor || !Object.prototype.hasOwnProperty.call(typeDescriptor, "value")) return { kind: "unsafe" };
+		if (typeDescriptor.value !== "custom") return { kind: "unrelated" };
+		const customTypeDescriptor = descriptors.customType;
+		if (!customTypeDescriptor || !Object.prototype.hasOwnProperty.call(customTypeDescriptor, "value")) {
+			return { kind: "unsafe" };
+		}
+		if (customTypeDescriptor.value !== CACHE_STATE_ENTRY_TYPE) return { kind: "unrelated" };
+		const dataDescriptor = descriptors.data;
+		if (!dataDescriptor || !Object.prototype.hasOwnProperty.call(dataDescriptor, "value")) {
+			return { kind: "matched", data: undefined };
+		}
+		return { kind: "matched", data: dataDescriptor.value };
+	} catch {
+		return { kind: "unsafe" };
+	}
+}
+
+function boundedSafeInteger(value: unknown, maximum: number): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= maximum;
+}
+
+function boundedCost(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= MAX_CACHE_STATE_NUMERIC_VALUE;
+}
+
+function cacheStateUsage(value: unknown): UsageTotalsLike | undefined {
+	const record = exactOwnDataRecord(value, CACHE_STATE_USAGE_KEYS);
+	if (!record) return undefined;
+	const { input, output, cacheRead, cacheWrite, totalTokens, cost } = record.values;
+	if (!boundedSafeInteger(input, MAX_CACHE_STATE_NUMERIC_VALUE)
+		|| !boundedSafeInteger(output, MAX_CACHE_STATE_NUMERIC_VALUE)
+		|| !boundedSafeInteger(cacheRead, MAX_CACHE_STATE_NUMERIC_VALUE)
+		|| !boundedSafeInteger(cacheWrite, MAX_CACHE_STATE_NUMERIC_VALUE)
+		|| !boundedSafeInteger(totalTokens, MAX_CACHE_STATE_NUMERIC_VALUE)
+		|| !boundedCost(cost)) return undefined;
+	const exactTotal = input + output + cacheRead + cacheWrite;
+	if (!Number.isSafeInteger(exactTotal) || exactTotal !== totalTokens) return undefined;
+	return { input, output, cacheRead, cacheWrite, totalTokens, cost };
+}
+
+function optionalHash(value: unknown): string | undefined {
+	return value === undefined || (typeof value === "string" && CACHE_STATE_SHA256.test(value))
+		? value
+		: undefined;
+}
+
+function optionalNullableHash(value: unknown): string | null | undefined {
+	return value === undefined || value === null || (typeof value === "string" && CACHE_STATE_SHA256.test(value))
+		? value
+		: undefined;
+}
+
+function cacheStateHashes(value: unknown): CacheStateEntryData["lastHashes"] | undefined {
+	const record = exactOwnDataRecord(value, CACHE_STATE_HASH_KEYS, []);
+	if (!record) return undefined;
+	const systemPromptHash = optionalHash(record.values.systemPromptHash);
+	const toolNamesHash = optionalHash(record.values.toolNamesHash);
+	const toolOrderHash = optionalHash(record.values.toolOrderHash);
+	const toolSchemaHash = optionalNullableHash(record.values.toolSchemaHash);
+	const contextShapeHash = optionalNullableHash(record.values.contextShapeHash);
+	if ((record.values.systemPromptHash !== undefined && systemPromptHash === undefined)
+		|| (record.values.toolNamesHash !== undefined && toolNamesHash === undefined)
+		|| (record.values.toolOrderHash !== undefined && toolOrderHash === undefined)
+		|| (record.values.toolSchemaHash !== undefined && toolSchemaHash === undefined)
+		|| (record.values.contextShapeHash !== undefined && contextShapeHash === undefined)) return undefined;
+	const hashes: CacheStateEntryData["lastHashes"] = {};
+	if (systemPromptHash !== undefined) hashes.systemPromptHash = systemPromptHash;
+	if (toolNamesHash !== undefined) hashes.toolNamesHash = toolNamesHash;
+	if (toolOrderHash !== undefined) hashes.toolOrderHash = toolOrderHash;
+	if (toolSchemaHash !== undefined) hashes.toolSchemaHash = toolSchemaHash;
+	if (contextShapeHash !== undefined) hashes.contextShapeHash = contextShapeHash;
+	return hashes;
+}
+
+function exactIsoTimestamp(value: unknown): value is string {
+	if (typeof value !== "string" || value.length < 20 || value.length > 32) return false;
+	const epoch = Date.parse(value);
+	return Number.isFinite(epoch) && new Date(epoch).toISOString() === value;
+}
+
+/** Parse and clone the only state shape allowed to influence cache metrics. */
+function parseCacheStateData(value: unknown): CacheStateEntryData | undefined {
+	try {
+		const record = exactOwnDataRecord(value, CACHE_STATE_KEYS, CACHE_STATE_REQUIRED_KEYS);
+		if (!record) return undefined;
+		const schemaVersion = record.values.schemaVersion;
+		if (schemaVersion !== "1.0" && schemaVersion !== TELEMETRY_SCHEMA_VERSION) return undefined;
+		const sessionHash = record.values.hashedSessionId;
+		if (typeof sessionHash !== "string" || !CACHE_STATE_SESSION_HASH.test(sessionHash)) return undefined;
+		const requestCount = record.values.requestCount;
+		if (!boundedSafeInteger(requestCount, MAX_CACHE_STATE_REQUESTS)) return undefined;
+		const usage = cacheStateUsage(record.values.usage);
+		const lastHashes = cacheStateHashes(record.values.lastHashes);
+		if (!usage || !lastHashes || !exactIsoTimestamp(record.values.updatedAt)) return undefined;
+		if (requestCount === 0 && Object.values(usage).some((part) => part !== 0)) return undefined;
+		if (requestCount > 0 && (
+			lastHashes.systemPromptHash === undefined
+			|| lastHashes.toolNamesHash === undefined
+			|| lastHashes.toolOrderHash === undefined
+			|| !Object.prototype.hasOwnProperty.call(lastHashes, "toolSchemaHash")
+			|| !Object.prototype.hasOwnProperty.call(lastHashes, "contextShapeHash")
+		)) return undefined;
+		if (requestCount === 0 && Object.keys(lastHashes).length !== 0) return undefined;
+
+		const rawSemanticStatus = record.values.usageSemanticStatus;
+		let usageSemanticStatus: UsageSemanticStatus | null;
+		if (rawSemanticStatus === undefined) {
+			usageSemanticStatus = requestCount > 0 ? "unverified" : null;
+		} else if (requestCount === 0 && rawSemanticStatus === null) {
+			usageSemanticStatus = null;
+		} else if (requestCount > 0
+			&& typeof rawSemanticStatus === "string"
+			&& CACHE_STATE_SEMANTIC_STATUSES.has(rawSemanticStatus as UsageSemanticStatus)) {
+			usageSemanticStatus = rawSemanticStatus as UsageSemanticStatus;
+		} else {
+			return undefined;
+		}
+
+		const rawReason = record.values.lastInvalidationReason;
+		if (rawReason !== undefined
+			&& (typeof rawReason !== "string" || !CACHE_STATE_INVALIDATION_REASONS.has(rawReason))) return undefined;
+		const rawTelemetryWriteGapPending = record.values.telemetryWriteGapPending;
+		const telemetryWriteGapPending = rawTelemetryWriteGapPending === undefined
+			? 0
+			: rawTelemetryWriteGapPending === 0 || rawTelemetryWriteGapPending === 1
+				? rawTelemetryWriteGapPending
+				: undefined;
+		if (telemetryWriteGapPending === undefined) return undefined;
+		if (telemetryWriteGapPending === 1 && usageSemanticStatus !== "unverified") return undefined;
+		const rawTelemetryFile = record.values.telemetryFile;
+		if (rawTelemetryFile !== undefined && rawTelemetryFile !== CACHE_STATE_TELEMETRY_FILE) return undefined;
+
+		const parsed: CacheStateEntryData = {
+			schemaVersion: TELEMETRY_SCHEMA_VERSION,
+			hashedSessionId: sessionHash,
+			requestCount,
+			usage,
+			usageSemanticStatus,
+			telemetryWriteGapPending,
+			lastHashes,
+			updatedAt: record.values.updatedAt,
+		};
+		if (rawReason !== undefined) parsed.lastInvalidationReason = rawReason as CacheInvalidationReason;
+		if (rawTelemetryFile !== undefined) parsed.telemetryFile = rawTelemetryFile;
+		return parsed;
+	} catch {
+		return undefined;
+	}
 }
 
 export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
@@ -155,13 +451,16 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 	// One-shot event flags consumed by the next message_end.
 	let pendingReload = false;
 	let pendingCompaction = false;
+	let pendingSessionTreeChange = false;
+	let pendingHistoryProjectionEpochChange = false;
 	let pendingNewSession = false;
 	let pendingModelChange = false;
 	let pendingThinkingChange = false;
 	let pendingModeChange = false;
-
 	let state: CacheStateEntryData = freshState();
-	let lastPayloadSummary: PayloadSummary | undefined;
+	let currentPayloadSummary: PayloadSummary | undefined;
+	let previousPayloadSummary: PayloadSummary | undefined;
+	let lastHistoryProjectionEpochHash: string | undefined;
 	let lastCacheRead = 0;
 	let lastSemanticStatus: UsageSemanticStatus | null = null;
 	let lastHitRatio: number | null = null;
@@ -174,6 +473,8 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 			hashedSessionId,
 			requestCount: 0,
 			usage: emptyUsageTotals(),
+			usageSemanticStatus: null,
+			telemetryWriteGapPending: 0,
 			lastHashes: {},
 			telemetryFile: undefined,
 			updatedAt: new Date(now()).toISOString(),
@@ -181,12 +482,41 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 	}
 
 	function persistState(): void {
-		state.updatedAt = new Date(now()).toISOString();
 		try {
-			deps.appendEntry(CACHE_STATE_ENTRY_TYPE, state);
+			state.updatedAt = new Date(now()).toISOString();
+			const snapshot = parseCacheStateData(state);
+			if (!snapshot) return;
+			// Pi keeps custom-entry data in memory. Persist a detached snapshot so a
+			// host callback cannot mutate telemetry internals and older entries remain
+			// chronological rather than sharing the current mutable state object.
+			deps.appendEntry(CACHE_STATE_ENTRY_TYPE, snapshot);
 		} catch {
 			// In-memory state remains valid; persistence is best-effort.
 		}
+	}
+
+	function resetRestoredState(): void {
+		state = freshState();
+		pendingNewSession = true;
+		lastCacheRead = 0;
+		lastSemanticStatus = null;
+		lastHitRatio = null;
+		lastReason = null;
+		lastConfidence = null;
+		currentPayloadSummary = undefined;
+		previousPayloadSummary = undefined;
+	}
+
+	function acceptRestoredState(restored: CacheStateEntryData): void {
+		state = restored;
+		pendingNewSession = false;
+		lastCacheRead = 0;
+		lastSemanticStatus = null;
+		lastHitRatio = null;
+		lastReason = restored.lastInvalidationReason ?? null;
+		lastConfidence = null;
+		currentPayloadSummary = undefined;
+		previousPayloadSummary = undefined;
 	}
 
 	const telemetry: CacheTelemetry = {
@@ -250,6 +580,24 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 			lastEvent = "session_before_compact";
 		},
 
+		observeSessionTreeChange(): void {
+			pendingSessionTreeChange = true;
+			lastEvent = "session_tree";
+		},
+
+		observeHistoryProjectionEpoch(epoch: string | number): void {
+			try {
+				const nextHash = sha256Hex(String(epoch));
+				if (lastHistoryProjectionEpochHash !== nextHash) {
+					lastHistoryProjectionEpochHash = nextHash;
+					pendingHistoryProjectionEpochChange = true;
+					lastEvent = "history_projection_epoch";
+				}
+			} catch {
+				// Observability cannot affect the request path.
+			}
+		},
+
 		observeNewSession(): void {
 			pendingNewSession = true;
 			lastEvent = "session_start:new";
@@ -258,34 +606,43 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 		observePayload(payload: unknown): void {
 			// Structural digest only — no text survives, payload untouched.
 			try {
-				lastPayloadSummary = summarizePayload(payload);
+				currentPayloadSummary = summarizePayload(payload);
 			} catch {
-				lastPayloadSummary = undefined;
+				currentPayloadSummary = undefined;
 			}
 			lastEvent = "before_provider_request";
 		},
 
 		restoreFromEntries(entries: readonly CacheStateEntryLike[]): void {
-			let restored: CacheStateEntryData | undefined;
-			for (const entry of entries) {
-				if (entry.type !== "custom" || entry.customType !== CACHE_STATE_ENTRY_TYPE) continue;
-				restored = entry.data as CacheStateEntryData | undefined;
+			try {
+				const safeEntries = strictEntryArray(entries);
+				if (!safeEntries) {
+					resetRestoredState();
+					return;
+				}
+				for (let index = safeEntries.length - 1; index >= 0; index -= 1) {
+					const candidate = cacheStateEntryCandidate(safeEntries[index]);
+					if (candidate.kind === "unrelated") continue;
+					if (candidate.kind === "unsafe") {
+						resetRestoredState();
+						return;
+					}
+					const restored = parseCacheStateData(candidate.data);
+					if (!restored || restored.hashedSessionId !== hashedSessionId) {
+						// The latest matching entry is authoritative. Malformed or
+						// cross-session state fails closed; older entries cannot revive it.
+						resetRestoredState();
+						return;
+					}
+					acceptRestoredState(restored);
+					return;
+				}
+				resetRestoredState();
+			} catch {
+				resetRestoredState();
+			} finally {
+				lastEvent = "session_start";
 			}
-			if (restored && typeof restored === "object" && restored.hashedSessionId === hashedSessionId) {
-				state = {
-					...freshState(),
-					requestCount: Number.isFinite(restored.requestCount) ? restored.requestCount : 0,
-					usage: restored.usage ?? emptyUsageTotals(),
-					lastHashes: restored.lastHashes ?? {},
-					lastInvalidationReason: restored.lastInvalidationReason,
-					telemetryFile: restored.telemetryFile,
-				};
-				lastReason = restored.lastInvalidationReason ?? null;
-			} else {
-				state = freshState();
-				pendingNewSession = true;
-			}
-			lastEvent = "session_start";
 		},
 
 		async observeMessageEnd(facts: MessageEndFacts): Promise<TelemetryRecord | null> {
@@ -295,7 +652,8 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 				const semantics = verifyUsageSemantics(facts.apiKind ?? lastApiKind, facts.usage);
 				const fingerprint = fingerprintTools(facts.activeToolNames, facts.tools);
 				const sysHash = systemPromptHash(facts.systemPrompt);
-				const ctxShapeHash = lastPayloadSummary ? payloadShapeHash(lastPayloadSummary) : null;
+				const ctxShapeHash = currentPayloadSummary ? payloadShapeHash(currentPayloadSummary) : null;
+				const payloadRelationship = classifyPayloadRelationship(previousPayloadSummary, currentPayloadSummary);
 
 				const previous = state.lastHashes;
 				const systemPromptChanged = previous.systemPromptHash !== undefined && previous.systemPromptHash !== sysHash;
@@ -308,8 +666,7 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 					previous.toolSchemaHash !== undefined &&
 					fingerprint.schemaHash !== null &&
 					previous.toolSchemaHash !== fingerprint.schemaHash;
-				const contextShapeChanged =
-					previous.contextShapeHash !== undefined && ctxShapeHash !== null && previous.contextShapeHash !== ctxShapeHash;
+				const contextShapeChanged = payloadRelationship === "PREFIX_REWRITTEN";
 
 				const verdict = classifyInvalidation({
 					isFirstRequest: state.requestCount === 0,
@@ -319,6 +676,8 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 					modeChanged: pendingModeChange,
 					packageReloaded: pendingReload,
 					compactionOccurred: pendingCompaction,
+					sessionTreeChanged: pendingSessionTreeChange,
+					historyProjectionEpochChanged: pendingHistoryProjectionEpochChange,
 					systemPromptChanged,
 					toolSetChanged,
 					toolOrderChanged,
@@ -333,6 +692,7 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 					? facts.usage.totalTokens
 					: facts.usage.input + facts.usage.output + facts.usage.cacheRead + facts.usage.cacheWrite;
 
+				const carriesTelemetryWriteGap = state.telemetryWriteGapPending === 1;
 				const record: TelemetryRecord = {
 					schemaVersion: TELEMETRY_SCHEMA_VERSION,
 					timestamp: new Date(now()).toISOString(),
@@ -352,25 +712,36 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 						totalTokens,
 						cost: facts.usage.cost.total,
 					},
-					usageSemanticStatus: semantics.status,
-					cacheHitRatio: semantics.cacheHitRatio,
+					usageSemanticStatus: carriesTelemetryWriteGap ? "unverified" : semantics.status,
+					cacheHitRatio: carriesTelemetryWriteGap ? null : semantics.cacheHitRatio,
 					systemPromptHash: sysHash,
 					activeToolNamesHash: fingerprint.namesHash,
 					activeToolOrderHash: fingerprint.orderHash,
 					activeToolSchemaHash: fingerprint.schemaHash,
 					contextShapeHash: ctxShapeHash,
-					precedingEvent: lastEvent,
+					precedingEvent: carriesTelemetryWriteGap ? TELEMETRY_WRITE_GAP_EVENT : lastEvent,
 					inferredInvalidationReason: verdict.reason,
 					inferenceConfidence: verdict.confidence,
 					driftSource: verdict.driftSource,
 				};
 
-				// Persist (best-effort, append-only). Failures never throw.
-				await store.appendRecord(record);
+				// Persist (best-effort, append-only). A failure is itself an
+				// observation gap: retain the marker until a later append succeeds,
+				// and fail this request's persisted semantics closed in memory.
+				const appendResult = await store.appendRecord(record);
+				if (appendResult.ok) {
+					if (carriesTelemetryWriteGap) state.telemetryWriteGapPending = 0;
+				} else {
+					state.telemetryWriteGapPending = 1;
+					record.precedingEvent = TELEMETRY_WRITE_GAP_EVENT;
+					record.usageSemanticStatus = "unverified";
+					record.cacheHitRatio = null;
+				}
 
 				// Advance the session state.
 				state.requestCount += 1;
 				state.usage = addUsageTotals(state.usage, facts.usage);
+				state.usageSemanticStatus = combineUsageSemanticStatus(state.usageSemanticStatus ?? null, record.usageSemanticStatus);
 				state.lastHashes = {
 					systemPromptHash: sysHash,
 					toolNamesHash: fingerprint.namesHash,
@@ -379,21 +750,24 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 					contextShapeHash: ctxShapeHash,
 				};
 				state.lastInvalidationReason = verdict.reason;
-				state.telemetryFile = store.telemetryRef();
+				if (appendResult.ok) state.telemetryFile = store.telemetryRef();
 
 				lastProvider = facts.provider;
 				lastModel = facts.model;
 				if (facts.apiKind !== null) lastApiKind = facts.apiKind;
 				lastCacheRead = facts.usage.cacheRead;
-				lastSemanticStatus = semantics.status;
-				lastHitRatio = semantics.cacheHitRatio;
+				lastSemanticStatus = record.usageSemanticStatus;
+				lastHitRatio = record.cacheHitRatio;
 				lastReason = verdict.reason;
 				lastConfidence = verdict.confidence;
+				previousPayloadSummary = currentPayloadSummary;
 				lastEvent = "message_end";
 
 				// One-shot flags are consumed.
 				pendingReload = false;
 				pendingCompaction = false;
+				pendingSessionTreeChange = false;
+				pendingHistoryProjectionEpochChange = false;
 				pendingNewSession = false;
 				pendingModelChange = false;
 				pendingThinkingChange = false;
@@ -415,14 +789,41 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 		},
 
 		statusSegment(): string | undefined {
-			if (!enabled || state.requestCount === 0) return undefined;
-			if (lastSemanticStatus !== "verified") return "CACHE N/A";
-			const ratio = state.usage.cacheRead / (state.usage.input + state.usage.cacheRead);
-			if (!Number.isFinite(ratio) || state.usage.input + state.usage.cacheRead <= 0) return "CACHE N/A";
-			return `CACHE ${Math.round(ratio * 100)}% | read ${formatTokens(state.usage.cacheRead)} | miss ${formatTokens(state.usage.input)}`;
+			try {
+				const safeState = parseCacheStateData(state);
+				if (!enabled || !safeState || safeState.requestCount === 0) return undefined;
+				const safeLastRatio = lastSemanticStatus === "verified"
+					&& typeof lastHitRatio === "number"
+					&& Number.isFinite(lastHitRatio)
+					&& lastHitRatio >= 0
+					&& lastHitRatio <= 1
+					? lastHitRatio
+					: null;
+				const last = safeLastRatio === null ? "N/A" : `${Math.round(safeLastRatio * 100)}%`;
+				const cumulativeRatio = safeState.usageSemanticStatus === "verified"
+					? cacheHitRatioFromTotals(safeState.usage)
+					: null;
+				const cumulative = cumulativeRatio === null ? "N/A" : `${Math.round(cumulativeRatio * 100)}%`;
+				return `CACHE last=${last} cum=${cumulative} | read ${formatTokens(safeState.usage.cacheRead)} | miss ${formatTokens(safeState.usage.input)}`;
+			} catch {
+				return undefined;
+			}
 		},
 
 		snapshot(): CacheSnapshot {
+			const safeState = parseCacheStateData(state);
+			const safeUsage = safeState?.usage ?? emptyUsageTotals();
+			const safeLastStatus = lastSemanticStatus !== null && CACHE_STATE_SEMANTIC_STATUSES.has(lastSemanticStatus)
+				? lastSemanticStatus
+				: null;
+			const safeLastRatio = safeLastStatus === "verified"
+				&& typeof lastHitRatio === "number"
+				&& Number.isFinite(lastHitRatio)
+				&& lastHitRatio >= 0
+				&& lastHitRatio <= 1
+				? lastHitRatio
+				: null;
+			const cumulativeStatus = safeState?.usageSemanticStatus ?? null;
 			return {
 				enabled,
 				hashedSessionId,
@@ -431,13 +832,15 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 				apiKind: lastApiKind,
 				mode: mode ?? null,
 				thinkingLevel,
-				requestCount: state.requestCount,
-				usage: state.usage,
-				hitRatio: lastHitRatio,
-				semanticStatus: lastSemanticStatus,
-				lastInvalidationReason: lastReason,
+				requestCount: safeState?.requestCount ?? 0,
+				usage: { ...safeUsage },
+				lastRequestHitRatio: safeLastRatio,
+				cumulativeHitRatio: cumulativeStatus === "verified" ? cacheHitRatioFromTotals(safeUsage) : null,
+				lastRequestSemanticStatus: safeLastStatus,
+				cumulativeSemanticStatus: cumulativeStatus,
+				lastInvalidationReason: safeState ? lastReason : null,
 				lastInvalidationConfidence: lastConfidence,
-				telemetryFile: state.telemetryFile ?? null,
+				telemetryFile: safeState?.telemetryFile ?? null,
 			};
 		},
 	};

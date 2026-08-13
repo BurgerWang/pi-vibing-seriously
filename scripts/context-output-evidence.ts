@@ -16,7 +16,7 @@ import { dirname, join, relative, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, SessionManager } from "@earendil-works/pi-coding-agent";
 
 import { compareRuns } from "../extensions/workbench-runtime/core/compare.ts";
 import {
@@ -172,6 +172,9 @@ interface MeasurementState {
 }
 
 interface WorkerRuntimeChildFacts {
+	projectTrusted: boolean;
+	runtimePackageProvenanceValid: boolean;
+	sessionProjectRootIsolated: boolean;
 	contextHandlerCount: number;
 	providerRequestHandlerCount: number;
 	contextRequests: number;
@@ -215,6 +218,7 @@ const CHILD_STDIO_MAX_BYTES = 128 * 1_024;
 const COMMAND_STDIO_MAX_BYTES = 2 * MIB;
 const MODULE_REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const FIXTURE_SESSION = join(MODULE_REPO_ROOT, "fixtures", "context-output", "legacy-large-details-session.jsonl");
+const OFFLINE_TELEMETRY_RELATIVE_PATH = join(CONFIG_DIR_NAME, "workbench", "cache", "telemetry.jsonl");
 const WORKER_CONTRACT: WorkerTaskContract = {
 	task: "Measure an offline Pi AgentSession worker loop",
 	allowedPaths: ["src/**"],
@@ -232,6 +236,49 @@ function bytes(value: string): number {
 
 function lines(value: string): number {
 	return value.length === 0 ? 0 : value.split("\n").length;
+}
+
+interface OfflineTelemetryFacts {
+	records: number;
+	bytes: number;
+	sha256: string;
+	onlyFakeRecords: boolean;
+}
+
+function isOfflineFakeTelemetryRecord(value: unknown): boolean {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const record = value as Record<string, unknown>;
+	const usage = record.usage;
+	if (typeof usage !== "object" || usage === null || Array.isArray(usage)) return false;
+	const totals = usage as Record<string, unknown>;
+	return record.provider === "deepseek"
+		&& record.model === "deepseek-v4-flash"
+		&& record.apiKind === "openai-completions"
+		&& totals.input === 100
+		&& totals.output === 10
+		&& totals.cacheRead === 50
+		&& totals.cacheWrite === 0
+		&& totals.totalTokens === 160;
+}
+
+async function inspectOfflineTelemetry(projectRoot: string): Promise<OfflineTelemetryFacts> {
+	const content = await readFile(join(projectRoot, OFFLINE_TELEMETRY_RELATIVE_PATH));
+	const records = content.toString("utf8")
+		.split("\n")
+		.filter((line) => line.trim().length > 0)
+		.map((line) => {
+			try {
+				return JSON.parse(line) as unknown;
+			} catch {
+				return null;
+			}
+		});
+	return {
+		records: records.length,
+		bytes: content.length,
+		sha256: sha256(content),
+		onlyFakeRecords: records.length > 0 && records.every(isOfflineFakeTelemetryRecord),
+	};
 }
 
 function percentile(sorted: readonly number[], fraction: number): number {
@@ -906,6 +953,13 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 	const tsxImport = import.meta.resolve("tsx");
 	const scriptPath = join(root, "fake-worker.mjs");
 	const sourceDirectory = join(root, "src");
+	const projectSettingsDirectory = join(root, CONFIG_DIR_NAME);
+	await mkdir(projectSettingsDirectory, { recursive: true, mode: 0o700 });
+	await writeFile(
+		join(projectSettingsDirectory, "settings.json"),
+		`${JSON.stringify({ packages: [MODULE_REPO_ROOT], compaction: { enabled: false } }, null, 2)}\n`,
+		{ encoding: "utf8", mode: 0o600 },
+	);
 	await mkdir(sourceDirectory, { recursive: true });
 	const expectedSourceHashes: string[] = [];
 	for (let index = 0; index < 24; index += 1) {
@@ -932,7 +986,9 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 		const sourceBytes = ${WORKER_SOURCE_FILE_BYTES};
 		const historyCap = ${WORKER_HISTORY_TOOL_TEXT_MAX_BYTES};
 		const projectRoot = process.env.WORKBENCH_WORKER_PROJECT_ROOT ?? process.cwd();
-		const sessionRoot = ${JSON.stringify(MODULE_REPO_ROOT)};
+		const sessionRoot = projectRoot;
+		const runtimePackageSource = ${JSON.stringify(MODULE_REPO_ROOT)};
+		const runtimePackageRoot = ${JSON.stringify(MODULE_REPO_ROOT)};
 		const runtimeSourcePath = ${JSON.stringify(runtimeSourcePath)};
 		const expectedSourceHashes = ${JSON.stringify(expectedSourceHashes)};
 		const sourcePaths = expectedSourceHashes.map((_, index) => join(projectRoot, "src", "worker-large-" + index + ".txt"));
@@ -971,6 +1027,8 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 		let requestBoundaryOrderValid = true;
 		let contextHandlerCount = 0;
 		let providerRequestHandlerCount = 0;
+		let projectTrusted = false;
+		let runtimePackageProvenanceValid = false;
 
 		const observerExtension = (pi) => {
 			pi.on("tool_result", (event) => {
@@ -1030,6 +1088,9 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 			const totalSourceBytes = sourcePaths.length * sourceBytes;
 			const totalPreHistoryToolResultBytes = preHistoryToolResultBytes.reduce((sum, value) => sum + value, 0);
 			return {
+				projectTrusted,
+				runtimePackageProvenanceValid,
+				sessionProjectRootIsolated: sessionRoot === projectRoot && process.cwd() === projectRoot,
 				contextHandlerCount,
 				providerRequestHandlerCount,
 				contextRequests: projectedHistoryToolTextBytes.length,
@@ -1201,6 +1262,8 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 			],
 		});
 		await resourceLoader.reload();
+		projectTrusted = settingsManager.isProjectTrusted();
+		if (!projectTrusted) throw new Error("temporary stress project was not accepted by the project trust guard");
 		const sessionManager = SessionManager.inMemory(sessionRoot, { id: "context-output-formal-worker" });
 		const { session, extensionsResult } = await createAgentSession({
 			cwd: sessionRoot,
@@ -1215,10 +1278,11 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 		});
 		if (extensionsResult.errors.length > 0) throw new Error("offline AgentSession extension load failed");
 		const runtimeExtension = extensionsResult.extensions.find((extension) => extension.resolvedPath === runtimeSourcePath);
-		if (runtimeExtension?.sourceInfo?.source !== ".." || runtimeExtension.sourceInfo.scope !== "project"
-			|| runtimeExtension.sourceInfo.origin !== "package" || runtimeExtension.sourceInfo.baseDir !== sessionRoot) {
-			throw new Error("production runtime did not retain the repository package provenance");
-		}
+		runtimePackageProvenanceValid = runtimeExtension?.sourceInfo?.source === runtimePackageSource
+			&& runtimeExtension.sourceInfo.scope === "project"
+			&& runtimeExtension.sourceInfo.origin === "package"
+			&& runtimeExtension.sourceInfo.baseDir === runtimePackageRoot;
+		if (!runtimePackageProvenanceValid) throw new Error("production runtime did not retain trusted temporary-project package provenance");
 		contextHandlerCount = runtimeExtension?.handlers.get("context")?.length ?? 0;
 		providerRequestHandlerCount = runtimeExtension?.handlers.get("before_provider_request")?.length ?? 0;
 		if (contextHandlerCount !== 1 || providerRequestHandlerCount !== 1) {
@@ -1331,6 +1395,9 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 		childFacts.finalRemovedToolBundles, childFacts.finalActiveHistoryToolTextBytes, childFacts.historyCap,
 	];
 	if (!numericCounts.every((value) => Number.isSafeInteger(value) && value >= 0)
+		|| typeof childFacts.projectTrusted !== "boolean"
+		|| typeof childFacts.runtimePackageProvenanceValid !== "boolean"
+		|| typeof childFacts.sessionProjectRootIsolated !== "boolean"
 		|| typeof childFacts.requestBoundaryOrderValid !== "boolean"
 		|| typeof childFacts.pairingValid !== "boolean" || typeof childFacts.sourceFilesUnchanged !== "boolean"
 		|| !Array.isArray(childFacts.preHistoryToolResultBytes) || childFacts.preHistoryToolResultBytes.length !== 24
@@ -1349,6 +1416,8 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 		|| !childFacts.projectionWallMs.every((value) => Number.isFinite(value) && value >= 0)) {
 		throw new Error("actual-runtime fake child lifecycle facts failed numeric validation");
 	}
+	const offlineTelemetry = await inspectOfflineTelemetry(root);
+	const telemetryIsolated = offlineTelemetry.records === 25 && offlineTelemetry.onlyFakeRecords;
 	// Actual Pi ordering persists turn telemetry before it constructs the next
 	// request. Progress for response N therefore carries request N-1's projection;
 	// the final turn_end entry, observed after the final assistant event, carries
@@ -1375,7 +1444,10 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 			value === childFacts.projectedHistoryToolTextBytes[index]
 			&& value <= WORKER_HISTORY_TOOL_TEXT_MAX_BYTES
 		));
-	const childFactsConsistent = childFacts.totalSourceBytes === 24 * WORKER_SOURCE_FILE_BYTES
+	const childFactsConsistent = childFacts.projectTrusted
+		&& childFacts.runtimePackageProvenanceValid
+		&& childFacts.sessionProjectRootIsolated
+		&& childFacts.totalSourceBytes === 24 * WORKER_SOURCE_FILE_BYTES
 		&& childFacts.productionReadToolResults === 24
 		&& childFacts.actualToolResultMessageEvents === 24
 		&& childFacts.forwardedRawToolResultEvents === 0
@@ -1410,6 +1482,7 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 		&& childFacts.maxPreHistoryToolResultEventBytes <= 2 * MIB
 		&& childFacts.maxPreHistoryToolResultBytes <= NATIVE_READ_MAX_BYTES
 		&& childFactsConsistent
+		&& telemetryIsolated
 		&& preflightObservedBeforeEveryProviderResponse
 		&& finalOutputControlObserved
 		&& historyBounded
@@ -1444,6 +1517,7 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 			total_source_bytes: childFacts.totalSourceBytes,
 			child_source_sha256: sha256(fakeChildSource),
 			model_calls: 0,
+			telemetry_sink: OFFLINE_TELEMETRY_RELATIVE_PATH,
 		},
 		{
 			turns: result.turns,
@@ -1464,6 +1538,13 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 			projections_after_completed_tool_turns: childFacts.projectionsAfterCompletedToolTurns,
 			child_context_handler_count: childFacts.contextHandlerCount,
 			child_before_provider_handler_count: childFacts.providerRequestHandlerCount,
+			child_project_trusted: childFacts.projectTrusted,
+			production_runtime_package_provenance_valid: childFacts.runtimePackageProvenanceValid,
+			session_project_root_isolated: childFacts.sessionProjectRootIsolated,
+			isolated_telemetry_records: offlineTelemetry.records,
+			isolated_telemetry_bytes: offlineTelemetry.bytes,
+			isolated_telemetry_sha256: offlineTelemetry.sha256,
+			isolated_telemetry_only_fake_records: offlineTelemetry.onlyFakeRecords,
 			child_canonical_telemetry_entries_before_final_response: childFacts.canonicalTelemetryEntries,
 			child_facts_consistent: childFactsConsistent,
 			preflight_before_every_provider_response: preflightObservedBeforeEveryProviderResponse,
@@ -1489,6 +1570,11 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 			acceptance("child-json-line-cap", childFacts.maxPreHistoryToolResultEventBytes, "<=", 2 * MIB),
 			acceptance("runtime-envelope-cap", childFacts.maxPreHistoryToolResultBytes, "<=", NATIVE_READ_MAX_BYTES),
 			acceptance("child-facts-consistent", childFactsConsistent, "=", true),
+			acceptance("temporary-project-trusted", childFacts.projectTrusted, "=", true),
+			acceptance("production-runtime-package-provenance", childFacts.runtimePackageProvenanceValid, "=", true),
+			acceptance("session-project-root-isolated", childFacts.sessionProjectRootIsolated, "=", true),
+			acceptance("isolated-telemetry-records", offlineTelemetry.records, "=", 25),
+			acceptance("isolated-telemetry-only-fake-records", offlineTelemetry.onlyFakeRecords, "=", true),
 			acceptance("actual-request-boundary-order", childFacts.requestBoundaryOrderValid, "=", true),
 			acceptance("post-tool-turn-projections", childFacts.projectionsAfterCompletedToolTurns, "=", 24),
 			acceptance("provider-preflight-observed", preflightObservedBeforeEveryProviderResponse, "=", true),

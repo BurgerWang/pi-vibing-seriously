@@ -34,6 +34,29 @@
   keys, and a bounded non-empty source; arbitrary foreign or collided packages
   remain denied.
 
+### Fixed
+
+- Active-history projection now rewrites the provider-visible prefix only at
+  discrete 75% / 96-bundle epochs while preserving the 96/64 KiB and
+  128-bundle hard limits. Normal appended turns remain append-only inside an
+  epoch, and telemetry records the crossing as an expected invalidation.
+- Cache status distinguishes last-request from cumulative-session hit ratios;
+  normal payload appends are no longer reported as prefix divergence, and
+  project/session reports read a bounded chronological window across rotated
+  and current telemetry with explicit data-quality handling. Cache doctor now
+  scans that rotation set too, reports total telemetry bytes and source quality,
+  and suppresses clean/no-drift conclusions for partial or truncated evidence.
+- Formal context-output stress runs its fake provider in a temporary telemetry
+  sink and proves repository telemetry files are unchanged. The 300 historical
+  fake records already found in this checkout are deliberately left untouched;
+  retention cleanup remains a separate operator decision.
+- A strict nine-field `workbench-context-pressure-v1` entry records projection
+  epoch/churn and raw-versus-projected diagnostics for a separately installed
+  auto-compaction companion. Pi 0.83 context usage already measures raw session
+  messages, so automatic thresholds use that usage alone and never add a
+  raw-minus-projected delta. This package publishes the contract but does not
+  deploy that companion extension.
+
 ### Breaking
 
 - The public tool metadata/schema fingerprint intentionally changes once;

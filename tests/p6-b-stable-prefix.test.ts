@@ -45,7 +45,12 @@ import {
 	DYNAMIC_ZONE_FIELDS,
 	DYNAMIC_CHANNELS,
 } from "../extensions/workbench-runtime/cache/stable-prefix.ts";
-import { fingerprintTools, type ToolInfoLike } from "../extensions/workbench-runtime/cache/prompt-fingerprint.ts";
+import {
+	classifyPayloadRelationship,
+	fingerprintTools,
+	summarizePayload,
+	type ToolInfoLike,
+} from "../extensions/workbench-runtime/cache/prompt-fingerprint.ts";
 import { classifyInvalidation, invalidationClass } from "../extensions/workbench-runtime/cache/invalidation-classifier.ts";
 import { createCacheTelemetry, type CacheStateEntryLike, type CacheTelemetry, type MessageEndFacts } from "../extensions/workbench-runtime/cache/cache-telemetry.ts";
 import { buildCacheReport } from "../extensions/workbench-runtime/cache/cache-report.ts";
@@ -781,11 +786,163 @@ test("mode switch / model switch / thinking change / reload / compaction are EXP
 		{ isFirstRequest: false, isNewSession: false, modelChanged: false, thinkingChanged: false, modeChanged: true, packageReloaded: false, compactionOccurred: false, systemPromptChanged: false, toolSetChanged: false, toolOrderChanged: false, toolSchemaChanged: false, contextShapeChanged: false, cacheReadTokens: 0, previousCacheReadTokens: 0 },
 		{ isFirstRequest: false, isNewSession: false, modelChanged: false, thinkingChanged: false, modeChanged: false, packageReloaded: true, compactionOccurred: false, systemPromptChanged: false, toolSetChanged: false, toolOrderChanged: false, toolSchemaChanged: false, contextShapeChanged: false, cacheReadTokens: 0, previousCacheReadTokens: 0 },
 		{ isFirstRequest: false, isNewSession: false, modelChanged: false, thinkingChanged: false, modeChanged: false, packageReloaded: false, compactionOccurred: true, systemPromptChanged: false, toolSetChanged: false, toolOrderChanged: false, toolSchemaChanged: false, contextShapeChanged: false, cacheReadTokens: 0, previousCacheReadTokens: 0 },
+		{ isFirstRequest: false, isNewSession: false, modelChanged: false, thinkingChanged: false, modeChanged: false, packageReloaded: false, compactionOccurred: false, sessionTreeChanged: true, systemPromptChanged: false, toolSetChanged: false, toolOrderChanged: false, toolSchemaChanged: false, contextShapeChanged: true, cacheReadTokens: 0, previousCacheReadTokens: 900 },
 	]) {
 		const verdict = classifyInvalidation(input);
 		assert.equal(invalidationClass(verdict.reason), "expected", verdict.reason);
 		assert.equal(verdict.driftSource, null, verdict.reason);
 	}
+});
+
+test("payload relationship distinguishes unchanged, append-only, rewritten, and unknown without retaining content", () => {
+	const base = summarizePayload({
+		model: "deepseek-v4-flash",
+		messages: [
+			{ role: "system", content: "stable system" },
+			{ role: "user", content: "first request" },
+		],
+		tools: [{ type: "function", function: { name: "read", description: "read", parameters: { type: "object" } } }],
+	});
+	const appended = summarizePayload({
+		model: "deepseek-v4-flash",
+		messages: [
+			{ role: "system", content: "stable system" },
+			{ role: "user", content: "first request" },
+			{ role: "assistant", content: "first response" },
+		],
+		tools: [{ type: "function", function: { name: "read", description: "read", parameters: { type: "object" } } }],
+	});
+	const rewritten = summarizePayload({
+		model: "deepseek-v4-flash",
+		messages: [
+			{ role: "system", content: "stable system" },
+			{ role: "user", content: "rewritten request" },
+			{ role: "assistant", content: "first response" },
+		],
+		tools: [{ type: "function", function: { name: "read", description: "read", parameters: { type: "object" } } }],
+	});
+	assert.equal(classifyPayloadRelationship(base, base), "UNCHANGED");
+	assert.equal(classifyPayloadRelationship(base, appended), "APPEND_ONLY");
+	assert.equal(classifyPayloadRelationship(base, rewritten), "PREFIX_REWRITTEN");
+	assert.equal(classifyPayloadRelationship(base, summarizePayload(null)), "UNKNOWN");
+	assert.ok(!JSON.stringify(base).includes("stable system"), "summary keeps only lengths and hashes");
+	assert.ok(!JSON.stringify(base).includes("first request"), "summary never retains message content");
+});
+
+test("payload relationship hashes complete items, including part types, images, scalar structure, and tool calls", () => {
+	const firstItem = {
+		role: "user",
+		content: [
+			{ type: "input_text", text: "inspect this" },
+			{ type: "input_image", image_url: "data:image/png;base64,AAAA", detail: "high" },
+		],
+		metadata: { cache_visible: true, priority: 3 },
+	};
+	const assistantToolCall = {
+		role: "assistant",
+		content: null,
+		tool_calls: [{ id: "call-1", type: "function", function: { name: "read", arguments: "{\"path\":\"/a\"}" } }],
+	};
+	const payload = (items: unknown[]) => ({
+		model: "deepseek-v4-flash",
+		messages: items,
+		tools: [{ type: "function", function: { name: "read", description: "read", parameters: { type: "object" }, strict: true } }],
+	});
+	const base = summarizePayload(payload([firstItem]));
+	const append = summarizePayload(payload([firstItem, assistantToolCall]));
+	assert.equal(classifyPayloadRelationship(base, append), "APPEND_ONLY");
+
+	const changedPartType = summarizePayload(payload([{ ...firstItem, content: [{ type: "output_text", text: "inspect this" }, firstItem.content[1]] }]));
+	const changedImage = summarizePayload(payload([{ ...firstItem, content: [firstItem.content[0], { ...firstItem.content[1], image_url: "data:image/png;base64,BBBB" }] }]));
+	const changedScalar = summarizePayload(payload([{ ...firstItem, metadata: { cache_visible: false, priority: 3 } }]));
+	const movedText = summarizePayload(payload([{ role: "user", content: [{ type: "input_text", text: "inspect" }] }, { role: "user", content: [{ type: "input_text", text: " this" }] }]));
+	const changedOldToolCall = summarizePayload(payload([firstItem, { ...assistantToolCall, tool_calls: [{ ...assistantToolCall.tool_calls[0], id: "call-2" }] }]));
+	assert.equal(classifyPayloadRelationship(base, changedPartType), "PREFIX_REWRITTEN");
+	assert.equal(classifyPayloadRelationship(base, changedImage), "PREFIX_REWRITTEN");
+	assert.equal(classifyPayloadRelationship(base, changedScalar), "PREFIX_REWRITTEN");
+	assert.equal(classifyPayloadRelationship(base, movedText), "PREFIX_REWRITTEN");
+	assert.equal(classifyPayloadRelationship(append, changedOldToolCall), "PREFIX_REWRITTEN");
+});
+
+test("payload relationship degrades to UNKNOWN for caps, tool schema failure, accessors, and proxies", () => {
+	const capped = summarizePayload({ messages: Array.from({ length: 20_001 }, (_, index) => ({ role: "user", content: String(index) })) });
+	const toolSchemaFailure = summarizePayload({ messages: [], tools: [{ type: "function", function: { name: "read", parameters: { forbidden: 1n } } }] });
+	const accessorPayload: Record<string, unknown> = {};
+	Object.defineProperty(accessorPayload, "messages", { enumerable: true, get: () => [] });
+	const proxied = new Proxy({ messages: [] }, { ownKeys: () => { throw new Error("trap"); } });
+	const safe = summarizePayload({ messages: [] });
+	for (const degraded of [capped, toolSchemaFailure, summarizePayload(accessorPayload), summarizePayload(proxied)]) {
+		assert.equal(classifyPayloadRelationship(safe, degraded), "UNKNOWN");
+	}
+});
+
+test("explicit history-projection epoch transition is an expected invalidation", () => {
+	const verdict = classifyInvalidation({
+		isFirstRequest: false,
+		isNewSession: false,
+		modelChanged: false,
+		thinkingChanged: false,
+		modeChanged: false,
+		packageReloaded: false,
+		compactionOccurred: false,
+		historyProjectionEpochChanged: true,
+		systemPromptChanged: false,
+		toolSetChanged: false,
+		toolOrderChanged: false,
+		toolSchemaChanged: false,
+		contextShapeChanged: true,
+		cacheReadTokens: 0,
+		previousCacheReadTokens: 900,
+	});
+	assert.equal(verdict.reason, "HISTORY_PROJECTION_EPOCH_CHANGED");
+	assert.equal(verdict.confidence, "high");
+	assert.equal(invalidationClass(verdict.reason), "expected");
+});
+
+test("session-tree lifecycle attribution is one-shot, report-safe, and does not mask later drift", async () => {
+	const telemetry = createCacheTelemetry({ now: () => 1_700_000_000_000, appendEntry: () => {} });
+	telemetry.setProjectRoot("/tmp/irrelevant");
+	telemetry.setSessionId("p6b-session-tree");
+	telemetry.setMode("DEV");
+	telemetry.setThinkingLevel("high");
+	const facts: MessageEndFacts = {
+		provider: "deepseek",
+		model: "deepseek-v4-flash",
+		apiKind: "openai-completions",
+		usage: { input: 100, output: 10, cacheRead: 900, cacheWrite: 0, totalTokens: 1010, cost: { total: 0.001 } },
+		thinkingLevel: "high",
+		systemPrompt: SYSTEM_PROMPT,
+		activeToolNames: DEV_TOOLS,
+		tools: allToolInfos(),
+	};
+	const payload = (text: string) => ({
+		model: "deepseek-v4-flash",
+		messages: [{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content: text }],
+	});
+
+	telemetry.observePayload(payload("original branch"));
+	const first = await telemetry.observeMessageEnd(facts);
+	assert.ok(first);
+	telemetry.observeSessionTreeChange();
+	telemetry.observePayload(payload("selected branch"));
+	const navigated = await telemetry.observeMessageEnd(facts);
+	assert.ok(navigated);
+	assert.equal(navigated.inferredInvalidationReason, "SESSION_TREE_CHANGED");
+	assert.equal(invalidationClass(navigated.inferredInvalidationReason), "expected");
+
+	const lifecycleReport = buildCacheReport([first, navigated], "session", () => undefined);
+	assert.equal(lifecycleReport.expectedInvalidations, 2);
+	assert.equal(lifecycleReport.unexpectedDrifts, 0);
+	assert.equal(lifecycleReport.sameModeMutationCount, 0, "tree navigation is not counted as a same-mode mutation");
+
+	telemetry.observePayload(payload("unattributed rewrite"));
+	const drifted = await telemetry.observeMessageEnd(facts);
+	assert.ok(drifted);
+	assert.equal(drifted.inferredInvalidationReason, "CONTEXT_PREFIX_DIVERGED", "one-shot tree attribution cannot weaken later drift detection");
+	const fullReport = buildCacheReport([first, navigated, drifted], "session", () => undefined);
+	assert.equal(fullReport.expectedInvalidations, 2);
+	assert.equal(fullReport.unexpectedDrifts, 1);
+	assert.equal(fullReport.sameModeMutationCount, 1);
 });
 
 test("same-mode mutations are UNEXPECTED_DRIFT with a driftSource", () => {

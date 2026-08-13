@@ -10,7 +10,8 @@
  *   - append-only JSONL, one record per line
  *   - single-file size limit with rotation (telemetry.N.jsonl, oldest
  *     dropped) — the directory never grows without bound
- *   - corrupted lines are skipped and counted on read, never fatal
+ *   - corrupted lines are skipped and counted; invalid UTF-8 makes that
+ *     source unavailable rather than replacement-decoding untrusted bytes
  *   - write failures degrade to {ok:false} — telemetry must never block or
  *     crash a model request
  *   - records containing forbidden fields are REFUSED before touching disk
@@ -20,8 +21,10 @@
 
 import { appendFile, mkdir, open, readdir, rename, rm, stat, writeFile, type FileHandle } from "node:fs/promises";
 import { join } from "node:path";
+import { TextDecoder } from "node:util";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
+import { isTelemetryRecord, type TelemetryRecord } from "./cache-types.ts";
 import {
 	fileSourceSnapshotFromStats,
 	type BoundedFileIoHooks,
@@ -32,6 +35,8 @@ export const TELEMETRY_FILE = "telemetry.jsonl";
 export const REPORTS_DIR_NAME = "reports";
 export const DEFAULT_MAX_TELEMETRY_BYTES = 5 * 1024 * 1024;
 export const DEFAULT_MAX_ROTATED_FILES = 5;
+export const DEFAULT_MAX_CHRONOLOGICAL_RECORDS = 100_000;
+export const MAX_CHRONOLOGICAL_RECORDS = 1_000_000;
 /** Includes the terminating JSONL newline. */
 export const MAX_TELEMETRY_RECORD_BYTES = 64 * 1024;
 
@@ -123,6 +128,8 @@ export interface CacheStoreOptions {
 	maxRotatedFiles?: number;
 	/** Test-only numeric allocation/read observations; never receives path/content. */
 	boundedReadHooks?: BoundedFileIoHooks;
+	/** Test-only filesystem fault injection for rotation rename handling. */
+	rotationRename?: (source: string, destination: string) => Promise<void>;
 }
 
 export interface StoreAppendResult {
@@ -133,7 +140,20 @@ export interface StoreAppendResult {
 export interface StoreReadResult {
 	records: unknown[];
 	skipped: number;
-	unavailable?: "source_oversized" | "source_not_regular" | "source_changed_during_read" | "read_error";
+	unavailable?: "source_oversized" | "source_not_regular" | "source_changed_during_read" | "rotation_gap" | "read_error";
+}
+
+export interface ChronologicalReadOptions {
+	/** Keep the newest N records, returned in chronological order. */
+	maxRecords?: number;
+}
+
+export interface ChronologicalReadResult extends StoreReadResult {
+	/** True only when a source file/line could not be read or parsed. */
+	sourceIncomplete: boolean;
+	/** Oldest valid records intentionally omitted by maxRecords. */
+	truncatedRecords: number;
+	filesRead: number;
 }
 
 export interface StoreReportResult {
@@ -147,12 +167,14 @@ export class CacheStore {
 	private readonly maxFileBytes: number;
 	private readonly maxRotatedFiles: number;
 	private readonly boundedReadHooks: BoundedFileIoHooks | undefined;
+	private readonly rotationRename: (source: string, destination: string) => Promise<void>;
 
 	constructor(projectRoot: string, options: CacheStoreOptions = {}) {
 		this.projectRoot = projectRoot;
 		this.maxFileBytes = normalizeTelemetryThreshold(options.maxFileBytes);
 		this.maxRotatedFiles = options.maxRotatedFiles ?? DEFAULT_MAX_ROTATED_FILES;
 		this.boundedReadHooks = options.boundedReadHooks;
+		this.rotationRename = options.rotationRename ?? rename;
 	}
 
 	cacheDir(): string {
@@ -181,17 +203,18 @@ export class CacheStore {
 	 * with the error message so callers can degrade gracefully.
 	 */
 	async appendRecord(record: unknown): Promise<StoreAppendResult> {
-		const forbidden = hasForbiddenTelemetryFields(record);
-		if (forbidden !== null) {
-			return { ok: false, error: `refused: record contains forbidden field "${forbidden}"` };
-		}
 		try {
+			const forbidden = hasForbiddenTelemetryFields(record);
+			if (forbidden !== null) {
+				return { ok: false, error: `refused: record contains forbidden field "${forbidden}"` };
+			}
 			const serialized = JSON.stringify(record);
 			if (typeof serialized !== "string") return { ok: false, error: "refused: telemetry record is not JSON-serializable" };
 			const payload = `${serialized}\n`;
 			if (Buffer.byteLength(payload, "utf8") > MAX_TELEMETRY_RECORD_BYTES) {
 				return { ok: false, error: "refused: telemetry record exceeds the fixed 65536-byte limit" };
 			}
+			if (!isTelemetryRecord(record)) return { ok: false, error: "refused: invalid telemetry record schema" };
 			await mkdir(this.cacheDir(), { recursive: true, mode: 0o700 });
 			await this.rotateIfNeeded();
 			await appendFile(this.telemetryPath(), payload, { flag: "a", mode: 0o600 });
@@ -216,18 +239,86 @@ export class CacheStore {
 				? { records: [], skipped: 0 }
 				: { records: [], skipped: 0, unavailable: loaded.reason };
 		}
-		const records: unknown[] = [];
-		let skipped = 0;
-		for (const line of loaded.text.split("\n")) {
-			const trimmed = line.trim();
-			if (trimmed.length === 0) continue;
-			try {
-				records.push(JSON.parse(trimmed) as unknown);
-			} catch {
-				skipped += 1;
+		const retained = new RecordRing<TelemetryRecord>(DEFAULT_MAX_CHRONOLOGICAL_RECORDS);
+		const parsed = parseTelemetryJsonlInto(loaded.text, retained);
+		return { records: retained.toArray(), skipped: parsed.skipped };
+	}
+
+	/**
+	 * Read rotated files oldest-first, then the current file. Each file uses
+	 * the same bounded same-handle reader as readRecords(); the retained object
+	 * count is independently capped and keeps the newest chronological window.
+	 * Existing readRecords() intentionally remains current-file-only.
+	 */
+	async readRecordsChronological(options: ChronologicalReadOptions = {}): Promise<ChronologicalReadResult> {
+		const maxRecords = normalizeChronologicalRecordLimit(options.maxRecords);
+		const sources = this.chronologicalSources();
+		for (let attempt = 0; attempt < 2; attempt += 1) {
+			const before = await snapshotTelemetryGeneration(sources);
+			const read = await this.readChronologicalAttempt(sources, maxRecords);
+			const after = await snapshotTelemetryGeneration(sources);
+			if (sameTelemetryGeneration(before, after)) {
+				return generationHasRotationGap(after)
+					? { ...read, unavailable: "rotation_gap", sourceIncomplete: true }
+					: read;
+			}
+			if (attempt === 1) {
+				return {
+					...read,
+					unavailable: "source_changed_during_read",
+					sourceIncomplete: true,
+				};
 			}
 		}
-		return { records, skipped };
+		return {
+			records: [],
+			skipped: 0,
+			unavailable: "read_error",
+			sourceIncomplete: true,
+			truncatedRecords: 0,
+			filesRead: 0,
+		};
+	}
+
+	private chronologicalSources(): Array<{ name: string; path: string }> {
+		const sources: Array<{ name: string; path: string }> = [];
+		for (let n = this.maxRotatedFiles; n >= 1; n -= 1) {
+			sources.push({ name: `telemetry.${n}.jsonl`, path: this.rotatedPath(n) });
+		}
+		sources.push({ name: TELEMETRY_FILE, path: this.telemetryPath() });
+		return sources;
+	}
+
+	private async readChronologicalAttempt(
+		sources: readonly { name: string; path: string }[],
+		maxRecords: number,
+	): Promise<ChronologicalReadResult> {
+		const retained = new RecordRing<TelemetryRecord>(maxRecords);
+		let skipped = 0;
+		let filesRead = 0;
+		let unavailable: StoreReadResult["unavailable"];
+		for (const source of sources) {
+			const loaded = await readTelemetryFileBounded(
+				source.path,
+				this.maxFileBytes + MAX_TELEMETRY_RECORD_BYTES,
+				this.boundedReadHooks,
+			);
+			if (!loaded.ok) {
+				if (loaded.reason !== "missing" && unavailable === undefined) unavailable = loaded.reason;
+				continue;
+			}
+			filesRead += 1;
+			const parsed = parseTelemetryJsonlInto(loaded.text, retained);
+			skipped += parsed.skipped;
+		}
+		return {
+			records: retained.toArray(),
+			skipped,
+			...(unavailable !== undefined ? { unavailable } : {}),
+			sourceIncomplete: unavailable !== undefined || skipped > 0,
+			truncatedRecords: Math.max(0, retained.totalPushed - retained.size),
+			filesRead,
+		};
 	}
 
 	/** Total bytes of the current telemetry file (0 when missing). */
@@ -269,12 +360,21 @@ export class CacheStore {
 
 	/** telemetry.jsonl -> telemetry.1.jsonl, shift the rest, drop the oldest. */
 	async rotateNow(): Promise<void> {
-		// Drop the oldest rotated file first so a failed rename never loses data.
+		// Drop the bounded oldest generation before shifting newer generations.
 		await rm(this.rotatedPath(this.maxRotatedFiles), { force: true });
 		for (let n = this.maxRotatedFiles - 1; n >= 1; n -= 1) {
-			await rename(this.rotatedPath(n), this.rotatedPath(n + 1)).catch(() => {});
+			await this.renameRotationSourceIfPresent(this.rotatedPath(n), this.rotatedPath(n + 1));
 		}
-		await rename(this.telemetryPath(), this.rotatedPath(1)).catch(() => {});
+		await this.renameRotationSourceIfPresent(this.telemetryPath(), this.rotatedPath(1));
+	}
+
+	private async renameRotationSourceIfPresent(source: string, destination: string): Promise<void> {
+		try {
+			await this.rotationRename(source, destination);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+			throw error;
+		}
 	}
 
 /**
@@ -333,6 +433,146 @@ function normalizeTelemetryThreshold(value: number | undefined): number {
 	return Math.min(Math.floor(value), DEFAULT_MAX_TELEMETRY_BYTES);
 }
 
+function normalizeChronologicalRecordLimit(value: number | undefined): number {
+	if (value === undefined || !Number.isFinite(value) || value <= 0) return DEFAULT_MAX_CHRONOLOGICAL_RECORDS;
+	return Math.min(Math.floor(value), MAX_CHRONOLOGICAL_RECORDS);
+}
+
+/** Fixed-cap newest-record ring; object retention never exceeds capacity. */
+class RecordRing<T> {
+	private readonly values: T[] = [];
+	private next = 0;
+	totalPushed = 0;
+
+	constructor(private readonly capacity: number) {}
+
+	get size(): number {
+		return this.values.length;
+	}
+
+	push(value: T): void {
+		this.totalPushed += 1;
+		if (this.values.length < this.capacity) {
+			this.values.push(value);
+			return;
+		}
+		this.values[this.next] = value;
+		this.next = (this.next + 1) % this.capacity;
+	}
+
+	toArray(): T[] {
+		if (this.values.length < this.capacity || this.next === 0) return this.values.slice();
+		const ordered: T[] = [];
+		for (let index = 0; index < this.values.length; index += 1) {
+			const value = this.values[(this.next + index) % this.values.length];
+			if (value !== undefined) ordered.push(value);
+		}
+		return ordered;
+	}
+}
+
+/** Scan one line at a time; never materialize an all-lines or all-records array. */
+function parseTelemetryJsonlInto(text: string, retained: RecordRing<TelemetryRecord>): { skipped: number } {
+	let skipped = 0;
+	let start = 0;
+	while (start < text.length) {
+		const newline = text.indexOf("\n", start);
+		const end = newline === -1 ? text.length : newline;
+		const line = text.slice(start, end);
+		start = newline === -1 ? text.length : newline + 1;
+		const trimmed = line.trim();
+		if (trimmed.length === 0) continue;
+		if (Buffer.byteLength(trimmed, "utf8") + 1 > MAX_TELEMETRY_RECORD_BYTES) {
+			skipped += 1;
+			continue;
+		}
+		try {
+			const parsed = JSON.parse(trimmed) as unknown;
+			if (isTelemetryRecord(parsed)) retained.push(parsed);
+			else skipped += 1;
+		} catch {
+			skipped += 1;
+		}
+	}
+	return { skipped };
+}
+
+type GenerationState =
+	| { name: string; state: "missing" }
+	| { name: string; state: "source_not_regular" }
+	| { name: string; state: "read_error" }
+	| { name: string; state: "regular"; fileSize: number; mtimeNs: string; dev?: number; ino?: number };
+
+/** Exact filename + regular-file identity snapshot across the rotation set. */
+async function snapshotTelemetryGeneration(
+	sources: readonly { name: string; path: string }[],
+): Promise<GenerationState[]> {
+	const generation: GenerationState[] = [];
+	for (const source of sources) {
+		try {
+			const info = await stat(source.path, { bigint: true });
+			if (!info.isFile()) {
+				generation.push({ name: source.name, state: "source_not_regular" });
+				continue;
+			}
+			const normalized = fileSourceSnapshotFromStats(info);
+			if (!normalized.ok || normalized.value.mtimeNs === undefined) {
+				generation.push({ name: source.name, state: "read_error" });
+				continue;
+			}
+			generation.push({
+				name: source.name,
+				state: "regular",
+				fileSize: normalized.value.fileSize,
+				mtimeNs: normalized.value.mtimeNs,
+				...(normalized.value.dev === undefined ? {} : { dev: normalized.value.dev }),
+				...(normalized.value.ino === undefined ? {} : { ino: normalized.value.ino }),
+			});
+		} catch (error) {
+			generation.push({
+				name: source.name,
+				state: (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "read_error",
+			});
+		}
+	}
+	return generation;
+}
+
+function sameTelemetryGeneration(left: readonly GenerationState[], right: readonly GenerationState[]): boolean {
+	if (left.length !== right.length) return false;
+	for (let index = 0; index < left.length; index += 1) {
+		const a = left[index];
+		const b = right[index];
+		if (!a || !b || a.name !== b.name || a.state !== b.state) return false;
+		if (a.state === "regular" && b.state === "regular") {
+			if (a.fileSize !== b.fileSize || a.mtimeNs !== b.mtimeNs || a.dev !== b.dev || a.ino !== b.ino) return false;
+		}
+	}
+	return true;
+}
+
+/**
+ * Once any rotated generation exists, every newer generation through the
+ * current file must exist. A missing file in that suffix proves that the
+ * retained history is discontinuous. A project with no telemetry at all, or
+ * a current file with no rotations yet, is complete rather than a gap.
+ */
+function generationHasRotationGap(generation: readonly GenerationState[]): boolean {
+	let rotatedGenerationSeen = false;
+	for (let index = 0; index < generation.length; index += 1) {
+		const item = generation[index];
+		if (!item) return true;
+		const isCurrent = index === generation.length - 1;
+		if (isCurrent) return rotatedGenerationSeen && item.state === "missing";
+		if (item.state !== "missing") {
+			rotatedGenerationSeen = true;
+		} else if (rotatedGenerationSeen) {
+			return true;
+		}
+	}
+	return false;
+}
+
 type TelemetryReadFailure = "missing" | "source_oversized" | "source_not_regular" | "source_changed_during_read" | "read_error";
 type TelemetryReadResult = { ok: true; text: string } | { ok: false; reason: TelemetryReadFailure };
 
@@ -349,10 +589,10 @@ async function readTelemetryFileBounded(
 		return { ok: false, reason: (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "read_error" };
 	}
 	try {
-		const initialStats = await handle.stat();
+		const initialStats = await handle.stat({ bigint: true });
 		if (!initialStats.isFile()) return { ok: false, reason: "source_not_regular" };
 		const initial = fileSourceSnapshotFromStats(initialStats);
-		if (!initial.ok) return { ok: false, reason: "read_error" };
+		if (!initial.ok || initial.value.mtimeNs === undefined) return { ok: false, reason: "read_error" };
 		await hooks?.afterInitialStat?.(Object.freeze({ ...initial.value }));
 		if (initial.value.fileSize > maxBytes) return { ok: false, reason: "source_oversized" };
 		hooks?.onBufferAllocate?.(initial.value.fileSize);
@@ -365,13 +605,16 @@ async function readTelemetryFileBounded(
 			offset += read.bytesRead;
 		}
 		await hooks?.afterRead?.(Object.freeze({ ...initial.value }));
-		const finalStats = await handle.stat();
+		const finalStats = await handle.stat({ bigint: true });
 		if (!finalStats.isFile()) return { ok: false, reason: "source_changed_during_read" };
 		const final = fileSourceSnapshotFromStats(finalStats);
-		if (!final.ok || !sameTelemetrySnapshot(initial.value, final.value)) {
+		if (!final.ok || final.value.mtimeNs === undefined || !sameTelemetrySnapshot(initial.value, final.value)) {
 			return { ok: false, reason: "source_changed_during_read" };
 		}
-		return { ok: true, text: buffer.toString("utf8") };
+		// Buffer.toString("utf8") silently replaces malformed byte sequences
+		// with U+FFFD. A replacement can leave otherwise valid JSON and schema
+		// data looking trustworthy, so telemetry must fail closed instead.
+		return { ok: true, text: new TextDecoder("utf-8", { fatal: true }).decode(buffer) };
 	} catch {
 		return { ok: false, reason: "read_error" };
 	} finally {
@@ -380,8 +623,8 @@ async function readTelemetryFileBounded(
 }
 
 function sameTelemetrySnapshot(
-	a: { fileSize: number; mtimeMs: number; dev?: number; ino?: number },
-	b: { fileSize: number; mtimeMs: number; dev?: number; ino?: number },
+	a: { fileSize: number; mtimeMs: number; mtimeNs?: string; dev?: number; ino?: number },
+	b: { fileSize: number; mtimeMs: number; mtimeNs?: string; dev?: number; ino?: number },
 ): boolean {
-	return a.fileSize === b.fileSize && a.mtimeMs === b.mtimeMs && a.dev === b.dev && a.ino === b.ino;
+	return a.fileSize === b.fileSize && a.mtimeMs === b.mtimeMs && a.mtimeNs === b.mtimeNs && a.dev === b.dev && a.ino === b.ino;
 }

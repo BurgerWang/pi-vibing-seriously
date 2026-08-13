@@ -67,6 +67,7 @@ For onboarding details, nested projects, and recipe examples, see
 | **Gates decide readiness** | b0–b6 base and q0–q5 quant gates return exactly PASS / FAIL / BLOCKED / NOT_RUN; model prose never substitutes for machine or recorded manual evidence |
 | **Workers own routine writes** | Bounded workers implement parent-approved slices; the commander owns architecture, reviews the actual git diff, and runs final gates |
 | **Output stays bounded** | Result envelopes, turn/history budgets, stale-safe cursors, bounded DTOs, numeric telemetry, and a legacy-session sanitizer control model-visible context |
+| **Prompt prefixes stay cooperative** | Active-history projection changes the provider-visible prefix only at discrete low-watermark epochs; ordinary turns remain append-only inside an epoch |
 | **Caching is explicit** | Opt-in, success-only recipe result caching uses declared content inputs; it never caches LLM answers or arbitrary bash |
 | **Quant work has contracts** | Mid/low-frequency profiles add Q0–Q5 plus versioned DATA_SNAPSHOT / FEATURE_SET / BACKTEST_RESULT and `quant-result.json` contracts |
 | **Everything stays Pi-native** | Extensions, 30 commands, 14 registered tools, 14 skills, 7 prompt templates, and compact status/widget renderers—no companion runtime |
@@ -173,7 +174,25 @@ history.
 | Gate read | 24 KiB and 320 lines |
 | One turn's tool-result batch | Commander 64 KiB; worker 48 KiB; at most 16 calls |
 | Active tool-result history | Commander 96 KiB; worker 64 KiB |
+| Active-history bundles | 128 complete assistant/tool-result bundles |
 | Details value / streaming update | 8 KiB / 4 KiB |
+
+When active history crosses a hard limit, the runtime starts one projection
+epoch at a 75% byte / 96-bundle low watermark. It then reuses that exact
+projected prefix and appends new raw messages until the next hard crossing.
+The hard limits above are unchanged; invalid tool pairing still fails closed.
+This avoids per-turn history rewrites but does not claim or guarantee a
+provider cache-hit recovery.
+
+Cache visibility is explicit: the footer shows `CACHE last=… cum=…`,
+`/q-cache-status` labels the last request and cumulative session ratios, and
+`/q-cache-report` reads a bounded chronological window across rotated plus
+current telemetry. Corrupt/unreadable sources make the aggregate ratio N/A.
+`/q-cache-doctor` uses the same oldest-archive-to-current bounded window and
+suppresses clean/no-drift conclusions whenever sources are partial, corrupt,
+unavailable, or intentionally truncated.
+The formal stress recipe writes fake-provider telemetry only to its temporary
+project and verifies repository telemetry hashes are unchanged.
 
 `/q-context-output-status [json]` reports numeric-only observations such as
 bytes shown or omitted, truncations, blocked calls, history collapse, and

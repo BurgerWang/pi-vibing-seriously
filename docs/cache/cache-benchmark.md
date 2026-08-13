@@ -65,8 +65,8 @@ equal in-Pi numbers.
 | `usageSemanticStatus` | Worst status across records: `verified` (api kind verified + internally consistent numbers), `partial` (structure ok, api kind unverified), `unverified` (invalid/missing usage). Never guessed. |
 | `providerReportedCost` | Σ `usage.cost` — Pi's `usage.cost.total`, the cost fact from the provider's own billing fields. |
 | `estimatedAvoidedCost` | Σ (`cacheRead` × `cacheRead` rate)/1M tokens using the **explicit `--cost-map`**; `null` if any record's provider/model has no rate in the map (strict — no partial estimates) or no map is given. |
-| `expectedInvalidations` | Records whose `inferredInvalidationReason` classifies as expected: FIRST_OBSERVED_REQUEST, NEW_SESSION, MODEL_CHANGED, THINKING_LEVEL_CHANGED, MODE_CHANGED, PACKAGE_RELOADED, COMPACTION, PROVIDER_BEST_EFFORT_MISS. |
-| `unexpectedDrifts` | Records classified as unexpected: UNEXPECTED_DRIFT (same-mode system-prompt/tool drift, with `driftSource` detail) and CONTEXT_PREFIX_DIVERGED (payload shape changed while stable-zone fingerprints stayed identical — the normal conversation-growth pattern; see the interpretation note below). |
+| `expectedInvalidations` | Records whose `inferredInvalidationReason` classifies as expected: FIRST_OBSERVED_REQUEST, NEW_SESSION, MODEL_CHANGED, THINKING_LEVEL_CHANGED, MODE_CHANGED, PACKAGE_RELOADED, COMPACTION, SESSION_TREE_CHANGED, HISTORY_PROJECTION_EPOCH_CHANGED, PROVIDER_BEST_EFFORT_MISS. |
+| `unexpectedDrifts` | Records classified as unexpected: UNEXPECTED_DRIFT (same-mode system-prompt/tool drift, with `driftSource` detail) and CONTEXT_PREFIX_DIVERGED (a previously observed payload prefix item was rewritten, deleted, or reordered without an attributable lifecycle event). Ordinary UNCHANGED and APPEND_ONLY payload relationships are healthy and are not counted as drift. |
 | `modeChanges` / `modelChanges` / `thinkingChanges` | Adjacent-record transitions of `workbenchMode` / `model` / `thinkingLevel`. |
 | `reloads` / `compactions` | Records with `inferredInvalidationReason` PACKAGE_RELOADED / COMPACTION. |
 | `recipeExecutions` | Run manifests found under `.pi/workbench/runs/` (each manifest = one recipe invocation, exec or cache-hit materialization). |
@@ -79,20 +79,20 @@ equal in-Pi numbers.
 | `fallbackCount` | Lock files whose owner PID is dead and whose age exceeds `LOCK_STALE_MS` (60 s) — evidence that execution proceeded without the lock (cache writes become best-effort). |
 | `skippedTelemetryLines` | Corrupted JSONL lines skipped during reading (counted, never fatal). |
 
-## Interpretation note (do not over-read `unexpectedDrifts`)
+## Interpretation note
 
-`CONTEXT_PREFIX_DIVERGED` is a **conservative** inference: it fires when the
-payload *shape* changed while the stable-zone fingerprints
+Normal conversation growth is `APPEND_ONLY`: the provider-visible prefix is
+unchanged and only new segments follow it. `UNCHANGED` and `APPEND_ONLY` are
+healthy relationships and do not imply drift. `CONTEXT_PREFIX_DIVERGED` is
+reserved for an unattributed rewrite, deletion, or reordering of an already
+observed payload prefix item while the stable-zone fingerprints
 (`systemPromptHash`, `activeToolNamesHash`, `activeToolOrderHash`,
-`activeToolSchemaHash`) stayed identical. In a normal conversation every
-turn appends new segments, so most records carry this reason **even when the
-cache is healthy** (the cached prefix covers the unchanged part; only the
-newest segments are billed as input). The actionable signal is
-`UNEXPECTED_DRIFT` **with a `driftSource`** (SYSTEM_PROMPT / TOOL_SET /
-TOOL_ORDER / TOOL_SCHEMA): that is a stable-zone change that genuinely
-invalidates the provider cache. The doctor distinguishes the two, and the
-benchmark reports both counts verbatim — treat `unexpectedDrifts` as an
-upper bound, not a failure count.
+`activeToolSchemaHash`) stayed identical. Known lifecycle rewrites win with
+their explicit expected reason, including `SESSION_TREE_CHANGED` and
+`HISTORY_PROJECTION_EPOCH_CHANGED`. `UNEXPECTED_DRIFT` with a `driftSource`
+(SYSTEM_PROMPT / TOOL_SET / TOOL_ORDER / TOOL_SCHEMA) identifies a stable-zone
+mutation. Both unexpected reasons are actionable evidence, while all reasons
+remain workbench inferences rather than provider-issued miss verdicts.
 
 ## Statistics, reproducibility
 

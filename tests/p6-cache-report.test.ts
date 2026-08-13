@@ -162,12 +162,82 @@ test("estimated avoided cost: non-finite or negative rates void the estimate", a
 	assert.equal(negative.estimatedAvoidedCost, null);
 });
 
+test("estimated avoided cost is unavailable when source evidence is partial or bounded", async () => {
+	const records = await collectRecords([{}, {}]);
+	const partial = buildCacheReport(records, "project", rateLookup, { skippedRecords: 1, sourceIncomplete: true });
+	assert.equal(partial.estimatedAvoidedCost, null);
+	assert.ok(renderCacheReport(partial).some((line) => line.includes("incomplete telemetry observation")));
+
+	const bounded = buildCacheReport(records, "project", rateLookup, { truncatedRecords: 1 });
+	assert.equal(bounded.hitRatio, 0.8, "a bounded ratio remains explicitly scoped to the retained window");
+	assert.equal(bounded.estimatedAvoidedCost, null, "a retained window cannot support a full-history cost estimate");
+	const rendered = renderCacheReport(bounded);
+	assert.ok(rendered.some((line) => line.includes("bounded retained window")));
+	assert.ok(rendered.some((line) => line.includes("full estimate unavailable")));
+});
+
 test("empty report: no records, no fabrication", () => {
 	const report = buildCacheReport([], "session", rateLookup);
 	assert.equal(report.requestCount, 0);
 	assert.equal(report.hitRatio, null);
 	assert.equal(report.semanticStatus, null);
 	assert.equal(report.estimatedAvoidedCost, null);
+});
+
+test("partial or unverified usage semantics never fabricate an aggregate hit ratio", async () => {
+	const records = await collectRecords([{}]);
+	const partial = [{ ...records[0]!, usageSemanticStatus: "partial" as const, cacheHitRatio: null }];
+	const unverified = [{ ...records[0]!, usageSemanticStatus: "unverified" as const, cacheHitRatio: null }];
+	assert.equal(buildCacheReport(partial, "project", rateLookup).hitRatio, null);
+	assert.equal(buildCacheReport(unverified, "project", rateLookup).hitRatio, null);
+	assert.equal(
+		buildCacheReport(records, "project", rateLookup, { skippedRecords: 2, sourceIncomplete: true }).hitRatio,
+		null,
+		"an incomplete chronological read must not present a verified ratio",
+	);
+});
+
+test("durable telemetry write gaps make reports and doctor conclusions partial", async () => {
+	const records = await collectRecords([{}, {}]);
+	const gapRecord: TelemetryRecord = {
+		...records[1]!,
+		precedingEvent: "telemetry_write_gap",
+		usageSemanticStatus: "unverified",
+		cacheHitRatio: null,
+	};
+	const gappedRecords = [records[0]!, gapRecord];
+	const report = buildCacheReport(gappedRecords, "project", rateLookup);
+	assert.equal(report.sourceIncomplete, true);
+	assert.equal(report.semanticStatus, "unverified");
+	assert.equal(report.hitRatio, null);
+	assert.equal(report.estimatedAvoidedCost, null);
+	assert.equal(report.invalidationCounts[gapRecord.inferredInvalidationReason], 1);
+	assert.equal(report.invalidationCounts["telemetry_write_gap"], undefined, "the quality marker is not an invalidation reason");
+	assert.ok(renderCacheReport(report).some((line) => line.includes("data quality") && line.includes("PARTIAL")));
+
+	const facts: DoctorFacts = {
+		provider: "deepseek",
+		model: "deepseek-v4-flash",
+		apiKind: "openai-completions",
+		modelCostPresent: true,
+		modelCostRatesValid: true,
+		systemPrompt: "You are the pi-dev-workbench assistant.",
+		activeToolNames: ["read", "grep"],
+		tools: TOOLS,
+		records: gappedRecords,
+		telemetryEnabled: true,
+		telemetryBytes: 2048,
+		telemetryMaxBytes: 5 * 1024 * 1024,
+		rotatedFiles: 0,
+	};
+	const checks = runDoctor(facts);
+	const quality = checks.find((check) => check.id === "telemetry_source_quality");
+	assert.equal(quality?.status, "warn");
+	assert.ok(quality?.message.includes("PARTIAL"));
+	assert.ok(quality?.message.includes("telemetry-write-gap=yes"));
+	assert.equal(checks.find((check) => check.id === "same_mode_drift")?.status, "warn");
+	const json = doctorToJson(checks, facts) as { telemetry_quality?: { sourceIncomplete?: boolean } };
+	assert.equal(json.telemetry_quality?.sourceIncomplete, true);
 });
 
 test("renderCacheReport and renderCacheStatus produce text without throwing", async () => {
@@ -178,8 +248,45 @@ test("renderCacheReport and renderCacheStatus produce text without throwing", as
 	assert.ok(lines.some((l) => l.includes("hit ratio")));
 	assert.ok(lines.some((l) => l.includes("estimated avoided cost")));
 	const telemetry = createCacheTelemetry({ now: () => BASE_TIME, appendEntry: () => {} });
+	telemetry.setProjectRoot("/tmp/irrelevant");
+	telemetry.setSessionId("status-session");
+	await telemetry.observeMessageEnd({
+		provider: "deepseek",
+		model: "deepseek-v4-flash",
+		apiKind: "openai-completions",
+		usage: { input: 10, output: 1, cacheRead: 90, cacheWrite: 0, totalTokens: 101, cost: { total: 0 } },
+		thinkingLevel: "high",
+		systemPrompt: "stable",
+		activeToolNames: [],
+		tools: [],
+	});
+	await telemetry.observeMessageEnd({
+		provider: "deepseek",
+		model: "deepseek-v4-flash",
+		apiKind: "openai-completions",
+		usage: { input: 90, output: 1, cacheRead: 10, cacheWrite: 0, totalTokens: 101, cost: { total: 0 } },
+		thinkingLevel: "high",
+		systemPrompt: "stable",
+		activeToolNames: [],
+		tools: [],
+	});
 	const statusLines = renderCacheStatus(telemetry.snapshot());
 	assert.ok(statusLines.some((l) => l.includes("requests")));
+	assert.ok(statusLines.some((l) => l.includes("last request ratio") && l.includes("10%")));
+	assert.ok(statusLines.some((l) => l.includes("cumulative ratio") && l.includes("50%")));
+	assert.equal(telemetry.statusSegment(), "CACHE last=10% cum=50% | read 100 | miss 100");
+});
+
+test("report rejects malformed runtime records without throwing or producing NaN", async () => {
+	const records = await collectRecords([{}]);
+	const malformed = { ...records[0]!, usage: { ...records[0]!.usage, input: Number.NaN } } as TelemetryRecord;
+	const report = buildCacheReport([records[0]!, malformed], "project", rateLookup);
+	assert.equal(report.requestCount, 1);
+	assert.equal(report.skippedRecords, 1);
+	assert.equal(report.sourceIncomplete, true);
+	assert.equal(report.hitRatio, null);
+	assert.ok(Object.values(report.totals).every(Number.isFinite));
+	assert.doesNotThrow(() => renderCacheReport(report));
 });
 
 test("doctor: all checks pass on a healthy setup", async () => {
@@ -203,9 +310,50 @@ test("doctor: all checks pass on a healthy setup", async () => {
 	const fails = checks.filter((c) => c.status === "fail");
 	assert.deepEqual(fails, [], `unexpected fails: ${JSON.stringify(fails)}`);
 	const ids = checks.map((c) => c.id);
-	for (const expected of ["current_model", "usage_fields", "model_cost_metadata", "models_json", "auth_json", "system_prompt_dynamics", "prefix_hashes", "tool_metadata_static", "tool_stability", "same_mode_drift", "expected_vs_unexpected", "churn", "forbidden_fields", "telemetry_size", "telemetry_enabled"]) {
+	for (const expected of ["current_model", "telemetry_source_quality", "usage_fields", "model_cost_metadata", "models_json", "auth_json", "system_prompt_dynamics", "prefix_hashes", "tool_metadata_static", "tool_stability", "same_mode_drift", "expected_vs_unexpected", "churn", "forbidden_fields", "telemetry_size", "telemetry_enabled"]) {
 		assert.ok(ids.includes(expected), expected);
 	}
+});
+
+test("doctor: partial or truncated telemetry suppresses clean historical conclusions", async () => {
+	const records = await collectRecords([{}]);
+	const facts: DoctorFacts = {
+		provider: "deepseek",
+		model: "deepseek-v4-flash",
+		apiKind: "openai-completions",
+		modelCostPresent: true,
+		modelCostRatesValid: true,
+		systemPrompt: "You are the pi-dev-workbench assistant.",
+		activeToolNames: ["read", "grep"],
+		tools: TOOLS,
+		records,
+		telemetryEnabled: true,
+		telemetryBytes: 2048,
+		telemetryMaxBytes: 5 * 1024 * 1024,
+		rotatedFiles: 2,
+		sourceIncomplete: true,
+		skippedRecords: 1,
+		truncatedRecords: 7,
+		filesRead: 3,
+		sourceUnavailable: "read_error",
+	};
+	const checks = runDoctor(facts);
+	const quality = checks.find((check) => check.id === "telemetry_source_quality");
+	assert.equal(quality?.status, "warn");
+	assert.ok(quality?.message.includes("PARTIAL"));
+	const drift = checks.find((check) => check.id === "same_mode_drift");
+	assert.equal(drift?.status, "warn");
+	assert.ok(drift?.message.includes("prevents a no-drift conclusion"));
+	assert.equal(checks.find((check) => check.id === "expected_vs_unexpected")?.status, "warn");
+	assert.equal(checks.find((check) => check.id === "forbidden_fields")?.status, "warn");
+	const json = doctorToJson(checks, facts) as { telemetry_quality?: Record<string, unknown> };
+	assert.deepEqual(json.telemetry_quality, {
+		sourceIncomplete: true,
+		skippedRecords: 1,
+		truncatedRecords: 7,
+		filesRead: 3,
+		sourceUnavailable: "read_error",
+	});
 });
 
 test("doctor flags dynamic system prompt markers (ids only, never content)", () => {

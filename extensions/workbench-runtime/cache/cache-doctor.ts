@@ -13,7 +13,7 @@
  * compaction). Rendering supports print (text lines) and json output.
  */
 
-import { hasForbiddenTelemetryFields } from "./cache-store.ts";
+import { hasForbiddenTelemetryFields, MAX_TELEMETRY_RECORD_BYTES } from "./cache-store.ts";
 import type { TelemetryRecord } from "./cache-types.ts";
 import { fingerprintTools, type ToolInfoLike } from "./prompt-fingerprint.ts";
 import { invalidationClass } from "./invalidation-classifier.ts";
@@ -42,6 +42,12 @@ export interface DoctorFacts {
 	telemetryBytes: number;
 	telemetryMaxBytes: number;
 	rotatedFiles: number;
+	/** Strict chronological source quality. Omitted fields default to a complete, untruncated in-memory input. */
+	sourceIncomplete?: boolean;
+	skippedRecords?: number;
+	truncatedRecords?: number;
+	filesRead?: number;
+	sourceUnavailable?: string | null;
 	/**
 	 * P6-E: "extension" (default) runs the full Pi-context checks;
 	 * "cli" (scripts/cache-benchmark.ts doctor) runs the offline subset —
@@ -54,6 +60,11 @@ export interface DoctorFacts {
 /** Churn thresholds (documented heuristics, not gates). */
 const MAX_CHURN_TOTAL = 20;
 const MAX_CHURN_SINGLE = 10;
+const TELEMETRY_WRITE_GAP_EVENT = "telemetry_write_gap";
+
+function telemetryWriteGapObserved(records: readonly TelemetryRecord[]): boolean {
+	return records.some((record) => record.precedingEvent === TELEMETRY_WRITE_GAP_EVENT);
+}
 
 /** Reasons that count as same-mode mutation (P6-B UNEXPECTED_DRIFT + payload divergence). */
 function isSameModeMutation(record: TelemetryRecord): boolean {
@@ -64,6 +75,13 @@ function isSameModeMutation(record: TelemetryRecord): boolean {
 export function runDoctor(facts: DoctorFacts): DoctorCheck[] {
 	const checks: DoctorCheck[] = [];
 	const cli = facts.context === "cli";
+	const skippedRecords = safeCount(facts.skippedRecords);
+	const truncatedRecords = safeCount(facts.truncatedRecords);
+	const filesRead = safeCount(facts.filesRead);
+	const writeGapObserved = telemetryWriteGapObserved(facts.records);
+	const sourceIncomplete = facts.sourceIncomplete === true || skippedRecords > 0 || Boolean(facts.sourceUnavailable) || writeGapObserved;
+	const observationIncomplete = sourceIncomplete || truncatedRecords > 0;
+	const qualityDetail = `files=${filesRead} skipped=${skippedRecords} bounded-oldest-omitted=${truncatedRecords} telemetry-write-gap=${writeGapObserved ? "yes" : "no"}`;
 
 	// Offline derivation: in CLI mode the live Pi model is unavailable, so
 	// provider/model/apiKind come from the last telemetry record instead.
@@ -86,7 +104,25 @@ export function runDoctor(facts: DoctorFacts): DoctorCheck[] {
 		checks.push({ id: "api_kind", status: "skip", message: "api kind unknown — model metadata does not provide it" });
 	}
 
-	// 3. Usage field validity across records.
+	// 3. Source completeness. Missing/corrupt/unavailable records and an
+	// intentionally truncated oldest window bound every historical claim.
+	if (sourceIncomplete) {
+		checks.push({
+			id: "telemetry_source_quality",
+			status: "warn",
+			message: `PARTIAL telemetry evidence (${qualityDetail}${facts.sourceUnavailable ? ` unavailable=${facts.sourceUnavailable}` : ""}) — absence-of-drift claims are suppressed`,
+		});
+	} else if (truncatedRecords > 0) {
+		checks.push({
+			id: "telemetry_source_quality",
+			status: "warn",
+			message: `bounded telemetry window (${qualityDetail}) — retained records are valid, but omitted history prevents whole-history absence claims`,
+		});
+	} else {
+		checks.push({ id: "telemetry_source_quality", status: "ok", message: `complete retained telemetry evidence (${qualityDetail})` });
+	}
+
+	// 4. Usage field validity across records.
 	let usageInvalid = 0;
 	let usageInconsistent = 0;
 	for (const record of facts.records) {
@@ -101,8 +137,10 @@ export function runDoctor(facts: DoctorFacts): DoctorCheck[] {
 			status: "fail",
 			message: `${usageInvalid} record(s) with invalid (non-finite/negative) usage, ${usageInconsistent} with inconsistent totalTokens`,
 		});
-	} else if (facts.records.length === 0) {
+	} else if (facts.records.length === 0 && !observationIncomplete) {
 		checks.push({ id: "usage_fields", status: "skip", message: "no telemetry records yet" });
+	} else if (observationIncomplete) {
+		checks.push({ id: "usage_fields", status: "warn", message: `${facts.records.length} retained record(s) have valid usage; partial/omitted evidence prevents a whole-source validity claim` });
 	} else {
 		checks.push({ id: "usage_fields", status: "ok", message: `${facts.records.length} record(s): all usage fields finite, non-negative and internally consistent` });
 	}
@@ -240,6 +278,8 @@ export function runDoctor(facts: DoctorFacts): DoctorCheck[] {
 			status: "warn",
 			message: `${sameModeMutations} same-mode mutation(s) — the context prefix changed without a mode switch (${sources})`,
 		});
+	} else if (observationIncomplete) {
+		checks.push({ id: "same_mode_drift", status: "warn", message: "no same-mode mutations observed in retained records, but partial/omitted telemetry prevents a no-drift conclusion" });
 	} else {
 		checks.push({ id: "same_mode_drift", status: "ok", message: "no same-mode mutations — the context prefix is stable within each mode" });
 	}
@@ -254,8 +294,8 @@ export function runDoctor(facts: DoctorFacts): DoctorCheck[] {
 	}
 	checks.push({
 		id: "expected_vs_unexpected",
-		status: "ok",
-		message: `expected invalidations=${expectedInvalidations} unexpected drifts=${unexpectedDrifts} (out of ${facts.records.length} record(s))`,
+		status: observationIncomplete ? "warn" : "ok",
+		message: `expected invalidations=${expectedInvalidations} unexpected drifts=${unexpectedDrifts} (out of ${facts.records.length} retained record(s)${observationIncomplete ? "; partial window" : ""})`,
 	});
 
 	// 13. Churn (frequent mode/model/thinking/reload/compaction).
@@ -282,6 +322,12 @@ export function runDoctor(facts: DoctorFacts): DoctorCheck[] {
 			status: "warn",
 			message: `high churn: model=${modelChanges} thinking=${thinkingChanges} mode=${modeChanges} reload=${reloads} compaction=${compactions} (each cache invalidation resets the provider cache)`,
 		});
+	} else if (observationIncomplete) {
+		checks.push({
+			id: "churn",
+			status: "warn",
+			message: `observed churn: model=${modelChanges} thinking=${thinkingChanges} mode=${modeChanges} reload=${reloads} compaction=${compactions}; partial/omitted telemetry prevents a whole-history bounds claim`,
+		});
 	} else {
 		checks.push({
 			id: "churn",
@@ -297,15 +343,18 @@ export function runDoctor(facts: DoctorFacts): DoctorCheck[] {
 	}
 	if (forbidden > 0) {
 		checks.push({ id: "forbidden_fields", status: "fail", message: `${forbidden} record(s) contain forbidden fields (prompt/content/secret/... keys) — fix the schema before continuing` });
+	} else if (observationIncomplete) {
+		checks.push({ id: "forbidden_fields", status: "warn", message: `no forbidden fields in ${facts.records.length} retained record(s); partial/omitted telemetry prevents a whole-source conclusion` });
 	} else {
 		checks.push({ id: "forbidden_fields", status: "ok", message: `no forbidden fields in ${facts.records.length} record(s)` });
 	}
 
 	// 15. Telemetry file size.
-	if (facts.telemetryBytes > facts.telemetryMaxBytes) {
-		checks.push({ id: "telemetry_size", status: "warn", message: `telemetry.jsonl is ${facts.telemetryBytes} bytes (limit ${facts.telemetryMaxBytes}, ${facts.rotatedFiles} rotated file(s)) — rotation is active` });
+	const telemetrySetCapacity = (facts.telemetryMaxBytes + MAX_TELEMETRY_RECORD_BYTES) * Math.max(1, facts.rotatedFiles + 1);
+	if (facts.telemetryBytes > telemetrySetCapacity) {
+		checks.push({ id: "telemetry_size", status: "warn", message: `telemetry set is ${facts.telemetryBytes} bytes (per-file limit ${facts.telemetryMaxBytes}, ${facts.rotatedFiles} rotated file(s)) — observed total exceeds the expected rotation-set capacity` });
 	} else {
-		checks.push({ id: "telemetry_size", status: "ok", message: `telemetry.jsonl is ${facts.telemetryBytes} bytes (limit ${facts.telemetryMaxBytes}, ${facts.rotatedFiles} rotated file(s))` });
+		checks.push({ id: "telemetry_size", status: "ok", message: `telemetry set is ${facts.telemetryBytes} bytes (per-file limit ${facts.telemetryMaxBytes}, ${facts.rotatedFiles} rotated file(s))` });
 	}
 
 	// 16. Telemetry enabled.
@@ -316,6 +365,10 @@ export function runDoctor(facts: DoctorFacts): DoctorCheck[] {
 	});
 
 	return checks;
+}
+
+function safeCount(value: number | undefined): number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
 function fingerprintSystemPromptHash(facts: DoctorFacts): string {
@@ -341,6 +394,16 @@ export function doctorToJson(checks: readonly DoctorCheck[], facts?: DoctorFacts
 	};
 	if (facts) {
 		const fingerprint = fingerprintTools(facts.activeToolNames, facts.tools);
+		out.telemetry_quality = {
+			sourceIncomplete: facts.sourceIncomplete === true
+				|| safeCount(facts.skippedRecords) > 0
+				|| Boolean(facts.sourceUnavailable)
+				|| telemetryWriteGapObserved(facts.records),
+			skippedRecords: safeCount(facts.skippedRecords),
+			truncatedRecords: safeCount(facts.truncatedRecords),
+			filesRead: safeCount(facts.filesRead),
+			sourceUnavailable: facts.sourceUnavailable ?? null,
+		};
 		out.prefix = {
 			systemPromptHash: fingerprintSystemPromptHash(facts),
 			activeToolNamesHash: fingerprint.namesHash,

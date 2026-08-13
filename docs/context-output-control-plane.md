@@ -16,6 +16,7 @@ session details are bounded presentations and are never acceptance evidence.
 | One new-session details value | 8 KiB |
 | Commander / worker tool-result batch | 64 KiB / 48 KiB |
 | Commander / worker active tool-result history | 96 KiB / 64 KiB |
+| Active-history bundle count (all roles) | 128 complete bundles |
 
 The final result envelope applies after tool execution and receipt handling,
 so a renderer, error, or finalize path cannot enlarge the result again. A
@@ -49,11 +50,37 @@ facts, and receipt facts—never full reports, patches, logs, or gate arrays.
 
 ## Active history and legacy migration
 
-Before provider requests, the runtime validates assistant tool calls and
-tool results as complete bundles. It protects the newest bundles, collapses
-older complete bundles to bounded descriptors, and removes only whole bundles
-when needed. Invalid pairing fails closed instead of producing orphan calls.
-Worker requests pass through the same protection with the worker limits.
+Before provider requests, the runtime validates assistant tool calls and tool
+results as complete bundles. Below the hard ceiling it returns raw history
+unchanged. At a hard crossing it freezes the current raw prefix, projects that
+prefix once to a low watermark (75% of the role's byte ceiling and at most 96
+bundles), and starts a new history epoch. Every later request in that epoch
+replays the same provider-visible projected prefix and appends the untouched
+raw suffix. A new epoch is required only when the combined result reaches a
+hard ceiling. This keeps normal turns append-only for provider cache reuse
+while preserving the original 96/64 KiB and 128-bundle hard limits. Invalid
+pairing still fails closed instead of producing orphan calls; worker requests
+use the same controller with the worker limits.
+
+The strict numeric/hash-only epoch state is restored on reload/resume and reset
+on a branch or completed compaction. Cache telemetry records an epoch crossing
+as the expected `HISTORY_PROJECTION_EPOCH_CHANGED`; it does not classify a
+normal appended suffix as prefix divergence.
+
+At turn end the runtime also publishes one strict numeric custom entry for
+companion diagnostics. Its custom type and `schema` are both
+`workbench-context-pressure-v1`, and its data has exactly these nine fields:
+`schema`, `role`, `epoch`, `rawToolTextBytes`, `projectedToolTextBytes`,
+`rawBundleCount`, `hardHistoryBytes`, `hardBundleCount`, and `timestampMs`.
+It contains no message text. Pi 0.83 `getContextUsage()` already estimates the
+raw session messages before provider-view projection, so this entry is only an
+epoch/churn and raw-versus-projected diagnostic. A companion must not convert
+`rawToolTextBytes - projectedToolTextBytes` into supplemental tokens or add it
+to Pi's usage; automatic thresholds depend on Pi's raw-session usage alone.
+This workbench only publishes the facts; the companion `pi-auto-compact` source
+is maintained in a separate repository and must apply its own strict parsing,
+post-compaction staleness, and model thresholds. Updating this repository does
+**not** deploy that companion source into a live Pi configuration.
 
 Pi clones legacy entries before a runtime context hook can shrink their clone
 peak. Create a separate safe session copy first:
@@ -88,6 +115,12 @@ run `ctx1`; do not use an earlier standalone `ctx1` run as prerequisite
 evidence. The benchmark summary is observational, not acceptance evidence.
 The stable-prefix transition and canonical old/new hashes are recorded in
 [the stable-prefix contract](cache/stable-prefix-contract.md).
+
+The formal stress session uses a temporary trusted project and temporary
+telemetry sink. Its test verifies that repository current/rotated telemetry
+hashes do not change. The repair does not delete the 300 pre-existing fake
+historical records found during audit; destructive retention cleanup remains a
+separate, explicitly authorized operation.
 
 ## Compatibility
 

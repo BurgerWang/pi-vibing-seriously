@@ -1,3 +1,4 @@
+import { createHash, type Hash } from "node:crypto";
 import { types as utilTypes } from "node:util";
 
 import type { ContextEvent } from "@earendil-works/pi-coding-agent";
@@ -12,6 +13,9 @@ export const WORKER_HISTORY_TOOL_TEXT_MAX_BYTES = 64 * 1_024;
 export const OTHER_HISTORY_TOOL_TEXT_MAX_BYTES = 64 * 1_024;
 export const HISTORY_MAX_BUNDLES = 128;
 export const HISTORY_DESCRIPTOR_MAX_BYTES = 384;
+export const HISTORY_PROJECTION_ENTRY_TYPE = "workbench-history-projection-state-v1";
+export const HISTORY_PROJECTION_LOW_WATERMARK_PERCENT = 75;
+export const HISTORY_PROJECTION_LOW_WATERMARK_BUNDLES = 96;
 
 export interface HistoryProjectionFacts {
 	originalToolTextBytes: number;
@@ -33,6 +37,36 @@ export interface ProjectContextHistoryInput {
 export interface ProjectContextHistoryResult {
 	messages: AgentMessage[];
 	facts: HistoryProjectionFacts;
+}
+
+export interface HistoryProjectionControllerResult extends ProjectContextHistoryResult {
+	epoch: number;
+	epochHash: string | null;
+	epochTransitioned: boolean;
+	newlyCollapsedResults: number;
+	newlyRemovedBundles: number;
+	rawBundleCount: number;
+	projectedBundleCount: number;
+}
+
+export interface HistoryProjectionStateEntryData {
+	schemaVersion: 1;
+	active: 0 | 1;
+	epoch: number;
+	epochHash: string;
+	prefixMessageCount: number;
+	prefixHash: string;
+	projectedPrefixHash: string;
+	hardToolTextBytes: number;
+	hardBundles: number;
+	lowToolTextBytes: number;
+	lowBundles: number;
+	transitionCollapsedResults: number;
+	transitionRemovedBundles: number;
+	rawToolTextBytes: number;
+	rawBundles: number;
+	projectedToolTextBytes: number;
+	projectedBundles: number;
 }
 
 interface ToolCallIdentity {
@@ -498,6 +532,15 @@ function projectionFailureMessage(omittedToolTextBytes = 0): AgentMessage {
 	} as AgentMessage;
 }
 
+/**
+ * Absolute fail-closed projection. This helper deliberately accepts no
+ * history input, so callers can use it after any hostile inspection fails
+ * without touching the failed value a second time.
+ */
+export function safeHistoryProjectionFailureMessages(): AgentMessage[] {
+	return [projectionFailureMessage()];
+}
+
 function roleCeiling(role: ProjectContextHistoryInput["role"]): number {
 	return role === "commander" ? COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES : WORKER_HISTORY_TOOL_TEXT_MAX_BYTES;
 }
@@ -652,7 +695,7 @@ export function historyProjectionFailureMessages(
 		const descriptorCap = effectiveDescriptorCap(descriptorMaxBytes);
 		return buildFailureProjection(messages, byteCap, descriptorCap).messages;
 	} catch {
-		return [projectionFailureMessage()];
+		return safeHistoryProjectionFailureMessages();
 	}
 }
 
@@ -861,6 +904,447 @@ export function projectContextHistory(input: ProjectContextHistoryInput): Projec
 				removedBundles: 0,
 				protectedLatestBundles: 0,
 			},
+		};
+	}
+}
+
+const HISTORY_PROJECTION_STATE_SCHEMA_VERSION = 1 as const;
+const EMPTY_HISTORY_HASH = "0".repeat(64);
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const HISTORY_PROJECTION_STATE_KEYS = Object.freeze([
+	"active", "epoch", "epochHash", "hardBundles", "hardToolTextBytes", "lowBundles", "lowToolTextBytes",
+	"prefixHash", "prefixMessageCount", "projectedBundles", "projectedPrefixHash", "projectedToolTextBytes",
+	"rawBundles", "rawToolTextBytes", "schemaVersion", "transitionCollapsedResults", "transitionRemovedBundles",
+].sort());
+
+interface FrozenHistoryProjectionEpoch {
+	epoch: number;
+	epochHash: string;
+	prefixMessageCount: number;
+	prefixHash: string;
+	projectedPrefixHash: string;
+	hardToolTextBytes: number;
+	hardBundles: number;
+	lowToolTextBytes: number;
+	lowBundles: number;
+	transitionCollapsedResults: number;
+	transitionRemovedBundles: number;
+}
+
+interface HistoryPressureFacts {
+	rawToolTextBytes: number;
+	rawBundles: number;
+	projectedToolTextBytes: number;
+	projectedBundles: number;
+}
+
+function safeNonNegativeInteger(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+function updateCanonicalHashString(hash: Hash, tag: string, value: string): void {
+	hash.update(tag);
+	hash.update(String(utf8Bytes(value)));
+	hash.update(":");
+	hash.update(value);
+	hash.update(";");
+}
+
+/**
+ * Hash JSON-like history values without property access or JSON.stringify.
+ * Proxies, accessors, custom prototypes, cycles and toJSON hooks are rejected
+ * before they can execute; the controller then takes its fixed fail-closed
+ * path. Only a digest escapes this routine.
+ */
+function updateCanonicalHistoryHash(hash: Hash, value: unknown, active: WeakSet<object>): void {
+	if (value === null) {
+		hash.update("null;");
+		return;
+	}
+	switch (typeof value) {
+		case "string":
+			updateCanonicalHashString(hash, "s", value);
+			return;
+		case "boolean":
+			hash.update(value ? "b1;" : "b0;");
+			return;
+		case "number":
+			if (!Number.isFinite(value)) throw new Error("non-finite history number");
+			updateCanonicalHashString(hash, "n", Object.is(value, -0) ? "0" : String(value));
+			return;
+		case "undefined":
+			hash.update("u;");
+			return;
+		case "object":
+			break;
+		default:
+			throw new Error("unsupported history value");
+	}
+
+	if (utilTypes.isProxy(value)) throw new Error("proxy history value is not hashable");
+	if (active.has(value)) throw new Error("cyclic history value");
+	const isArray = Array.isArray(value);
+	const prototype = Object.getPrototypeOf(value);
+	if (isArray ? prototype !== Array.prototype : (prototype !== Object.prototype && prototype !== null)) {
+		throw new Error("non-plain history value");
+	}
+	const descriptors = Object.getOwnPropertyDescriptors(value);
+	if (Object.prototype.hasOwnProperty.call(descriptors, "toJSON")) {
+		throw new Error("custom history toJSON is not permitted");
+	}
+	active.add(value);
+	try {
+		if (isArray) {
+			const lengthDescriptor = descriptors.length;
+			if (!lengthDescriptor || !Object.prototype.hasOwnProperty.call(lengthDescriptor, "value")
+				|| typeof lengthDescriptor.value !== "number" || !Number.isSafeInteger(lengthDescriptor.value)
+				|| lengthDescriptor.value < 0) throw new Error("invalid history array length");
+			const length = lengthDescriptor.value;
+			updateCanonicalHashString(hash, "a", String(length));
+			const indices = Object.entries(descriptors)
+				.filter(([key, descriptor]) => descriptor.enumerable === true && /^(?:0|[1-9][0-9]*)$/.test(key))
+				.map(([key, descriptor]) => ({ key, index: Number(key), descriptor }))
+				.filter(({ index }) => Number.isSafeInteger(index) && index >= 0 && index < length)
+				.sort((left, right) => left.index - right.index);
+			for (const { key, descriptor } of indices) {
+				if (!Object.prototype.hasOwnProperty.call(descriptor, "value")) throw new Error("history array accessor");
+				updateCanonicalHashString(hash, "i", key);
+				updateCanonicalHistoryHash(hash, descriptor.value, active);
+			}
+			hash.update("];");
+			return;
+		}
+
+		hash.update("o;");
+		const entries = Object.entries(descriptors)
+			.filter(([, descriptor]) => descriptor.enumerable === true)
+			.sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+		for (const [key, descriptor] of entries) {
+			if (!Object.prototype.hasOwnProperty.call(descriptor, "value")) throw new Error("history object accessor");
+			updateCanonicalHashString(hash, "k", key);
+			updateCanonicalHistoryHash(hash, descriptor.value, active);
+		}
+		hash.update("};");
+	} finally {
+		active.delete(value);
+	}
+}
+
+function hashHistoryMessages(messages: readonly AgentMessage[]): string {
+	const hash = createHash("sha256");
+	hash.update("workbench-history-canonical-v1;");
+	updateCanonicalHistoryHash(hash, messages, new WeakSet<object>());
+	return hash.digest("hex");
+}
+
+function historyBundleCount(messages: readonly AgentMessage[]): number | undefined {
+	const analysis = analyzeContextHistory(messages);
+	return analysis.valid ? analysis.bundles.length : undefined;
+}
+
+function strictProjectionState(value: unknown): HistoryProjectionStateEntryData | undefined {
+	try {
+		if (value === null || typeof value !== "object" || utilTypes.isProxy(value)) return undefined;
+		const prototype = Object.getPrototypeOf(value);
+		if (prototype !== Object.prototype && prototype !== null) return undefined;
+		if (Object.getOwnPropertySymbols(value).length !== 0) return undefined;
+		const descriptors = Object.getOwnPropertyDescriptors(value);
+		const keys = Object.keys(descriptors).sort();
+		if (keys.length !== HISTORY_PROJECTION_STATE_KEYS.length
+			|| keys.some((key, index) => key !== HISTORY_PROJECTION_STATE_KEYS[index])) return undefined;
+		if (Object.values(descriptors).some((descriptor) => (
+			descriptor.enumerable !== true || !Object.prototype.hasOwnProperty.call(descriptor, "value")
+		))) return undefined;
+		const record = value as Record<string, unknown>;
+		if (record.schemaVersion !== HISTORY_PROJECTION_STATE_SCHEMA_VERSION) return undefined;
+		if (record.active !== 0 && record.active !== 1) return undefined;
+		for (const key of [
+			"epoch", "prefixMessageCount", "hardToolTextBytes", "hardBundles", "lowToolTextBytes", "lowBundles",
+			"transitionCollapsedResults", "transitionRemovedBundles", "rawToolTextBytes", "rawBundles",
+			"projectedToolTextBytes", "projectedBundles",
+		]) {
+			if (safeNonNegativeInteger(record[key]) === undefined) return undefined;
+		}
+		if (typeof record.epochHash !== "string" || !SHA256_PATTERN.test(record.epochHash)) return undefined;
+		if (typeof record.prefixHash !== "string" || !SHA256_PATTERN.test(record.prefixHash)) return undefined;
+		if (typeof record.projectedPrefixHash !== "string" || !SHA256_PATTERN.test(record.projectedPrefixHash)) return undefined;
+		if (record.active === 1) {
+			if ((record.epoch as number) < 1 || (record.prefixMessageCount as number) < 1) return undefined;
+			if ((record.lowToolTextBytes as number) > (record.hardToolTextBytes as number)) return undefined;
+			if ((record.lowBundles as number) > (record.hardBundles as number)) return undefined;
+		} else if (record.prefixMessageCount !== 0
+			|| record.epochHash !== EMPTY_HISTORY_HASH
+			|| record.prefixHash !== EMPTY_HISTORY_HASH
+			|| record.projectedPrefixHash !== EMPTY_HISTORY_HASH) return undefined;
+		return record as unknown as HistoryProjectionStateEntryData;
+	} catch {
+		return undefined;
+	}
+}
+
+function projectionEntryData(entry: unknown): { matched: boolean; data?: unknown } {
+	try {
+		if (entry === null || typeof entry !== "object" || utilTypes.isProxy(entry)) return { matched: false };
+		if (dataValue(entry, "customType") !== HISTORY_PROJECTION_ENTRY_TYPE) return { matched: false };
+		return { matched: true, data: dataValue(entry, "data") };
+	} catch {
+		return { matched: false };
+	}
+}
+
+/**
+ * Session-scoped, I/O-free projection state machine.
+ *
+ * A threshold crossing freezes the complete current history as one epoch and
+ * projects that prefix once to a 75% / 96-bundle low watermark. Later calls
+ * deterministically replay the same frozen prefix projection and append the
+ * untouched suffix. The epoch advances only when that combined result reaches
+ * a hard ceiling, so Pi/provider payloads remain append-only inside an epoch.
+ */
+export class HistoryProjectionController {
+	private frozen: FrozenHistoryProjectionEpoch | undefined;
+	private epochCounter = 0;
+	private pressure: HistoryPressureFacts = {
+		rawToolTextBytes: 0,
+		rawBundles: 0,
+		projectedToolTextBytes: 0,
+		projectedBundles: 0,
+	};
+
+	reset(): void {
+		if (this.frozen) this.epochCounter = Math.max(this.epochCounter, this.frozen.epoch) + 1;
+		this.frozen = undefined;
+		this.pressure = { rawToolTextBytes: 0, rawBundles: 0, projectedToolTextBytes: 0, projectedBundles: 0 };
+	}
+
+	restoreFromEntries(entries: readonly unknown[]): boolean {
+		try {
+			for (let index = entries.length - 1; index >= 0; index -= 1) {
+				const candidate = projectionEntryData(entries[index]);
+				if (!candidate.matched) continue;
+				const parsed = strictProjectionState(candidate.data);
+				if (!parsed) {
+					this.frozen = undefined;
+					this.epochCounter = 0;
+					this.pressure = { rawToolTextBytes: 0, rawBundles: 0, projectedToolTextBytes: 0, projectedBundles: 0 };
+					return false;
+				}
+				this.epochCounter = parsed.epoch;
+				this.pressure = {
+					rawToolTextBytes: parsed.rawToolTextBytes,
+					rawBundles: parsed.rawBundles,
+					projectedToolTextBytes: parsed.projectedToolTextBytes,
+					projectedBundles: parsed.projectedBundles,
+				};
+				this.frozen = parsed.active === 1 ? {
+					epoch: parsed.epoch,
+					epochHash: parsed.epochHash,
+					prefixMessageCount: parsed.prefixMessageCount,
+					prefixHash: parsed.prefixHash,
+					projectedPrefixHash: parsed.projectedPrefixHash,
+					hardToolTextBytes: parsed.hardToolTextBytes,
+					hardBundles: parsed.hardBundles,
+					lowToolTextBytes: parsed.lowToolTextBytes,
+					lowBundles: parsed.lowBundles,
+					transitionCollapsedResults: parsed.transitionCollapsedResults,
+					transitionRemovedBundles: parsed.transitionRemovedBundles,
+				} : undefined;
+				return true;
+			}
+		} catch {
+			this.frozen = undefined;
+			this.epochCounter = 0;
+			this.pressure = { rawToolTextBytes: 0, rawBundles: 0, projectedToolTextBytes: 0, projectedBundles: 0 };
+			return false;
+		}
+		this.frozen = undefined;
+		this.epochCounter = 0;
+		this.pressure = { rawToolTextBytes: 0, rawBundles: 0, projectedToolTextBytes: 0, projectedBundles: 0 };
+		return false;
+	}
+
+	serialize(): HistoryProjectionStateEntryData {
+		const frozen = this.frozen;
+		return {
+			schemaVersion: HISTORY_PROJECTION_STATE_SCHEMA_VERSION,
+			active: frozen ? 1 : 0,
+			epoch: frozen?.epoch ?? this.epochCounter,
+			epochHash: frozen?.epochHash ?? EMPTY_HISTORY_HASH,
+			prefixMessageCount: frozen?.prefixMessageCount ?? 0,
+			prefixHash: frozen?.prefixHash ?? EMPTY_HISTORY_HASH,
+			projectedPrefixHash: frozen?.projectedPrefixHash ?? EMPTY_HISTORY_HASH,
+			hardToolTextBytes: frozen?.hardToolTextBytes ?? 0,
+			hardBundles: frozen?.hardBundles ?? 0,
+			lowToolTextBytes: frozen?.lowToolTextBytes ?? 0,
+			lowBundles: frozen?.lowBundles ?? 0,
+			transitionCollapsedResults: frozen?.transitionCollapsedResults ?? 0,
+			transitionRemovedBundles: frozen?.transitionRemovedBundles ?? 0,
+			rawToolTextBytes: this.pressure.rawToolTextBytes,
+			rawBundles: this.pressure.rawBundles,
+			projectedToolTextBytes: this.pressure.projectedToolTextBytes,
+			projectedBundles: this.pressure.projectedBundles,
+		};
+	}
+
+	project(input: ProjectContextHistoryInput): HistoryProjectionControllerResult {
+		let rawToolTextBytes = 0;
+		let rawBundles = 0;
+		let previousTransitionCollapsedResults = 0;
+		let previousTransitionRemovedBundles = 0;
+		try {
+			rawToolTextBytes = historyToolTextBytes(input.messages);
+			const analyzedBundles = historyBundleCount(input.messages);
+			if (analyzedBundles === undefined) {
+				this.frozen = undefined;
+				const failure = projectContextHistory(input);
+				return this.finish(failure, rawToolTextBytes, 0, true, failure.facts.collapsedResults, failure.facts.removedBundles);
+			}
+			rawBundles = analyzedBundles;
+			const hardToolTextBytes = effectiveByteCap(input);
+			const hardBundles = effectiveBundleCap(input.maxBundles);
+
+			if (this.frozen) {
+				const frozen = this.frozen;
+				const compatible = frozen.hardToolTextBytes === hardToolTextBytes
+					&& frozen.hardBundles === hardBundles
+					&& input.messages.length >= frozen.prefixMessageCount;
+				if (compatible) {
+					const prefix = input.messages.slice(0, frozen.prefixMessageCount);
+					const prefixHash = hashHistoryMessages(prefix);
+					if (prefixHash === frozen.prefixHash) {
+						const base = projectContextHistory({
+							...input,
+							messages: prefix,
+							maxToolTextBytes: frozen.lowToolTextBytes,
+							maxBundles: frozen.lowBundles,
+						});
+						if (hashHistoryMessages(base.messages) === frozen.projectedPrefixHash) {
+							const combined = [...base.messages, ...input.messages.slice(frozen.prefixMessageCount)];
+							const projectedBundles = historyBundleCount(combined);
+							const projectedToolTextBytes = historyToolTextBytes(combined);
+							if (projectedBundles !== undefined
+								&& projectedToolTextBytes <= hardToolTextBytes
+								&& projectedBundles <= hardBundles) {
+								return this.finish({
+									messages: combined,
+									facts: {
+										originalToolTextBytes: rawToolTextBytes,
+										finalToolTextBytes: projectedToolTextBytes,
+										collapsedResults: base.facts.collapsedResults,
+										removedBundles: base.facts.removedBundles,
+										protectedLatestBundles: base.facts.protectedLatestBundles,
+									},
+								}, rawToolTextBytes, rawBundles, false, 0, 0);
+							}
+							previousTransitionCollapsedResults = frozen.transitionCollapsedResults;
+							previousTransitionRemovedBundles = frozen.transitionRemovedBundles;
+						}
+					}
+				}
+				// A branch, compacted prefix, changed policy, or implementation drift
+				// invalidates the frozen boundary and starts a fresh epoch if needed.
+				this.epochCounter = Math.max(this.epochCounter, frozen.epoch);
+				this.frozen = undefined;
+			}
+
+			if (rawToolTextBytes <= hardToolTextBytes && rawBundles <= hardBundles) {
+				return this.finish({
+					messages: Array.from(input.messages),
+					facts: {
+						originalToolTextBytes: rawToolTextBytes,
+						finalToolTextBytes: rawToolTextBytes,
+						collapsedResults: 0,
+						removedBundles: 0,
+						protectedLatestBundles: rawBundles > 0 ? 1 : 0,
+					},
+				}, rawToolTextBytes, rawBundles, false, 0, 0);
+			}
+
+			const lowToolTextBytes = Math.floor(hardToolTextBytes * HISTORY_PROJECTION_LOW_WATERMARK_PERCENT / 100);
+			const lowBundles = Math.min(hardBundles, HISTORY_PROJECTION_LOW_WATERMARK_BUNDLES);
+			const projected = projectContextHistory({
+				...input,
+				maxToolTextBytes: lowToolTextBytes,
+				maxBundles: lowBundles,
+			});
+			const projectedBundles = historyBundleCount(projected.messages);
+			if (projectedBundles === undefined
+				|| projected.facts.finalToolTextBytes > hardToolTextBytes
+				|| projectedBundles > hardBundles) {
+				this.frozen = undefined;
+				const failure = projectContextHistory(input);
+				return this.finish(failure, rawToolTextBytes, rawBundles, true, failure.facts.collapsedResults, failure.facts.removedBundles);
+			}
+			const prefixHash = hashHistoryMessages(input.messages);
+			const projectedPrefixHash = hashHistoryMessages(projected.messages);
+			const epoch = this.epochCounter + 1;
+			const epochHash = createHash("sha256").update([
+				"workbench-history-epoch-v1", String(epoch), prefixHash, projectedPrefixHash,
+				String(hardToolTextBytes), String(hardBundles), String(lowToolTextBytes), String(lowBundles),
+			].join("\n")).digest("hex");
+			this.epochCounter = epoch;
+			this.frozen = {
+				epoch,
+				epochHash,
+				prefixMessageCount: input.messages.length,
+				prefixHash,
+				projectedPrefixHash,
+				hardToolTextBytes,
+				hardBundles,
+				lowToolTextBytes,
+				lowBundles,
+				transitionCollapsedResults: projected.facts.collapsedResults,
+				transitionRemovedBundles: projected.facts.removedBundles,
+			};
+			return this.finish(
+				projected,
+				rawToolTextBytes,
+				rawBundles,
+				true,
+				Math.max(0, projected.facts.collapsedResults - previousTransitionCollapsedResults),
+				Math.max(0, projected.facts.removedBundles - previousTransitionRemovedBundles),
+			);
+		} catch {
+			this.frozen = undefined;
+			const messages = safeHistoryProjectionFailureMessages();
+			const failure = {
+				messages,
+				facts: {
+					originalToolTextBytes: rawToolTextBytes,
+					finalToolTextBytes: 0,
+					collapsedResults: 0,
+					removedBundles: 0,
+					protectedLatestBundles: 0,
+				},
+			};
+			return this.finish(failure, rawToolTextBytes, rawBundles, true, 0, 0);
+		}
+	}
+
+	private finish(
+		projection: ProjectContextHistoryResult,
+		rawToolTextBytes: number,
+		rawBundles: number,
+		epochTransitioned: boolean,
+		newlyCollapsedResults: number,
+		newlyRemovedBundles: number,
+	): HistoryProjectionControllerResult {
+		const projectedBundles = historyBundleCount(projection.messages) ?? 0;
+		this.pressure = {
+			rawToolTextBytes: Math.max(0, rawToolTextBytes),
+			rawBundles: Math.max(0, rawBundles),
+			projectedToolTextBytes: Math.max(0, projection.facts.finalToolTextBytes),
+			projectedBundles,
+		};
+		return {
+			...projection,
+			epoch: this.frozen?.epoch ?? this.epochCounter,
+			epochHash: this.frozen?.epochHash ?? null,
+			epochTransitioned,
+			newlyCollapsedResults: Math.max(0, newlyCollapsedResults),
+			newlyRemovedBundles: Math.max(0, newlyRemovedBundles),
+			rawBundleCount: Math.max(0, rawBundles),
+			projectedBundleCount: projectedBundles,
 		};
 	}
 }
