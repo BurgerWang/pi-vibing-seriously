@@ -3,8 +3,11 @@
     ".."
   ],
   "compaction": {
-    "enabled": true,
+    "enabled": false,
     "reserveTokens": 27200,
     "keepRecentTokens": 20000
+  },
+  "solProactiveCompaction": {
+    "enabled": true
   }
 }
