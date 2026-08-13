@@ -13,9 +13,10 @@
  *     facts/scope/hash; segmented include_paths calls merge displayed
  *     coverage across the same bound hash and the delegation becomes
  *     REVIEWED only on scope PASS + complete coverage;
- *   - details carry the coverage facts (displayed_paths / remaining_paths /
- *     coverage_complete), the review_status and the durable project-relative
- *     review_record path; review.json exists at that path;
+ *   - details carry bounded coverage facts (displayed_count / remaining_count /
+ *     next_include_paths / coverage_complete), the review_status and the
+ *     durable project-relative review_record path; complete path arrays remain
+ *     only in review.json at that path;
  *   - a hidden out-of-scope path always FAILs, and a scope FAIL invalidates
  *     a prior same-hash REVIEWED state fail-closed (demoted to
  *     PENDING_REVIEW, reviewed hash cleared — persisted);
@@ -26,8 +27,9 @@
  *     durable compact patch entry (source "compact", additive structured
  *     facts, generator equality NOT_VERIFIED) when the registered tool is
  *     called with ONLY the existing {delegation_id} argument — the active
- *     tool set, registration order and parameter schema stay unchanged and
- *     the result details patch_paths carries the honest compact stat;
+ *     tool set, registration order and parameter schema stay unchanged; the
+ *     durable review.json patch_paths carries the honest compact stat without
+ *     copying it into session details;
  *   - the delegation state persists as the existing custom entry
  *     (workbench-delegation-state) and the review writes only review.json
  *     plus that entry — no tool/order/schema change (registration order
@@ -154,18 +156,42 @@ interface ReviewDetails {
 	review_status: string;
 	bound_diff_hash: string;
 	recorded_after_hash: string;
+	violation_count: number;
+	drift_count: number;
+	checked_count: number;
+	displayed_count: number;
+	remaining_count: number;
+	coverage_complete: boolean;
+	review_record: string;
+	next_include_paths: string[];
+	patch_truncated: boolean;
+}
+
+interface DurableReviewRecord {
+	delegation_id: string;
 	violations: Array<{ path: string; reason: string }>;
+	checked_paths: string[];
 	displayed_paths: string[];
 	remaining_paths: string[];
 	coverage_complete: boolean;
-	review_record: string;
-	/** Phase 5: bounded per-path stat of the rendered patch (source/bytes/truncated). */
 	patch_paths: Array<{ path: string; source: string; bytes: number; truncated: boolean }>;
 }
 
 /** The structured details of a registered review tool result. */
 function reviewDetails(result: { details: Record<string, unknown> }): ReviewDetails {
 	return result.details as unknown as ReviewDetails;
+}
+
+/** Session details are a bounded DTO; complete review arrays live only in review.json. */
+function assertNoFullReviewArrays(details: ReviewDetails): void {
+	for (const field of ["violations", "drift_paths", "checked_paths", "displayed_paths", "remaining_paths", "patch", "patch_paths"]) {
+		assert.equal(Object.prototype.hasOwnProperty.call(details, field), false, `${field} must not be copied into session details`);
+	}
+}
+
+/** Read the durable full-fidelity review record named by the bounded DTO. */
+async function durableReview(root: string, details: ReviewDetails): Promise<DurableReviewRecord> {
+	return JSON.parse(await readFile(join(root, details.review_record), "utf8")) as DurableReviewRecord;
 }
 
 /** Text content of a tool result (the ACTUAL registered runtime output). */
@@ -196,6 +222,59 @@ async function fireSessionStart(stub: StubAPI & ExtensionAPI, root: string, entr
 	for (const handler of handlers) {
 		await handler({ reason: "reload" } as never, trustedCtx(root, entries) as never);
 	}
+}
+
+async function fireRuntimeEvent(stub: StubAPI & ExtensionAPI, name: string, event: Record<string, unknown>, ctx: ExtensionContext): Promise<void> {
+	for (const handler of stub.events.get(name) ?? []) await handler(event as never, ctx as never);
+}
+
+async function fireMessageEnd(stub: StubAPI & ExtensionAPI, message: Record<string, unknown>, ctx: ExtensionContext): Promise<Record<string, unknown>> {
+	let current = message;
+	for (const handler of stub.events.get("message_end") ?? []) {
+		const patch = await handler({ type: "message_end", message: current } as never, ctx as never) as { message?: Record<string, unknown> } | undefined;
+		if (patch?.message) current = patch.message;
+	}
+	return current;
+}
+
+async function fireToolCall(stub: StubAPI & ExtensionAPI, event: Record<string, unknown>, ctx: ExtensionContext): Promise<{ block?: boolean; reason?: string }> {
+	let current: { block?: boolean; reason?: string } = {};
+	for (const handler of stub.events.get("tool_call") ?? []) {
+		const result = await handler(event as never, ctx as never) as { block?: boolean; reason?: string } | undefined;
+		if (result) current = result;
+		if (current.block) break;
+	}
+	return current;
+}
+
+async function fireToolResult(
+	stub: StubAPI & ExtensionAPI,
+	event: {
+		type: "tool_result";
+		toolCallId: string;
+		toolName: string;
+		input: Record<string, unknown>;
+		content: Array<{ type: string; text: string }>;
+		isError: boolean;
+		details: Record<string, unknown>;
+	},
+): Promise<{
+	type: "tool_result";
+	toolCallId: string;
+	toolName: string;
+	input: Record<string, unknown>;
+	content: Array<{ type: string; text: string }>;
+	isError: boolean;
+	details: Record<string, unknown>;
+}> {
+	const current = { ...event, content: [...event.content] };
+	for (const handler of stub.events.get("tool_result") ?? []) {
+		const patch = await handler(current as never, undefined as never) as Partial<typeof event> | undefined;
+		if (patch?.content !== undefined) current.content = patch.content;
+		if (patch?.details !== undefined) current.details = patch.details;
+		if (patch?.isError !== undefined) current.isError = patch.isError;
+	}
+	return current;
 }
 
 /**
@@ -320,38 +399,65 @@ test("registered review tool: repeated coverage-gated calls drive PENDING_REVIEW
 		const activeToolsBefore = [...stub.activeTools];
 		const review = reviewTool(stub);
 
-		// Segment 1: a tight global line cap leaves two of three paths
-		// remaining — PASS but not REVIEWED (coverage incomplete).
-		const r1 = await review.execute("call-1", { delegation_id: id, max_lines: 10 }, undefined, undefined, trustedCtx(root) as never);
+		// Segment 1: one explicitly selected path is present in the bounded
+		// final content and therefore advances coverage by exactly one.
+		const r1 = await review.execute("call-1", { delegation_id: id, include_paths: ["src/a.ts"], max_lines: 40 }, undefined, undefined, trustedCtx(root) as never);
 		const d1 = reviewDetails(r1);
 		assert.equal(d1.ok, true);
 		assert.equal(d1.verdict, "PASS");
 		assert.equal(d1.review_status, "PENDING_REVIEW", "no REVIEWED until coverage is complete");
 		assert.equal(d1.coverage_complete, false);
-		assert.deepEqual(d1.displayed_paths, ["src/a.ts"]);
-		assert.deepEqual(d1.remaining_paths, ["src/b.ts", "src/c.ts"]);
+		assert.equal(d1.violation_count, 0);
+		assert.equal(d1.checked_count, 3);
+		assert.equal(d1.displayed_count, 1);
+		assert.equal(d1.remaining_count, 2);
+		assert.deepEqual(d1.next_include_paths, ["src/b.ts", "src/c.ts"]);
 		assert.equal(d1.bound_diff_hash, afterHash);
 		assert.equal(d1.review_record, `${CONFIG_DIR_NAME}/workbench/delegations/${id}/review.json`);
-		assert.ok(toolText(r1).includes("coverage   : INCOMPLETE"), toolText(r1));
+		assertNoFullReviewArrays(d1);
+		const disk1 = await durableReview(root, d1);
+		assert.deepEqual(disk1.displayed_paths, ["src/a.ts"]);
+		assert.deepEqual(disk1.remaining_paths, ["src/b.ts", "src/c.ts"]);
+		const r1Text = toolText(r1);
+		assert.ok(r1Text.split("\n").length <= 40, `review exceeded requested 40-line cap:\n${r1Text}`);
+		assert.ok(Buffer.byteLength(r1Text, "utf8") <= 32_768, `fallback exceeded 32 KiB policy cap: ${Buffer.byteLength(r1Text, "utf8")}`);
+		assert.ok(r1Text.includes(`full=${d1.review_record}`), r1Text);
+		assert.ok(r1Text.includes("bounded summary is not acceptance evidence"), r1Text);
+		assert.match(r1Text, /(?:^|\n)--- src\/a\.ts /, "coverage advances only when the selected patch entry is in final content");
 
 		// Segment 2: include_paths merges coverage on the same hash.
-		const r2 = await review.execute("call-2", { delegation_id: id, include_paths: ["src/b.ts"], max_lines: 10 }, undefined, undefined, trustedCtx(root) as never);
+		const r2 = await review.execute("call-2", { delegation_id: id, include_paths: ["src/b.ts"], max_lines: 40 }, undefined, undefined, trustedCtx(root) as never);
 		const d2 = reviewDetails(r2);
 		assert.equal(d2.verdict, "PASS");
 		assert.equal(d2.review_status, "PENDING_REVIEW");
-		assert.deepEqual(d2.displayed_paths, ["src/a.ts", "src/b.ts"]);
-		assert.deepEqual(d2.remaining_paths, ["src/c.ts"]);
+		assert.equal(d2.violation_count, 0);
+		assert.equal(d2.displayed_count, 2);
+		assert.equal(d2.remaining_count, 1);
+		assert.deepEqual(d2.next_include_paths, ["src/c.ts"]);
 		assert.equal(d2.bound_diff_hash, afterHash, "every segment binds the complete current diff hash");
+		assertNoFullReviewArrays(d2);
+		const disk2 = await durableReview(root, d2);
+		assert.deepEqual(disk2.displayed_paths, ["src/a.ts", "src/b.ts"]);
+		assert.deepEqual(disk2.remaining_paths, ["src/c.ts"]);
 
 		// Segment 3: complete coverage → REVIEWED (scope PASS + coverage complete).
-		const r3 = await review.execute("call-3", { delegation_id: id, include_paths: ["src/c.ts"], max_lines: 10 }, undefined, undefined, trustedCtx(root) as never);
+		const r3 = await review.execute("call-3", { delegation_id: id, include_paths: ["src/c.ts"], max_lines: 40 }, undefined, undefined, trustedCtx(root) as never);
 		const d3 = reviewDetails(r3);
 		assert.equal(d3.verdict, "PASS");
 		assert.equal(d3.review_status, "REVIEWED");
 		assert.equal(d3.coverage_complete, true);
-		assert.deepEqual(d3.displayed_paths, ["src/a.ts", "src/b.ts", "src/c.ts"]);
-		assert.deepEqual(d3.remaining_paths, []);
-		assert.ok(toolText(r3).includes("coverage   : COMPLETE"), toolText(r3));
+		assert.equal(d3.violation_count, 0);
+		assert.equal(d3.displayed_count, 3);
+		assert.equal(d3.remaining_count, 0);
+		assert.deepEqual(d3.next_include_paths, []);
+		assertNoFullReviewArrays(d3);
+		assert.equal(d3.review_record, `${CONFIG_DIR_NAME}/workbench/delegations/${id}/review.json`);
+		const r3Text = toolText(r3);
+		assert.ok(r3Text.split("\n").length <= 40, `review exceeded requested 40-line cap:\n${r3Text}`);
+		assert.ok(Buffer.byteLength(r3Text, "utf8") <= 32_768, `fallback exceeded 32 KiB policy cap: ${Buffer.byteLength(r3Text, "utf8")}`);
+		assert.ok(r3Text.includes(`full=${d3.review_record}`), r3Text);
+		assert.ok(r3Text.includes("bounded summary is not acceptance evidence"), r3Text);
+		assert.match(r3Text, /(?:^|\n)--- src\/c\.ts /, "the final path is visibly reviewed before REVIEWED binds");
 
 		// The persisted delegation state binds REVIEWED to the current hash.
 		const entry = lastDelegationStateEntry(stub);
@@ -362,7 +468,7 @@ test("registered review tool: repeated coverage-gated calls drive PENDING_REVIEW
 		assert.equal(entry.blockedWriteAttempts, 0);
 
 		// The durable review.json exists at the declared project-relative path.
-		const onDisk = JSON.parse(await readFile(join(root, d3.review_record), "utf8"));
+		const onDisk = await durableReview(root, d3);
 		assert.equal(onDisk.delegation_id, id);
 		assert.equal(onDisk.coverage_complete, true);
 		assert.deepEqual(onDisk.displayed_paths, ["src/a.ts", "src/b.ts", "src/c.ts"]);
@@ -375,6 +481,86 @@ test("registered review tool: repeated coverage-gated calls drive PENDING_REVIEW
 		// Only the latest delegation is reviewable.
 		const other = await review.execute("call-4", { delegation_id: "20260101-000000-zzzz" }, undefined, undefined, trustedCtx(root) as never);
 		assert.match(toolText(other), /is not the latest delegation/);
+	});
+});
+
+test("registered review tool: a real 16-call turn uses each exact 4 KiB reservation before rendering, and only final-content patch entries advance coverage to REVIEWED", async () => {
+	await withTempDir(async (root) => {
+		const paths = ["src/a.ts", "src/b.ts", "src/c.ts"];
+		const { id, afterHash } = await setupDelegation(root, async (dir) => {
+			for (const path of paths) await writeFile(join(dir, path), `${path}\n${(`${"v".repeat(600)}\n`).repeat(24)}`, "utf8");
+		});
+		const stub = makeStub();
+		workbenchRuntime(stub);
+		const ctx = trustedCtx(root) as ExtensionContext;
+		await fireSessionStart(stub, root, pendingStateEntry(id, afterHash));
+		await fireRuntimeEvent(stub, "model_select", {
+			type: "model_select",
+			model: { provider: "openai-codex", id: "gpt-5.6-sol", api: "responses" },
+			previousModel: undefined,
+			source: "set",
+		}, ctx);
+		await fireRuntimeEvent(stub, "turn_start", { type: "turn_start", turnIndex: 0, timestamp: 1 }, ctx);
+		const selected = [
+			{ path: paths[0]!, max_lines: 10, visible: false },
+			...paths.map((path) => ({ path, max_lines: 40, visible: true })),
+		].map((item, index) => ({
+			id: `reserved-review-${index}`,
+			name: "workbench_review_worker_diff",
+			arguments: { delegation_id: id, include_paths: [item.path], max_lines: item.max_lines },
+			visible: item.visible,
+		}));
+		const calls = [
+			...selected,
+			...Array.from({ length: 12 }, (_, index) => ({
+				id: `reserved-review-filler-${index}`,
+				name: "workbench_review_worker_diff",
+				arguments: { delegation_id: id, include_paths: [paths[0]!] },
+			})),
+		];
+		await fireMessageEnd(stub, {
+			role: "assistant",
+			content: calls.map((call) => ({ type: "toolCall", id: call.id, name: call.name, arguments: call.arguments })),
+			provider: "openai-codex",
+			model: "gpt-5.6-sol",
+			stopReason: "toolUse",
+			timestamp: 1,
+		}, ctx);
+		const tool = reviewTool(stub);
+		for (let index = 0; index < selected.length; index += 1) {
+			const call = selected[index]!;
+			const guard = await fireToolCall(stub, {
+				type: "tool_call", toolCallId: call.id, toolName: call.name, input: call.arguments,
+			}, ctx);
+			assert.equal(guard.block, undefined);
+			const raw = await tool.execute(call.id, call.arguments, undefined, undefined, ctx);
+			const rawText = toolText(raw);
+			assert.ok(Buffer.byteLength(rawText, "utf8") <= 4_096, "the renderer consumes this call's exact planned minimum allocation");
+			if (call.visible) assert.match(rawText, new RegExp(`(?:^|\\n)--- ${call.arguments.include_paths[0]!.replace(".", "\\.")} `));
+			else assert.doesNotMatch(rawText, /(?:^|\n)--- /, "a summary-only fallback cannot advance patch coverage");
+			const final = await fireToolResult(stub, {
+				type: "tool_result",
+				toolCallId: call.id,
+				toolName: call.name,
+				input: call.arguments,
+				content: raw.content,
+				isError: false,
+				details: raw.details,
+			});
+			assert.equal(toolText(final), rawText, "the generic result envelope is a no-op after allocation-aware review rendering");
+			const details = reviewDetails(final);
+			const envelope = final.details.output_envelope as Record<string, unknown>;
+			assert.equal(envelope.truncated, false);
+			assert.equal(envelope.shownTextBytes, Buffer.byteLength(rawText, "utf8"));
+			const visibleCount = Math.max(0, index);
+			assert.equal(details.displayed_count, visibleCount);
+			assert.equal(details.remaining_count, paths.length - visibleCount);
+			assert.equal(details.coverage_complete, index === selected.length - 1);
+			assert.equal(details.review_status, index === selected.length - 1 ? "REVIEWED" : "PENDING_REVIEW");
+			const persisted = await durableReview(root, details);
+			assert.deepEqual(persisted.displayed_paths, paths.slice(0, visibleCount));
+		}
+		await fireRuntimeEvent(stub, "turn_end", { type: "turn_end", turnIndex: 0, message: {}, toolResults: [] }, ctx);
 	});
 });
 
@@ -420,10 +606,17 @@ test("registered review tool: hidden out-of-scope path always FAILs; a scope FAI
 		const details = reviewDetails(result);
 		assert.equal(details.verdict, "FAIL");
 		assert.equal(details.review_status, "PENDING_REVIEW", "a scope FAIL invalidates the prior same-hash REVIEWED state");
-		assert.deepEqual(details.violations.map((v) => v.path), ["forbidden.ts"]);
+		assert.equal(details.violation_count, 1);
+		assert.equal(details.checked_count, 2);
+		assert.equal(details.displayed_count, 1);
 		assert.equal(details.coverage_complete, false);
-		assert.deepEqual(details.remaining_paths, ["forbidden.ts"]);
+		assert.equal(details.remaining_count, 1);
+		assert.deepEqual(details.next_include_paths, ["forbidden.ts"]);
 		assert.equal(details.bound_diff_hash, afterHash, "same hash — the FAIL is the invalidation trigger");
+		assertNoFullReviewArrays(details);
+		const onDisk = await durableReview(root, details);
+		assert.deepEqual(onDisk.violations.map((violation) => violation.path), ["forbidden.ts"]);
+		assert.deepEqual(onDisk.remaining_paths, ["forbidden.ts"]);
 		assert.ok(toolText(result).includes("verdict    : FAIL"), toolText(result));
 
 		// The persisted state is demoted: PENDING_REVIEW, reviewed hash cleared.
@@ -451,7 +644,15 @@ test("registered review tool: a hash change resets coverage and turns REVIEWED S
 		assert.equal(d1.review_status, "REVIEWED");
 		assert.equal(d1.coverage_complete, true);
 		assert.equal(d1.bound_diff_hash, afterHash);
-		assert.deepEqual(d1.displayed_paths, ["src/a.ts", "src/b.ts"]);
+		assert.equal(d1.violation_count, 0);
+		assert.equal(d1.checked_count, 2);
+		assert.equal(d1.displayed_count, 2);
+		assert.equal(d1.remaining_count, 0);
+		assert.deepEqual(d1.next_include_paths, []);
+		assertNoFullReviewArrays(d1);
+		const disk1 = await durableReview(root, d1);
+		assert.deepEqual(disk1.displayed_paths, ["src/a.ts", "src/b.ts"]);
+		assert.deepEqual(disk1.remaining_paths, []);
 
 		// The diff changes after REVIEWED (commander edit).
 		await writeFile(join(root, "src", "b.ts"), "b2 — commander edit\n", "utf8");
@@ -461,9 +662,15 @@ test("registered review tool: a hash change resets coverage and turns REVIEWED S
 		const d2 = reviewDetails(r2);
 		assert.equal(d2.review_status, "STALE", "a diff change after REVIEWED turns the delegation STALE");
 		assert.equal(d2.coverage_complete, false);
-		assert.deepEqual(d2.displayed_paths, ["src/a.ts"]);
-		assert.deepEqual(d2.remaining_paths, ["src/b.ts"], "coverage resets on the hash change — a.ts was re-displayed in THIS call and is not remaining");
+		assert.equal(d2.violation_count, 0);
+		assert.equal(d2.displayed_count, 1);
+		assert.equal(d2.remaining_count, 1, "coverage resets on the hash change — a.ts was re-displayed in THIS call and is not remaining");
+		assert.deepEqual(d2.next_include_paths, ["src/b.ts"]);
 		assert.notEqual(d2.bound_diff_hash, afterHash);
+		assertNoFullReviewArrays(d2);
+		const disk2 = await durableReview(root, d2);
+		assert.deepEqual(disk2.displayed_paths, ["src/a.ts"]);
+		assert.deepEqual(disk2.remaining_paths, ["src/b.ts"]);
 		const staleEntry = lastDelegationStateEntry(stub);
 		assert.equal(staleEntry.status, "STALE");
 		assert.equal(staleEntry.reviewedDiffHash, afterHash, "the reviewed hash keeps the diff that was actually reviewed");
@@ -474,7 +681,14 @@ test("registered review tool: a hash change resets coverage and turns REVIEWED S
 		assert.equal(d3.review_status, "REVIEWED");
 		assert.equal(d3.coverage_complete, true);
 		assert.equal(d3.bound_diff_hash, d2.bound_diff_hash);
-		assert.deepEqual(d3.displayed_paths, ["src/a.ts", "src/b.ts"]);
+		assert.equal(d3.violation_count, 0);
+		assert.equal(d3.displayed_count, 2);
+		assert.equal(d3.remaining_count, 0);
+		assert.deepEqual(d3.next_include_paths, []);
+		assertNoFullReviewArrays(d3);
+		const disk3 = await durableReview(root, d3);
+		assert.deepEqual(disk3.displayed_paths, ["src/a.ts", "src/b.ts"]);
+		assert.deepEqual(disk3.remaining_paths, []);
 		const rebound = lastDelegationStateEntry(stub);
 		assert.equal(rebound.status, "REVIEWED");
 		assert.equal(rebound.reviewedDiffHash, d3.bound_diff_hash);
@@ -486,6 +700,13 @@ test("registered review tool: a hash change resets coverage and turns REVIEWED S
 		assert.equal(d4.review_status, "REVIEWED", "same-hash complete PASS rerender keeps REVIEWED");
 		assert.equal(d4.coverage_complete, true, "same-hash merge keeps complete coverage");
 		assert.equal(d4.bound_diff_hash, d3.bound_diff_hash);
+		assert.equal(d4.displayed_count, 2);
+		assert.equal(d4.remaining_count, 0);
+		assert.deepEqual(d4.next_include_paths, []);
+		assertNoFullReviewArrays(d4);
+		const disk4 = await durableReview(root, d4);
+		assert.deepEqual(disk4.displayed_paths, ["src/a.ts", "src/b.ts"]);
+		assert.deepEqual(disk4.remaining_paths, []);
 	});
 });
 
@@ -547,10 +768,17 @@ test("registered review tool: a repeated same-hash PASS with incomplete coverage
 		const details = reviewDetails(result);
 		assert.equal(details.verdict, "PASS");
 		assert.equal(details.coverage_complete, false);
-		assert.deepEqual(details.displayed_paths, ["src/a.ts"]);
-		assert.deepEqual(details.remaining_paths, ["src/b.ts"]);
+		assert.equal(details.violation_count, 0);
+		assert.equal(details.checked_count, 2);
+		assert.equal(details.displayed_count, 1);
+		assert.equal(details.remaining_count, 1);
+		assert.deepEqual(details.next_include_paths, ["src/b.ts"]);
 		assert.equal(details.bound_diff_hash, afterHash, "same hash — the incomplete PASS is the invalidation trigger");
 		assert.equal(details.review_status, "PENDING_REVIEW", "a PASS with incomplete coverage must never leave REVIEWED in place");
+		assertNoFullReviewArrays(details);
+		const partialRecord = await durableReview(root, details);
+		assert.deepEqual(partialRecord.displayed_paths, ["src/a.ts"]);
+		assert.deepEqual(partialRecord.remaining_paths, ["src/b.ts"]);
 		assert.ok(toolText(result).includes("coverage   : INCOMPLETE"), toolText(result));
 
 		// The persisted state is demoted: PENDING_REVIEW, reviewed hash cleared.
@@ -564,10 +792,17 @@ test("registered review tool: a repeated same-hash PASS with incomplete coverage
 		const fullDetails = reviewDetails(full);
 		assert.equal(fullDetails.review_status, "REVIEWED", "fresh complete coverage re-binds REVIEWED after the demotion");
 		assert.equal(fullDetails.coverage_complete, true);
+		assert.equal(fullDetails.displayed_count, 2);
+		assert.equal(fullDetails.remaining_count, 0);
+		assert.deepEqual(fullDetails.next_include_paths, []);
+		assertNoFullReviewArrays(fullDetails);
+		const fullRecord = await durableReview(root, fullDetails);
+		assert.deepEqual(fullRecord.displayed_paths, ["src/a.ts", "src/b.ts"]);
+		assert.deepEqual(fullRecord.remaining_paths, []);
 	});
 });
 
-test("registered review tool: Phase 5 — a single >32 KiB regular JSON renders as a durable compact entry (one-call PASS → REVIEWED, honest patch_paths stat, no schema/order/parameter change)", async () => {
+test("registered review tool: Phase 5 — a single >32 KiB regular JSON renders as a durable compact entry (one-call PASS → REVIEWED, honest durable patch_paths stat, no schema/order/parameter change)", async () => {
 	await withTempDir(async (root) => {
 		// One regular JSON LARGER than the default global review byte cap
 		// (COMPACT_MIN_BYTES = 32 KiB), multi-line with distinct head/tail
@@ -611,11 +846,15 @@ test("registered review tool: Phase 5 — a single >32 KiB regular JSON renders 
 		assert.equal(d1.verdict, "PASS");
 		assert.equal(d1.review_status, "REVIEWED");
 		assert.equal(d1.coverage_complete, true, "the single compact entry is complete displayed-path coverage");
-		assert.deepEqual(d1.displayed_paths, ["src/manifest.json"]);
-		assert.deepEqual(d1.remaining_paths, []);
+		assert.equal(d1.violation_count, 0);
+		assert.equal(d1.checked_count, 1);
+		assert.equal(d1.displayed_count, 1);
+		assert.equal(d1.remaining_count, 0);
+		assert.deepEqual(d1.next_include_paths, []);
 		assert.equal(d1.bound_diff_hash, afterHash);
 		assert.equal(d1.recorded_after_hash, afterHash);
 		assert.equal(d1.review_record, `${CONFIG_DIR_NAME}/workbench/delegations/${id}/review.json`);
+		assertNoFullReviewArrays(d1);
 		assert.ok(toolText(r1).includes("coverage   : COMPLETE"), toolText(r1));
 		assert.ok(toolText(r1).includes("--- src/manifest.json (compact, truncated) ---"), toolText(r1));
 
@@ -629,14 +868,19 @@ test("registered review tool: Phase 5 — a single >32 KiB regular JSON renders 
 			verdict: string;
 			bound_diff_hash: string;
 			recorded_after_hash: string;
+			displayed_paths: string[];
+			remaining_paths: string[];
 			patch_truncated: boolean;
 			patch: Array<{ path: string; source: string; truncated: boolean; text: string; compact?: Record<string, unknown> }>;
+			patch_paths: Array<{ path: string; source: string; bytes: number; truncated: boolean }>;
 		};
 		assert.equal(onDisk.schema_version, 1);
 		assert.equal(onDisk.delegation_id, id);
 		assert.equal(onDisk.verdict, "PASS");
 		assert.equal(onDisk.bound_diff_hash, afterHash);
 		assert.equal(onDisk.recorded_after_hash, afterHash);
+		assert.deepEqual(onDisk.displayed_paths, ["src/manifest.json"]);
+		assert.deepEqual(onDisk.remaining_paths, []);
 		assert.equal(onDisk.patch.length, 1);
 		const entry = onDisk.patch[0]!;
 		assert.equal(entry.path, "src/manifest.json");
@@ -676,10 +920,10 @@ test("registered review tool: Phase 5 — a single >32 KiB regular JSON renders 
 		assert.equal(facts.content_truncated, true, "content beyond the shown previews is honestly reported");
 		assert.ok(entry.text.includes("generator equality NOT_VERIFIED"), entry.text);
 
-		// The result details patch_paths stat shows the same path with the
-		// compact source and honest truncation; its bytes match the durable
-		// rendered entry text.
-		assert.deepEqual(d1.patch_paths, [
+		// The durable patch_paths stat shows the same path with the compact
+		// source and honest truncation; its bytes match the durable rendered
+		// entry text. Session details deliberately omit this full array.
+		assert.deepEqual(onDisk.patch_paths, [
 			{ path: "src/manifest.json", source: "compact", bytes: Buffer.byteLength(entry.text, "utf8"), truncated: true },
 		]);
 
@@ -698,5 +942,33 @@ test("registered review tool: Phase 5 — a single >32 KiB regular JSON renders 
 			"parameter object unchanged after execution",
 		);
 		assert.deepEqual(stub.activeTools, activeToolsBefore, "review calls never change the active tool set");
+	});
+});
+
+test("registered review tool returns a whole bounded 500-path presentation with exact omission facts", async () => {
+	await withTempDir(async (root) => {
+		const names = Array.from({ length: 500 }, (_, index) => `f${String(index).padStart(3, "0")}.ts`);
+		const allowed = Array.from({ length: 50 }, (_, index) => `allowed-${index}/${"a".repeat(275)}/**`);
+		const { id, afterHash } = await setupDelegation(
+			root,
+			async (dir) => {
+				await mkdir(join(dir, "bulk"), { recursive: true });
+				for (const name of names) await writeFile(join(dir, "bulk", name), `${name}\n${"🙂汉\n".repeat(20)}`, "utf8");
+			},
+			allowed,
+		);
+		const stub = makeStub();
+		workbenchRuntime(stub);
+		await fireSessionStart(stub, root, pendingStateEntry(id, afterHash));
+		const result = await reviewTool(stub).execute("bulk-review", { delegation_id: id, max_bytes: 512_000, max_lines: 2_000 }, undefined, undefined, trustedCtx(root) as never);
+		const text = toolText(result);
+		assert.ok(Buffer.byteLength(text, "utf8") <= 32_768, String(Buffer.byteLength(text, "utf8")));
+		assert.ok(text.split("\n").length <= 400, String(text.split("\n").length));
+		assert.match(text, /presentation: violations=500\/10\/490;/);
+		assert.match(text, /patch=500\/\d+\/\d+; stats=500\/\d+\/\d+;/);
+		assert.equal((text.match(/^allowed    :/gm) ?? []).length, 1);
+		assert.doesNotMatch(text, /allowed-49\/[a]+\/\*\*.*allowed-49\//s, "allowed scope prose must not repeat per violation");
+		assert.match(text, /bounded summary is not acceptance evidence/);
+		assert.equal(reviewDetails(result).verdict, "FAIL");
 	});
 });

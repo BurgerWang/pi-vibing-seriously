@@ -1,11 +1,11 @@
 /**
- * P5 command-inventory and direct-load tests (extended by P6-A with the
- * cache telemetry commands and lifecycle events).
+ * P5 command-inventory and direct-load tests (extended additively through
+ * R8 with cache, delegation, cost, and context/output observability).
  *
  * 1. Direct load: the extension module is imported and its default export is
  *    invoked with a stub ExtensionAPI — no Pi runtime needed. This is the
  *    "extension direct-load smoke test" as a repeatable unit test.
- * 2. Inventory: the registered command set must be EXACTLY the 29
+ * 2. Inventory: the registered command set must be EXACTLY the 30
  *    deterministic workbench commands, the registered tool surface exactly
  *    the 14 tools (three fixed native read/grep/find overrides first, then
  *    the 11 workbench catalog tools), and the 7 prompt templates — no
@@ -24,7 +24,7 @@ import workbenchRuntime from "../extensions/workbench-runtime/index.ts";
 import { NATIVE_OVERRIDE_NAMES } from "../extensions/workbench-runtime/core/native-tool-policy.ts";
 import { WORKBENCH_TOOL_NAMES } from "../extensions/workbench-runtime/core/tool-catalog.ts";
 
-/** The deterministic command surface (P5 requirement 七, extended by P6-A). */
+/** The deterministic command surface (P5 requirement 七, extended additively through R8). */
 export const EXPECTED_COMMANDS = [
 	"q-mode-audit",
 	"q-mode-dev",
@@ -54,6 +54,8 @@ export const EXPECTED_COMMANDS = [
 	"q-cache-lineage",
 	// Unreleased split session-cost observability command.
 	"q-cost-status",
+	// R8: numeric-only context/output control observations (no enforcement).
+	"q-context-output-status",
 	// P7: delegation write-authority + review status command.
 	"q-delegation-status",
 	// P7 slice 3: user-only commander write-lease commands.
@@ -111,14 +113,14 @@ function makeStub(): ExtensionAPI & Record<string, unknown> {
 	return stub as unknown as ExtensionAPI & Record<string, unknown>;
 }
 
-test("extension module direct-loads and registers exactly the 29 deterministic commands", () => {
+test("extension module direct-loads and registers exactly the 30 deterministic commands, including the R8 observation-only status command", () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	const registered = stub.commands as Map<string, unknown>;
 	assert.deepEqual(
 		[...registered.keys()].sort(),
 		[...EXPECTED_COMMANDS].sort(),
-		"registered commands must be exactly the P5+P6-A+P6-C+P6-D+P7+Unreleased command list",
+		"registered commands must be exactly the P5+P6-A+P6-C+P6-D+P7+R8+Unreleased command list",
 	);
 });
 

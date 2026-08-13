@@ -1,6 +1,6 @@
 {
 	"name": "pi-dev-workbench",
-	"version": "0.9.0",
+	"version": "0.10.0",
 	"private": true,
 	"type": "module",
 	"description": "Pi-native development workbench: AUDIT/DEV/VERIFY mode policy, skills, and prompt templates for quantitative research (selection, timing, backtesting, data analysis, parameter experiments, walk-forward, out-of-sample validation) and general software engineering. No HFT/L2/market-making/exchange-order routing.",
@@ -22,6 +22,11 @@
 		"test:gate-preflight": "tsx --test tests/gates.test.ts tests/p4-render.test.ts tests/result-summary-wiring.test.ts",
 		"test:worker-efficiency": "tsx --test tests/worker-policy.test.ts tests/worker-runner.test.ts tests/delegation-ledger.test.ts tests/p6-b-stable-prefix.test.ts",
 		"test:diff-review-efficiency": "tsx --test tests/diff-review.test.ts tests/diff-review-wiring.test.ts",
+		"test:context-output-baseline": "tsx --test tests/context-output-baseline.test.ts",
+		"test:context-output-core": "tsx --test tests/output-envelope.test.ts tests/turn-output-budget.test.ts tests/continuation-cursor.test.ts tests/bounded-file-io.test.ts tests/details-projection.test.ts tests/context-history-budget.test.ts tests/output-control-telemetry.test.ts",
+		"test:context-output-integration": "tsx --test tests/output-control-wiring.test.ts tests/read-v3.test.ts tests/read-run-log-page.test.ts tests/compare-output-bounds.test.ts tests/gate-output-bounds.test.ts tests/context-output-worker.test.ts",
+		"test:context-output-stress": "tsx --test tests/context-output-stress.test.ts",
+		"test:read-v3": "tsx --test tests/native-tool-policy.test.ts tests/native-tool-wiring.test.ts tests/read-v3.test.ts",
 		"check": "npm run typecheck && npm test && git diff --check",
 		"commander:benchmark": "tsx scripts/commander-token-benchmark.ts",
 		"commander:prepare": "tsx scripts/commander-token-p9-prepare.ts",
@@ -33,7 +38,9 @@
 		"commander:nro:final": "tsx scripts/commander-native-tool-final-collect.ts",
 		"commander:nro:pilot": "tsx scripts/commander-native-tool-dev-pilot.ts",
 		"cache:report": "tsx scripts/cache-benchmark.ts report",
-		"cache:doctor": "tsx scripts/cache-benchmark.ts doctor"
+		"cache:doctor": "tsx scripts/cache-benchmark.ts doctor",
+		"benchmark:context-output": "tsx scripts/context-output-benchmark.ts",
+		"session:sanitize": "tsx scripts/workbench-session-sanitize.ts"
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-coding-agent": "*",

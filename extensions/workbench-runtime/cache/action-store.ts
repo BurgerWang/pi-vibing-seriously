@@ -23,9 +23,13 @@
  */
 
 import { randomBytes, createHash } from "node:crypto";
-import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import {
+	readJsonFileBounded,
+	type BoundedFileIoHooks,
+} from "../core/bounded-file-io.ts";
 import { workbenchDir } from "../core/config.ts";
 import {
 	ACTION_RECORD_SCHEMA_VERSION,
@@ -39,6 +43,9 @@ export const CAS_DIR = "cas";
 export const LOCKS_DIR = "locks";
 export const TMP_DIR = "tmp";
 export const INDEX_FILE = "cache-index.json";
+export const ACTION_RECORD_MAX_BYTES = 1_048_576;
+export const CACHE_INDEX_MAX_BYTES = 1_048_576;
+export const LOCK_RECORD_MAX_BYTES = 4_096;
 
 export interface IndexEntry {
 	key: string;
@@ -67,6 +74,8 @@ export interface StoreOptions {
 	lockStaleMs?: number;
 	lockWaitMs?: number;
 	pid?: number;
+	/** Test-only numeric allocation/read observations; never receives path/content. */
+	boundedReadHooks?: BoundedFileIoHooks;
 }
 
 export interface PruneResult {
@@ -98,6 +107,7 @@ export class ActionCacheStore {
 	private readonly lockStaleMs: number;
 	private readonly lockWaitMs: number;
 	private readonly pid: number;
+	private readonly boundedReadHooks: BoundedFileIoHooks | undefined;
 
 	constructor(projectRoot: string, options: StoreOptions = {}) {
 		this.projectRoot = projectRoot;
@@ -106,6 +116,7 @@ export class ActionCacheStore {
 		this.lockStaleMs = options.lockStaleMs ?? LOCK_STALE_MS;
 		this.lockWaitMs = options.lockWaitMs ?? 120_000;
 		this.pid = options.pid ?? process.pid;
+		this.boundedReadHooks = options.boundedReadHooks;
 	}
 
 	cacheDir(): string {
@@ -151,13 +162,16 @@ export class ActionCacheStore {
 	/** Atomic record write: tmp + rename. Best-effort index maintenance. */
 	async writeRecord(record: ActionRecord): Promise<{ ok: boolean; error?: string }> {
 		try {
+			const payload = `${JSON.stringify(record, null, 2)}\n`;
+			if (Buffer.byteLength(payload, "utf8") > ACTION_RECORD_MAX_BYTES) {
+				return { ok: false, error: "action record exceeds the fixed size limit" };
+			}
 			await mkdir(this.actionsDir(), { recursive: true, mode: 0o700 });
 			await mkdir(this.tmpDir(), { recursive: true, mode: 0o700 });
-			const payload = `${JSON.stringify(record, null, 2)}\n`;
 			const tmp = join(this.tmpDir(), `${record.actionKey}.${this.pid}.${randomBytes(4).toString("hex")}.tmp`);
 			await writeFile(tmp, payload, { mode: 0o600 });
 			await rename(tmp, this.actionPath(record.actionKey));
-			await this.updateIndex(record, payload.length);
+			await this.updateIndex(record, Buffer.byteLength(payload, "utf8"));
 			return { ok: true };
 		} catch (error) {
 			return { ok: false, error: (error as Error).message };
@@ -169,24 +183,25 @@ export class ActionCacheStore {
 	 * in tmp/ and a miss result (cache corruption is always a miss).
 	 */
 	async readRecord(key: string): Promise<{ record: ActionRecord | null; corrupt: boolean }> {
-		const path = this.actionPath(key);
-		let text: string;
-		try {
-			text = await readFile(path, "utf8");
-		} catch {
-			return { record: null, corrupt: false };
+		const loaded = await readJsonFileBounded<unknown>(
+			this.actionPath(key),
+			ACTION_RECORD_MAX_BYTES,
+			this.boundedReadHooks,
+		);
+		if (!loaded.ok) {
+			if (loaded.error.code === "io_error") {
+				return { record: null, corrupt: false };
+			}
+			await this.quarantineAction(key, "bounded-read-rejected");
+			return { record: null, corrupt: true };
 		}
-		let parsed: unknown;
-		try {
-			parsed = JSON.parse(text);
-		} catch {
-			await this.quarantineAction(key, "unparseable-json");
+		const parsed = loaded.value.value;
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+			await this.quarantineAction(key, "schema-or-key-mismatch");
 			return { record: null, corrupt: true };
 		}
 		const record = parsed as ActionRecord;
 		if (
-			typeof record !== "object" ||
-			record === null ||
 			record.schemaVersion !== ACTION_RECORD_SCHEMA_VERSION ||
 			record.actionKey !== key
 		) {
@@ -243,23 +258,28 @@ export class ActionCacheStore {
 
 	/** Read the index; a corrupted index is rebuilt from actions/. */
 	async readIndex(): Promise<CacheIndex> {
-		try {
-			const raw = await readFile(this.indexPath(), "utf8");
-			const parsed = JSON.parse(raw) as CacheIndex;
-			if (parsed.schemaVersion !== CACHE_INDEX_SCHEMA_VERSION || !Array.isArray(parsed.entries)) {
-				return await this.rebuildIndex();
-			}
-			return parsed;
-		} catch {
-			return await this.rebuildIndex();
+		const loaded = await readJsonFileBounded<unknown>(
+			this.indexPath(),
+			CACHE_INDEX_MAX_BYTES,
+			this.boundedReadHooks,
+		);
+		if (!loaded.ok) return this.rebuildIndex();
+		const parsed = loaded.value.value as Partial<CacheIndex> | null;
+		if (typeof parsed !== "object" || parsed === null || parsed.schemaVersion !== CACHE_INDEX_SCHEMA_VERSION || !Array.isArray(parsed.entries)) {
+			return this.rebuildIndex();
 		}
+		return parsed as CacheIndex;
 	}
 
 	private async writeIndex(index: CacheIndex): Promise<void> {
+		const payload = `${JSON.stringify(index, null, 2)}\n`;
+		if (Buffer.byteLength(payload, "utf8") > CACHE_INDEX_MAX_BYTES) {
+			throw new Error("cache index exceeds the fixed size limit");
+		}
 		await mkdir(this.cacheDir(), { recursive: true, mode: 0o700 });
 		const tmp = join(this.tmpDir(), `index.${this.pid}.${randomBytes(4).toString("hex")}.tmp`);
 		await mkdir(this.tmpDir(), { recursive: true, mode: 0o700 });
-		await writeFile(tmp, `${JSON.stringify(index, null, 2)}\n`, { mode: 0o600 });
+		await writeFile(tmp, payload, { mode: 0o600 });
 		await rename(tmp, this.indexPath());
 	}
 
@@ -276,16 +296,20 @@ export class ActionCacheStore {
 			if (!name.endsWith(".json")) continue;
 			const key = name.slice(0, -".json".length);
 			try {
-				const path = this.actionPath(key);
-				const [raw, info] = await Promise.all([readFile(path, "utf8"), stat(path)]);
-				const record = JSON.parse(raw) as ActionRecord;
+				const loaded = await readJsonFileBounded<unknown>(
+					this.actionPath(key),
+					ACTION_RECORD_MAX_BYTES,
+					this.boundedReadHooks,
+				);
+				if (!loaded.ok || typeof loaded.value.value !== "object" || loaded.value.value === null || Array.isArray(loaded.value.value)) continue;
+				const record = loaded.value.value as ActionRecord;
 				if (record.schemaVersion !== ACTION_RECORD_SCHEMA_VERSION || record.actionKey !== key) continue;
 				entries.push({
 					key,
 					recipe: record.recipe,
 					createdAt: record.createdAt,
 					lastUsedAt: record.createdAt,
-					sizeBytes: info.size,
+					sizeBytes: loaded.value.bytes,
 					success: record.success,
 					mode: record.mode,
 				});
@@ -322,14 +346,9 @@ export class ActionCacheStore {
 					key,
 					token,
 					release: async () => {
-						try {
-							const raw = await readFile(path, "utf8");
-							const parsed = JSON.parse(raw) as { token?: string };
-							if (parsed.token !== token) return; // someone else's lock now
-							await rm(path, { force: true });
-						} catch {
-							// already gone
-						}
+						const loaded = await readJsonFileBounded<{ token?: unknown }>(path, LOCK_RECORD_MAX_BYTES, this.boundedReadHooks);
+						if (!loaded.ok || !isJsonObject(loaded.value.value) || loaded.value.value.token !== token) return; // already gone or someone else's lock now
+						await rm(path, { force: true }).catch(() => {});
 					},
 				};
 			} catch (error) {
@@ -349,8 +368,9 @@ export class ActionCacheStore {
 
 	private async isStaleLock(path: string): Promise<boolean> {
 		try {
-			const raw = await readFile(path, "utf8");
-			const parsed = JSON.parse(raw) as { ownerPid?: number; createdAt?: string };
+			const loaded = await readJsonFileBounded<{ ownerPid?: unknown; createdAt?: unknown }>(path, LOCK_RECORD_MAX_BYTES, this.boundedReadHooks);
+			if (!loaded.ok || !isJsonObject(loaded.value.value)) return true;
+			const parsed = loaded.value.value;
 			const createdAt = typeof parsed.createdAt === "string" ? Date.parse(parsed.createdAt) : NaN;
 			const ownerPid = parsed.ownerPid;
 			// A lock whose owner process is still alive is NEVER stale, no
@@ -369,13 +389,7 @@ export class ActionCacheStore {
 
 	/** True when a fresh lock exists for a key (used by prune safety). */
 	async hasFreshLock(key: string): Promise<boolean> {
-		try {
-			const path = this.lockPath(key);
-			await readFile(path, "utf8");
-			return !(await this.isStaleLock(path));
-		} catch {
-			return false;
-		}
+		return !(await this.isStaleLock(this.lockPath(key)));
 	}
 
 	// ------------------------------------------------------------------
@@ -500,6 +514,10 @@ export class ActionCacheStore {
 /** SHA-256 of raw bytes (CAS content is hashed as bytes, never as text). */
 function sha256Bytes(content: Buffer): string {
 	return createHash("sha256").update(content).digest("hex");
+}
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function pidAlive(pid: number): boolean {

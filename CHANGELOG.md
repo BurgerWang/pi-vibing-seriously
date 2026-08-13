@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.10.0] — Context Output Control Plane
+
+### Added
+
+- A unified final-result envelope, deterministic per-turn reservations, and
+  role-specific active-history projection for commander and worker requests.
+- Strict continuation cursors, including explicit `wbcur2`/v2 high-resolution
+  file snapshots (`mtimeNs`) while the exact `wbcur1` decoder remains
+  compatible and conservatively stale on stronger sources; seek-based native
+  read/run-log/gate pages, bounded details DTOs, numeric-only output-control
+  status/telemetry, and a non-destructive legacy-session sanitizer with a hash
+  manifest.
+- Persisted comparison records, focused/stress/benchmark recipes, and the
+  prerequisite-bound `ctx1` Context Output Safety gate.
+
+### Changed
+
+- Native `read` pages are limited to 12 KiB/240 file lines; run logs, diff
+  review, compare, gates, list and inspect use whole-result limits rather than
+  independently capped fields.
+- Independent read-only tools may batch only when the runtime turn budget
+  authorizes every call. Version, compatibility matrix, banner, schemas, and
+  cache documentation now describe 0.10.0.
+- Streaming calls now fail closed before execution unless the effective Pi
+  registry proves an exact workbench-wrapped definition or pinned Pi built-in;
+  foreign/SDK/collided tools cannot publish immutable oversized updates. Tool
+  inventory and schema fingerprints remain unchanged. Exact provenance includes
+  both explicit temporary loading and this repository's `packages: [".."]`
+  project-package tuple; it does not trust arbitrary project packages.
+
+### Breaking
+
+- The public tool metadata/schema fingerprint intentionally changes once;
+  old cache prefixes are cold after reload. Unsafe legacy maxima are not
+  retained. Internal full `record`/`report`/`gates_full` details are replaced
+  by bounded DTOs and artifact pointers. Old sessions remain readable and can
+  be migrated with `npm run session:sanitize`.
+
 All notable changes to pi-dev-workbench are documented here.
 
 ## [Unreleased] — P8 Safe Nested Project Support

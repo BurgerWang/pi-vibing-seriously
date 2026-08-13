@@ -8,7 +8,7 @@
  *   can never drift from package.json (it reads the version from there).
  * - The SVG is safe for GitHub rendering: no scripts, no external
  *   references, no foreignObject.
- * - The refreshed (v0.9) design is pinned by stable semantic checks — mode
+ * - The refreshed banner design is pinned by stable semantic checks — mode
  *   chips, title cursor, tagline/version chip, README/alt consistency —
  *   and importing the generator is side-effect free (no CLI on import).
  */
@@ -20,6 +20,7 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parse as parseYaml } from "yaml";
 
 const ROOT = process.cwd();
 
@@ -48,6 +49,44 @@ test("EXTENSION_VERSION stays in sync with package.json (version bump guard)", a
 		pkg.version,
 		"cache-types.ts EXTENSION_VERSION must equal package.json version — telemetry records it per request",
 	);
+});
+
+test("v0.10.0 release metadata, compatibility and control-plane docs stay synchronized", async () => {
+	const pkg = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8")) as { version: string; scripts: Record<string, string> };
+	const compatibility = JSON.parse(await readFile(join(ROOT, "compatibility", "pi.json"), "utf8")) as {
+		package: { version: string };
+	};
+	const readme = await readFile(join(ROOT, "README.md"), "utf8");
+	const changelog = await readFile(join(ROOT, "CHANGELOG.md"), "utf8");
+	const controlPlane = await readFile(join(ROOT, "docs", "context-output-control-plane.md"), "utf8");
+	const compatibilityDoc = await readFile(join(ROOT, "docs", "compatibility.md"), "utf8");
+	const stablePrefix = await readFile(join(ROOT, "docs", "cache", "stable-prefix-contract.md"), "utf8");
+	assert.equal(pkg.version, "0.10.0");
+	assert.equal(compatibility.package.version, pkg.version);
+	assert.match(readme, /pi-dev-workbench v0\.10\.0/);
+	assert.match(changelog, /## \[0\.10\.0\] — Context Output Control Plane/);
+	assert.match(controlPlane, /12,288 UTF-8 bytes/);
+	assert.match(compatibilityDoc, /v0\.10\.0 \(Context Output Control Plane\)/);
+	assert.match(compatibilityDoc, /Pi 0\.83\.0/);
+	assert.match(controlPlane, /context-output-stress\/context-output-evidence\.json/);
+	assert.match(stablePrefix, /1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd/);
+	assert.match(stablePrefix, /b5938d64d2730119daa0f1b1c833aac09ff4923b52124a833bc2f1e0d5294b11/);
+	assert.equal(pkg.scripts["test:context-output-stress"], "tsx --test tests/context-output-stress.test.ts");
+});
+
+test("ctx1 release gate pins current base prerequisites and final evidence checks", async () => {
+	const document = parseYaml(await readFile(join(ROOT, ".pi", "workbench", "gates.yaml"), "utf8")) as {
+		gates: Array<{ id: string; prerequisites?: string[]; checks?: Array<{ id: string; kind: string; recipes?: string[]; required?: boolean; blocking?: boolean }> }>;
+	};
+	const gate = document.gates.find((item) => item.id === "ctx1");
+	assert.ok(gate);
+	assert.deepEqual(gate.prerequisites, ["b1", "b2", "b3"]);
+	assert.deepEqual(gate.checks?.map((check) => [check.id, check.kind, check.recipes ?? [], check.required, check.blocking]), [
+		["ctx1.1", "recipe", ["context-output-core-test"], true, true],
+		["ctx1.2", "recipe", ["context-output-integration-test"], true, true],
+		["ctx1.3", "recipe", ["context-output-stress"], true, true],
+		["ctx1.4", "manual", [], true, true],
+	]);
 });
 
 test("banner.svg exists, is referenced by the README, and is renderer-safe", async () => {

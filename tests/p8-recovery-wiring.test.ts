@@ -44,7 +44,9 @@ import { before, test } from "node:test";
 import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import workbenchRuntime from "../extensions/workbench-runtime/index.ts";
+import { DEFAULT_RESULT_MAX_BYTES, DEFAULT_RESULT_MAX_LINES, DETAILS_MAX_BYTES, MAX_TOOL_CALLS_PER_TURN } from "../extensions/workbench-runtime/core/output-policy.ts";
 import { RECOVERY_TOOL_NAME } from "../extensions/workbench-runtime/core/tool-catalog.ts";
+import { TURN_CALL_LIMIT_CONTROL_TEXT } from "../extensions/workbench-runtime/core/turn-output-budget.ts";
 import {
 	deriveResultId,
 	MAX_IN_FLIGHT_RECEIPTS,
@@ -158,14 +160,28 @@ async function emitToolCall(stub: StubAPI & ExtensionAPI, ctx: ExtensionContext,
 	return result;
 }
 
-/** Run every registered tool_result handler in registration order (Pi middleware semantics). */
-async function emitToolResult(stub: StubAPI & ExtensionAPI, event: unknown): Promise<{ details?: unknown } | undefined> {
-	let result: { details?: unknown } | undefined;
+interface ToolResultPatch {
+	content?: Array<{ type: string; text?: string }>;
+	details?: unknown;
+	isError?: boolean;
+	usage?: unknown;
+}
+
+/** Run every registered tool_result handler with Pi's SAME-event chaining semantics. */
+async function emitToolResult(stub: StubAPI & ExtensionAPI, event: ToolResultEvent): Promise<ToolResultPatch | undefined> {
+	const currentEvent: ToolResultEvent & { usage?: unknown } = { ...event };
+	let modified = false;
 	for (const handler of stub.events.get("tool_result") ?? []) {
-		const r = (await handler(event, undefined)) as { details?: unknown } | undefined;
-		if (r !== undefined) result = r;
+		const r = (await handler(currentEvent, undefined)) as ToolResultPatch | undefined;
+		if (!r) continue;
+		if (r.content !== undefined) { currentEvent.content = r.content; modified = true; }
+		if (r.details !== undefined) { currentEvent.details = r.details; modified = true; }
+		if (r.isError !== undefined) { currentEvent.isError = r.isError; modified = true; }
+		if (r.usage !== undefined) { currentEvent.usage = r.usage; modified = true; }
 	}
-	return result;
+	return modified
+		? { content: currentEvent.content, details: currentEvent.details, isError: currentEvent.isError, usage: currentEvent.usage }
+		: undefined;
 }
 
 interface ToolResultEvent {
@@ -363,6 +379,13 @@ test("recovered output is persisted, bounded and truncated (caps + omission mark
 		const huge = Array.from({ length: 5000 }, (_, i) => `line-${i}-${"x".repeat(80)}`).join("\n");
 		const merged = await emitToolResult(stub, resultEvent(callId, "workbench_project_inspect", huge, { ok: true }));
 		assert.ok(merged?.details, "details merged");
+		const boundedText = (merged?.content ?? []).filter((block) => block.type === "text").map((block) => block.text ?? "").join("");
+		assert.ok(utf8Bytes(boundedText) <= DEFAULT_RESULT_MAX_BYTES, "receipt input is the final per-tool bounded content");
+		assert.ok(boundedText.split("\n").length <= DEFAULT_RESULT_MAX_LINES, "receipt input respects the final line cap");
+		assert.ok(!boundedText.includes("line-4999"), "raw tail is removed before receipt finalization");
+		const envelopeFacts = (merged.details as Record<string, unknown>).output_envelope as Record<string, unknown>;
+		assert.equal(envelopeFacts.schema, "workbench-output-v1");
+		assert.equal(envelopeFacts.shownTextBytes, utf8Bytes(boundedText));
 		assert.equal((merged.details as Record<string, unknown>).receipt && ((merged.details as Record<string, unknown>).receipt as Record<string, unknown>).available, true);
 		const finalized = JSON.parse(await readFile(join(receiptsDir(root), `${id}.json`), "utf8")) as {
 			summary: string;
@@ -495,13 +518,19 @@ test("finalization failure: unavailable metadata merged, started receipt left in
 		// and the started artifact must stay in place (incomplete).
 		await writeFile(join(receiptsDir(root), `${id}.started`), "{broken", "utf8");
 		const merged = await emitToolResult(stub, resultEvent(callId, "workbench_project_inspect", "ok", { ok: true }));
-		const receiptMeta = (merged?.details as Record<string, unknown>).receipt as Record<string, unknown>;
+		const projectedDetails = merged?.details as Record<string, unknown>;
+		const receiptMeta = projectedDetails.receipt as Record<string, unknown>;
 		assert.equal(receiptMeta.available, false, "failure never claims availability");
 		assert.equal(receiptMeta.code, "corrupt_started", "bounded unavailable code");
 		assert.equal(receiptMeta.result_id, id);
 		assert.deepEqual((await receiptFiles(root, id)).sort(), [`${id}.started`], "started receipt left incomplete (never deleted, never finalized)");
-		// The domain artifact (details) was not rewritten or rolled back.
-		assert.equal((merged?.details as Record<string, unknown>).ok, true, "original details preserved");
+		// R6 projects registered tools through their explicit DTO whitelist.
+		// `ok` is not a project-inspect DTO field, while trusted control-plane
+		// facts survive and the complete persisted details object stays bounded.
+		assert.equal(Object.hasOwn(projectedDetails, "ok"), false, "unlisted domain field removed by per-tool DTO");
+		assert.equal(Object.hasOwn(projectedDetails, "output_envelope"), true, "trusted envelope preserved");
+		assert.equal((projectedDetails.output_envelope as Record<string, unknown>).schema, "workbench-output-v1");
+		assert.ok(Buffer.byteLength(JSON.stringify(projectedDetails), "utf8") <= DETAILS_MAX_BYTES, "projected details stay within the session cap");
 
 		const recoverTool = stub.tools.get(RECOVERY_TOOL_NAME) as unknown as ToolDef;
 		const recovered = await recoverTool.execute("call-r1", { result_id: id }, undefined, undefined, ctx as never);
@@ -729,9 +758,12 @@ test("tool_result tool-name mismatch never finalizes: started stays incomplete, 
 		assert.equal((mismatched.details as Record<string, unknown>).ok, true, "original domain details preserved");
 
 		// The in-memory handle was consumed: a later tool_result with the
-		// CORRECT name finds no pending handle and finalizes nothing.
+		// CORRECT name finds no pending handle and finalizes nothing. The
+		// global envelope/details handlers still run for every result.
 		const later = await emitToolResult(stub, resultEvent(callId, "workbench_project_inspect", "real result text", { ok: true }));
-		assert.equal(later, undefined, "consumed handle finalizes nothing");
+		assert.ok(later?.details, "global output-control middleware still projects details");
+		assert.equal(Object.hasOwn(later.details as Record<string, unknown>, "receipt"), false, "consumed handle produces no new receipt metadata");
+		assert.equal(((later.details as Record<string, unknown>).output_envelope as Record<string, unknown>).schema, "workbench-output-v1");
 		assert.deepEqual(await receiptFiles(root, id), [`${id}.started`], "still no finalized JSON after the corrected result");
 
 		// Recovery sees the incomplete receipt — never completed.
@@ -742,10 +774,10 @@ test("tool_result tool-name mismatch never finalizes: started stays incomplete, 
 });
 
 // --------------------------------------------------------------------------
-// 12. Capacity: full in-memory map blocks a NEW call before begin/execute
+// 12. Capacity reachability: the per-turn call limit is the tighter bound
 // --------------------------------------------------------------------------
 
-test("capacity: a full in-memory map blocks a new call before begin/execution and never evicts existing handles", async () => {
+test("capacity: the 16-call turn limit prevents an unreachable full map and never evicts admitted handles", async () => {
 	await withTempDir(async (root) => {
 		await setupProject(root, TICK_RECIPES);
 		await writeFile(join(root, "tick.js"), TICK_JS, "utf8");
@@ -753,9 +785,18 @@ test("capacity: a full in-memory map blocks a new call before begin/execution an
 		workbenchRuntime(stub);
 		const ctx = trustedCtx(root, SESSION);
 
-		// Fill the in-memory handle map to exactly MAX_IN_FLIGHT_RECEIPTS.
+		// A real turn clears the pending map at its boundary. Because turn_end
+		// clears it again and the hard per-turn call limit is smaller than the
+		// receipt-core capacity, a full runtime map is deliberately unreachable.
+		assert.ok(MAX_TOOL_CALLS_PER_TURN < MAX_IN_FLIGHT_RECEIPTS, "turn budget is the tighter runtime bound");
+		for (const handler of stub.events.get("turn_start") ?? []) {
+			await handler({ type: "turn_start", turnIndex: 0, timestamp: 1 }, ctx);
+		}
+
+		// Admit every call reachable in this turn without completing its result,
+		// leaving all sixteen receipt handles pending simultaneously.
 		const fillIds: string[] = [];
-		for (let i = 0; i < MAX_IN_FLIGHT_RECEIPTS; i++) {
+		for (let i = 0; i < MAX_TOOL_CALLS_PER_TURN; i++) {
 			const callId = `call-cap-fill-${i}`;
 			const guard = await emitToolCall(stub, ctx, {
 				type: "tool_call",
@@ -764,12 +805,13 @@ test("capacity: a full in-memory map blocks a new call before begin/execution an
 				input: {},
 			});
 			assert.equal(guard.block, undefined, callId);
+			assert.deepEqual(await receiptFiles(root, deriveResultId(SESSION, callId)), [`${deriveResultId(SESSION, callId)}.started`], `${callId} remains pending`);
 			fillIds.push(callId);
 		}
 		assert.equal(await tickCount(root), 0, "nothing executed yet");
 
-		// The next registered workbench call is blocked BEFORE beginReceipt
-		// and execution: fixed bounded reason, no receipt, no execute.
+		// The next registered workbench call is blocked by the hard turn budget
+		// before receipt capacity is consulted, beginReceipt runs, or execution.
 		const excessCallId = "call-cap-excess-1";
 		const excessGuard = await emitToolCall(stub, ctx, {
 			type: "tool_call",
@@ -778,12 +820,12 @@ test("capacity: a full in-memory map blocks a new call before begin/execution an
 			input: { recipe: "tick" },
 		});
 		assert.equal(excessGuard.block, true, "excess call is blocked");
-		assert.match(excessGuard.reason ?? "", /capacity/, "fixed bounded capacity reason");
+		assert.equal(excessGuard.reason, TURN_CALL_LIMIT_CONTROL_TEXT, "fixed bounded turn-call-limit reason");
 		assert.deepEqual(await receiptFiles(root, deriveResultId(SESSION, excessCallId)), [], "excess call has NO receipt (blocked before begin)");
 		assert.equal(await tickCount(root), 0, "excess call did not execute");
 
-		// Existing handles are retained (never evicted): every original call
-		// still finalizes with available: true.
+		// Capacity was not used as an eviction mechanism: every admitted handle
+		// is retained and can still finalize successfully.
 		for (const callId of fillIds) {
 			const merged = await emitToolResult(stub, resultEvent(callId, "workbench_project_inspect", `result of ${callId}`, { ok: true }));
 			assert.ok(merged, `details merged for ${callId}`);

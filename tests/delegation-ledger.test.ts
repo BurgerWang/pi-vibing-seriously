@@ -30,6 +30,7 @@ import {
 	delegationDirFor,
 	delegationReportPath,
 	delegationsDir,
+	DELEGATION_RECORD_MAX_BYTES,
 	digestFromPrefix,
 	finishDelegationLedger,
 	isDelegationRecordPath,
@@ -873,6 +874,57 @@ test("readDelegationLedger returns null for invalid ids, missing or corrupt reco
 		// Corruption (bad JSON) is null.
 		await writeFile(join(delegationDirFor(dir, id), "manifest.json"), "{not json", "utf8");
 		assert.equal(await readDelegationLedger(dir, id), null);
+	});
+});
+
+test("delegation authority JSON reads reject oversized/non-regular records before allocation", async () => {
+	await withTempDir(async (dir) => {
+		await cleanRepo(dir);
+		const before = await collectGitFacts(dir, spawnExec);
+		const id = makeDelegationId(new Date());
+		await createDelegationLedger(dir, id, { task: "t", allowedPaths: ["src/**"], acceptanceCriteria: [], verification: [], timeoutSeconds: 1800 }, before, NOW);
+		assert.ok(await readDelegationLedger(dir, id), "normal bounded ledger remains readable");
+		const manifestPath = join(delegationDirFor(dir, id), "manifest.json");
+		const original = await readFile(manifestPath, "utf8");
+
+		await writeFile(manifestPath, "x".repeat(DELEGATION_RECORD_MAX_BYTES + 1), "utf8");
+		const oversizedAllocations: number[] = [];
+		assert.equal(await readDelegationLedger(dir, id, { onBufferAllocate: (bytes) => oversizedAllocations.push(bytes) }), null);
+		assert.deepEqual(oversizedAllocations, [], "oversized manifest is rejected before Buffer allocation");
+
+		await rm(manifestPath);
+		await mkdir(manifestPath);
+		const nonRegularAllocations: number[] = [];
+		assert.equal(await readDelegationLedger(dir, id, { onBufferAllocate: (bytes) => nonRegularAllocations.push(bytes) }), null);
+		assert.deepEqual(nonRegularAllocations, [], "non-regular manifest is rejected before Buffer allocation");
+
+		await rm(manifestPath, { recursive: true });
+		await writeFile(manifestPath, "{not-json", "utf8");
+		const corruptAllocations: number[] = [];
+		assert.equal(await readDelegationLedger(dir, id, { onBufferAllocate: (bytes) => corruptAllocations.push(bytes) }), null);
+		assert.deepEqual(corruptAllocations, [Buffer.byteLength("{not-json")], "corrupt manifest stops before any later authority record is allocated");
+
+		const wrongDelegationId = id === "20260601-120000-abcd" ? "20260601-120000-abce" : "20260601-120000-abcd";
+		const wrongManifest = `${JSON.stringify({ ...(JSON.parse(original) as object), delegation_id: wrongDelegationId })}\n`;
+		await writeFile(manifestPath, wrongManifest, "utf8");
+		const mismatchedAllocations: number[] = [];
+		assert.equal(await readDelegationLedger(dir, id, { onBufferAllocate: (bytes) => mismatchedAllocations.push(bytes) }), null);
+		assert.deepEqual(mismatchedAllocations, [Buffer.byteLength(wrongManifest)], "mismatched manifest identity stops before before.json is allocated");
+
+		await writeFile(manifestPath, original, "utf8");
+		assert.ok(await readDelegationLedger(dir, id), "restored normal record remains compatible");
+
+		const beforePath = join(delegationDirFor(dir, id), "before.json");
+		await writeFile(join(delegationDirFor(dir, id), "after.json"), JSON.stringify({ delegation_id: id }), "utf8");
+		await writeFile(join(delegationDirFor(dir, id), "worker-summary.json"), JSON.stringify({ delegation_id: id }), "utf8");
+		await writeFile(beforePath, "{not-json", "utf8");
+		const invalidBeforeAllocations: number[] = [];
+		assert.equal(await readDelegationLedger(dir, id, { onBufferAllocate: (bytes) => invalidBeforeAllocations.push(bytes) }), null);
+		assert.deepEqual(
+			invalidBeforeAllocations,
+			[Buffer.byteLength(original), Buffer.byteLength("{not-json")],
+			"invalid before record stops before optional after/worker-summary records are allocated",
+		);
 	});
 });
 

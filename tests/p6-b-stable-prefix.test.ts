@@ -132,6 +132,11 @@ function allToolInfos(): ToolInfoLike[] {
 	return [...nativeOverrideToolInfos(), ...OTHER_BUILTIN_TOOLS, ...catalogToolInfos()];
 }
 
+/** Public static surface used for the v0.10.0 transition record. */
+function publicToolSurface(): ToolInfoLike[] {
+	return [...nativeOverrideToolInfos(), ...catalogToolInfos()];
+}
+
 /**
  * The PRE-NRO legacy fixture (NRO plan §10 control arm): pristine Pi 0.83.0
  * built-in read/grep/find captured from the same create*ToolDefinition
@@ -170,6 +175,13 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 	assert.match(a.modeHash, /^[0-9a-f]{64}$/);
 	assert.match(a.systemPromptHash, /^[0-9a-f]{64}$/);
 	assert.equal(a.toolOrderHash, canonicalHash(VERIFY_TOOLS), "order hash = canonical hash of the explicit MODE_TOOLS order");
+});
+
+test("v0.10.0 public tool surface has the intentional canonical transition hash", () => {
+	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
+	const currentHash = "b5938d64d2730119daa0f1b1c833aac09ff4923b52124a833bc2f1e0d5294b11";
+	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
+	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the documented 0.10.0 hash");
 });
 
 test("the stable-zone contract constants are explicit and disjoint", () => {
@@ -489,9 +501,9 @@ test("NRO N1/N2 transition: override metadata/schemas shift the schema/mode fing
 		// CURRENT surface are deterministic
 		assert.deepEqual(after, modePrefixFingerprint(mode, SYSTEM_PROMPT, current, modeToolNames), `${mode} current fingerprint is deterministic across builds`);
 	}
-	// the transition is exactly the documented combined N1/N2 one (plan
-	// §7.1 / §6.4): read keeps the built-in schema and gains exactly the ONE
-	// continuation/count guideline bullet (N1); grep keeps the built-in
+	// The original N1/N2 transition remains deterministic. In v0.10.0 read
+	// deliberately moves beyond byte-identical built-in metadata/schema to
+	// the bounded pager contract; grep keeps the built-in
 	// metadata/schema PREFIX byte-identical, appends exactly the two
 	// optional count selectors, gains the intended static count-mode
 	// description sentence and mirrors the ONE guideline bullet (N2); find
@@ -499,13 +511,22 @@ test("NRO N1/N2 transition: override metadata/schemas shift the schema/mode fing
 	const currentRead = nativeOverrideToolInfos()[0]!;
 	const builtinRead = createReadToolDefinition(".") as unknown as ToolInfoLike;
 	assert.equal(currentRead.name, builtinRead.name);
-	assert.equal(currentRead.description, builtinRead.description, "read description unchanged (built-in verbatim)");
+	assert.notEqual(currentRead.description, builtinRead.description, "v0.10.0 read description intentionally declares the bounded pager");
+	assert.match(currentRead.description ?? "", /12 KiB/);
+	assert.match(currentRead.description ?? "", /240 file lines/);
 	assert.equal(currentRead.promptSnippet, builtinRead.promptSnippet, "read promptSnippet unchanged (built-in verbatim)");
-	assert.deepEqual(currentRead.parameters, builtinRead.parameters, "read parameter schema byte-identical to the Pi 0.83.0 built-in");
+	const currentReadParameters = currentRead.parameters as { properties: Record<string, { type?: string; minimum?: number; maximum?: number }>; required?: string[] };
+	assert.deepEqual(Object.keys(currentReadParameters.properties), ["path", "offset", "limit", "cursor"], "read v3 schema has the fixed path/offset/limit/cursor order");
+	assert.equal(currentReadParameters.properties.offset?.type, "integer");
+	assert.equal(currentReadParameters.properties.offset?.minimum, 1);
+	assert.equal(currentReadParameters.properties.limit?.type, "integer");
+	assert.equal(currentReadParameters.properties.limit?.minimum, 1);
+	assert.equal(currentReadParameters.properties.limit?.maximum, 240);
+	assert.ok(!(currentReadParameters.required ?? []).includes("cursor"), "cursor remains optional");
 	assert.deepEqual(
 		currentRead.promptGuidelines,
 		[...(builtinRead.promptGuidelines ?? []), READ_PREVIEW_GUIDELINE],
-		"read adds exactly the ONE §6.4 guideline bullet — nothing else",
+		"read v3 keeps the built-in usage bullet plus the one static continuation/count guideline",
 	);
 	// grep: the built-in description is the verbatim prefix of the current
 	// one, which then carries the intended static count-mode sentence; the
@@ -674,6 +695,23 @@ test("the independent read-only allowlist is the exact approved set and never in
 	assert.equal(isIndependentReadOnlyTool(""), false);
 });
 
+test("v0.10.0 runtime removes only the temporary sequential read-only modes", async () => {
+	const index = await readFile(new URL("index.ts", EXTENSION_DIR), "utf8");
+	const registration = (name: string): string => {
+		const marker = `...WORKBENCH_TOOL_METADATA.${name},`;
+		const start = index.indexOf(marker);
+		assert.ok(start >= 0, `${name} registration exists`);
+		const next = index.indexOf("pi.registerTool({", start + marker.length);
+		return index.slice(start, next < 0 ? index.length : next);
+	};
+	for (const name of ["workbench_read_run", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs"]) {
+		assert.doesNotMatch(registration(name), /executionMode:\s*"sequential"/, `${name} now uses runtime turn-budget authorization`);
+	}
+	for (const name of ["workbench_delegate_worker", "workbench_review_worker_diff"]) {
+		assert.match(registration(name), /executionMode:\s*"sequential"/, `${name} remains sequential`);
+	}
+});
+
 test("workbench_read_run schema/metadata wording declares the summary default and the P4b observation-only verdict semantics (Commander Slice B1 + P4b)", () => {
 	const params = WORKBENCH_TOOL_PARAMETERS.workbench_read_run as unknown as {
 		properties: Record<string, { description?: string }>;
@@ -705,6 +743,31 @@ test("workbench_read_run schema/metadata wording declares the summary default an
 	assert.match(verdictGuideline!, /never skips recipe\/gate execution/, "the guideline says the verdict never skips execution");
 	assert.match(verdictGuideline!, /never acceptance evidence/, "the guideline says the verdict is never acceptance evidence");
 	assert.match(verdictGuideline!, /final recipe\/gate runs remain required/, "the guideline keeps final recipe/gate runs required");
+});
+
+test("v0.10.0 bounded public schemas pin paging selectors and hard maxima", () => {
+	const schema = (name: keyof typeof WORKBENCH_TOOL_PARAMETERS) => WORKBENCH_TOOL_PARAMETERS[name] as unknown as {
+		properties: Record<string, { type?: string; minimum?: number; maximum?: number; anyOf?: Array<{ const?: string }> }>;
+	};
+	const readRun = schema("workbench_read_run").properties;
+	assert.deepEqual((readRun.log_stream?.anyOf ?? []).map((item) => item.const), ["stdout", "stderr", "both"]);
+	assert.equal(readRun.max_lines?.minimum, 1);
+	assert.equal(readRun.max_lines?.maximum, 400);
+	assert.equal(readRun.max_bytes?.minimum, 1024);
+	assert.equal(readRun.max_bytes?.maximum, 32768);
+	assert.ok(readRun.cursor);
+
+	const readGate = schema("workbench_read_gate").properties;
+	assert.deepEqual((readGate.include?.anyOf ?? []).map((item) => item.const), ["summary", "failures", "checks"]);
+	assert.ok(readGate.cursor);
+	assert.equal(readGate.max_lines?.minimum, 1);
+	assert.equal(readGate.max_lines?.maximum, 320);
+
+	const review = schema("workbench_review_worker_diff").properties;
+	assert.equal(review.max_lines?.minimum, 1);
+	assert.equal(review.max_lines?.maximum, 400);
+	assert.equal(review.max_bytes?.minimum, 1);
+	assert.equal(review.max_bytes?.maximum, 32768);
 });
 
 // ---------------------------------------------------------------------------

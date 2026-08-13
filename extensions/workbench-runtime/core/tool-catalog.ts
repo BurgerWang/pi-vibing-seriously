@@ -85,8 +85,14 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 				description: "What to include (default: summary)",
 			}),
 		),
-		max_lines: Type.Optional(Type.Integer({ description: "Log snippet line cap (default 200)", minimum: 1, maximum: 2000 })),
-		max_bytes: Type.Optional(Type.Integer({ description: "Log snippet byte cap (default 20KB)", minimum: 1, maximum: 512000 })),
+		log_stream: Type.Optional(
+			Type.Union([Type.Literal("stdout"), Type.Literal("stderr"), Type.Literal("both")], {
+				description: "Log stream selection for logs/all (default: both)",
+			}),
+		),
+		cursor: Type.Optional(Type.String({ minLength: 1, maxLength: 1024, description: "Opaque previous-page cursor returned by logs/all" })),
+		max_lines: Type.Optional(Type.Integer({ description: "Shared whole-result line cap for logs/all (default 200)", minimum: 1, maximum: 400 })),
+		max_bytes: Type.Optional(Type.Integer({ description: "Shared whole-result byte cap for logs/all (default 20KB)", minimum: 1024, maximum: 32768 })),
 	}),
 	workbench_run_gate: Type.Object({
 		gates: Type.String({ description: "Gate selector: a gate id (e.g. \"b0\"), comma-separated ids, or base|quant|all" }),
@@ -110,6 +116,13 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 	workbench_read_gate: Type.Object({
 		run_id: Type.Optional(Type.String({ description: "Run id of a gate run (e.g. 20260101-120000-abcd)" })),
 		gate_id: Type.Optional(Type.String({ description: "Gate id (e.g. b0, q3)" })),
+		include: Type.Optional(
+			Type.Union([Type.Literal("summary"), Type.Literal("failures"), Type.Literal("checks")], {
+				description: "Bounded view (default failures: summary plus non-PASS rows; checks pages every check)",
+			}),
+		),
+		cursor: Type.Optional(Type.String({ minLength: 1, maxLength: 1024, description: "Opaque stale-safe gate-read continuation cursor" })),
+		max_lines: Type.Optional(Type.Integer({ description: "Whole-result line cap (default/max 320)", minimum: 1, maximum: 320 })),
 	}),
 	workbench_list_gates: Type.Object({}),
 	workbench_compare_runs: Type.Object({
@@ -124,8 +137,8 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 				maxItems: 50,
 			}),
 		),
-		max_lines: Type.Optional(Type.Integer({ description: "Global rendered-patch line cap (default 400)", minimum: 1, maximum: 2000 })),
-		max_bytes: Type.Optional(Type.Integer({ description: "Global rendered-patch byte cap (default 32KB)", minimum: 1, maximum: 512000 })),
+		max_lines: Type.Optional(Type.Integer({ description: "Whole-result line cap (default/max 400)", minimum: 1, maximum: 400 })),
+		max_bytes: Type.Optional(Type.Integer({ description: "Whole-result byte cap (default/max 32 KiB)", minimum: 1, maximum: 32768 })),
 	}),
 	workbench_delegation_status: Type.Object({}),
 	// P8b: public read-only recovery tool. Both params are OPTIONAL in the
@@ -235,12 +248,13 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 		name: "workbench_read_run",
 		label: "Workbench read run",
 		description:
-			"Read a workbench run record by run_id: a bounded Summary/Evidence/Persisted summary by default (no raw logs, no argv), or manifest metadata and caller-bounded log tails on request. Every readable run also reports the current-state validation assessment — REUSABLE or RERUN_REQUIRED with fixed reason codes — as observation only: it never automatically skips recipe/gate execution and is never acceptance evidence. Full logs are never sent inline; use the returned log paths with read/grep when more detail is needed.",
+			"Read a workbench run record by run_id: a bounded Summary/Evidence/Persisted summary by default (no raw logs, no argv), or a seek-based quoted stdout/stderr reverse page on logs/all. Log pages share one 32 KiB/400-line ceiling and return a stale-safe previous cursor; full logs stay on disk. Every readable run also reports the current-state validation assessment — REUSABLE or RERUN_REQUIRED with fixed reason codes — as observation only: it never automatically skips recipe/gate execution and is never acceptance evidence.",
 		promptSnippet: "Read a workbench run record (default: bounded summary; manifest/logs on request; current-state REUSABLE/RERUN_REQUIRED verdict) by run_id",
 		promptGuidelines: [
 			"Use workbench_read_run to inspect previous recipe runs; default output is deliberately bounded.",
+			"For logs/all, choose log_stream and follow previous_cursor for older pages; max_bytes is shared by stdout and stderr and never raises the 32 KiB hard ceiling.",
 			"A REUSABLE/RERUN_REQUIRED validation verdict is a current-state observation only — it never skips recipe/gate execution and is never acceptance evidence; final recipe/gate runs remain required.",
-			"Batch 2+ known-independent read-only tool calls (read, grep, find, ls, workbench_project_inspect, workbench_read_run, workbench_read_gate, workbench_list_gates, workbench_compare_runs) in one host parallel turn; dependent calls, writes, delegations, reviews and final recipe/gate execution stay sequential.",
+			"Batch 2+ known-independent read-only calls only when every call is read, grep, find, ls, workbench_project_inspect, workbench_read_run, workbench_read_gate, workbench_list_gates, or workbench_compare_runs and the runtime turn budget authorizes every call; dependent calls, writes, delegations, reviews, and final recipe/gate execution stay sequential.",
 		],
 	},
 	workbench_run_gate: {
@@ -259,11 +273,11 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 		name: "workbench_read_gate",
 		label: "Workbench read gate",
 		description:
-			"Read a gate run record by run_id (gates.json summary) or a gate definition by gate_id (with its latest persisted status). Provide exactly one of run_id / gate_id.",
+			"Read exactly one gate run record or gate definition through a bounded 24 KiB/320-line view. The default returns summary plus non-PASS rows; include=checks pages all checks with a stale-safe cursor. Full gates.json remains authoritative on disk.",
 		promptSnippet: "Read a gate run record or gate definition",
 		promptGuidelines: [
-			"Use workbench_read_gate with run_id to inspect the per-gate statuses of a gate run.",
-			"Use workbench_read_gate with gate_id to see the gate definition and its latest status.",
+			"Provide exactly one of run_id or gate_id. Use the default failures view first; request include=checks only when full check detail is needed.",
+			"Follow next_cursor to continue the same source/include view. A changed source returns stale_cursor; a cursor from another run/gate/include returns source_mismatch.",
 		],
 	},
 	workbench_list_gates: {

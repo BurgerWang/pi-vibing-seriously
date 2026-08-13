@@ -18,12 +18,12 @@ day-to-day workflow rules that follow from this contract.
 
 | Input | Source | Workbench guarantee |
 | ----- | ------ | ------------------- |
-| Pi's fixed system prompt | Pi itself | the workbench never modifies it (`before_agent_start`/`context` return nothing) |
+| Pi's fixed system prompt | Pi itself | the workbench never rewrites it per turn (`before_agent_start` returns nothing) |
 | Workbench static rules | AGENTS.md, project rules | loaded by Pi; never rewritten per turn |
 | Extension registration order | `package.json` `pi` arrays | static file content |
 | The current mode's fixed tool list | `core/mode-policy.ts` `MODE_TOOLS` | explicit constant arrays (tested) |
 | Tool name/label/description/schema | `core/tool-catalog.ts` | single static catalog; registerTool spreads it (tested) |
-| Native override metadata/schemas | `core/native-tool-policy.ts` | static `NATIVE_OVERRIDE_METADATA` / `NATIVE_OVERRIDE_PARAMETERS`; `read`/`find` schemas byte-identical to the Pi 0.83.0 built-ins, `grep` appends exactly the two optional count selectors (`output`, `count_kind`); metadata is the built-in strings verbatim plus the §6.4 guideline bullets (`read`'s one and its grep mirror) and the grep count-mode description sentence; no dynamic facts (tested) |
+| Native override metadata/schemas | `core/native-tool-policy.ts` | static `NATIVE_OVERRIDE_METADATA` / `NATIVE_OVERRIDE_PARAMETERS`; v0.10.0 `read` declares path plus optional integer offset/limit and cursor, `find` stays built-in-compatible, and `grep` appends exactly the two optional count selectors (`output`, `count_kind`); no dynamic facts (tested) |
 | promptSnippet / promptGuidelines | `core/tool-catalog.ts` | static, audited for dynamic values (tested) |
 | Skill name/description metadata | Pi discovery | names/descriptions static per install; ordering documented |
 | Prompt template metadata | Pi discovery | static per install |
@@ -50,6 +50,9 @@ re-hashes the prefix and silently defeats caching.
    records, never their text.
 5. **Normal chat messages** — the compaction supplement note
    (`workbench-compact-note`, bounded, redacted, display:false).
+6. **Context projection** — a deterministic runtime transform may replace
+   older complete assistant-tool bundles with bounded descriptors before a
+   provider request. It never changes the system prompt or tool definitions.
 
 ## What the workbench audited (and what it does not do)
 
@@ -58,9 +61,11 @@ compaction hooks, AGENTS/context loading, skills discovery, prompt template
 discovery.
 
 - **No per-turn system prompt rewrites.** The workbench never returns a
-  system prompt from `before_agent_start` and never listens to context
-  mutation events. `ctx.getSystemPrompt()` is only ever READ, for telemetry
-  hashes and `/q-cache-doctor`.
+  system prompt from `before_agent_start`. The `context` event now performs
+  the v0.10.0 active-history projection: it validates exact tool-call/result
+  pairing, protects the latest bundles, and replaces or removes only whole
+  older bundles under the role budget. `ctx.getSystemPrompt()` remains
+  read-only, for telemetry hashes and `/q-cache-doctor`.
 - **No dynamic appends.** Nothing appends timestamps, cwd state, mode, git,
   run or cache info to the system prompt.
 - **`ctx.getSystemPrompt()` is stable** within the same mode and unchanged
@@ -74,7 +79,15 @@ discovery.
   carries task/mode/gates/runs/evidence pointers only (tested).
 - **`before_provider_request` stays read-only.** It produces a structural
   digest in memory; the payload and headers are never mutated (tested).
-- **The `context` event is not used** for cache observation.
+- **The `context` event is enforcement, not cache observation.** Its output
+  can intentionally change the message-history prefix when old bundles are
+  collapsed; this is expected cache invalidation. Tool/system stable-zone
+  hashes remain unchanged after the one-time public schema transition.
+
+Old session JSONL remains readable but can carry large legacy details before
+Pi clones it. Use `npm run session:sanitize -- ...` to create a separate
+mode-0600, hash-manifested safe copy; the sanitizer never edits the source in
+place. See `docs/context-output-control-plane.md`.
 
 ## Deterministic tool registration
 
@@ -88,15 +101,11 @@ discovery.
   `WORKBENCH_TOOL_NAMES` (source-scanned by tests), and the catalog's names,
   order, mode matrices and write inventories are unchanged. Their static
   metadata and parameter schemas live in `core/native-tool-policy.ts`
-  (`NATIVE_OVERRIDE_METADATA` / `NATIVE_OVERRIDE_PARAMETERS`): `read` and
-  `find` schemas are byte-identical to the Pi 0.83.0 built-ins, `grep`
-  appends exactly the two optional count selectors (`output`, `count_kind`)
-  after its byte-identical legacy property prefix; the metadata is the
-  built-in strings verbatim plus exactly the two §6.4 guideline bullets (the
-  ONE on `read` — `READ_PREVIEW_GUIDELINE` — and its grep mirror —
-  `GREP_COUNT_GUIDELINE`) and the grep count-mode description sentence;
-  `find` keeps the built-in strings verbatim; no dynamic facts ever appear
-  (the same static-metadata audit as the catalog tools).
+  (`NATIVE_OVERRIDE_METADATA` / `NATIVE_OVERRIDE_PARAMETERS`). `read` v3
+  intentionally declares its 12 KiB pager, integer-bounded compatibility
+  selectors and opaque cursor; `grep` appends its two count selectors after
+  the legacy property prefix; `find` keeps the built-in strings/schema.
+  Guideline text remains static and contains no runtime facts.
 - Tool metadata (name/label/description/promptSnippet/promptGuidelines/
   parameters) is static at runtime and centralized in the catalog.
 - Parameter JSON schemas are built in source order; `canonicalHash`
@@ -135,14 +144,10 @@ classifier — AUDIT is exactly the batch allowlist plus the recovery tool
 NRO N1/N2 (Commander Native Tool Optimization): the three fixed same-name
 overrides (`read` → `grep` → `find`) replace the Pi built-ins under the
 SAME names, so the resolved tool list (names and order) and every
-mode/write inventory are unchanged. N1 is the read-preview slice: a text
-`read` WITHOUT `offset`/`limit` returns the complete content byte-for-byte
-plus the deterministic frozen nine-fact `nro-read-facts:` trailer, or a
-deterministic preview at the fixed caps (240 lines / 12 KiB / 2048-byte
-per-line representation) with the facts; legacy `offset`/`limit` reads,
-images (attachment or the built-in text-only note), errors and abort stay
-byte-identical to the built-in; `details` is undefined when complete and
-exactly a valid `TruncationResult`-only object when truncated. N2 is the
+mode/write inventory are unchanged. In v0.10.0, N1's preview is superseded
+by read v3: every text path uses one quoted 12 KiB/240-file-line pager and a
+strict stale-safe cursor; legacy offset/limit calls enter that same pager;
+images still use Pi's attachment pipeline. N2 is the
 grep count slice: `output=count` returns one exact uncapped
 `count kind=<matches|lines> value=<n> files=<n>` line through the direct
 abort-aware ripgrep adapter (managed rg first, then system rg;
@@ -168,6 +173,33 @@ measurement/verdict).
   `UNEXPECTED_DRIFT` and `/q-cache-doctor` reports a `same_mode_drift`
   warning.
 
+## v0.10.0 intentional transition
+
+Context Output Control Plane v1 intentionally changes the static tool surface
+once. The native `read` schema adds the opaque cursor and integer-bounded
+legacy offset/limit fields; `workbench_read_run`, diff review, and
+`workbench_read_gate` expose their lower hard ceilings and paging selectors;
+the independent-read guideline now conditions batching on runtime turn-budget
+authorization. Unsafe legacy maxima are not retained for cache continuity.
+
+The canonical public surface here is the ordered array of the three native
+overrides followed by all workbench tools, each represented as
+`{name,description,promptSnippet,parameters,promptGuidelines}`. It is separate
+from a mode prefix because it intentionally excludes the system prompt and
+mode-specific built-ins.
+
+| Surface | Canonical SHA-256 |
+| --- | --- |
+| Baseline commit `8ec8c269c6a3ef699c7e8112e8fec75a73fb7c4c` | `1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd` |
+| v0.10.0 final public surface | `b5938d64d2730119daa0f1b1c833aac09ff4923b52124a833bc2f1e0d5294b11` |
+
+The hashes are pinned by `tests/p6-b-stable-prefix.test.ts`; the baseline is
+derived read-only from the frozen commit, while the current hash is computed
+from the registered static sources. Reloading v0.10.0 therefore produces one
+expected `TOOL_SCHEMA` drift and cold cache prefix. Repeated builds in the same
+mode must then be stable. Runtime history collapse may still change the normal
+message-history prefix, but never these stable-zone tool hashes.
+
 ## Hashing rules
 
 - Canonical hashing: `cache/canonical-hash.ts` — sorted object keys,
@@ -190,12 +222,13 @@ measurement/verdict).
   order randomization (filesystem/YAML/glob), dynamic-fact isolation,
   per-mode hashes, invalidation classification, payload read-only,
   telemetry-out-of-context, no dynamic tool loader, no tool-search claims.
-  The same file carries the NRO N1/N2 transition evidence: current
+  The same file carries the historical NRO N1/N2 transition evidence and
+  the v0.10.0 read-v3/public-surface transition: current
   read/grep/find tool info is built from the REGISTERED override metadata
   and schemas (`NATIVE_OVERRIDE_METADATA` / `NATIVE_OVERRIDE_PARAMETERS`),
-  the current schema/mode fingerprints differ from the pre-NRO
-  pristine-built-in fixture exactly once (the combined N1/N2 transition)
-  with names/order unchanged, and repeated same-mode builds are
+  the current schema/mode fingerprints differ from the pre-NRO fixture with
+  names/order unchanged; the separately pinned baseline/current public hashes
+  identify the intentional 0.10.0 delta, and repeated same-mode builds are
   deterministic for DEV/AUDIT/VERIFY.
 - `/q-cache-doctor` — `prefix_hashes` (current systemPromptHash /
   activeToolNamesHash / activeToolOrderHash / activeToolSchemaHash),

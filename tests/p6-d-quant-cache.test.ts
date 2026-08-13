@@ -246,7 +246,7 @@ test("quant lifecycle: manifest must exist — missing manifest refuses the cach
 		assert.equal(result.ok, true, "normal execution proceeds");
 		assert.equal(exec.recipeCalls, 1);
 		assert.equal(result.cache?.status, "refused");
-		assert.match(result.cache?.reason ?? "", /not found/);
+		assert.match(result.cache?.reason ?? "", /manifest file is unavailable/);
 		assert.equal(await actionRecords(root), 0, "nothing cached");
 	});
 });
@@ -460,7 +460,7 @@ test("q-cache-validate: missing manifest errors cleanly", async () => {
 	await withTempDir(async (root) => {
 		const report = await validateQuantManifestCommand(root, "artifacts/never.json");
 		assert.equal(report.ok, false);
-		assert.match(report.error ?? "", /not found/);
+		assert.match(report.error ?? "", /manifest file is unavailable/);
 	});
 });
 

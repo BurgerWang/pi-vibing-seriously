@@ -102,9 +102,15 @@ const RELEASE_ASSETS_INPUTS = [
 	"tests/release-assets.test.ts",
 	"LICENSE",
 	"README.md",
+	"CHANGELOG.md",
 	"assets/banner.svg",
 	"tools/make-banner.mjs",
 	"extensions/workbench-runtime/cache/cache-types.ts",
+	"compatibility/pi.json",
+	".pi/workbench/gates.yaml",
+	"docs/context-output-control-plane.md",
+	"docs/compatibility.md",
+	"docs/cache/stable-prefix-contract.md",
 ] as const;
 
 const RUNTIME_CORE_TEST_FILES = [
@@ -379,7 +385,7 @@ test("real release-assets wiring: package script and recipe declare the exact as
 	assert.deepEqual(ra.validation_components, []);
 	const cache = ra.cache;
 	assert.equal(cache.enabled, true);
-	assert.equal(cache.version, 1);
+	assert.equal(cache.version, 2);
 	assert.equal(cache.mode, "result-only");
 	assert.equal(cache.successOnly, true);
 	assert.equal(cache.maxAgeSeconds, null);

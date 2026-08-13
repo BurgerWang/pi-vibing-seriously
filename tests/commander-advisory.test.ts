@@ -34,6 +34,7 @@ import {
 	ADVISORY_DIMENSIONS,
 	advisoryCurrentValues,
 	advisoryStatusSegment,
+	contextOutputAdvisoryStatusSegment,
 	DEFAULT_ADVISORY_HIGH,
 	DEFAULT_ADVISORY_SOFT,
 	defaultAdvisoryConfig,
@@ -447,6 +448,15 @@ test("advisoryStatusSegment: ok adds no footer segment; soft/high map to CMD:SOF
 	};
 	assert.equal(advisoryStatusSegment(evaluateAdvisory(breakdown({ commanderRequests: 1 }), config)), "CMD:SOFT");
 	assert.equal(advisoryStatusSegment(evaluateAdvisory(breakdown({ commanderRequests: 2 }), config)), "CMD:HIGH");
+});
+
+test("context output advisory is a fixed observation-only CTX footer segment", () => {
+	assert.equal(contextOutputAdvisoryStatusSegment("OK"), undefined);
+	assert.equal(contextOutputAdvisoryStatusSegment("SOFT"), "CTX:SOFT");
+	assert.equal(contextOutputAdvisoryStatusSegment("HIGH"), "CTX:HIGH");
+	for (const hostile of ["soft", "VIOLATION", true, 1, null, { band: "HIGH" }]) {
+		assert.equal(contextOutputAdvisoryStatusSegment(hostile), undefined);
+	}
 });
 
 // ------------------------------------------------------ rendering

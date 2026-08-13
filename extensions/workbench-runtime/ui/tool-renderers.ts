@@ -26,7 +26,6 @@ import {
 	renderReadRunLines,
 	renderRecipeLines,
 	renderToolCallLine,
-	type CompareToolDetails,
 	type GateToolDetails,
 	type InspectToolDetails,
 	type ReadRunToolDetails,
@@ -36,9 +35,46 @@ import {
 /** The subset of Theme the renderers use (testable with a passthrough fake). */
 export type ThemeLike = Pick<Theme, "fg" | "bold">;
 
-export type RendererKind = "inspect" | "recipe" | "gate" | "read_run" | "compare";
+export type RendererKind = "inspect" | "recipe" | "gate" | "read_run" | "compare" | "review";
 
 type StatusColor = "success" | "error" | "warning";
+
+interface ProjectedCompareDetails {
+	ok?: boolean;
+	comparison_id?: string;
+	a_run_id?: string;
+	b_run_id?: string;
+	compatible?: boolean;
+	artifact_added_count?: number;
+	artifact_removed_count?: number;
+	gate_changed_count?: number;
+	quant_changed_count?: number;
+	parameter_changed_count?: number;
+	comparison_path?: string;
+	error?: string;
+	/** Legacy in-memory payload; absent after bounded details projection. */
+	report?: Parameters<typeof renderCompareLines>[0];
+}
+
+interface ProjectedReviewDetails {
+	ok?: boolean;
+	delegation_id?: string;
+	verdict?: "PASS" | "FAIL";
+	review_status?: string;
+	bound_diff_hash?: string;
+	recorded_after_hash?: string;
+	mismatch?: boolean;
+	violation_count?: number;
+	drift_count?: number;
+	checked_count?: number;
+	displayed_count?: number;
+	remaining_count?: number;
+	coverage_complete?: boolean;
+	review_record?: string;
+	next_include_paths?: string[];
+	patch_truncated?: boolean;
+	error?: string;
+}
 
 function statusColor(status: string): StatusColor {
 	if (status === "OK" || status === "PASS") return "success";
@@ -60,6 +96,45 @@ function styledLines(lines: string[], color: StatusColor | "muted" | "accent", t
 	return lines
 		.map((line, index) => (index === 0 ? theme.fg(color, line) : theme.fg("dim", line)))
 		.join("\n");
+}
+
+/** Render the bounded comparison DTO without reloading its durable record. */
+function renderProjectedCompareLines(details: ProjectedCompareDetails, expanded: boolean): string[] {
+	const id = details.comparison_id ?? "?";
+	const left = details.a_run_id ?? "?";
+	const right = details.b_run_id ?? "?";
+	const compatibility = details.compatible === true ? "compatible" : details.compatible === false ? "incompatible" : "unknown";
+	const compact = `${compatibility} comparison:${id} ${left} vs ${right}`;
+	if (!expanded) return [compact];
+	const count = (value: number | undefined): string => Number.isSafeInteger(value) && value! >= 0 ? String(value) : "n/a";
+	return [
+		compact,
+		`artifacts    : +${count(details.artifact_added_count)} -${count(details.artifact_removed_count)}`,
+		`gate changes : ${count(details.gate_changed_count)}`,
+		`quant changes: ${count(details.quant_changed_count)}`,
+		`param changes: ${count(details.parameter_changed_count)}`,
+		`record       : ${details.comparison_path ?? "(n/a)"}`,
+	];
+}
+
+/** Render only persisted review counters and bounded continuation guidance. */
+function renderProjectedReviewLines(details: ProjectedReviewDetails, expanded: boolean): string[] {
+	const count = (value: number | undefined): string => Number.isSafeInteger(value) && value! >= 0 ? String(value) : "n/a";
+	const verdict = details.verdict ?? "UNKNOWN";
+	const compact = `${verdict} review:${details.delegation_id ?? "?"} coverage ${count(details.displayed_count)}/${count(details.checked_count)} remaining ${count(details.remaining_count)}`;
+	if (!expanded) return [compact];
+	return [
+		compact,
+		`review status : ${details.review_status ?? "unknown"}`,
+		`scope issues  : ${count(details.violation_count)} violation(s), ${count(details.drift_count)} drift path(s)`,
+		`coverage      : ${details.coverage_complete === true ? "complete" : "incomplete"}`,
+		`hash mismatch : ${details.mismatch === true ? "yes" : "no"}`,
+		`bound hash    : ${details.bound_diff_hash ?? "(n/a)"}`,
+		`recorded hash : ${details.recorded_after_hash ?? "(n/a)"}`,
+		`next paths    : ${count(details.next_include_paths?.length)} shown of ${count(details.remaining_count)} remaining`,
+		`patch bounded : ${details.patch_truncated === true ? "yes" : "no"}`,
+		`review record : ${details.review_record ?? "(n/a)"}`,
+	];
 }
 
 /**
@@ -122,13 +197,28 @@ export function workbenchToolRenderer(kind: RendererKind, name: string): { rende
 				break;
 			}
 			case "compare": {
-				const d = details as unknown as CompareToolDetails;
-				if (!d.ok) {
-					lines = [renderErrorLine(name, d.error)];
+				const d = details as ProjectedCompareDetails;
+				if (d.ok !== true) {
+					lines = [renderErrorLine(name, d.error ?? "comparison unavailable")];
 					color = "error";
-				} else {
+				} else if (d.report && typeof d.report === "object") {
+					// Backward-compatible rendering for already-open legacy results.
 					lines = renderCompareLines(d.report, options.expanded);
 					color = d.report.compatible ? "accent" : "warning";
+				} else {
+					lines = renderProjectedCompareLines(d, options.expanded);
+					color = d.compatible === true ? "accent" : "warning";
+				}
+				break;
+			}
+			case "review": {
+				const d = details as ProjectedReviewDetails;
+				if (d.ok !== true) {
+					lines = [renderErrorLine(name, d.error ?? "review unavailable")];
+					color = "error";
+				} else {
+					lines = renderProjectedReviewLines(d, options.expanded);
+					color = d.verdict === "FAIL" ? "error" : d.coverage_complete === true ? "success" : "warning";
 				}
 				break;
 			}

@@ -54,6 +54,8 @@ const SUCCESS_MAX_BYTES = 4096;
 const SUCCESS_MAX_LINES = 40;
 const FAILURE_MAX_BYTES = 12288;
 const FAILURE_MAX_LINES = 120;
+const COMMAND_OUTPUT_MAX_BYTES = 16384;
+const COMMAND_OUTPUT_MAX_LINES = 240;
 
 /** Exact UTF-8 byte length of the ACTUAL runtime output (TextEncoder). */
 function utf8Bytes(text: string): number {
@@ -627,5 +629,83 @@ test("Phase 3B preflight is read-only and exact: model {preflight:true} and /q-g
 		assert.equal(gateManifests[0]!.run_id, formalDetails.run_id, "details.run_id identifies the persisted gate run");
 		assert.equal(manifests.filter((m) => m.recipe === "mark").length, 1, "the recipe check ran and persisted its run record");
 		assert.equal(await readFile(join(root, PREFLIGHT_MARKER), "utf8"), "executed", "recipe check actually executed in the formal run");
+	});
+});
+
+test("/q-run-show clamps a hostile but preflight-valid manifest and retains its authority pointer", async () => {
+	await withTempDir(async (root) => {
+		await setupProject(root, GREEN_RECIPES);
+		await writeFile(join(root, "green.js"), GREEN_JS, "utf8");
+		const stub = makeStub();
+		workbenchRuntime(stub);
+		const recipeTool = stub.tools.get("workbench_run_recipe") as unknown as RecipeTool;
+		await recipeTool.execute("call-run-show", { recipe: "green" }, undefined, undefined, trustedCtx(root) as never);
+		const runDir = await singleRunDir(root);
+		const runId = runDir.split("/").at(-1)!;
+		const command = stub.commands.get("q-run-show") as { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> };
+		assert.ok(command);
+		const normalCtx = trustedCtx(root);
+		await command.handler(runId, normalCtx as never);
+		const normalText = normalCtx.notifyLines.join("\n");
+		assertWithinCaps(normalText, COMMAND_OUTPUT_MAX_BYTES, COMMAND_OUTPUT_MAX_LINES);
+		assert.match(normalText, /recipe    : green/, "a normal run manifest remains compatible");
+		const manifestPath = join(runDir, "manifest.json");
+		const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
+		manifest.argv = Array.from({ length: 700 }, (_, index) => `arg-${index}-${"界".repeat(250)}`);
+		manifest.artifact_paths = Array.from({ length: 200 }, (_, index) => `artifacts/${index}-${"a".repeat(200)}.json`);
+		const payload = JSON.stringify(manifest);
+		assert.ok(Buffer.byteLength(payload, "utf8") < 1_048_576, "fixture stays inside the manifest input cap");
+		await writeFile(manifestPath, payload, "utf8");
+
+		const ctx = trustedCtx(root);
+		await command.handler(runId, ctx as never);
+		const text = ctx.notifyLines.join("\n");
+		assertWithinCaps(text, COMMAND_OUTPUT_MAX_BYTES, COMMAND_OUTPUT_MAX_LINES);
+		assert.match(text, new RegExp(`full record: \\.pi/workbench/runs/${runId}/manifest\\.json`));
+		assert.match(text, /workbench-output truncated omitted_bytes=/);
+	});
+});
+
+test("/q-evidence uses the strict reader and clamps the entire hostile evidence presentation", async () => {
+	await withTempDir(async (root) => {
+		await setupProject(root, undefined, GATES_FAIL_YAML);
+		const stub = makeStub();
+		workbenchRuntime(stub);
+		const gateTool = stub.tools.get("workbench_run_gate") as unknown as GateTool;
+		const gateResult = await gateTool.execute("call-evidence", { gates: "g1" }, undefined, undefined, trustedCtx(root) as never);
+		const runId = String(gateResult.details.run_id);
+		assert.match(runId, RUN_ID_RE);
+		const command = stub.commands.get("q-evidence") as { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> };
+		assert.ok(command);
+		const normalCtx = trustedCtx(root);
+		await command.handler(runId, normalCtx as never);
+		const normalText = normalCtx.notifyLines.join("\n");
+		assertWithinCaps(normalText, COMMAND_OUTPUT_MAX_BYTES, COMMAND_OUTPUT_MAX_LINES);
+		assert.match(normalText, new RegExp(`evidence for gate run ${runId}`), "a real gate evidence record remains compatible");
+		const checks: Record<string, unknown> = {};
+		for (let index = 0; index < 200; index += 1) {
+			const checkId = `g1.${index}`;
+			checks[checkId] = {
+				check_id: checkId,
+				status: index % 2 === 0 ? "PASS" : "FAIL",
+				kind: "manual",
+				evidence: Array.from({ length: 8 }, (_, item) => ({ type: "manual", detail: `detail-${index}-${item}-${"界".repeat(100)}` })),
+			};
+		}
+		const evidencePath = join(runsDir(root), runId, "evidence.json");
+		const payload = JSON.stringify({ schema_version: 1, run_id: runId, requested: ["g1"], profile: "generic", mode: "DEV", checks });
+		assert.ok(Buffer.byteLength(payload, "utf8") < 1_048_576, "fixture stays inside the evidence input cap");
+		await writeFile(evidencePath, payload, "utf8");
+
+		const ctx = trustedCtx(root);
+		await command.handler(runId, ctx as never);
+		const text = ctx.notifyLines.join("\n");
+		assertWithinCaps(text, COMMAND_OUTPUT_MAX_BYTES, COMMAND_OUTPUT_MAX_LINES);
+		const display = text.match(/display: shown=(\d+) omitted=(\d+) max_evidence_items_per_check=4/);
+		assert.ok(display, text);
+		assert.equal(Number(display![1]) + Number(display![2]), 200, "shown + omitted is exact after fitting the whole result");
+		assert.ok(Number(display![1]) > 0 && Number(display![1]) < 200, "the bounded view makes progress and explicitly omits the rest");
+		assert.match(text, new RegExp(`full record: \\.pi/workbench/runs/${runId}/evidence\\.json`));
+		assert.doesNotMatch(text, /workbench-output truncated/, "semantic fitting precedes the shared whole-result defense");
 	});
 });

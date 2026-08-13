@@ -10,11 +10,11 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { compareRuns, QUANT_NEUTRALITY_NOTE } from "../extensions/workbench-runtime/core/compare.ts";
+import { compareRuns, QUANT_NEUTRALITY_NOTE, type RunComparison } from "../extensions/workbench-runtime/core/compare.ts";
 import { runGates } from "../extensions/workbench-runtime/core/gate-engine.ts";
 import { runRecipe } from "../extensions/workbench-runtime/core/recipe-runner.ts";
 import { renderCompareLines } from "../extensions/workbench-runtime/core/render.ts";
@@ -122,6 +122,16 @@ test("generic comparison diffs exit code, duration and artifacts", async () => {
 		assert.equal(r.generic.test_counts, null);
 		assert.equal(r.quant, null);
 		assert.ok(r.notes.some((n) => n.includes("neither run has a valid quant-result artifact")));
+		assert.match(outcome.comparison_id, /^cmp1-[0-9a-f]{64}$/);
+		assert.equal(r.comparison_id, outcome.comparison_id);
+		assert.equal(r.comparison_path, outcome.comparison_path);
+		assert.equal(
+			outcome.comparison_path,
+			`.pi/workbench/comparisons/${outcome.comparison_id}/comparison.json`,
+		);
+		const persisted = JSON.parse(await readFile(join(dir, outcome.comparison_path), "utf8")) as Record<string, unknown>;
+		assert.equal(persisted.comparison_id, outcome.comparison_id);
+		assert.deepEqual((persisted.report as RunComparison).generic.exit_code, r.generic.exit_code);
 	});
 });
 
@@ -172,6 +182,11 @@ test("comparing a run to itself yields zero deltas", async () => {
 		assert.equal(outcome.report.generic.exit_code.changed, false);
 		assert.equal(outcome.report.generic.duration_ms.changed, false);
 		assert.deepEqual(outcome.report.generic.artifact_metrics, []);
+		const replay = await compareRuns(dir, a, a);
+		assert.ok(replay.ok);
+		if (!replay.ok) return;
+		assert.equal(replay.comparison_id, outcome.comparison_id);
+		assert.equal(replay.comparison_path, outcome.comparison_path);
 	});
 });
 
@@ -264,6 +279,7 @@ test("quant comparison diffs benchmark, return, drawdown, turnover, costs, folds
 		assert.deepEqual(q.parameters.map((p) => p.field), ["lookback"]);
 		assert.equal(q.parameters[0]?.a, 20);
 		assert.equal(q.parameters[0]?.b, 30);
+		assert.deepEqual(outcome.report.generic.artifact_metrics, [], "gate authority records are not domain metric snapshots");
 		assert.ok(outcome.report.notes.length === 0, "fully compatible comparison must not invent notes");
 	});
 });

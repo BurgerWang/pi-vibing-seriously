@@ -102,7 +102,7 @@ recipes:
 /q-gate q1,q2        # a chain; prerequisites resolve first
 ```
 
-Gates form a ladder: B0-B5 (every profile) and Q0-Q5 (quant-research
+Gates form a ladder: B0-B6 (every profile) and Q0-Q5 (quant-research
 profiles). A non-PASS blocking prerequisite BLOCKs its dependents. Manual
 checks take evidence through `manual:<check-id>=<note>`; that evidence is
 recorded as type `manual` only — model prose can never masquerade as machine
@@ -126,8 +126,13 @@ verification.
 | Mode | Tools | Blocked |
 | ---- | ----- | ------- |
 | AUDIT | read, grep, find, ls + read-only workbench tools | bash, edit, write, workbench_run_recipe, workbench_run_gate |
-| DEV | full local dev tool set + all workbench tools | destructive commands (see below), protected-path writes |
+| DEV | strict commander: fixed 15-tool allowlist; an active user-issued lease may add only edit/write. Workers: bounded tools on parent-approved paths | commander bash/foreign tools/direct writes without a lease; worker free bash, recursive delegation, out-of-scope writes, final gates |
 | VERIFY | read, grep, find, ls + all workbench tools | bash, edit, write (recipes only) |
+
+In DEV, the GPT-5.6 Sol commander delegates routine writes and runs project
+commands through declared recipes. A temporary commander lease is bounded by
+calls, time, and project-relative paths and never enables bash; worker
+edit/write calls remain limited to the parent-approved path contract.
 
 The mode is stored in a Pi custom session entry and restored on every
 session start — including `/resume`, `/fork`, `/clone`, `/reload`, and

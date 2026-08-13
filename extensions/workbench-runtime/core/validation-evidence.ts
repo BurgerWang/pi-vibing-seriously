@@ -30,7 +30,10 @@
  * full worker-first facts never appear in the block.
  *
  * Collection is STRICTLY fail-closed: every known lockfile and every
- * relevant workbench config path must be inspectable WHEN PRESENT.
+ * relevant workbench config path must be inspectable WHEN PRESENT. Gate-run
+ * capture is the deliberate exception for gates.yaml itself: it MUST receive
+ * the digest of the bounded stable snapshot that selected/executed the run,
+ * and never reopens that mutable pathname during binding capture.
  * Absence is PROVEN with lstat: a genuine ENOENT stays a deterministic
  * "missing" marker ONLY when the path itself is absent — a dangling
  * symlink or any other existing path (symlink, directory, unreadable,
@@ -78,6 +81,20 @@ import type { WorkerFirstGateFacts } from "./gate-schema.ts";
 
 export const VALIDATION_EVIDENCE_SCHEMA_VERSION = 1;
 export const VALIDATION_BINDING_SCHEMA_VERSION = 1;
+
+/**
+ * One already-proven workbench-config snapshot supplied by an authority
+ * reader. Gate execution uses this for gates.yaml so validation capture binds
+ * the exact bytes that selected/executed the gates without reopening the
+ * pathname after evaluation. The path and key are both carried explicitly so
+ * a misplaced digest cannot silently substitute for another config file.
+ */
+export interface TrustedWorkbenchConfigFileDigest {
+	key: "gates.yaml";
+	path: string;
+	/** SHA-256 of the exact stable bytes, or the proven-absent marker. */
+	digest: string;
+}
 
 /** Bounded capture-failure reason persisted as `unavailable_reason`. */
 export const MAX_UNAVAILABLE_REASON_CHARS = 500;
@@ -622,14 +639,43 @@ async function collectLockfileHashesStrict(projectRoot: string): Promise<Record<
 /**
  * Hash the relevant workbench config files under
  * <root>/<CONFIG_DIR_NAME>/workbench (Pi's official config dir name; same
- * files and marker semantics as the P6-C action-key config hash). Absence
+ * files and marker semantics as the P6-C action-key config hash). An explicit
+ * trusted gates.yaml digest substitutes ONLY for that exact key/path; all
+ * other files retain the strict filesystem collection below. Absence
  * is PROVEN with lstat: a genuine ENOENT is the only "missing" marker; any
  * EXISTING path that is not a provable regular file (symlink — dangling or
  * resolving — directory, unreadable, I/O error) THROWS (fail closed).
  */
-async function collectWorkbenchConfigHashStrict(projectRoot: string): Promise<string> {
+async function collectWorkbenchConfigHashStrict(
+	projectRoot: string,
+	trustedFile?: TrustedWorkbenchConfigFileDigest,
+): Promise<string> {
+	if (trustedFile !== undefined) {
+		if (!isRecord(trustedFile)) {
+			throw new Error("trusted workbench config digest must be an object");
+		}
+		const keys = Object.keys(trustedFile).sort();
+		if (keys.length !== 3 || keys[0] !== "digest" || keys[1] !== "key" || keys[2] !== "path") {
+			throw new Error("trusted workbench config digest must contain exactly digest, key and path");
+		}
+		if (trustedFile.key !== "gates.yaml") {
+			throw new Error("trusted workbench config digest key must be gates.yaml");
+		}
+		const expectedPath = join(projectRoot, CONFIG_DIR_NAME, "workbench", "gates.yaml");
+		if (trustedFile.path !== expectedPath) {
+			throw new Error("trusted workbench config digest path does not exactly match project gates.yaml");
+		}
+		if (trustedFile.digest !== "missing" && !HASH_RE.test(trustedFile.digest)) {
+			throw new Error("trusted workbench config digest must be missing or a SHA-256 hash");
+		}
+	}
+
 	const parts: Record<string, string> = {};
 	for (const file of WORKBENCH_CONFIG_FILES) {
+		if (trustedFile !== undefined && file === trustedFile.key) {
+			parts[file] = trustedFile.digest;
+			continue;
+		}
 		const path = join(projectRoot, CONFIG_DIR_NAME, "workbench", file);
 		let info: Stats;
 		try {
@@ -841,6 +887,12 @@ export interface CaptureGateValidationInput {
 	/** effective gate ids actually evaluated (dependency order). */
 	effectiveGates: readonly string[];
 	projectGates: readonly unknown[];
+	/**
+	 * Exact digest from the bounded stable gates.yaml snapshot used for this
+	 * run. Required (including the explicit `missing` marker): gate capture
+	 * never falls back to reopening gates.yaml after execution.
+	 */
+	trustedConfigFileDigest: TrustedWorkbenchConfigFileDigest;
 	manualEvidence: Readonly<Record<string, string>>;
 	workerFirstFacts?: WorkerFirstGateFacts;
 	/** gateId → status only (sources/run ids are dropped by the hash). */
@@ -857,10 +909,13 @@ export interface CaptureGateValidationInput {
  */
 export async function captureGateValidationEvidence(input: CaptureGateValidationInput): Promise<CaptureValidationResult> {
 	try {
+		if (input.trustedConfigFileDigest === undefined) {
+			throw new Error("gate validation capture requires the trusted gates.yaml snapshot digest");
+		}
 		const facts = await collectGitFacts(input.projectRoot, input.exec);
 		const diffHash = await collectCompleteDiffHash(input.projectRoot, facts);
 		const lockfiles = await collectLockfileHashesStrict(input.projectRoot);
-		const configHash = await collectWorkbenchConfigHashStrict(input.projectRoot);
+		const configHash = await collectWorkbenchConfigHashStrict(input.projectRoot, input.trustedConfigFileDigest);
 		const binding: ValidationBinding = {
 			schema_version: VALIDATION_BINDING_SCHEMA_VERSION,
 			kind: "gate",

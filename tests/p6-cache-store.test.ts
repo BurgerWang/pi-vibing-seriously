@@ -4,12 +4,14 @@
  */
 
 import assert from "node:assert/strict";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 
 import {
 	CacheStore,
+	DEFAULT_MAX_TELEMETRY_BYTES,
+	MAX_TELEMETRY_RECORD_BYTES,
 	hasForbiddenTelemetryFields,
 } from "../extensions/workbench-runtime/cache/cache-store.ts";
 import { withTempDir } from "./helpers.ts";
@@ -68,6 +70,50 @@ test("missing telemetry file reads as zero records without error", async () => {
 		const { records, skipped } = await store.readRecords();
 		assert.equal(records.length, 0);
 		assert.equal(skipped, 0);
+	});
+});
+
+test("oversized and non-regular telemetry sources are rejected before allocation", async () => {
+	await withTempDir(async (dir) => {
+		const allocations: number[] = [];
+		const reads: number[] = [];
+		const store = new CacheStore(dir, {
+			boundedReadHooks: {
+				onBufferAllocate: (bytes) => allocations.push(bytes),
+				beforeRead: (bytes) => reads.push(bytes),
+			},
+		});
+		await mkdir(store.cacheDir(), { recursive: true });
+		const handle = await open(store.telemetryPath(), "w");
+		try { await handle.truncate(DEFAULT_MAX_TELEMETRY_BYTES + MAX_TELEMETRY_RECORD_BYTES + 1); }
+		finally { await handle.close(); }
+		assert.deepEqual(await store.readRecords(), { records: [], skipped: 0, unavailable: "source_oversized" });
+		assert.deepEqual(allocations, [], "oversized telemetry is rejected before allocation");
+		assert.deepEqual(reads, [], "oversized telemetry is rejected before read");
+
+		await writeFile(store.telemetryPath(), "", "utf8");
+		const directoryRoot = join(dir, "directory-source");
+		const directoryAllocations: number[] = [];
+		const directoryReads: number[] = [];
+		const directoryStore = new CacheStore(directoryRoot, {
+			boundedReadHooks: {
+				onBufferAllocate: (bytes) => directoryAllocations.push(bytes),
+				beforeRead: (bytes) => directoryReads.push(bytes),
+			},
+		});
+		await mkdir(directoryStore.telemetryPath(), { recursive: true });
+		assert.deepEqual(await directoryStore.readRecords(), { records: [], skipped: 0, unavailable: "source_not_regular" });
+		assert.deepEqual(directoryAllocations, [], "non-regular telemetry is rejected before allocation");
+		assert.deepEqual(directoryReads, [], "non-regular telemetry is rejected before read");
+	});
+});
+
+test("a single telemetry record has a fixed 64 KiB hard cap before disk write", async () => {
+	await withTempDir(async (dir) => {
+		const store = new CacheStore(dir);
+		const result = await store.appendRecord({ safeField: "x".repeat(MAX_TELEMETRY_RECORD_BYTES) });
+		assert.deepEqual(result, { ok: false, error: "refused: telemetry record exceeds the fixed 65536-byte limit" });
+		assert.equal(await store.telemetryBytes(), 0, "refused records never touch telemetry.jsonl");
 	});
 });
 

@@ -853,14 +853,16 @@ function assertNumericOnlyProgress(updates: Array<Record<string, unknown>>, forb
 	for (const update of updates) {
 		const band = update.spendBand;
 		assert.ok(band === "ok" || band === "soft" || band === "hard", `spendBand is only ok|soft|hard, got ${String(band)}`);
-		for (const key of ["turns", "totalTokens", "outputTokens"]) {
+		for (const key of [
+			"turns", "totalTokens", "outputTokens", "currentToolTextBytes", "collapsedToolResults", "turnReservedBytes",
+		]) {
 			const value = update[key];
 			assert.ok(typeof value === "number" && Number.isFinite(value), `${key} is a finite number, got ${String(value)}`);
 		}
 	}
 }
 
-test("progress callbacks expose exactly turns/totalTokens/outputTokens/spendBand and provider/model — never lastText or worker text", async () => {
+test("progress callbacks expose spend and output-control numeric facts plus provider/model — never lastText or worker text", async () => {
 	const first = assistantEvent({ content: [{ type: "text", text: "working" }], stopReason: "toolUse" });
 	const final = assistantEvent({ content: [{ type: "text", text: "## Completed\nfinal report body" }] });
 	const updates: Array<Record<string, unknown>> = [];
@@ -885,8 +887,8 @@ test("progress callbacks expose exactly turns/totalTokens/outputTokens/spendBand
 	for (const update of updates) {
 		assert.equal(
 			Object.keys(update).sort().join(","),
-			"model,outputTokens,provider,spendBand,totalTokens,turns",
-			"WorkerProgress exposes exactly turns/totalTokens/outputTokens/spendBand/provider/model",
+			"collapsedToolResults,currentToolTextBytes,model,outputTokens,provider,spendBand,totalTokens,turnReservedBytes,turns",
+			"WorkerProgress exposes only fixed spend/output-control numbers and provider/model",
 		);
 		assert.ok(!("lastText" in update), "lastText is removed from progress");
 	}
@@ -898,6 +900,9 @@ test("progress callbacks expose exactly turns/totalTokens/outputTokens/spendBand
 		totalTokens: 35,
 		outputTokens: 5,
 		spendBand: "ok",
+		currentToolTextBytes: 0,
+		collapsedToolResults: 0,
+		turnReservedBytes: 0,
 		provider: "deepseek",
 		model: "deepseek-v4-flash",
 	});
@@ -906,6 +911,9 @@ test("progress callbacks expose exactly turns/totalTokens/outputTokens/spendBand
 		totalTokens: 70,
 		outputTokens: 10,
 		spendBand: "ok",
+		currentToolTextBytes: 0,
+		collapsedToolResults: 0,
+		turnReservedBytes: 0,
 		provider: "deepseek",
 		model: "deepseek-v4-flash",
 	});
@@ -941,6 +949,9 @@ test("progress counters stay finite and normalized under cacheRead fallback and 
 		totalTokens: 35,
 		outputTokens: 5,
 		spendBand: "ok",
+		currentToolTextBytes: 0,
+		collapsedToolResults: 0,
+		turnReservedBytes: 0,
 		provider: "deepseek",
 		model: "deepseek-v4-flash",
 	});
@@ -949,6 +960,9 @@ test("progress counters stay finite and normalized under cacheRead fallback and 
 		totalTokens: 40,
 		outputTokens: 5,
 		spendBand: "ok",
+		currentToolTextBytes: 0,
+		collapsedToolResults: 0,
+		turnReservedBytes: 0,
 		provider: "deepseek",
 		model: "deepseek-v4-flash",
 	});

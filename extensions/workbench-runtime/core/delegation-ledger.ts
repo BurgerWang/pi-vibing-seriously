@@ -53,7 +53,7 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { open, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { open, mkdir, rename, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
@@ -69,6 +69,7 @@ import type {
 	WorkerSpendState,
 } from "./worker-spend.ts";
 import { resolveWorkerBudgetProfile, resolveWorkerRepairOf } from "./worker-policy.ts";
+import { readJsonFileBounded, type BoundedFileIoHooks } from "./bounded-file-io.ts";
 import {
 	MAX_WORKER_REPORT_BYTES,
 	parseWorkerReport,
@@ -80,6 +81,8 @@ import {
 } from "../worker/handoff.ts";
 
 export const DELEGATION_SCHEMA_VERSION = 1;
+/** Every JSON authority record in one delegation ledger is size-preflighted before allocation. */
+export const DELEGATION_RECORD_MAX_BYTES = 1_048_576 as const;
 
 export const DELEGATION_ID_RE = /^\d{8}-\d{6}-[A-Za-z0-9]{4}$/;
 
@@ -818,10 +821,10 @@ export async function writeTextAtomic(dir: string, fileName: string, text: strin
 	await rename(tmp, join(dir, fileName));
 }
 
-async function readJson<T>(dir: string, fileName: string): Promise<T | null> {
+async function readJson<T>(dir: string, fileName: string, hooks?: BoundedFileIoHooks): Promise<T | null> {
 	try {
-		const raw = await readFile(join(dir, fileName), "utf8");
-		return JSON.parse(raw) as T;
+		const read = await readJsonFileBounded<T>(join(dir, fileName), DELEGATION_RECORD_MAX_BYTES, hooks);
+		return read.ok ? read.value.value : null;
 	} catch {
 		return null;
 	}
@@ -1157,15 +1160,16 @@ export async function finishDelegationLedger(
  * when the id is invalid or any core record is missing/corrupt. review.json
  * is owned by core/diff-review.ts.
  */
-export async function readDelegationLedger(projectRoot: string, delegationId: string): Promise<DelegationLedger | null> {
+export async function readDelegationLedger(projectRoot: string, delegationId: string, hooks?: BoundedFileIoHooks): Promise<DelegationLedger | null> {
 	if (!isValidDelegationId(delegationId)) return null;
 	const dir = delegationDirFor(projectRoot, delegationId);
-	const manifest = await readJson<DelegationManifest>(dir, "manifest.json");
-	const before = await readJson<LedgerBeforeRecord>(dir, "before.json");
-	if (!manifest || !before || manifest.delegation_id !== delegationId || before.delegation_id !== delegationId) return null;
-	const after = await readJson<LedgerAfterRecord>(dir, "after.json");
-	const workerSummary = await readJson<LedgerWorkerSummaryRecord>(dir, "worker-summary.json");
+	const manifest = await readJson<DelegationManifest>(dir, "manifest.json", hooks);
+	if (!manifest || manifest.delegation_id !== delegationId) return null;
+	const before = await readJson<LedgerBeforeRecord>(dir, "before.json", hooks);
+	if (!before || before.delegation_id !== delegationId) return null;
+	const after = await readJson<LedgerAfterRecord>(dir, "after.json", hooks);
 	if (after && after.delegation_id !== delegationId) return null;
+	const workerSummary = await readJson<LedgerWorkerSummaryRecord>(dir, "worker-summary.json", hooks);
 	if (workerSummary && workerSummary.delegation_id !== delegationId) return null;
 	return { manifest, before, after, workerSummary };
 }

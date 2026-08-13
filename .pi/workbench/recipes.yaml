@@ -17,6 +17,195 @@
 #   .pi/workbench/cache/{actions,cas,locks,tmp,cache-index.json}
 
 recipes:
+  - name: read-v3-test
+    description: R4 native read v3 focused integration tests
+    command: [npm, run, test:read-v3]
+    cwd: .
+    timeout_ms: 300000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: []
+    mutation: none
+    artifacts: []
+    environment: []
+    output_strategy: tail
+    max_lines: 300
+    max_bytes: 30720
+    cache:
+      enabled: true
+      version: 1
+      mode: result-only
+      successOnly: true
+      inputs:
+        - package.json
+        - package-lock.json
+        - tsconfig.json
+        - .pi/workbench/recipes.yaml
+        - extensions/**/*.ts
+        - tests/helpers.ts
+        - tests/native-tool-policy.test.ts
+        - tests/native-tool-wiring.test.ts
+        - tests/read-v3.test.ts
+      outputs: []
+      environment: []
+      toolchain: [node, npm]
+      maxAgeSeconds: null
+
+  - name: context-output-integration-test
+    description: R2-R8 output-control runtime wiring, native read v3, run-log paging, bounded renderers, and worker integration tests
+    command: [npm, run, test:context-output-integration]
+    cwd: .
+    timeout_ms: 600000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: []
+    mutation: none
+    artifacts: []
+    environment: []
+    output_strategy: tail
+    max_lines: 300
+    max_bytes: 30720
+    cache:
+      enabled: true
+      version: 5
+      mode: result-only
+      successOnly: true
+      inputs:
+        - package.json
+        - package-lock.json
+        - tsconfig.json
+        - .pi/workbench/recipes.yaml
+        - extensions/**/*.ts
+        - extensions/workbench-runtime/core/compare.ts
+        - extensions/workbench-runtime/core/comparison-record.ts
+        - extensions/workbench-runtime/core/details-projection.ts
+        - extensions/workbench-runtime/core/context-history-budget.ts
+        - extensions/workbench-runtime/core/diff-review.ts
+        - extensions/workbench-runtime/core/render.ts
+        - extensions/workbench-runtime/ui/tool-renderers.ts
+        - tests/helpers.ts
+        - tests/output-control-wiring.test.ts
+        - tests/read-v3.test.ts
+        - tests/read-run-log-page.test.ts
+        - tests/compare-output-bounds.test.ts
+        - tests/gate-output-bounds.test.ts
+        - tests/context-output-worker.test.ts
+      outputs: []
+      environment: []
+      toolchain: [node, npm]
+      maxAgeSeconds: null
+
+  - name: context-output-core-test
+    description: R1-R8 context-output envelope, turn-budget, cursor, bounded-I/O, details/history projection, and numeric telemetry focused tests - cached result-only development feedback
+    command: [npm, run, test:context-output-core]
+    cwd: .
+    timeout_ms: 300000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: []
+    mutation: none
+    artifacts: []
+    environment: []
+    output_strategy: tail
+    max_lines: 200
+    max_bytes: 20480
+    cache:
+      enabled: true
+      version: 4
+      mode: result-only
+      successOnly: true
+      inputs:
+        - package.json
+        - package-lock.json
+        - tsconfig.json
+        - .pi/workbench/recipes.yaml
+        - extensions/workbench-runtime/core/output-policy.ts
+        - extensions/workbench-runtime/core/output-envelope.ts
+        - extensions/workbench-runtime/core/turn-output-budget.ts
+        - extensions/workbench-runtime/core/continuation-cursor.ts
+        - extensions/workbench-runtime/core/bounded-file-io.ts
+        - extensions/workbench-runtime/core/details-projection.ts
+        - extensions/workbench-runtime/core/context-history-budget.ts
+        - extensions/workbench-runtime/core/output-control-telemetry.ts
+        - tests/output-envelope.test.ts
+        - tests/turn-output-budget.test.ts
+        - tests/continuation-cursor.test.ts
+        - tests/bounded-file-io.test.ts
+        - tests/details-projection.test.ts
+        - tests/context-history-budget.test.ts
+        - tests/output-control-telemetry.test.ts
+      outputs: []
+      environment: []
+      toolchain: [node, npm]
+      maxAgeSeconds: null
+
+  - name: context-output-baseline-test
+    description: R0 context-output hard-cap baseline tests - cached result-only focused feedback
+    command: [npm, run, test:context-output-baseline]
+    cwd: .
+    timeout_ms: 300000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: []
+    mutation: none
+    artifacts: []
+    environment: []
+    output_strategy: tail
+    max_lines: 200
+    max_bytes: 20480
+    cache:
+      enabled: true
+      version: 2
+      mode: result-only
+      successOnly: true
+      inputs:
+        - package.json
+        - package-lock.json
+        - tsconfig.json
+        - .pi/workbench/recipes.yaml
+        - extensions/**/*.ts
+        - tests/helpers.ts
+        - tests/context-output-baseline.test.ts
+        - scripts/context-output-benchmark.ts
+      outputs: []
+      environment: []
+      toolchain: [node, npm]
+      maxAgeSeconds: null
+
+  - name: context-output-benchmark
+    description: R9 offline context-output benchmark - uncached final machine evidence; its bounded summary is not acceptance evidence
+    command: [npm, run, benchmark:context-output]
+    cwd: .
+    timeout_ms: 300000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes:
+      - .pi/workbench/runs/context-output-benchmark/context-output-benchmark.json
+    mutation: artifacts
+    artifacts:
+      - .pi/workbench/runs/context-output-benchmark/context-output-benchmark.json
+    environment: []
+    output_strategy: tail
+    max_lines: 200
+    max_bytes: 20480
+
+  - name: context-output-stress
+    description: R9 uncached context-output stress suite with persisted hard-cap, RSS, active-history, worker, and sanitizer evidence; its bounded summary is not acceptance evidence
+    command: [npm, run, test:context-output-stress]
+    cwd: .
+    timeout_ms: 900000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes:
+      - .pi/workbench/runs/context-output-stress/context-output-evidence.json
+    mutation: artifacts
+    artifacts:
+      - .pi/workbench/runs/context-output-stress/context-output-evidence.json
+    environment: []
+    output_strategy: tail
+    max_lines: 300
+    max_bytes: 30720
+
   - name: typecheck
     description: TypeScript typecheck (tsc --noEmit) — cached (result-only)
     validation_components: [typecheck]
@@ -301,12 +490,11 @@ recipes:
     max_bytes: 20480
     cache:
       enabled: true
-      version: 1
+      version: 2
       mode: result-only
       successOnly: true
-      # Exactly the release-asset closure: package/lock/tsconfig, the test
-      # file itself, LICENSE, README.md, the banner, its generator and the
-      # EXTENSION_VERSION source the test pins against package.json.
+      # Exactly the release-asset closure: version/compatibility, public
+      # release docs, ctx1 gate, banner/generator and EXTENSION_VERSION.
       inputs:
         - package.json
         - package-lock.json
@@ -314,9 +502,15 @@ recipes:
         - tests/release-assets.test.ts
         - LICENSE
         - README.md
+        - CHANGELOG.md
         - assets/banner.svg
         - tools/make-banner.mjs
         - extensions/workbench-runtime/cache/cache-types.ts
+        - compatibility/pi.json
+        - .pi/workbench/gates.yaml
+        - docs/context-output-control-plane.md
+        - docs/compatibility.md
+        - docs/cache/stable-prefix-contract.md
       outputs: []
       environment: []
       toolchain: [node, npm]

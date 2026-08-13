@@ -16,25 +16,35 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdir, readFile, readdir, symlink, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join, sep } from "node:path";
+import { parse as parseYaml } from "yaml";
 
 import {
 	GateSetupError,
+	GATE_AUTHORITY_PERSISTENCE_ERROR,
+	GATE_AUTHORITY_RECORD_MAX_BYTES,
+	GATE_CONFIG_MAX_BYTES,
+	GATE_CONFIG_READ_ERROR,
+	GATE_JSON_ARTIFACT_MAX_BYTES,
 	fileCheckRoot,
 	latestGateStatus,
 	loadGates,
 	preflightGateManualEvidence,
+	readPersistedGateRunFacts,
 	runGates,
 	type CheckContext,
 } from "../extensions/workbench-runtime/core/gate-engine.ts";
+import { readGateFileRecord } from "../extensions/workbench-runtime/core/report.ts";
 import { readManifest } from "../extensions/workbench-runtime/core/runs.ts";
 import type { ValidationEvidenceBlock } from "../extensions/workbench-runtime/core/validation-evidence.ts";
+import { gateStateHash } from "../extensions/workbench-runtime/core/validation-evidence.ts";
 import type { ExecFn } from "../extensions/workbench-runtime/core/config.ts";
 import { BASE_GATES } from "../extensions/workbench-runtime/core/gate-catalog.ts";
 import { runRecipe } from "../extensions/workbench-runtime/core/recipe-runner.ts";
 import type { GateCheck, WorkerFirstGateFacts } from "../extensions/workbench-runtime/core/gate-schema.ts";
 import { makeValidQuantResult, spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
+import { canonicalHash, sha256Hex } from "../extensions/workbench-runtime/cache/canonical-hash.ts";
 
 const CONFIG_CHECK = "      - { id: g1.1, title: Config, kind: config }";
 
@@ -238,6 +248,90 @@ test("json equals and any_of_paths checks", async () => {
 		const result = await runGates({ projectRoot: dir, selector: "g1,g2", mode: "DEV", exec: spawnExec });
 		assert.equal(result.gates[0]!.status, "PASS");
 		assert.equal(result.gates[1]!.status, "PASS", "any_of_paths must pass when one path exists");
+	});
+});
+
+test("nested JSON mismatches persist only bounded digest/type/size facts", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(
+				`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Payload, kind: json, file: results/r.json, path: payload, equals: expected }`,
+			),
+		});
+		await mkdir(join(dir, "results"), { recursive: true });
+		const hostile = "x".repeat(900_000);
+		await writeFile(join(dir, "results", "r.json"), JSON.stringify({ payload: hostile }), "utf8");
+
+		const result = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
+		assert.equal(result.status, "FAIL");
+		const check = result.gates[0]!.checks[0]!;
+		assert.match(check.failure_reason ?? "", /type=string, json_bytes=10, sha256=[0-9a-f]{64}/);
+		assert.match(check.evidence[0]!.detail, /actual\(type=string, json_bytes=900002, sha256=[0-9a-f]{64}\)/);
+		assert.ok((check.failure_reason?.length ?? 0) < 256);
+		assert.ok(check.evidence[0]!.detail.length < 320);
+		assert.ok(!JSON.stringify(check).includes("x".repeat(256)), "hostile JSON content never enters failure/evidence authority");
+
+		const gatesJson = await readFile(join(result.runDir, "gates.json"), "utf8");
+		const evidenceJson = await readFile(join(result.runDir, "evidence.json"), "utf8");
+		assert.ok(Buffer.byteLength(gatesJson, "utf8") <= GATE_AUTHORITY_RECORD_MAX_BYTES);
+		assert.ok(Buffer.byteLength(evidenceJson, "utf8") <= GATE_AUTHORITY_RECORD_MAX_BYTES);
+		const manifest = await readManifest(dir, result.runId);
+		assert.ok(manifest);
+		assert.ok(await readPersistedGateRunFacts(dir, result.runId, manifest), "failed-run authority remains reconstructible");
+		assert.ok(await readGateFileRecord(dir, result.runId), "failed-run gates remain readable by the presentation reader");
+	});
+});
+
+test("gate JSON checks reject oversized/non-regular inputs before allocation and corrupt JSON with fixed bounded reasons", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(
+				`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Payload, kind: json, file: results/r.json, path: ok }`,
+			),
+		});
+		const artifact = join(dir, "results", "r.json");
+		await mkdir(join(dir, "results"), { recursive: true });
+
+		await writeFile(artifact, "x".repeat(GATE_JSON_ARTIFACT_MAX_BYTES + 1), "utf8");
+		const oversizedAllocations: number[] = [];
+		const oversized = await runGates({
+			projectRoot: dir,
+			selector: "g1",
+			mode: "DEV",
+			exec: spawnExec,
+			jsonFileReadHooks: { onBufferAllocate: (bytes) => oversizedAllocations.push(bytes) },
+		});
+		assert.equal(oversized.gates[0]!.status, "FAIL");
+		assert.match(oversized.gates[0]!.checks[0]!.failure_reason ?? "", /source_oversized \(maximum 1048576 bytes\)/);
+		assert.deepEqual(oversizedAllocations, [], "oversized JSON is rejected after stat and before Buffer allocation");
+
+		await rm(artifact);
+		await mkdir(artifact);
+		const nonRegularAllocations: number[] = [];
+		const nonRegular = await runGates({
+			projectRoot: dir,
+			selector: "g1",
+			mode: "DEV",
+			exec: spawnExec,
+			jsonFileReadHooks: { onBufferAllocate: (bytes) => nonRegularAllocations.push(bytes) },
+		});
+		assert.equal(nonRegular.gates[0]!.status, "FAIL");
+		assert.match(nonRegular.gates[0]!.checks[0]!.failure_reason ?? "", /source_not_regular/);
+		assert.deepEqual(nonRegularAllocations, [], "directories are rejected before Buffer allocation");
+
+		await rm(artifact, { recursive: true });
+		await writeFile(artifact, "{not-json", "utf8");
+		const corruptAllocations: number[] = [];
+		const corrupt = await runGates({
+			projectRoot: dir,
+			selector: "g1",
+			mode: "DEV",
+			exec: spawnExec,
+			jsonFileReadHooks: { onBufferAllocate: (bytes) => corruptAllocations.push(bytes) },
+		});
+		assert.equal(corrupt.gates[0]!.status, "FAIL");
+		assert.match(corrupt.gates[0]!.checks[0]!.failure_reason ?? "", /invalid JSON/);
+		assert.ok(corruptAllocations.length > 0, "bounded corrupt input is allocated only after size/type preflight");
 	});
 });
 
@@ -583,6 +677,144 @@ test("invalid gates.yaml aborts the run with a setup error", async () => {
 	});
 });
 
+test("gate config uses a fixed same-handle UTF-8 read cap before YAML parsing", async () => {
+	await withTempDir(async (dir) => {
+		const normal = gatesYaml(`  - id: g1\n    title: G1\n    checks:\n${CONFIG_CHECK}`);
+		await setupProject(dir, { gatesYaml: normal });
+		const gatePath = join(dir, ".pi", "workbench", "gates.yaml");
+
+		const normalAllocations: number[] = [];
+		const normalStats: number[] = [];
+		const loaded = await loadGates(dir, {
+			afterInitialStat: (source) => {
+				normalStats.push(source.fileSize);
+			},
+			onBufferAllocate: (bytes) => normalAllocations.push(bytes),
+		});
+		assert.ok(loaded.some((gate) => gate.id === "g1"), "a normal bounded project gate remains loadable");
+		assert.deepEqual(normalStats, [Buffer.byteLength(normal, "utf8")], "the opened handle is statted before allocation");
+		assert.deepEqual(normalAllocations, [Buffer.byteLength(normal, "utf8")]);
+
+		const sparse = await open(gatePath, "w");
+		try {
+			await sparse.truncate(GATE_CONFIG_MAX_BYTES + 1);
+		} finally {
+			await sparse.close();
+		}
+		const oversizedAllocations: number[] = [];
+		await assert.rejects(
+			loadGates(dir, { onBufferAllocate: (bytes) => oversizedAllocations.push(bytes) }),
+			(error) => error instanceof GateSetupError && error.message === GATE_CONFIG_READ_ERROR,
+		);
+		assert.deepEqual(oversizedAllocations, [], "oversized sparse gate config is rejected before allocation");
+		const runOversizedAllocations: number[] = [];
+		await assert.rejects(
+			runGates({
+				projectRoot: dir,
+				selector: "g1",
+				mode: "DEV",
+				exec: spawnExec,
+				gateConfigReadHooks: { onBufferAllocate: (bytes) => runOversizedAllocations.push(bytes) },
+			}),
+			(error) => error instanceof GateSetupError && error.message === GATE_CONFIG_READ_ERROR,
+		);
+		assert.deepEqual(runOversizedAllocations, [], "formal gate selection also rejects oversized config before allocation");
+
+		await rm(gatePath);
+		await mkdir(gatePath);
+		const nonRegularAllocations: number[] = [];
+		await assert.rejects(
+			loadGates(dir, { onBufferAllocate: (bytes) => nonRegularAllocations.push(bytes) }),
+			(error) => error instanceof GateSetupError && error.message === GATE_CONFIG_READ_ERROR,
+		);
+		assert.deepEqual(nonRegularAllocations, [], "non-regular gate config is rejected before allocation");
+
+		await rm(gatePath, { recursive: true });
+		await writeFile(gatePath, Buffer.from([0x67, 0x61, 0x80]));
+		const invalidUtf8Allocations: number[] = [];
+		await assert.rejects(
+			loadGates(dir, { onBufferAllocate: (bytes) => invalidUtf8Allocations.push(bytes) }),
+			(error) => error instanceof GateSetupError && error.message === GATE_CONFIG_READ_ERROR,
+		);
+		assert.deepEqual(invalidUtf8Allocations, [3], "bounded bytes are allocated only after type/size preflight");
+
+		await writeFile(gatePath, normal, "utf8");
+		let mutationHookCalls = 0;
+		await assert.rejects(
+			loadGates(dir, {
+				afterRead: async () => {
+					mutationHookCalls += 1;
+					await writeFile(gatePath, `${normal}# changed during read\n`, "utf8");
+				},
+			}),
+			(error) => error instanceof GateSetupError && error.message === GATE_CONFIG_READ_ERROR,
+		);
+		assert.equal(mutationHookCalls, 1, "the post-read stat checks the same opened handle");
+	});
+});
+
+test("gate selection, project config and validation binding share one bounded gates.yaml snapshot", async () => {
+	await withTempDir(async (dir) => {
+		const original = gatesYaml(`  - id: g1\n    title: Original G1\n    checks:\n${CONFIG_CHECK}`);
+		const replacement = "x".repeat(GATE_CONFIG_MAX_BYTES + 1);
+		await setupProject(dir, { gatesYaml: original });
+		await gitBacked(dir);
+		const gatePath = join(dir, ".pi", "workbench", "gates.yaml");
+		const allocations: number[] = [];
+		let stableSnapshots = 0;
+
+		const result = await runGates({
+			projectRoot: dir,
+			selector: "g1",
+			mode: "DEV",
+			exec: spawnExec,
+			gateConfigReadHooks: {
+				onBufferAllocate: (bytes) => allocations.push(bytes),
+				afterStableSnapshot: async () => {
+					stableSnapshots += 1;
+					// Replace the pathname only AFTER the authoritative open handle was
+					// read and verified. Any generic second gates.yaml read would observe
+					// an oversized foreign snapshot and split or exhaust binding capture.
+					await writeFile(gatePath, replacement, "utf8");
+				},
+			},
+		});
+
+		assert.equal(stableSnapshots, 1);
+		assert.deepEqual(allocations, [Buffer.byteLength(original, "utf8")], "exactly one bounded gate-config buffer is allocated");
+		assert.equal(result.ok, true);
+		assert.deepEqual(result.requested, ["g1"]);
+		assert.deepEqual(result.gates.map((gate) => gate.id), ["g1"], "execution uses the original stable snapshot");
+
+		const manifest = (await readRunFile(result.runDir, "manifest.json")) as { validation_evidence: ValidationEvidenceBlock };
+		const binding = manifest.validation_evidence.binding;
+		assert.ok(binding, manifest.validation_evidence.unavailable_reason ?? "validation binding unavailable");
+		const originalDoc = parseYaml(original) as { gates: unknown[] };
+		const expectedOriginalHash = gateStateHash({
+			profile: "generic",
+			projectGates: originalDoc.gates,
+			manualEvidence: {},
+			prerequisiteStatus: {},
+		});
+		assert.equal(binding.gate_state_hash, expectedOriginalHash, "binding hashes the exact project-gate snapshot that executed");
+		assert.equal(
+			binding.config_hash,
+			canonicalHash({
+				"project.yaml": sha256Hex("name: test-project\nprofile: generic\n"),
+				"recipes.yaml": "missing",
+				"gates.yaml": sha256Hex(original),
+				"profiles.yaml": "missing",
+			}),
+			"config binding reuses the first stable gates.yaml bytes even after the pathname becomes oversized",
+		);
+		assert.deepEqual(
+			allocations,
+			[Buffer.byteLength(original, "utf8")],
+			"validation capture performs no later gates.yaml allocation after the original bounded snapshot",
+		);
+	});
+});
+
 // ---------------------------------------------------------------------------
 // Persistence
 // ---------------------------------------------------------------------------
@@ -657,6 +889,88 @@ test("repeated runs produce independent run ids", async () => {
 		assert.notEqual(first.runId, second.runId);
 		assert.notEqual(first.runDir, second.runDir);
 		assert.equal(await latestGateStatus(dir, "g1").then((s) => s?.run_id), second.runId, "the latest status must come from the newest run");
+	});
+});
+
+test("persisted gate/evidence authority readers preflight size/type before allocation and fail closed on corruption", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(
+				`  - id: g1\n    title: G1\n    checks:\n${CONFIG_CHECK}`,
+			),
+		});
+		const result = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
+		const manifest = await readManifest(dir, result.runId);
+		assert.ok(manifest);
+		assert.ok(await readPersistedGateRunFacts(dir, result.runId, manifest), "normal authority records remain compatible");
+		assert.ok(await readGateFileRecord(dir, result.runId), "every successful gate record is accepted by the bounded presentation reader");
+		const gatesPath = join(result.runDir, "gates.json");
+		const evidencePath = join(result.runDir, "evidence.json");
+		const gatesOriginal = await readFile(gatesPath, "utf8");
+		const evidenceOriginal = await readFile(evidencePath, "utf8");
+		assert.ok(Buffer.byteLength(gatesOriginal, "utf8") <= GATE_AUTHORITY_RECORD_MAX_BYTES);
+		assert.ok(Buffer.byteLength(evidenceOriginal, "utf8") <= GATE_AUTHORITY_RECORD_MAX_BYTES);
+
+		await writeFile(gatesPath, "x".repeat(GATE_AUTHORITY_RECORD_MAX_BYTES + 1), "utf8");
+		const gatesAllocations: number[] = [];
+		assert.equal(
+			await readPersistedGateRunFacts(dir, result.runId, manifest, { gates: { onBufferAllocate: (bytes) => gatesAllocations.push(bytes) } }),
+			null,
+		);
+		assert.deepEqual(gatesAllocations, [], "oversized gates.json is rejected before allocation");
+		const latestAllocations: number[] = [];
+		assert.equal(await latestGateStatus(dir, "g1", { onBufferAllocate: (bytes) => latestAllocations.push(bytes) }), null);
+		assert.deepEqual(latestAllocations, [], "historical status reader also rejects oversized gates.json before allocation");
+
+		await writeFile(gatesPath, gatesOriginal, "utf8");
+		await writeFile(evidencePath, "x".repeat(GATE_AUTHORITY_RECORD_MAX_BYTES + 1), "utf8");
+		const evidenceAllocations: number[] = [];
+		assert.equal(
+			await readPersistedGateRunFacts(dir, result.runId, manifest, { evidence: { onBufferAllocate: (bytes) => evidenceAllocations.push(bytes) } }),
+			null,
+		);
+		assert.deepEqual(evidenceAllocations, [], "oversized evidence.json is rejected before allocation");
+
+		await writeFile(evidencePath, "{not-json", "utf8");
+		assert.equal(await readPersistedGateRunFacts(dir, result.runId, manifest), null, "corrupt evidence fails closed");
+		await writeFile(evidencePath, evidenceOriginal, "utf8");
+		await rm(gatesPath);
+		await mkdir(gatesPath);
+		const nonRegularAllocations: number[] = [];
+		assert.equal(
+			await readPersistedGateRunFacts(dir, result.runId, manifest, { gates: { onBufferAllocate: (bytes) => nonRegularAllocations.push(bytes) } }),
+			null,
+		);
+		assert.deepEqual(nonRegularAllocations, [], "non-regular gates.json is rejected before allocation");
+	});
+});
+
+test("large check/path volume fails closed before writing unreadable gate authority", async () => {
+	await withTempDir(async (dir) => {
+		const segmentA = "a".repeat(190);
+		const segmentB = "b".repeat(190);
+		const segmentC = "c".repeat(190);
+		const checks = Array.from({ length: 500 }, (_, index) => {
+			const paths = ["one", "two", "three"].map((variant) => `missing/${segmentA}/${segmentB}/${segmentC}/${variant}-${index}.json`);
+			return `      - { id: g1.${index + 1}, title: Path ${index + 1}, kind: file, any_of: [${paths.join(", ")}] }`;
+		}).join("\n");
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(`  - id: g1\n    title: Large path gate\n    checks:\n${checks}`),
+		});
+
+		await assert.rejects(
+			runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec }),
+			(error) => error instanceof GateSetupError && error.message === GATE_AUTHORITY_PERSISTENCE_ERROR,
+		);
+
+		const runRoot = join(dir, ".pi", "workbench", "runs");
+		const runIds = await readdir(runRoot);
+		assert.equal(runIds.length, 1, "evaluation may allocate one private run directory before final authority compilation");
+		const files = await readdir(join(runRoot, runIds[0]!));
+		assert.ok(files.includes("artifacts"));
+		assert.ok(!files.includes("gates.json"), "oversized complete gates facts are never silently truncated or persisted unreadably");
+		assert.ok(!files.includes("evidence.json"), "neither authority half is opened before both compiled records fit");
+		assert.ok(!files.includes("manifest.json"), "the rejected run is never advertised as a gate authority run");
 	});
 });
 

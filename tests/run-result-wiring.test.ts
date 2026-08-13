@@ -159,7 +159,7 @@ interface RecipeTool {
 interface ReadRunTool {
 	execute: (
 		toolCallId: string,
-		params: { run_id: string; include?: string; max_lines?: number; max_bytes?: number },
+		params: { run_id: string; include?: string; log_stream?: string; cursor?: string; max_lines?: number; max_bytes?: number },
 		signal: unknown,
 		onUpdate: unknown,
 		ctx: ExtensionContext,
@@ -339,7 +339,7 @@ test("workbench_read_run include=manifest: bounded cwd/argv metadata, no tails, 
 	});
 });
 
-test("workbench_read_run include=logs: caller-bounded tails only (default 200-line cap), metadata block, raw markers excluded from the tail boundary", async () => {
+test("workbench_read_run include=logs: shared quoted reverse page with bounded protocol", async () => {
 	await withTempDir(async (root) => {
 		await setupProject(root, GREEN_RECIPES);
 		await writeFile(join(root, "green.js"), GREEN_JS, "utf8");
@@ -353,22 +353,16 @@ test("workbench_read_run include=logs: caller-bounded tails only (default 200-li
 		const readRun = stub.tools.get("workbench_read_run") as unknown as ReadRunTool;
 		const result = await readRun.execute("call-2", { run_id: runId, include: "logs" }, undefined, undefined, trustedCtx(root) as never);
 		const text = toolText(result);
-		// the caller-bounded tail (default 200 lines) is appended after the metadata block
-		assert.ok(text.includes(`--- stdout tail (truncated): ${CONFIG_DIR_NAME}/workbench/runs/${runId}/stdout.log ---`), text);
+		assertWithinCaps(text, 20_480, 200);
+		assert.ok(text.includes("[workbench-run-log-page v1]"), text);
+		assert.ok(text.includes(`.pi/workbench/runs/${runId}/stdout.log`), text);
 		assert.ok(text.includes("noise-line-250"), "tail keeps the LAST log lines");
-		assert.ok(text.includes("noise-line-51"), "tail starts at the 200-line boundary (line 51 of 251)");
-		assert.ok(!text.includes("noise-line-50"), "earlier lines are outside the caller-bounded tail");
-		// exact-line matching: substring checks would false-positive on
-		// noise-line-10 … noise-line-19 (and 100 … 199) inside the tail
-		assert.ok(!text.split("\n").includes("noise-line-1"), "line 1 is outside the caller-bounded tail");
-		assert.ok(!text.split("\n").includes("RAW-SUCCESS-MARKER-42"), "the first line is outside the 200-line tail");
-		assert.ok(text.includes("--- stderr tail (full):"), text);
+		assert.ok(!text.split("\n").includes("| noise-line-1"), "oldest line is outside the reverse page");
+		assert.ok(!text.split("\n").includes("| RAW-SUCCESS-MARKER-42"), "the first line is outside the reverse page");
+		assert.ok(text.includes("--- BEGIN QUOTED STDERR CONTENT ---"), text);
 		assert.ok(text.includes("(empty)"), text);
-		// the same metadata block (incl. argv) precedes the tails
-		const idxArgv = text.split("\n").findIndex((l) => l.startsWith("argv       : "));
-		const idxTail = text.split("\n").findIndex((l) => l.startsWith("--- stdout tail"));
-		assert.ok(idxArgv >= 0 && idxTail > idxArgv, "metadata before tails");
-		assert.ok(text.includes("caller-bounded tails below (max_lines / max_bytes)"), text);
+		assert.ok(text.includes("previous_cursor=\"wbcur1."), text);
+		assert.ok(text.includes("full_log_inlined=false"), text);
 	});
 });
 
@@ -386,17 +380,16 @@ test("workbench_read_run include=all honors custom caller caps (max_lines/max_by
 		const readRun = stub.tools.get("workbench_read_run") as unknown as ReadRunTool;
 		const result = await readRun.execute(
 			"call-2",
-			{ run_id: runId, include: "all", max_lines: 5, max_bytes: 512 },
+			{ run_id: runId, include: "all", max_lines: 30, max_bytes: 4096 },
 			undefined,
 			undefined,
 			trustedCtx(root) as never,
 		);
 		const text = toolText(result);
-		assert.ok(text.includes(`--- stdout tail (truncated): ${CONFIG_DIR_NAME}/workbench/runs/${runId}/stdout.log ---`), text);
+		assertWithinCaps(text, 4096, 30);
+		assert.ok(text.includes("[workbench-run-log-page v1]"), text);
 		assert.ok(text.includes("noise-line-250"), text);
-		assert.ok(text.includes("noise-line-246"), "custom 5-line tail keeps the LAST 5 lines");
-		assert.ok(!text.includes("noise-line-245"), text);
-		assert.ok(text.includes("argv       : node green.js"), "all include keeps the metadata block");
+		assert.ok(!text.includes("argv       : node green.js"), "log pages never inline argv");
 		// stderr tail is empty
 		assert.ok(text.includes("(empty)"), text);
 	});
@@ -780,23 +773,20 @@ test("P4b fresh-Sol recipe run: REUSABLE in text+details across all four include
 		// ---- include=logs: caller-bounded tail semantics (default caps) ----
 		const logs = await readRun.execute("call-4", { run_id: runId, include: "logs" }, undefined, undefined, trustedCtx(root) as never);
 		const logsText = assertReusableResult(logs, "logs");
-		assert.ok(logsText.includes(`--- stdout tail (full): ${CONFIG_DIR_NAME}/workbench/runs/${runId}/stdout.log ---`), logsText);
+		assert.ok(logsText.includes("[workbench-run-log-page v1]"), logsText);
+		assert.ok(logsText.includes(`${CONFIG_DIR_NAME}/workbench/runs/${runId}/stdout.log`), logsText);
 		assert.ok(logsText.includes("RAW-STDOUT-MARKER-42"), logsText);
 		assert.ok(logsText.includes("counter-noise-4"), logsText);
-		assert.ok(logsText.includes(`--- stderr tail (full): ${CONFIG_DIR_NAME}/workbench/runs/${runId}/stderr.log ---`), logsText);
+		assert.ok(logsText.includes(`${CONFIG_DIR_NAME}/workbench/runs/${runId}/stderr.log`), logsText);
 		assert.ok(logsText.includes("(empty)"), logsText);
-		assert.ok(logsText.includes(`argv       : node counter.js ${ARGV_SECRET}`), "logs keeps the metadata block (explicit opt-in)");
+		assert.ok(!logsText.includes(ARGV_SECRET), "log page never inlines argv");
 
 		// ---- include=all: custom caller caps bound the tail ----------------
-		const all = await readRun.execute("call-5", { run_id: runId, include: "all", max_lines: 2, max_bytes: 2048 }, undefined, undefined, trustedCtx(root) as never);
+		const all = await readRun.execute("call-5", { run_id: runId, include: "all", max_lines: 30, max_bytes: 2048 }, undefined, undefined, trustedCtx(root) as never);
 		const allText = assertReusableResult(all, "all");
-		assert.ok(allText.includes(`--- stdout tail (truncated): ${CONFIG_DIR_NAME}/workbench/runs/${runId}/stdout.log ---`), allText);
-		for (const kept of ["counter-noise-3", "counter-noise-4"]) {
-			assert.ok(allText.split("\n").includes(kept), `tail keeps ${kept}:\n${allText}`);
-		}
-		for (const dropped of ["RAW-STDOUT-MARKER-42", "counter-noise-1", "counter-noise-2"]) {
-			assert.ok(!allText.split("\n").includes(dropped), `tail must drop ${dropped}:\n${allText}`);
-		}
+		assertWithinCaps(allText, 2048, 30);
+		assert.ok(allText.includes("[workbench-run-log-page v1]"), allText);
+		assert.ok(allText.includes("counter-noise-4"), allText);
 		assert.ok(allText.includes("(empty)"), allText);
 
 		// ---- read-only invariance: nothing executed, nothing mutated ------
@@ -852,8 +842,16 @@ test("P4b fresh-Sol manual gate run: one registered PASS, REUSABLE in default te
 		assert.equal(gateSummary.length, 1, toolText(gateResult));
 		assert.equal(gateSummary[0]!.id, "g1", toolText(gateResult));
 		assert.equal(gateSummary[0]!.status, "PASS", toolText(gateResult));
-		const counts = gateResult.details.counts as { pass: number; fail: number; blocked: number; not_run: number };
-		assert.deepEqual(counts, { pass: 1, fail: 0, blocked: 0, not_run: 0 }, toolText(gateResult));
+		const counts = gateResult.details.counts as {
+			pass: number;
+			fail: number;
+			blocked: number;
+			not_run: number;
+			total: number;
+			shown: number;
+			omitted: number;
+		};
+		assert.deepEqual(counts, { pass: 1, fail: 0, blocked: 0, not_run: 0, total: 1, shown: 1, omitted: 0 }, toolText(gateResult));
 
 		const runDir = await singleRunDir(root);
 		const runId = basename(runDir);

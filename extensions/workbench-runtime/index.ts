@@ -129,8 +129,7 @@
  *     per-model commander breakdown from ctx.sessionManager.getEntries()
  *     in TUI and print/json modes
  *
- * NRO N1/N2 additions (commander-native-tool-optimization plan, slices N1
- * and N2 — native read/grep/find overrides, additive):
+ * Native read v3 and NRO search additions:
  *   - three fixed same-name overrides of the Pi built-in read/grep/find
  *     tools, registered statically in the fixed read → grep → find order
  *     BEFORE the 11 workbench catalog tools (the registration surface is
@@ -139,19 +138,12 @@
  *     guideline bullet (N1), grep mirrors the same bullet and appends the
  *     static count-mode sentence to its description (N2), find keeps the
  *     built-in metadata verbatim (N3 not implemented)
- *   - N1 read: explicit offset and/or limit, images, errors and abort
- *     delegate byte-for-byte to the captured built-in definition
- *     (createReadToolDefinition(ctx.cwd)); a text read WITHOUT
- *     offset/limit returns the deterministic preview (240 lines / 12 KiB /
- *     2048-byte per-line representation, core/native-tool-policy.ts; the
- *     terminal newline of a trailing-newline file is reserved on the last
- *     real line so returned_bytes can never exceed 12288, and a preview
- *     over already-truncated built-in content is never complete) with
- *     the frozen nine-fact `nro-read-facts:` line; complete small files
- *     keep the built-in text byte-for-byte and append complete=true facts;
- *     details stay undefined when complete or a valid
- *     ReadToolDetails.truncation-only object when truncated; no custom
- *     renderCall/renderResult (built-in slot renderer inheritance)
+ *   - read v3: offset, limit and cursor all use one same-handle streaming
+ *     pager. Text is quoted in a trusted protocol capped at 12,288 bytes,
+ *     240 file lines and 252 total lines; strict cursors bind normalized path,
+ *     file snapshot, byte offset and line number. Long lines use segment
+ *     cursors. A bounded prefix sniff delegates images to Pi's attachment
+ *     pipeline without passing text through Pi's legacy full-read path.
  *   - N2 grep count: the parameter schema appends exactly the two optional
  *     selectors `output` (matches|count) and `count_kind` (matches|lines)
  *     after the byte-identical legacy property prefix; output=count runs a
@@ -167,14 +159,8 @@
  *     legacy pass-through — schema, metadata and execute delegate to the
  *     built-in definition byte-for-byte
  *   - the overrides perform no writes, no pi.exec, no shell and no model
- *     calls; the only second reads are read-only — the >50KB-first-line
- *     re-read and the image-note magic-byte sniff, both through the
- *     Pi-equivalent path normalization from the policy module (a text-only
- *     built-in image note — failed decode/resize or unprocessed BMP — is
- *     validated against the source's magic bytes and passes through
- *     byte-identically, while genuine text starting the same phrase still
- *     gets facts); the exact-name tool_call guard, MODE_TOOLS/write-
- *     authority inventories and WORKBENCH_TOOL_NAMES are unchanged
+ *     calls; the exact-name tool_call guard, MODE_TOOLS/write-authority
+ *     inventories and WORKBENCH_TOOL_NAMES are unchanged
  *
  * P0/P1 additions (commander-token-optimization plan, slice A — additive):
  *   - P0 observability in core/cost-breakdown.ts: exact commander
@@ -482,6 +468,7 @@
  *   /q-cache-validate <manifest-path>                  — quant contract validation (P6-D)
  *   /q-cache-lineage <run-id|action-key>               — quant cache lineage (P6-D)
  *   /q-cost-status                                     — split session cost (commander/worker/other)
+ *   /q-context-output-status [json]                    — numeric-only output-control observations (R8)
  *   /q-delegation-status                              — write authority + delegation review status (P7)
  *   /q-write-policy status                           — P7 write policy status (P7)
  *   /q-commander-write-unlock <reason> --paths ...   — temporary commander write lease (P7)
@@ -535,31 +522,46 @@
  * routing/execution code is implemented or planned.
  */
 
-import { access, mkdir, open, readFile, writeFile } from "node:fs/promises";
+import { constants as BUFFER_CONSTANTS } from "node:buffer";
+import { access, mkdir, open, readFile, writeFile, type FileHandle } from "node:fs/promises";
 import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import type {
+	AgentToolResult,
+	AgentToolUpdateCallback,
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
+	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
 	CONFIG_DIR_NAME,
 	createFindToolDefinition,
 	createGrepToolDefinition,
 	createReadToolDefinition,
-	type ReadToolDetails,
 } from "@earendil-works/pi-coding-agent";
+import type { TSchema } from "typebox";
 import {
-	buildReadPreview,
+	buildNativeReadV3Page,
+	READ_V3_ALLOCATION_TOO_SMALL,
+	READ_V3_MAX_FILE_LINES,
+	READ_V3_MAX_OUTPUT_BYTES,
 	formatGrepCountLine,
 	IMAGE_SNIFF_BYTES,
-	imageMimeFromReadNote,
 	NATIVE_OVERRIDE_METADATA,
 	NATIVE_OVERRIDE_PARAMETERS,
 	nativeResolveReadPath,
 	sniffImageMimeType,
 } from "./core/native-tool-policy.ts";
+import { fileSourceSnapshotFromStats, readTextPage } from "./core/bounded-file-io.ts";
+import {
+	computeFileSourceId,
+	decodeContinuationCursor,
+	validateFileCursorSource,
+	type FileCursorPayload,
+	type FileSourceSnapshot,
+} from "./core/continuation-cursor.ts";
 import { runGrepCount } from "./core/native-search-adapter.ts";
 
 import {
@@ -641,7 +643,7 @@ import { inspectProject } from "./core/inspect.ts";
 import { planInit, applyInit, renderInitPlan } from "./core/init.ts";
 import { isSupportedInitProfile, INIT_PROFILES } from "./core/templates.ts";
 import { displayRelative, runRecipe, RecipeSetupError } from "./core/recipe-runner.ts";
-import { buildArgv } from "./core/recipe-schema.ts";
+import { buildArgv, type ValidationComponent } from "./core/recipe-schema.ts";
 import { EXTENSION_VERSION, type TelemetryRecord } from "./cache/cache-types.ts";
 import {
 	GateSetupError,
@@ -649,27 +651,45 @@ import {
 	loadGates,
 	preflightGateManualEvidence,
 	runGates,
-	type GateRunEntry,
 } from "./core/gate-engine.ts";
 import { GATE_CATALOG } from "./core/gate-catalog.ts";
-import { QUANT_GATE_ID_RE, type Gate, type WorkerFirstGateFacts } from "./core/gate-schema.ts";
-import { isValidRunId, listRuns, readLogSnippet, readManifest } from "./core/runs.ts";
+import { type Gate, type GateStatus, type WorkerFirstGateFacts } from "./core/gate-schema.ts";
+import {
+	DEFAULT_SNIPPET_BYTES,
+	DEFAULT_SNIPPET_LINES,
+	isValidRunId,
+	listRuns,
+	readLogSnippet,
+	readManifest,
+	readRunLogPage,
+} from "./core/runs.ts";
 import { join } from "node:path";
 import { runStatusLabel, fitToWidth } from "./core/format.ts";
-import { renderRunResult } from "./core/run-result.ts";
+import { renderRunLogPage, renderRunResult } from "./core/run-result.ts";
 import { assessRunValidation } from "./core/validation-assessment.ts";
 import { buildStatusLine } from "./core/status.ts";
 import { buildCostBreakdown, costStatusSegment, renderCostBreakdown } from "./core/cost-breakdown.ts";
 import {
 	advisoryStatusSegment,
+	contextOutputAdvisoryStatusSegment,
 	evaluateAdvisory,
 	renderAdvisoryFacts,
 	type AdvisoryConfig,
 } from "./core/commander-advisory.ts";
 import { buildGateParentSummary, buildRecipeParentSummary } from "./core/result-summary.ts";
 import { buildWidgetLines, widgetAction, type WidgetState } from "./core/widget.ts";
-import { buildRunReport, latestGateRunSummary, resolveRunTarget } from "./core/report.ts";
+import {
+	buildRunReport,
+	GATE_READ_MAX_BYTES,
+	latestGateRunSummary,
+	latestGateStatuses,
+	readGateEvidenceView,
+	readGateRunPage,
+	renderGateDefinitionPage,
+	resolveRunTarget,
+} from "./core/report.ts";
 import { compareRuns } from "./core/compare.ts";
+import { COMPARISON_PERSIST_ERROR } from "./core/comparison-record.ts";
 import {
 	buildCompactNote,
 	collectDoNotRetry,
@@ -688,6 +708,8 @@ import {
 import {
 	renderCompareLines,
 	renderGatePreflightLines,
+	renderInspectLines,
+	type BoundedStringListDetails,
 	type CompareToolDetails,
 	type GatePreflightToolDetails,
 	type GateToolDetails,
@@ -728,7 +750,59 @@ import {
 	type LedgerWorkerFacts,
 	type LedgerWorkerSummaryRecord,
 } from "./core/delegation-ledger.ts";
-import { readReviewRecord, reviewDelegation } from "./core/diff-review.ts";
+import {
+	MAX_REVIEW_GUIDANCE_BYTES,
+	MAX_REVIEW_PATCH_PATHS,
+	MAX_REVIEW_PATH_BYTES,
+	readReviewRecord,
+	reviewDelegation,
+} from "./core/diff-review.ts";
+import {
+	ERROR_RESULT_MAX_BYTES,
+	DIFF_REVIEW_RESULT_MAX_BYTES,
+	DIFF_REVIEW_RESULT_MAX_LINES,
+	RUN_LOG_RESULT_MAX_BYTES,
+	RUN_LOG_RESULT_MAX_LINES,
+	clampWholeResultText,
+	resolveToolOutputPolicy,
+} from "./core/output-policy.ts";
+import {
+	enforceOutputEnvelope,
+	enforceStreamingUpdate,
+	type ImageContent as OutputImageContent,
+	type OutputEnvelopeFacts,
+	type OutputEnvelopeResult,
+	type TextContent as OutputTextContent,
+} from "./core/output-envelope.ts";
+import {
+	projectToolResultDetails,
+	type BoundedReceiptFacts,
+} from "./core/details-projection.ts";
+import {
+	COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES,
+	HISTORY_DESCRIPTOR_MAX_BYTES,
+	HISTORY_MAX_BUNDLES,
+	OTHER_HISTORY_TOOL_TEXT_MAX_BYTES,
+	WORKER_HISTORY_TOOL_TEXT_MAX_BYTES,
+	historyProjectionFailureMessages,
+	historyToolTextBytes,
+	projectContextHistory,
+	type HistoryProjectionFacts,
+} from "./core/context-history-budget.ts";
+import {
+	blockedControlText,
+	createTurnOutputBudgetState,
+	planTurnOutputBudget,
+	type TurnOutputAuthorization,
+	type TurnRole,
+} from "./core/turn-output-budget.ts";
+import {
+	OUTPUT_CONTROL_TELEMETRY_ENTRY_TYPE,
+	createOutputControlTelemetry,
+	renderOutputControlStatus,
+	serializeOutputControlTelemetry,
+	type OutputControlTelemetryAccumulator,
+} from "./core/output-control-telemetry.ts";
 import {
 	blocksVerify,
 	DELEGATION_STATE_ENTRY_TYPE,
@@ -788,9 +862,334 @@ import {
 } from "./core/milestone-handoff.ts";
 
 const STATUS_KEY = "workbench";
+const OUTPUT_TURN_TELEMETRY_ENTRY_TYPE = "workbench-output-turn-telemetry-v1";
 
 /** Secret env values scrubbed from every ledger/review artifact. */
 const secrets = collectSecretValues(process.env);
+
+type RuntimeOutputContent = Array<OutputTextContent | OutputImageContent>;
+
+const MAX_GUARD_REASON_BYTES = 511;
+const MAX_GUARD_REASON_LINES = 4;
+const GUARD_REASON_FALLBACK = "[workbench blocked]";
+
+/** Fixed-safe guard presentation: no path, argument or exception can exceed Pi's immediate-result boundary. */
+function boundedGuardReason(value: unknown): string {
+	try {
+		const source = typeof value === "string" ? value : GUARD_REASON_FALLBACK;
+		let result = "";
+		let usedBytes = 0;
+		let usedLines = 0;
+		for (let index = 0; index < source.length; index += 1) {
+			const unit = source.charCodeAt(index);
+			let scalar: string;
+			if (unit >= 0xd800 && unit <= 0xdbff) {
+				const next = source.charCodeAt(index + 1);
+				if (next >= 0xdc00 && next <= 0xdfff) {
+					scalar = source.slice(index, index + 2);
+					index += 1;
+				} else scalar = "\ufffd";
+			} else scalar = unit >= 0xdc00 && unit <= 0xdfff ? "\ufffd" : source[index]!;
+			const scalarBytes = Buffer.byteLength(scalar, "utf8");
+			const nextLines = result.length === 0 ? (scalar === "\n" ? 2 : 1) : usedLines + (scalar === "\n" ? 1 : 0);
+			if (usedBytes + scalarBytes > MAX_GUARD_REASON_BYTES || nextLines > MAX_GUARD_REASON_LINES) break;
+			result += scalar;
+			usedBytes += scalarBytes;
+			usedLines = nextLines;
+		}
+		return result.length > 0 ? result : GUARD_REASON_FALLBACK;
+	} catch {
+		return GUARD_REASON_FALLBACK;
+	}
+}
+
+/** Read an own DATA property without invoking a getter or proxy trap value. */
+function ownDataValue(value: unknown, key: PropertyKey): unknown {
+	if ((typeof value !== "object" && typeof value !== "function") || value === null) return undefined;
+	try {
+		const descriptor = Object.getOwnPropertyDescriptor(value, key);
+		return descriptor && Object.prototype.hasOwnProperty.call(descriptor, "value") ? descriptor.value : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Collect assistant tool calls in source order without invoking accessors. */
+function assistantToolCalls(message: unknown): unknown[] | undefined {
+	if (ownDataValue(message, "role") !== "assistant") return undefined;
+	const content = ownDataValue(message, "content");
+	if (!Array.isArray(content)) return [];
+	const calls: unknown[] = [];
+	const lengthValue = ownDataValue(content, "length");
+	const length = typeof lengthValue === "number" && Number.isSafeInteger(lengthValue) && lengthValue >= 0
+		? Math.min(lengthValue, 2_049)
+		: 0;
+	for (let index = 0; index < length; index += 1) {
+		const block = ownDataValue(content, String(index));
+		if (ownDataValue(block, "type") !== "toolCall") continue;
+		calls.push({
+			toolCallId: ownDataValue(block, "id"),
+			toolName: ownDataValue(block, "name"),
+			args: ownDataValue(block, "arguments"),
+		});
+	}
+	return calls;
+}
+
+function exactCallKey(toolCallId: unknown, toolName: unknown): string | undefined {
+	if (
+		typeof toolCallId !== "string" || toolCallId.length === 0 || toolCallId.length > 512
+		|| typeof toolName !== "string" || toolName.length === 0 || toolName.length > 512
+	) return undefined;
+	return JSON.stringify([toolCallId, toolName]);
+}
+
+/**
+ * Streaming details are presentation-only.  If defensive projection had to
+ * touch, omit, or replace any ordinary detail, expose one fixed short DTO
+ * instead of allowing a hostile/circular/accessor payload into Pi's partial
+ * result event.  Trusted envelope facts remain numeric/bounded and no receipt
+ * is ever minted for an update.
+ */
+function streamingDetailsFailure(envelope: OutputEnvelopeFacts): Record<string, unknown> {
+	return {
+		details_projection: { available: false, code: "projection_error" },
+		output_envelope: envelope,
+	};
+}
+
+function boundedStreamingUpdate<TDetails>(
+	toolName: string,
+	partialResult: AgentToolResult<TDetails>,
+): AgentToolResult<TDetails> {
+	const content = ownDataValue(partialResult, "content");
+	const details = ownDataValue(partialResult, "details");
+	const envelope = enforceStreamingUpdate({ toolName, content });
+	const projection = projectToolResultDetails({
+		toolName,
+		details,
+		envelope: envelope.facts,
+	});
+	return {
+		content: envelope.content,
+		details: (projection.truncated
+			? streamingDetailsFailure(envelope.facts)
+			: projection.details) as TDetails,
+	};
+}
+
+/** Locally bounded objects skip the publish-time defense-in-depth pass. */
+const locallyBoundedStreamingUpdates = new WeakSet<object>();
+
+function wrapStreamingToolDefinition<TParams extends TSchema, TDetails, TState>(
+	tool: ToolDefinition<TParams, TDetails, TState>,
+): ToolDefinition<TParams, TDetails, TState> {
+	const execute = tool.execute;
+	const toolName = tool.name;
+	return {
+		...tool,
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			const boundedOnUpdate: AgentToolUpdateCallback<TDetails> | undefined = onUpdate
+				? (partialResult) => {
+					const bounded = boundedStreamingUpdate(toolName, partialResult);
+					locallyBoundedStreamingUpdates.add(bounded);
+					onUpdate(bounded);
+				}
+				: undefined;
+			return execute.call(tool, toolCallId, params, signal, boundedOnUpdate, ctx);
+		},
+	};
+}
+
+/**
+ * Pi 0.83 does not let an extension replace a tool_execution_update event, but
+ * AgentSession currently passes the same mutable AgentToolResult object to
+ * extension handlers before notifying downstream subscribers. Replace its two
+ * presentation fields in place as defense in depth for exact trusted built-ins.
+ *
+ * This mutation is never the authority for foreign tools: a frozen, accessor-
+ * backed, inherited or Proxy partial result cannot be proven rewritable. The
+ * tool_call guard below therefore prevents every effective foreign definition
+ * from executing before it can publish any update.
+ */
+function boundGlobalStreamingUpdate(event: unknown): void {
+	const partialResult = ownDataValue(event, "partialResult");
+	const toolNameValue = ownDataValue(event, "toolName");
+	if ((typeof partialResult !== "object" && typeof partialResult !== "function") || partialResult === null) return;
+	if (locallyBoundedStreamingUpdates.delete(partialResult)) return;
+	let contentDescriptor: PropertyDescriptor | undefined;
+	let detailsDescriptor: PropertyDescriptor | undefined;
+	try {
+		contentDescriptor = Object.getOwnPropertyDescriptor(partialResult, "content");
+		detailsDescriptor = Object.getOwnPropertyDescriptor(partialResult, "details");
+	} catch {
+		return;
+	}
+	if (
+		!contentDescriptor || !Object.prototype.hasOwnProperty.call(contentDescriptor, "value")
+		|| !detailsDescriptor || !Object.prototype.hasOwnProperty.call(detailsDescriptor, "value")
+		|| (!contentDescriptor.writable && !contentDescriptor.configurable)
+		|| (!detailsDescriptor.writable && !detailsDescriptor.configurable)
+	) return;
+	const bounded = boundedStreamingUpdate(
+		typeof toolNameValue === "string" ? toolNameValue : "",
+		partialResult as AgentToolResult<unknown>,
+	);
+	try {
+		Object.defineProperties(partialResult, {
+			content: { ...contentDescriptor, value: bounded.content },
+			details: { ...detailsDescriptor, value: bounded.details },
+		});
+	} catch {
+		// A non-conforming foreign object cannot be safely rewritten through
+		// Pi 0.83's observation-only event API. Never invoke accessors as a
+		// fallback and never claim it is inside the supported global scope.
+	}
+}
+
+const STREAMING_BOUNDARY_UNAVAILABLE = "Tool streaming output boundary is unavailable";
+const MAX_STREAMING_REGISTRY_TOOLS = 4_096;
+const WORKBENCH_RUNTIME_SOURCE_PATH = fileURLToPath(import.meta.url);
+const WORKBENCH_RUNTIME_SOURCE_DIR = dirname(WORKBENCH_RUNTIME_SOURCE_PATH);
+const WORKBENCH_PACKAGE_ROOT = dirname(dirname(WORKBENCH_RUNTIME_SOURCE_DIR));
+const TRUSTED_PI_BUILTIN_NAMES = new Set(["bash", "edit", "find", "grep", "ls", "read", "write"]);
+const SOURCE_INFO_KEYS = ["baseDir", "origin", "path", "scope", "source"] as const;
+
+type StreamingToolTrust = "trusted" | "absent" | "unproven";
+
+function hasExactSourceInfoKeys(value: unknown): boolean {
+	if ((typeof value !== "object" && typeof value !== "function") || value === null) return false;
+	try {
+		const keys = Reflect.ownKeys(value);
+		if (keys.some((key) => typeof key !== "string")) return false;
+		const sorted = (keys as string[]).slice().sort();
+		return sorted.length === SOURCE_INFO_KEYS.length
+			&& SOURCE_INFO_KEYS.every((key, index) => sorted[index] === key);
+	} catch {
+		return false;
+	}
+}
+
+function isExactWorkbenchSourceInfo(value: unknown): boolean {
+	if (!hasExactSourceInfoKeys(value) || ownDataValue(value, "path") !== WORKBENCH_RUNTIME_SOURCE_PATH) return false;
+	const source = ownDataValue(value, "source");
+	const scope = ownDataValue(value, "scope");
+	const origin = ownDataValue(value, "origin");
+	const baseDir = ownDataValue(value, "baseDir");
+	const exactTemporarySource = source === "local"
+		&& scope === "temporary"
+		&& origin === "top-level"
+		&& baseDir === WORKBENCH_RUNTIME_SOURCE_DIR;
+	// The repository's checked-in `.pi/settings.json` loads this package via
+	// `packages: [".."]`. Pi preserves that literal source and assigns the
+	// resolved package root as baseDir. Keep this acceptance tuple exact: a
+	// different project package, source spelling, entry path, or base directory
+	// remains foreign even if it collides with a workbench tool name.
+	const exactRepositoryPackageSource = source === ".."
+		&& scope === "project"
+		&& origin === "package"
+		&& baseDir === WORKBENCH_PACKAGE_ROOT;
+	return exactTemporarySource || exactRepositoryPackageSource;
+}
+
+function isExactTrustedBuiltinSourceInfo(toolName: string, value: unknown): boolean {
+	return TRUSTED_PI_BUILTIN_NAMES.has(toolName)
+		&& hasExactSourceInfoKeys(value)
+		&& ownDataValue(value, "path") === `<builtin:${toolName}>`
+		&& ownDataValue(value, "source") === "builtin"
+		&& ownDataValue(value, "scope") === "temporary"
+		&& ownDataValue(value, "origin") === "top-level"
+		&& ownDataValue(value, "baseDir") === undefined;
+}
+
+interface StreamingControlPlane {
+	readonly api: ExtensionAPI;
+	readonly toolCallBlockReason: (toolName: unknown) => string | undefined;
+}
+
+/**
+ * Install the global publish-time boundary, then shadow registerTool so tools
+ * owned by this extension are additionally bounded at their callback source.
+ * Every call re-resolves Pi's effective registry: a workbench name is trusted
+ * only when this runtime wrapped it AND its live source is this exact module;
+ * the seven pinned Pi built-ins require their exact synthetic provenance.
+ * Missing definitions are left to Pi's non-executing unknown-tool path, while
+ * malformed, collided, SDK and foreign definitions fail closed. All other API
+ * methods retain the original ExtensionAPI receiver.
+ */
+function streamingControlledApi(runtimePi: ExtensionAPI): StreamingControlPlane {
+	const wrappedTools = new Map<string, object>();
+	runtimePi.on("tool_execution_update", (event) => {
+		boundGlobalStreamingUpdate(event);
+	});
+	function registerBoundedTool<TParams extends TSchema, TDetails, TState>(
+		tool: ToolDefinition<TParams, TDetails, TState>,
+	): void {
+		const wrapped = wrapStreamingToolDefinition(tool);
+		wrappedTools.set(tool.name, wrapped);
+		runtimePi.registerTool(wrapped);
+	}
+	const api = new Proxy(runtimePi, {
+		get(target, property) {
+			if (property === "registerTool") return registerBoundedTool;
+			const value = Reflect.get(target, property, target);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	});
+
+	function effectiveToolTrust(toolName: unknown): StreamingToolTrust {
+		if (typeof toolName !== "string" || toolName.length === 0 || toolName.length > 512) return "unproven";
+		let tools: unknown;
+		try {
+			tools = runtimePi.getAllTools();
+		} catch {
+			return "unproven";
+		}
+		if (!Array.isArray(tools)) return "unproven";
+		const length = ownDataValue(tools, "length");
+		if (typeof length !== "number" || !Number.isSafeInteger(length) || length < 0 || length > MAX_STREAMING_REGISTRY_TOOLS) {
+			return "unproven";
+		}
+		let match: unknown;
+		for (let index = 0; index < length; index += 1) {
+			const candidate = ownDataValue(tools, String(index));
+			const candidateName = ownDataValue(candidate, "name");
+			if (typeof candidateName !== "string" || candidateName.length === 0 || candidateName.length > 512) {
+				return "unproven";
+			}
+			if (candidateName !== toolName) continue;
+			if (match !== undefined) return "unproven";
+			match = candidate;
+		}
+		if (match === undefined) return "absent";
+		// Some conforming test/non-Pi hosts expose the exact registered
+		// definition rather than Pi's ToolInfo projection. Reference equality
+		// is still a complete proof that this runtime installed the wrapper.
+		if (wrappedTools.get(toolName) === match) return "trusted";
+		const sourceInfo = ownDataValue(match, "sourceInfo");
+		if (wrappedTools.has(toolName) && isExactWorkbenchSourceInfo(sourceInfo)) return "trusted";
+		if (isExactTrustedBuiltinSourceInfo(toolName, sourceInfo)) return "trusted";
+		return "unproven";
+	}
+
+	return {
+		api,
+		toolCallBlockReason(toolName) {
+			return effectiveToolTrust(toolName) === "unproven" ? STREAMING_BOUNDARY_UNAVAILABLE : undefined;
+		},
+	};
+}
+
+function runtimeFailureEnvelope(): OutputEnvelopeResult {
+	const policy = resolveToolOutputPolicy({ toolName: "", args: undefined, role: "commander" });
+	return enforceOutputEnvelope({
+		toolName: "",
+		content: null as unknown as RuntimeOutputContent,
+		isError: true,
+		policy,
+		allocatedBytes: ERROR_RESULT_MAX_BYTES,
+	});
+}
 
 // ------------------------------------------------------------- P5 state
 
@@ -817,7 +1216,146 @@ function rememberRunOutcome(toolName: string, details: Record<string, unknown>):
 	compactState.doNotRetry = collectDoNotRetry(recentOutcomes, MAX_DO_NOT_RETRY);
 }
 
-export default function workbenchRuntime(pi: ExtensionAPI): void {
+type NativeReadV3IoErrorCode = "source_not_regular" | "source_changed_during_read" | "source_oversized" | "io_error";
+
+class NativeReadV3IoFailure extends Error {
+	constructor(readonly code: NativeReadV3IoErrorCode) {
+		super(code);
+		this.name = "NativeReadV3IoFailure";
+	}
+}
+
+export interface NativeReadV3TestHookFacts {
+	readonly toolCallId: string;
+	readonly fileSize: number;
+	readonly mimeType: string | null;
+}
+
+/**
+ * Deterministic race instrumentation for native-read regression tests.
+ * Hooks are scoped to one exact tool-call id and receive no path or content.
+ */
+export interface NativeReadV3TestHooks {
+	afterMagicSniff?: (facts: Readonly<NativeReadV3TestHookFacts>) => void | Promise<void>;
+	afterImageBytesRead?: (facts: Readonly<NativeReadV3TestHookFacts>) => void | Promise<void>;
+	afterAuthoritativeClose?: (facts: Readonly<{ toolCallId: string; closed: boolean }>) => void | Promise<void>;
+}
+
+const nativeReadV3TestHooks = new Map<string, Readonly<NativeReadV3TestHooks>>();
+
+/** Test-only, opt-in hook lease; restoring cannot remove another lease. */
+export function installNativeReadV3TestHooks(toolCallId: string, hooks: Readonly<NativeReadV3TestHooks>): () => void {
+	if (toolCallId.length === 0 || toolCallId.length > 512 || nativeReadV3TestHooks.has(toolCallId)) {
+		throw new Error("invalid native read v3 test hook lease");
+	}
+	nativeReadV3TestHooks.set(toolCallId, hooks);
+	return () => {
+		if (nativeReadV3TestHooks.get(toolCallId) === hooks) nativeReadV3TestHooks.delete(toolCallId);
+	};
+}
+
+function sameNativeReadSnapshot(a: FileSourceSnapshot, b: FileSourceSnapshot): boolean {
+	return a.fileSize === b.fileSize
+		&& a.mtimeMs === b.mtimeMs
+		&& a.mtimeNs === b.mtimeNs
+		&& a.dev === b.dev
+		&& a.ino === b.ino;
+}
+
+async function nativeReadHandleSnapshot(handle: FileHandle): Promise<FileSourceSnapshot> {
+	try {
+		const stats = await handle.stat({ bigint: true });
+		if (!stats.isFile()) throw new NativeReadV3IoFailure("source_not_regular");
+		const snapshot = fileSourceSnapshotFromStats(stats);
+		if (!snapshot.ok) throw new NativeReadV3IoFailure("io_error");
+		return snapshot.value;
+	} catch (error) {
+		if (error instanceof NativeReadV3IoFailure) throw error;
+		throw new NativeReadV3IoFailure("io_error");
+	}
+}
+
+async function verifyNativeReadHandle(handle: FileHandle, expected: FileSourceSnapshot): Promise<void> {
+	let current: FileSourceSnapshot;
+	try {
+		current = await nativeReadHandleSnapshot(handle);
+	} catch {
+		throw new NativeReadV3IoFailure("source_changed_during_read");
+	}
+	if (!sameNativeReadSnapshot(expected, current)) throw new NativeReadV3IoFailure("source_changed_during_read");
+}
+
+/** Verify that the path still resolves to the authoritative inode; never read it. */
+async function verifyNativeReadPathIdentity(path: string, expected: FileSourceSnapshot): Promise<void> {
+	let verifier: FileHandle;
+	try {
+		verifier = await open(path, "r");
+	} catch {
+		throw new NativeReadV3IoFailure("source_changed_during_read");
+	}
+	let current: FileSourceSnapshot | undefined;
+	let failed = false;
+	try {
+		current = await nativeReadHandleSnapshot(verifier);
+	} catch {
+		failed = true;
+	}
+	try {
+		await verifier.close();
+	} catch {
+		throw new NativeReadV3IoFailure("io_error");
+	}
+	if (failed || current === undefined || !sameNativeReadSnapshot(expected, current)) {
+		throw new NativeReadV3IoFailure("source_changed_during_read");
+	}
+}
+
+function throwIfNativeReadAborted(signal: AbortSignal | undefined): void {
+	if (signal?.aborted) throw new Error("Operation aborted");
+}
+
+async function readNativeHandleExactly(handle: FileHandle, size: number, signal: AbortSignal | undefined): Promise<Buffer> {
+	if (!Number.isSafeInteger(size) || size < 0) throw new NativeReadV3IoFailure("io_error");
+	if (size > BUFFER_CONSTANTS.MAX_LENGTH) throw new NativeReadV3IoFailure("source_oversized");
+	let buffer: Buffer;
+	try {
+		buffer = Buffer.allocUnsafe(size);
+	} catch {
+		throw new NativeReadV3IoFailure("source_oversized");
+	}
+	let offset = 0;
+	while (offset < buffer.length) {
+		throwIfNativeReadAborted(signal);
+		let bytesRead: number;
+		try {
+			({ bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset));
+		} catch {
+			throw new NativeReadV3IoFailure("io_error");
+		}
+		if (bytesRead <= 0) throw new NativeReadV3IoFailure("source_changed_during_read");
+		offset += bytesRead;
+	}
+	return buffer;
+}
+
+async function closeNativeReadAuthority(handle: FileHandle, toolCallId: string): Promise<boolean> {
+	let closed = true;
+	try {
+		await handle.close();
+	} catch {
+		closed = false;
+	}
+	try {
+		await nativeReadV3TestHooks.get(toolCallId)?.afterAuthoritativeClose?.(Object.freeze({ toolCallId, closed }));
+	} catch {
+		closed = false;
+	}
+	return closed;
+}
+
+export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
+	const streamingControl = streamingControlledApi(runtimePi);
+	const pi = streamingControl.api;
 	let mode: WorkbenchMode = "DEV";
 	/**
 	 * P7 session-scoped write-authority state. The delegation review
@@ -839,6 +1377,10 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	 * finalized; a replayed call or the recovery tool never enters this map.
 	 */
 	const pendingReceiptHandles = new Map<string, { handle: ReceiptHandle; projectRoot: string }>();
+	/** Per-result side-channel facts keyed by Pi's SAME mutable middleware event. */
+	const outputEnvelopeFactsByEvent = new WeakMap<object, OutputEnvelopeFacts>();
+	const receiptFactsByEvent = new WeakMap<object, BoundedReceiptFacts>();
+	/** Trusted continuation comes only from the registered tool result details. */
 	/** Latest known commander identity facts (updated on session_start/model_select). */
 	let currentModelFacts: { provider?: string; model?: string } = {};
 	const workerRoleContext = {
@@ -853,6 +1395,174 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			? process.env[WORKER_SPEND_PROFILE_ENV]
 			: WORKER_SPEND_DEFAULT_PROFILE,
 	};
+	const turnOutputBudget = createTurnOutputBudgetState();
+	/** Session-scoped numeric-only context-output observations (never enforcement). */
+	let outputControlTelemetry: OutputControlTelemetryAccumulator | undefined;
+	let outputControlTelemetryRole: TurnRole | undefined;
+	const pendingOutputAuthorizations = new Map<string, TurnOutputAuthorization[]>();
+	/** Cursor facts created by this runtime's read execute, never by details. */
+	const trustedReadContinuations = new Map<string, Array<{ kind: "read"; value: string }>>();
+	/** Run-log cursor facts created by this runtime, never accepted from details. */
+	const trustedRunLogContinuations = new Map<string, Array<{ kind: "run-log"; value: string }>>();
+	/** Gate-page cursors created by read_gate execute, never accepted from details. */
+	const trustedGateContinuations = new Map<string, Array<{ kind: "gate-read"; value: string }>>();
+	/** Exact FIFO counts for results that already traversed all tool_result middleware. */
+	const processedNormalResults = new Map<string, number>();
+	/**
+	 * Numeric-only outgoing-history side channel. R8 consumes this in-memory
+	 * snapshot when it persists the unified output-control telemetry; R7 does
+	 * not append an entry per provider request and never retains message text.
+	 */
+	let latestHistoryProjectionFacts: HistoryProjectionFacts = {
+		originalToolTextBytes: 0,
+		finalToolTextBytes: 0,
+		collapsedResults: 0,
+		removedBundles: 0,
+		protectedLatestBundles: 0,
+	};
+	let currentTurnSerial = 0;
+
+	function outputTurnRole(): TurnRole {
+		if (workerRoleContext.role === "worker") return "worker";
+		return detectActorRole({
+			roleEnv: workerRoleContext.role,
+			provider: currentModelFacts.provider,
+			model: currentModelFacts.model,
+		}) === "sol-commander" ? "commander" : "other";
+	}
+
+	function ensureOutputControlTelemetry(entries?: readonly unknown[]): OutputControlTelemetryAccumulator {
+		const role = outputTurnRole();
+		if (!outputControlTelemetry || outputControlTelemetryRole !== role) {
+			outputControlTelemetry = createOutputControlTelemetry(role);
+			outputControlTelemetryRole = role;
+			if (entries) outputControlTelemetry.restoreFromEntries(entries);
+		}
+		return outputControlTelemetry;
+	}
+
+	function mirrorOutputControlCompactFacts(): void {
+		const snapshot = ensureOutputControlTelemetry().snapshot();
+		compactState.outputTruncatedResults = snapshot.totals.truncatedResults;
+		compactState.outputHistoryCollapsedBundles = snapshot.totals.historyCollapsedResults;
+	}
+
+	function persistOutputControlTelemetry(): void {
+		const snapshot = serializeOutputControlTelemetry(ensureOutputControlTelemetry().snapshot());
+		pi.appendEntry(OUTPUT_CONTROL_TELEMETRY_ENTRY_TYPE, snapshot);
+	}
+
+	function observeOutputEnvelope(toolName: unknown, facts: unknown): void {
+		try {
+			ensureOutputControlTelemetry().recordEnvelope(toolName, facts);
+			mirrorOutputControlCompactFacts();
+		} catch {
+			// Observation is never allowed to alter or reject a bounded result.
+		}
+	}
+
+	function rememberOutputAuthorization(authorization: TurnOutputAuthorization): void {
+		if (!authorization.authorizationId) return;
+		const key = exactCallKey(authorization.toolCallId, authorization.toolName);
+		if (!key) return;
+		const queue = pendingOutputAuthorizations.get(key) ?? [];
+		queue.push(authorization);
+		pendingOutputAuthorizations.set(key, queue);
+	}
+
+	function takeOutputAuthorization(toolCallId: unknown, toolName: unknown): TurnOutputAuthorization | undefined {
+		const key = exactCallKey(toolCallId, toolName);
+		if (!key) return undefined;
+		const queue = pendingOutputAuthorizations.get(key);
+		const authorization = queue?.shift();
+		if (queue?.length === 0) pendingOutputAuthorizations.delete(key);
+		return authorization;
+	}
+
+	/**
+	 * Read the next exact id+name authorization without settling its FIFO slot.
+	 * Tool execute uses this only to render inside its already-authorized byte
+	 * allocation; tool_result remains the sole consumer/accounting boundary.
+	 */
+	function peekOutputAuthorization(toolCallId: unknown, toolName: unknown): TurnOutputAuthorization | undefined {
+		const key = exactCallKey(toolCallId, toolName);
+		if (!key) return undefined;
+		return pendingOutputAuthorizations.get(key)?.[0];
+	}
+
+	function rememberTrustedReadContinuation(toolCallId: unknown, cursor: unknown): void {
+		if (typeof cursor !== "string" || cursor.length === 0 || cursor.length > 1_024) return;
+		const key = exactCallKey(toolCallId, "read");
+		if (!key) return;
+		const queue = trustedReadContinuations.get(key) ?? [];
+		queue.push({ kind: "read", value: cursor });
+		trustedReadContinuations.set(key, queue);
+	}
+
+	function takeTrustedReadContinuation(toolCallId: unknown, toolName: unknown): { kind: "read"; value: string } | undefined {
+		const key = exactCallKey(toolCallId, toolName);
+		if (!key || toolName !== "read") return undefined;
+		const queue = trustedReadContinuations.get(key);
+		const continuation = queue?.shift();
+		if (queue?.length === 0) trustedReadContinuations.delete(key);
+		return continuation;
+	}
+
+	function rememberTrustedRunLogContinuation(toolCallId: unknown, cursor: unknown): void {
+		if (typeof cursor !== "string" || cursor.length === 0 || cursor.length > 1_024) return;
+		const key = exactCallKey(toolCallId, "workbench_read_run");
+		if (!key) return;
+		const queue = trustedRunLogContinuations.get(key) ?? [];
+		queue.push({ kind: "run-log", value: cursor });
+		trustedRunLogContinuations.set(key, queue);
+	}
+
+	function takeTrustedRunLogContinuation(toolCallId: unknown, toolName: unknown): { kind: "run-log"; value: string } | undefined {
+		const key = exactCallKey(toolCallId, toolName);
+		if (!key || toolName !== "workbench_read_run") return undefined;
+		const queue = trustedRunLogContinuations.get(key);
+		const continuation = queue?.shift();
+		if (queue?.length === 0) trustedRunLogContinuations.delete(key);
+		return continuation;
+	}
+
+	function rememberTrustedGateContinuation(toolCallId: unknown, cursor: unknown): void {
+		if (typeof cursor !== "string" || cursor.length === 0 || cursor.length > 1_024) return;
+		const key = exactCallKey(toolCallId, "workbench_read_gate");
+		if (!key) return;
+		const queue = trustedGateContinuations.get(key) ?? [];
+		queue.push({ kind: "gate-read", value: cursor });
+		trustedGateContinuations.set(key, queue);
+	}
+
+	function takeTrustedGateContinuation(toolCallId: unknown, toolName: unknown): { kind: "gate-read"; value: string } | undefined {
+		const key = exactCallKey(toolCallId, toolName);
+		if (!key || toolName !== "workbench_read_gate") return undefined;
+		const queue = trustedGateContinuations.get(key);
+		const continuation = queue?.shift();
+		if (queue?.length === 0) trustedGateContinuations.delete(key);
+		return continuation;
+	}
+
+	function authorizeOutput(toolCallId: unknown, toolName: unknown, args: unknown): TurnOutputAuthorization {
+		return turnOutputBudget.authorizeToolCall({ toolCallId, toolName, args });
+	}
+
+	function rememberProcessedNormalResult(toolCallId: unknown, toolName: unknown): void {
+		const key = exactCallKey(toolCallId, toolName);
+		if (!key) return;
+		processedNormalResults.set(key, (processedNormalResults.get(key) ?? 0) + 1);
+	}
+
+	function takeProcessedNormalResult(toolCallId: unknown, toolName: unknown): boolean {
+		const key = exactCallKey(toolCallId, toolName);
+		if (!key) return false;
+		const count = processedNormalResults.get(key) ?? 0;
+		if (count <= 0) return false;
+		if (count === 1) processedNormalResults.delete(key);
+		else processedNormalResults.set(key, count - 1);
+		return true;
+	}
 	/** One-shot worker soft-budget steer flag (worker role only, per process). */
 	let workerSoftSteerSent = false;
 	/**
@@ -1161,6 +1871,8 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		if (costSegment) line = line ? `${line} | ${costSegment}` : costSegment;
 		const advisorySegment = advisoryStatusSegment(evaluateAdvisory(breakdown, advisoryConfig));
 		if (advisorySegment) line = line ? `${line} | ${advisorySegment}` : advisorySegment;
+		const outputAdvisorySegment = contextOutputAdvisoryStatusSegment(ensureOutputControlTelemetry().snapshot().advisory);
+		if (outputAdvisorySegment) line = line ? `${line} | ${outputAdvisorySegment}` : outputAdvisorySegment;
 		// P7 write-authority segments: an ACTIVE confirmed lease renders the
 		// required compact `WF:LEASE <callsUsed>/<maxCalls>`; locked/pending/
 		// expired/exhausted/revoked render `WF:LOCKED`. WF:REVIEW (a review
@@ -1375,29 +2087,125 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		return { lines, gitRefresh };
 	}
 
-	function renderGateDefinition(gate: Gate, latestStatus?: string, latestRunId?: string): string[] {
-		const lines = [
-			`gate        : ${gate.id} — ${gate.title}`,
-			`description : ${gate.description}`,
-			`profiles    : ${gate.profiles.length > 0 ? gate.profiles.join(", ") : "(all)"}${QUANT_GATE_ID_RE.test(gate.id) ? " [quant]" : " [base]"}`,
-			`prereq      : ${gate.prerequisites.length > 0 ? gate.prerequisites.join(", ") : "(none)"}`,
-			`required    : ${gate.required}`,
-			`blocking    : ${gate.blocking}`,
-			`latest      : ${latestStatus ? `${latestStatus} (run ${latestRunId})` : "NOT_RUN (never run)"}`,
-			`acceptance  : ${gate.acceptance || "(not declared)"}`,
-			`evidence    : ${gate.evidence.length > 0 ? gate.evidence.join(", ") : "(not declared)"}`,
-			"checks:",
-		];
-		for (const c of gate.checks) {
-			const flags = [c.required ? "required" : "optional", c.blocking ? "blocking" : "non-blocking"].join("/");
-			const target =
-				c.recipe ?? c.recipes?.join("|") ?? c.path ?? c.any_of?.join("|") ??
-				(c.json_file ? `${c.json_file}#${c.json_path ?? c.json_any_of_paths?.join("|") ?? ""}` : undefined) ??
-				(c.artifact_recipe ? `artifacts of ${c.artifact_recipe}` : undefined) ??
-				(c.kind === "manual" ? "manual evidence" : c.kind === "config" ? "config" : c.schema_name ?? "");
-			lines.push(`  - ${c.id} [${c.kind}, ${flags}] ${c.title}${target ? ` — ${target}` : ""}`);
+	const TOOL_ERROR_MAX_BYTES = 8_192;
+	const TOOL_ERROR_MAX_LINES = 120;
+	const TOOL_DEFAULT_MAX_BYTES = 16_384;
+	const TOOL_DEFAULT_MAX_LINES = 240;
+	const GATE_DETAILS_MAX_ROWS = 24;
+	const GATE_DETAILS_MAX_FAILED_CHECKS = 12;
+
+	function boundedInlineDetail(value: unknown, maxBytes = 512): string {
+		const clean = (typeof value === "string" ? value : "").replace(/[\x00-\x1f\x7f]/g, " ");
+		return clampWholeResultText(clean, { maxBytes, maxLines: 1 }).text;
+	}
+
+	function boundedToolText(value: unknown, maxBytes = TOOL_DEFAULT_MAX_BYTES, maxLines = TOOL_DEFAULT_MAX_LINES): string {
+		return clampWholeResultText(value, { maxBytes, maxLines }).text;
+	}
+
+	function fixedToolFailure(tool: string, code: string, sourcePath?: string): {
+		content: Array<{ type: "text"; text: string }>;
+		details: Record<string, unknown>;
+	} {
+		const safeCode = boundedInlineDetail(code, 128) || "runtime_error";
+		const text = boundedToolText(`${tool}: ${safeCode}${sourcePath ? ` source=${boundedInlineDetail(sourcePath, 512)}` : ""}`, TOOL_ERROR_MAX_BYTES, TOOL_ERROR_MAX_LINES);
+		return { content: [{ type: "text", text }], details: { ok: false, error: safeCode, ...(sourcePath ? { source_path: boundedInlineDetail(sourcePath, 512) } : {}) } };
+	}
+
+	function boundedDetailsList(values: readonly string[], maxItems: number, maxItemBytes: number): BoundedStringListDetails {
+		const shown = values.slice(0, maxItems).map((value) => boundedInlineDetail(value, maxItemBytes));
+		return {
+			items: shown,
+			original_items: values.length,
+			shown_items: shown.length,
+			omitted_items: values.length - shown.length,
+		};
+	}
+
+	function boundedCoverageMap(recipes: readonly { name: string; validation_components: readonly ValidationComponent[] }[]): NonNullable<InspectToolDetails["recipe_validation_components"]> {
+		const shown = recipes.slice(0, 24);
+		const output: NonNullable<InspectToolDetails["recipe_validation_components"]> = {
+			__original_items__: recipes.length,
+			__shown_items__: shown.length,
+			__omitted_items__: recipes.length - shown.length,
+		};
+		for (const recipe of shown) {
+			let key = boundedInlineDetail(recipe.name, 128) || "(unnamed)";
+			let suffix = 1;
+			while (Object.prototype.hasOwnProperty.call(output, key)) key = `${boundedInlineDetail(recipe.name, 112)}#${suffix++}`;
+			output[key] = recipe.validation_components.slice(0, 16);
 		}
-		return lines;
+		return output;
+	}
+
+	function boundedGateDetails(result: Awaited<ReturnType<typeof runGates>>, projectRoot: string): GateToolDetails {
+		const nonPass = result.gates.filter((gate) => gate.status !== "PASS");
+		const pass = result.gates.filter((gate) => gate.status === "PASS");
+		const selected = [...nonPass, ...pass].slice(0, GATE_DETAILS_MAX_ROWS);
+		const gates = selected.map((gate) => {
+			const failedChecks = gate.checks.filter((check) => check.status === "FAIL").map((check) => check.check_id);
+			const shownChecks = failedChecks.slice(0, GATE_DETAILS_MAX_FAILED_CHECKS).map((check) => boundedInlineDetail(check, 128));
+			return {
+				id: boundedInlineDetail(gate.id, 96),
+				status: gate.status,
+				title: boundedInlineDetail(gate.title, 256),
+				failure_reason: gate.failure_reason ? boundedInlineDetail(gate.failure_reason, 512) : null,
+				blocked_reason: gate.blocked_reason ? boundedInlineDetail(gate.blocked_reason, 512) : null,
+				failed_checks: shownChecks,
+				failed_check_count: failedChecks.length,
+				failed_checks_omitted: failedChecks.length - shownChecks.length,
+			};
+		});
+		return {
+			ok: result.ok,
+			status: result.status,
+			run_id: boundedInlineDetail(result.runId, 128),
+			requested: result.requested.slice(0, 16).map((selector) => boundedInlineDetail(selector, 128)),
+			profile: result.profile ? boundedInlineDetail(result.profile, 128) : undefined,
+			gates,
+			counts: {
+				pass: result.gates.filter((gate) => gate.status === "PASS").length,
+				fail: result.gates.filter((gate) => gate.status === "FAIL").length,
+				blocked: result.gates.filter((gate) => gate.status === "BLOCKED").length,
+				not_run: result.gates.filter((gate) => gate.status === "NOT_RUN").length,
+				total: result.gates.length,
+				shown: gates.length,
+				omitted: result.gates.length - gates.length,
+			},
+			log_path: boundedInlineDetail(displayRelative(projectRoot, `${CONFIG_DIR_NAME}/workbench/runs/${result.runId}`), 512),
+			phase: "finished",
+		};
+	}
+
+	function renderGateListPresentation(
+		gates: readonly Gate[],
+		statuses: Readonly<Record<string, { status: GateStatus; run_id: string }>>,
+	): { text: string; shownGates: Gate[] } {
+		const maximum = Math.min(gates.length, 24);
+		for (let shown = maximum; shown >= 0; shown -= 1) {
+			const selected = gates.slice(0, shown);
+			const lines = [
+				`${gates.length} gate(s) for this project; shown=${shown}; omitted=${gates.length - shown}:`,
+				...selected.map((gate) => {
+					const latest = statuses[gate.id];
+					const status = latest ? `${latest.status} (run ${boundedInlineDetail(latest.run_id, 96)})` : "NOT_RUN (never run)";
+					const prereqs = gate.prerequisites.length > 0 ? boundedInlineDetail(gate.prerequisites.join(","), 256) : "(none)";
+					return `  ${boundedInlineDetail(gate.id, 96)} ${status} ${boundedInlineDetail(gate.title, 256)} prereqs=${prereqs}`;
+				}),
+				`omissions: ${gates.length - shown} gate row(s) omitted`,
+				"source: .pi/workbench/gates.yaml + builtin ladder",
+			];
+			const text = lines.join("\n");
+			if (Buffer.byteLength(text, "utf8") <= TOOL_DEFAULT_MAX_BYTES && lines.length <= TOOL_DEFAULT_MAX_LINES) {
+				return { text, shownGates: [...selected] };
+			}
+		}
+		return { text: "workbench_list_gates: bounded rendering unavailable\nsource: .pi/workbench/gates.yaml + builtin ladder", shownGates: [] };
+	}
+
+	function renderGateDefinition(gate: Gate, latestStatus?: GateStatus, latestRunId?: string): string[] {
+		const page = renderGateDefinitionPage({ gate, latestStatus, latestRunId, include: "checks", maxLines: 320 });
+		return page.text.split("\n");
 	}
 
 	// -------------------------------------------------------------- lifecycle
@@ -1419,6 +2227,12 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		delegationState = loadDelegationStateFromEntries(entries);
 		writeLease = loadLeaseFromEntries(entries);
 		if (ctx.model) currentModelFacts = { provider: ctx.model.provider, model: ctx.model.id };
+		// Restore only the latest strict numeric/fixed-enum snapshot for the
+		// resolved role. Malformed matching entries reset the accumulator.
+		outputControlTelemetry = undefined;
+		outputControlTelemetryRole = undefined;
+		ensureOutputControlTelemetry(entries);
+		mirrorOutputControlCompactFacts();
 		if (writeLease) {
 			const now = new Date().toISOString();
 			const reason = leaseRevokeReason(writeLease, {
@@ -1497,6 +2311,55 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 
 	// -------------------------------------------------------- widget events
 
+	pi.on("turn_start", (event) => {
+		currentTurnSerial = event.turnIndex;
+		pendingOutputAuthorizations.clear();
+		trustedReadContinuations.clear();
+		trustedRunLogContinuations.clear();
+		trustedGateContinuations.clear();
+		processedNormalResults.clear();
+		pendingReceiptHandles.clear();
+		turnOutputBudget.startTurn({ turnSerial: event.turnIndex, role: outputTurnRole() });
+		ensureOutputControlTelemetry();
+	});
+
+	pi.on("turn_end", () => {
+		const telemetry = turnOutputBudget.endTurn();
+		try {
+			pi.appendEntry(OUTPUT_TURN_TELEMETRY_ENTRY_TYPE, {
+				role: telemetry.role,
+				planning: telemetry.planned ? "planned" : "dynamic",
+				turnSerial: telemetry.turnSerial,
+				maxBytes: telemetry.maxBytes,
+				reservationCount: telemetry.reservationCount,
+				blockedCalls: telemetry.blockedCalls,
+				consumedCalls: telemetry.consumedCalls,
+				releasedCalls: telemetry.releasedCalls,
+				reservedBytes: telemetry.reservedBytes,
+				consumedBytes: telemetry.consumedBytes,
+				controlConsumedBytes: telemetry.controlConsumedBytes,
+				totalAccountedBytes: telemetry.totalAccountedBytes,
+				releasedBytes: telemetry.releasedBytes,
+				unusedBytes: telemetry.unusedBytes,
+			});
+		} catch {
+			// Legacy per-turn observation persistence is best-effort.
+		}
+		try {
+			ensureOutputControlTelemetry().recordTurn(telemetry);
+			mirrorOutputControlCompactFacts();
+			persistOutputControlTelemetry();
+		} catch {
+			// Session telemetry persistence is advisory and never breaks closure.
+		}
+		pendingOutputAuthorizations.clear();
+		trustedReadContinuations.clear();
+		trustedRunLogContinuations.clear();
+		trustedGateContinuations.clear();
+		processedNormalResults.clear();
+		pendingReceiptHandles.clear();
+	});
+
 	pi.on("before_agent_start", async (event, ctx) => {
 		// P7: lazy lease-lock sync before every agent turn — an
 		// expired/exhausted lease is reverted to the exact canonical 15
@@ -1543,9 +2406,12 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 				if (typeof record.recipe === "string") compactState.lastRecipe = record.recipe;
 				const evidencePath = `.pi/workbench/runs/${runId}`;
 				compactState.evidencePaths = pushBounded(compactState.evidencePaths, evidencePath, MAX_EVIDENCE_PATHS);
-				if (event.toolName === "workbench_run_gate" && Array.isArray(record.gates)) {
-					for (const g of record.gates as Array<{ id?: unknown; status?: unknown }>) {
-						const id = typeof g.id === "string" ? g.id : "?";
+					if (event.toolName === "workbench_run_gate" && Array.isArray(record.gates)) {
+						// R6: tool_execution_end receives the projected, bounded DTO.
+						// Consume only its finite status summary; never depend on gates_full
+						// or a domain GateRunEntry/check/evidence structure.
+						for (const g of (record.gates as Array<{ id?: unknown; status?: unknown }>).slice(0, 32)) {
+							const id = typeof g.id === "string" ? g.id : "?";
 						if (g.status === "PASS") compactState.passedGates = pushBounded(compactState.passedGates, id, MAX_GATES);
 						else if (g.status === "FAIL") compactState.failedGates = pushBounded(compactState.failedGates, `${id} (run ${runId})`, MAX_GATES);
 						else if (g.status === "BLOCKED") compactState.blockedGates = pushBounded(compactState.blockedGates, `${id} (run ${runId})`, MAX_GATES);
@@ -1589,12 +2455,174 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		cacheTelemetry.observeThinkingChange(event.level);
 	});
 
+	// Pi 0.83 calls `context` before constructing every provider request. It
+	// structured-clones the active messages first, so this replacement affects
+	// only the outgoing copy and can never rewrite session entries. The handler
+	// catches its own failures because Pi otherwise swallows an extension error
+	// and continues with the unprojected (raw) context.
+	pi.on("context", (event) => {
+		const role = outputTurnRole();
+		const maxToolTextBytes = role === "commander"
+			? COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES
+			: role === "worker"
+				? WORKER_HISTORY_TOOL_TEXT_MAX_BYTES
+				: OTHER_HISTORY_TOOL_TEXT_MAX_BYTES;
+		try {
+			const projection = projectContextHistory({
+				messages: event.messages,
+				maxToolTextBytes,
+				maxBundles: HISTORY_MAX_BUNDLES,
+				descriptorMaxBytes: HISTORY_DESCRIPTOR_MAX_BYTES,
+				role,
+			});
+			latestHistoryProjectionFacts = { ...projection.facts };
+			ensureOutputControlTelemetry().recordHistory(projection.facts, role);
+			mirrorOutputControlCompactFacts();
+			return { messages: projection.messages };
+		} catch {
+			const messages = historyProjectionFailureMessages(
+				event.messages,
+				maxToolTextBytes,
+				HISTORY_DESCRIPTOR_MAX_BYTES,
+			);
+			latestHistoryProjectionFacts = {
+				originalToolTextBytes: 0,
+				finalToolTextBytes: historyToolTextBytes(messages),
+				collapsedResults: 0,
+				removedBundles: 0,
+				protectedLatestBundles: 0,
+			};
+			ensureOutputControlTelemetry().recordHistory(latestHistoryProjectionFacts, role);
+			mirrorOutputControlCompactFacts();
+			return { messages };
+		}
+	});
+
 	// READ-ONLY structural peek: the payload is never replaced, mutated or
 	// stored — only a structural digest (roles, lengths, per-segment hashes,
 	// tool names) is kept in memory for contextShapeHash classification.
 	pi.on("before_provider_request", (event) => {
 		cacheTelemetry.observePayload(event.payload);
 		return undefined;
+	});
+
+	// The first message_end handler plans assistant batches before Pi starts
+	// any tool, and owns every immediate toolResult path that bypasses
+	// tool_result middleware (unknown tool, validation failure, guard block,
+	// abort, or length-stop). It is registered before telemetry/persistence
+	// observers and never creates/finalizes a receipt.
+	pi.on("message_end", (event) => {
+		const messageValue = event.message as unknown;
+		const calls = assistantToolCalls(messageValue);
+		if (calls !== undefined) {
+			const plan = planTurnOutputBudget({
+				turnSerial: currentTurnSerial,
+				role: outputTurnRole(),
+				calls,
+			});
+			turnOutputBudget.installPlan(plan);
+			pendingOutputAuthorizations.clear();
+			return undefined;
+		}
+		if (ownDataValue(messageValue, "role") !== "toolResult") return undefined;
+
+		const toolCallIdValue = ownDataValue(messageValue, "toolCallId");
+		const toolNameValue = ownDataValue(messageValue, "toolName");
+		const toolCallId = typeof toolCallIdValue === "string" ? toolCallIdValue : "";
+		const toolName = typeof toolNameValue === "string" ? toolNameValue : "";
+		// Never trust caller-supplied output_envelope/receipt facts as proof of
+		// processing. Only this private, exact FIFO marker can bypass immediate
+		// result accounting after the normal tool_result middleware path.
+		if (takeProcessedNormalResult(toolCallId, toolName)) return undefined;
+		let authorization = takeOutputAuthorization(toolCallId, toolName);
+		try {
+			const content = ownDataValue(messageValue, "content");
+			const details = ownDataValue(messageValue, "details");
+			const role = outputTurnRole();
+			authorization ??= authorizeOutput(toolCallId, toolName, undefined);
+			pendingReceiptHandles.delete(toolCallId);
+			const policy = resolveToolOutputPolicy({ toolName, args: undefined, role });
+			let envelope: OutputEnvelopeResult;
+			if (!authorization.authorizationId) {
+				envelope = enforceOutputEnvelope({
+					toolName,
+					content: [],
+					isError: true,
+					policy,
+					allocatedBytes: 0,
+				});
+			} else if (!authorization.allowed) {
+				const controlText = authorization.controlAllocatedBytes > 0
+					? authorization.controlText ?? blockedControlText(authorization.blockCode ?? "turn_output_budget")
+					: "";
+				envelope = enforceOutputEnvelope({
+					toolName,
+					content: controlText ? [{ type: "text", text: controlText }] : [],
+					isError: true,
+					policy,
+					allocatedBytes: authorization.controlAllocatedBytes,
+				});
+				const accounting = turnOutputBudget.accountImmediate({
+					authorizationId: authorization.authorizationId,
+					actualBytes: envelope.facts.shownTextBytes,
+				});
+				if (!accounting.accepted) {
+					envelope = enforceOutputEnvelope({ toolName, content: [], isError: true, policy, allocatedBytes: 0 });
+				}
+			} else {
+				envelope = enforceOutputEnvelope({
+					toolName,
+					content: content as RuntimeOutputContent,
+					isError: true,
+					policy,
+					allocatedBytes: authorization.allocatedBytes,
+				});
+				const accounting = turnOutputBudget.accountImmediate({
+					authorizationId: authorization.authorizationId,
+					actualBytes: envelope.facts.shownTextBytes,
+				});
+				if (!accounting.accepted) {
+					envelope = enforceOutputEnvelope({ toolName, content: [], isError: true, policy, allocatedBytes: 0 });
+				}
+			}
+			const projectedDetails = projectToolResultDetails({
+				toolName,
+				details,
+				envelope: envelope.facts,
+			}).details;
+			observeOutputEnvelope(toolName, envelope.facts);
+			const replacement = {
+				...(messageValue as Record<string, unknown>),
+				content: envelope.content,
+				details: projectedDetails,
+				isError: true,
+			};
+			return { message: replacement as never };
+		} catch {
+			if (authorization?.authorizationId) {
+				turnOutputBudget.accountImmediate({ authorizationId: authorization.authorizationId, actualBytes: 0 });
+			}
+			pendingReceiptHandles.delete(toolCallId);
+			const policy = resolveToolOutputPolicy({ toolName, args: undefined, role: outputTurnRole() });
+			const envelope = enforceOutputEnvelope({ toolName, content: [], isError: true, policy, allocatedBytes: 0 });
+			observeOutputEnvelope(toolName || "unknown", envelope.facts);
+			const timestampValue = ownDataValue(messageValue, "timestamp");
+			return {
+				message: {
+					role: "toolResult",
+					toolCallId: toolCallId || "unknown",
+					toolName: toolName || "unknown",
+					content: envelope.content,
+					details: projectToolResultDetails({
+						toolName: toolName || "unknown",
+						details: undefined,
+						envelope: envelope.facts,
+					}).details,
+					isError: true,
+					timestamp: typeof timestampValue === "number" && Number.isFinite(timestampValue) ? timestampValue : 0,
+				} as never,
+			};
+		}
 	});
 
 	// message_end records telemetry for ASSISTANT messages and refreshes cost
@@ -1825,6 +2853,22 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			}
 			const facts = evaluateAdvisory(breakdown, advisoryConfig);
 			output(ctx, [...renderCostBreakdown(breakdown), "", ...renderAdvisoryFacts(facts)]);
+		},
+	});
+
+	// ------------------------------------------- /q-context-output-status
+
+	pi.registerCommand("q-context-output-status", {
+		description:
+			"Show numeric-only context-output observations; optional exact subcommand: json (observation-only, never enforcement)",
+		handler: async (args, ctx) => {
+			const format = typeof args === "string" ? args.trim() : "";
+			if (format !== "" && format !== "json") {
+				output(ctx, ["usage: /q-context-output-status [json]"]);
+				return;
+			}
+			const snapshot = ensureOutputControlTelemetry().snapshot();
+			output(ctx, renderOutputControlStatus(snapshot, format === "json" ? "json" : "text").split("\n"));
 		},
 	});
 
@@ -2352,39 +3396,48 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	pi.registerCommand("q-run-show", {
 		description: "Show a run record: /q-run-show <run-id> (manifest, summary, bounded log tails)",
 		handler: async (args, ctx) => {
+			const emitRunShow = (value: unknown): void => {
+				const text = boundedToolText(value, TOOL_DEFAULT_MAX_BYTES, TOOL_DEFAULT_MAX_LINES);
+				output(ctx, text.split("\n"));
+			};
 			const runId = args.trim();
 			if (!isValidRunId(runId)) {
-				output(ctx, ["/q-run-show: usage: /q-run-show <run-id> (e.g. 20260101-120000-abcd)"]);
+				emitRunShow("/q-run-show: usage: /q-run-show <run-id> (e.g. 20260101-120000-abcd)");
 				return;
 			}
 			const trustError = trustedOrError(ctx);
 			if (trustError) {
-				output(ctx, [`/q-run-show: ${trustError}`]);
+				emitRunShow(`/q-run-show: ${trustError}`);
 				return;
 			}
 			const projectRoot = await projectRootFor(ctx);
 			const manifest = await readManifest(projectRoot, runId);
 			if (!manifest) {
-				output(ctx, [`/q-run-show: run ${runId} not found`]);
+				emitRunShow(`/q-run-show: run ${runId} not found`);
 				return;
 			}
 			const stdoutSnippet = await readLogSnippet(projectRoot, runId, "stdout");
 			const stderrSnippet = await readLogSnippet(projectRoot, runId, "stderr");
+			const argvValues = Array.isArray(manifest.argv) ? manifest.argv.filter((value): value is string => typeof value === "string") : [];
+			const artifactValues = Array.isArray(manifest.artifact_paths) ? manifest.artifact_paths.filter((value): value is string => typeof value === "string") : [];
+			const argv = boundedDetailsList(argvValues, 32, 256);
+			const artifacts = boundedDetailsList(artifactValues, 32, 256);
 			const lines = [
-				`run       : ${manifest.run_id}`,
-				`recipe    : ${manifest.recipe}`,
-				`profile   : ${manifest.profile ?? "(none)"}`,
-				`mode      : ${manifest.mode}`,
-				`started   : ${manifest.started_at}`,
-				`finished  : ${manifest.finished_at}`,
+				`run       : ${boundedInlineDetail(manifest.run_id, 128)}`,
+				`full record: ${displayRelative(projectRoot, `${CONFIG_DIR_NAME}/workbench/runs/${runId}/manifest.json`)}`,
+				`recipe    : ${boundedInlineDetail(manifest.recipe, 256)}`,
+				`profile   : ${boundedInlineDetail(manifest.profile ?? "(none)", 256)}`,
+				`mode      : ${boundedInlineDetail(manifest.mode, 64)}`,
+				`started   : ${boundedInlineDetail(manifest.started_at, 128)}`,
+				`finished  : ${boundedInlineDetail(manifest.finished_at, 128)}`,
 				`duration  : ${manifest.duration_ms} ms`,
-				`cwd       : ${manifest.cwd}`,
-				`argv      : ${manifest.argv.join(" ")}`,
+				`cwd       : ${boundedInlineDetail(manifest.cwd, 512)}`,
+				`argv      : ${argv.items.join(" ") || "(none)"}${argv.omitted_items > 0 ? ` (+${argv.omitted_items} argv item(s) omitted)` : ""}`,
 				`exit code : ${manifest.exit_code ?? "killed"}`,
 				`timed out : ${manifest.timed_out}`,
 				`cancelled : ${manifest.cancelled}`,
-				`git       : ${manifest.git_commit ? manifest.git_commit.slice(0, 12) : "(no git)"}${manifest.git_dirty ? " (dirty)" : ""}`,
-				`artifacts : ${manifest.artifact_paths.length > 0 ? manifest.artifact_paths.join(", ") : "(none)"}`,
+				`git       : ${typeof manifest.git_commit === "string" ? boundedInlineDetail(manifest.git_commit, 12) : "(no git)"}${manifest.git_dirty ? " (dirty)" : ""}`,
+				`artifacts : ${artifacts.items.join(", ") || "(none)"}${artifacts.omitted_items > 0 ? ` (+${artifacts.omitted_items} artifact path(s) omitted)` : ""}`,
 				`stdout log: ${displayRelative(projectRoot, stdoutSnippet.path)}${stdoutSnippet.truncated ? " (truncated below)" : ""}`,
 				`stderr log: ${displayRelative(projectRoot, stderrSnippet.path)}${stderrSnippet.truncated ? " (truncated below)" : ""}`,
 				"",
@@ -2393,7 +3446,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 				"--- stderr tail ---",
 				stderrSnippet.content || "(empty)",
 			];
-			output(ctx, lines);
+			emitRunShow(lines.join("\n"));
 		},
 	});
 
@@ -2430,7 +3483,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	 * success/failure caps as recipe summaries.
 	 */
 	function gateParentSummaryLines(result: Awaited<ReturnType<typeof runGates>>, projectRoot: string): string[] {
-		return buildGateParentSummary({
+		const summary = buildGateParentSummary({
 			runId: result.runId,
 			requested: result.requested,
 			profile: result.profile,
@@ -2443,7 +3496,8 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 				blocked_reason: g.blocked_reason,
 			})),
 			recordPath: displayRelative(projectRoot, `${CONFIG_DIR_NAME}/workbench/runs/${result.runId}`),
-		}).lines;
+		});
+		return clampWholeResultText(summary.text, { maxBytes: 16_384, maxLines: 240 }).text.split("\n");
 	}
 
 	pi.registerCommand("q-gate", {
@@ -2585,39 +3639,36 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	pi.registerCommand("q-evidence", {
 		description: "Show the evidence of a gate run: /q-evidence <run-id>",
 		handler: async (args, ctx) => {
+			const emitEvidence = (value: unknown): void => {
+				const text = boundedToolText(value, TOOL_DEFAULT_MAX_BYTES, TOOL_DEFAULT_MAX_LINES);
+				output(ctx, text.split("\n"));
+			};
 			const runId = args.trim();
 			if (!isValidRunId(runId)) {
-				output(ctx, ["/q-evidence: usage: /q-evidence <run-id> (e.g. 20260101-120000-abcd)"]);
+				emitEvidence("/q-evidence: usage: /q-evidence <run-id> (e.g. 20260101-120000-abcd)");
 				return;
 			}
 			const trustError = trustedOrError(ctx);
 			if (trustError) {
-				output(ctx, [`/q-evidence: ${trustError}`]);
+				emitEvidence(`/q-evidence: ${trustError}`);
 				return;
 			}
 			const projectRoot = await projectRootFor(ctx);
 			const manifest = await readManifest(projectRoot, runId);
 			if (!manifest) {
-				output(ctx, [`/q-evidence: run ${runId} not found`]);
+				emitEvidence(`/q-evidence: run ${runId} not found`);
 				return;
 			}
 			if (manifest.recipe !== "gate") {
-				output(ctx, [`/q-evidence: run ${runId} is a recipe run (recipe "${manifest.recipe}") — it has no gate evidence`]);
+				emitEvidence(`/q-evidence: run ${runId} is a recipe run (recipe "${boundedInlineDetail(manifest.recipe, 256)}") — it has no gate evidence`);
 				return;
 			}
-			const { readFile } = await import("node:fs/promises");
-			const evidence = await readFile(join(runsDirFor(projectRoot), runId, "evidence.json"), "utf8");
-			const parsed = JSON.parse(evidence) as { checks?: Record<string, { status: string; kind: string; evidence: unknown[]; failure_reason?: string | null }> };
-			const lines = [`evidence for gate run ${runId} (${Object.keys(parsed.checks ?? {}).length} check record(s)):`, ""];
-			for (const [checkId, record] of Object.entries(parsed.checks ?? {})) {
-				const items = (record.evidence ?? []).map((e) => {
-					const ev = e as { type?: string; detail?: string };
-					return `${ev.type ?? "?"}:${ev.detail ?? ""}`;
-				});
-				lines.push(`  ${checkId.padEnd(8)} ${record.status.padEnd(8)} ${record.kind.padEnd(8)} ${items.join(" | ") || "(no evidence)"}`);
+			try {
+				const evidence = await readGateEvidenceView(projectRoot, runId);
+				emitEvidence(evidence.text);
+			} catch {
+				emitEvidence("/q-evidence: gate evidence unavailable");
 			}
-			lines.push("", `full record: ${displayRelative(projectRoot, `${CONFIG_DIR_NAME}/workbench/runs/${runId}/evidence.json`)}`);
-			output(ctx, lines);
 		},
 	});
 
@@ -3011,92 +4062,152 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 
 	// --------------------------------------- NRO N1/N2 native tool overrides
 
-	/**
-	 * NRO N1: a text-only built-in read result whose text starts with the
-	 * built-in image note is validated against the source file's magic bytes
-	 * (read-only sniff through the Pi-equivalent path normalization). True
-	 * when the sniffed MIME agrees with the note's MIME — the result is an
-	 * image-path result and must pass through byte-identically. A genuine
-	 * text file starting with the same phrase has no matching magic bytes
-	 * and still gets the deterministic preview + facts. On any read failure
-	 * the built-in's own result is kept byte-identical (never invent facts
-	 * on an ambiguous image note).
-	 */
-	async function isReadImageNoteResult(path: string, cwd: string, note: string): Promise<boolean> {
-		const noteMime = imageMimeFromReadNote(note);
-		if (noteMime === null) return false;
-		const absolutePath = await nativeResolveReadPath(path, cwd);
-		try {
-			const handle = await open(absolutePath, "r");
-			try {
-				const buffer = Buffer.alloc(IMAGE_SNIFF_BYTES);
-				const { bytesRead } = await handle.read(buffer, 0, IMAGE_SNIFF_BYTES, 0);
-				return sniffImageMimeType(buffer.subarray(0, bytesRead)) === noteMime;
-			} finally {
-				await handle.close();
-			}
-		} catch {
-			return true;
-		}
+	function nativeReadV3Error(code: string): { content: Array<{ type: "text"; text: string }>; details: { schema: "workbench-read-page-v1"; code: string } } {
+		return {
+			content: [{ type: "text", text: `workbench_read: ${code}` }],
+			details: { schema: "workbench-read-page-v1", code },
+		};
 	}
 
 	pi.registerTool({
 		...NATIVE_OVERRIDE_METADATA.read,
 		parameters: NATIVE_OVERRIDE_PARAMETERS.read,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			// NRO N1 (plan §6.1): the captured built-in definition owns path
-			// normalization (leading-@, relative/absolute, macOS variants),
-			// image handling, error text and abort semantics. Explicit offset
-			// and/or limit always take the LEGACY path: content/details/errors/
-			// abort are byte-identical to the built-in.
-			const builtin = createReadToolDefinition(ctx.cwd);
-			if (params.offset !== undefined || params.limit !== undefined) {
-				return builtin.execute(toolCallId, params, signal, onUpdate, ctx);
-			}
-			const result = await builtin.execute(toolCallId, params, signal, onUpdate, ctx);
-			// Images pass through unchanged (attachment content + note). A
-			// FAILED decode/resize (or an unprocessed BMP) is a TEXT-ONLY
-			// result that still starts with the built-in image note
-			// ("Read image file [<mime>]") — and a genuine text file can start
-			// with the same phrase. The source's magic bytes are sniffed
-			// (read-only) and compared against the note's MIME: an image-path
-			// result passes through byte-identically, genuine text still gets
-			// the deterministic preview + facts.
-			if (result.content.some((c) => c.type === "image")) return result;
-			const textBlock = result.content.find((c): c is { type: "text"; text: string } => c.type === "text");
-			if (!textBlock) return result;
-			if (textBlock.text.startsWith("Read image file [") && (await isReadImageNoteResult(params.path, ctx.cwd, textBlock.text))) {
-				return result;
-			}
-			const truncation = (result.details as ReadToolDetails | undefined)?.truncation;
-			if (truncation?.firstLineExceedsLimit) {
-				// The built-in cannot return a first line > 50KB; re-read the
-				// file read-only through the Pi-equivalent path normalization
-				// (policy module) to build the deterministic preview. No shell,
-				// no pi.exec, no writes.
-				if (signal?.aborted) throw new Error("Operation aborted");
-				const absolutePath = await nativeResolveReadPath(params.path, ctx.cwd);
-				const buffer = await readFile(absolutePath);
-				if (signal?.aborted) throw new Error("Operation aborted");
-				const preview = buildReadPreview(buffer.toString("utf-8"));
-				return { content: [{ type: "text", text: preview.content }], details: preview.details };
-			}
-			if (truncation?.truncated) {
-				// Built-in head truncation at 2000 lines / 50KB: the preview
-				// window (240 lines / 12 KiB) is always inside the built-in's
-				// returned content; the totals come from the built-in's own
-				// TruncationResult (same counting basis as the policy module).
-				const preview = buildReadPreview(truncation.content, {
-					totalLines: truncation.totalLines,
-					totalBytes: truncation.totalBytes,
+			if (params.cursor !== undefined && params.offset !== undefined) return nativeReadV3Error("invalid_pagination");
+			throwIfNativeReadAborted(signal);
+			const pendingAuthorization = peekOutputAuthorization(toolCallId, "read");
+			// Direct execute tests/callers have no guard-side authorization and keep
+			// the native hard cap. A guarded runtime call must use exactly its own
+			// pending reservation; a blocked/zero allocation never falls back up.
+			const maxOutputBytes = pendingAuthorization === undefined
+				? READ_V3_MAX_OUTPUT_BYTES
+				: pendingAuthorization.allowed
+					? Math.min(READ_V3_MAX_OUTPUT_BYTES, pendingAuthorization.allocatedBytes)
+					: 0;
+			const absolutePath = await nativeResolveReadPath(params.path, ctx.cwd);
+			const source = computeFileSourceId("read", absolutePath);
+			if (!source.ok) return nativeReadV3Error(source.error.code);
+			let authority: FileHandle | undefined;
+			let authorityClosed = false;
+			const closeAuthority = async (): Promise<boolean> => {
+				if (authority === undefined || authorityClosed) return true;
+				authorityClosed = true;
+				return closeNativeReadAuthority(authority, toolCallId);
+			};
+			try {
+				try {
+					authority = await open(absolutePath, "r");
+				} catch {
+					throw new NativeReadV3IoFailure("io_error");
+				}
+				const initial = await nativeReadHandleSnapshot(authority);
+				const prefix = await readNativeHandleExactly(authority, Math.min(initial.fileSize, IMAGE_SNIFF_BYTES), signal);
+				const mimeType = sniffImageMimeType(prefix);
+				const hookFacts = Object.freeze({ toolCallId, fileSize: initial.fileSize, mimeType });
+				await nativeReadV3TestHooks.get(toolCallId)?.afterMagicSniff?.(hookFacts);
+				await verifyNativeReadHandle(authority, initial);
+				await verifyNativeReadPathIdentity(absolutePath, initial);
+
+				if (mimeType !== null) {
+					if (params.cursor !== undefined) return nativeReadV3Error("invalid_pagination");
+					let imageRead = false;
+					const verifyImageRequest = async (requestedPath: string): Promise<void> => {
+						throwIfNativeReadAborted(signal);
+						if (requestedPath !== absolutePath) throw new NativeReadV3IoFailure("source_changed_during_read");
+						await verifyNativeReadHandle(authority!, initial);
+						await verifyNativeReadPathIdentity(absolutePath, initial);
+					};
+					const imageTool = createReadToolDefinition(ctx.cwd, {
+						operations: {
+							access: verifyImageRequest,
+							detectImageMimeType: async (requestedPath) => {
+								await verifyImageRequest(requestedPath);
+								return mimeType;
+							},
+							readFile: async (requestedPath) => {
+								await verifyImageRequest(requestedPath);
+								const bytes = await readNativeHandleExactly(authority!, initial.fileSize, signal);
+								imageRead = true;
+								await nativeReadV3TestHooks.get(toolCallId)?.afterImageBytesRead?.(hookFacts);
+								await verifyNativeReadHandle(authority!, initial);
+								await verifyNativeReadPathIdentity(absolutePath, initial);
+								return bytes;
+							},
+						},
+					});
+					let imageResult: Awaited<ReturnType<typeof imageTool.execute>>;
+					try {
+						// Do not hand Pi the caller signal: its built-in rejects immediately
+						// while image processing continues in the background. The custom
+						// operations check the signal without closing their live handle early.
+						imageResult = await imageTool.execute(toolCallId, params, undefined, onUpdate, ctx);
+					} catch (error) {
+						if (error instanceof NativeReadV3IoFailure) return nativeReadV3Error(error.code);
+						if (error instanceof Error && error.message === "Operation aborted") throw error;
+						return nativeReadV3Error("io_error");
+					}
+					if (!imageRead) return nativeReadV3Error("io_error");
+					throwIfNativeReadAborted(signal);
+					await verifyNativeReadHandle(authority, initial);
+					await verifyNativeReadPathIdentity(absolutePath, initial);
+					if (!(await closeAuthority())) return nativeReadV3Error("io_error");
+					return imageResult;
+				}
+
+				// Text never enters Pi's legacy full-read branch. The classifier handle
+				// is closed first; the bounded pager's own handle must report the exact
+				// same source identity, so a path/symlink swap cannot expose replacement
+				// bytes even if it lands between the two opens.
+				if (!(await closeAuthority())) return nativeReadV3Error("io_error");
+				let cursorPayload: FileCursorPayload | undefined;
+				if (params.cursor !== undefined) {
+					const decoded = decodeContinuationCursor(params.cursor);
+					if (!decoded.ok || decoded.value.kind !== "read") return nativeReadV3Error("invalid_cursor");
+					cursorPayload = decoded.value;
+					if (cursorPayload.sourceId !== source.value) return nativeReadV3Error("source_mismatch");
+				}
+				const page = await readTextPage(absolutePath, {
+					...(cursorPayload
+						? {
+							startByte: cursorPayload.byteOffset,
+							lineNumber: cursorPayload.lineNumber,
+							expectedSource: cursorPayload,
+							verifyStartByteForLine: true,
+						}
+						: params.offset !== undefined ? { startLine: params.offset } : {}),
+					maxBytes: READ_V3_MAX_OUTPUT_BYTES,
+					maxLines: params.limit ?? READ_V3_MAX_FILE_LINES,
+					signal,
 				});
-				return { content: [{ type: "text", text: preview.content }], details: preview.details };
+				if (!page.ok) return nativeReadV3Error(page.error.code);
+				if (!sameNativeReadSnapshot(initial, page.value.source)) return nativeReadV3Error("source_changed_during_read");
+				if (cursorPayload) {
+					const validated = validateFileCursorSource({
+						payload: cursorPayload,
+						expectedKind: "read",
+						expectedSourceId: source.value,
+						currentSnapshot: page.value.source,
+					});
+					if (!validated.ok) return nativeReadV3Error(validated.error.code);
+				}
+				const rendered = buildNativeReadV3Page({
+					displayPath: params.path,
+					sourceId: source.value,
+					page: page.value,
+					maxOutputBytes,
+				});
+				rememberTrustedReadContinuation(toolCallId, rendered.details.next_cursor);
+				return { content: [{ type: "text", text: rendered.text }], details: rendered.details };
+			} catch (error) {
+				if (error instanceof NativeReadV3IoFailure) return nativeReadV3Error(error.code);
+				if (error instanceof Error && error.message === "Operation aborted") throw error;
+				if (error instanceof Error && error.message === READ_V3_ALLOCATION_TOO_SMALL) {
+					return nativeReadV3Error("output_allocation_too_small");
+				}
+				return nativeReadV3Error("io_error");
+			} finally {
+				if (!authorityClosed) await closeAuthority();
 			}
-			// No built-in truncation: the text is the complete file content —
-			// keep it byte-for-byte and append the deterministic facts
-			// (complete=true, or line_truncated when a line exceeds 2048 bytes).
-			const preview = buildReadPreview(textBlock.text);
-			return { content: [{ type: "text", text: preview.content }], details: preview.details };
 		},
 	});
 
@@ -3160,43 +4271,34 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		...WORKBENCH_TOOL_METADATA.workbench_project_inspect,
 		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_project_inspect,
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			const trustError = trustedOrError(ctx);
-			if (trustError) {
-				return { content: [{ type: "text", text: `workbench_project_inspect: ${trustError}` }], details: {} };
+			try {
+				const trustError = trustedOrError(ctx);
+				if (trustError) return fixedToolFailure("workbench_project_inspect", "untrusted_project");
+				const projectRoot = await projectRootFor(ctx);
+				const result = await inspectProject(projectRoot, { trusted: true, exec: execFn });
+				const stacks = result.stacks.map((stack) => `${stack.language}${stack.package_manager ? ` (${stack.package_manager})` : ""}`);
+				const errors = result.config_errors.map((error) => `${error.file}: ${error.message}`);
+				const details: InspectToolDetails = {
+					project_root: boundedInlineDetail(result.project_root, 512),
+					effective_project_root: boundedInlineDetail(result.effective_project_root, 512),
+					git: {
+						is_git: result.git.is_git,
+						commit: result.git.commit ? boundedInlineDetail(result.git.commit, 128) : null,
+						dirty: result.git.dirty,
+						branch: result.git.branch ? boundedInlineDetail(result.git.branch, 128) : null,
+					},
+					stacks: boundedDetailsList(stacks, 24, 256),
+					profile: result.profile ? boundedInlineDetail(result.profile, 128) : undefined,
+					recipes: boundedDetailsList(result.recipes.map((recipe) => recipe.name), 24, 256),
+					recipe_validation_components: boundedCoverageMap(result.recipes),
+					config_errors: boundedDetailsList(errors, 24, 512),
+					config_files_present: boundedDetailsList(result.config_files_present, 24, 256),
+				};
+				const text = boundedToolText(renderInspectLines(details, true).join("\n"));
+				return { content: [{ type: "text", text }], details };
+			} catch {
+				return fixedToolFailure("workbench_project_inspect", "runtime_error");
 			}
-			const projectRoot = await projectRootFor(ctx);
-			const result = await inspectProject(projectRoot, { trusted: true, exec: execFn });
-			const lines = [
-				`project root : ${result.project_root}`,
-				`effective root: ${result.effective_project_root}${result.effective_project_root === result.project_root ? " (repository root)" : ""}`,
-				`git          : ${result.git.is_git ? `${result.git.branch ?? "(detached)"} @ ${result.git.commit?.slice(0, 12) ?? "(no commits)"}${result.git.dirty ? " (dirty)" : ""}` : "(not a git repo)"}`,
-				`stacks       : ${result.stacks.length > 0 ? result.stacks.map((s) => `${s.language}${s.package_manager ? ` (${s.package_manager})` : ""}`).join(", ") : "(none detected)"}`,
-				`profile      : ${result.profile ?? "(not set)"}`,
-				`config files : ${result.config_files_present.length > 0 ? result.config_files_present.join(", ") : "(none — run /q-init)"}`,
-				`config errors: ${result.config_errors.length > 0 ? result.config_errors.map((e) => `${e.file}: ${e.message}`).join("; ") : "(none)"}`,
-				`recipes      : ${result.recipes.length > 0 ? result.recipes.map((r) => `${r.name} [${r.allowed_modes.join(",")}]`).join(", ") : "(none)"}`,
-				// Phase 2B: annotate the declared nonempty validation coverage
-				// (recipe name -> exact declared components, in the config's
-				// name-sorted recipe order — never YAML declaration order; the
-				// components within each array keep their declared order).
-				...(result.recipes.some((r) => r.validation_components.length > 0)
-					? [`validation coverage: ${result.recipes.filter((r) => r.validation_components.length > 0).map((r) => `${r.name}=[${r.validation_components.join(", ")}]`).join(", ")}`]
-					: ["validation coverage: (none declared)"]),
-			];
-			const details: InspectToolDetails = {
-				project_root: result.project_root,
-				effective_project_root: result.effective_project_root,
-				git: result.git,
-				stacks: result.stacks.map((s) => `${s.language}${s.package_manager ? ` (${s.package_manager})` : ""}`),
-				profile: result.profile,
-				recipes: result.recipes.map((r) => r.name),
-				// Phase 2B: the FULL deterministic map — every recipe is a key,
-				// explicit empty arrays included.
-				recipe_validation_components: Object.fromEntries(result.recipes.map((r) => [r.name, r.validation_components])),
-				config_errors: result.config_errors.map((e) => `${e.file}: ${e.message}`),
-				config_files_present: result.config_files_present,
-			};
-			return { content: [{ type: "text", text: lines.join("\n") }], details };
 		},
 		...workbenchToolRenderer("inspect", "workbench_project_inspect"),
 	});
@@ -3205,22 +4307,20 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		...WORKBENCH_TOOL_METADATA.workbench_run_recipe,
 		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_run_recipe,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const trustError = trustedOrError(ctx);
-			if (trustError) {
-				return { content: [{ type: "text", text: `workbench_run_recipe: ${trustError}` }], details: {} };
-			}
-			const projectRoot = await projectRootFor(ctx);
-			if (workerRoleContext.role === "worker") {
-				const config = await loadProjectConfig(projectRoot, { trusted: true });
-				const recipe = config.recipes.find((candidate) => candidate.name === params.recipe);
-				const recipeRoleError = recipe ? workerRecipeBlockReason(workerRoleContext.role, recipe.name, recipe.writes) : undefined;
-				if (recipeRoleError) throw new Error(recipeRoleError);
-			}
-			onUpdate?.({
-				content: [{ type: "text", text: `Running recipe "${params.recipe}" (${mode} mode)...` }],
-				details: { phase: "started", recipe: params.recipe },
-			});
 			try {
+				const trustError = trustedOrError(ctx);
+				if (trustError) return fixedToolFailure("workbench_run_recipe", "untrusted_project");
+				const projectRoot = await projectRootFor(ctx);
+				if (workerRoleContext.role === "worker") {
+					const config = await loadProjectConfig(projectRoot, { trusted: true });
+					const recipe = config.recipes.find((candidate) => candidate.name === params.recipe);
+					const recipeRoleError = recipe ? workerRecipeBlockReason(workerRoleContext.role, recipe.name, recipe.writes) : undefined;
+					if (recipeRoleError) return fixedToolFailure("workbench_run_recipe", "execution_denied");
+				}
+				onUpdate?.({
+					content: [{ type: "text", text: "Running declared recipe..." }],
+					details: { phase: "started", recipe: boundedInlineDetail(params.recipe, 256) },
+				});
 				const result = await runRecipe({
 					projectRoot,
 					recipeName: params.recipe,
@@ -3240,11 +4340,11 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 					},
 				});
 				if (!result.ok && result.error) {
-					return { content: [{ type: "text", text: `workbench_run_recipe: ${result.error}` }], details: { ok: false, error: result.error } };
+					return fixedToolFailure("workbench_run_recipe", "recipe_error");
 				}
 				const summary = result.summary;
 				if (!summary) {
-					return { content: [{ type: "text", text: "workbench_run_recipe: no summary produced" }], details: { ok: false } };
+					return fixedToolFailure("workbench_run_recipe", "summary_unavailable");
 				}
 				const status = summary.timed_out ? "TIMED OUT" : summary.cancelled ? "CANCELLED" : result.ok ? "OK" : "FAILED";
 				// P1: the parent result is a BOUNDED presentation summary (plan §8)
@@ -3269,17 +4369,23 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 					artifactPaths: summary.artifact_paths,
 					cache: result.cache,
 				});
-				const text = parentSummary.text;
+				const text = boundedToolText(parentSummary.text);
+				const artifactPaths = summary.artifact_paths
+					.slice(0, summary.artifact_paths.length > 32 ? 31 : 32)
+					.map((path) => boundedInlineDetail(path, 512));
+				if (summary.artifact_paths.length > artifactPaths.length) {
+					artifactPaths.push(`... ${summary.artifact_paths.length - artifactPaths.length} artifact path(s) omitted`);
+				}
 				const details: RecipeToolDetails = {
 					ok: result.ok,
-					run_id: summary.run_id,
-					recipe: summary.recipe,
+					run_id: boundedInlineDetail(summary.run_id, 128),
+					recipe: boundedInlineDetail(summary.recipe, 256),
 					status,
 					exit_code: summary.exit_code ?? null,
 					duration_ms: summary.duration_ms,
-					artifact_paths: summary.artifact_paths,
-					stdout_log: displayRelative(projectRoot, summary.stdout_log),
-					stderr_log: displayRelative(projectRoot, summary.stderr_log),
+					artifact_paths: artifactPaths,
+					stdout_log: boundedInlineDetail(displayRelative(projectRoot, summary.stdout_log), 512),
+					stderr_log: boundedInlineDetail(displayRelative(projectRoot, summary.stderr_log), 512),
 					expected_exit_codes: result.record?.expected_exit_codes ?? [0],
 					// Phase 2B: BOTH facts are copied ONLY from the persisted/returned
 					// run record — a missing record leaves them absent (the renderer
@@ -3298,10 +4404,9 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 					content: [{ type: "text", text }],
 					details: { ...details },
 				});
-				return { content: [{ type: "text", text }], details: { ...details, record: result.record } };
-			} catch (error) {
-				// Setup violations (path escapes) and spawn failures surface as errors.
-				throw new Error(error instanceof RecipeSetupError ? error.message : `workbench_run_recipe failed: ${(error as Error).message}`);
+				return { content: [{ type: "text", text }], details };
+			} catch {
+				return fixedToolFailure("workbench_run_recipe", "runtime_error");
 			}
 		},
 		...workbenchToolRenderer("recipe", "workbench_run_recipe"),
@@ -3310,23 +4415,57 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	pi.registerTool({
 		...WORKBENCH_TOOL_METADATA.workbench_read_run,
 		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_read_run,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const trustError = trustedOrError(ctx);
-			if (trustError) {
-				return { content: [{ type: "text", text: `workbench_read_run: ${trustError}` }], details: {} };
-			}
-			if (!isValidRunId(params.run_id)) {
-				return { content: [{ type: "text", text: `workbench_read_run: invalid run_id "${params.run_id}"` }], details: {} };
-			}
-			const projectRoot = await projectRootFor(ctx);
-			const manifest = await readManifest(projectRoot, params.run_id);
-			if (!manifest) {
-				return { content: [{ type: "text", text: `workbench_read_run: run ${params.run_id} not found` }], details: {} };
-			}
-			const include = params.include ?? "summary";
-			const snippetOptions = { maxLines: params.max_lines, maxBytes: params.max_bytes };
-			const stdoutSnippet = include === "logs" || include === "all" ? await readLogSnippet(projectRoot, params.run_id, "stdout", snippetOptions) : null;
-			const stderrSnippet = include === "logs" || include === "all" ? await readLogSnippet(projectRoot, params.run_id, "stderr", snippetOptions) : null;
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			// R0 emergency boundary: EVERY return path (early validation,
+			// missing/corrupt records, normal rendering, and caught runtime
+			// failures) passes through this one final whole-result clamp. Later
+			// phases replace it with the policy-aware generic result envelope.
+			const readRunText = (value: unknown): string => clampWholeResultText(value, {
+				maxBytes: RUN_LOG_RESULT_MAX_BYTES,
+				maxLines: RUN_LOG_RESULT_MAX_LINES,
+			}).text;
+			try {
+				const trustError = trustedOrError(ctx);
+				if (trustError) {
+					return { content: [{ type: "text", text: readRunText(`workbench_read_run: ${trustError}`) }], details: {} };
+				}
+				if (!isValidRunId(params.run_id)) {
+					return { content: [{ type: "text", text: readRunText(`workbench_read_run: invalid run_id "${params.run_id}"`) }], details: {} };
+				}
+				const projectRoot = await projectRootFor(ctx);
+				const manifest = await readManifest(projectRoot, params.run_id);
+				if (!manifest) {
+					return { content: [{ type: "text", text: readRunText(`workbench_read_run: run ${params.run_id} not found`) }], details: {} };
+				}
+				const include = params.include ?? "summary";
+				const logMode = include === "logs" || include === "all";
+				if (!logMode && params.cursor !== undefined) {
+					return { content: [{ type: "text", text: readRunText("workbench_read_run: cursor_requires_logs_or_all") }], details: {} };
+				}
+				// R3 reservation is applied before file paging/rendering. A direct
+				// execute call (unit/UI compatibility) retains the compile-time cap;
+				// an authorized runtime call can only lower it.
+				const pendingAuthorization = peekOutputAuthorization(toolCallId, "workbench_read_run");
+				const requestedOutputBytes = params.max_bytes ?? DEFAULT_SNIPPET_BYTES;
+				const outputBytes = pendingAuthorization
+					? (pendingAuthorization.allowed ? Math.min(requestedOutputBytes, pendingAuthorization.allocatedBytes) : 0)
+					: Math.min(requestedOutputBytes, RUN_LOG_RESULT_MAX_BYTES);
+				const outputLines = Math.min(params.max_lines ?? DEFAULT_SNIPPET_LINES, RUN_LOG_RESULT_MAX_LINES);
+				if (logMode && outputBytes <= 0) {
+					return { content: [{ type: "text", text: "" }], details: {} };
+				}
+				const logPage = logMode
+					? await readRunLogPage(projectRoot, params.run_id, {
+						logStream: params.log_stream ?? "both",
+						...(params.cursor === undefined ? {} : { cursor: params.cursor }),
+						maxLines: outputLines,
+						maxBytes: Math.min(RUN_LOG_RESULT_MAX_BYTES, Math.max(1, outputBytes)),
+						preferStderr: manifest.exit_code === null || manifest.exit_code !== 0 || manifest.timed_out || manifest.cancelled,
+					})
+					: null;
+				if (logPage && !logPage.ok) {
+					return { content: [{ type: "text", text: readRunText(`workbench_read_run: ${logPage.error.code}`) }], details: {} };
+				}
 			// P4b: current-state validation assessment (strictly read-only —
 			// observation only: it never skips recipe/gate execution, never
 			// consults/alters the P6-C action cache, never rewrites run
@@ -3334,41 +4473,67 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			// worker-first facts for gate runs come from the READ-ONLY
 			// projection, so the authoritative in-memory delegation state is
 			// never mutated and nothing is persisted.
-			const validation = await assessRunValidation({
-				projectRoot,
-				mode,
-				exec: execFn,
-				manifest,
-				actorFacts: {
-					role: workerRoleContext.role,
-					provider: currentModelFacts.provider,
-					model: currentModelFacts.model,
-				},
-				...(manifest.recipe === "gate"
-					? { workerFirstFacts: await buildReadOnlyWorkerFirstGateFacts(projectRoot, new Date().toISOString()) }
-					: {}),
-			});
+				const validation = await assessRunValidation({
+					projectRoot,
+					mode,
+					exec: execFn,
+					manifest,
+					actorFacts: {
+						role: workerRoleContext.role,
+						provider: currentModelFacts.provider,
+						model: currentModelFacts.model,
+					},
+					...(manifest.recipe === "gate"
+						? { workerFirstFacts: await buildReadOnlyWorkerFirstGateFacts(projectRoot, new Date().toISOString()) }
+						: {}),
+				});
 			// Commander Slice B1: the layered bounded renderer (core/run-result.ts)
 			// builds the ordered Summary/Evidence/Persisted output (plus the
 			// bounded cwd/argv metadata for explicit manifest/logs/all includes
 			// and the caller-bounded log tails for logs/all). All paths are
 			// durable project-relative; disk records stay untouched. P4b adds
 			// the REQUIRED bounded validation line to every include mode.
-			const runDirRel = `${CONFIG_DIR_NAME}/workbench/runs/${manifest.run_id}`;
-			const rendered = renderRunResult({
-				include,
-				manifest,
-				validation,
-				stdoutSnippet,
-				stderrSnippet,
-				runDir: runDirRel,
-				manifestPath: `${runDirRel}/manifest.json`,
-				summaryPath: `${runDirRel}/summary.json`,
-				stdoutPath: `${runDirRel}/stdout.log`,
-				stderrPath: `${runDirRel}/stderr.log`,
-			});
-			const text = rendered.text;
-			const details: ReadRunToolDetails = {
+				const runDirRel = `${CONFIG_DIR_NAME}/workbench/runs/${manifest.run_id}`;
+				const stdoutPath = `${runDirRel}/stdout.log`;
+				const stderrPath = `${runDirRel}/stderr.log`;
+				let renderedText: string;
+				let runLogDetails: Record<string, unknown> = {};
+				if (logPage?.ok) {
+					const rendered = renderRunLogPage({
+						manifest,
+						page: logPage.value,
+						validation,
+						stdoutPath,
+						stderrPath,
+						maxOutputBytes: outputBytes,
+						maxOutputLines: outputLines,
+					});
+					renderedText = rendered.text;
+					runLogDetails = {
+						include,
+						log_stream: logPage.value.selection,
+						shown_lines: rendered.shownLines,
+						shown_bytes: rendered.shownBytes,
+						remaining_bytes: rendered.omittedBeforeBytes,
+						...(rendered.previousCursor ? { next_cursor: rendered.previousCursor } : {}),
+					};
+					if (rendered.previousCursor) rememberTrustedRunLogContinuation(toolCallId, rendered.previousCursor);
+				} else {
+					renderedText = renderRunResult({
+						include,
+						manifest,
+						validation,
+						stdoutSnippet: null,
+						stderrSnippet: null,
+						runDir: runDirRel,
+						manifestPath: `${runDirRel}/manifest.json`,
+						summaryPath: `${runDirRel}/summary.json`,
+						stdoutPath,
+						stderrPath,
+					}).text;
+				}
+				const text = readRunText(renderedText);
+				const details: ReadRunToolDetails = {
 				run_id: manifest.run_id,
 				recipe: manifest.recipe,
 				kind: manifest.recipe === "gate" ? "gate" : "recipe",
@@ -3388,11 +4553,17 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 				validation: { status: validation.status, reasons: validation.reasons },
 				stdout_log: displayRelative(projectRoot, `${CONFIG_DIR_NAME}/workbench/runs/${manifest.run_id}/stdout.log`),
 				stderr_log: displayRelative(projectRoot, `${CONFIG_DIR_NAME}/workbench/runs/${manifest.run_id}/stderr.log`),
-			};
-			return {
-				content: [{ type: "text", text }],
-				details,
-			};
+				...runLogDetails,
+				};
+				return {
+					content: [{ type: "text", text }],
+					details,
+				};
+			} catch (error) {
+				// Passing the value directly keeps hostile Error/string coercion
+				// inside clampWholeResultText's fail-closed boundary.
+				return { content: [{ type: "text", text: readRunText(error) }], details: {} };
+			}
 		},
 		...workbenchToolRenderer("read_run", "workbench_read_run"),
 	});
@@ -3401,27 +4572,18 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		...WORKBENCH_TOOL_METADATA.workbench_run_gate,
 		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_run_gate,
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const trustError = trustedOrError(ctx);
-			if (trustError) {
-				return { content: [{ type: "text", text: `workbench_run_gate: ${trustError}` }], details: {} };
-			}
-			// P7: while a review is pending or stale, VERIFY (final gate
-			// verification) is blocked — never falls back to DEV gate runs as
-			// a substitute for a reviewed diff.
-			if (mode === "VERIFY" && blocksVerify(delegationState)) {
-				return {
-					content: [{ type: "text", text: `workbench_run_gate: ${reviewBlockReason(delegationState, "verify")}` }],
-					details: { ok: false, blocked_reason: reviewBlockReason(delegationState, "verify") },
-				};
-			}
-			const projectRoot = await projectRootFor(ctx);
-			// Phase 3B: read-only preflight branch — after trust/project
-			// resolution, BEFORE any start update, worker-first facts, runGates
-			// or widget/compact state refresh. Returns preflight lines/details
-			// ONLY: no run created, no recipe/exec executed, no gate status
-			// assigned, no running update sent.
-			if (params.preflight === true) {
-				try {
+			try {
+				const trustError = trustedOrError(ctx);
+				if (trustError) return fixedToolFailure("workbench_run_gate", "untrusted_project");
+				// P7: while a review is pending or stale, VERIFY is blocked.
+				if (mode === "VERIFY" && blocksVerify(delegationState)) {
+					const result = fixedToolFailure("workbench_run_gate", "review_blocked");
+					result.details.blocked_reason = "review_blocked";
+					return result;
+				}
+				const projectRoot = await projectRootFor(ctx);
+				// Read-only preflight: no start update/run/recipe/status mutation.
+				if (params.preflight === true) {
 					const preflight = await preflightGateManualEvidence({
 						projectRoot,
 						selector: params.gates,
@@ -3440,17 +4602,13 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 						recipes_executed: 0,
 						gate_status_assigned: false,
 					};
-					const text = renderGatePreflightLines(details, true).join("\n");
+					const text = boundedToolText(renderGatePreflightLines(details, true).join("\n"));
 					return { content: [{ type: "text", text }], details };
-				} catch (error) {
-					throw new Error(error instanceof GateSetupError ? error.message : `workbench_run_gate preflight failed: ${(error as Error).message}`);
 				}
-			}
-			onUpdate?.({
-				content: [{ type: "text", text: `Running gates "${params.gates}" (${mode} mode)...` }],
-				details: { phase: "started", gates: params.gates },
-			});
-			try {
+				onUpdate?.({
+					content: [{ type: "text", text: "Running declared gates..." }],
+					details: { phase: "started", gates: boundedInlineDetail(params.gates, 256) },
+				});
 				// P7 slice 3: the model-tool gate run injects the same bounded
 				// worker-first compliance facts as the /q-gate slash command.
 				const workerFirstFacts = await buildWorkerFirstGateFacts(projectRoot, new Date().toISOString());
@@ -3468,34 +4626,12 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 						model: currentModelFacts.model,
 					},
 				});
-				const text = gateParentSummaryLines(result, projectRoot).join("\n");
-				const details: GateToolDetails = {
-					ok: result.ok,
-					status: result.status,
-					run_id: result.runId,
-					requested: result.requested,
-					profile: result.profile,
-					gates: result.gates.map((g) => ({
-						id: g.id,
-						status: g.status,
-						title: g.title,
-						failure_reason: g.failure_reason,
-						blocked_reason: g.blocked_reason,
-						failed_checks: g.checks.filter((c) => c.status === "FAIL").map((c) => c.check_id),
-					})),
-					counts: {
-						pass: result.gates.filter((g) => g.status === "PASS").length,
-						fail: result.gates.filter((g) => g.status === "FAIL").length,
-						blocked: result.gates.filter((g) => g.status === "BLOCKED").length,
-						not_run: result.gates.filter((g) => g.status === "NOT_RUN").length,
-					},
-					log_path: displayRelative(projectRoot, `${CONFIG_DIR_NAME}/workbench/runs/${result.runId}`),
-					phase: "finished",
-				};
+				const text = boundedToolText(gateParentSummaryLines(result, projectRoot).join("\n"));
+				const details = boundedGateDetails(result, projectRoot);
 				onUpdate?.({ content: [{ type: "text", text }], details: { ...details } });
-				return { content: [{ type: "text", text }], details: { ...details, gates_full: result.gates } };
-			} catch (error) {
-				throw new Error(error instanceof GateSetupError ? error.message : `workbench_run_gate failed: ${(error as Error).message}`);
+				return { content: [{ type: "text", text }], details };
+			} catch {
+				return fixedToolFailure("workbench_run_gate", "runtime_error");
 			}
 		},
 		...workbenchToolRenderer("gate", "workbench_run_gate"),
@@ -3504,75 +4640,98 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	pi.registerTool({
 		...WORKBENCH_TOOL_METADATA.workbench_read_gate,
 		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_read_gate,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const trustError = trustedOrError(ctx);
-			if (trustError) {
-				return { content: [{ type: "text", text: `workbench_read_gate: ${trustError}` }], details: {} };
-			}
-			const projectRoot = await projectRootFor(ctx);
-			if (params.run_id === undefined && params.gate_id === undefined) {
-				return { content: [{ type: "text", text: "workbench_read_gate: provide run_id or gate_id" }], details: {} };
-			}
-			if (params.run_id !== undefined) {
-				if (!isValidRunId(params.run_id)) {
-					return { content: [{ type: "text", text: `workbench_read_gate: invalid run_id "${params.run_id}"` }], details: {} };
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			try {
+				const pendingAuthorization = peekOutputAuthorization(toolCallId, "workbench_read_gate");
+				const maxOutputBytes = pendingAuthorization === undefined
+					? GATE_READ_MAX_BYTES
+					: pendingAuthorization.allowed
+						? Math.min(GATE_READ_MAX_BYTES, pendingAuthorization.allocatedBytes)
+						: 0;
+				if (maxOutputBytes <= 0) return fixedToolFailure("workbench_read_gate", "output_allocation_unavailable");
+				const trustError = trustedOrError(ctx);
+				if (trustError) return fixedToolFailure("workbench_read_gate", "untrusted_project");
+				const runId = params.run_id;
+				const hasRun = runId !== undefined;
+				const hasGate = params.gate_id !== undefined;
+				if (hasRun === hasGate) return fixedToolFailure("workbench_read_gate", "invalid_target");
+				const projectRoot = await projectRootFor(ctx);
+				if (runId !== undefined) {
+					if (!isValidRunId(runId)) return fixedToolFailure("workbench_read_gate", "invalid_run_id");
+					const manifest = await readManifest(projectRoot, runId);
+					if (!manifest) return fixedToolFailure("workbench_read_gate", "run_not_found");
+					if (manifest.recipe !== "gate") return fixedToolFailure("workbench_read_gate", "not_a_gate_run");
+					const page = await readGateRunPage({
+						projectRoot,
+						runId,
+						include: params.include,
+						cursor: params.cursor,
+						maxBytes: maxOutputBytes,
+						maxLines: params.max_lines,
+					});
+					if (!page.ok) return fixedToolFailure("workbench_read_gate", page.code, page.details.source_path);
+					if (page.details.next_cursor) rememberTrustedGateContinuation(toolCallId, page.details.next_cursor);
+					return {
+						content: [{ type: "text", text: boundedToolText(page.text, maxOutputBytes, 320) }],
+						details: page.details,
+					};
 				}
-				const manifest = await readManifest(projectRoot, params.run_id);
-				if (!manifest) {
-					return { content: [{ type: "text", text: `workbench_read_gate: run ${params.run_id} not found` }], details: {} };
-				}
-				if (manifest.recipe !== "gate") {
-					return { content: [{ type: "text", text: `workbench_read_gate: run ${params.run_id} is not a gate run (recipe "${manifest.recipe}")` }], details: {} };
-				}
-				const { readFile } = await import("node:fs/promises");
-				const gatesJson = JSON.parse(await readFile(join(runsDirFor(projectRoot), params.run_id, "gates.json"), "utf8")) as { gates: GateRunEntry[] };
-				const lines = [`gate run ${params.run_id} (profile ${manifest.profile ?? "(none)"}):`, ""];
-				for (const g of gatesJson.gates) {
-					const reason = g.failure_reason ?? g.blocked_reason ?? "";
-					lines.push(`  ${g.id.padEnd(4)} ${g.status.padEnd(8)} ${g.title}${reason ? ` — ${reason}` : ""}`);
-					for (const c of g.checks) {
-						const why = c.failure_reason ?? c.blocked_reason ?? "";
-						lines.push(`      ${c.check_id.padEnd(8)} ${c.status.padEnd(8)} ${c.kind}${why ? ` — ${why}` : ""}`);
-					}
-				}
+				const gates = await loadGates(projectRoot);
+				const gate = gates.find((candidate) => candidate.id === params.gate_id);
+				if (!gate) return fixedToolFailure("workbench_read_gate", "gate_not_found", ".pi/workbench/gates.yaml + builtin ladder");
+				const latest = (await latestGateStatuses(projectRoot, [gate.id]))[gate.id];
+				const page = renderGateDefinitionPage({
+					gate,
+					latestStatus: latest?.status,
+					latestRunId: latest?.run_id,
+					include: params.include,
+					cursor: params.cursor,
+					maxBytes: maxOutputBytes,
+					maxLines: params.max_lines,
+				});
+				if (!page.ok) return fixedToolFailure("workbench_read_gate", page.code, page.details.source_path);
+				if (page.details.next_cursor) rememberTrustedGateContinuation(toolCallId, page.details.next_cursor);
 				return {
-					content: [{ type: "text", text: lines.join("\n") }],
-					details: { run_id: params.run_id, gates: gatesJson.gates.map((g) => ({ id: g.id, status: g.status })) },
+					content: [{ type: "text", text: boundedToolText(page.text, maxOutputBytes, 320) }],
+					details: page.details,
 				};
+			} catch {
+				return fixedToolFailure("workbench_read_gate", "runtime_error");
 			}
-			const gates = await loadGates(projectRoot);
-			const gate = gates.find((g) => g.id === params.gate_id);
-			if (!gate) {
-				return { content: [{ type: "text", text: `workbench_read_gate: gate "${params.gate_id}" not found for this profile` }], details: {} };
-			}
-			const latest = await latestGateStatus(projectRoot, gate.id);
-			return {
-				content: [{ type: "text", text: renderGateDefinition(gate, latest?.status, latest?.run_id).join("\n") }],
-				details: { gate_id: gate.id, latest_status: latest?.status ?? "NOT_RUN", latest_run: latest?.run_id ?? null },
-			};
-		},
-	});
+			},
+		});
 
 	pi.registerTool({
 		...WORKBENCH_TOOL_METADATA.workbench_list_gates,
 		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_list_gates,
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			const trustError = trustedOrError(ctx);
-			if (trustError) {
-				return { content: [{ type: "text", text: `workbench_list_gates: ${trustError}` }], details: {} };
+			try {
+				const trustError = trustedOrError(ctx);
+				if (trustError) return fixedToolFailure("workbench_list_gates", "untrusted_project");
+				const projectRoot = await projectRootFor(ctx);
+				const gates = await loadGates(projectRoot);
+				const latest = await latestGateStatuses(projectRoot, gates.map((gate) => gate.id));
+				const presentation = renderGateListPresentation(gates, latest);
+				const statuses: Record<string, GateStatus> = {};
+				for (const gate of presentation.shownGates) {
+					let key = boundedInlineDetail(gate.id, 96) || "(unnamed)";
+					let suffix = 1;
+					while (Object.prototype.hasOwnProperty.call(statuses, key)) key = `${boundedInlineDetail(gate.id, 80)}#${suffix++}`;
+					statuses[key] = latest[gate.id]?.status ?? "NOT_RUN";
+				}
+				return {
+					content: [{ type: "text", text: boundedToolText(presentation.text) }],
+					details: {
+						gate_count: gates.length,
+						shown_count: presentation.shownGates.length,
+						omitted_count: gates.length - presentation.shownGates.length,
+						statuses,
+						source_path: ".pi/workbench/gates.yaml + builtin ladder",
+					},
+				};
+			} catch {
+				return fixedToolFailure("workbench_list_gates", "runtime_error", ".pi/workbench/gates.yaml + builtin ladder");
 			}
-			const projectRoot = await projectRootFor(ctx);
-			const gates = await loadGates(projectRoot);
-			const lines = [`${gates.length} gate(s) for this project:`];
-			const statuses: Record<string, string> = {};
-			for (const g of gates) {
-				const latest = await latestGateStatus(projectRoot, g.id);
-				const status = latest ? `${latest.status} (run ${latest.run_id})` : "NOT_RUN (never run)";
-				statuses[g.id] = latest?.status ?? "NOT_RUN";
-				const prereqs = g.prerequisites.length > 0 ? ` needs: ${g.prerequisites.join(",")}` : "";
-				lines.push(`  ${g.id.padEnd(4)} ${status.padEnd(42)} ${g.title}${prereqs}`);
-			}
-			return { content: [{ type: "text", text: lines.join("\n") }], details: { gate_count: gates.length, statuses } };
 		},
 	});
 
@@ -3587,10 +4746,30 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			const projectRoot = await projectRootFor(ctx);
 			const outcome = await compareRuns(projectRoot, params.a, params.b);
 			if (!outcome.ok) {
+				if (outcome.error === COMPARISON_PERSIST_ERROR) {
+					throw new Error(`workbench_compare_runs: ${COMPARISON_PERSIST_ERROR}`);
+				}
 				const details: CompareToolDetails = { ok: false, error: outcome.error };
 				return { content: [{ type: "text", text: `workbench_compare_runs: ${outcome.error}` }], details };
 			}
-			const details: CompareToolDetails = { ok: true, report: outcome.report };
+			const quant = outcome.report.quant;
+			const quantChangedCount = quant === null
+				? 0
+				: [quant.benchmark_delta, quant.return, quant.drawdown, quant.turnover]
+					.filter((delta) => delta.changed).length + quant.costs.length + quant.parameters.length;
+			const details: CompareToolDetails = {
+				ok: true,
+				comparison_id: outcome.comparison_id,
+				a_run_id: outcome.report.a.run_id,
+				b_run_id: outcome.report.b.run_id,
+				compatible: outcome.report.compatible,
+				artifact_added_count: outcome.report.generic.artifacts.added.length,
+				artifact_removed_count: outcome.report.generic.artifacts.removed.length,
+				gate_changed_count: outcome.report.generic.gate_delta?.changed.length ?? 0,
+				quant_changed_count: quantChangedCount,
+				parameter_changed_count: quant?.parameters.length ?? 0,
+				comparison_path: outcome.comparison_path,
+			};
 			return {
 				content: [{ type: "text", text: renderCompareLines(outcome.report, true).join("\n") }],
 				details,
@@ -3902,10 +5081,24 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 	pi.registerTool({
 		...WORKBENCH_TOOL_METADATA.workbench_review_worker_diff,
 		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_review_worker_diff,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		executionMode: "sequential",
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			const pendingAuthorization = peekOutputAuthorization(toolCallId, "workbench_review_worker_diff");
+			const requestedMaxBytes = Math.min(params.max_bytes ?? DIFF_REVIEW_RESULT_MAX_BYTES, DIFF_REVIEW_RESULT_MAX_BYTES);
+			const renderMaxBytes = pendingAuthorization === undefined
+				? requestedMaxBytes
+				: pendingAuthorization.allowed
+					? Math.min(requestedMaxBytes, pendingAuthorization.allocatedBytes)
+					: 0;
+			const renderMaxLines = Math.min(params.max_lines ?? DIFF_REVIEW_RESULT_MAX_LINES, DIFF_REVIEW_RESULT_MAX_LINES);
+			const reviewText = (value: unknown): string => clampWholeResultText(value, {
+				maxBytes: renderMaxBytes,
+				maxLines: renderMaxLines,
+			}).text;
+			if (renderMaxBytes <= 0) return { content: [], details: { ok: false, error: "output_allocation_unavailable" } };
 			const trustError = trustedOrError(ctx);
 			if (trustError) {
-				return { content: [{ type: "text", text: `workbench_review_worker_diff: ${trustError}` }], details: {} };
+				return { content: [{ type: "text", text: reviewText(`workbench_review_worker_diff: ${trustError}`) }], details: {} };
 			}
 			// P7: lazy lease-lock sync — the review guard never runs against
 			// stale advertised edit/write tools.
@@ -3919,14 +5112,14 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			// (a same-hash complete PASS rerender keeps the valid REVIEWED
 			// binding; a changed hash resets coverage).
 			if (delegationState.latestId === undefined) {
-				return { content: [{ type: "text", text: "workbench_review_worker_diff: no delegation to review" }], details: {} };
+				return { content: [{ type: "text", text: reviewText("workbench_review_worker_diff: no delegation to review") }], details: {} };
 			}
 			if (delegationState.latestId !== delegationId) {
 				return {
 					content: [
 						{
 							type: "text",
-							text: `workbench_review_worker_diff: delegation ${delegationId} is not the latest delegation (${delegationState.latestId}); only the latest delegation can be reviewed`,
+							text: reviewText(`workbench_review_worker_diff: delegation ${delegationId} is not the latest delegation (${delegationState.latestId}); only the latest delegation can be reviewed`),
 						},
 					],
 					details: {},
@@ -3937,12 +5130,12 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 				delegationId,
 				exec: execFn,
 				includePaths: params.include_paths,
-				maxLines: params.max_lines,
-				maxBytes: params.max_bytes,
+				maxLines: renderMaxLines,
+				maxBytes: renderMaxBytes,
 				secrets,
 			});
 			if (!result.ok || !result.record) {
-				return { content: [{ type: "text", text: `workbench_review_worker_diff: ${result.error ?? "review failed"}` }], details: { ok: false, error: result.error } };
+				return { content: [{ type: "text", text: reviewText(`workbench_review_worker_diff: ${result.error ?? "review failed"}`) }], details: { ok: false, error: result.error } };
 			}
 			// Bind the state to the REAL current hash (the review record binds
 			// it too). Slice B2: REVIEWED means scope PASS AND complete
@@ -3958,7 +5151,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 					const marked = markReviewed(delegationState, now);
 					if (!marked.ok) {
 						return {
-							content: [{ type: "text", text: `workbench_review_worker_diff: review record written but state refused REVIEWED: ${marked.error}` }],
+							content: [{ type: "text", text: reviewText(`workbench_review_worker_diff: review record written but state refused REVIEWED: ${marked.error}`) }],
 							details: { ok: false, error: marked.error },
 						};
 					}
@@ -3977,8 +5170,20 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			persistDelegationState();
 			void refreshStatus(ctx);
 			const record = result.record;
+			const text = reviewText(result.lines.join("\n"));
+			const nextIncludePaths: string[] = [];
+			let nextIncludeBytes = 0;
+			for (const path of record.remaining_paths) {
+				if (nextIncludePaths.length >= MAX_REVIEW_PATCH_PATHS) break;
+				if (typeof path !== "string" || Buffer.byteLength(path, "utf8") > MAX_REVIEW_PATH_BYTES) break;
+				if (/[\u0000-\u001f\u007f]/.test(path)) break;
+				const quotedBytes = Buffer.byteLength(JSON.stringify(path), "utf8") + (nextIncludePaths.length > 0 ? 2 : 0);
+				if (nextIncludeBytes + quotedBytes > MAX_REVIEW_GUIDANCE_BYTES) break;
+				nextIncludePaths.push(path);
+				nextIncludeBytes += quotedBytes;
+			}
 			return {
-				content: [{ type: "text", text: result.lines.join("\n") }],
+				content: [{ type: "text", text }],
 				details: {
 					ok: true,
 					delegation_id: delegationId,
@@ -3987,18 +5192,19 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 					bound_diff_hash: record.bound_diff_hash,
 					recorded_after_hash: record.recorded_after_hash,
 					mismatch: record.mismatch,
-					violations: record.violations,
-					drift_paths: record.drift_paths,
-					checked_paths: record.checked_paths,
-					displayed_paths: record.displayed_paths,
-					remaining_paths: record.remaining_paths,
+					violation_count: record.violations.length,
+					drift_count: record.drift_paths.length,
+					checked_count: record.checked_paths.length,
+					displayed_count: record.displayed_paths.length,
+					remaining_count: record.remaining_paths.length,
 					coverage_complete: record.coverage_complete,
 					review_record: record.review_path,
-					patch_paths: record.patch_paths,
+					next_include_paths: nextIncludePaths,
 					patch_truncated: record.patch_truncated,
 				},
 			};
 		},
+		...workbenchToolRenderer("review", "workbench_review_worker_diff"),
 	});
 
 	pi.registerTool({
@@ -4094,50 +5300,75 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 
 	// ------------------------------------------- second-layer tool_call guard
 
+	/** tool_result #1 — final envelope using only this call's reservation. */
+	pi.on("tool_result", (event) => {
+		let envelope: OutputEnvelopeResult;
+		try {
+				const trustedContinuation = takeTrustedReadContinuation(event.toolCallId, event.toolName)
+					?? takeTrustedRunLogContinuation(event.toolCallId, event.toolName)
+					?? takeTrustedGateContinuation(event.toolCallId, event.toolName);
+			const authorization = takeOutputAuthorization(event.toolCallId, event.toolName)
+				?? authorizeOutput(event.toolCallId, event.toolName, event.input);
+			const policy = resolveToolOutputPolicy({
+				toolName: event.toolName,
+				args: event.input,
+				role: outputTurnRole(),
+			});
+			if (!authorization.allowed || !authorization.authorizationId) {
+				envelope = enforceOutputEnvelope({ toolName: event.toolName, content: [], isError: true, policy, allocatedBytes: 0 });
+			} else {
+				envelope = enforceOutputEnvelope({
+					toolName: event.toolName,
+					content: event.content,
+					isError: event.isError,
+					policy,
+					allocatedBytes: authorization.allocatedBytes,
+					continuation: trustedContinuation,
+				});
+				const accounting = turnOutputBudget.consumeResult({
+					authorizationId: authorization.authorizationId,
+					actualBytes: envelope.facts.shownTextBytes,
+				});
+				if (!accounting.accepted) {
+					envelope = enforceOutputEnvelope({ toolName: event.toolName, content: [], isError: true, policy, allocatedBytes: 0 });
+				}
+			}
+		} catch {
+			const policy = resolveToolOutputPolicy({ toolName: event.toolName, args: undefined, role: outputTurnRole() });
+			envelope = enforceOutputEnvelope({ toolName: event.toolName, content: [], isError: true, policy, allocatedBytes: 0 });
+		}
+		outputEnvelopeFactsByEvent.set(event, envelope.facts);
+		observeOutputEnvelope(event.toolName, envelope.facts);
+		// Even a fail-closed normal middleware result is already bounded and its
+		// authorization has been settled/released. Preserve FIFO multiplicity for
+		// repeated exact id+name pairs so message_end never double-accounts it.
+		rememberProcessedNormalResult(event.toolCallId, event.toolName);
+		return { content: envelope.content, isError: envelope.isError };
+	});
+
 	/**
-	 * P8b: tool_result finalize — fires after the tool executed (and after
-	 * its own handler/domain persistence) and before Pi emits
-	 * tool_execution_end / the final toolResult message events. ONLY a
-	 * matching handle begun by THIS runtime is finalized (exact toolCallId
-	 * map lookup AND exact tool name match); text blocks only, env secret
-	 * values scrubbed, status success/error, bounded redacted summary
-	 * persisted. The in-memory handle is removed after the attempt. On
-	 * success, safe structured recovery metadata (available, result id,
-	 * project-relative receipt path/status) is merged into object details
-	 * without changing content/isError/caps; on failure availability is
-	 * never claimed, the domain artifact is never rewritten/rolled back,
-	 * the started receipt stays incomplete, and a bounded unavailable code
-	 * is merged into the details. A tool-name mismatch never finalizes: the
-	 * started receipt stays incomplete on disk, the in-memory handle is
-	 * consumed, and only a bounded tool_name_mismatch fact is merged.
-	 * Replay-blocked calls and recovery-tool calls have no newly-begun
-	 * handle and are never finalized or overwritten here.
+	 * tool_result #2 — receipt FINALIZE. The preceding middleware has already
+	 * replaced event.content, so receipts can consume only bounded text. This
+	 * handler records bounded metadata in a WeakMap and never alters content.
 	 */
 	pi.on("tool_result", async (event) => {
 		const pending = pendingReceiptHandles.get(event.toolCallId);
 		if (!pending) return undefined;
 		const { handle, projectRoot } = pending;
-		// Exact identity: a tool_result finalizes ONLY when BOTH the
-		// toolCallId matches AND the reported tool name equals the begun
-		// handle's exact tool name. A name mismatch (another tool reusing
-		// the same id, or a mismatched id binding) never finalizes: the
-		// started receipt stays incomplete, the in-memory handle is
-		// consumed, and only a bounded unavailable fact is merged into
-		// mergeable details (a defined non-object details is left untouched).
-		if (event.toolName !== handle.toolName) {
-			pendingReceiptHandles.delete(event.toolCallId);
-			if (event.details !== undefined && (typeof event.details !== "object" || event.details === null || Array.isArray(event.details))) {
+		try {
+			if (event.toolName !== handle.toolName) {
+				receiptFactsByEvent.set(event, {
+					available: false,
+					code: "tool_name_mismatch",
+					result_id: handle.id,
+					tool: handle.toolName,
+				});
 				return undefined;
 			}
-			const merged: Record<string, unknown> = { ...((event.details as Record<string, unknown> | undefined) ?? {}) };
-			merged.receipt = { available: false, code: "tool_name_mismatch", result_id: handle.id, tool: handle.toolName };
-			return { details: merged };
-		}
-		try {
 			const text = event.content
-				.filter((block): block is { type: "text"; text: string } => block.type === "text")
+				.filter((block): block is { type: "text"; text: string } => block.type === "text" && typeof block.text === "string")
 				.map((block) => block.text)
-				.join("\n");
+				.join("");
 			const outcome = await finalizeReceipt({
 				projectRoot,
 				handle,
@@ -4146,38 +5377,58 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 				error: event.isError ? text : undefined,
 				secrets,
 			});
-			// Object details only: merged in place, never replaced. A defined
-			// non-object details is left untouched (no patch).
-			if (event.details !== undefined && (typeof event.details !== "object" || event.details === null || Array.isArray(event.details))) {
-				return undefined;
-			}
-			const merged: Record<string, unknown> = { ...((event.details as Record<string, unknown> | undefined) ?? {}) };
-			merged.receipt = outcome.ok
+			receiptFactsByEvent.set(event, outcome.ok
 				? {
 						available: true,
 						result_id: outcome.receipt.id,
 						status: outcome.receipt.status,
 						path: receiptRelativePath(projectRoot, outcome.receipt.id),
 					}
-				: { available: false, code: finalizeUnavailableCode(outcome), result_id: handle.id };
-			return { details: merged };
+				: { available: false, code: finalizeUnavailableCode(outcome), result_id: handle.id });
 		} catch {
-			// A finalize failure must never break the tool result itself.
-			if (event.details !== undefined && (typeof event.details !== "object" || event.details === null || Array.isArray(event.details))) {
-				return undefined;
-			}
-			const merged: Record<string, unknown> = { ...((event.details as Record<string, unknown> | undefined) ?? {}) };
-			merged.receipt = { available: false, code: "storage_error", result_id: handle.id };
-			return { details: merged };
+			receiptFactsByEvent.set(event, { available: false, code: "storage_error", result_id: handle.id });
 		} finally {
-			// Remove the in-memory handle after the attempt.
+			// Matching ids are consumed after every attempt, including mismatch.
 			pendingReceiptHandles.delete(event.toolCallId);
+		}
+		return undefined;
+	});
+
+	/**
+	 * tool_result #3 — bounded per-tool details projection/attachment. The
+	 * projector receives envelope/receipt facts only from private side channels,
+	 * drops full domain records, and enforces the 8 KiB session invariant before
+	 * Pi emits tool_execution_end or persists the tool-result message.
+	 */
+	pi.on("tool_result", (event) => {
+		try {
+			const envelope = outputEnvelopeFactsByEvent.get(event) ?? runtimeFailureEnvelope().facts;
+			const receipt = receiptFactsByEvent.get(event);
+			let details: unknown;
+			try {
+				details = event.details;
+			} catch {
+				details = undefined;
+			}
+			return {
+				details: projectToolResultDetails({
+					toolName: event.toolName,
+					details,
+					envelope,
+					receipt,
+				}).details,
+			};
+		} finally {
+			outputEnvelopeFactsByEvent.delete(event);
+			receiptFactsByEvent.delete(event);
 		}
 	});
 
 	pi.on("tool_call", async (event, ctx) => {
+		const streamingBoundaryReason = streamingControl.toolCallBlockReason(event.toolName);
+		if (streamingBoundaryReason) return { block: true, reason: streamingBoundaryReason };
 		const workerRoleReason = workerRoleToolCallBlockReason(workerRoleContext, event.toolName, event.input);
-		if (workerRoleReason) return { block: true, reason: workerRoleReason };
+		if (workerRoleReason) return { block: true, reason: boundedGuardReason(workerRoleReason) };
 		if (
 			workerRoleContext.role === "worker" &&
 			(event.toolName === "edit" || event.toolName === "write") &&
@@ -4188,7 +5439,7 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 		) {
 			const path = (event.input as { path: string }).path;
 			if (!(await isWorkerPathAllowedRealpath(workerRoleContext.projectRoot, path, workerRoleContext.allowedPaths))) {
-				return { block: true, reason: `Delegated worker path failed realpath/symlink scope validation: ${path}` };
+				return { block: true, reason: boundedGuardReason("Delegated worker path failed realpath/symlink scope validation") };
 			}
 		}
 		// P7 second layer — strict Sol commander guard: bash is always
@@ -4224,43 +5475,29 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 					delegationState = recordBlockedWriteAttempt(delegationState, now);
 					persistDelegationState();
 				}
-				return { block: true, reason: commanderReason };
+				return { block: true, reason: boundedGuardReason(commanderReason) };
 			}
 		}
 		const check = checkToolCall(mode, event.toolName, event.input);
 		if (!check.allowed) {
 			return {
 				block: true,
-				reason: check.reason ?? `Blocked by workbench ${mode} mode`,
+				reason: boundedGuardReason(check.reason ?? `Blocked by workbench ${mode} mode`),
 			};
 		}
-		// Authorized commander write: consume exactly one lease call per
-		// proceeding call — AFTER the generic mode/path guard, so a call
-		// blocked by mode policy never burns a lease call (the lease gates
-		// the call itself; the counter enforces the bounded per-lease call
-		// budget). Exhaustion/expiry removes the lease's edit/write tools
-		// from the active set (back to the exact canonical 15).
-		if (actor === "sol-commander" && (event.toolName === "edit" || event.toolName === "write")) {
-			const path =
-				event.input && typeof event.input === "object" && typeof (event.input as { path?: unknown }).path === "string"
-					? (event.input as { path: string }).path
-					: "";
-			if (writeLease && leaseStatus(writeLease, now) === "active") {
-				const consumed = consumeLeaseCall(writeLease, event.toolName, path, now);
-				if (consumed.ok) {
-					writeLease = consumed.lease;
-					persistLease();
-					if (leaseStatus(writeLease, now) !== "active") applyModeTools();
-				}
-			}
-		}
-		// P5: remember which project files the agent modified (bounded) so the
-		// compaction supplement can point at them.
-		if ((event.toolName === "edit" || event.toolName === "write") && event.input && typeof event.input === "object") {
-			const path = (event.input as { path?: unknown }).path;
-			if (typeof path === "string" && path.length > 0) {
-				compactState.modifiedFiles = pushBounded(compactState.modifiedFiles, path, MAX_MODIFIED_FILES);
-			}
+
+		// R3 budget authorization is the final policy guard and always precedes
+		// receipt BEGIN. Keep the exact id+name authorization queued because
+		// Pi's immediate-result paths bypass tool_result middleware.
+		const authorization = authorizeOutput(event.toolCallId, event.toolName, event.input);
+		rememberOutputAuthorization(authorization);
+		if (!authorization.allowed) {
+			return {
+				block: true,
+				reason: boundedGuardReason(
+					authorization.controlText ?? blockedControlText(authorization.blockCode ?? "turn_output_budget"),
+				),
+			};
 		}
 		// P8b: two-phase tool-result receipt BEGIN — the LAST step of this
 		// guard, after every worker/commander/mode/path/lease check above has
@@ -4284,20 +5521,50 @@ export default function workbenchRuntime(pi: ExtensionAPI): void {
 			// nothing is begun for the blocked call, so no started receipt is
 			// left incomplete.
 			if (pendingReceiptHandles.size >= MAX_IN_FLIGHT_RECEIPTS) {
-				return { block: true, reason: capacityBlockReason() };
+				if (authorization.authorizationId) turnOutputBudget.releaseAuthorization({ authorizationId: authorization.authorizationId });
+				return { block: true, reason: boundedGuardReason(capacityBlockReason()) };
 			}
-			const projectRoot = await projectRootFor(ctx);
-			const begun = await beginReceipt({
-				projectRoot,
-				sessionIdentity: ctx.sessionManager.getSessionId(),
-				toolCallId: event.toolCallId,
-				toolName: event.toolName,
-				rawInput: event.input,
-			});
-			if (!begun.ok) {
-				return { block: true, reason: beginBlockReason(begun) };
+			try {
+				const projectRoot = await projectRootFor(ctx);
+				const begun = await beginReceipt({
+					projectRoot,
+					sessionIdentity: ctx.sessionManager.getSessionId(),
+					toolCallId: event.toolCallId,
+					toolName: event.toolName,
+					rawInput: event.input,
+				});
+				if (!begun.ok) {
+					if (authorization.authorizationId) turnOutputBudget.releaseAuthorization({ authorizationId: authorization.authorizationId });
+					return { block: true, reason: boundedGuardReason(beginBlockReason(begun)) };
+				}
+				pendingReceiptHandles.set(event.toolCallId, { handle: begun.handle, projectRoot });
+			} catch {
+				if (authorization.authorizationId) turnOutputBudget.releaseAuthorization({ authorizationId: authorization.authorizationId });
+				return { block: true, reason: boundedGuardReason("Tool result receipt storage unavailable") };
 			}
-			pendingReceiptHandles.set(event.toolCallId, { handle: begun.handle, projectRoot });
+		}
+
+		// Only a fully authorized call reaches lease consumption and modified
+		// bookkeeping; receipted calls have also completed BEGIN successfully.
+		if (actor === "sol-commander" && (event.toolName === "edit" || event.toolName === "write")) {
+			const path =
+				event.input && typeof event.input === "object" && typeof (event.input as { path?: unknown }).path === "string"
+					? (event.input as { path: string }).path
+					: "";
+			if (writeLease && leaseStatus(writeLease, now) === "active") {
+				const consumed = consumeLeaseCall(writeLease, event.toolName, path, now);
+				if (consumed.ok) {
+					writeLease = consumed.lease;
+					persistLease();
+					if (leaseStatus(writeLease, now) !== "active") applyModeTools();
+				}
+			}
+		}
+		if ((event.toolName === "edit" || event.toolName === "write") && event.input && typeof event.input === "object") {
+			const path = (event.input as { path?: unknown }).path;
+			if (typeof path === "string" && path.length > 0) {
+				compactState.modifiedFiles = pushBounded(compactState.modifiedFiles, path, MAX_MODIFIED_FILES);
+			}
 		}
 		return undefined;
 	});

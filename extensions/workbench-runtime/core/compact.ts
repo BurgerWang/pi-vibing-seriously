@@ -34,6 +34,8 @@ const MAX_STRING_FIELD = 240;
 
 /** Bound for the blocked commander write-attempt counter (mirrors delegation-state). */
 export const MAX_BLOCKED_COMMANDER_WRITE_ATTEMPTS = 999;
+/** Session telemetry counters saturate at safe integers, independently of the P7 audit cap. */
+export const MAX_OUTPUT_CONTROL_COMPACT_COUNT = Number.MAX_SAFE_INTEGER;
 
 /** The only write policy the workbench defines (P7 worker-first-strict). */
 const WORKER_FIRST_POLICY = "worker-first-strict";
@@ -73,6 +75,10 @@ export interface CompactState {
 	blockedCommanderWriteAttempts?: number;
 	/** The next required delegation/review action (bounded pointer). */
 	nextDelegationAction?: string;
+	// R8 output-control observations. These numeric counters are advisory
+	// only: enforcement never reads compact state or the rendered note.
+	outputTruncatedResults?: number;
+	outputHistoryCollapsedBundles?: number;
 }
 
 export function emptyCompactState(mode: string): CompactState {
@@ -107,9 +113,9 @@ function cleanBoolean(value: unknown, fallback: boolean | undefined): boolean | 
 	return typeof value === "boolean" ? value : fallback;
 }
 
-function cleanBoundedCounter(value: unknown): number | undefined {
+function cleanBoundedCounter(value: unknown, max = MAX_BLOCKED_COMMANDER_WRITE_ATTEMPTS): number | undefined {
 	if (typeof value !== "number" || !Number.isInteger(value) || value < 0) return undefined;
-	return Math.min(value, MAX_BLOCKED_COMMANDER_WRITE_ATTEMPTS);
+	return Math.min(value, max);
 }
 
 /** Sanitize an unknown persisted payload into a valid CompactState. */
@@ -140,6 +146,8 @@ export function mergeCompactState(base: CompactState, raw: unknown): CompactStat
 		activeWriteLease: cleanString(r.activeWriteLease) ?? base.activeWriteLease,
 		blockedCommanderWriteAttempts: cleanBoundedCounter(r.blockedCommanderWriteAttempts) ?? base.blockedCommanderWriteAttempts,
 		nextDelegationAction: cleanString(r.nextDelegationAction) ?? base.nextDelegationAction,
+		outputTruncatedResults: cleanBoundedCounter(r.outputTruncatedResults, MAX_OUTPUT_CONTROL_COMPACT_COUNT) ?? base.outputTruncatedResults,
+		outputHistoryCollapsedBundles: cleanBoundedCounter(r.outputHistoryCollapsedBundles, MAX_OUTPUT_CONTROL_COMPACT_COUNT) ?? base.outputHistoryCollapsedBundles,
 	};
 }
 
@@ -206,7 +214,9 @@ export function shouldSupplement(state: CompactState): boolean {
 			state.lastDelegationId !== undefined ||
 			state.pendingDelegationReview === true ||
 			state.blockedCommanderWriteAttempts !== undefined ||
-			state.nextDelegationAction !== undefined,
+			state.nextDelegationAction !== undefined ||
+			(state.outputTruncatedResults ?? 0) > 0 ||
+			(state.outputHistoryCollapsedBundles ?? 0) > 0,
 	);
 }
 
@@ -247,6 +257,11 @@ export function buildCompactNote(state: CompactState): string {
 	}
 	if (state.activeWriteLease) lines.push(`write lease: ${state.activeWriteLease}`);
 	lines.push(...line("next delegation action", state.nextDelegationAction));
+	if ((state.outputTruncatedResults ?? 0) > 0 || (state.outputHistoryCollapsedBundles ?? 0) > 0) {
+		lines.push(
+			`context output: ${state.outputTruncatedResults ?? 0} results truncated, ${state.outputHistoryCollapsedBundles ?? 0} history bundles collapsed`,
+		);
+	}
 	if (state.lastRunId) lines.push(`last run: ${state.lastRunId}${state.lastRecipe ? ` (${state.lastRecipe})` : ""}`);
 	if (state.passedGates.length > 0) lines.push(`gates passed: ${state.passedGates.join(", ")}`);
 	if (state.failedGates.length > 0) lines.push(`gates failed: ${state.failedGates.join(", ")}`);

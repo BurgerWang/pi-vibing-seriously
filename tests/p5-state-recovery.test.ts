@@ -292,12 +292,19 @@ function messageEndEvent(totalTokens: number, overrides: Record<string, unknown>
 	} as never;
 }
 
+/** Pi invokes every registered message_end handler in registration order. */
+async function fireMessageEnd(stub: StubAPI, event: never, ctx: never): Promise<void> {
+	const handlers = stub.events.get("message_end") ?? [];
+	assert.ok(handlers.length > 0, "message_end handlers registered");
+	for (const handler of handlers) await handler(event, ctx);
+}
+
 test("worker role sends exactly one hidden soft-budget steer at/above 80%", async () => {
 	const stub = makeStub();
 	withWorkerRole(() => workbenchRuntime(stub));
 	const messageEnd = stub.events.get("message_end");
 	assert.ok(messageEnd && messageEnd.length > 0);
-	const handler = messageEnd[0]!;
+	const handler = (event: never, ctx: never) => fireMessageEnd(stub, event, ctx);
 	const ctx = fakeCtx([]) as never;
 
 	// Below the soft threshold: no steer.
@@ -345,7 +352,7 @@ test("commander session never receives the worker soft-budget steer", async () =
 	workbenchRuntime(stub);
 	const messageEnd = stub.events.get("message_end");
 	assert.ok(messageEnd && messageEnd.length > 0);
-	await messageEnd[0]!(messageEndEvent(WORKER_HARD_BUDGET), fakeCtx([]) as never);
+	await fireMessageEnd(stub, messageEndEvent(WORKER_HARD_BUDGET), fakeCtx([]) as never);
 	assert.equal(stub.messages.length, 0, "the steer is worker-role only");
 });
 
@@ -358,7 +365,7 @@ test("worker role sends exactly one hidden cumulative spend steer at the standar
 	withWorkerRole(() => workbenchRuntime(stub));
 	const messageEnd = stub.events.get("message_end");
 	assert.ok(messageEnd && messageEnd.length > 0);
-	const handler = messageEnd[0]!;
+	const handler = (event: never, ctx: never) => fireMessageEnd(stub, event, ctx);
 	const ctx = fakeCtx([]) as never;
 
 	// 4 x 600,000 = 2,400,000: below the standard soft total (3,000,000) and
@@ -390,7 +397,7 @@ test("worker role spend steer fires on the turns dimension (low profile, exact s
 	withWorkerRoleAndSpendProfile("low", () => workbenchRuntime(stub));
 	const messageEnd = stub.events.get("message_end");
 	assert.ok(messageEnd && messageEnd.length > 0);
-	const handler = messageEnd[0]!;
+	const handler = (event: never, ctx: never) => fireMessageEnd(stub, event, ctx);
 	const ctx = fakeCtx([]) as never;
 
 	// 7 x 100 tokens: 7 turns stay below the low soft turns limit (8).
@@ -417,7 +424,7 @@ test("worker role spend steer fires on the output dimension at the exact soft bo
 	withWorkerRole(() => workbenchRuntime(stub));
 	const messageEnd = stub.events.get("message_end");
 	assert.ok(messageEnd && messageEnd.length > 0);
-	const handler = messageEnd[0]!;
+	const handler = (event: never, ctx: never) => fireMessageEnd(stub, event, ctx);
 	const ctx = fakeCtx([]) as never;
 
 	// 3 x 30,000 output = 90,000: below the standard soft output (120,000).
@@ -442,7 +449,7 @@ test("spend steer fires when the band first becomes hard (soft steer, hard band)
 	withWorkerRoleAndSpendProfile("low", () => workbenchRuntime(stub));
 	const messageEnd = stub.events.get("message_end");
 	assert.ok(messageEnd && messageEnd.length > 0);
-	const handler = messageEnd[0]!;
+	const handler = (event: never, ctx: never) => fireMessageEnd(stub, event, ctx);
 	const ctx = fakeCtx([]) as never;
 
 	// One message at 700,000: below the low soft total — band ok, no steer.
@@ -466,7 +473,7 @@ test("malformed spend-profile env falls back to standard defensively", async () 
 	withWorkerRoleAndSpendProfile("bogus-profile", () => workbenchRuntime(stub));
 	const messageEnd = stub.events.get("message_end");
 	assert.ok(messageEnd && messageEnd.length > 0);
-	const handler = messageEnd[0]!;
+	const handler = (event: never, ctx: never) => fireMessageEnd(stub, event, ctx);
 	const ctx = fakeCtx([]) as never;
 
 	// 5 x 600,000 = 3,000,000: the STANDARD soft total boundary. The fallback
@@ -490,7 +497,7 @@ test("commander session never receives the spend steer even with a profile env s
 	}
 	const messageEnd = stub.events.get("message_end");
 	assert.ok(messageEnd && messageEnd.length > 0);
-	const handler = messageEnd[0]!;
+	const handler = (event: never, ctx: never) => fireMessageEnd(stub, event, ctx);
 	// 9 turns would cross the low soft turns limit (8) in a worker session.
 	for (let i = 0; i < 9; i++) await handler(messageEndEvent(100), fakeCtx([]) as never);
 	assert.equal(stub.messages.length, 0, "the spend steer never reaches a commander session");
@@ -509,7 +516,7 @@ test("a spend steer send failure is swallowed and never breaks a model request",
 	}) as typeof stub.sendMessage;
 	const messageEnd = stub.events.get("message_end");
 	assert.ok(messageEnd && messageEnd.length > 0);
-	const handler = messageEnd[0]!;
+	const handler = (event: never, ctx: never) => fireMessageEnd(stub, event, ctx);
 	const ctx = fakeCtx([]) as never;
 
 	// 5 x 600,000 crosses the standard soft total on the 5th message; the
@@ -592,17 +599,16 @@ test("the tool_call guard blocks bash/edit/write and foreign tools for strict So
 		fakeCtx([], { model: { provider: "openai", id: "gpt-5.6-sol", api: "responses" } as never }) as never,
 	);
 	type GuardResult = { block?: boolean; reason?: string } | undefined;
-	const guard = stub.events.get("tool_call")![0]!;
-	const bash = (await guard({ type: "tool_call", toolName: "bash", input: { command: "ls -la" } } as never, fakeCtx([]) as never)) as GuardResult;
+	const bash = (await guardCall(stub, "bash", { command: "ls -la" })) as GuardResult;
 	assert.ok(bash && bash.block === true, "bash blocked for strict Sol");
 	assert.match(String(bash.reason), /Worker-first write authority/);
-	const edit = (await guard({ type: "tool_call", toolName: "edit", input: { path: "src/main.ts" } } as never, fakeCtx([]) as never)) as GuardResult;
+	const edit = (await guardCall(stub, "edit", { path: "src/main.ts" })) as GuardResult;
 	assert.ok(edit && edit.block === true, "edit blocked without a lease");
 	assert.match(String(edit.reason), /lease locked/);
-	const foreign = (await guard({ type: "tool_call", toolName: "web_search", input: {} } as never, fakeCtx([]) as never)) as GuardResult;
+	const foreign = (await guardCall(stub, "web_search", {})) as GuardResult;
 	assert.ok(foreign && foreign.block === true, "foreign tool blocked despite re-enable");
 	assert.match(String(foreign.reason), /outside the strict Sol DEV allowlist/);
-	const read = (await guard({ type: "tool_call", toolName: "read", input: { path: "README.md" } } as never, fakeCtx([]) as never)) as GuardResult;
+	const read = (await guardCall(stub, "read", { path: "README.md" })) as GuardResult;
 	assert.equal(read, undefined, "allowlist tools pass the guard");
 });
 
@@ -610,8 +616,7 @@ test("non-Sol controllers keep the existing DEV guard behavior (bash allowed)", 
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	type GuardResult = { block?: boolean; reason?: string } | undefined;
-	const guard = stub.events.get("tool_call")![0]!;
-	const bash = (await guard({ type: "tool_call", toolName: "bash", input: { command: "ls -la" } } as never, fakeCtx([]) as never)) as GuardResult;
+	const bash = (await guardCall(stub, "bash", { command: "ls -la" })) as GuardResult;
 	assert.equal(bash, undefined, "non-Sol DEV bash is not newly denied");
 });
 
@@ -631,10 +636,9 @@ test("worker role keeps its edit/write path scope in the P7 tool_call guard", as
 			const stub = makeStub();
 			workbenchRuntime(stub);
 			type GuardResult = { block?: boolean; reason?: string } | undefined;
-			const guard = stub.events.get("tool_call")![0]!;
-			const inScope = (await guard({ type: "tool_call", toolName: "edit", input: { path: "src/main.ts" } } as never, fakeCtx([]) as never)) as GuardResult;
+			const inScope = (await guardCall(stub, "edit", { path: "src/main.ts" })) as GuardResult;
 			assert.equal(inScope, undefined, "in-scope worker edit passes");
-			const outOfScope = (await guard({ type: "tool_call", toolName: "edit", input: { path: "README.md" } } as never, fakeCtx([]) as never)) as GuardResult;
+			const outOfScope = (await guardCall(stub, "edit", { path: "README.md" })) as GuardResult;
 			assert.ok(outOfScope && outOfScope.block === true, "out-of-scope worker edit blocked");
 			assert.match(String(outOfScope.reason), /outside the parent-approved scope/);
 		} finally {
@@ -709,17 +713,29 @@ async function runCmd(
 	return { output, confirmCalls, statuses };
 }
 
-/** Run the extension's own second-layer tool_call guard. */
+let guardTurnSerial = 0;
+
+/** Run all guards for one real fresh-turn tool call with a unique Pi id. */
 async function guardCall(
 	stub: StubAPI,
 	toolName: string,
 	input: unknown,
 ): Promise<{ block?: boolean; reason?: string } | undefined> {
-	const guard = stub.events.get("tool_call")![0]!;
-	return (await guard({ type: "tool_call", toolName, input } as never, fakeCtx([]) as never)) as {
-		block?: boolean;
-		reason?: string;
-	} | undefined;
+	guardTurnSerial += 1;
+	const ctx = fakeCtx([]) as never;
+	for (const handler of stub.events.get("turn_start") ?? []) {
+		await handler({ type: "turn_start", turnIndex: guardTurnSerial } as never, ctx);
+	}
+	for (const guard of stub.events.get("tool_call") ?? []) {
+		const result = (await guard({
+			type: "tool_call",
+			toolCallId: `p5-state-guard-${guardTurnSerial}`,
+			toolName,
+			input,
+		} as never, ctx)) as { block?: boolean; reason?: string } | undefined;
+		if (result !== undefined) return result;
+	}
+	return undefined;
 }
 
 /** Extract the two issued token parts from a non-TUI issuance output. */
@@ -1329,10 +1345,9 @@ test("the strict Sol guard counts EVERY blocked edit/write attempt, with or with
 	workbenchRuntime(stub);
 	await solSession(stub);
 	type GuardResult = { block?: boolean; reason?: string } | undefined;
-	const guard = stub.events.get("tool_call")![0]!;
 	// No delegation exists: every blocked attempt is still counted.
 	for (let i = 0; i < 3; i += 1) {
-		const blocked = (await guard({ type: "tool_call", toolName: "edit", input: { path: "src/main.ts" } } as never, fakeCtx([]) as never)) as GuardResult;
+		const blocked = (await guardCall(stub, "edit", { path: "src/main.ts" })) as GuardResult;
 		assert.ok(blocked && blocked.block === true);
 	}
 	const delegationEntries = stub.appendEntryCalls.filter((c) => c.customType === DELEGATION_STATE_ENTRY_TYPE);
@@ -1340,11 +1355,11 @@ test("the strict Sol guard counts EVERY blocked edit/write attempt, with or with
 	assert.ok(last && typeof last.data === "object" && last.data !== null);
 	assert.equal((last.data as { blockedWriteAttempts?: number }).blockedWriteAttempts, 3, "every blocked attempt increments the audit counter");
 	// A blocked bash call is NOT an edit/write attempt: the counter stays.
-	await guard({ type: "tool_call", toolName: "bash", input: { command: "ls" } } as never, fakeCtx([]) as never);
+	await guardCall(stub, "bash", { command: "ls" });
 	const after = stub.appendEntryCalls.filter((c) => c.customType === DELEGATION_STATE_ENTRY_TYPE);
 	assert.equal((after[after.length - 1]!.data as { blockedWriteAttempts?: number }).blockedWriteAttempts, 3);
 	// A blocked foreign-tool call is not a write attempt either.
-	await guard({ type: "tool_call", toolName: "web_search", input: {} } as never, fakeCtx([]) as never);
+	await guardCall(stub, "web_search", {});
 	const after2 = stub.appendEntryCalls.filter((c) => c.customType === DELEGATION_STATE_ENTRY_TYPE);
 	assert.equal((after2[after2.length - 1]!.data as { blockedWriteAttempts?: number }).blockedWriteAttempts, 3);
 });
@@ -1404,8 +1419,7 @@ test("the compaction mirror never weakens the hard guards (note text is not cons
 	const hostile = [entry(COMPACT_STATE_ENTRY_TYPE, { writePolicy: "lenient", commanderWritesDenied: false, task: "x" })];
 	await solSession(stub, hostile);
 	type GuardResult = { block?: boolean; reason?: string } | undefined;
-	const guard = stub.events.get("tool_call")![0]!;
-	const edit = (await guard({ type: "tool_call", toolName: "edit", input: { path: "src/main.ts" } } as never, fakeCtx([]) as never)) as GuardResult;
+	const edit = (await guardCall(stub, "edit", { path: "src/main.ts" })) as GuardResult;
 	assert.ok(edit && edit.block === true, "the guard ignores the compact note text");
 	assert.match(String(edit.reason), /lease locked/);
 });

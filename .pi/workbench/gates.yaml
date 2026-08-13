@@ -9,9 +9,9 @@
 # (typecheck + unit tests + git diff --check) exercises the full surface;
 # the unit-test suite includes the spawn/integration-style tests (real exec,
 # real cache store, real telemetry files). Additional declared recipes
-# (benchmark/collection/prepare and the focused cached
-# release-assets-test) are auxiliary tooling, not gate recipes. Everything
-# else stays built-in.
+# (benchmark/collection/prepare and focused cached release-assets tests) are
+# auxiliary tooling; the v0.10.0 `ctx1` project gate below deliberately owns
+# the three context-output recipes. Everything else stays built-in.
 #
 # Convention (see templates/project/*/gates.yaml): a project gate with a
 # built-in id replaces the built-in gate entirely.
@@ -68,5 +68,34 @@ gates:
         title: Data read/write path smoke
         kind: manual
         prompt: "Smoke-test evidence that the data read/write path works (for quant projects this is covered by the Q1 data:fetch recipe check)."
+        required: true
+        blocking: true
+  - id: ctx1
+    title: Context Output Safety
+    description: "Release gate for the v0.10.0 context output control plane. Run b1,b2,b3 in the same final tree before this gate so prerequisite evidence is current."
+    prerequisites: [b1, b2, b3]
+    checks:
+      - id: ctx1.1
+        title: Context output core tests pass
+        kind: recipe
+        recipes: [context-output-core-test]
+        required: true
+        blocking: true
+      - id: ctx1.2
+        title: Context output integration tests pass
+        kind: recipe
+        recipes: [context-output-integration-test]
+        required: true
+        blocking: true
+      - id: ctx1.3
+        title: Context output stress evidence passes
+        kind: recipe
+        recipes: [context-output-stress]
+        required: true
+        blocking: true
+      - id: ctx1.4
+        title: Fingerprint transition and cache contract reviewed
+        kind: manual
+        prompt: "Evidence that the intentional tool fingerprint transition and cache contract were reviewed and recorded."
         required: true
         blocking: true

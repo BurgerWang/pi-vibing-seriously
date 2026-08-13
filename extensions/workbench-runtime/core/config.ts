@@ -80,6 +80,23 @@ export interface ProjectConfig {
 	commanderAdvisory: AdvisoryConfig;
 }
 
+/**
+ * A caller-owned, already-parsed gates document. The wrapper is intentional:
+ * `{ value: undefined }` means the caller has authoritatively observed an
+ * absent/empty gates.yaml and the generic loader must NOT fall back to reading
+ * the path again. Callers that omit this option retain the historical generic
+ * config-loading behaviour unchanged.
+ */
+export interface ParsedGatesDocumentOverride {
+	readonly value: unknown;
+}
+
+export interface LoadProjectConfigOptions {
+	trusted: boolean;
+	/** Internal authority hand-off for bounded gate-loading paths. */
+	parsedGatesDocument?: ParsedGatesDocumentOverride;
+}
+
 /** The workbench config directory for a project root. */
 export function workbenchDir(projectRoot: string): string {
 	return join(resolve(projectRoot), CONFIG_DIR_NAME, WORKBENCH_DIR);
@@ -190,26 +207,35 @@ export async function resolveEffectiveProjectRoot(
  * `trusted` is false. Missing files are fine (empty config); invalid YAML and
  * invalid recipes are collected as issues, never thrown.
  */
-export async function loadProjectConfig(projectRoot: string, options: { trusted: boolean }): Promise<ProjectConfig> {
+export async function loadProjectConfig(projectRoot: string, options: LoadProjectConfigOptions): Promise<ProjectConfig> {
 	if (!options.trusted) throw new UntrustedProjectError(projectRoot);
 	const dir = workbenchDir(projectRoot);
 	const issues: ConfigIssue[] = [];
 
 	const documents = new Map<string, unknown>();
 	for (const file of CONFIG_FILES) {
-		const content = await readOptionalText(join(dir, file));
-		if (content === undefined) continue;
-		try {
-			const doc = parseYaml(content);
-			if (doc === null || doc === undefined) continue;
-			if (typeof doc !== "object" || Array.isArray(doc)) {
-				issues.push({ file, message: "document root must be a YAML mapping" });
+		let doc: unknown;
+		if (file === "gates.yaml" && options.parsedGatesDocument !== undefined) {
+			// The gate engine already obtained and parsed this document through its
+			// fixed-size, same-handle reader. Presence of the wrapper is an
+			// authority transfer: never touch gates.yaml again in this load.
+			doc = options.parsedGatesDocument.value;
+		} else {
+			const content = await readOptionalText(join(dir, file));
+			if (content === undefined) continue;
+			try {
+				doc = parseYaml(content);
+			} catch (error) {
+				issues.push({ file, message: `invalid YAML: ${(error as Error).message}` });
 				continue;
 			}
-			documents.set(file, doc);
-		} catch (error) {
-			issues.push({ file, message: `invalid YAML: ${(error as Error).message}` });
 		}
+		if (doc === null || doc === undefined) continue;
+		if (typeof doc !== "object" || Array.isArray(doc)) {
+			issues.push({ file, message: "document root must be a YAML mapping" });
+			continue;
+		}
+		documents.set(file, doc);
 	}
 
 	const projectDoc = documents.get("project.yaml") as Record<string, unknown> | undefined;

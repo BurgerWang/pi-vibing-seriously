@@ -13,6 +13,7 @@ import {
 	QUANT_NEUTRALITY_NOTE,
 	type RunComparison,
 } from "./compare.ts";
+import { canonicalJsonWithin } from "./comparison-record.ts";
 import { formatDelta, formatDuration, formatNumber, fitToWidth } from "./format.ts";
 import { truncateUtf8Bytes, utf8Bytes } from "./result-summary.ts";
 import type { ValidationComponent } from "./recipe-schema.ts";
@@ -67,11 +68,38 @@ export interface GateToolDetails {
 	run_id: string;
 	requested: string[];
 	profile: string | undefined;
-	gates: { id: string; status: string; title: string; failure_reason: string | null; blocked_reason: string | null; failed_checks: string[] }[];
-	counts: { pass: number; fail: number; blocked: number; not_run: number };
+	gates: {
+		id: string;
+		status: string;
+		title: string;
+		failure_reason: string | null;
+		blocked_reason: string | null;
+		failed_checks: string[];
+		failed_check_count?: number;
+		failed_checks_omitted?: number;
+	}[];
+	counts: {
+		pass: number;
+		fail: number;
+		blocked: number;
+		not_run: number;
+		total?: number;
+		shown?: number;
+		omitted?: number;
+	};
 	log_path: string;
 	phase?: string;
 }
+
+/** Session-safe exact-count list accepted alongside legacy arrays. */
+export interface BoundedStringListDetails {
+	items: string[];
+	original_items: number;
+	shown_items: number;
+	omitted_items: number;
+}
+
+export type StringListDetails = string[] | BoundedStringListDetails;
 
 /**
  * Phase 3B: read-only preflight payload — deliberately SEPARATE from
@@ -135,21 +163,35 @@ export interface InspectToolDetails {
 	/** P8: safe effective project root (project.yaml project_dir; repo root by default). */
 	effective_project_root?: string;
 	git: { is_git: boolean; commit: string | null; dirty: boolean; branch: string | null };
-	stacks: string[];
+	stacks: StringListDetails;
 	profile: string | undefined;
-	recipes: string[];
+	recipes: StringListDetails;
 	/**
 	 * Phase 2B: recipe name -> the recipe's exact declared validation
 	 * components. The FULL deterministic map — every recipe is a key,
 	 * explicit empty arrays included; absent only when the payload was not
 	 * populated (renderer shows unavailable).
 	 */
-	recipe_validation_components?: Record<string, ValidationComponent[]>;
-	config_errors: string[];
-	config_files_present: string[];
+	recipe_validation_components?: Record<string, ValidationComponent[] | number>;
+	config_errors: StringListDetails;
+	config_files_present: StringListDetails;
 }
 
-export type CompareToolDetails = { ok: true; report: RunComparison } | { ok: false; error: string };
+export type CompareToolDetails =
+	| {
+		ok: true;
+		comparison_id: string;
+		a_run_id: string;
+		b_run_id: string;
+		compatible: boolean;
+		artifact_added_count: number;
+		artifact_removed_count: number;
+		gate_changed_count: number;
+		quant_changed_count: number;
+		parameter_changed_count: number;
+		comparison_path: string;
+	}
+	| { ok: false; error: string };
 
 // ---------------------------------------------------------------------------
 // Tool call header line (renderCall)
@@ -160,9 +202,9 @@ export function renderToolCallLine(toolName: string, args: Record<string, unknow
 	const a = args ?? {};
 	switch (toolName) {
 		case "workbench_run_recipe":
-			return `workbench_run_recipe ${typeof a.recipe === "string" ? a.recipe : ""}`.trim();
+			return `workbench_run_recipe ${boundedBytes(typeof a.recipe === "string" ? a.recipe : "", 256)}`.trim();
 		case "workbench_run_gate":
-			return `workbench_run_gate ${typeof a.gates === "string" ? a.gates : ""}`.trim();
+			return `workbench_run_gate ${boundedBytes(typeof a.gates === "string" ? a.gates : "", 256)}`.trim();
 		case "workbench_read_run":
 			return `workbench_read_run ${typeof a.run_id === "string" ? a.run_id : ""}`.trim();
 		case "workbench_compare_runs":
@@ -191,14 +233,49 @@ export function renderErrorLine(toolName: string, message: string): string {
 // ---------------------------------------------------------------------------
 
 const fmtExit = (code: number | null | undefined): string => (code == null ? "killed" : String(code));
-const fmtArtifacts = (paths: readonly string[] | undefined): string => (paths && paths.length > 0 ? paths.join(", ") : "(none)");
-const fmtList = (items: readonly string[] | undefined): string => (items && items.length > 0 ? items.join(", ") : "(none)");
+const INSPECT_RENDER_MAX_BYTES = 16_384;
+const INSPECT_RENDER_MAX_LINES = 240;
+const GATE_RENDER_MAX_BYTES = 16_384;
+const GATE_RENDER_MAX_LINES = 240;
+
+function listFacts(value: StringListDetails | undefined): { items: string[]; original: number; shown: number; omitted: number } {
+	if (Array.isArray(value)) return { items: value.filter((item): item is string => typeof item === "string"), original: value.length, shown: value.length, omitted: 0 };
+	if (!value || typeof value !== "object" || !Array.isArray(value.items)) return { items: [], original: 0, shown: 0, omitted: 0 };
+	const items = value.items.filter((item): item is string => typeof item === "string");
+	const original = Number.isSafeInteger(value.original_items) && value.original_items >= 0 ? value.original_items : items.length;
+	const shown = Math.min(items.length, Number.isSafeInteger(value.shown_items) && value.shown_items >= 0 ? value.shown_items : items.length);
+	const omitted = Math.max(0, Number.isSafeInteger(value.omitted_items) && value.omitted_items >= 0 ? value.omitted_items : original - shown);
+	return { items: items.slice(0, shown), original, shown, omitted };
+}
+
+function boundedJoinedList(value: StringListDetails | undefined, itemBytes = 192): string {
+	const facts = listFacts(value);
+	const shown = facts.items.map((item) => boundedBytes(item, itemBytes)).join(", ");
+	return `${shown || "(none)"}${facts.omitted > 0 ? ` (+${facts.omitted} omitted)` : ""}`;
+}
+
+function capRendererLines(lines: string[], maxBytes: number, maxLines: number): string[] {
+	const normalized = lines.map((line) => boundedBytes(line, 1_024));
+	if (normalized.length <= maxLines && utf8Bytes(normalized.join("\n")) <= maxBytes) return normalized;
+	const maximum = Math.min(normalized.length, maxLines - 1);
+	for (let keep = maximum; keep >= 0; keep -= 1) {
+		const marker = `... ${normalized.length - keep} renderer line(s) omitted`;
+		const candidate = [...normalized.slice(0, keep), marker];
+		if (utf8Bytes(candidate.join("\n")) <= maxBytes) return candidate;
+	}
+	return ["bounded renderer unavailable"];
+}
+
+const fmtArtifacts = (paths: readonly string[] | undefined): string => boundedJoinedList(paths ? [...paths] : undefined, 256);
+const fmtList = (items: StringListDetails | undefined): string => boundedJoinedList(items);
 const fmtMs = (ms: number | undefined): string => (Number.isFinite(ms) ? `${ms} ms` : "n/a");
-const fmtPath = (p: string | undefined): string => p ?? "(n/a)";
+const fmtPath = (p: string | undefined): string => boundedBytes(p ?? "(n/a)", 512);
 
 /** workbench_project_inspect */
 export function renderInspectLines(d: InspectToolDetails, expanded: boolean): string[] {
-	const compact = `profile:${d.profile ?? "not set"} recipes:${(d.recipes ?? []).length} errors:${(d.config_errors ?? []).length}`;
+	const recipes = listFacts(d.recipes);
+	const errors = listFacts(d.config_errors);
+	const compact = `profile:${boundedBytes(d.profile ?? "not set", 128)} recipes:${recipes.original} errors:${errors.original}`;
 	if (!expanded) return [compact];
 	// Phase 2B: deterministic per-recipe validation coverage in map order
 	// (name-sorted — the tool builds the map from the config's name-sorted
@@ -206,32 +283,49 @@ export function renderInspectLines(d: InspectToolDetails, expanded: boolean): st
 	// array stays exactly as declared). Missing map -> unavailable; an empty
 	// map -> none declared.
 	const vc: unknown = d.recipe_validation_components;
+	const omittedValidationItems = typeof vc === "object" && vc !== null && !Array.isArray(vc)
+		? (vc as Record<string, unknown>).__omitted_items__
+		: undefined;
 	const coverageLines =
 		typeof vc !== "object" || vc === null || Array.isArray(vc)
 			? ["validation coverage: (n/a)"]
-			: Object.keys(vc).length === 0
+			: Object.keys(vc).filter((key) => !key.startsWith("__")).length === 0
 				? ["validation coverage: (none declared)"]
-				: Object.entries(vc).map(([name, comps]) => `validation coverage: ${name}=[${(Array.isArray(comps) ? comps : []).join(", ")}]`);
-	return [
+				: [
+					...Object.entries(vc)
+						.filter(([name, comps]) => !name.startsWith("__") && Array.isArray(comps))
+						.map(([name, comps]) => `validation coverage: ${boundedBytes(name, 128)}=[${(comps as unknown[]).filter((item): item is string => typeof item === "string").map((item) => boundedBytes(item, 64)).join(", ")}]`),
+					...(typeof omittedValidationItems === "number" && omittedValidationItems > 0
+						? [`validation coverage: ... ${omittedValidationItems} recipe(s) omitted`]
+						: []),
+				];
+	const stacks = listFacts(d.stacks);
+	const configFiles = listFacts(d.config_files_present);
+	const lines = [
 		compact,
-		`project root : ${d.project_root}`,
+		`project root : ${boundedBytes(d.project_root, 512)}`,
 		...(d.effective_project_root && d.effective_project_root !== d.project_root
-			? [`effective root: ${d.effective_project_root}`]
+			? [`effective root: ${boundedBytes(d.effective_project_root, 512)}`]
 			: d.project_root
-				? [`effective root: ${d.project_root} (repository root)`]
+				? [`effective root: ${boundedBytes(d.project_root, 512)} (repository root)`]
 				: []),
-		`stacks       : ${fmtList(d.stacks)}`,
-		`config files : ${fmtList(d.config_files_present)}`,
-		`config errors: ${fmtList(d.config_errors)}`,
-		`recipes      : ${fmtList(d.recipes)}`,
+		`stacks (${stacks.original}; shown=${stacks.shown}; omitted=${stacks.omitted}):`,
+		...stacks.items.map((item) => `  - ${boundedBytes(item, 256)}`),
+		`config files (${configFiles.original}; shown=${configFiles.shown}; omitted=${configFiles.omitted}):`,
+		...configFiles.items.map((item) => `  - ${boundedBytes(item, 256)}`),
+		`config errors (${errors.original}; shown=${errors.shown}; omitted=${errors.omitted}):`,
+		...(errors.items.length > 0 ? errors.items.map((item) => `  - ${boundedBytes(item, 512)}`) : ["  (none)"]),
+		`recipes (${recipes.original}; shown=${recipes.shown}; omitted=${recipes.omitted}):`,
+		...(recipes.items.length > 0 ? recipes.items.map((item) => `  - ${boundedBytes(item, 256)}`) : ["  (none)"]),
 		...coverageLines,
-		`git          : ${d.git && d.git.is_git ? `${d.git.branch ?? "(detached)"} @ ${d.git.commit?.slice(0, 12) ?? "(no commits)"}${d.git.dirty ? " (dirty)" : ""}` : "(not a git repo)"}`,
+		`git          : ${d.git && d.git.is_git ? `${boundedBytes(d.git.branch ?? "(detached)", 128)} @ ${d.git.commit?.slice(0, 12) ?? "(no commits)"}${d.git.dirty ? " (dirty)" : ""}` : "(not a git repo)"}`,
 	];
+	return capRendererLines(lines, INSPECT_RENDER_MAX_BYTES, INSPECT_RENDER_MAX_LINES);
 }
 
 /** workbench_run_recipe */
 export function renderRecipeLines(d: RecipeToolDetails, expanded: boolean): string[] {
-	const compact = `${d.status ?? "?"} run:${d.run_id ?? "?"} ${d.recipe ?? "?"} exit=${fmtExit(d.exit_code)} ${formatDuration(d.duration_ms)}`;
+	const compact = `${boundedBytes(d.status ?? "?", 64)} run:${boundedBytes(d.run_id ?? "?", 128)} ${boundedBytes(d.recipe ?? "?", 256)} exit=${fmtExit(d.exit_code)} ${formatDuration(d.duration_ms)}`;
 	if (!expanded) return [compact];
 	// Phase 2B: the two facts come from the run record ONLY — absent facts
 	// render as unavailable, never as []/default (fails closed).
@@ -241,9 +335,9 @@ export function renderRecipeLines(d: RecipeToolDetails, expanded: boolean): stri
 			: "(none declared)"
 		: "(unavailable)";
 	const cacheRequestMode = typeof d.cache_request_mode === "string" ? d.cache_request_mode : "(unavailable)";
-	return [
+	return capRendererLines([
 		compact,
-		`recipe     : ${d.recipe ?? "?"}`,
+		`recipe     : ${boundedBytes(d.recipe ?? "?", 256)}`,
 		`duration   : ${formatDuration(d.duration_ms)} (${fmtMs(d.duration_ms)})`,
 		`exit code  : ${fmtExit(d.exit_code)} (expected: ${(d.expected_exit_codes ?? []).join(", ") || "(none)"})`,
 		`validation : ${validationComponents}`,
@@ -251,7 +345,7 @@ export function renderRecipeLines(d: RecipeToolDetails, expanded: boolean): stri
 		`artifacts  : ${fmtArtifacts(d.artifact_paths)}`,
 		`stdout log : ${fmtPath(d.stdout_log)}`,
 		`stderr log : ${fmtPath(d.stderr_log)}`,
-	];
+	], INSPECT_RENDER_MAX_BYTES, INSPECT_RENDER_MAX_LINES);
 }
 
 /** workbench_run_gate */
@@ -263,18 +357,29 @@ export function renderGateLines(d: GateToolDetails | GatePreflightToolDetails, e
 		return renderGatePreflightLines(d as GatePreflightToolDetails, expanded);
 	}
 	const g = d as GateToolDetails;
-	const gateSummary = (g.gates ?? []).map((item) => `${item.id}:${item.status}`).join(" ");
-	const compact = `${g.status ?? "?"} run:${g.run_id ?? "?"} ${gateSummary}`;
-	if (!expanded) return [compact];
-	const lines = [compact, `requested   : ${fmtList(g.requested)}`, `profile     : ${g.profile ?? "(none)"}`];
-	for (const item of g.gates ?? []) {
+	const allGates = Array.isArray(g.gates) ? g.gates : [];
+	const gates = allGates.slice(0, 24);
+	const gateSummary = gates.map((item) => `${boundedBytes(item.id, 96)}:${boundedBytes(item.status, 32)}`).join(" ");
+	const declaredOmitted = Number.isSafeInteger(g.counts?.omitted) && (g.counts?.omitted ?? 0) > 0 ? g.counts!.omitted! : 0;
+	const omitted = declaredOmitted + Math.max(0, allGates.length - gates.length);
+	const compact = `${boundedBytes(g.status ?? "?", 64)} run:${boundedBytes(g.run_id ?? "?", 128)} ${gateSummary}${omitted > 0 ? ` (+${omitted} gates omitted)` : ""}`;
+	if (!expanded) return capRendererLines([compact], GATE_RENDER_MAX_BYTES, GATE_RENDER_MAX_LINES);
+	const total = Number.isSafeInteger(g.counts?.total) ? g.counts!.total! : allGates.length + declaredOmitted;
+	const lines = [
+		compact,
+		`requested   : ${fmtList(g.requested)}`,
+		`profile     : ${boundedBytes(g.profile ?? "(none)", 128)}`,
+		`gate counts : total=${total} shown=${gates.length} omitted=${omitted} pass=${g.counts?.pass ?? 0} fail=${g.counts?.fail ?? 0} blocked=${g.counts?.blocked ?? 0} not_run=${g.counts?.not_run ?? 0}`,
+	];
+	for (const item of gates) {
 		const reason = item.failure_reason ?? item.blocked_reason ?? "";
-		lines.push(`  ${item.id.padEnd(4)} ${item.status.padEnd(8)} ${item.title}${reason ? ` — ${reason}` : ""}`);
+		lines.push(`  ${boundedBytes(item.id, 96).padEnd(4)} ${boundedBytes(item.status, 32).padEnd(8)} ${boundedBytes(item.title, 256)}${reason ? ` — ${boundedBytes(reason, 512)}` : ""}`);
 	}
-	const failed = (g.gates ?? []).flatMap((item) => item.failed_checks ?? []);
-	if (failed.length > 0) lines.push(`failed checks: ${failed.join(", ")}`);
+	const failed = gates.flatMap((item) => Array.isArray(item.failed_checks) ? item.failed_checks : []);
+	const failedOmitted = gates.reduce((sum, item) => sum + (Number.isSafeInteger(item.failed_checks_omitted) ? item.failed_checks_omitted ?? 0 : 0), 0);
+	if (failed.length > 0 || failedOmitted > 0) lines.push(`failed checks: ${failed.map((item) => boundedBytes(item, 128)).join(", ") || "(none shown)"}${failedOmitted > 0 ? ` (+${failedOmitted} omitted)` : ""}`);
 	lines.push(`log path    : ${fmtPath(g.log_path)}`);
-	return lines;
+	return capRendererLines(lines, GATE_RENDER_MAX_BYTES, GATE_RENDER_MAX_LINES);
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +582,133 @@ function quantChangedCount(quant: NonNullable<RunComparison["quant"]>): number {
 	return n + quant.costs.length + quant.parameters.length;
 }
 
+export const COMPARE_SUMMARY_MAX_BYTES = 32_768 as const;
+export const COMPARE_SUMMARY_MAX_LINES = 400 as const;
+
+const MAX_COMPARE_LIST_ITEMS = 8;
+const MAX_COMPARE_GATE_ROWS = 24;
+const MAX_COMPARE_COST_ROWS = 24;
+const MAX_COMPARE_PARAMETER_ROWS = 16;
+const MAX_COMPARE_NOTE_ROWS = 8;
+const MAX_COMPARE_PATH_BYTES = 192;
+const MAX_COMPARE_FIELD_BYTES = 128;
+const MAX_COMPARE_NOTE_BYTES = 384;
+const MAX_COMPARE_PARAMETER_JSON_BYTES = 256;
+
+function compareInline(value: unknown, maxBytes: number): string {
+	return boundedBytes(typeof value === "string" ? value : "(invalid)", maxBytes);
+}
+
+function compareList(items: readonly string[], label: string, fullPath: string | undefined): string {
+	if (items.length === 0) return "(none)";
+	const shown = items.slice(0, MAX_COMPARE_LIST_ITEMS).map((item) => compareInline(item, MAX_COMPARE_PATH_BYTES));
+	const omitted = items.length - shown.length;
+	return `${shown.join(", ")}${omitted > 0
+		? ` (+${omitted} more ${label} omitted; full comparison: ${compareInline(fullPath ?? "(n/a)", MAX_COMPARE_PATH_BYTES)})`
+		: ""}`;
+}
+
+function projectionType(value: unknown): string {
+	if (value === null) return "null";
+	if (Array.isArray(value)) return "array";
+	return typeof value;
+}
+
+function boundedParameterProjection(value: unknown, depth: number, active: WeakSet<object>): unknown {
+	if (value === null || typeof value === "boolean") return value;
+	if (typeof value === "number") return Number.isFinite(value) ? value : "n/a";
+	if (typeof value === "string") {
+		const shown = truncateUtf8Bytes(value, 128);
+		if (!shown.truncated) return value;
+		return {
+			comparison_string_prefix: shown.text,
+			original_bytes: utf8Bytes(value),
+			shown_bytes: utf8Bytes(shown.text),
+			omitted_bytes: utf8Bytes(value) - utf8Bytes(shown.text),
+		};
+	}
+	if (typeof value !== "object" || value === null) return { comparison_value_omitted: true, type: projectionType(value) };
+	if (active.has(value)) return { comparison_value_omitted: true, type: "circular" };
+	if (depth >= 4) {
+		return Array.isArray(value)
+			? { comparison_value_omitted: true, type: "array", original_items: value.length }
+			: { comparison_value_omitted: true, type: "object", original_keys: Object.keys(value).length };
+	}
+	active.add(value);
+	try {
+		if (Array.isArray(value)) {
+			const shownCount = Math.min(value.length, 7);
+			const output = value.slice(0, shownCount).map((item) => boundedParameterProjection(item, depth + 1, active));
+			if (shownCount < value.length) {
+				output.push({
+					comparison_items_omitted: true,
+					original_items: value.length,
+					shown_items: shownCount,
+					omitted_items: value.length - shownCount,
+				});
+			}
+			return output;
+		}
+		const descriptors = Object.getOwnPropertyDescriptors(value);
+		const keys = Object.keys(descriptors)
+			.filter((key) => descriptors[key]?.enumerable === true)
+			.sort();
+		const shownKeys = keys.slice(0, 7);
+		const entries = shownKeys.map((key) => {
+			const descriptor = descriptors[key];
+			return {
+				key: compareInline(key, MAX_COMPARE_FIELD_BYTES),
+				value: descriptor && Object.prototype.hasOwnProperty.call(descriptor, "value")
+					? boundedParameterProjection(descriptor.value, depth + 1, active)
+					: { comparison_value_omitted: true, type: "accessor" },
+			};
+		});
+		return {
+			comparison_object_entries: entries,
+			original_keys: keys.length,
+			shown_keys: shownKeys.length,
+			omitted_keys: keys.length - shownKeys.length,
+		};
+	} catch {
+		return { comparison_value_omitted: true, type: "unavailable" };
+	} finally {
+		active.delete(value);
+	}
+}
+
+function boundedParameterJson(value: unknown): string {
+	const projected = boundedParameterProjection(value, 0, new WeakSet<object>());
+	const encoded = canonicalJsonWithin(projected, MAX_COMPARE_PARAMETER_JSON_BYTES);
+	if (encoded) return encoded.text;
+	const fallback = canonicalJsonWithin({
+		comparison_value_omitted: true,
+		type: projectionType(value),
+		...(Array.isArray(value) ? { original_items: value.length } : {}),
+		...(value !== null && typeof value === "object" && !Array.isArray(value)
+			? { original_keys: Object.keys(value).length }
+			: {}),
+	}, MAX_COMPARE_PARAMETER_JSON_BYTES);
+	return fallback?.text ?? "{\"comparison_value_omitted\":true}";
+}
+
+function nullableDelta(a: number | null, b: number | null): string {
+	if (a !== null && b !== null) return formatDelta(a, b);
+	return `${a === null ? "n/a" : formatNumber(a)} -> ${b === null ? "n/a" : formatNumber(b)}`;
+}
+
+function capCompareSummary(lines: string[], fullPath: string | undefined): string[] {
+	const joinedBytes = (value: readonly string[]): number => utf8Bytes(value.join("\n"));
+	if (lines.length <= COMPARE_SUMMARY_MAX_LINES && joinedBytes(lines) <= COMPARE_SUMMARY_MAX_BYTES) return lines;
+	const maxPrefix = Math.min(lines.length, COMPARE_SUMMARY_MAX_LINES - 1);
+	for (let keep = maxPrefix; keep >= 0; keep -= 1) {
+		const omitted = lines.length - keep;
+		const marker = `... ${omitted} summary line(s) omitted; full comparison: ${compareInline(fullPath ?? "(n/a)", MAX_COMPARE_PATH_BYTES)}`;
+		const candidate = [...lines.slice(0, keep), marker];
+		if (joinedBytes(candidate) <= COMPARE_SUMMARY_MAX_BYTES) return candidate;
+	}
+	return ["comparison summary unavailable; use the persisted comparison artifact"];
+}
+
 /** workbench_compare_runs — full comparison display (also used by /q-compare). */
 export function renderCompareLines(report: RunComparison, expanded: boolean, width?: number): string[] {
 	const g = report.generic;
@@ -494,16 +726,18 @@ export function renderCompareLines(report: RunComparison, expanded: boolean, wid
 
 	const lines: string[] = [
 		fit(compact),
-		`run a      : ${report.a.run_id} (${report.a.recipe})`,
-		`run b      : ${report.b.run_id} (${report.b.recipe})`,
+		`run a      : ${compareInline(report.a.run_id, MAX_COMPARE_FIELD_BYTES)} (${compareInline(report.a.recipe, MAX_COMPARE_FIELD_BYTES)})`,
+		`run b      : ${compareInline(report.b.run_id, MAX_COMPARE_FIELD_BYTES)} (${compareInline(report.b.recipe, MAX_COMPARE_FIELD_BYTES)})`,
 		`compatible : ${report.compatible ? "yes" : "no — see notes"}`,
+		`comparison : ${compareInline(report.comparison_id ?? "(n/a)", MAX_COMPARE_PATH_BYTES)}`,
+		`full record: ${compareInline(report.comparison_path ?? "(n/a)", MAX_COMPARE_PATH_BYTES)}`,
 		`exit code  : ${fmtExit(g.exit_code.a)} -> ${fmtExit(g.exit_code.b)}`,
 		`duration   : ${formatDuration(g.duration_ms.a)} -> ${formatDuration(g.duration_ms.b)}`,
 	];
 	const changes: string[] = [];
-	if (g.artifacts.added.length > 0) changes.push(`+${g.artifacts.added.join(", ")}`);
-	if (g.artifacts.removed.length > 0) changes.push(`-${g.artifacts.removed.join(", ")}`);
-	lines.push(`artifacts  : ${changes.length > 0 ? changes.join(" ") : "(no changes)"} (common: ${fmtList(g.artifacts.common)})`);
+	if (g.artifacts.added.length > 0) changes.push(`+${compareList(g.artifacts.added, "added artifact(s)", report.comparison_path)}`);
+	if (g.artifacts.removed.length > 0) changes.push(`-${compareList(g.artifacts.removed, "removed artifact(s)", report.comparison_path)}`);
+	lines.push(`artifacts  : ${changes.length > 0 ? changes.join(" ") : "(no changes)"} (common: ${compareList(g.artifacts.common, "common artifact(s)", report.comparison_path)})`);
 	if (g.test_counts) {
 		const tc = g.test_counts;
 		const fmtCounts = (c: { passed: number; failed: number; blocked: number; not_run: number } | null): string =>
@@ -514,45 +748,51 @@ export function renderCompareLines(report: RunComparison, expanded: boolean, wid
 	}
 	if (g.gate_delta) {
 		lines.push("gate delta :");
-		for (const change of g.gate_delta.changed) {
-			lines.push(`  ${change.gate}: ${change.a} -> ${change.b}`);
+		for (const change of g.gate_delta.changed.slice(0, MAX_COMPARE_GATE_ROWS)) {
+			lines.push(`  ${compareInline(change.gate, MAX_COMPARE_FIELD_BYTES)}: ${change.a} -> ${change.b}`);
 		}
 		if (g.gate_delta.changed.length === 0) lines.push("  (no gate status changed)");
+		if (g.gate_delta.changed.length > MAX_COMPARE_GATE_ROWS) {
+			lines.push(`  ... ${g.gate_delta.changed.length - MAX_COMPARE_GATE_ROWS} more gate change(s) omitted; full comparison: ${compareInline(report.comparison_path ?? "(n/a)", MAX_COMPARE_PATH_BYTES)}`);
+		}
 	} else {
 		lines.push("gate delta : n/a (neither run is a gate run)");
 	}
 	if (g.artifact_metrics.length > 0) {
 		lines.push("artifact metrics:");
 		for (const m of g.artifact_metrics) {
-			lines.push(`  ${m.file}#${m.field}: ${formatDelta(m.a, m.b)}`);
+			lines.push(`  ${compareInline(m.file, MAX_COMPARE_PATH_BYTES)}#${compareInline(m.field, MAX_COMPARE_FIELD_BYTES)}: ${formatDelta(m.a, m.b)}`);
 		}
 	}
 	if (report.quant) {
 		const q = report.quant;
 		lines.push("quant metrics:");
-		lines.push(`  return          : ${formatDelta(q.return.a ?? 0, q.return.b ?? 0)}`);
-		lines.push(`  benchmark delta : ${formatDelta(q.benchmark_delta.a ?? 0, q.benchmark_delta.b ?? 0)}`);
-		lines.push(`  drawdown        : ${formatDelta(q.drawdown.a ?? 0, q.drawdown.b ?? 0)}`);
-		lines.push(`  turnover        : ${formatDelta(q.turnover.a ?? 0, q.turnover.b ?? 0)}`);
-		for (const c of q.costs) {
-			lines.push(`  costs.${c.field}    : ${formatDelta(c.a, c.b)}`);
+		lines.push(`  return          : ${nullableDelta(q.return.a, q.return.b)}`);
+		lines.push(`  benchmark delta : ${nullableDelta(q.benchmark_delta.a, q.benchmark_delta.b)}`);
+		lines.push(`  drawdown        : ${nullableDelta(q.drawdown.a, q.drawdown.b)}`);
+		lines.push(`  turnover        : ${nullableDelta(q.turnover.a, q.turnover.b)}`);
+		for (const c of q.costs.slice(0, MAX_COMPARE_COST_ROWS)) {
+			lines.push(`  costs.${compareInline(c.field, MAX_COMPARE_FIELD_BYTES)}    : ${nullableDelta(c.a, c.b)}`);
 		}
+		if (q.costs.length > MAX_COMPARE_COST_ROWS) lines.push(`  ... ${q.costs.length - MAX_COMPARE_COST_ROWS} more cost change(s) omitted; full comparison: ${compareInline(report.comparison_path ?? "(n/a)", MAX_COMPARE_PATH_BYTES)}`);
 		const fmtFolds = (f: { passed: number; failed: number; skipped: number; pending: number } | null): string =>
 			f ? `${f.passed} passed / ${f.failed} failed / ${f.skipped} skipped / ${f.pending} pending` : "n/a";
 		lines.push(`  folds           : ${fmtFolds(q.folds.a)} -> ${fmtFolds(q.folds.b)}`);
-		for (const p of q.parameters) {
-			lines.push(`  parameter ${p.field}: ${JSON.stringify(p.a)} -> ${JSON.stringify(p.b)}`);
+		for (const p of q.parameters.slice(0, MAX_COMPARE_PARAMETER_ROWS)) {
+			lines.push(`  parameter ${compareInline(p.field, MAX_COMPARE_FIELD_BYTES)}: ${boundedParameterJson(p.a)} -> ${boundedParameterJson(p.b)}`);
 		}
 		if (q.parameters.length === 0) lines.push("  parameters      : (no parameter changes)");
+		if (q.parameters.length > MAX_COMPARE_PARAMETER_ROWS) lines.push(`  ... ${q.parameters.length - MAX_COMPARE_PARAMETER_ROWS} more parameter change(s) omitted; full comparison: ${compareInline(report.comparison_path ?? "(n/a)", MAX_COMPARE_PATH_BYTES)}`);
 	}
 	if (report.notes.length > 0) {
 		lines.push("notes:");
-		for (const note of report.notes) lines.push(`  - ${note}`);
+		for (const note of report.notes.slice(0, MAX_COMPARE_NOTE_ROWS)) lines.push(`  - ${compareInline(note, MAX_COMPARE_NOTE_BYTES)}`);
+		if (report.notes.length > MAX_COMPARE_NOTE_ROWS) lines.push(`  - ... ${report.notes.length - MAX_COMPARE_NOTE_ROWS} more note(s) omitted; full comparison: ${compareInline(report.comparison_path ?? "(n/a)", MAX_COMPARE_PATH_BYTES)}`);
 		if (report.quant) lines.push(`  - ${QUANT_NEUTRALITY_NOTE}`);
 	} else if (report.quant) {
 		lines.push(`note: ${QUANT_NEUTRALITY_NOTE}`);
 	}
-	return lines.map(fit);
+	return capCompareSummary(lines, report.comparison_path).map(fit);
 }
 
 // ---------------------------------------------------------------------------

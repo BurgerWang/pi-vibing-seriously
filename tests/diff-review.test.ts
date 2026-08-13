@@ -26,7 +26,8 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, open, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -53,6 +54,11 @@ import {
 	DEFAULT_REVIEW_MAX_LINES,
 	MAX_REVIEW_GUIDANCE_BYTES,
 	MAX_REVIEW_PATCH_PATHS,
+	MAX_REVIEW_VIOLATIONS,
+	MAX_REVIEW_NOTES,
+	MAX_REVIEW_DRIFT_PATHS,
+	REVIEW_ERROR_MAX_BYTES,
+	REVIEW_RECORD_MAX_BYTES,
 	readReviewRecord,
 	renderReviewLines,
 	reviewDelegation,
@@ -175,6 +181,21 @@ function assertSecretsAbsent(record: ReviewRecord, secrets: readonly string[]): 
 	}
 }
 
+function assertWholeReviewBound(lines: readonly string[], maxBytes = DEFAULT_REVIEW_MAX_BYTES, maxLines = DEFAULT_REVIEW_MAX_LINES): string {
+	const text = lines.join("\n");
+	assert.ok(Buffer.byteLength(text, "utf8") <= maxBytes, `${Buffer.byteLength(text, "utf8")} > ${maxBytes}`);
+	assert.ok(lines.length <= maxLines, `${lines.length} > ${maxLines}`);
+	for (let index = 0; index < text.length; index += 1) {
+		const unit = text.charCodeAt(index);
+		if (unit >= 0xd800 && unit <= 0xdbff) {
+			const next = text.charCodeAt(index + 1);
+			assert.ok(next >= 0xdc00 && next <= 0xdfff, "rendered output contains a lone high surrogate");
+			index += 1;
+		} else assert.ok(unit < 0xdc00 || unit > 0xdfff, "rendered output contains a lone low surrogate");
+	}
+	return text;
+}
+
 // ---------------------------------------------------------------------------
 // PASS / FAIL verdicts from the real git state
 // ---------------------------------------------------------------------------
@@ -199,6 +220,10 @@ test("PASS: in-scope worker diff binds the current hash, writes review.json and 
 		assert.ok(patchText.includes("v2"), "patch carries the real diff text");
 		assert.ok(patchText.includes("const x = 1;"), "untracked new files appear as bounded content");
 		// review.json persisted in the delegation directory.
+		const reviewPath = join(dir, ".pi", "workbench", "delegations", id, "review.json");
+		const rawReview = await readFile(reviewPath, "utf8");
+		assert.ok(Buffer.byteLength(rawReview, "utf8") <= REVIEW_RECORD_MAX_BYTES, "a successful review always fits its bounded reader");
+		assert.deepEqual(JSON.parse(rawReview), JSON.parse(JSON.stringify(record)), "the complete returned authority facts roundtrip without truncation");
 		const persisted = await readReviewRecord(dir, id);
 		assert.ok(persisted);
 		assert.equal(persisted.delegation_id, id);
@@ -254,7 +279,8 @@ test("include_paths narrows only the patch — scope checks still cover the whol
 		// Include entries outside the worker diff are REFUSED — no review runs.
 		const refused = await reviewDelegation(reviewInput(dir, id, { includePaths: ["src/main.ts", "never-changed.ts"] }));
 		assert.equal(refused.ok, false);
-		assert.match(refused.error ?? "", /"never-changed.ts" is not part of the worker diff/);
+		assert.equal(refused.error, "include_path_not_in_diff: include_paths entry is not part of the worker diff");
+		assert.doesNotMatch(refused.error ?? "", /never-changed|src\/main/, "fixed error prose never echoes caller args or path lists");
 	});
 });
 
@@ -377,7 +403,7 @@ test("untracked patch reads are bounded prefixes — huge files are never loaded
 			const big = Buffer.alloc(2 * 1024 * 1024, 0x62);
 			await writeFile(join(d, "src", "huge.ts"), big, "utf8");
 		});
-		const result = await reviewDelegation(reviewInput(dir, id, { maxBytes: 1024, maxLines: 5 }));
+		const result = await reviewDelegation(reviewInput(dir, id, { maxBytes: 4_096, maxLines: 40 }));
 		assert.ok(result.ok, result.error ?? "review failed");
 		const record = result.record!;
 		assert.equal(record.verdict, "PASS");
@@ -385,7 +411,7 @@ test("untracked patch reads are bounded prefixes — huge files are never loaded
 		assert.ok(entry, "huge untracked file appears in the patch");
 		assert.equal(entry.source, "file-content");
 		assert.equal(entry.truncated, true, "oversized untracked file is prefix-truncated");
-		assert.ok(Buffer.byteLength(entry.text, "utf8") <= 1024, "patch bytes stay within the bound");
+		assert.ok(Buffer.byteLength(entry.text, "utf8") <= 4_096, "patch bytes stay within the bound");
 	});
 });
 
@@ -498,14 +524,14 @@ test("the patch is bounded by max_bytes/max_lines and redacts secrets", async ()
 		const { id } = await setupDelegation(dir, async (d) => {
 			await writeFile(join(d, "src", "main.ts"), `line0\n${"pad-secret-token-xyz\n".repeat(500)}`, "utf8");
 		});
-		const result = await reviewDelegation(reviewInput(dir, id, { maxBytes: 200, maxLines: 10, secrets: ["pad-secret-token-xyz"] }));
+		const result = await reviewDelegation(reviewInput(dir, id, { maxBytes: 4_096, maxLines: 40, secrets: ["pad-secret-token-xyz"] }));
 		assert.ok(result.ok, result.error ?? "review failed");
 		const record = result.record!;
 		assert.equal(record.verdict, "PASS");
 		const patchText = record.patch.map((p) => p.text).join("\n");
 		assert.ok(!patchText.includes("pad-secret-token-xyz"), "secrets scrubbed from the patch");
 		assert.ok(record.patch_truncated, "oversized patch is truncated");
-		assert.ok(Buffer.byteLength(patchText, "utf8") <= 300, "patch bytes stay within the bound");
+		assert.ok(Buffer.byteLength(patchText, "utf8") <= 4_096, "patch bytes stay within the bound");
 	});
 });
 
@@ -558,6 +584,111 @@ test("review fails closed: a thrown or non-zero git status returns a structured 
 	});
 });
 
+test("readReviewRecord bounds review.json before allocation and fails closed for non-regular, corrupt, foreign, mismatched, and pending records", async () => {
+	await withTempDir(async (dir) => {
+		const id = "20260601-120000-abcd";
+		const recordDir = join(dir, ".pi", "workbench", "delegations", id);
+		const recordPath = join(recordDir, "review.json");
+		await mkdir(recordDir, { recursive: true });
+
+		// A sparse record above the fixed 1 MiB cap is rejected from the same
+		// open-handle stat before any content buffer or read is attempted.
+		const sparse = await open(recordPath, "w", 0o600);
+		try { await sparse.truncate(REVIEW_RECORD_MAX_BYTES + 1); }
+		finally { await sparse.close(); }
+		const allocations: number[] = [];
+		const reads: number[] = [];
+		assert.equal(await readReviewRecord(dir, id, {
+			onBufferAllocate(bytes) { allocations.push(bytes); },
+			beforeRead(bytes) { reads.push(bytes); },
+		}), null);
+		assert.deepEqual(allocations, [], "oversized review record is rejected before allocation");
+		assert.deepEqual(reads, [], "oversized review record is rejected before read");
+
+		// A directory at review.json is non-regular and therefore unavailable.
+		await rm(recordPath, { force: true });
+		await mkdir(recordPath);
+		assert.equal(await readReviewRecord(dir, id), null);
+		await rm(recordPath, { recursive: true });
+
+		await writeFile(recordPath, Buffer.from([0x7b, 0xff, 0x7d]));
+		assert.equal(await readReviewRecord(dir, id), null, "invalid UTF-8 fails closed");
+		await writeFile(recordPath, "{not-json}", "utf8");
+		assert.equal(await readReviewRecord(dir, id), null, "invalid JSON fails closed");
+		await writeFile(recordPath, JSON.stringify({ schema_version: 1, delegation_id: "20260601-120000-efgh" }), "utf8");
+		assert.equal(await readReviewRecord(dir, id), null, "foreign delegation record fails closed");
+		await writeFile(recordPath, JSON.stringify({ schema_version: 2, delegation_id: id }), "utf8");
+		assert.equal(await readReviewRecord(dir, id), null, "schema version mismatch fails closed");
+		await writeFile(recordPath, JSON.stringify({ schema_version: 1, delegation_id: id, review_status: "PENDING_REVIEW" }), "utf8");
+		assert.equal(await readReviewRecord(dir, id), null, "finish-time placeholder is not a completed review");
+
+		// Legacy schema-v1 records remain readable without the additive
+		// coverage fields; existing merge tests exercise their coverage use.
+		const legacy = {
+			schema_version: 1,
+			delegation_id: id,
+			reviewed_at: NOW,
+			verdict: "PASS",
+			bound_diff_hash: "a".repeat(64),
+			recorded_after_hash: "a".repeat(64),
+			mismatch: false,
+			drift_paths: [],
+			violations: [],
+			checked_paths: [],
+			include_paths: [],
+			patch: [],
+			patch_truncated: false,
+			patch_paths: [],
+			notes: [],
+		};
+		await writeFile(recordPath, JSON.stringify(legacy), "utf8");
+		const readable = await readReviewRecord(dir, id);
+		assert.ok(readable);
+		assert.equal(readable.verdict, "PASS");
+	});
+});
+
+test("500 worst-case long violating paths fail review persistence closed without replacing the readable placeholder", async () => {
+	await withTempDir(async (dir) => {
+		const segmentA = "a".repeat(180);
+		const segmentB = "b".repeat(180);
+		const { id } = await setupDelegation(
+			dir,
+			async (root) => {
+				const outsideDir = join(root, "outside", segmentA, segmentB);
+				await mkdir(outsideDir, { recursive: true });
+				for (let start = 0; start < 500; start += 50) {
+					await Promise.all(Array.from({ length: 50 }, (_, offset) => {
+						const index = start + offset;
+						return writeFile(join(outsideDir, `p${String(index).padStart(3, "0")}.txt`), "x\n", "utf8");
+					}));
+				}
+			},
+			["allowed/**"],
+		);
+		const ledger = await readDelegationLedger(dir, id);
+		assert.ok(ledger?.after);
+		assert.equal(ledger.after.changed_since_before.length, 500, "the authority test reaches the complete maximum path set");
+		assert.ok(ledger.after.changed_since_before.every((path) => path.length > 370), "every path is near the fixed 400-character boundary");
+
+		const reviewPath = join(dir, ".pi", "workbench", "delegations", id, "review.json");
+		const placeholder = await readFile(reviewPath, "utf8");
+		assert.match(placeholder, /"review_status": "PENDING_REVIEW"/);
+		assert.ok(Buffer.byteLength(placeholder, "utf8") <= REVIEW_RECORD_MAX_BYTES);
+
+		const result = await reviewDelegation(reviewInput(dir, id));
+		assert.equal(result.ok, false, "an unpersistable complete review can never be returned as successful authority");
+		assert.equal(result.error, "review_persist_failed: failed to write review record");
+		assert.equal(result.record, undefined, "no silently truncated record is exposed to the caller");
+		assert.deepEqual(result.lines, [
+			"[workbench-diff-review error code=review_persist_failed]",
+			"failed to write review record",
+		]);
+		assert.equal(await readFile(reviewPath, "utf8"), placeholder, "preflight happens before the atomic writer and leaves prior readable authority untouched");
+		assert.equal(await readReviewRecord(dir, id), null, "the untouched pending placeholder is never mistaken for a completed review");
+	});
+});
+
 test("renderReviewLines is deterministic and carries verdict, hashes and the patch", async () => {
 	await withTempDir(async (dir) => {
 		const { id } = await setupDelegation(dir, async (d) => {
@@ -575,6 +706,54 @@ test("renderReviewLines is deterministic and carries verdict, hashes and the pat
 		// The scope note is part of the rendered output.
 		assert.ok(text.includes("Scope checks always cover the entire worker diff"));
 	});
+});
+
+test("small review renderer keeps the compact v1 text format stable", () => {
+	const reviewPath = ".pi/workbench/delegations/20260601-120000-abcd/review.json";
+	const record: ReviewRecord = {
+		schema_version: 1,
+		delegation_id: "20260601-120000-abcd",
+		reviewed_at: NOW,
+		verdict: "PASS",
+		bound_diff_hash: "a".repeat(64),
+		recorded_after_hash: "a".repeat(64),
+		mismatch: false,
+		drift_paths: [],
+		violations: [],
+		allowed_paths: ["src/**"],
+		checked_paths: ["src/a.ts"],
+		include_paths: ["src/a.ts"],
+		patch: [{ path: "src/a.ts", source: "git-diff", text: "+a", truncated: false }],
+		patch_truncated: false,
+		patch_paths: [{ path: "src/a.ts", source: "git-diff", bytes: 2, truncated: false }],
+		notes: [],
+		displayed_paths: ["src/a.ts"],
+		remaining_paths: [],
+		coverage_complete: true,
+		review_path: reviewPath,
+	};
+	const allowedHash = createHash("sha256").update(JSON.stringify(["src/**"])).digest("hex");
+	assert.deepEqual(renderReviewLines(record), [
+		"delegation : 20260601-120000-abcd",
+		"verdict    : PASS",
+		`reviewed   : ${NOW}`,
+		`bound hash : ${"a".repeat(64)}`,
+		`after hash : ${"a".repeat(64)}`,
+		"checked    : 1 worker path(s)",
+		"displayed  : 1 of 1 worker path(s)",
+		"remaining  : 0 worker path(s)",
+		"coverage   : COMPLETE — every worker path displayed for this bound hash",
+		`presentation: violations=0/0/0; notes=0/0/0; drift=0/0/0; patch=1/1/0; stats=1/1/0; full=${reviewPath}; bounded summary is not acceptance evidence`,
+		"next incl. : (none — every worker path displayed for this bound hash)",
+		`review path: ${reviewPath}`,
+		`allowed    : count=1 hash=${allowedHash} shown=["src/**"] omitted=0`,
+		"patch (1 path(s), shown 1, omitted 0):",
+		"--- src/a.ts (git-diff) ---",
+		"+a",
+		"patch paths (1): original=1 shown=1 omitted=0",
+		"  - src/a.ts (git-diff, 2 bytes)",
+		"Scope checks always cover the entire worker diff; include_paths only narrows the bounded patch above.",
+	]);
 });
 
 test("review patch defaults are 400 lines / 32 KiB, enforced GLOBALLY over the rendered patch", async () => {
@@ -609,6 +788,106 @@ test("review patch defaults are 400 lines / 32 KiB, enforced GLOBALLY over the r
 		const rendered = renderReviewLines(record).join("\n");
 		assert.ok(rendered.includes("review segments via workbench_review_worker_diff include_paths"), "segmented include_paths instruction when truncated");
 		assert.ok(rendered.includes("patch paths (3)"), "bounded path/stat info rendered");
+	});
+});
+
+test("whole renderer bounds 500 paths and exact section omissions under one 32 KiB / 400-line envelope", () => {
+	const paths = Array.from({ length: 500 }, (_, index) => `src/${String(index).padStart(3, "0")}-${"汉🙂".repeat(30)}.ts`);
+	const allowedPaths = Array.from({ length: 50 }, (_, index) => `scope-${index}/${"a".repeat(280)}/**`);
+	const record: ReviewRecord = {
+		schema_version: 1,
+		delegation_id: "20260601-120000-abcd",
+		reviewed_at: NOW,
+		verdict: "FAIL",
+		bound_diff_hash: "a".repeat(64),
+		recorded_after_hash: "b".repeat(64),
+		mismatch: true,
+		drift_paths: paths.slice(0, 80),
+		violations: paths.slice(0, 80).map((path, index) => ({
+			path,
+			reason: `outside scope ${index}: ${allowedPaths.join(", ")}`,
+		})),
+		allowed_paths: allowedPaths,
+		checked_paths: paths,
+		include_paths: paths,
+		patch: paths.slice(0, 50).map((path) => ({
+			path, source: "git-diff", text: `@@ ${path} @@\n${"变更🙂\n".repeat(40)}`, truncated: true,
+		})),
+		patch_truncated: true,
+		patch_paths: paths.slice(0, 50).map((path) => ({ path, source: "git-diff", bytes: 1_000, truncated: true })),
+		notes: Array.from({ length: 40 }, (_, index) => `note-${index}-${"注🙂".repeat(150)}`),
+		displayed_paths: paths.slice(0, 50),
+		remaining_paths: paths.slice(50),
+		coverage_complete: false,
+		review_path: ".pi/workbench/delegations/20260601-120000-abcd/review.json",
+	};
+	const rendered = renderReviewLines(record);
+	const text = assertWholeReviewBound(rendered);
+	assert.deepEqual(rendered, renderReviewLines(record), "the same domain record renders byte-identically");
+	const firstPatch = text.indexOf(`--- ${paths[0]} (git-diff, truncated) ---`);
+	const secondPatch = text.indexOf(`--- ${paths[1]} (git-diff, truncated) ---`);
+	assert.ok(firstPatch >= 0 && secondPatch > firstPatch, "bounded patch entries preserve deterministic source order");
+	const summary = /presentation: violations=(\d+)\/(\d+)\/(\d+); notes=(\d+)\/(\d+)\/(\d+); drift=(\d+)\/(\d+)\/(\d+);/.exec(text);
+	assert.ok(summary, text);
+	const values = summary.slice(1).map(Number);
+	assert.deepEqual([values[0], values[3], values[6]], [80, 40, 80]);
+	assert.equal(values[1]! + values[2]!, values[0]);
+	assert.equal(values[4]! + values[5]!, values[3]);
+	assert.equal(values[7]! + values[8]!, values[6]);
+	assert.ok(values[1]! <= MAX_REVIEW_VIOLATIONS);
+	assert.ok(values[4]! <= MAX_REVIEW_NOTES);
+	assert.ok(values[7]! <= MAX_REVIEW_DRIFT_PATHS);
+	assert.match(text, /patch=500\/\d+\/\d+; stats=500\/\d+\/\d+;/);
+	assert.match(text, /allowed    : count=50 hash=[0-9a-f]{64} shown=\[.*\] omitted=\d+/);
+	assert.equal((text.match(/^allowed    :/gm) ?? []).length, 1, "allowed scope prose is rendered once, not once per violation");
+	assert.equal((text.match(/^violation  :/gm) ?? []).length, values[1]);
+	assert.equal((text.match(/^note       :/gm) ?? []).length, values[4]);
+	assert.equal((text.match(/^drift      :/gm) ?? []).length, values[7]);
+	assert.match(text, /full=\.pi\/workbench\/delegations\/20260601-120000-abcd\/review\.json/);
+	assert.match(text, /bounded summary is not acceptance evidence/);
+});
+
+test("whole renderer honors caller lower caps and keeps its omission marker inside the cap", () => {
+	const paths = Array.from({ length: 60 }, (_, index) => `src/path-${index}.ts`);
+	const record: ReviewRecord = {
+		schema_version: 1, delegation_id: "20260601-120000-abcd", reviewed_at: NOW, verdict: "PASS",
+		bound_diff_hash: "a".repeat(64), recorded_after_hash: "a".repeat(64), mismatch: false,
+		drift_paths: [], violations: [], allowed_paths: ["src/**"], checked_paths: paths, include_paths: paths,
+		patch: paths.slice(0, 50).map((path) => ({ path, source: "file-content", text: `${"🙂汉x\n".repeat(80)}tail`, truncated: true })),
+		patch_truncated: true,
+		patch_paths: paths.slice(0, 50).map((path) => ({ path, source: "file-content", bytes: 4_000, truncated: true })),
+		notes: [], displayed_paths: paths.slice(0, 50), remaining_paths: paths.slice(50), coverage_complete: false,
+		review_path: ".pi/workbench/delegations/20260601-120000-abcd/review.json",
+	};
+	const text = assertWholeReviewBound(renderReviewLines(record, { maxBytes: 4_096, maxLines: 40 }), 4_096, 40);
+	assert.match(text, /Patch content truncated or omitted/);
+	assert.match(text, /patch \(60 path\(s\), shown \d+, omitted \d+, truncated\):/);
+	assert.match(text, /patch paths \(60\): original=60 shown=\d+ omitted=\d+/);
+});
+
+test("review error paths are fixed, bounded, and never expose hostile messages, args, or stacks", async () => {
+	await withTempDir(async (dir) => {
+		const { id } = await setupDelegation(dir, async (root) => {
+			await writeFile(join(root, "src", "main.ts"), "v2\n", "utf8");
+		});
+		const secret = `SECRET-${"🙂".repeat(3_000)}`;
+		const result = await reviewDelegation(reviewInput(dir, id, {
+			exec: async () => { const error = new Error(secret); error.stack = `${secret}\nSTACK`; throw error; },
+		}));
+		assert.equal(result.ok, false);
+		const text = assertWholeReviewBound(result.lines, REVIEW_ERROR_MAX_BYTES, 20);
+		assert.equal(text, "[workbench-diff-review error code=git_state_unavailable]\ncannot collect the real git state; git status --porcelain failed");
+		assert.equal(result.error, "git_state_unavailable: cannot collect the real git state; git status --porcelain failed");
+		assert.doesNotMatch(`${text}\n${result.error}`, /SECRET|STACK/);
+
+		const hostile = await reviewDelegation({
+			...reviewInput(dir, id),
+			includePaths: [{ trim() { throw new Error(secret); } } as unknown as string],
+		});
+		assert.equal(hostile.ok, false);
+		assert.equal(hostile.error, "runtime_failure: diff review failed closed");
+		assert.ok(Buffer.byteLength(hostile.lines.join("\n"), "utf8") <= REVIEW_ERROR_MAX_BYTES);
+		assert.doesNotMatch(`${hostile.lines.join("\n")}\n${hostile.error}`, /SECRET|STACK/);
 	});
 });
 
@@ -876,12 +1155,13 @@ test("Slice B2: the next include_paths guidance is bounded to 50 paths with an e
 
 test("Slice B2: the next include_paths guidance is ALSO bounded by a fixed UTF-8 byte cap — complete usable paths only and an exact omitted count", () => {
 	assert.equal(MAX_REVIEW_GUIDANCE_BYTES, 1024, "the fixed guidance byte cap is 1024 UTF-8 bytes");
-	// Two valid ~400-byte paths and one path that alone exceeds the cap.
-	const longA = `src/${"d".repeat(60)}/${"e".repeat(60)}/${"f".repeat(60)}/${"g".repeat(60)}/${"h".repeat(60)}/${"i".repeat(60)}/${"j".repeat(50)}.ts`;
-	const longB = `src/${"k".repeat(60)}/${"l".repeat(60)}/${"m".repeat(60)}/${"n".repeat(60)}/${"o".repeat(60)}/${"p".repeat(60)}/${"q".repeat(50)}.ts`;
+	// Two valid ~250-byte paths and one path that exceeds both the per-path
+	// presentation cap and the aggregate guidance cap.
+	const longA = `src/${"d".repeat(60)}/${"e".repeat(60)}/${"f".repeat(60)}/${"g".repeat(60)}.ts`;
+	const longB = `src/${"k".repeat(60)}/${"l".repeat(60)}/${"m".repeat(60)}/${"n".repeat(60)}.ts`;
 	const huge = `src/${"r".repeat(200)}/${"s".repeat(200)}/${"t".repeat(200)}/${"u".repeat(200)}/${"v".repeat(200)}/${"w".repeat(200)}/${"x".repeat(300)}.ts`;
-	assert.ok(Buffer.byteLength(longA, "utf8") >= 400, "longA is a ~400-byte valid path");
-	assert.ok(Buffer.byteLength(longB, "utf8") >= 400, "longB is a ~400-byte valid path");
+	assert.ok(Buffer.byteLength(longA, "utf8") >= 240, "longA is a ~250-byte valid path");
+	assert.ok(Buffer.byteLength(longB, "utf8") >= 240, "longB is a ~250-byte valid path");
 	assert.ok(Buffer.byteLength(huge, "utf8") > MAX_REVIEW_GUIDANCE_BYTES, "huge alone exceeds the byte cap");
 	const record: ReviewRecord = {
 		schema_version: 1,
@@ -909,7 +1189,7 @@ test("Slice B2: the next include_paths guidance is ALSO bounded by a fixed UTF-8
 	assert.ok(guidance, rendered);
 	const quoted = /\[([^\]]*)\]/.exec(guidance!)?.[1] ?? "";
 	const listed = quoted.length === 0 ? [] : quoted.split(",").map((entry) => JSON.parse(entry) as string);
-	assert.ok(listed.length >= 2, `the two ~400-byte paths fit within the byte cap (listed ${listed.length})`);
+	assert.ok(listed.length >= 2, `the two ~250-byte paths fit within the byte cap (listed ${listed.length})`);
 	// Every listed path is a COMPLETE usable path string — never truncated.
 	for (const path of listed) {
 		assert.ok([longA, longB].includes(path), `only complete remaining paths are listed, got ${path}`);
@@ -917,7 +1197,7 @@ test("Slice B2: the next include_paths guidance is ALSO bounded by a fixed UTF-8
 	assert.ok(guidance!.includes("+1 more"), "the byte-exceeding path is counted exactly in the omitted count");
 	assert.ok(!guidance!.includes(huge.slice(0, 40)), "an overlong path is never truncated into the guidance");
 	// The path list itself never exceeds the fixed byte cap: an unbounded
-	// 50-path line is impossible even with 400-byte paths.
+	// 50-path line is impossible even with long bounded paths.
 	const bracketList = quoted.length === 0 ? "[]" : `[${quoted}]`;
 	assert.ok(Buffer.byteLength(bracketList, "utf8") <= MAX_REVIEW_GUIDANCE_BYTES, "guidance path list stays within the byte cap");
 
@@ -1156,7 +1436,9 @@ test("Phase 5: a tracked modified large SVG and an untracked minified single-lin
 		assert.ok(svgRendered.includes('"assets/bundle.json"'), "the next include_paths guidance names the remaining compact path");
 
 		// Segment 2: the untracked minified JSON at the CALLER maxBytes cap
-		// (512000) — compaction stays automatic regardless of maxBytes.
+		// The caller may still pass a legacy-sized value programmatically;
+		// the v1 whole renderer clamps it to the 32 KiB hard ceiling while
+		// compact eligibility stays tied to the fixed threshold.
 		const jsonReview = await reviewDelegation(
 			reviewInput(dir, id, { includePaths: ["assets/bundle.json"], maxBytes: 512_000, exec: rec.exec, secrets }),
 		);
@@ -1167,7 +1449,7 @@ test("Phase 5: a tracked modified large SVG and an untracked minified single-lin
 		assert.equal(jsonRecord.patch.length, 1);
 		const jsonEntry = jsonRecord.patch[0]!;
 		assert.equal(jsonEntry.path, "assets/bundle.json");
-		assert.equal(jsonEntry.source, "compact", "compaction stays automatic even at the caller maxBytes cap (512000)");
+		assert.equal(jsonEntry.source, "compact", "compaction stays automatic even when a caller tries to raise maxBytes above the hard ceiling");
 		assert.equal(jsonEntry.truncated, true);
 		assert.equal(jsonRecord.patch_truncated, true);
 		const freshJsonDigest = await contentDigest(dir, "assets/bundle.json");
@@ -1284,16 +1566,19 @@ test("Phase 5: compact eligibility is strict — ordinary .ts, small .svg/.json 
 			},
 			["src/**"],
 		);
-		// A large-enough caller budget so the exact-size JSON entry fits the
-		// GLOBAL envelope — per-path compactness is judged by the strict
-		// threshold, never by the caller's maxBytes.
-		const result = await reviewDelegation(reviewInput(dir, id, { maxBytes: 512_000 }));
-		assert.ok(result.ok, result.error ?? "review failed");
-		const record = result.record!;
-		assert.equal(record.verdict, "PASS");
-		assert.equal(record.patch.length, 6, "every worker path renders");
-
-		const byPath = new Map(record.patch.map((p) => [p.path, p] as const));
+		// A legacy oversized caller value cannot raise the hard ceiling. Review
+		// each source as a normal include_paths page so source selection is
+		// checked independently of the shared whole-result budget.
+		const byPath = new Map<string, ReviewRecord["patch"][number]>();
+		const statsByPath = new Map<string, ReviewRecord["patch_paths"][number]>();
+		for (const path of ["src/main.ts", "src/small.svg", "src/small.json", "src/exact.json", "src/over.json", "src/gone.json"]) {
+			const segment = await reviewDelegation(reviewInput(dir, id, { includePaths: [path], maxBytes: 512_000 }));
+			assert.ok(segment.ok, segment.error ?? `review failed for ${path}`);
+			assert.equal(segment.record!.verdict, "PASS");
+			assert.equal(segment.record!.patch.length, 1, `the narrowed ${path} page has one bounded entry`);
+			byPath.set(path, segment.record!.patch[0]!);
+			statsByPath.set(path, segment.record!.patch_paths[0]!);
+		}
 		const main = byPath.get("src/main.ts")!;
 		assert.equal(main.source, "git-diff", "ordinary tracked .ts keeps the git-diff source");
 		assert.equal(main.truncated, false);
@@ -1306,7 +1591,7 @@ test("Phase 5: compact eligibility is strict — ordinary .ts, small .svg/.json 
 		assert.equal(smallJson.compact, undefined);
 		const exact = byPath.get("src/exact.json")!;
 		assert.equal(exact.source, "file-content", "a JSON of exactly COMPACT_MIN_BYTES is NOT compact — strictly greater is required");
-		assert.equal(exact.truncated, false, "the exact-size entry fits the caller budget untouched");
+		assert.equal(exact.truncated, true, "the exact-size non-compact entry is honestly bounded by the fixed patch sub-budget");
 		assert.equal(exact.compact, undefined);
 		const over = byPath.get("src/over.json")!;
 		assert.equal(over.source, "compact", "COMPACT_MIN_BYTES + 1 crosses the strict threshold");
@@ -1325,10 +1610,10 @@ test("Phase 5: compact eligibility is strict — ordinary .ts, small .svg/.json 
 		assert.equal(gone.compact, undefined, "deleted paths carry no compact facts");
 		assert.ok(gone.text.includes("deleted file mode"), "the removal diff is the honest git evidence");
 		// patch_paths stats mirror the same honest sources.
-		const stat = record.patch_paths.find((s) => s.path === "src/over.json")!;
+		const stat = statsByPath.get("src/over.json")!;
 		assert.deepEqual([stat.source, stat.truncated], ["compact", true]);
-		const goneStat = record.patch_paths.find((s) => s.path === "src/gone.json")!;
-		assert.deepEqual([goneStat.source, goneStat.truncated], ["git-diff", false]);
+		const goneStat = statsByPath.get("src/gone.json")!;
+		assert.deepEqual([goneStat.source, goneStat.truncated], ["git-diff", true]);
 	});
 });
 

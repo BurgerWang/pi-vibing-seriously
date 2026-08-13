@@ -1,9 +1,57 @@
 # Compatibility
 
-Tested-environment matrix for **pi-dev-workbench v0.9.0 (P7)**. Only
+Tested-environment matrix for **pi-dev-workbench v0.10.0 (Context Output Control Plane)**. Only
 environments that were actually exercised are listed; no untested
 compatibility is claimed. The machine-readable copy lives in
 [`compatibility/pi.json`](../compatibility/pi.json).
+
+## v0.10.0 context-output compatibility
+
+The control plane is implemented and tested against Pi 0.83.0's event order
+and tool-result replacement surface. Legacy `read(path, offset, limit)` calls
+remain valid, but use the bounded read-v3 pager; run manifests, review records,
+receipts, and old session JSONL remain readable. The comparison artifact is
+additive. A separate streaming sanitizer creates a safe legacy-session copy
+and manifest; it never rewrites or activates the source.
+
+Streaming interoperability is deliberately fail-closed. Pi 0.83's public
+extension API cannot replace a foreign tool definition or replace a
+`tool_execution_update`; an immutable/accessor/Proxy partial result therefore
+cannot be safely bounded after execution starts. Before every call, the
+workbench re-reads Pi's effective tool registry and permits only a tool wrapped
+by this exact runtime entry or one of Pi 0.83's seven exact synthetic built-ins
+(`bash`, `edit`, `find`, `grep`, `ls`, `read`, `write`). The runtime-entry proof
+accepts two exact Pi source tuples: explicit temporary local loading of
+`extensions/workbench-runtime/index.ts`, and this repository's checked-in
+`.pi/settings.json` package load (`packages: [".."]`, project scope, package
+origin, exact repository base directory and exact entry path). It does not
+generalize trust to other project packages. A matching SDK/foreign/collided/
+malformed source is blocked before `execute` with one fixed bounded reason.
+Foreign tools can remain in the advertised inventory, so tool order/schema
+fingerprints do not drift, but they are not executable while this control plane
+is active. An absent name is left to Pi's non-executing unknown-tool path.
+Nonstandard inline or aliased loading that does not preserve one of those exact
+source tuples is intentionally unsupported and also fails closed.
+
+The continuation wire transition is explicit rather than an in-place v1
+reinterpretation: newly minted real-file read/gate cursors use `wbcur2` with
+payload v2 and an exact decimal `mtimeNs` identity. `wbcur1` keeps its exact
+legacy field set and canonical decoding. Because a v1 file cursor lacks the
+stronger identity, it is conservatively stale when replayed against a source
+whose bigint stat exposes `mtimeNs`; clients should treat every cursor as
+opaque and continue with the latest returned value. Run-log cursors keep the
+`wbcur1` envelope while their hashed source state includes `mtimeNs`. This
+changes no tool parameter schema, registration order, mode inventory, or
+tool-schema fingerprint.
+
+The public tool schema/metadata intentionally changes once in 0.10.0. Old
+prompt-cache prefixes are cold after reload; repeated same-mode static
+fingerprints remain deterministic. Internal full `record`, `report`, and
+`gates_full` details are not a compatibility surface and are replaced by
+bounded DTOs plus persisted artifact pointers. See
+[`context-output-control-plane.md`](context-output-control-plane.md) and the
+[stable-prefix transition](cache/stable-prefix-contract.md). No Pi version
+other than the matrix below is newly claimed by this release.
 
 ## Tool-schema fingerprint transition (Phase 3, worker token-budget repair)
 
@@ -222,9 +270,10 @@ additive and backward compatible:
   regular `.svg`/`.json` worker path strictly larger than the 32 KiB
   default global byte cap — and never depends on the caller's
   `max_bytes`: a larger caller bound does not disable the compact form.
-  Default/global caps (400 lines / 32 KiB) and caller bounds
-  (max_lines 1–2000, max_bytes 1–512000, max 50 include_paths) are
-  unchanged; ordinary/small/deleted/unreadable/non-regular paths keep
+  The historical caller bounds were max_lines 1–2000 and max_bytes
+  1–512000. Version 0.10.0 intentionally lowers the public and whole-result
+  maxima to 400 lines / 32 KiB (include_paths remains max 50); ordinary/
+  small/deleted/unreadable/non-regular paths keep
   the existing git-diff/content/deleted presentation, and generator
   execution is deliberately absent (`generator_equality` is always
   `NOT_VERIFIED`, so independent current-state regeneration/byte

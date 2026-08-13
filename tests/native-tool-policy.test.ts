@@ -562,9 +562,23 @@ test("override names are the fixed read → grep → find order; metadata is sta
 	}
 });
 
-test("read schema stays byte-identical to the built-in; read carries the built-in guideline plus the ONE §6.4 bullet", () => {
+test("read v3 schema preserves path compatibility while enforcing integer paging caps and a bounded cursor", () => {
 	const builtin = builtinDefinitions().read;
-	assert.deepEqual(NATIVE_OVERRIDE_PARAMETERS.read, builtin.parameters, "read parameter schema byte-identical to the Pi 0.83.0 built-in");
+	const properties = NATIVE_OVERRIDE_PARAMETERS.read.properties;
+	const { offset, limit, cursor } = properties;
+	assert.ok(offset && limit && cursor);
+	const offsetSchema = offset as unknown as { type: string; minimum: number };
+	const limitSchema = limit as unknown as { type: string; minimum: number; maximum: number };
+	const cursorSchema = cursor as unknown as { minLength: number; maxLength: number };
+	assert.deepEqual(properties.path, builtin.parameters.properties.path, "path remains built-in-compatible");
+	assert.deepEqual(Object.keys(properties), ["path", "offset", "limit", "cursor"]);
+	assert.equal(offsetSchema.type, "integer");
+	assert.equal(offsetSchema.minimum, 1);
+	assert.equal(limitSchema.type, "integer");
+	assert.equal(limitSchema.minimum, 1);
+	assert.equal(limitSchema.maximum, 240);
+	assert.equal(cursorSchema.minLength, 1);
+	assert.equal(cursorSchema.maxLength, 1024);
 	assert.deepEqual(NATIVE_OVERRIDE_METADATA.read.promptGuidelines.slice(0, 1), [...builtin.promptGuidelines], "read keeps the built-in guideline verbatim");
 	assert.equal(NATIVE_OVERRIDE_METADATA.read.promptGuidelines[1], READ_PREVIEW_GUIDELINE);
 	assert.equal(NATIVE_OVERRIDE_METADATA.read.promptGuidelines.length, 2);

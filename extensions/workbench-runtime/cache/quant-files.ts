@@ -18,6 +18,10 @@ import { globSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 
+import {
+	readJsonFileBounded,
+	type BoundedFileIoHooks,
+} from "../core/bounded-file-io.ts";
 import { realpathContained } from "../core/path-guard.ts";
 import { sha256HexBytes } from "./canonical-hash.ts";
 import {
@@ -35,8 +39,16 @@ import {
 
 /** Refuse to hash files larger than this (keep hit validation bounded). */
 export const MAX_HASH_VERIFY_BYTES = 256 * 1024 * 1024;
+/** Whole-file allocation cap for every quant JSON authority record. */
+export const QUANT_MANIFEST_MAX_BYTES = 1_048_576;
 /** Cap on how many candidate manifests a logical resolution may scan. */
 export const MAX_REGISTRY_CANDIDATES = 500;
+
+export interface QuantFileOptions {
+	profile?: string;
+	/** Test-only numeric allocation/read observations; never receives path/content. */
+	boundedReadHooks?: BoundedFileIoHooks;
+}
 
 export interface ManifestFileResult {
 	ok: boolean;
@@ -46,23 +58,18 @@ export interface ManifestFileResult {
 }
 
 /** Read + parse a manifest file (project-root contained, small JSON only). */
-export async function readQuantManifestFile(projectRoot: string, relPath: string): Promise<ManifestFileResult> {
+export async function readQuantManifestFile(
+	projectRoot: string,
+	relPath: string,
+	hooks?: BoundedFileIoHooks,
+): Promise<ManifestFileResult> {
 	const absolute = await realpathContained(projectRoot, relPath);
 	if (absolute === undefined) {
-		return { ok: false, reason: `manifest path escapes the project root: ${relPath}` };
+		return { ok: false, reason: "manifest path escapes the project root" };
 	}
-	let raw: string;
-	try {
-		raw = await readFile(absolute, "utf8");
-	} catch {
-		return { ok: false, reason: `manifest file not found: ${relPath}` };
-	}
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(raw);
-	} catch (error) {
-		return { ok: false, reason: `manifest is not valid JSON: ${(error as Error).message}` };
-	}
+	const loaded = await readJsonFileBounded<unknown>(absolute, QUANT_MANIFEST_MAX_BYTES, hooks);
+	if (!loaded.ok) return { ok: false, reason: quantManifestReadReason(loaded.error.code) };
+	const parsed = loaded.value.value;
 	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
 		return { ok: false, reason: "manifest root must be a JSON object" };
 	}
@@ -73,9 +80,9 @@ export async function readQuantManifestFile(projectRoot: string, relPath: string
 export async function validateQuantManifestFile(
 	projectRoot: string,
 	relPath: string,
-	options: { profile?: string } = {},
+	options: QuantFileOptions = {},
 ): Promise<ManifestFileResult> {
-	const loaded = await readQuantManifestFile(projectRoot, relPath);
+	const loaded = await readQuantManifestFile(projectRoot, relPath, options.boundedReadHooks);
 	if (!loaded.ok || !loaded.value) return loaded;
 	const validation = validateQuantContract(loaded.value, options);
 	return { ok: validation.valid, value: loaded.value, validation };
@@ -154,7 +161,7 @@ export async function discoverCandidateManifests(
 	projectRoot: string,
 	type: QuantContractType,
 	selfPath: string,
-	options: { profile?: string } = {},
+	options: QuantFileOptions = {},
 ): Promise<Record<string, unknown>[]> {
 	const patterns: string[] = [];
 	const absolute = await realpathContained(projectRoot, selfPath);
@@ -167,14 +174,17 @@ export async function discoverCandidateManifests(
 	const seen = new Set<string>();
 	const candidates: Record<string, unknown>[] = [];
 	const selfAbsolute = absolute;
+	let scanned = 0;
 	for (const pattern of patterns) {
 		for (const match of globSync(pattern, { cwd: projectRoot })) {
 			if (seen.has(match)) continue;
 			seen.add(match);
+			if (scanned >= MAX_REGISTRY_CANDIDATES) return candidates;
+			scanned += 1;
 			const abs = await realpathContained(projectRoot, match);
 			if (abs === undefined) continue;
 			if (selfAbsolute !== undefined && resolve(abs) === resolve(selfAbsolute)) continue; // never resolve to itself
-			const loaded = await readQuantManifestFile(projectRoot, match);
+			const loaded = await readQuantManifestFile(projectRoot, match, options.boundedReadHooks);
 			if (!loaded.ok || !loaded.value) continue;
 			if (loaded.value.contractType !== type) continue;
 			if (loaded.value.schemaVersion !== 1) continue;
@@ -182,7 +192,6 @@ export async function discoverCandidateManifests(
 			const validation = validateQuantContract(loaded.value, options);
 			if (!validation.cacheEligible) continue;
 			candidates.push(loaded.value);
-			if (candidates.length >= MAX_REGISTRY_CANDIDATES) return candidates;
 		}
 	}
 	return candidates;
@@ -211,9 +220,9 @@ export interface ResolvedQuantContract {
 export async function resolveQuantContract(
 	projectRoot: string,
 	decl: QuantContractDecl,
-	options: { profile?: string } = {},
+	options: QuantFileOptions = {},
 ): Promise<{ ok: true; resolved: ResolvedQuantContract } | { ok: false; reason: string }> {
-	const loaded = await readQuantManifestFile(projectRoot, decl.manifest);
+	const loaded = await readQuantManifestFile(projectRoot, decl.manifest, options.boundedReadHooks);
 	if (!loaded.ok || !loaded.value) {
 		return { ok: false, reason: `quant contract manifest: ${loaded.reason ?? "unreadable"}` };
 	}
@@ -227,12 +236,12 @@ export async function resolveQuantContract(
 	// else refuses the quant cache.
 	const structuralErrors = validation.errors.filter((e) => !e.includes("mutable reference"));
 	if (structuralErrors.length > 0) {
-		return { ok: false, reason: `quant contract manifest is schema-invalid: ${structuralErrors.slice(0, 3).join("; ")}` };
+		return { ok: false, reason: "quant contract manifest is schema-invalid" };
 	}
 
 	if (!mutable && !logicalField) {
 		if (!validation.cacheEligible) {
-			return { ok: false, reason: `quant contract is not validated: ${validation.warnings.filter((w) => w.includes("validated") || w.includes("semantics")).slice(0, 3).join("; ") || "semantic requirements unmet"}` };
+			return { ok: false, reason: "quant contract semantic requirements are unmet" };
 		}
 		const key = quantImmutableKey(value);
 		if (!key) return { ok: false, reason: "quant contract manifest has no immutable key" };
@@ -262,7 +271,7 @@ export async function resolveQuantContract(
 		candidates,
 	);
 	if (!outcome.resolved) {
-		return { ok: false, reason: `logical reference "${logicalId}" could not be resolved: ${outcome.reason}` };
+		return { ok: false, reason: "logical reference could not be resolved to an immutable manifest" };
 	}
 	const resolvedValidation = validateQuantContract(outcome.result.manifest, options);
 	return {
@@ -295,6 +304,17 @@ export function quantContractInfoOf(resolved: ResolvedQuantContract, decl: Quant
 /** Human-readable id of a manifest (for lineage output). */
 export function manifestDisplayId(manifest: Record<string, unknown>): string {
 	return String(manifest.snapshotId ?? manifest.featureSetId ?? manifest.backtestId ?? "?");
+}
+
+function quantManifestReadReason(code: string): string {
+	switch (code) {
+		case "source_oversized": return "manifest exceeds the fixed 1048576-byte limit";
+		case "source_not_regular": return "manifest source is not a regular file";
+		case "invalid_utf8": return "manifest is not valid UTF-8";
+		case "invalid_json": return "manifest is not valid JSON";
+		case "source_changed_during_read": return "manifest changed during the bounded read";
+		default: return "manifest file is unavailable";
+	}
 }
 
 export { parseQuantReferenceKey, basename };

@@ -92,7 +92,8 @@
  * never modifies project files and never computes business metrics.
  */
 
-import { open, readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { open } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
@@ -110,19 +111,49 @@ import {
 	normalizeStatusPath,
 	readBoundedFilePrefix,
 	readDelegationLedger,
-	writeJsonAtomic,
+	writeTextAtomic,
 	type GitFacts,
 } from "./delegation-ledger.ts";
 import { realpathContained } from "./path-guard.ts";
 import { redactText } from "./redact.ts";
 import { isWorkerPathAllowedRealpath } from "../worker/path-scope.ts";
+import { readJsonFileBounded, type BoundedFileIoHooks } from "./bounded-file-io.ts";
 import type { ExecFn } from "./config.ts";
 
 export const REVIEW_SCHEMA_VERSION = 1;
 export const DEFAULT_REVIEW_MAX_LINES = 400;
 export const DEFAULT_REVIEW_MAX_BYTES = 32 * 1024;
+/** Fixed pre-allocation cap for the authoritative persisted review record. */
+export const REVIEW_RECORD_MAX_BYTES = 1_048_576 as const;
+export const REVIEW_ERROR_MAX_BYTES = 8 * 1024;
 export const MAX_REVIEW_PATCH_PATHS = 50;
-export const MAX_REVIEW_NOTES = 20;
+export const MAX_REVIEW_NOTES = 10;
+export const MAX_REVIEW_VIOLATIONS = 10;
+export const MAX_REVIEW_DRIFT_PATHS = 20;
+export const MAX_REVIEW_PATH_BYTES = 300;
+export const MAX_REVIEW_REASON_BYTES = 240;
+export const MAX_REVIEW_NOTE_BYTES = 240;
+export const REVIEW_CONTROL_MAX_BYTES = 8 * 1024;
+export const REVIEW_PATCH_MAX_BYTES = 20 * 1024;
+export const REVIEW_PATH_STATS_MAX_BYTES = 4 * 1024;
+export const REVIEW_CONTROL_MAX_LINES = 100;
+export const REVIEW_PATCH_MAX_LINES = 240;
+export const REVIEW_PATH_STATS_MAX_LINES = 60;
+
+/**
+ * Compile the exact canonical payload accepted by readReviewRecord before
+ * opening the atomic writer. Review authority is never silently truncated:
+ * complete facts either fit the fixed reader cap byte-for-byte (including
+ * the trailing newline) or persistence fails closed.
+ */
+function compileReviewRecordPayload(record: ReviewRecord): string | undefined {
+	try {
+		const payload = `${JSON.stringify(record, null, 2)}\n`;
+		return Buffer.byteLength(payload, "utf8") <= REVIEW_RECORD_MAX_BYTES ? payload : undefined;
+	} catch {
+		return undefined;
+	}
+}
 
 /**
  * Fixed UTF-8 byte cap for the rendered next-include guidance path list.
@@ -312,6 +343,8 @@ export interface ReviewRecord {
 	drift_paths: string[];
 	/** Worker paths outside the parent-approved scope (verdict FAIL when non-empty). */
 	violations: ReviewViolation[];
+	/** Full domain scope remains durable; presentation renders it once as count/hash/bounded preview. */
+	allowed_paths?: string[];
 	/** Every worker path that was scope-checked (all of them, regardless of include_paths). */
 	checked_paths: string[];
 	/** Patch narrowing requested by the caller (empty = all worker paths). */
@@ -353,6 +386,11 @@ export interface ReviewResult {
 	lines: string[];
 }
 
+export interface ReviewRenderCaps {
+	maxBytes?: number;
+	maxLines?: number;
+}
+
 export interface ReviewInput {
 	projectRoot: string;
 	delegationId: string;
@@ -387,8 +425,112 @@ export function digestKindOf(digest: string): ReviewDigestKind {
 }
 
 function boundInt(raw: number | undefined, fallback: number, min: number, max: number): number {
-	if (typeof raw !== "number" || !Number.isInteger(raw)) return fallback;
+	if (raw === undefined) return fallback;
+	// Explicit malformed caps fail closed to the minimum; they never amplify
+	// into a default or lift a compile-time ceiling.
+	if (typeof raw !== "number" || !Number.isSafeInteger(raw)) return min;
 	return Math.min(Math.max(raw, min), max);
+}
+
+type ReviewFailureCode =
+	| "invalid_delegation"
+	| "delegation_not_found"
+	| "delegation_incomplete"
+	| "git_state_unavailable"
+	| "invalid_include_path"
+	| "include_path_not_in_diff"
+	| "review_persist_failed"
+	| "runtime_failure";
+
+const REVIEW_FAILURE_TEXT: Readonly<Record<ReviewFailureCode, string>> = Object.freeze({
+	invalid_delegation: "invalid delegation id",
+	delegation_not_found: "delegation not found or incomplete",
+	delegation_incomplete: "delegation has no recorded result (still running or incomplete)",
+	git_state_unavailable: "cannot collect the real git state; git status --porcelain failed",
+	invalid_include_path: "include_paths entry is not a safe project-relative path (absolute, drive-letter, parent escape, and overlong paths are refused)",
+	include_path_not_in_diff: "include_paths entry is not part of the worker diff",
+	review_persist_failed: "failed to write review record",
+	runtime_failure: "diff review failed closed",
+});
+
+function reviewFailure(code: ReviewFailureCode): ReviewResult {
+	const error = `${code}: ${REVIEW_FAILURE_TEXT[code]}`;
+	const text = `[workbench-diff-review error code=${code}]\n${REVIEW_FAILURE_TEXT[code]}`;
+	return {
+		ok: false,
+		error: truncateUtf8(error, REVIEW_ERROR_MAX_BYTES),
+		lines: truncateUtf8(text, REVIEW_ERROR_MAX_BYTES).split("\n"),
+	};
+}
+
+function unicodeScalarText(value: string): string {
+	let output = "";
+	for (let index = 0; index < value.length; index += 1) {
+		const unit = value.charCodeAt(index);
+		if (unit >= 0xd800 && unit <= 0xdbff) {
+			const next = value.charCodeAt(index + 1);
+			if (next >= 0xdc00 && next <= 0xdfff) { output += value.slice(index, index + 2); index += 1; }
+			else output += "\ufffd";
+		} else if (unit >= 0xdc00 && unit <= 0xdfff) output += "\ufffd";
+		else output += value[index];
+	}
+	return output;
+}
+
+function boundedInline(value: unknown, maxBytes: number): string {
+	const source = unicodeScalarText(typeof value === "string" ? value : "(invalid)").replace(/[\u0000-\u001f\u007f]/g, " ");
+	if (Buffer.byteLength(source, "utf8") <= maxBytes) return source;
+	if (maxBytes < 3) return truncateUtf8(source, maxBytes);
+	return `${truncateUtf8(source, maxBytes - 3)}…`;
+}
+
+function textByteLength(lines: readonly string[]): number {
+	return Buffer.byteLength(lines.join("\n"), "utf8");
+}
+
+class ReviewLineBuilder {
+	readonly lines: string[] = [];
+	constructor(readonly maxBytes: number, readonly maxLines: number) {}
+
+	canAdd(lines: readonly string[]): boolean {
+		if (lines.length === 0) return true;
+		const joined = [...this.lines, ...lines];
+		return joined.length <= this.maxLines && textByteLength(joined) <= this.maxBytes;
+	}
+
+	add(lines: readonly string[]): boolean {
+		if (!this.canAdd(lines)) return false;
+		this.lines.push(...lines);
+		return true;
+	}
+}
+
+function allowedScopeLine(allowedPaths: readonly string[]): string {
+	const normalized = allowedPaths.map((path) => boundedInline(path, MAX_REVIEW_PATH_BYTES));
+	const hash = createHash("sha256").update(JSON.stringify(allowedPaths)).digest("hex");
+	const shown: string[] = [];
+	let bytes = 2;
+	for (const path of normalized) {
+		const encoded = JSON.stringify(path);
+		const next = Buffer.byteLength(encoded, "utf8") + (shown.length > 0 ? 2 : 0);
+		if (shown.length >= 5 || bytes + next > 900) break;
+		shown.push(path);
+		bytes += next;
+	}
+	return `allowed    : count=${allowedPaths.length} hash=${hash} shown=[${shown.map((path) => JSON.stringify(path)).join(", ")}] omitted=${allowedPaths.length - shown.length}`;
+}
+
+function boundedPathList(prefix: string, paths: readonly string[], maxItems: number): string {
+	const shown: string[] = [];
+	let bytes = Buffer.byteLength(prefix, "utf8");
+	for (const raw of paths.slice(0, maxItems)) {
+		const path = boundedInline(raw, MAX_REVIEW_PATH_BYTES);
+		const next = Buffer.byteLength(path, "utf8") + (shown.length > 0 ? 2 : 0);
+		if (bytes + next > MAX_REVIEW_NOTE_BYTES) break;
+		shown.push(path);
+		bytes += next;
+	}
+	return `${prefix}${shown.join(", ")}${paths.length > shown.length ? ` …(+${paths.length - shown.length} more)` : ""}`;
 }
 
 /**
@@ -863,23 +1005,23 @@ export function mergeReviewCoverage(
  * (atomic) and returns the verdict + bounded redacted patch. Never touches
  * the delegation state entry — the runtime does that.
  */
-export async function reviewDelegation(input: ReviewInput): Promise<ReviewResult> {
+async function reviewDelegationInner(input: ReviewInput): Promise<ReviewResult> {
 	const projectRoot = input.projectRoot;
-	const delegationId = input.delegationId.trim();
+	const delegationId = typeof input.delegationId === "string" ? input.delegationId.trim() : "";
 	const now = input.now ?? new Date().toISOString();
-	const maxLines = boundInt(input.maxLines, DEFAULT_REVIEW_MAX_LINES, 1, 2000);
-	const maxBytes = boundInt(input.maxBytes, DEFAULT_REVIEW_MAX_BYTES, 1, 512_000);
+	const maxLines = boundInt(input.maxLines, DEFAULT_REVIEW_MAX_LINES, 1, DEFAULT_REVIEW_MAX_LINES);
+	const maxBytes = boundInt(input.maxBytes, DEFAULT_REVIEW_MAX_BYTES, 1, DEFAULT_REVIEW_MAX_BYTES);
 	const secrets = input.secrets ?? [];
 
 	if (!isValidDelegationId(delegationId)) {
-		return { ok: false, error: `invalid delegation id "${delegationId}"`, lines: [] };
+		return reviewFailure("invalid_delegation");
 	}
 	const ledger = await readDelegationLedger(projectRoot, delegationId);
 	if (!ledger) {
-		return { ok: false, error: `delegation ${delegationId} not found or incomplete`, lines: [] };
+		return reviewFailure("delegation_not_found");
 	}
 	if (!ledger.after) {
-		return { ok: false, error: `delegation ${delegationId} has no recorded result (still running or incomplete)`, lines: [] };
+		return reviewFailure("delegation_incomplete");
 	}
 
 	// Slice B2: read the PRIOR persisted review record BEFORE this call
@@ -905,7 +1047,7 @@ export async function reviewDelegation(input: ReviewInput): Promise<ReviewResult
 		if (!(await isWorkerPathAllowedRealpath(projectRoot, path, allowedPaths))) {
 			violations.push({
 				path,
-				reason: `changed path "${path}" is outside the parent-approved scope (realpath/symlink check): ${allowedPaths.join(", ")}`,
+				reason: "outside the parent-approved scope (realpath/symlink check)",
 			});
 		}
 	}
@@ -920,12 +1062,8 @@ export async function reviewDelegation(input: ReviewInput): Promise<ReviewResult
 	let current: GitFacts;
 	try {
 		current = await collectGitFacts(projectRoot, input.exec);
-	} catch (error) {
-		return {
-			ok: false,
-			error: `cannot collect the real git state for the review: ${(error as Error).message}`,
-			lines: [],
-		};
+	} catch {
+		return reviewFailure("git_state_unavailable");
 	}
 	const boundDiffHash = computeDiffHash(current.changedPaths, current.pathDigests, current.pathStatuses);
 	const recordedAfterHash = ledger.after.diff_hash;
@@ -942,18 +1080,10 @@ export async function reviewDelegation(input: ReviewInput): Promise<ReviewResult
 		if (!trimmed) continue;
 		const normalized = normalizeStatusPath(trimmed);
 		if (!normalized) {
-			return {
-				ok: false,
-				error: `include_paths entry "${trimmed}" is not a safe project-relative path (absolute, drive-letter, ".." escape and overlong paths are refused)`,
-				lines: [],
-			};
+			return reviewFailure("invalid_include_path");
 		}
 		if (!workerPaths.includes(normalized)) {
-			return {
-				ok: false,
-				error: `include_paths entry "${normalized}" is not part of the worker diff (${workerPaths.length === 0 ? "the worker changed no paths" : workerPaths.join(", ")})`,
-				lines: [],
-			};
+			return reviewFailure("include_path_not_in_diff");
 		}
 		includeSet.add(normalized);
 	}
@@ -978,7 +1108,7 @@ export async function reviewDelegation(input: ReviewInput): Promise<ReviewResult
 		notes.push(`current diff hash differs from the worker's recorded after hash (${boundDiffHash.slice(0, 12)} vs ${recordedAfterHash.slice(0, 12)}) — the review binds the CURRENT hash; any further change turns the delegation STALE`);
 	}
 	if (driftPaths.length > 0) {
-		notes.push(`${driftPaths.length} path(s) changed after the worker finished: ${driftPaths.slice(0, 10).join(", ")}${driftPaths.length > 10 ? "…" : ""}`);
+		notes.push(boundedPathList(`${driftPaths.length} path(s) changed after the worker finished: `, driftPaths, 10));
 	}
 	// Worker report vs actual diff: the ledger records the safe paths the
 	// worker listed in its bounded ## Files Changed section. A missing
@@ -993,10 +1123,10 @@ export async function reviewDelegation(input: ReviewInput): Promise<ReviewResult
 		const onlyReported = reportedPaths.filter((p) => !actualSet.has(p));
 		const onlyActual = workerPaths.filter((p) => !reportedSet.has(p));
 		if (onlyReported.length > 0) {
-			notes.push(`worker report lists ${onlyReported.length} path(s) not present in the actual diff: ${onlyReported.slice(0, 10).join(", ")}${onlyReported.length > 10 ? "…" : ""}`);
+			notes.push(boundedPathList(`worker report lists ${onlyReported.length} path(s) not present in the actual diff: `, onlyReported, 10));
 		}
 		if (onlyActual.length > 0) {
-			notes.push(`worker report misses ${onlyActual.length} actual diff path(s): ${onlyActual.slice(0, 10).join(", ")}${onlyActual.length > 10 ? "…" : ""}`);
+			notes.push(boundedPathList(`worker report misses ${onlyActual.length} actual diff path(s): `, onlyActual, 10));
 		}
 	}
 
@@ -1021,28 +1151,18 @@ export async function reviewDelegation(input: ReviewInput): Promise<ReviewResult
 			rawEntries.push({ path, source: "withheld", text: WITHHELD_MARKER, perPathTruncated: false });
 			continue;
 		}
-		const entry = await patchEntryFor(projectRoot, path, input.exec, secrets, maxBytes, ledger.after.path_digests, current.pathStatuses[path] ?? "");
+		const entry = await patchEntryFor(projectRoot, path, input.exec, secrets, Math.min(maxBytes, REVIEW_PATCH_MAX_BYTES), ledger.after.path_digests, current.pathStatuses[path] ?? "");
 		rawEntries.push(entry);
 	}
-	const bounded = boundPatchEntries(rawEntries, maxLines, maxBytes);
-	const patch = bounded.entries;
-	const patchTruncated = bounded.truncated || patchPaths.length > patch.length;
-	const patchPathsStat: ReviewPatchPathStat[] = patchPaths.slice(0, MAX_REVIEW_PATCH_PATHS).map((path) => {
-		const entry = patch.find((p) => p.path === path);
-		return {
-			path,
-			source: entry?.source ?? "omitted",
-			bytes: entry ? Buffer.byteLength(entry.text, "utf8") : 0,
-			truncated: entry ? entry.truncated : true,
-		};
-	});
-
+	const bounded = boundPatchEntries(
+		rawEntries,
+		Math.min(maxLines, REVIEW_PATCH_MAX_LINES),
+		Math.min(maxBytes, REVIEW_PATCH_MAX_BYTES),
+	);
+	const candidatePatch = bounded.entries;
 	const verdict: ReviewVerdict = violations.length > 0 ? "FAIL" : "PASS";
-	// Slice B2 coverage: displayed = actually rendered patch entries this
-	// call, merged with prior same-hash persisted coverage (valid worker
-	// paths only; legacy records infer from their patch entries).
-	const coverage = mergeReviewCoverage(workerPaths, patch.map((entry) => entry.path), priorReview, boundDiffHash);
-	const record: ReviewRecord = {
+	const priorCoverage = mergeReviewCoverage(workerPaths, [], priorReview, boundDiffHash);
+	const provisionalRecord: ReviewRecord = {
 		schema_version: REVIEW_SCHEMA_VERSION,
 		delegation_id: delegationId,
 		reviewed_at: now,
@@ -1052,25 +1172,75 @@ export async function reviewDelegation(input: ReviewInput): Promise<ReviewResult
 		mismatch,
 		drift_paths: [...driftPaths],
 		violations,
+		allowed_paths: [...allowedPaths],
 		checked_paths: workerPaths,
 		include_paths: patchPaths,
-		patch,
-		patch_truncated: patchTruncated,
-		patch_paths: patchPathsStat,
-		notes: notes.slice(0, MAX_REVIEW_NOTES),
-		displayed_paths: coverage.displayed_paths,
-		remaining_paths: coverage.remaining_paths,
-		coverage_complete: coverage.coverage_complete,
+		patch: candidatePatch,
+		patch_truncated: bounded.truncated || patchPaths.length > candidatePatch.length,
+		patch_paths: [],
+		notes,
+		displayed_paths: priorCoverage.displayed_paths,
+		remaining_paths: priorCoverage.remaining_paths,
+		coverage_complete: priorCoverage.coverage_complete,
 		review_path: reviewRecordRelPath(delegationId),
 	};
 
-	try {
-		await writeJsonAtomic(delegationDirFor(projectRoot, delegationId), "review.json", record);
-	} catch (error) {
-		return { ok: false, error: `failed to write review record: ${(error as Error).message}`, lines: [] };
+	// Presentation is part of review authority: determine which candidate
+	// patch entries fit the exact whole-result caps BEFORE coverage/state is
+	// advanced or review.json is written. The generic tool_result envelope
+	// therefore receives already-bounded content and remains a no-op.
+	const provisionalPresentation = renderReviewPresentationInner(provisionalRecord, { maxBytes, maxLines });
+	const visibleSet = new Set(provisionalPresentation.visiblePatchPaths);
+	const patch = candidatePatch.filter((entry) => visibleSet.has(entry.path));
+	const patchTruncated = bounded.truncated || patchPaths.length > patch.length;
+	const patchPathsStat: ReviewPatchPathStat[] = patchPaths.map((path) => {
+		const entry = patch.find((candidate) => candidate.path === path);
+		return {
+			path,
+			source: entry?.source ?? "omitted",
+			bytes: entry ? Buffer.byteLength(entry.text, "utf8") : 0,
+			truncated: entry ? entry.truncated : true,
+		};
+	});
+	// Slice B2 coverage: only patch entries present in the final bounded
+	// content advance this call; prior same-hash durable coverage still
+	// merges normally (legacy records infer it from their persisted patch).
+	const coverage = mergeReviewCoverage(workerPaths, patch.map((entry) => entry.path), priorReview, boundDiffHash);
+	const record: ReviewRecord = {
+		...provisionalRecord,
+		patch,
+		patch_truncated: patchTruncated,
+		patch_paths: patchPathsStat,
+		displayed_paths: coverage.displayed_paths,
+		remaining_paths: coverage.remaining_paths,
+		coverage_complete: coverage.coverage_complete,
+	};
+	const presentation = renderReviewPresentationInner(record, { maxBytes, maxLines });
+	if (
+		presentation.visiblePatchPaths.length !== patch.length
+		|| presentation.visiblePatchPaths.some((path, index) => path !== patch[index]?.path)
+	) {
+		return reviewFailure("runtime_failure");
 	}
 
-	return { ok: true, record, lines: renderReviewLines(record) };
+	const reviewPayload = compileReviewRecordPayload(record);
+	if (reviewPayload === undefined) return reviewFailure("review_persist_failed");
+	try {
+		await writeTextAtomic(delegationDirFor(projectRoot, delegationId), "review.json", reviewPayload);
+	} catch {
+		return reviewFailure("review_persist_failed");
+	}
+
+	return { ok: true, record, lines: presentation.lines };
+}
+
+/** Public fail-closed boundary: hostile values/errors never expose stacks or arguments. */
+export async function reviewDelegation(input: ReviewInput): Promise<ReviewResult> {
+	try {
+		return await reviewDelegationInner(input);
+	} catch {
+		return reviewFailure("runtime_failure");
+	}
 }
 
 /**
@@ -1134,98 +1304,280 @@ export function normalizeReviewCoverage(record: ReviewRecord): ReviewCoverage {
 	};
 }
 
-/** Plain-text rendering of a review record (print/json mode content). */
-export function renderReviewLines(record: ReviewRecord): string[] {
-	// Slice B2 coverage facts — normalized from the record's VALID checked
-	// worker paths: legacy records without the additive fields render their
-	// persisted patch entries as displayed and checked_paths as the full
-	// set; malformed persisted coverage arrays or a persisted
-	// coverage_complete flag are never trusted over the recomputation
-	// (absent fields never render zero/zero COMPLETE).
-	const coverage = normalizeReviewCoverage(record);
-	const displayedPaths = coverage.displayed_paths;
-	const remainingPaths = coverage.remaining_paths;
-	const coverageComplete = coverage.coverage_complete;
-	const checkedCount = Array.isArray(record.checked_paths) ? record.checked_paths.length : 0;
-	// Next-include guidance bounded by BOTH the path-count cap AND a fixed
-	// UTF-8 byte cap: paths are included WHOLE (never truncated mid-string)
-	// in remaining order while they fit; every path not listed — whether
-	// beyond the count cap or beyond the byte cap — is counted exactly in
-	// the omitted count.
+interface ReviewSectionFacts {
+	original: number;
+	shown: number;
+	omitted: number;
+	truncated: boolean;
+	/** Complete patch-entry paths that are actually present in final content. */
+	visiblePaths?: string[];
+}
+
+function selectedPatchCount(record: ReviewRecord): number {
+	// Empty include_paths is the legacy/domain spelling for "all checked
+	// paths"; only a non-empty list represents an explicit narrowed page.
+	if (Array.isArray(record.include_paths) && record.include_paths.length > 0) return record.include_paths.length;
+	return Array.isArray(record.checked_paths) ? record.checked_paths.length : 0;
+}
+
+function reviewPathOf(record: ReviewRecord): string {
+	const raw = typeof record.review_path === "string" && record.review_path
+		? record.review_path
+		: reviewRecordRelPath(record.delegation_id);
+	return boundedInline(raw, MAX_REVIEW_PATH_BYTES);
+}
+
+function renderPatchSection(record: ReviewRecord, maxBytes: number, maxLines: number): { lines: string[]; facts: ReviewSectionFacts } {
+	const original = selectedPatchCount(record);
+	if (maxBytes <= 0 || maxLines <= 0) return { lines: [], facts: { original, shown: 0, omitted: original, truncated: original > 0 || record.patch_truncated, visiblePaths: [] } };
+	const marker = `Patch content truncated or omitted — full review: ${reviewPathOf(record)}; review segments via workbench_review_worker_diff include_paths (max ${MAX_REVIEW_PATCH_PATHS} paths per call).`;
+	const markerReserveBytes = Buffer.byteLength(marker, "utf8") + 1;
+	const content = new ReviewLineBuilder(Math.max(0, maxBytes - markerReserveBytes), Math.max(0, maxLines - 1));
+	const placeholder = `patch (${original} path(s), shown ${original}, omitted ${original}${record.patch_truncated ? ", truncated" : ""}):`;
+	if (!content.add([placeholder])) return { lines: [], facts: { original, shown: 0, omitted: original, truncated: true, visiblePaths: [] } };
+	let shown = 0;
+	let cut = false;
+	const visiblePaths: string[] = [];
+	for (const entry of Array.isArray(record.patch) ? record.patch : []) {
+		const path = boundedInline(entry.path, MAX_REVIEW_PATH_BYTES);
+		const title = `--- ${path} (${entry.source}${entry.truncated ? ", truncated" : ""}) ---`;
+		const normalized = unicodeScalarText(typeof entry.text === "string" ? entry.text : "(invalid)")
+			.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "\ufffd");
+		const body = normalized.split("\n");
+		if (content.add([title, ...body])) {
+			shown += 1;
+			visiblePaths.push(entry.path);
+			continue;
+		}
+		// Preserve one deterministic bounded segment of the straddling entry;
+		// the final omission marker is reserved outside this builder.
+		if (!content.add([title])) { cut = true; break; }
+		// The complete bounded title is itself a visible entry boundary. Even
+		// if no body scalar fits, the final content visibly identifies this
+		// path/source as the straddling evidence segment.
+		shown += 1;
+		visiblePaths.push(entry.path);
+		for (const line of body) {
+			if (content.add([line])) continue;
+			const newlineCost = content.lines.length > 0 ? 1 : 0;
+			const remainingBytes = content.maxBytes - textByteLength(content.lines) - newlineCost;
+			const bounded = truncateUtf8(line, Math.max(0, remainingBytes));
+			if (bounded.length > 0) content.add([bounded]);
+			break;
+		}
+		cut = true;
+		break;
+	}
+	const omitted = Math.max(0, original - shown);
+	const truncated = cut || omitted > 0 || record.patch_truncated;
+	content.lines[0] = `patch (${original} path(s), shown ${shown}, omitted ${omitted}${truncated ? ", truncated" : ""}):`;
+	const lines = [...content.lines];
+	if (truncated && lines.length < maxLines && textByteLength([...lines, marker]) <= maxBytes) lines.push(marker);
+	return { lines, facts: { original, shown, omitted, truncated, visiblePaths } };
+}
+
+function renderPathStatsSection(record: ReviewRecord, maxBytes: number, maxLines: number): { lines: string[]; facts: ReviewSectionFacts } {
+	const original = selectedPatchCount(record);
+	if (maxBytes <= 0 || maxLines <= 0) return { lines: [], facts: { original, shown: 0, omitted: original, truncated: original > 0 } };
+	const scopeLine = "Scope checks always cover the entire worker diff; include_paths only narrows the bounded patch above.";
+	const reserveBytes = Buffer.byteLength(scopeLine, "utf8") + 1;
+	const builder = new ReviewLineBuilder(Math.max(0, maxBytes - reserveBytes), Math.max(0, maxLines - 1));
+	const placeholder = `patch paths (${original}): original=${original} shown=${original} omitted=${original}`;
+	if (!builder.add([placeholder])) return { lines: [], facts: { original, shown: 0, omitted: original, truncated: true } };
+	let shown = 0;
+	const pathStats = Array.isArray(record.patch_paths)
+		? record.patch_paths
+		: (Array.isArray(record.patch) ? record.patch : []).map((entry) => ({
+			path: entry.path, source: entry.source, bytes: Buffer.byteLength(entry.text, "utf8"), truncated: entry.truncated,
+		}));
+	for (const stat of pathStats.slice(0, MAX_REVIEW_PATCH_PATHS)) {
+		const line = `  - ${boundedInline(stat.path, MAX_REVIEW_PATH_BYTES)} (${stat.source}, ${Number.isSafeInteger(stat.bytes) && stat.bytes >= 0 ? stat.bytes : 0} bytes${stat.truncated ? ", truncated" : ""})`;
+		if (!builder.add([line])) break;
+		shown += 1;
+	}
+	const omitted = Math.max(0, original - shown);
+	builder.lines[0] = `patch paths (${original}): original=${original} shown=${shown} omitted=${omitted}`;
+	const lines = [...builder.lines];
+	if (lines.length < maxLines && textByteLength([...lines, scopeLine]) <= maxBytes) lines.push(scopeLine);
+	return { lines, facts: { original, shown, omitted, truncated: omitted > 0 } };
+}
+
+function nextIncludeLine(remainingPaths: readonly string[]): string {
 	const nextInclude: string[] = [];
 	let guidanceBytes = 0;
-	for (const path of remainingPaths) {
+	for (const raw of remainingPaths) {
 		if (nextInclude.length >= MAX_REVIEW_PATCH_PATHS) break;
+		// Continuation guidance is executable input, so paths are never
+		// abbreviated. A path that cannot be shown whole is omitted and is
+		// still included in the exact omitted count.
+		if (typeof raw !== "string" || Buffer.byteLength(raw, "utf8") > MAX_REVIEW_PATH_BYTES) break;
+		const path = unicodeScalarText(raw);
+		if (path !== raw || /[\u0000-\u001f\u007f]/.test(path)) break;
 		const quoted = JSON.stringify(path);
 		const entryBytes = Buffer.byteLength(quoted, "utf8") + (nextInclude.length > 0 ? 2 : 0);
 		if (guidanceBytes + entryBytes > MAX_REVIEW_GUIDANCE_BYTES) break;
 		nextInclude.push(path);
 		guidanceBytes += entryBytes;
 	}
-	const nextIncludeOmitted = remainingPaths.length - nextInclude.length;
-	const nextIncludeText =
-		remainingPaths.length === 0
-			? "(none — every worker path displayed for this bound hash)"
-			: `[${nextInclude.map((path) => JSON.stringify(path)).join(", ")}]${nextIncludeOmitted > 0 ? `, … +${nextIncludeOmitted} more` : ""} (max ${MAX_REVIEW_PATCH_PATHS} paths per call; ≤ ${MAX_REVIEW_GUIDANCE_BYTES} bytes)`;
-	const lines = [
-		`delegation : ${record.delegation_id}`,
-		`verdict    : ${record.verdict}`,
-		`reviewed   : ${record.reviewed_at}`,
-		`bound hash : ${record.bound_diff_hash}`,
-		`after hash : ${record.recorded_after_hash}${record.mismatch ? " (MISMATCH)" : ""}`,
-		`checked    : ${checkedCount} worker path(s)${record.include_paths.length > 0 && record.include_paths.length !== checkedCount ? `, patch narrowed to ${record.include_paths.length} path(s)` : ""}`,
-		`displayed  : ${displayedPaths.length} of ${checkedCount} worker path(s)`,
-		`remaining  : ${remainingPaths.length} worker path(s)`,
-		`coverage   : ${coverageComplete ? "COMPLETE" : "INCOMPLETE"}${coverageComplete ? " — every worker path displayed for this bound hash" : " — review incomplete until every worker path is displayed (per-path truncated entries count; globally omitted paths do not)"}`,
-		`next incl. : ${nextIncludeText}`,
-		`review path: ${typeof record.review_path === "string" && record.review_path ? record.review_path : reviewRecordRelPath(record.delegation_id)}`,
+	const omitted = remainingPaths.length - nextInclude.length;
+	const text = remainingPaths.length === 0
+		? "(none — every worker path displayed for this bound hash)"
+		: `[${nextInclude.map((path) => JSON.stringify(path)).join(", ")}]${omitted > 0 ? `, … +${omitted} more` : ""} (max ${MAX_REVIEW_PATCH_PATHS} paths per call; ≤ ${MAX_REVIEW_GUIDANCE_BYTES} bytes)`;
+	return `next incl. : ${text}`;
+}
+
+function renderControlSection(
+	record: ReviewRecord,
+	patchFacts: ReviewSectionFacts,
+	statFacts: ReviewSectionFacts,
+	maxBytes: number,
+	maxLines: number,
+): string[] {
+	if (maxBytes <= 0 || maxLines <= 0) return [];
+	const coverage = normalizeReviewCoverage(record);
+	const checkedCount = Array.isArray(record.checked_paths) ? record.checked_paths.length : 0;
+	const violations = Array.isArray(record.violations) ? record.violations : [];
+	const notes = Array.isArray(record.notes) ? record.notes : [];
+	const drift = Array.isArray(record.drift_paths) ? record.drift_paths : [];
+	const allowedPaths = Array.isArray(record.allowed_paths) ? record.allowed_paths.filter((path): path is string => typeof path === "string") : [];
+	const countText = (value: number): string => (Number.isSafeInteger(value) && value >= 0 ? String(value) : "0");
+	const violationCount = countText(violations.length);
+	const noteCount = countText(notes.length);
+	const driftCount = countText(drift.length);
+	const patchOriginal = countText(patchFacts.original);
+	const patchShown = countText(patchFacts.shown);
+	const patchOmitted = countText(patchFacts.omitted);
+	const statOriginal = countText(statFacts.original);
+	const statShown = countText(statFacts.shown);
+	const statOmitted = countText(statFacts.omitted);
+	const summaryReserve = `presentation: violations=${violationCount}/${violationCount}/${violationCount}; notes=${noteCount}/${noteCount}/${noteCount}; drift=${driftCount}/${driftCount}/${driftCount}; patch=${patchOriginal}/${patchShown}/${patchOmitted}; stats=${statOriginal}/${statShown}/${statOmitted}; full=${reviewPathOf(record)}; bounded summary is not acceptance evidence`;
+	const base = [
+		`delegation : ${boundedInline(record.delegation_id, 64)}`,
+		`verdict    : ${record.verdict === "FAIL" ? "FAIL" : "PASS"}`,
+		`reviewed   : ${boundedInline(record.reviewed_at, 40)}`,
+		`bound hash : ${boundedInline(record.bound_diff_hash, 64)}`,
+		`after hash : ${boundedInline(record.recorded_after_hash, 64)}${record.mismatch ? " (MISMATCH)" : ""}`,
+		`checked    : ${checkedCount} worker path(s)${Array.isArray(record.include_paths) && record.include_paths.length > 0 && record.include_paths.length !== checkedCount ? `, patch narrowed to ${record.include_paths.length} path(s)` : ""}`,
+		`displayed  : ${coverage.displayed_paths.length} of ${checkedCount} worker path(s)`,
+		`remaining  : ${coverage.remaining_paths.length} worker path(s)`,
+		`coverage   : ${coverage.coverage_complete ? "COMPLETE — every worker path displayed for this bound hash" : "INCOMPLETE — review incomplete until every worker path is displayed (per-path truncated entries count; globally omitted paths do not)"}`,
+		summaryReserve,
 	];
-	if (record.violations.length > 0) {
-		lines.push(`violations : ${record.violations.length}`);
-		for (const v of record.violations) lines.push(`  - ${v.reason}`);
+	const builder = new ReviewLineBuilder(maxBytes, maxLines);
+	if (!builder.add(base)) {
+		const fallback = new ReviewLineBuilder(maxBytes, maxLines);
+		for (const line of [
+			"[workbench-diff-review v1]",
+			`delegation=${boundedInline(record.delegation_id, 64)} verdict=${record.verdict === "FAIL" ? "FAIL" : "PASS"}`,
+			`coverage=${coverage.coverage_complete ? "COMPLETE" : "INCOMPLETE"} checked=${checkedCount} displayed=${coverage.displayed_paths.length} remaining=${coverage.remaining_paths.length}`,
+			`presentation bounded; full=${reviewPathOf(record)}; summary is not acceptance evidence`,
+		]) {
+			if (!fallback.add([line])) break;
+		}
+		return fallback.lines;
 	}
-	if (record.notes.length > 0) {
-		for (const note of record.notes) lines.push(`note       : ${note}`);
+	for (const line of [nextIncludeLine(coverage.remaining_paths), `review path: ${reviewPathOf(record)}`, allowedScopeLine(allowedPaths)]) {
+		builder.add([line]);
 	}
-	if (record.drift_paths.length > 0) {
-		lines.push(`drift      : ${record.drift_paths.join(", ")}`);
+	let violationsShown = 0;
+	for (const violation of violations.slice(0, MAX_REVIEW_VIOLATIONS)) {
+		const line = `violation  : path=${JSON.stringify(boundedInline(violation.path, MAX_REVIEW_PATH_BYTES))} reason=${JSON.stringify(boundedInline(violation.reason, MAX_REVIEW_REASON_BYTES))}`;
+		if (!builder.add([line])) break;
+		violationsShown += 1;
 	}
-	lines.push("", `patch (${record.patch.length} path(s)${record.patch_truncated ? ", truncated" : ""}):`, "");
-	for (const entry of record.patch) {
-		lines.push(`--- ${entry.path} (${entry.source}${entry.truncated ? ", truncated" : ""}) ---`);
-		lines.push(entry.text);
+	let notesShown = 0;
+	for (const note of notes.slice(0, MAX_REVIEW_NOTES)) {
+		if (!builder.add([`note       : ${boundedInline(note, MAX_REVIEW_NOTE_BYTES)}`])) break;
+		notesShown += 1;
 	}
-	if (record.patch_truncated || record.patch.length === 0 || remainingPaths.length > 0) {
-		lines.push(
-			"",
-			"Patch content truncated or omitted — review segments via workbench_review_worker_diff include_paths (max 50 paths per call); scope checks and the bound hash always cover the complete actual diff.",
-		);
+	let driftShown = 0;
+	for (const path of drift) {
+		if (driftShown >= MAX_REVIEW_DRIFT_PATHS) break;
+		// Drift paths, like continuation paths, are only counted as shown
+		// when the complete project-relative value is present.
+		if (typeof path !== "string" || Buffer.byteLength(path, "utf8") > MAX_REVIEW_PATH_BYTES) continue;
+		const complete = unicodeScalarText(path);
+		if (complete !== path || /[\u0000-\u001f\u007f]/.test(complete)) continue;
+		if (!builder.add([`drift      : ${complete}`])) break;
+		driftShown += 1;
 	}
-	// Bounded path/stat info for every patch path (kept even when content is
-	// omitted/truncated so the reviewer can drive segmented re-reviews).
-	const pathStats = record.patch_paths ?? record.patch.map((entry) => ({
-		path: entry.path,
-		source: entry.source,
-		bytes: Buffer.byteLength(entry.text, "utf8"),
-		truncated: entry.truncated,
-	}));
-	lines.push("", `patch paths (${pathStats.length}):`);
-	for (const stat of pathStats) {
-		lines.push(`  - ${stat.path} (${stat.source}, ${stat.bytes} bytes${stat.truncated ? ", truncated" : ""})`);
+	const summary = `presentation: violations=${violationCount}/${violationsShown}/${violations.length - violationsShown}; notes=${noteCount}/${notesShown}/${notes.length - notesShown}; drift=${driftCount}/${driftShown}/${drift.length - driftShown}; patch=${patchOriginal}/${patchShown}/${patchOmitted}; stats=${statOriginal}/${statShown}/${statOmitted}; full=${reviewPathOf(record)}; bounded summary is not acceptance evidence`;
+	builder.lines[9] = summary;
+	return builder.lines;
+}
+
+interface ReviewPresentation {
+	lines: string[];
+	/** Paths whose bounded patch entry is actually present in `lines`. */
+	visiblePatchPaths: string[];
+}
+
+function renderReviewPresentationInner(record: ReviewRecord, caps: ReviewRenderCaps): ReviewPresentation {
+	const maxBytes = boundInt(caps.maxBytes, DEFAULT_REVIEW_MAX_BYTES, 1, DEFAULT_REVIEW_MAX_BYTES);
+	const maxLines = boundInt(caps.maxLines, DEFAULT_REVIEW_MAX_LINES, 1, DEFAULT_REVIEW_MAX_LINES);
+	if (maxBytes < 1024 || maxLines < 16) {
+		const fallback = [
+			"[workbench-diff-review v1]",
+			`delegation=${boundedInline(record.delegation_id, 64)} verdict=${record.verdict === "FAIL" ? "FAIL" : "PASS"}`,
+			`full=${reviewPathOf(record)}; bounded summary is not acceptance evidence`,
+		];
+		const builder = new ReviewLineBuilder(maxBytes, maxLines);
+		for (const line of fallback) if (!builder.add([line])) break;
+		return { lines: builder.lines, visiblePatchPaths: [] };
 	}
-	lines.push("", "Scope checks always cover the entire worker diff; include_paths only narrows the patch above.");
-	return lines;
+	// Two inter-section newline bytes are reserved inside the whole cap.
+	const allocatableBytes = Math.max(0, maxBytes - 2);
+	const controlBytes = Math.min(REVIEW_CONTROL_MAX_BYTES, Math.max(512, Math.floor(allocatableBytes / 4)));
+	const afterControlBytes = Math.max(0, allocatableBytes - controlBytes);
+	const statBytes = Math.min(REVIEW_PATH_STATS_MAX_BYTES, Math.floor(afterControlBytes / 5));
+	const patchBytes = Math.min(REVIEW_PATCH_MAX_BYTES, Math.max(0, afterControlBytes - statBytes));
+	const controlLines = Math.min(REVIEW_CONTROL_MAX_LINES, Math.max(12, Math.floor(maxLines / 4)));
+	const afterControlLines = Math.max(0, maxLines - controlLines);
+	const statLines = Math.min(REVIEW_PATH_STATS_MAX_LINES, Math.floor(afterControlLines / 5));
+	const patchLines = Math.min(REVIEW_PATCH_MAX_LINES, Math.max(0, afterControlLines - statLines));
+
+	const patch = renderPatchSection(record, patchBytes, patchLines);
+	const stats = renderPathStatsSection(record, statBytes, statLines);
+	const control = renderControlSection(record, patch.facts, stats.facts, controlBytes, controlLines);
+	const lines = [...control, ...patch.lines, ...stats.lines];
+	if (lines.length <= maxLines && textByteLength(lines) <= maxBytes) {
+		return { lines, visiblePatchPaths: patch.facts.visiblePaths ?? [] };
+	}
+	// Defensive fail-closed boundary; allocations above make this unreachable.
+	return {
+		lines: truncateUtf8("[workbench-diff-review error code=runtime_failure]", maxBytes).split("\n").slice(0, maxLines),
+		visiblePatchPaths: [],
+	};
+}
+
+/** Whole-result renderer: title, facts, patch, stats and markers share one cap. */
+export function renderReviewLines(record: ReviewRecord, caps: ReviewRenderCaps = {}): string[] {
+	try {
+		return renderReviewPresentationInner(record, caps).lines;
+	} catch {
+		return reviewFailure("runtime_failure").lines;
+	}
 }
 
 /**
  * Read the persisted review record of a delegation (null when absent or
  * corrupt). The delegation state entry stays owned by the runtime.
  */
-export async function readReviewRecord(projectRoot: string, delegationId: string): Promise<ReviewRecord | null> {
+export async function readReviewRecord(
+	projectRoot: string,
+	delegationId: string,
+	hooks?: BoundedFileIoHooks,
+): Promise<ReviewRecord | null> {
 	if (!isValidDelegationId(delegationId)) return null;
 	try {
-		const raw = await readFile(join(delegationDirFor(projectRoot, delegationId), "review.json"), "utf8");
-		const parsed = JSON.parse(raw) as ReviewRecord;
+		const read = await readJsonFileBounded<ReviewRecord>(
+			join(delegationDirFor(projectRoot, delegationId), "review.json"),
+			REVIEW_RECORD_MAX_BYTES,
+			hooks,
+		);
+		if (!read.ok) return null;
+		const parsed = read.value.value;
+		if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
 		if (parsed.schema_version !== REVIEW_SCHEMA_VERSION || parsed.delegation_id !== delegationId) return null;
 		// The finish-time PENDING_REVIEW placeholder (core/delegation-ledger.ts)
 		// is not a completed review — treat it as "no review yet".

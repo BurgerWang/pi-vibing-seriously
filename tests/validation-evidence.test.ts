@@ -38,6 +38,7 @@ import {
 	unavailableEvidenceBlock,
 	VALIDATION_REFUSAL_REASONS,
 	workerFirstFactsHash,
+	type TrustedWorkbenchConfigFileDigest,
 	type ValidationCurrentState,
 	type ValidationEvidenceBlock,
 } from "../extensions/workbench-runtime/core/validation-evidence.ts";
@@ -134,6 +135,13 @@ function cleanWorkerFacts(overrides: Partial<WorkerFirstGateFacts> = {}): Worker
 const GATE_TARGET = buildGateValidationTarget("g1,g2", ["g2", "g1"], ["g1", "g2"]);
 
 async function captureGate(dir: string, overrides: Partial<Parameters<typeof captureGateValidationEvidence>[0]> = {}): Promise<ValidationEvidenceBlock> {
+	const gatePath = join(dir, CONFIG_DIR_NAME, "workbench", "gates.yaml");
+	let gateDigest = "missing";
+	try {
+		gateDigest = createHash("sha256").update(await readFile(gatePath)).digest("hex");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
 	const captured = await captureGateValidationEvidence({
 		projectRoot: dir,
 		profile: "generic",
@@ -143,6 +151,7 @@ async function captureGate(dir: string, overrides: Partial<Parameters<typeof cap
 		requestedGates: ["g2", "g1"],
 		effectiveGates: ["g1", "g2"],
 		projectGates: [],
+		trustedConfigFileDigest: { key: "gates.yaml", path: gatePath, digest: gateDigest },
 		manualEvidence: {},
 		workerFirstFacts: undefined,
 		prerequisiteStatus: {},
@@ -189,6 +198,39 @@ test("exact same state compares reusable (recipe + gate), including JSON round-t
 		const gateBlock = await captureGate(dir);
 		const gateCurrent = await currentForGate(dir);
 		assert.equal(evaluateValidationReuse(gateBlock, gateCurrent).reusable, true);
+	});
+});
+
+test("gate capture requires one exact trusted gates.yaml digest and never silently falls back", async () => {
+	await withTempDir(async (dir) => {
+		await setupGitProject(dir);
+		const exactPath = join(dir, CONFIG_DIR_NAME, "workbench", "gates.yaml");
+		const invalid: unknown[] = [
+			undefined,
+			{ key: "recipes.yaml", path: exactPath, digest: "missing" },
+			{ key: "gates.yaml", path: `${exactPath}.other`, digest: "missing" },
+			{ key: "gates.yaml", path: exactPath, digest: "not-a-digest" },
+			{ key: "gates.yaml", path: exactPath, digest: "missing", extra: true },
+		];
+
+		for (const trustedConfigFileDigest of invalid) {
+			const captured = await captureGateValidationEvidence({
+				projectRoot: dir,
+				profile: "generic",
+				mode: "DEV",
+				exec: spawnExec,
+				selector: "g1",
+				requestedGates: ["g1"],
+				effectiveGates: ["g1"],
+				projectGates: [],
+				trustedConfigFileDigest: trustedConfigFileDigest as TrustedWorkbenchConfigFileDigest,
+				manualEvidence: {},
+				prerequisiteStatus: {},
+				actorFacts: SOL,
+				successful: true,
+			});
+			assert.equal(captured.ok, false, "invalid/missing trusted digest must fail closed instead of rereading gates.yaml");
+		}
 	});
 });
 

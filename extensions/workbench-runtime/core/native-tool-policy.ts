@@ -1,69 +1,11 @@
 /**
- * NRO N1/N2 native-tool policy — deterministic `read` preview, the exact
- * `grep` count semantics, and the three fixed same-name override definitions
- * (Commander Native Tool Optimization plan,
- * `docs/plans/commander-native-tool-optimization.md` §6).
- *
- * Pure and Pi-free (only Node builtins + typebox + type-only package imports),
- * so it is unit-testable with plain `node:test` like every other `core/*`
- * module. The extension (`index.ts`) is the only Pi adapter: it registers the
- * three overrides statically (fixed `read → grep → find` order, then the 11
- * catalog tools) and delegates the legacy read branches to the captured
- * built-in `createReadToolDefinition(ctx.cwd)` execution path.
- *
- * Contract (plan §6.1, frozen in the N0 benchmark protocol §8.4):
- *   - a text `read` WITHOUT `offset`/`limit` returns either the complete
- *     file content byte-for-byte (built-in content) plus the frozen nine-fact
- *     `nro-read-facts:` line, or a deterministic preview of the first
- *     `min(240 lines, 12 KiB)` cut at line boundaries (with the documented
- *     oversized-line prefix representation) plus the same facts line;
- *   - caps: PREVIEW_MAX_LINES = 240, PREVIEW_MAX_UTF8_BYTES = 12 * 1024
- *     (12,288), PREVIEW_MAX_LINE_UTF8_BYTES = 2048 — fixed static constants;
- *   - byte accounting is UTF-8-exact and code-point-safe: returned_bytes is
- *     the byte length of the returned content (line representations plus the
- *     separating newlines), total_bytes is the byte length of the full file
- *     text, so `returned_bytes <= 12288` always holds and the facts trailer
- *     is never counted;
- *   - trailing-newline boundary: the terminal `\n` is RESERVED on the last
- *     real line — the last line's contribution includes its terminal
- *     newline, so when "last line + terminal newline" would exceed 12288
- *     the last line is NOT returned, `complete=false` and `next_offset`
- *     points at that last real line (the legacy offset re-read returns it
- *     WITH its newline, so the file stays reconstructable with no content
- *     lost); a preview built over already-truncated built-in content (a
- *     `totals` override) is NEVER complete;
- *   - line counting mirrors the built-in read tool exactly: a trailing
- *     newline's phantom empty line is part of the content but is not counted
- *     as a line (same semantics as Pi's `truncateHead`), so `total_lines`
- *     agrees with the built-in's own `TruncationResult.totalLines` on every
- *     path;
- *   - the facts trailer is a single line of the exact frozen form
- *     `nro-read-facts: complete=<true|false> returned_lines=<n> ...`
- *     (nine facts, fixed order, single spaces); `next_offset` is 0 when
- *     complete, else `returned_lines + 1` (line-boundary cut) or the
- *     truncated line's own number (`line_truncated=true`);
- *   - `details` is undefined when complete and otherwise carries exactly a
- *     valid built-in `TruncationResult`-only object (`{ truncation }`) so
- *     the inherited built-in renderer shows its standard truncation warning;
- *     no additive details keys ever appear.
- *
- * Path normalization for the second read-only reads (the >50KB-first-line
- * case, where the built-in cannot return the content, and the image-note
- * magic-byte sniff) replicates Pi 0.83.0's `resolveToCwd` +
- * `resolveReadPathAsync` semantics — unicode-space normalization, leading-`@`
- * strip, tilde expansion, `file://` handling, absolute-vs-relative
- * resolution and the macOS AM/PM / NFD / curly-quote variant fallbacks — so
- * `@`/relative/absolute parity with the built-in is preserved (proven by
- * tests) and errors are never weakened.
- *
- * Image-note disambiguation (plan §6.1 / §9 row 6): a text-only built-in
- * result whose text starts with the built-in image note (`Read image file
- * [<mime>]` — a failed decode/resize or an unprocessed BMP) is validated
- * against the source file's magic bytes; when the sniffed MIME agrees with
- * the note's MIME the result is an image-path result and passes through
- * byte-identically (the preview never applies to images). A genuine text
- * file starting with the same phrase has no matching magic bytes and still
- * gets the deterministic preview + facts.
+ * Native-tool policy shared by the fixed read → grep → find overrides.
+ * Read v3 renders every UTF-8 text path through a seek-based, cursor-bound,
+ * quoted protocol capped at 12,288 bytes and 240 file lines. A bounded magic
+ * prefix selects images for Pi's built-in attachment pipeline. Grep count and
+ * legacy find behavior remain isolated below. The old preview builder is kept
+ * only as a compatibility utility for frozen benchmark analysis; the runtime
+ * read override no longer calls it.
  */
 
 import { constants } from "node:fs";
@@ -74,6 +16,9 @@ import { fileURLToPath } from "node:url";
 
 import type { ReadToolDetails, TruncationResult } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+
+import type { TextPage } from "./bounded-file-io.ts";
+import { encodeContinuationCursor, type FileCursorPayload } from "./continuation-cursor.ts";
 
 // ---------------------------------------------------------------------------
 // Frozen preview caps (plan §6.1 — fixed static starting values, never
@@ -129,7 +74,7 @@ export interface NativeOverrideMeta {
  * of the single combined N1/N2 metadata transition and is static text.
  */
 export const READ_PREVIEW_GUIDELINE =
-	"Use read with explicit offset/limit (or follow next_offset until complete: true) when a file's complete content is required (SKILL.md, AGENTS.md, Pi docs, plans, baselines, run logs); prefer grep output=count for existence/occurrence questions.";
+	"Follow next_cursor until complete=true when complete text is required; offset/limit remain bounded compatibility inputs. Prefer grep output=count for existence/occurrence questions.";
 
 /**
  * The mirrored §6.4 bullet on the grep override — the SAME static
@@ -155,7 +100,7 @@ export const NATIVE_OVERRIDE_METADATA: Readonly<Record<NativeOverrideName, Nativ
 		name: "read",
 		label: "read",
 		description:
-			"Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.",
+			"Read a bounded, quoted page of a UTF-8 text file, or an image attachment. Text pages are capped at 12 KiB and 240 file lines; follow next_cursor until complete=true. Legacy offset/limit inputs use the same pager.",
 		promptSnippet: "Read file contents",
 		promptGuidelines: ["Use read to examine files instead of cat or sed.", READ_PREVIEW_GUIDELINE],
 	},
@@ -189,8 +134,9 @@ export const NATIVE_OVERRIDE_METADATA: Readonly<Record<NativeOverrideName, Nativ
 export const NATIVE_OVERRIDE_PARAMETERS = {
 	read: Type.Object({
 		path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
-		offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed)" })),
-		limit: Type.Optional(Type.Number({ description: "Maximum number of lines to read" })),
+		offset: Type.Optional(Type.Integer({ minimum: 1, description: "Line number to start reading from (1-indexed)" })),
+		limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 240, description: "Preferred maximum number of file lines (hard maximum: 240)" })),
+		cursor: Type.Optional(Type.String({ minLength: 1, maxLength: 1024, description: "Opaque workbench continuation cursor from the previous page" })),
 	}),
 	grep: Type.Object({
 		pattern: Type.String({ description: "Search pattern (regex or literal string)" }),
@@ -642,4 +588,198 @@ export function imageMimeFromReadNote(text: string): string | null {
 	if (bracket === -1) return null;
 	const mime = rest.slice(0, bracket);
 	return /^image\/(jpeg|png|gif|webp|bmp)$/.test(mime) ? mime : null;
+}
+
+// ---------------------------------------------------------------------------
+// Native read v3 trusted quoted-page protocol
+// ---------------------------------------------------------------------------
+
+export const READ_V3_PROTOCOL = "workbench-read-page-v1" as const;
+export const READ_V3_MAX_OUTPUT_BYTES = 12_288 as const;
+export const READ_V3_MAX_FILE_LINES = 240 as const;
+export const READ_V3_MAX_TOTAL_LINES = 252 as const;
+export const READ_V3_QUOTE_PREFIX = "│ " as const;
+/** Fixed internal signal: the reservation cannot fit protocol + cursor + progress. */
+export const READ_V3_ALLOCATION_TOO_SMALL = "read_v3_allocation_too_small" as const;
+
+export interface NativeReadV3Details {
+	schema: typeof READ_V3_PROTOCOL;
+	complete: boolean;
+	start_line: number;
+	shown_lines: number;
+	shown_bytes: number;
+	start_byte: number;
+	end_exclusive: number;
+	line_segment: boolean;
+	source_id: string;
+	next_cursor?: string;
+}
+
+export interface NativeReadV3Page {
+	text: string;
+	details: NativeReadV3Details;
+	continuation?: { kind: "read"; value: string };
+}
+
+function readV3ScalarBoundaries(buffer: Buffer): number[] {
+	const text = new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+	const boundaries = [0];
+	let bytes = 0;
+	for (const scalar of text) {
+		bytes += Buffer.byteLength(scalar, "utf8");
+		boundaries.push(bytes);
+	}
+	return boundaries;
+}
+
+function readV3LineFacts(buffer: Buffer): { lines: number; newlines: number } {
+	if (buffer.length === 0) return { lines: 0, newlines: 0 };
+	let newlines = 0;
+	for (const byte of buffer) if (byte === 0x0a) newlines += 1;
+	return { lines: buffer[buffer.length - 1] === 0x0a ? newlines : newlines + 1, newlines };
+}
+
+function quoteReadV3Content(text: string): string {
+	if (text.length === 0) return "";
+	const quoted = READ_V3_QUOTE_PREFIX + text.replaceAll("\n", `\n${READ_V3_QUOTE_PREFIX}`);
+	return text.endsWith("\n") ? quoted.slice(0, -READ_V3_QUOTE_PREFIX.length) : quoted;
+}
+
+function boundedDisplayPath(path: string): string {
+	let out = "";
+	let used = 0;
+	for (const scalar of path) {
+		const size = Buffer.byteLength(scalar, "utf8");
+		if (used + size > 512) break;
+		out += scalar;
+		used += size;
+	}
+	return out.length === path.length ? out : `${out}…`;
+}
+
+function renderReadV3Protocol(input: {
+	displayPath: string;
+	page: TextPage;
+	sourceId: string;
+	content: Buffer;
+	complete: boolean;
+	nextCursor?: string;
+}): { text: string; details: NativeReadV3Details } {
+	const decoded = new TextDecoder("utf-8", { fatal: true }).decode(input.content);
+	const facts = readV3LineFacts(input.content);
+	const endExclusive = input.page.startByte + input.content.length;
+	const lineSegment = input.page.startsWithinLine || (!input.complete && input.content.length > 0 && input.content[input.content.length - 1] !== 0x0a);
+	const header = [
+		"[workbench-read-page v1]",
+		`path=${JSON.stringify(boundedDisplayPath(input.displayPath))}`,
+		`complete=${String(input.complete)}`,
+		`start_line=${input.page.startLineNumber}`,
+		`shown_lines=${facts.lines}`,
+		`shown_bytes=${input.content.length}`,
+		`byte_range=${input.page.startByte}:${endExclusive}`,
+		`line_segment=${String(lineSegment)} segment=${input.page.startByte}:${endExclusive}`,
+		...(input.nextCursor ? [`next_cursor=${JSON.stringify(input.nextCursor)}`] : []),
+		"[/workbench-read-page]",
+		"--- BEGIN QUOTED FILE CONTENT ---",
+	];
+	const quoted = quoteReadV3Content(decoded);
+	const text = `${header.join("\n")}\n${quoted}${quoted.length > 0 && !decoded.endsWith("\n") ? "\n" : ""}--- END QUOTED FILE CONTENT ---`;
+	return {
+		text,
+		details: {
+			schema: READ_V3_PROTOCOL,
+			complete: input.complete,
+			start_line: input.page.startLineNumber,
+			shown_lines: facts.lines,
+			shown_bytes: input.content.length,
+			start_byte: input.page.startByte,
+			end_exclusive: endExclusive,
+			line_segment: lineSegment,
+			source_id: input.sourceId,
+			...(input.nextCursor ? { next_cursor: input.nextCursor } : {}),
+		},
+	};
+}
+
+/**
+ * Fit protocol metadata, quote prefixes, content and cursor inside the native
+ * read hard cap. The input page is already bounded and came from one open
+ * handle; this function can only shrink it at UTF-8 scalar boundaries.
+ */
+export function buildNativeReadV3Page(input: {
+	displayPath: string;
+	sourceId: string;
+	page: TextPage;
+	/** Trusted per-call reservation; omitted direct calls retain the hard cap. */
+	maxOutputBytes?: number;
+}): NativeReadV3Page {
+	const requestedCap = input.maxOutputBytes === undefined
+		? READ_V3_MAX_OUTPUT_BYTES
+		: typeof input.maxOutputBytes === "number" && Number.isFinite(input.maxOutputBytes) && input.maxOutputBytes > 0
+			? Math.floor(input.maxOutputBytes)
+			: 0;
+	const outputCap = Math.min(READ_V3_MAX_OUTPUT_BYTES, requestedCap);
+	const full = Buffer.from(input.page.text, "utf8");
+	const boundaries = readV3ScalarBoundaries(full);
+	let low = 0;
+	let high = boundaries.length - 1;
+	let selected: ReturnType<typeof renderReadV3Protocol> | undefined;
+	while (low <= high) {
+		const middle = Math.floor((low + high) / 2);
+		const length = boundaries[middle]!;
+		const candidate = full.subarray(0, length);
+		const complete = input.page.completeAfter && length === full.length;
+		const lineFacts = readV3LineFacts(candidate);
+		const nextLine = input.page.startLineNumber + lineFacts.newlines;
+		let nextCursor: string | undefined;
+		if (!complete) {
+			const source = input.page.source;
+			const payload: FileCursorPayload = source.mtimeNs === undefined
+				? {
+					v: 1,
+					kind: "read",
+					sourceId: input.sourceId,
+					byteOffset: input.page.startByte + length,
+					lineNumber: nextLine,
+					fileSize: source.fileSize,
+					mtimeMs: source.mtimeMs,
+					...(source.dev === undefined ? {} : { dev: source.dev, ino: source.ino }),
+				}
+				: {
+					v: 2,
+					kind: "read",
+					sourceId: input.sourceId,
+					byteOffset: input.page.startByte + length,
+					lineNumber: nextLine,
+					fileSize: source.fileSize,
+					mtimeMs: source.mtimeMs,
+					mtimeNs: source.mtimeNs,
+					...(source.dev === undefined ? {} : { dev: source.dev, ino: source.ino }),
+				};
+			const encoded = encodeContinuationCursor(payload);
+			if (!encoded.ok) throw new Error(encoded.error.code);
+			nextCursor = encoded.value;
+		}
+		const rendered = renderReadV3Protocol({ ...input, content: candidate, complete, nextCursor });
+		const fits = Buffer.byteLength(rendered.text, "utf8") <= outputCap
+			&& (rendered.text.length === 0 ? 0 : rendered.text.split("\n").length) <= READ_V3_MAX_TOTAL_LINES;
+		if (fits) {
+			selected = rendered;
+			low = middle + 1;
+		} else {
+			high = middle - 1;
+		}
+	}
+	if (!selected) throw new Error(READ_V3_ALLOCATION_TOO_SMALL);
+	if (!selected.details.complete && selected.details.shown_bytes === 0 && input.page.source.fileSize > input.page.startByte) {
+		// A non-complete page must advance at least one Unicode scalar. Returning
+		// an empty page with a same-position cursor would loop forever; fail with
+		// the same fixed allocation error and expose no cursor instead.
+		throw new Error(READ_V3_ALLOCATION_TOO_SMALL);
+	}
+	return {
+		text: selected.text,
+		details: selected.details,
+		...(selected.details.next_cursor ? { continuation: { kind: "read", value: selected.details.next_cursor } } : {}),
+	};
 }

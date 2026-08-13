@@ -81,7 +81,8 @@
  */
 
 import { truncateUtf8Bytes, utf8Bytes } from "./result-summary.ts";
-import type { RunRecord } from "./runs.ts";
+import { encodeContinuationCursor, type RunLogCursorPayloadV1 } from "./continuation-cursor.ts";
+import type { RunLogPage, RunLogPageStream, RunRecord } from "./runs.ts";
 
 // ---------------------------------------------------------------------------
 // Include modes and caps
@@ -735,6 +736,192 @@ export function renderRunResult(input: RunResultRenderInput): RunResultRender {
 		stderrTailShown,
 		omissionFacts: facts,
 	};
+}
+
+// ---------------------------------------------------------------------------
+// Run-log reverse-page renderer (R5)
+// ---------------------------------------------------------------------------
+
+export const RUN_LOG_PROTOCOL = "workbench-run-log-page-v1" as const;
+export const RUN_LOG_OUTPUT_MAX_BYTES = 32_768 as const;
+export const RUN_LOG_OUTPUT_MAX_LINES = 400 as const;
+
+export interface RunLogRenderInput {
+	manifest: RunRecord;
+	page: RunLogPage;
+	validation?: RunValidationRender | null;
+	stdoutPath: string;
+	stderrPath: string;
+	/** Trusted turn reservation; omitted direct calls retain the hard cap. */
+	maxOutputBytes?: number;
+	maxOutputLines?: number;
+}
+
+export interface RunLogRenderResult {
+	text: string;
+	utf8Bytes: number;
+	lines: number;
+	shownBytes: number;
+	shownLines: number;
+	omittedBeforeBytes: number;
+	completeBefore: boolean;
+	previousCursor?: string;
+	continuation?: { kind: "run-log"; value: string };
+}
+
+function validOutputCap(value: unknown, fallback: number, hardMax: number): number {
+	return value === undefined
+		? fallback
+		: typeof value === "number" && Number.isSafeInteger(value) && value > 0
+			? Math.min(value, hardMax)
+			: 0;
+}
+
+function utf8Suffix(buffer: Buffer, requestedBytes: number): Buffer {
+	if (requestedBytes >= buffer.length) return buffer;
+	if (requestedBytes <= 0) return buffer.subarray(buffer.length);
+	let start = buffer.length - requestedBytes;
+	while (start < buffer.length && (buffer[start]! & 0xc0) === 0x80) start += 1;
+	return buffer.subarray(start);
+}
+
+function quotedLogContent(text: string): string {
+	if (text.length === 0) return "";
+	return text.split("\n").map((line) => `| ${line}`).join("\n");
+}
+
+function boundedLogPath(value: string): string {
+	return boundedBytes(value, 120);
+}
+
+/**
+ * Count logical source lines, matching bounded-file-io's byte-level facts:
+ * a trailing LF terminates the last line and never invents an extra empty
+ * source line. CRLF is one line ending because LF is the delimiter.
+ */
+function sourceLineCount(text: string): number {
+	if (text.length === 0) return 0;
+	let lines = text.endsWith("\n") ? 0 : 1;
+	for (let index = 0; index < text.length; index += 1) {
+		if (text.charCodeAt(index) === 0x0a) lines += 1;
+	}
+	return lines;
+}
+
+/** Display-line accounting is deliberately independent of source facts. */
+function displayLineCount(text: string): number {
+	return text.length === 0 ? 0 : text.split("\n").length;
+}
+
+function renderLogCandidate(input: RunLogRenderInput, stdout: Buffer, stderr: Buffer): RunLogRenderResult {
+	const selected = input.page.selection === "both" ? ["stdout", "stderr"] as const : [input.page.selection] as const;
+	const adjusted = (stream: "stdout" | "stderr", bytes: Buffer): RunLogPageStream & { renderedText: string } => {
+		const source = input.page[stream];
+		const renderedText = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+		const removed = source.shownBytes - bytes.length;
+		return {
+			...source,
+			text: renderedText,
+			renderedText,
+			startByte: source.startByte + removed,
+			shownBytes: bytes.length,
+			shownLines: sourceLineCount(renderedText),
+			completeBefore: source.completeBefore && removed === 0,
+			lineSegment: source.lineSegment || removed > 0,
+		};
+	};
+	const pages = { stdout: adjusted("stdout", stdout), stderr: adjusted("stderr", stderr) };
+	const completeBefore = selected.every((stream) => pages[stream].completeBefore);
+	let previousCursor: string | undefined;
+	if (!completeBefore) {
+		const payload: RunLogCursorPayloadV1 = {
+			v: 1,
+			kind: "run-log",
+			sourceId: input.page.sourceId,
+			sourceStateId: input.page.sourceStateId,
+			stdoutEndExclusive: input.page.selection === "stderr" || pages.stdout.completeBefore ? 0 : pages.stdout.startByte,
+			stderrEndExclusive: input.page.selection === "stdout" || pages.stderr.completeBefore ? 0 : pages.stderr.startByte,
+		};
+		const encoded = encodeContinuationCursor(payload);
+		if (!encoded.ok) throw new Error(encoded.error.code);
+		previousCursor = encoded.value;
+	}
+	const shownBytes = selected.reduce((sum, stream) => sum + pages[stream].shownBytes, 0);
+	const shownLines = selected.reduce((sum, stream) => sum + pages[stream].shownLines, 0);
+	const omittedBeforeBytes = selected.reduce((sum, stream) => sum + pages[stream].startByte, 0);
+	const header = [
+		"[workbench-run-log-page v1]",
+		`protocol=${JSON.stringify(RUN_LOG_PROTOCOL)}`,
+		`run_id=${JSON.stringify(boundedBytes(input.manifest.run_id, MAX_RUN_ID_CHARS))}`,
+		`status=${JSON.stringify(boundedBytes(statusOf(input.manifest), MAX_STATUS_CHARS))}`,
+		validationLine(input.validation),
+		`stream=${JSON.stringify(input.page.selection)}`,
+		...selected.map((stream) => {
+			const page = pages[stream];
+			const path = stream === "stdout" ? input.stdoutPath : input.stderrPath;
+			return `${stream}=${JSON.stringify({ path: boundedLogPath(path), state: page.state, byte_range: [page.startByte, page.endExclusive], file_size: page.fileSize, shown_bytes: page.shownBytes, shown_lines: page.shownLines, line_segment: page.lineSegment })}`;
+		}),
+		`shown_bytes=${shownBytes}`,
+		`shown_lines=${shownLines}`,
+		`omitted_before_bytes=${omittedBeforeBytes}`,
+		`omitted_before_lines=${JSON.stringify("not_scanned")}`,
+		`complete_before=${String(completeBefore)}`,
+		...(previousCursor ? [`previous_cursor=${JSON.stringify(previousCursor)}`] : []),
+		"full_log_inlined=false",
+		"[/workbench-run-log-page]",
+	];
+	const sections: string[] = [];
+	for (const stream of selected) {
+		sections.push(`--- BEGIN QUOTED ${stream.toUpperCase()} CONTENT ---`);
+		if (pages[stream].state === "missing") sections.push("| (missing)");
+		else if (pages[stream].state === "empty") sections.push("| (empty)");
+		else sections.push(quotedLogContent(pages[stream].renderedText));
+		sections.push(`--- END QUOTED ${stream.toUpperCase()} CONTENT ---`);
+	}
+	const text = [...header, ...sections].join("\n");
+	return {
+		text,
+		utf8Bytes: utf8Bytes(text),
+		lines: displayLineCount(text),
+		shownBytes,
+		shownLines,
+		omittedBeforeBytes,
+		completeBefore,
+		...(previousCursor ? { previousCursor, continuation: { kind: "run-log" as const, value: previousCursor } } : {}),
+	};
+}
+
+/**
+ * Quote and fit one shared stdout/stderr page. Binary search only removes a
+ * UTF-8-safe prefix from the already bounded tail, so a previous cursor can
+ * replay every omitted older byte and protocol-like log text stays data.
+ */
+export function renderRunLogPage(input: RunLogRenderInput): RunLogRenderResult {
+	const maxBytes = validOutputCap(input.maxOutputBytes, RUN_LOG_OUTPUT_MAX_BYTES, RUN_LOG_OUTPUT_MAX_BYTES);
+	const maxLines = validOutputCap(input.maxOutputLines, RUN_LOG_OUTPUT_MAX_LINES, RUN_LOG_OUTPUT_MAX_LINES);
+	const stdoutFull = Buffer.from(input.page.stdout.text, "utf8");
+	const stderrFull = Buffer.from(input.page.stderr.text, "utf8");
+	let low = 0;
+	let high = 1_000_000;
+	let best: RunLogRenderResult | undefined;
+	while (low <= high) {
+		const ratio = Math.floor((low + high) / 2);
+		const stdout = utf8Suffix(stdoutFull, Math.floor(stdoutFull.length * ratio / 1_000_000));
+		const stderr = utf8Suffix(stderrFull, Math.floor(stderrFull.length * ratio / 1_000_000));
+		const candidate = renderLogCandidate(input, stdout, stderr);
+		if (candidate.utf8Bytes <= maxBytes && candidate.lines <= maxLines) {
+			best = candidate;
+			low = ratio + 1;
+		} else {
+			high = ratio - 1;
+		}
+	}
+	if (!best || ((stdoutFull.length > 0 || stderrFull.length > 0) && best.shownBytes === 0)) {
+		const error = "workbench_read_run: output_allocation_too_small";
+		const text = boundedBytes(error, Math.max(0, maxBytes));
+		return { text, utf8Bytes: utf8Bytes(text), lines: displayLineCount(text), shownBytes: 0, shownLines: 0, omittedBeforeBytes: 0, completeBefore: false };
+	}
+	return best;
 }
 
 // ---------------------------------------------------------------------------

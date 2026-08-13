@@ -313,13 +313,25 @@ async function runMilestoneCommand(
 	await def.handler(args, ctx);
 }
 
-/** Run the extension's own second-layer tool_call guard. */
+let milestoneGuardSerial = 0;
+
+/** Run all guards for one real fresh-turn tool call with a unique Pi id. */
 async function guardCall(stub: StubAPI, toolName: string, input: unknown): Promise<{ block?: boolean; reason?: string } | undefined> {
-	const guard = stub.events.get("tool_call")![0]!;
-	return (await guard({ type: "tool_call", toolName, input } as never, fakeCtx([]) as never)) as {
-		block?: boolean;
-		reason?: string;
-	} | undefined;
+	milestoneGuardSerial += 1;
+	const ctx = fakeCtx([]) as never;
+	for (const handler of stub.events.get("turn_start") ?? []) {
+		await handler({ type: "turn_start", turnIndex: milestoneGuardSerial } as never, ctx);
+	}
+	for (const guard of stub.events.get("tool_call") ?? []) {
+		const result = (await guard({
+			type: "tool_call",
+			toolCallId: `milestone-guard-${milestoneGuardSerial}`,
+			toolName,
+			input,
+		} as never, ctx)) as { block?: boolean; reason?: string } | undefined;
+		if (result !== undefined) return result;
+	}
+	return undefined;
 }
 
 // ===========================================================================

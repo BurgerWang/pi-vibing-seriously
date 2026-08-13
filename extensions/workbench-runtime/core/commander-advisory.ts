@@ -250,6 +250,16 @@ export function advisoryStatusSegment(facts: AdvisoryFacts): string | undefined 
 	return `CMD:${facts.band.toUpperCase()}`;
 }
 
+/**
+ * R8 context-output footer observation. The input band is produced by the
+ * numeric-only output telemetry accumulator; malformed values render
+ * nothing. This is deliberately presentation-only and has no enforcement
+ * return shape.
+ */
+export function contextOutputAdvisoryStatusSegment(band: unknown): string | undefined {
+	return band === "SOFT" || band === "HIGH" ? `CTX:${band}` : undefined;
+}
+
 /** Bounded display of a raw config value inside an issue message. */
 function boundedValue(value: unknown): string {
 	if (typeof value === "string") return value.length > 40 ? `"${value.slice(0, 40)}…"` : JSON.stringify(value);

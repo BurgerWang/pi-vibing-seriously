@@ -12,6 +12,7 @@ import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { types as utilTypes } from "node:util";
 
 import {
 	DEFAULT_MAX_BYTES,
@@ -43,6 +44,11 @@ import {
 	workerContextRatio,
 	workerContextTokens,
 } from "../core/worker-budget.ts";
+import {
+	OUTPUT_CONTROL_TELEMETRY_ENTRY_TYPE,
+	parseOutputControlTelemetryEntry,
+} from "../core/output-control-telemetry.ts";
+import { WORKER_TURN_MAX_BYTES } from "../core/output-policy.ts";
 import {
 	addWorkerSpendUsage,
 	EMPTY_WORKER_SPEND_STATE,
@@ -81,6 +87,8 @@ Finish with exactly these sections:
 const MAX_JSON_LINE_BYTES = 2 * 1024 * 1024;
 const MAX_TASK_ARGUMENT_BYTES = 64 * 1024;
 const KILL_GRACE_MS = 5_000;
+/** Exact custom-entry identity already emitted by the child runtime. */
+const OUTPUT_TURN_TELEMETRY_ENTRY_TYPE = "workbench-output-turn-telemetry-v1";
 const WORKER_TOOL_ALLOWLIST = [
 	"read",
 	"grep",
@@ -177,6 +185,21 @@ export interface WorkerRunResult {
 	spendSoftReached: WorkerSpendDimensionFlags["soft"];
 	/** Per-dimension hard trigger flags at the final spend state. */
 	spendHardExceeded: WorkerSpendDimensionFlags["hard"];
+	/**
+	 * Latest trusted child-runtime output-control observation. The child
+	 * extension enforces the caps before provider requests; the runner only
+	 * observes the two fixed numeric custom-entry protocols and never treats
+	 * this object as a substitute enforcement layer. Optional for source
+	 * compatibility with callers that construct legacy failure results.
+	 */
+	outputControl?: Readonly<WorkerOutputControlFacts>;
+}
+
+/** Numeric-only worker output-control observation; no free-form string fits. */
+export interface WorkerOutputControlFacts {
+	currentToolTextBytes: number;
+	collapsedToolResults: number;
+	turnReservedBytes: number;
 }
 
 export interface WorkerProgress {
@@ -199,6 +222,12 @@ export interface WorkerProgress {
 	outputTokens: number;
 	/** Cumulative spend band after this assistant message (fixed enum). */
 	spendBand: WorkerSpendBand;
+	/** Latest child context projection gauge (outgoing tool-result text bytes). */
+	currentToolTextBytes: number;
+	/** Latest cumulative count of tool results collapsed from active history. */
+	collapsedToolResults: number;
+	/** Reserved bytes in the latest completed child tool batch. */
+	turnReservedBytes: number;
 	provider?: string;
 	model?: string;
 }
@@ -236,6 +265,114 @@ interface AssistantLike {
 	usage?: unknown;
 	stopReason?: unknown;
 	errorMessage?: unknown;
+}
+
+const EMPTY_OUTPUT_CONTROL_FACTS: Readonly<WorkerOutputControlFacts> = Object.freeze({
+	currentToolTextBytes: 0,
+	collapsedToolResults: 0,
+	turnReservedBytes: 0,
+});
+
+const CURRENT_TURN_TELEMETRY_KEYS = [
+	"role", "planning", "turnSerial", "maxBytes", "reservationCount", "blockedCalls", "consumedCalls",
+	"releasedCalls", "reservedBytes", "consumedBytes", "controlConsumedBytes", "totalAccountedBytes",
+	"releasedBytes", "unusedBytes",
+] as const;
+const CANONICAL_TURN_TELEMETRY_KEYS = [
+	"schema", "turnSerial", "role", "planned", "maxBytes", "reservationCount", "blockedCalls", "consumedCalls",
+	"releasedCalls", "reservedBytes", "consumedBytes", "controlConsumedBytes", "totalAccountedBytes",
+	"releasedBytes", "unusedBytes",
+] as const;
+
+/**
+ * Return own enumerable data properties only. This parser is deliberately
+ * stricter than ordinary JSON access so a future non-JSON test seam cannot
+ * invoke getters/proxy traps or smuggle text beside the numeric protocol.
+ */
+function exactDataRecord(value: unknown, keys: readonly string[]): Readonly<Record<string, unknown>> | undefined {
+	try {
+		if (value === null || typeof value !== "object" || utilTypes.isProxy(value)) return undefined;
+		const prototype = Object.getPrototypeOf(value);
+		if (prototype !== Object.prototype && prototype !== null) return undefined;
+		if (Object.getOwnPropertySymbols(value).length !== 0) return undefined;
+		const descriptors = Object.getOwnPropertyDescriptors(value);
+		const names = Object.keys(descriptors);
+		if (names.length !== keys.length || names.some((name) => !keys.includes(name))) return undefined;
+		const output: Record<string, unknown> = Object.create(null);
+		for (const key of keys) {
+			const descriptor = descriptors[key];
+			if (!descriptor || descriptor.enumerable !== true || !Object.prototype.hasOwnProperty.call(descriptor, "value")) return undefined;
+			output[key] = descriptor.value;
+		}
+		return output;
+	} catch {
+		return undefined;
+	}
+}
+
+function ownDataValue(value: unknown, key: string): unknown {
+	try {
+		if (value === null || typeof value !== "object" || utilTypes.isProxy(value)) return undefined;
+		const descriptor = Object.getOwnPropertyDescriptor(value, key);
+		return descriptor && Object.prototype.hasOwnProperty.call(descriptor, "value") ? descriptor.value : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function safeCount(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+/**
+ * Parse only the child runtime's fixed turn telemetry custom entry. Both
+ * the currently persisted enum shape and the canonical core shape are
+ * accepted; every other key (including text/args/patch/log/error) rejects
+ * the complete entry. The returned value is observation-only.
+ */
+function parseTurnReservedBytes(entry: unknown): number | undefined {
+	if (ownDataValue(entry, "type") !== "custom" || ownDataValue(entry, "customType") !== OUTPUT_TURN_TELEMETRY_ENTRY_TYPE) {
+		return undefined;
+	}
+	const data = ownDataValue(entry, "data");
+	const current = exactDataRecord(data, CURRENT_TURN_TELEMETRY_KEYS);
+	const canonical = current ? undefined : exactDataRecord(data, CANONICAL_TURN_TELEMETRY_KEYS);
+	const record = current ?? canonical;
+	if (!record || record.role !== "worker") return undefined;
+	if (current && record.planning !== "planned" && record.planning !== "dynamic") return undefined;
+	if (canonical && (record.schema !== "workbench-turn-output-telemetry-v1" || typeof record.planned !== "boolean")) return undefined;
+	const numericKeys = [
+		"turnSerial", "maxBytes", "reservationCount", "blockedCalls", "consumedCalls", "releasedCalls",
+		"reservedBytes", "consumedBytes", "controlConsumedBytes", "totalAccountedBytes", "releasedBytes", "unusedBytes",
+	] as const;
+	for (const key of numericKeys) if (!safeCount(record[key])) return undefined;
+	const maxBytes = record.maxBytes as number;
+	const reservedBytes = record.reservedBytes as number;
+	const totalAccountedBytes = record.totalAccountedBytes as number;
+	if (maxBytes !== WORKER_TURN_MAX_BYTES
+		|| reservedBytes > maxBytes
+		|| totalAccountedBytes > maxBytes
+		|| record.releasedBytes !== Math.max(0, reservedBytes - totalAccountedBytes)
+		|| record.unusedBytes !== maxBytes - totalAccountedBytes) return undefined;
+	return reservedBytes;
+}
+
+/** Update only from the two fixed, strictly parsed custom-entry protocols. */
+function observeOutputControlEntry(
+	entry: unknown,
+	current: Readonly<WorkerOutputControlFacts>,
+): Readonly<WorkerOutputControlFacts> {
+	const snapshot = parseOutputControlTelemetryEntry(entry);
+	if (snapshot?.role === "worker") {
+		return Object.freeze({
+			currentToolTextBytes: snapshot.activeHistoryToolTextBytes,
+			collapsedToolResults: snapshot.totals.historyCollapsedResults,
+			turnReservedBytes: current.turnReservedBytes,
+		});
+	}
+	const turnReservedBytes = parseTurnReservedBytes(entry);
+	if (turnReservedBytes === undefined) return current;
+	return Object.freeze({ ...current, turnReservedBytes });
 }
 
 function emptyUsage(): WorkerUsage {
@@ -411,6 +548,7 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 		spendReasons: [],
 		spendSoftReached: { turns: false, totalTokens: false, outputTokens: false },
 		spendHardExceeded: { turns: false, totalTokens: false, outputTokens: false },
+		outputControl: EMPTY_OUTPUT_CONTROL_FACTS,
 	};
 
 	try {
@@ -452,12 +590,22 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 				resolvePromise();
 			};
 
+			let outputControl: Readonly<WorkerOutputControlFacts> = EMPTY_OUTPUT_CONTROL_FACTS;
+
 			const processLine = (line: string) => {
 				if (!line.trim()) return;
-				let event: { type?: unknown; message?: unknown; reason?: unknown };
+				let event: { type?: unknown; message?: unknown; reason?: unknown; entry?: unknown };
 				try {
-					event = JSON.parse(line) as { type?: unknown; message?: unknown; reason?: unknown };
+					event = JSON.parse(line) as { type?: unknown; message?: unknown; reason?: unknown; entry?: unknown };
 				} catch {
+					return;
+				}
+				// Observation only: the child extension already enforced history/turn
+				// limits before the provider request. The runner trusts exactly two
+				// fixed custom-entry schemas and retains numeric/enum facts only.
+				if (event.type === "entry_appended") {
+					outputControl = observeOutputControlEntry(event.entry, outputControl);
+					result.outputControl = outputControl;
 					return;
 				}
 				// Pi emits compaction_start before compacting. The worker extension
@@ -544,6 +692,9 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 					totalTokens: result.spendState.totalTokens,
 					outputTokens: result.spendState.outputTokens,
 					spendBand: workerSpendBand(result.spendState, spendProfile),
+					currentToolTextBytes: outputControl.currentToolTextBytes,
+					collapsedToolResults: outputControl.collapsedToolResults,
+					turnReservedBytes: outputControl.turnReservedBytes,
 					provider: result.provider,
 					model: result.model,
 				});

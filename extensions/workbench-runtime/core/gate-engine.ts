@@ -17,7 +17,8 @@
  *     prose can never masquerade as machine verification
  */
 
-import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { copyFile, lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { globSync } from "node:fs";
 import { basename, join, relative } from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -50,9 +51,24 @@ import { recipeMutationBlockReason, type RecipeMutationFacts } from "./worker-po
 import { listRuns, makeRunId, readManifest, RUN_SCHEMA_VERSION, type RunRecord } from "./runs.ts";
 import type { WorkbenchMode } from "./mode-policy.ts";
 import { truncateTail } from "@earendil-works/pi-coding-agent";
-import { captureGateValidationEvidence, unavailableEvidenceBlock } from "./validation-evidence.ts";
+import {
+	captureGateValidationEvidence,
+	unavailableEvidenceBlock,
+	type TrustedWorkbenchConfigFileDigest,
+} from "./validation-evidence.ts";
+import { readJsonFileBounded, readUtf8FileBounded, type BoundedFileIoHooks } from "./bounded-file-io.ts";
 
 export const GATE_SCHEMA_VERSION = 1;
+/** Persisted gate/evidence records are authority inputs, never unbounded JSON channels. */
+export const GATE_AUTHORITY_RECORD_MAX_BYTES = 1_048_576 as const;
+/** Project gate configuration uses the exact gate-authority ceiling and may never raise it. */
+export const GATE_CONFIG_MAX_BYTES = GATE_AUTHORITY_RECORD_MAX_BYTES;
+/** Fixed fail-closed result for every present gate configuration that cannot be read as one stable UTF-8 file. */
+export const GATE_CONFIG_READ_ERROR = "gates.yaml: bounded gate config read failed under fixed 1048576-byte regular UTF-8 file policy" as const;
+/** Fixed fail-closed result when a complete gate authority record cannot fit. */
+export const GATE_AUTHORITY_PERSISTENCE_ERROR = "gate authority persistence failed: complete record exceeds fixed 1048576-byte limit" as const;
+/** Gate-declared JSON artifacts use the same fixed same-open preflight ceiling. */
+export const GATE_JSON_ARTIFACT_MAX_BYTES = 1_048_576 as const;
 
 /**
  * P4b: the caller's manual-evidence map trimmed for EVALUATION — every
@@ -177,6 +193,10 @@ export interface RunGatesInput {
 	workerFirstFacts?: WorkerFirstGateFacts;
 	/** P7: actor facts for the shared recipe mutation policy in recipe checks. */
 	actorFacts?: RecipeMutationFacts;
+	/** Test-only allocation observation; cannot raise the fixed JSON artifact cap. */
+	jsonFileReadHooks?: BoundedFileIoHooks;
+	/** Test-only stable-snapshot observation; cannot raise the gate config cap. */
+	gateConfigReadHooks?: GateConfigReadHooks;
 }
 
 export interface RunGatesResult {
@@ -202,19 +222,65 @@ export interface GateFileRecord {
 // Gate loading (catalog + gates.yaml)
 // ---------------------------------------------------------------------------
 
-async function readGatesYaml(projectRoot: string): Promise<{ doc: unknown; errors: string[] }> {
+/**
+ * Test instrumentation for the gate authority read. `afterStableSnapshot`
+ * runs only after same-handle verification and strict gate parsing have
+ * completed, immediately before the parsed document is handed to the generic
+ * config parser. It receives no content and cannot alter any limit.
+ */
+export interface GateConfigReadHooks extends BoundedFileIoHooks {
+	afterStableSnapshot?: () => void | Promise<void>;
+}
+
+async function readGatesYaml(
+	projectRoot: string,
+	hooks?: GateConfigReadHooks,
+): Promise<{ doc: unknown; errors: string[]; trustedConfigFileDigest?: TrustedWorkbenchConfigFileDigest }> {
 	const path = join(projectRoot, CONFIG_DIR_NAME, "workbench", "gates.yaml");
-	let content: string;
+	// Preserve the documented optional-file semantics without treating every
+	// I/O failure as absence. Once a path exists, the shared bounded reader
+	// opens it, stats the SAME handle, rejects non-regular/oversized sources
+	// before allocation, validates UTF-8, and verifies that opened handle's
+	// identity after the read. Any read failure after this presence probe
+	// fails closed instead of silently dropping project gates.
 	try {
-		content = await readFile(path, "utf8");
-	} catch {
-		// Missing gates.yaml means "no project gates" — the built-in catalog applies.
-		return { doc: undefined, errors: [] };
+		await lstat(path);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+			// Missing gates.yaml means "no project gates" — the built-in catalog applies.
+			return {
+				doc: undefined,
+				errors: [],
+				trustedConfigFileDigest: { key: "gates.yaml", path, digest: "missing" },
+			};
+		}
+		return { doc: undefined, errors: [GATE_CONFIG_READ_ERROR] };
 	}
+	const read = await readUtf8FileBounded(path, GATE_CONFIG_MAX_BYTES, hooks);
+	if (!read.ok) return { doc: undefined, errors: [GATE_CONFIG_READ_ERROR] };
+	// The bounded reader proves and decodes one stable open-handle snapshot.
+	// Valid UTF-8 round-trips byte-for-byte except that TextDecoder consumes a
+	// leading BOM. Reconstruct that sole case from the exact source byte count
+	// and hash incrementally, avoiding a second file read or full-size buffer.
+	const decodedBytes = Buffer.byteLength(read.value.text, "utf8");
+	const digest = createHash("sha256");
+	if (decodedBytes === read.value.bytes) {
+		digest.update(read.value.text, "utf8");
+	} else if (decodedBytes + 3 === read.value.bytes) {
+		digest.update(Uint8Array.of(0xef, 0xbb, 0xbf));
+		digest.update(read.value.text, "utf8");
+	} else {
+		return { doc: undefined, errors: [GATE_CONFIG_READ_ERROR] };
+	}
+	const trustedConfigFileDigest: TrustedWorkbenchConfigFileDigest = {
+		key: "gates.yaml",
+		path,
+		digest: digest.digest("hex"),
+	};
 	try {
-		const doc = parseYaml(content);
-		if (doc === null || doc === undefined) return { doc: undefined, errors: [] };
-		return { doc, errors: [] };
+		const doc = parseYaml(read.value.text);
+		if (doc === null || doc === undefined) return { doc: undefined, errors: [], trustedConfigFileDigest };
+		return { doc, errors: [], trustedConfigFileDigest };
 	} catch (error) {
 		return { doc: undefined, errors: [`gates.yaml: ${(error as Error).message}`] };
 	}
@@ -225,13 +291,29 @@ async function readGatesYaml(projectRoot: string): Promise<{ doc: unknown; error
  * gates.yaml abort with GateSetupError — a broken gate declaration must
  * never silently drop checks from the ladder.
  */
-export async function loadGates(projectRoot: string): Promise<Gate[]> {
-	const yaml = await readGatesYaml(projectRoot);
+async function loadGateSelectionConfig(
+	projectRoot: string,
+	hooks?: GateConfigReadHooks,
+): Promise<{ config: ProjectConfig; gates: Gate[]; trustedConfigFileDigest: TrustedWorkbenchConfigFileDigest }> {
+	const yaml = await readGatesYaml(projectRoot, hooks);
 	if (yaml.errors.length > 0) throw new GateSetupError(yaml.errors.join("; "));
+	if (!yaml.trustedConfigFileDigest) throw new GateSetupError(GATE_CONFIG_READ_ERROR);
 	const parsed = parseGatesDocument(yaml.doc);
 	if (parsed.errors.length > 0) throw new GateSetupError(parsed.errors.join("; "));
-	const config = await loadProjectConfig(projectRoot, { trusted: true });
-	return effectiveGates(config.profile, GATE_CATALOG, parsed.gates);
+	await hooks?.afterStableSnapshot?.();
+	const config = await loadProjectConfig(projectRoot, {
+		trusted: true,
+		parsedGatesDocument: { value: yaml.doc },
+	});
+	return {
+		config,
+		gates: effectiveGates(config.profile, GATE_CATALOG, parsed.gates),
+		trustedConfigFileDigest: yaml.trustedConfigFileDigest,
+	};
+}
+
+export async function loadGates(projectRoot: string, hooks?: GateConfigReadHooks): Promise<Gate[]> {
+	return (await loadGateSelectionConfig(projectRoot, hooks)).gates;
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +323,8 @@ export async function loadGates(projectRoot: string): Promise<Gate[]> {
 interface GateSelection {
 	config: ProjectConfig;
 	gates: Gate[];
+	/** Exact stable gates.yaml bytes used by selection, for validation binding. */
+	trustedConfigFileDigest: TrustedWorkbenchConfigFileDigest;
 	/** Selector-expanded requested gate ids, in selector order. */
 	requestedIds: string[];
 	/** Requested gate ids in prerequisite (topological) execution order. */
@@ -254,9 +338,12 @@ interface GateSelection {
  * prerequisite cycles — exactly the validation formal gate runs apply. Never
  * writes, never executes anything, never reads run records.
  */
-async function selectGates(projectRoot: string, selector: string): Promise<GateSelection> {
-	const config = await loadProjectConfig(projectRoot, { trusted: true });
-	const gates = await loadGates(projectRoot);
+async function selectGates(projectRoot: string, selector: string, hooks?: GateConfigReadHooks): Promise<GateSelection> {
+	// One fixed-size, same-handle gates.yaml snapshot supplies BOTH the strict
+	// executable Gate[] and config.gates (the gate-state binding input). The
+	// generic loader receives the parsed authority directly and cannot reread
+	// the path into a different snapshot.
+	const { gates, config, trustedConfigFileDigest } = await loadGateSelectionConfig(projectRoot, hooks);
 
 	const requestedIds = resolveSelector(selector, gates);
 	if (requestedIds.length === 0) {
@@ -277,7 +364,7 @@ async function selectGates(projectRoot: string, selector: string): Promise<GateS
 	} catch (error) {
 		throw new GateSetupError((error as Error).message);
 	}
-	return { config, gates, requestedIds, ordered };
+	return { config, gates, trustedConfigFileDigest, requestedIds, ordered };
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +473,43 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Privacy/resource-safe identity for an individual JSON value. The compact
+ * serialization is used only to compute fixed-size facts; raw hostile values
+ * never enter a failure reason, evidence detail, log line, or authority
+ * record. Values parsed from gate JSON artifacts have already passed the
+ * fixed 1 MiB same-open read cap.
+ */
+function jsonValueFacts(value: unknown): string {
+	const type = value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
+	try {
+		const serialized = JSON.stringify(value);
+		if (serialized === undefined) return `type=${type}, json_bytes=unavailable, sha256=unavailable`;
+		return `type=${type}, json_bytes=${Buffer.byteLength(serialized, "utf8")}, sha256=${createHash("sha256").update(serialized, "utf8").digest("hex")}`;
+	} catch {
+		return `type=${type}, json_bytes=unavailable, sha256=unavailable`;
+	}
+}
+
+/**
+ * Compile exactly the bytes that will be written, before either authority
+ * file is opened. Authority facts are never silently truncated: an otherwise
+ * legitimate but too-large run fails setup with one fixed bounded error and
+ * cannot be returned as a successful gate run.
+ */
+function compileGateAuthorityRecord(value: unknown): string {
+	let serialized: string;
+	try {
+		serialized = JSON.stringify(value, null, 2);
+	} catch {
+		throw new GateSetupError(GATE_AUTHORITY_PERSISTENCE_ERROR);
+	}
+	if (Buffer.byteLength(serialized, "utf8") > GATE_AUTHORITY_RECORD_MAX_BYTES) {
+		throw new GateSetupError(GATE_AUTHORITY_PERSISTENCE_ERROR);
+	}
+	return serialized;
+}
+
 function isStringArray(value: unknown): value is string[] {
 	return Array.isArray(value) && value.length <= 500 && value.every((item) => typeof item === "string" && item.length <= 200);
 }
@@ -430,11 +554,16 @@ export async function readPersistedGateRunFacts(
 	projectRoot: string,
 	runId: string,
 	manifest: Pick<RunRecord, "run_id" | "recipe" | "profile" | "mode">,
+	hooks?: { gates?: BoundedFileIoHooks; evidence?: BoundedFileIoHooks },
 ): Promise<PersistedGateRunFacts | null> {
 	const dir = join(runsDir(projectRoot), runId);
 	try {
-		const gatesRaw = JSON.parse(await readFile(join(dir, "gates.json"), "utf8")) as unknown;
-		const evidenceRaw = JSON.parse(await readFile(join(dir, "evidence.json"), "utf8")) as unknown;
+		const gatesRead = await readJsonFileBounded(join(dir, "gates.json"), GATE_AUTHORITY_RECORD_MAX_BYTES, hooks?.gates);
+		if (!gatesRead.ok) return null;
+		const evidenceRead = await readJsonFileBounded(join(dir, "evidence.json"), GATE_AUTHORITY_RECORD_MAX_BYTES, hooks?.evidence);
+		if (!evidenceRead.ok) return null;
+		const gatesRaw = gatesRead.value.value;
+		const evidenceRaw = evidenceRead.value.value;
 		if (!isRecord(gatesRaw) || !isRecord(evidenceRaw)) return null;
 		if (gatesRaw.schema_version !== GATE_SCHEMA_VERSION || gatesRaw.run_id !== runId) return null;
 		// Strict evidence schema identity: a missing or foreign
@@ -527,23 +656,35 @@ export async function readPersistedGateRunFacts(
 // Latest persisted gate status (prerequisite resolution)
 // ---------------------------------------------------------------------------
 
-async function readGatesFile(projectRoot: string, runId: string): Promise<GateFileRecord | null> {
+interface PersistedGateStatusRecord {
+	gates: Array<{ id: string; status: GateStatus }>;
+}
+
+async function readGatesFile(projectRoot: string, runId: string, hooks?: BoundedFileIoHooks): Promise<PersistedGateStatusRecord | null> {
 	const manifest = await readManifest(projectRoot, runId);
 	if (!manifest || manifest.recipe !== "gate") return null;
 	try {
-		const raw = await readFile(join(runsDir(projectRoot), runId, "gates.json"), "utf8");
-		const parsed = JSON.parse(raw) as GateFileRecord;
-		return parsed.run_id === runId ? parsed : null;
+		const read = await readJsonFileBounded(join(runsDir(projectRoot), runId, "gates.json"), GATE_AUTHORITY_RECORD_MAX_BYTES, hooks);
+		if (!read.ok || !isRecord(read.value.value)) return null;
+		const parsed = read.value.value;
+		if (parsed.schema_version !== GATE_SCHEMA_VERSION || parsed.run_id !== runId || !Array.isArray(parsed.gates)) return null;
+		const gates: PersistedGateStatusRecord["gates"] = [];
+		for (const candidate of parsed.gates) {
+			if (!isRecord(candidate) || typeof candidate.id !== "string" || candidate.id.length === 0 || candidate.id.length > 200) return null;
+			if (typeof candidate.status !== "string" || !GATE_STATUSES.includes(candidate.status as GateStatus)) return null;
+			gates.push({ id: candidate.id, status: candidate.status as GateStatus });
+		}
+		return { gates };
 	} catch {
 		return null;
 	}
 }
 
 /** Most recent persisted status of a gate, if any. */
-export async function latestGateStatus(projectRoot: string, gateId: string): Promise<{ status: GateStatus; run_id: string } | null> {
+export async function latestGateStatus(projectRoot: string, gateId: string, hooks?: BoundedFileIoHooks): Promise<{ status: GateStatus; run_id: string } | null> {
 	const runs = await listRuns(projectRoot, 50);
 	for (const run of runs) {
-		const record = await readGatesFile(projectRoot, run.run_id);
+		const record = await readGatesFile(projectRoot, run.run_id, hooks);
 		if (!record) continue;
 		const gate = record.gates.find((g) => g.id === gateId);
 		if (gate) return { status: gate.status, run_id: run.run_id };
@@ -569,6 +710,8 @@ export interface CheckContext {
 	effectiveProjectRoot: string;
 	runDir: string;
 	configIssues: ConfigIssue[];
+	/** Recipes from the same project-config load used by gate selection. */
+	recipes: readonly Recipe[];
 	profile: string | undefined;
 	mode: WorkbenchMode;
 	exec: ExecFn;
@@ -579,6 +722,8 @@ export interface CheckContext {
 	workerFirstFacts?: WorkerFirstGateFacts;
 	/** P7: actor facts for the shared recipe mutation decision in recipe checks. */
 	actorFacts?: RecipeMutationFacts;
+	/** Test-only allocation observation; cannot raise the fixed JSON artifact cap. */
+	jsonFileReadHooks?: BoundedFileIoHooks;
 	log: (line: string) => void;
 }
 
@@ -637,19 +782,18 @@ class JsonArtifactError extends Error {
 
 async function resolveJsonFile(ctx: CheckContext, check: GateCheck, file: string, label: string): Promise<{ path: string; value: unknown }> {
 	const absolute = await assertPathContained(ctx.effectiveProjectRoot, file, label);
-	let raw: string;
-	try {
-		raw = await readFile(absolute, "utf8");
-	} catch {
-		throw new JsonArtifactError("missing", true);
+	const read = await readJsonFileBounded(absolute, GATE_JSON_ARTIFACT_MAX_BYTES, ctx.jsonFileReadHooks);
+	if (!read.ok) {
+		switch (read.error.code) {
+			case "io_error": throw new JsonArtifactError("missing", true);
+			case "source_oversized": throw new JsonArtifactError("source_oversized (maximum 1048576 bytes)", false);
+			case "source_not_regular": throw new JsonArtifactError("source_not_regular", false);
+			case "invalid_json":
+			case "invalid_utf8": throw new JsonArtifactError("invalid JSON", false);
+			default: throw new JsonArtifactError("bounded read failed", false);
+		}
 	}
-	let value: unknown;
-	try {
-		value = JSON.parse(raw);
-	} catch (error) {
-		throw new JsonArtifactError(`invalid JSON: ${(error as Error).message}`, false);
-	}
-	return { path: absolute, value };
+	return { path: absolute, value: read.value.value };
 }
 
 /** Dot-path resolution; arrays support `.length`. */
@@ -818,14 +962,14 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 
 			case "recipe": {
 				const candidates = check.recipe ? [check.recipe] : (check.recipes ?? []);
-				const declared = await declaredRecipe(ctx.projectRoot, candidates);
+				const declared = ctx.recipes.find((recipe) => candidates.includes(recipe.name));
 				if (!declared) {
 					fail(`no declared recipe among: ${candidates.join(", ")}`, [
 						{ type: "config", source: ".pi/workbench/recipes.yaml", detail: `none of ${candidates.join(", ")} is declared` },
 					]);
 					break;
 				}
-				if (!(await recipeAllowedInMode(ctx.projectRoot, declared.name, ctx.mode))) {
+				if (!declared.allowed_modes.includes(ctx.mode)) {
 					entry.status = "BLOCKED";
 					entry.blocked_reason = `recipe "${declared.name}" is not allowed in ${ctx.mode} mode`;
 					break;
@@ -980,8 +1124,10 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 				if (check.json_equals !== undefined) {
 					const resolvedValue = resolveJsonPath(resolved.value, foundPath).value;
 					if (!isDeepStrictEqual(resolvedValue, check.json_equals)) {
-						fail(`JSON field ${file}#${foundPath} does not equal ${JSON.stringify(check.json_equals)}`, [
-							{ type: "json", source: file, detail: `${foundPath} = ${JSON.stringify(resolvedValue)}, expected ${JSON.stringify(check.json_equals)}` },
+						const actualFacts = jsonValueFacts(resolvedValue);
+						const expectedFacts = jsonValueFacts(check.json_equals);
+						fail(`JSON field ${file}#${foundPath} does not equal expected value (${expectedFacts})`, [
+							{ type: "json", source: file, detail: `${foundPath} mismatch: actual(${actualFacts}), expected(${expectedFacts})` },
 						]);
 						break;
 					}
@@ -1010,8 +1156,9 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 				const { found, value } = resolveJsonPath(resolved.value, path);
 				const finite = typeof value === "number" && Number.isFinite(value);
 				if (!found || !finite) {
-					fail(`numeric field ${file}#${path} must be a finite number (got ${JSON.stringify(value)})`, [
-						{ type: "numeric", source: file, detail: `${path} = ${JSON.stringify(value)} (not a finite number)` },
+					const valueFacts = found ? jsonValueFacts(value) : "value=missing";
+					fail(`numeric field ${file}#${path} must be a finite number (${valueFacts})`, [
+						{ type: "numeric", source: file, detail: `${path} is not a finite number (${valueFacts})` },
 					]);
 					break;
 				}
@@ -1170,17 +1317,6 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 	entry.finished_at = finishedAt.toISOString();
 	entry.duration_ms = Math.max(0, finishedAt.getTime() - startedAt.getTime());
 	return { entry, artifactPaths };
-}
-
-async function declaredRecipe(projectRoot: string, candidates: readonly string[]): Promise<Recipe | undefined> {
-	const config = await loadProjectConfig(projectRoot, { trusted: true });
-	return config.recipes.find((r) => candidates.includes(r.name));
-}
-
-async function recipeAllowedInMode(projectRoot: string, recipeName: string, mode: WorkbenchMode): Promise<boolean> {
-	const config = await loadProjectConfig(projectRoot, { trusted: true });
-	const recipe = config.recipes.find((r) => r.name === recipeName);
-	return recipe?.allowed_modes.includes(mode) ?? false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1343,7 +1479,7 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 	const now = input.now ?? (() => new Date());
 	const startedAt = now();
 
-	const { config, gates, requestedIds, ordered } = await selectGates(projectRoot, selector);
+	const { config, gates, trustedConfigFileDigest, requestedIds, ordered } = await selectGates(projectRoot, selector, input.gateConfigReadHooks);
 
 	const runId = makeRunId(startedAt);
 	const runDir = join(runsDir(projectRoot), runId);
@@ -1373,6 +1509,7 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 		effectiveProjectRoot: config.effectiveProjectRoot,
 		runDir,
 		configIssues: config.issues,
+		recipes: config.recipes,
 		profile: config.profile,
 		mode,
 		exec,
@@ -1381,6 +1518,7 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 		manualEvidence: trimmedManual,
 		workerFirstFacts: input.workerFirstFacts,
 		actorFacts: input.actorFacts,
+		jsonFileReadHooks: input.jsonFileReadHooks,
 		log,
 	};
 
@@ -1434,6 +1572,12 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 		mode,
 		gates: gateEntries,
 	};
+	// Compile BOTH authority records before opening either destination. The
+	// bounded readers reject files above this exact cap, so returning success
+	// after writing an unreadable record would manufacture acceptance
+	// authority. Complete facts either fit unchanged or the run fails closed.
+	const gatesAuthorityJson = compileGateAuthorityRecord(gatesFile);
+	const evidenceAuthorityJson = compileGateAuthorityRecord(evidenceFile);
 
 	const stdoutView = truncateTail(stdoutFull, { maxLines: 2000, maxBytes: 51200 });
 
@@ -1458,6 +1602,7 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 		requestedGates: requestedIds,
 		effectiveGates: gateEntries.map((g) => g.id),
 		projectGates: config.gates,
+		trustedConfigFileDigest,
 		manualEvidence: persistedManual,
 		workerFirstFacts: input.workerFirstFacts,
 		prerequisiteStatus,
@@ -1526,8 +1671,8 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 	};
 
 	await writeFile(join(runDir, "manifest.json"), JSON.stringify(manifest, null, 2), "utf8");
-	await writeFile(join(runDir, "gates.json"), JSON.stringify(gatesFile, null, 2), "utf8");
-	await writeFile(join(runDir, "evidence.json"), JSON.stringify(evidenceFile, null, 2), "utf8");
+	await writeFile(join(runDir, "gates.json"), gatesAuthorityJson, "utf8");
+	await writeFile(join(runDir, "evidence.json"), evidenceAuthorityJson, "utf8");
 	await writeFile(join(runDir, "summary.json"), JSON.stringify(summary, null, 2), "utf8");
 	await writeFile(join(runDir, "stdout.log"), stdoutFull, "utf8");
 	await writeFile(join(runDir, "stderr.log"), "", "utf8");

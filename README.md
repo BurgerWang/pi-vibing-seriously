@@ -1,57 +1,75 @@
 # pi-dev-workbench
 
 <p align="center">
-  <img src="assets/banner.svg" alt="pi-dev-workbench v0.9.0 — Pi-native workbench: AUDIT / DEV / VERIFY modes, recipes, gates and evidence" width="661" />
+  <img src="assets/banner.svg" alt="pi-dev-workbench v0.10.0 — Pi-native workbench: AUDIT / DEV / VERIFY modes, recipes, gates and evidence" width="679" />
 </p>
 
-**pi-dev-workbench** is a [Pi Package](https://pi.dev) that turns Pi into a
-development workbench for quantitative research and general software
-engineering: a strict **AUDIT / DEV / VERIFY** mode policy, declarative
-recipes with auditable run records, **evidence-backed validation gates**,
-deterministic action caching, and a **worker-first delegation workflow** with
-actual-diff review. It runs entirely on Pi's native mechanisms — extensions,
-custom tools, custom commands, skills, prompt templates, and TUI
-status/widget slots. **It is not a standalone agent framework, daemon,
+**pi-dev-workbench** is a [Pi Package](https://pi.dev) that makes software and
+quantitative-research work reviewable from plan to verdict. It combines an
+enforced **AUDIT / DEV / VERIFY** workflow, declared recipes, durable run
+evidence, machine-backed gates, bounded worker delegation, and strict context
+output control — all through Pi's native extension, tool, command, skill,
+prompt, and TUI surfaces. **It is not a standalone agent framework, daemon,
 background service, or sandbox.**
+
+**Navigate:** [Quick start](#quick-start) · [Core concepts](#core-concepts) ·
+[Modes](#mode-policy) · [Recipes](#recipes-and-run-records) ·
+[Context limits](#context-output-control) · [Command surface](#reference) ·
+[Documentation](#documentation)
 
 ## Quick start
 
-```bash
-npm install --ignore-scripts   # devDependencies (TS, tsx, Pi types) + yaml runtime dep
-pi install -l .                # register this package in project settings
-pi -a -p "/q-status"           # non-interactive smoke test (print mode)
-```
+1. **Install this checkout and confirm that the extension loads:**
 
-Inside a Pi session:
+   ```bash
+   npm install --ignore-scripts   # devDependencies (TS, tsx, Pi types) + yaml runtime dep
+   pi install -l .                # register this package in project settings
+   pi -a -p "/q-status"           # non-interactive smoke test (print mode)
+   ```
 
-```
-/q-init generic                        # or: /q-init quant-research/stock-selection
-                                       #     /q-init quant-research/market-timing
-/q-status                              # mode, cwd, project trust, active tools
-/q-mode-verify                         # switch to VERIFY after implementation
-```
+2. **Initialize the target project.** Start Pi in that project, approve
+   project trust, then choose one profile:
 
-`/q-init` shows every file it will write before writing anything, never
-overwrites existing files (per-file confirmation otherwise), and writes a
-profile-specific `AGENTS.md` for the project. After initialization:
-**exit Pi, re-enter the project, and approve project trust** — workbench
-config is only read under trust. The `hft`, `market-making`, `lob` and
-`execution-engine` profiles are rejected by design.
+   ```text
+   /q-init generic                        # or: /q-init quant-research/stock-selection
+                                          #     /q-init quant-research/market-timing
+   ```
 
-## Highlights
+   `/q-init` previews every planned file, creates the missing files, and asks
+   for confirmation before each overwrite. It also writes a profile-specific
+   `AGENTS.md`. The `hft`, `market-making`, `lob`, and `execution-engine`
+   profiles are rejected by design.
+
+3. **Reload the initialized project.** Exit Pi, re-enter the project, and
+   approve project trust again. Workbench configuration and recipes are read
+   only for trusted projects.
+
+4. **Follow the mode → recipe → gate loop:**
+
+   ```text
+   /q-status              # mode, cwd, project trust, active tools
+   /q-mode-audit          # inspect without writes
+   /q-mode-dev            # implement through bounded worker slices
+   /q-run typecheck       # run a declared recipe; use the names in recipes.yaml
+   /q-mode-verify         # declared recipes and gates only
+   /q-gate base           # run the base validation ladder
+   ```
+
+For onboarding details, nested projects, and recipe examples, see
+[Project onboarding](docs/project-onboarding.md).
+
+## Core concepts
 
 | Capability | What you get |
 | --- | --- |
-| **Pi-native integration** | Built on Pi's own extension surface — no standalone/companion framework, daemon, background service, or separate runtime |
-| **Mode policy** | AUDIT (read-only) / DEV (implement) / VERIFY (re-verify), enforced by active-tool sets **and** a hard `tool_call` guard |
-| **Declarative recipes** | Named, schema-parameterized commands from `recipes.yaml`; argv-only (no shell strings), path-contained, redacted run records |
-| **Evidence-backed gates** | b0–b6 base + q0–q5 quant gates; statuses exactly PASS / FAIL / BLOCKED / NOT_RUN; machine evidence only — model prose can never masquerade as verification |
-| **Worker-first delegation** | Bounded, budgeted workers with parent-approved write paths; every diff reviewed against the real git state before the next delegation or VERIFY |
-| **Deterministic action cache** | Opt-in, result-only caching of declared recipes with content-addressed keys (`/q-cache-*`); never caches LLM answers or arbitrary bash |
-| **Quant research contracts** | Q0–Q5 validation ladder, `quant-result.json` output schema, and versioned DATA_SNAPSHOT / FEATURE_SET / BACKTEST_RESULT cache contracts |
-| **Run records & comparison** | Per-run manifests, bounded/redacted logs, artifact snapshots, `/q-report` and `/q-compare` |
-| **Native read/grep overrides** | `read` preview and `grep` count mode keep large tool results out of the session context (frozen-cohort results below) |
-| **Pi-native TUI** | Status line (mode · profile · gates · latest run), auto-hiding widget, compact tool renderers |
+| **Modes define authority** | AUDIT inspects, DEV implements, and VERIFY re-runs declared evidence; active-tool sets and a hard `tool_call` guard enforce the boundary |
+| **Recipes produce evidence** | Named, schema-parameterized argv commands run without shell strings; path-contained, redacted run records keep the full evidence on disk |
+| **Gates decide readiness** | b0–b6 base and q0–q5 quant gates return exactly PASS / FAIL / BLOCKED / NOT_RUN; model prose never substitutes for machine or recorded manual evidence |
+| **Workers own routine writes** | Bounded workers implement parent-approved slices; the commander owns architecture, reviews the actual git diff, and runs final gates |
+| **Output stays bounded** | Result envelopes, turn/history budgets, stale-safe cursors, bounded DTOs, numeric telemetry, and a legacy-session sanitizer control model-visible context |
+| **Caching is explicit** | Opt-in, success-only recipe result caching uses declared content inputs; it never caches LLM answers or arbitrary bash |
+| **Quant work has contracts** | Mid/low-frequency profiles add Q0–Q5 plus versioned DATA_SNAPSHOT / FEATURE_SET / BACKTEST_RESULT and `quant-result.json` contracts |
+| **Everything stays Pi-native** | Extensions, 30 commands, 14 registered tools, 14 skills, 7 prompt templates, and compact status/widget renderers—no companion runtime |
 
 **Native read-preview / grep-count benchmark (frozen cohort).** In the
 frozen protocol-v2 cohort — 20 control + 20 treatment sessions, fixed ABBA×10
@@ -130,12 +148,44 @@ Recipes are fully declarative in `.pi/workbench/recipes.yaml`:
 - Each run persists a manifest, bounded logs, redacted environment facts,
   and artifact snapshots under `.pi/workbench/runs/<run-id>/` — never API
   keys, tokens, or full environment values.
-- Output truncation uses Pi's official helpers (2000 lines / ~50 KB);
-  `workbench_read_run` returns bounded tails.
+- Model-visible recipe summaries are bounded independently from full run
+  evidence. `workbench_read_run` uses seek-based log pages with one shared
+  32 KiB/400-line ceiling and a stale-safe cursor; full logs remain on disk.
 
 Commands: `/q-run <recipe> [key=value ...]`, `/q-runs [limit]`,
 `/q-run-show <run-id>`, `/q-evidence <run-id>`. Tools:
 `workbench_run_recipe`, `workbench_read_run`, `workbench_compare_runs`.
+
+## Context output control
+
+Version 0.10.0 treats model-visible tool output as a limited control-plane
+resource. Complete logs, comparisons, reviews, and gate records remain in
+project artifacts; tool results expose bounded summaries, opaque continuation
+cursors, and artifact pointers. A changed source makes its cursor stale, and
+invalid tool-call/result pairing fails closed instead of creating orphaned
+history.
+
+| Model-visible surface | Hard limit |
+| --- | --- |
+| Native `read` page | 12,288 UTF-8 bytes; 240 file lines (252 lines including framing) |
+| Default result / error result | 16 KiB and 240 lines / 8 KiB |
+| Run-log page; diff review; comparison | 32,768 bytes and 400 lines |
+| Gate read | 24 KiB and 320 lines |
+| One turn's tool-result batch | Commander 64 KiB; worker 48 KiB; at most 16 calls |
+| Active tool-result history | Commander 96 KiB; worker 64 KiB |
+| Details value / streaming update | 8 KiB / 4 KiB |
+
+`/q-context-output-status [json]` reports numeric-only observations such as
+bytes shown or omitted, truncations, blocked calls, history collapse, and
+worker facts. For a legacy session, create a separate bounded copy with:
+
+```bash
+npm run session:sanitize -- --input <session.jsonl> --output <new-session.jsonl> [--collapse-content]
+```
+
+The sanitizer never edits or activates the source session. See
+[Context Output Control Plane v1](docs/context-output-control-plane.md) for
+cursor semantics, durable evidence, compatibility, and release recipes.
 
 ## Validation gates
 
@@ -229,9 +279,11 @@ the project directory, and approve trust when prompted.
 
 ## Reference
 
-The deterministic surface — **29 commands, 11 workbench tools, 7 prompt
-templates** — is pinned by the inventory test. The three lease commands and
-`/q-milestone-handoff` are **user-only** slash commands, never model tools.
+The deterministic surface — **30 commands, 14 registered tools** (3 native
+`read`/`grep`/`find` overrides followed by 11 `workbench_*` tools), and **7
+prompt templates** — is pinned by the inventory test. The three lease
+commands and `/q-milestone-handoff` are **user-only** slash commands, never
+model tools.
 
 **Workbench tools:** `workbench_project_inspect`, `workbench_run_recipe`,
 `workbench_read_run`, `workbench_run_gate`, `workbench_read_gate`,
@@ -246,7 +298,7 @@ templates** — is pinned by the inventory test. The three lease commands and
 /q-run <recipe> [k=v ...] | /q-runs [n] | /q-run-show <run-id>
 /q-gate <id|base|quant|all> | /q-gates | /q-gate-show <gate-id> | /q-evidence <run-id>
 /q-report latest|<run-id> | /q-compare <run-a> <run-b> | /q-widget on|off
-/q-cost-status | /q-delegation-status
+/q-cost-status | /q-context-output-status [json] | /q-delegation-status
 /q-cache-status | /q-cache-report | /q-cache-doctor | /q-cache-explain
 /q-cache-prune | /q-cache-clear | /q-cache-validate | /q-cache-lineage
 /q-write-policy status | /q-commander-write-unlock ... | /q-commander-write-lock   (user-only)
@@ -268,10 +320,11 @@ scoped to mid/low-frequency research only.
 
 | Doc | Covers |
 | --- | --- |
+| [project-onboarding.md](docs/project-onboarding.md) | Install, initialize, trust, nested-project setup, first recipes and gates |
 | [architecture.md](docs/architecture.md) | Extension layout, core services, event wiring |
+| [context-output-control-plane.md](docs/context-output-control-plane.md) | Hard output limits, cursors, history projection, session sanitization and release evidence |
 | [worker-delegation.md](docs/worker-delegation.md) | Worker contract, budgets, review lifecycle |
 | [security.md](docs/security.md) | Full protection matrix and boundaries |
-| [project-onboarding.md](docs/project-onboarding.md) | Setting up a new project |
 | [quant-research-profile.md](docs/quant-research-profile.md) | Quant scope, contracts, Q0–Q5 |
 | [compatibility.md](docs/compatibility.md) | Tested environment matrix |
 | [cache/](docs/cache/) | Telemetry, stable-prefix, action cache, quant contracts, benchmark |

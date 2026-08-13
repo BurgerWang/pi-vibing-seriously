@@ -18,13 +18,18 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { before, test } from "node:test";
 
 import { runRecipe, type RunRecipeResult } from "../extensions/workbench-runtime/core/recipe-runner.ts";
 import { runGates } from "../extensions/workbench-runtime/core/gate-engine.ts";
-import { ActionCacheStore } from "../extensions/workbench-runtime/cache/action-store.ts";
+import {
+	ACTION_RECORD_MAX_BYTES,
+	CACHE_INDEX_MAX_BYTES,
+	LOCK_RECORD_MAX_BYTES,
+	ActionCacheStore,
+} from "../extensions/workbench-runtime/cache/action-store.ts";
 import { recipeDefinitionHash } from "../extensions/workbench-runtime/cache/action-key.ts";
 import { readManifest } from "../extensions/workbench-runtime/core/runs.ts";
 import { DEFAULT_RECIPE, type Recipe } from "../extensions/workbench-runtime/core/recipe-schema.ts";
@@ -596,6 +601,68 @@ test("store: corrupted action JSON is a miss and is quarantined", async () => {
 	});
 });
 
+test("store: oversized and non-regular authority records are rejected before allocation", async () => {
+	await withTempDir(async (root) => {
+		const allocations: number[] = [];
+		const reads: number[] = [];
+		const store = new ActionCacheStore(root, {
+			boundedReadHooks: {
+				onBufferAllocate: (bytes) => allocations.push(bytes),
+				beforeRead: (bytes) => reads.push(bytes),
+			},
+		});
+		await mkdir(join(cacheDir(root), "actions"), { recursive: true });
+		const oversizedKey = "b".repeat(64);
+		const oversizedHandle = await open(store.actionPath(oversizedKey), "w");
+		try { await oversizedHandle.truncate(ACTION_RECORD_MAX_BYTES + 1); }
+		finally { await oversizedHandle.close(); }
+		assert.deepEqual(await store.readRecord(oversizedKey), { record: null, corrupt: true });
+		assert.deepEqual(allocations, [], "oversized action record is rejected before allocation");
+		assert.deepEqual(reads, [], "oversized action record is rejected before read");
+
+		const directoryKey = "c".repeat(64);
+		await mkdir(store.actionPath(directoryKey));
+		assert.deepEqual(await store.readRecord(directoryKey), { record: null, corrupt: true });
+		assert.deepEqual(allocations, [], "non-regular action record is rejected before allocation");
+
+		const indexHandle = await open(store.indexPath(), "w");
+		try { await indexHandle.truncate(CACHE_INDEX_MAX_BYTES + 1); }
+		finally { await indexHandle.close(); }
+		const rebuilt = await store.readIndex();
+		assert.deepEqual(rebuilt.entries, [], "oversized index fails closed to a bounded rebuild");
+		assert.deepEqual(allocations, [], "oversized index is rejected before allocation");
+
+		await mkdir(join(cacheDir(root), "locks"), { recursive: true });
+		const lockKey = "d".repeat(64);
+		const lockHandle = await open(store.lockPath(lockKey), "w");
+		try { await lockHandle.truncate(LOCK_RECORD_MAX_BYTES + 1); }
+		finally { await lockHandle.close(); }
+		assert.equal(await store.hasFreshLock(lockKey), false, "oversized lock fails closed as not fresh");
+		assert.deepEqual(allocations, [], "oversized lock is rejected before allocation");
+	});
+});
+
+test("store: index rebuild skips oversized action records without allocating them", async () => {
+	await withTempDir(async (root) => {
+		const allocations: number[] = [];
+		const reads: number[] = [];
+		const store = new ActionCacheStore(root, {
+			boundedReadHooks: {
+				onBufferAllocate: (bytes) => allocations.push(bytes),
+				beforeRead: (bytes) => reads.push(bytes),
+			},
+		});
+		await mkdir(join(cacheDir(root), "actions"), { recursive: true });
+		const key = "e".repeat(64);
+		const handle = await open(store.actionPath(key), "w");
+		try { await handle.truncate(ACTION_RECORD_MAX_BYTES + 1); }
+		finally { await handle.close(); }
+		assert.deepEqual((await store.rebuildIndex()).entries, []);
+		assert.deepEqual(allocations, []);
+		assert.deepEqual(reads, []);
+	});
+});
+
 test("store: corrupted index is rebuilt from actions/", async () => {
 	await withTempDir(async (root) => {
 		await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"]) });
@@ -1105,7 +1172,7 @@ test("P4b/P6-C separation: a registered read (REUSABLE in text+details) leaves t
 		// registered read, include=all (bounded tails): the same verdict
 		const read2 = await readRun.execute(
 			"call-3",
-			{ run_id: firstRunId, include: "all", max_lines: 5, max_bytes: 1024 },
+			{ run_id: firstRunId, include: "all", max_lines: 40, max_bytes: 4096 },
 			undefined,
 			undefined,
 			trustedCtx(root) as never,

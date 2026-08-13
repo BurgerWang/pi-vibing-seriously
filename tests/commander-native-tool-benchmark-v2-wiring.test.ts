@@ -7,15 +7,22 @@
  *     v2 inputs path, the fixed v2 manifest path and the v2 FINAL
  *     collector entry; every pre-existing script and the version metadata
  *     stay byte-identical (the later test:release-assets,
- *     test:runtime-core, test:gate-preflight, test:worker-efficiency and
- *     test:diff-review-efficiency scripts and the release-assets-test,
+ *     test:runtime-core, test:gate-preflight, test:worker-efficiency,
+ *     test:diff-review-efficiency, test:context-output-baseline,
+ *     test:context-output-core and
+ *     benchmark:context-output scripts and the release-assets-test,
  *     runtime-core-test, typecheck-feedback, gate-preflight-test,
- *     worker-efficiency-test and diff-review-efficiency-test recipes are
- *     additive and pinned in tests/execution-efficiency.test.ts);
+ *     worker-efficiency-test, diff-review-efficiency-test,
+ *     context-output-baseline-test, context-output-core-test and
+ *     context-output-benchmark recipes are
+ *     additive and pinned here or in tests/execution-efficiency.test.ts);
  *   - recipes.yaml stays schema-valid (no parse errors/warnings) and the
  *     declared recipe set is exactly the pre-existing set plus the three v2
- *     recipes, release-assets-test, runtime-core-test, typecheck-feedback
- *     and gate-preflight-test (nothing removed);
+ *     recipes, release-assets-test, runtime-core-test, typecheck-feedback,
+ *     gate-preflight-test, worker-efficiency-test, diff-review-efficiency-test,
+ *     context-output-baseline-test, context-output-core-test and
+ *     context-output-benchmark (nothing
+ *     removed);
  *   - commander-native-tool-benchmark-v2-prepare: exact argv through the
  *     package script (`--collection {{collection}}`), exactly one required
  *     string param, DEV+VERIFY, expected exit 0, mutation artifacts, the
@@ -52,19 +59,32 @@ import { ATTEMPT_TIMEOUT_MS_V2, FINAL_V2_MAX_ATTEMPTS, OUTPUT_ROOT_NAME_V2 } fro
 const V2_PREPARE_SCRIPT = "tsx scripts/commander-native-tool-benchmark-v2-prepare.ts prepare --inputs fixtures/commander-native-tool-benchmark-v2/inputs";
 const V2_BENCHMARK_SCRIPT = "tsx scripts/commander-native-tool-benchmark-v2-analyze.ts analyze .pi/workbench/runs/commander-native-tool-benchmark-v2-manifest.json --json";
 const V2_FINAL_SCRIPT = "tsx scripts/commander-native-tool-v2-final-collect.ts";
+const CONTEXT_OUTPUT_BASELINE_SCRIPT = "tsx --test tests/context-output-baseline.test.ts";
+const CONTEXT_OUTPUT_CORE_SCRIPT = "tsx --test tests/output-envelope.test.ts tests/turn-output-budget.test.ts tests/continuation-cursor.test.ts tests/bounded-file-io.test.ts tests/details-projection.test.ts tests/context-history-budget.test.ts tests/output-control-telemetry.test.ts";
+const CONTEXT_OUTPUT_INTEGRATION_SCRIPT = "tsx --test tests/output-control-wiring.test.ts tests/read-v3.test.ts tests/read-run-log-page.test.ts tests/compare-output-bounds.test.ts tests/gate-output-bounds.test.ts tests/context-output-worker.test.ts";
+const CONTEXT_OUTPUT_STRESS_SCRIPT = "tsx --test tests/context-output-stress.test.ts";
+const READ_V3_SCRIPT = "tsx --test tests/native-tool-policy.test.ts tests/native-tool-wiring.test.ts tests/read-v3.test.ts";
+const CONTEXT_OUTPUT_BENCHMARK_SCRIPT = "tsx scripts/context-output-benchmark.ts";
+const SESSION_SANITIZE_SCRIPT = "tsx scripts/workbench-session-sanitize.ts";
 
-test("package.json: exactly the three intended v2 scripts, frozen v2 inputs and fixed v2 manifest path; all existing scripts and version metadata unchanged", async () => {
+test("package.json: exact script inventory includes v2 and final v0.10 context-output scripts", async () => {
 	const pkg = JSON.parse(await readFile(join(process.cwd(), "package.json"), "utf8")) as { version?: string; scripts?: Record<string, string> };
 
 	// Exactly the three v2 scripts, with the exact frozen intent.
 	assert.equal(pkg.scripts?.["commander:nro:v2:prepare"], V2_PREPARE_SCRIPT);
 	assert.equal(pkg.scripts?.["commander:nro:v2:benchmark"], V2_BENCHMARK_SCRIPT);
 	assert.equal(pkg.scripts?.["commander:nro:v2:final"], V2_FINAL_SCRIPT);
+	assert.equal(pkg.scripts?.["test:context-output-baseline"], CONTEXT_OUTPUT_BASELINE_SCRIPT);
+	assert.equal(pkg.scripts?.["test:read-v3"], READ_V3_SCRIPT);
+	assert.equal(pkg.scripts?.["benchmark:context-output"], CONTEXT_OUTPUT_BENCHMARK_SCRIPT);
+	assert.equal(pkg.scripts?.["session:sanitize"], SESSION_SANITIZE_SCRIPT);
 
 	// The complete scripts map is exactly the pre-existing scripts plus the
 	// three v2 scripts and the additive test:release-assets,
 	// test:runtime-core, test:gate-preflight, test:worker-efficiency and
-	// test:diff-review-efficiency scripts — nothing changed, nothing removed.
+	// test:diff-review-efficiency scripts, plus the two approved R0
+	// context-output baseline, core, and benchmark scripts — nothing changed,
+	// nothing removed.
 	assert.deepEqual(pkg.scripts, {
 		typecheck: "tsc --noEmit",
 		test: "tsx --test tests/*.test.ts",
@@ -73,6 +93,11 @@ test("package.json: exactly the three intended v2 scripts, frozen v2 inputs and 
 		"test:gate-preflight": "tsx --test tests/gates.test.ts tests/p4-render.test.ts tests/result-summary-wiring.test.ts",
 		"test:worker-efficiency": "tsx --test tests/worker-policy.test.ts tests/worker-runner.test.ts tests/delegation-ledger.test.ts tests/p6-b-stable-prefix.test.ts",
 		"test:diff-review-efficiency": "tsx --test tests/diff-review.test.ts tests/diff-review-wiring.test.ts",
+		"test:context-output-baseline": CONTEXT_OUTPUT_BASELINE_SCRIPT,
+		"test:context-output-core": CONTEXT_OUTPUT_CORE_SCRIPT,
+		"test:context-output-integration": CONTEXT_OUTPUT_INTEGRATION_SCRIPT,
+		"test:context-output-stress": CONTEXT_OUTPUT_STRESS_SCRIPT,
+		"test:read-v3": READ_V3_SCRIPT,
 		check: "npm run typecheck && npm test && git diff --check",
 		"commander:benchmark": "tsx scripts/commander-token-benchmark.ts",
 		"commander:prepare": "tsx scripts/commander-token-p9-prepare.ts",
@@ -85,9 +110,11 @@ test("package.json: exactly the three intended v2 scripts, frozen v2 inputs and 
 		"commander:nro:pilot": "tsx scripts/commander-native-tool-dev-pilot.ts",
 		"cache:report": "tsx scripts/cache-benchmark.ts report",
 		"cache:doctor": "tsx scripts/cache-benchmark.ts doctor",
+		"benchmark:context-output": CONTEXT_OUTPUT_BENCHMARK_SCRIPT,
+		"session:sanitize": SESSION_SANITIZE_SCRIPT,
 	});
 	// No version metadata drift.
-	assert.equal(pkg.version, "0.9.0");
+	assert.equal(pkg.version, "0.10.0");
 });
 
 // ---------------------------------------------------------------------------
@@ -102,15 +129,16 @@ async function loadRecipes(): Promise<ReturnType<typeof parseRecipesDocument>> {
 	return parseRecipesDocument(parseYaml(text));
 }
 
-test("recipes.yaml: schema-valid, declared recipe set is exactly the pre-existing set plus the three v2 recipes, release-assets-test, runtime-core-test, typecheck-feedback, gate-preflight-test, worker-efficiency-test and diff-review-efficiency-test", async () => {
+test("recipes.yaml: schema-valid, exact recipe inventory includes additive context-output recipes without removing prior entries", async () => {
 	const doc = await loadRecipes();
 	assert.deepEqual(doc.errors, []);
 	assert.deepEqual(doc.warnings, []);
 	// The declared recipe set is exactly the pre-existing set plus the three
 	// v2 recipes, release-assets-test, runtime-core-test, typecheck-feedback,
 	// gate-preflight-test, worker-efficiency-test and
-	// diff-review-efficiency-test — the parser returns recipes sorted by
-	// name, so compare order-independently.
+	// diff-review-efficiency-test, plus the approved context-output
+	// recipes — the parser returns recipes sorted by name, so compare
+	// order-independently.
 	assert.deepEqual(
 		[...doc.recipes.map((r) => r.name)].sort(),
 		[
@@ -123,6 +151,12 @@ test("recipes.yaml: schema-valid, declared recipe set is exactly the pre-existin
 			"gate-preflight-test",
 			"worker-efficiency-test",
 			"diff-review-efficiency-test",
+				"context-output-baseline-test",
+				"context-output-core-test",
+				"context-output-integration-test",
+				"context-output-stress",
+				"read-v3-test",
+			"context-output-benchmark",
 			"commander-token-p9-prepare",
 			"commander-token-p9-benchmark",
 			"commander-native-tool-benchmark-prepare",
@@ -134,6 +168,123 @@ test("recipes.yaml: schema-valid, declared recipe set is exactly the pre-existin
 			"commander-native-tool-final-collect",
 		].sort(),
 	);
+
+	const contextOutputBaseline = doc.recipes.find((r) => r.name === "context-output-baseline-test");
+	assert.ok(contextOutputBaseline, "context-output-baseline-test recipe declared");
+	assert.deepEqual(contextOutputBaseline.command, ["npm", "run", "test:context-output-baseline"]);
+	assert.deepEqual(contextOutputBaseline.allowed_modes, ["DEV", "VERIFY"]);
+	assert.equal(contextOutputBaseline.mutation, "none");
+	assert.deepEqual(contextOutputBaseline.writes, []);
+	assert.equal(contextOutputBaseline.cache.enabled, true);
+	assert.equal(contextOutputBaseline.cache.version, 2);
+	assert.deepEqual(contextOutputBaseline.cache.inputs, [
+		"package.json",
+		"package-lock.json",
+		"tsconfig.json",
+		".pi/workbench/recipes.yaml",
+		"extensions/**/*.ts",
+		"tests/helpers.ts",
+		"tests/context-output-baseline.test.ts",
+		"scripts/context-output-benchmark.ts",
+	]);
+
+	const contextOutputCore = doc.recipes.find((r) => r.name === "context-output-core-test");
+	assert.ok(contextOutputCore, "context-output-core-test recipe declared");
+	assert.deepEqual(contextOutputCore.command, ["npm", "run", "test:context-output-core"]);
+	assert.deepEqual(contextOutputCore.allowed_modes, ["DEV", "VERIFY"]);
+	assert.equal(contextOutputCore.mutation, "none");
+	assert.deepEqual(contextOutputCore.writes, []);
+	assert.equal(contextOutputCore.cache.enabled, true);
+	assert.equal(contextOutputCore.cache.version, 4);
+	assert.deepEqual(contextOutputCore.cache.inputs, [
+		"package.json",
+		"package-lock.json",
+		"tsconfig.json",
+		".pi/workbench/recipes.yaml",
+		"extensions/workbench-runtime/core/output-policy.ts",
+		"extensions/workbench-runtime/core/output-envelope.ts",
+		"extensions/workbench-runtime/core/turn-output-budget.ts",
+		"extensions/workbench-runtime/core/continuation-cursor.ts",
+		"extensions/workbench-runtime/core/bounded-file-io.ts",
+		"extensions/workbench-runtime/core/details-projection.ts",
+		"extensions/workbench-runtime/core/context-history-budget.ts",
+		"extensions/workbench-runtime/core/output-control-telemetry.ts",
+		"tests/output-envelope.test.ts",
+		"tests/turn-output-budget.test.ts",
+		"tests/continuation-cursor.test.ts",
+		"tests/bounded-file-io.test.ts",
+		"tests/details-projection.test.ts",
+		"tests/context-history-budget.test.ts",
+		"tests/output-control-telemetry.test.ts",
+	]);
+
+	const contextOutputIntegration = doc.recipes.find((r) => r.name === "context-output-integration-test");
+	assert.ok(contextOutputIntegration, "context-output-integration-test recipe declared");
+	assert.deepEqual(contextOutputIntegration.command, ["npm", "run", "test:context-output-integration"]);
+	assert.deepEqual(contextOutputIntegration.allowed_modes, ["DEV", "VERIFY"]);
+	assert.equal(contextOutputIntegration.mutation, "none");
+	assert.deepEqual(contextOutputIntegration.writes, []);
+	assert.equal(contextOutputIntegration.cache.enabled, true);
+	assert.equal(contextOutputIntegration.cache.version, 5);
+	assert.deepEqual(contextOutputIntegration.cache.inputs, [
+		"package.json",
+		"package-lock.json",
+		"tsconfig.json",
+		".pi/workbench/recipes.yaml",
+		"extensions/**/*.ts",
+		"extensions/workbench-runtime/core/compare.ts",
+		"extensions/workbench-runtime/core/comparison-record.ts",
+		"extensions/workbench-runtime/core/details-projection.ts",
+		"extensions/workbench-runtime/core/context-history-budget.ts",
+		"extensions/workbench-runtime/core/diff-review.ts",
+		"extensions/workbench-runtime/core/render.ts",
+		"extensions/workbench-runtime/ui/tool-renderers.ts",
+		"tests/helpers.ts",
+		"tests/output-control-wiring.test.ts",
+		"tests/read-v3.test.ts",
+		"tests/read-run-log-page.test.ts",
+		"tests/compare-output-bounds.test.ts",
+		"tests/gate-output-bounds.test.ts",
+		"tests/context-output-worker.test.ts",
+	]);
+
+	const readV3 = doc.recipes.find((r) => r.name === "read-v3-test");
+	assert.ok(readV3, "read-v3-test recipe declared");
+	assert.deepEqual(readV3.command, ["npm", "run", "test:read-v3"]);
+	assert.deepEqual(readV3.allowed_modes, ["DEV", "VERIFY"]);
+	assert.equal(readV3.mutation, "none");
+	assert.deepEqual(readV3.writes, []);
+	assert.equal(readV3.cache.enabled, true);
+	assert.deepEqual(readV3.cache.inputs, [
+		"package.json",
+		"package-lock.json",
+		"tsconfig.json",
+		".pi/workbench/recipes.yaml",
+		"extensions/**/*.ts",
+		"tests/helpers.ts",
+		"tests/native-tool-policy.test.ts",
+		"tests/native-tool-wiring.test.ts",
+		"tests/read-v3.test.ts",
+	]);
+
+	const contextOutputBenchmark = doc.recipes.find((r) => r.name === "context-output-benchmark");
+	assert.ok(contextOutputBenchmark, "context-output-benchmark recipe declared");
+	assert.deepEqual(contextOutputBenchmark.command, ["npm", "run", "benchmark:context-output"]);
+	assert.deepEqual(contextOutputBenchmark.allowed_modes, ["DEV", "VERIFY"]);
+	assert.equal(contextOutputBenchmark.mutation, "artifacts");
+	assert.deepEqual(contextOutputBenchmark.writes, [".pi/workbench/runs/context-output-benchmark/context-output-benchmark.json"]);
+	assert.deepEqual(contextOutputBenchmark.artifacts, [".pi/workbench/runs/context-output-benchmark/context-output-benchmark.json"]);
+	assert.equal(contextOutputBenchmark.cache.enabled, false);
+
+	const contextOutputStress = doc.recipes.find((r) => r.name === "context-output-stress");
+	assert.ok(contextOutputStress, "context-output-stress recipe declared");
+	assert.deepEqual(contextOutputStress.command, ["npm", "run", "test:context-output-stress"]);
+	assert.deepEqual(contextOutputStress.allowed_modes, ["DEV", "VERIFY"]);
+	assert.equal(contextOutputStress.mutation, "artifacts");
+	assert.deepEqual(contextOutputStress.writes, [".pi/workbench/runs/context-output-stress/context-output-evidence.json"]);
+	assert.deepEqual(contextOutputStress.artifacts, [".pi/workbench/runs/context-output-stress/context-output-evidence.json"]);
+	assert.equal(contextOutputStress.cache.enabled, false);
+
 	// No recipe besides the three v2 ones may reference the v2 package scripts.
 	const v2ScriptNames = new Set(["commander:nro:v2:prepare", "commander:nro:v2:benchmark", "commander:nro:v2:final"]);
 	for (const recipe of doc.recipes) {

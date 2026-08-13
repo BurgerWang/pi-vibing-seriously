@@ -17,7 +17,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -34,6 +34,8 @@ import {
 } from "../extensions/workbench-runtime/cache/quant-contracts.ts";
 import {
 	discoverCandidateManifests,
+	MAX_REGISTRY_CANDIDATES,
+	QUANT_MANIFEST_MAX_BYTES,
 	readQuantManifestFile,
 	resolveQuantContract,
 	verifyBacktestResultArtifact,
@@ -526,5 +528,61 @@ test("readQuantManifestFile: paths outside the project root are refused", async 
 		const outside = await readQuantManifestFile(dir, "../outside.json");
 		assert.ok(!outside.ok);
 		if (!outside.ok) assert.match(outside.reason ?? "", /escapes the project root/);
+	});
+});
+
+test("readQuantManifestFile: oversized, non-regular, and corrupt manifests fail with fixed bounded reasons", async () => {
+	await withTempDir(async (dir) => {
+		await mkdir(join(dir, "artifacts"), { recursive: true });
+		const allocations: number[] = [];
+		const reads: number[] = [];
+		const hooks = {
+			onBufferAllocate: (bytes: number) => allocations.push(bytes),
+			beforeRead: (bytes: number) => reads.push(bytes),
+		};
+		const oversizedPath = join(dir, "artifacts", "oversized.json");
+		const oversized = await open(oversizedPath, "w");
+		try { await oversized.truncate(QUANT_MANIFEST_MAX_BYTES + 1); }
+		finally { await oversized.close(); }
+		const tooLarge = await readQuantManifestFile(dir, "artifacts/oversized.json", hooks);
+		assert.deepEqual(tooLarge, { ok: false, reason: "manifest exceeds the fixed 1048576-byte limit" });
+		assert.deepEqual(allocations, [], "oversized manifest is rejected before allocation");
+		assert.deepEqual(reads, [], "oversized manifest is rejected before read");
+
+		await mkdir(join(dir, "artifacts", "directory.json"));
+		assert.deepEqual(
+			await readQuantManifestFile(dir, "artifacts/directory.json", hooks),
+			{ ok: false, reason: "manifest source is not a regular file" },
+		);
+		assert.deepEqual(allocations, [], "non-regular manifest is rejected before allocation");
+
+		const hostile = "secret-path-and-content-".repeat(1_000);
+		await writeFile(join(dir, "artifacts", "corrupt.json"), `{${hostile}`, "utf8");
+		const corrupt = await readQuantManifestFile(dir, "artifacts/corrupt.json");
+		assert.deepEqual(corrupt, { ok: false, reason: "manifest is not valid JSON" });
+		assert.ok(!corrupt.reason?.includes(hostile.slice(0, 40)), "parser errors never echo hostile content");
+	});
+});
+
+test("discoverCandidateManifests scans at most 500 records and never allocates oversized candidates", async () => {
+	await withTempDir(async (dir) => {
+		const registry = join(dir, ".pi", "workbench", "quant", "registry");
+		await mkdir(registry, { recursive: true });
+		for (let index = 0; index < MAX_REGISTRY_CANDIDATES + 1; index += 1) {
+			const handle = await open(join(registry, `candidate-${String(index).padStart(3, "0")}.json`), "w");
+			try { await handle.truncate(QUANT_MANIFEST_MAX_BYTES + 1); }
+			finally { await handle.close(); }
+		}
+		const allocations: number[] = [];
+		let initialStats = 0;
+		const candidates = await discoverCandidateManifests(dir, "data-snapshot", "artifacts/self.json", {
+			boundedReadHooks: {
+				afterInitialStat: () => { initialStats += 1; },
+				onBufferAllocate: (bytes) => allocations.push(bytes),
+			},
+		});
+		assert.deepEqual(candidates, []);
+		assert.equal(initialStats, MAX_REGISTRY_CANDIDATES, "the candidate scan has a hard 500-record ceiling");
+		assert.deepEqual(allocations, [], "every oversized candidate is rejected before allocation");
 	});
 });

@@ -345,9 +345,17 @@ test("registration surface: exactly read → grep → find then the 11 catalog t
 				for (const key of legacyKeys) {
 					assert.deepEqual(overrideProps[key], builtinSchema.properties[key], `grep legacy property ${key} byte-identical`);
 				}
+			} else if (name === "find") {
+				assert.deepEqual(def.parameters, builtinSchema, "find schema remains byte-identical to Pi");
 			} else {
-				// read (N1) and find (N3 not implemented) stay byte-identical
-				assert.deepEqual(def.parameters, builtinSchema, `${name} schema byte-identical to the Pi 0.83.0 built-in`);
+				const properties = (def.parameters as { properties: Record<string, Record<string, unknown>> }).properties;
+				const { offset, limit, cursor } = properties;
+				assert.ok(offset && limit && cursor);
+				assert.deepEqual(Object.keys(properties), ["path", "offset", "limit", "cursor"]);
+				assert.equal(offset.type, "integer");
+				assert.equal(offset.minimum, 1);
+				assert.equal(limit.maximum, 240);
+				assert.equal(cursor.maxLength, 1024);
 			}
 		}
 		// grep exposes exactly output/count_kind (the two N2 additions); find
@@ -380,72 +388,6 @@ test("active tool inventory and names are unchanged after session_start (no new 
 // 2. Read legacy parity (matrix row 1)
 // --------------------------------------------------------------------------
 
-test("read with explicit offset and/or limit is byte-identical to the built-in (content/details/errors)", async () => {
-	await withTempDir(async (root) => {
-		await writeFixture(root);
-		const stub = makeStub();
-		workbenchRuntime(stub);
-		const { read } = registered(stub);
-		const oracle = builtins(root);
-		const ctx = trustedCtx(root);
-		const cases: Array<{ path: string; offset?: number; limit?: number }> = [
-			{ path: "large.txt", offset: 10 },
-			{ path: "large.txt", limit: 5 },
-			{ path: "large.txt", offset: 100, limit: 50 },
-			{ path: "small.txt", offset: 2 },
-			// Pi's offset is 1-indexed over the built-in's split lines, which
-			// include the trailing newline's phantom empty line: the
-			// three-real-line small.txt ("alpha\nbeta\ngamma\n") has offset
-			// positions 1..4, so offset=4 reads the phantom line and is a
-			// valid built-in call — covered as successful parity here.
-			{ path: "small.txt", offset: 4 },
-			{ path: "small.txt", limit: 1 },
-			{ path: "@small.txt", offset: 1 },
-			{ path: join(root, "small.txt"), limit: 2 },
-			{ path: "sub/nested.txt", offset: 1 },
-			{ path: "crlf.txt", limit: 2 },
-			{ path: "hugeline.txt", offset: 1 },
-			{ path: "hugeline.txt", limit: 1 },
-			{ path: "empty.txt", offset: 1 },
-		];
-		for (const params of cases) {
-			const override = await read.execute("call-1", params, undefined, undefined, ctx);
-			const builtin = await oracle.read.execute("call-1", params, undefined, undefined, ctx);
-			assert.deepEqual(override, builtin, `legacy parity for ${JSON.stringify(params)}`);
-		}
-		// offset beyond end of file: identical error text (the oracle error is
-		// captured first — the validator must return a plain boolean).
-		// offset=5 is the first TRUE beyond-end position for small.txt — the
-		// phantom trailing line occupies offset=4 (covered as a successful
-		// parity case above), so only 5 and beyond are rejected.
-		for (const params of [{ path: "small.txt", offset: 99 }, { path: "small.txt", offset: 5 }, { path: "empty.txt", offset: 2 }]) {
-			const expectedError = await oracle.read.execute("call-2", params, undefined, undefined, ctx).then(
-				() => null,
-				(e: unknown) => e as Error,
-			);
-			assert.ok(expectedError, `oracle rejects for ${JSON.stringify(params)}`);
-			await assert.rejects(
-				() => read.execute("call-2", params, undefined, undefined, ctx),
-				(error: unknown) => (error as Error).message === (expectedError as Error).message,
-				`offset-beyond-end parity for ${JSON.stringify(params)}`,
-			);
-		}
-		// missing / unreadable files: identical error text
-		for (const path of ["missing.txt", "@missing.txt", join(root, "missing.txt"), "sub/missing.txt"]) {
-			const expectedError = await oracle.read.execute("call-3", { path }, undefined, undefined, ctx).then(
-				() => null,
-				(e: unknown) => e as Error,
-			);
-			assert.ok(expectedError, `oracle rejects for ${path}`);
-			await assert.rejects(
-				() => read.execute("call-3", { path }, undefined, undefined, ctx),
-				(error: unknown) => (error as Error).message === (expectedError as Error).message,
-				`missing-file parity for ${path}`,
-			);
-		}
-	});
-});
-
 test("read abort parity: a pre-aborted signal rejects with the exact built-in 'Operation aborted' error on legacy and preview paths", async () => {
 	await withTempDir(async (root) => {
 		await writeFixture(root);
@@ -463,252 +405,9 @@ test("read abort parity: a pre-aborted signal rejects with the exact built-in 'O
 	});
 });
 
-test("image reads pass through byte-identically for ALL FIVE supported types (attachment or built-in text-only notes); genuine text starting the note phrase still gets facts", async () => {
-	await withTempDir(async (root) => {
-		await writeFixture(root);
-		const stub = makeStub();
-		workbenchRuntime(stub);
-		const { read } = registered(stub);
-		const oracle = builtins(root);
-		const ctx = trustedCtx(root);
-		// plan §9 row 6: JPEG, PNG, GIF, WEBP and BMP no-offset reads through
-		// BOTH the registered override and the captured Pi 0.83.0 built-in,
-		// byte-for-byte. The outcome is whatever the built-in ACTUALLY
-		// produced — an attachment (image block + note) when
-		// decode/convert/resize succeeded (the built-in converts BMP to PNG
-		// and the note says "[Image converted from image/bmp to image/png.]"),
-		// or the built-in TEXT-ONLY note (failed decode/resize) — and the
-		// override must reproduce it exactly: never a preview, never facts,
-		// never a weakened result.
-		const fiveTypes = [
-			{ path: "image.jpg", mime: "image/jpeg" },
-			{ path: "image.png", mime: "image/png" },
-			{ path: "image.gif", mime: "image/gif" },
-			{ path: "image.webp", mime: "image/webp" },
-			{ path: "image.bmp", mime: "image/bmp" },
-		] as const;
-		for (const { path, mime } of fiveTypes) {
-			const override = await read.execute("call-1", { path }, undefined, undefined, ctx);
-			const builtin = await oracle.read.execute("call-1", { path }, undefined, undefined, ctx);
-			assert.deepEqual(override, builtin, `image parity for ${path}`);
-			assert.ok(!textOf(override).includes(NRO_FACTS_MARKER), `no facts marker on the image path for ${path}`);
-			assert.equal(override.details, undefined, `image details undefined for ${path}`);
-			const note = textOf(builtin);
-			if (mime === "image/bmp") {
-				// Pi 0.83.0's built-in converts BMP → PNG on read: the note
-				// names the CONVERTED mime and identifies the source format.
-				assert.match(note, /^Read image file \[image\/png\]/, `${path} conversion outcome names image/png`);
-				assert.match(note, /\[Image converted from image\/bmp to image\/png\.\]/, `${path} note identifies the conversion from image/bmp`);
-			} else {
-				// non-converted formats: the note names the source MIME directly
-				assert.match(note, new RegExp(`^Read image file \\[${mime.replace("/", "\\/")}\\]`), `${path} note names the source MIME`);
-			}
-			const builtinAttachment = builtin.content.some((c) => c.type === "image");
-			if (builtinAttachment) {
-				assert.ok(override.content.some((c) => c.type === "image"), `${path} keeps the built-in attachment content`);
-			} else {
-				assert.ok(!override.content.some((c) => c.type === "image"), `${path} keeps the built-in TEXT-ONLY note (no preview, no facts)`);
-			}
-			// @-path and absolute-path spellings stay byte-identical too
-			const atPath = `@${path}`;
-			assert.deepEqual(
-				await read.execute("call-1", { path: atPath }, undefined, undefined, ctx),
-				await oracle.read.execute("call-1", { path: atPath }, undefined, undefined, ctx),
-				`@-path image parity for ${path}`,
-			);
-			assert.deepEqual(
-				await read.execute("call-1", { path: join(root, path) }, undefined, undefined, ctx),
-				await oracle.read.execute("call-1", { path: join(root, path) }, undefined, undefined, ctx),
-				`absolute-path image parity for ${path}`,
-			);
-		}
-		// corrupt magic-byte files (decode/resize fails) are text-only notes
-		// and stay byte-identical — fail-closed, never a preview, never facts
-		for (const path of ["corrupt.jpg", "corrupt.png", "@corrupt.jpg"]) {
-			const override = await read.execute("call-1", { path }, undefined, undefined, ctx);
-			const builtin = await oracle.read.execute("call-1", { path }, undefined, undefined, ctx);
-			assert.deepEqual(override, builtin, `image parity for ${path}`);
-			assert.ok(!textOf(override).includes(NRO_FACTS_MARKER), `no facts marker on the image path for ${path}`);
-			assert.equal(override.details, undefined, `image details undefined for ${path}`);
-			assert.ok(!override.content.some((c) => c.type === "image"), `${path} stays a text-only built-in note`);
-		}
-		// a real image yields the attachment content (image block) — the
-		// built-in read pipeline produced it, the override kept it.
-		const png = await read.execute("call-2", { path: "image.png" }, undefined, undefined, ctx);
-		assert.ok(png.content.some((c) => c.type === "image"), "image block present");
-		assert.match(textOf(png), /^Read image file \[image\/png\]/);
-		// a GENUINE text file starting with the same note phrase has no
-		// matching magic bytes and still receives the NRO facts (complete=true)
-		const note = await read.execute("call-3", { path: "note.txt" }, undefined, undefined, ctx);
-		const noteFacts = parseFacts(textOf(note));
-		assert.ok(noteFacts, "facts present on genuine text starting the note phrase");
-		assert.equal(noteFacts.complete, true);
-		assert.equal(noteFacts.total_lines, 2);
-		assert.equal(note.details, undefined);
-		const noteBody = textOf(note).slice(0, textOf(note).indexOf("\n" + NRO_FACTS_MARKER));
-		assert.equal(noteBody, await (await import("node:fs/promises")).readFile(join(root, "note.txt"), "utf8"), "genuine text kept byte-for-byte");
-	});
-});
-
 // --------------------------------------------------------------------------
 // 3. No-offset/limit preview path (matrix rows 1, 3–5, 7)
 // --------------------------------------------------------------------------
-
-test("small no-offset/limit read: built-in text byte-for-byte + complete=true facts; details undefined", async () => {
-	await withTempDir(async (root) => {
-		await writeFixture(root);
-		const stub = makeStub();
-		workbenchRuntime(stub);
-		const { read } = registered(stub);
-		const oracle = builtins(root);
-		const ctx = trustedCtx(root);
-		for (const path of ["small.txt", "crlf.txt", "bom.txt", "unicode.txt", "empty.txt", "sub/nested.txt", "@small.txt"]) {
-			const override = await read.execute("call-1", { path }, undefined, undefined, ctx);
-			const builtin = await oracle.read.execute("call-1", { path }, undefined, undefined, ctx);
-			const builtinText = textOf(builtin);
-			const overrideText = textOf(override);
-			assert.ok(overrideText.startsWith(builtinText), `built-in text kept byte-for-byte for ${path}`);
-			const facts = parseFacts(overrideText);
-			assert.ok(facts, `facts present for ${path}`);
-			assert.equal(facts.complete, true, `complete=true for ${path}`);
-			assert.equal(facts.returned_lines, facts.total_lines, path);
-			assert.equal(facts.omitted_lines, 0, path);
-			assert.equal(facts.next_offset, 0, path);
-			assert.equal(override.details, undefined, `details undefined when complete for ${path}`);
-			assert.deepEqual(override.details, builtin.details, `details parity (both undefined) for ${path}`);
-		}
-	});
-});
-
-test("large no-offset/limit read: deterministic preview bounded at the caps with exact facts; legacy continuation reconstructs the file with no line skipped", async () => {
-	await withTempDir(async (root) => {
-		await writeFixture(root);
-		const stub = makeStub();
-		workbenchRuntime(stub);
-		const { read } = registered(stub);
-		const ctx = trustedCtx(root);
-		const fullText = await (await import("node:fs/promises")).readFile(join(root, "large.txt"), "utf8");
-
-		const r1 = await read.execute("call-1", { path: "large.txt" }, undefined, undefined, ctx);
-		const facts1 = parseFacts(textOf(r1));
-		assert.ok(facts1);
-		assert.equal(facts1.complete, false);
-		assert.equal(facts1.total_lines, 500);
-		assert.equal(facts1.returned_lines, PREVIEW_MAX_LINES);
-		assert.equal(facts1.next_offset, PREVIEW_MAX_LINES + 1);
-		assert.equal(facts1.line_truncated, false);
-		assert.ok(Number(facts1.returned_bytes) <= PREVIEW_MAX_UTF8_BYTES, "returned_bytes ≤ 12 KiB");
-		// details: exactly a valid truncation-only object
-		assert.ok(r1.details, "truncated ⇒ details present");
-		assert.deepEqual(Object.keys(r1.details), ["truncation"], "no additive details keys");
-		const trunc = (r1.details as { truncation: Record<string, unknown> }).truncation;
-		assert.equal(trunc.truncated, true);
-		assert.equal(trunc.firstLineExceedsLimit, false);
-		assert.equal(trunc.maxLines, PREVIEW_MAX_LINES);
-		assert.equal(trunc.maxBytes, PREVIEW_MAX_UTF8_BYTES);
-		assert.equal(trunc.outputLines, facts1.returned_lines);
-		assert.equal(trunc.totalLines, 500);
-		// determinism: same call again → identical result
-		const r1b = await read.execute("call-1", { path: "large.txt" }, undefined, undefined, ctx);
-		assert.deepEqual(r1, r1b, "preview is deterministic");
-
-		// follow next_offset via legacy pagination — every page is a built-in
-		// read (no facts marker on legacy pages), and the continuation
-		// reconstructs the full file with no line skipped (no false
-		// complete=true claim on the preview marker)
-		const previewLines = textOf(r1).slice(0, textOf(r1).indexOf("\n" + NRO_FACTS_MARKER)).split("\n");
-		assert.deepEqual(previewLines, fullText.split("\n").slice(0, 240), "preview lines are exactly the first 240 lines");
-		let offset = Number(facts1.next_offset);
-		const collected = [...previewLines];
-		let guard = 0;
-		while (guard < 10) {
-			guard += 1;
-			const page = await read.execute("call-2", { path: "large.txt", offset }, undefined, undefined, ctx);
-			const pageText = textOf(page);
-			collected.push(...pageText.split("\n"));
-			if (collected.join("\n") === fullText) break;
-			// legacy continuation notice: "[N more lines in file. Use offset=X to continue.]"
-			const m = /Use offset=(\d+) to continue/.exec(pageText);
-			assert.ok(m, "legacy continuation notice present");
-			offset = Number(m[1]);
-		}
-		assert.equal(collected.join("\n"), fullText, "pagination reconstructs the file with no line skipped");
-		assert.ok(guard < 10, "pagination terminates");
-	});
-});
-
-test("huge single line: prefix representation with line_truncated=true; legacy pagination at next_offset re-reads the full line", async () => {
-	await withTempDir(async (root) => {
-		await writeFixture(root);
-		const stub = makeStub();
-		workbenchRuntime(stub);
-		const { read } = registered(stub);
-		const oracle = builtins(root);
-		const ctx = trustedCtx(root);
-		const r1 = await read.execute("call-1", { path: "hugeline.txt" }, undefined, undefined, ctx);
-		const facts = parseFacts(textOf(r1));
-		assert.ok(facts);
-		assert.equal(facts.complete, false);
-		assert.equal(facts.line_truncated, true);
-		assert.equal(facts.next_offset, 1, "next_offset points at the truncated line itself");
-		assert.ok(textOf(r1).includes(" [line truncated]"), "fixed inline marker present");
-		// legacy continuation: offset=1 returns the FULL first line
-		const full = await oracle.read.execute("call-2", { path: "hugeline.txt", offset: 1 }, undefined, undefined, ctx);
-		assert.ok(textOf(full).startsWith("H".repeat(5000)), "the full line is retrievable via legacy pagination");
-		// and the override's legacy path returns it byte-identically
-		const viaOverride = await read.execute("call-2", { path: "hugeline.txt", offset: 1 }, undefined, undefined, ctx);
-		assert.deepEqual(viaOverride, full);
-	});
-});
-
-test(">50KB first line: the second read-only read uses Pi-equivalent normalization (@/relative/absolute parity) and previews deterministically", async () => {
-	await withTempDir(async (root) => {
-		await writeFixture(root);
-		const stub = makeStub();
-		workbenchRuntime(stub);
-		const { read } = registered(stub);
-		const ctx = trustedCtx(root);
-		for (const path of ["hugefirst.txt", "@hugefirst.txt", join(root, "hugefirst.txt"), "./hugefirst.txt"]) {
-			const r = await read.execute("call-1", { path }, undefined, undefined, ctx);
-			const facts = parseFacts(textOf(r));
-			assert.ok(facts, `facts present for ${path}`);
-			assert.equal(facts.complete, false, `preview for ${path}`);
-			assert.equal(facts.line_truncated, true, `huge first line prefix-represented for ${path}`);
-			assert.equal(facts.next_offset, 1, path);
-			assert.equal(facts.total_lines, 2, path);
-			assert.equal(facts.total_bytes, 60 * 1024 + 1 + 5, path);
-			assert.ok(Number(facts.returned_bytes) <= PREVIEW_MAX_LINE_UTF8_BYTES, path);
-			// identical previews across the path spellings (deterministic)
-			const r2 = await read.execute("call-1", { path: "hugefirst.txt" }, undefined, undefined, ctx);
-			assert.deepEqual(r, r2, `deterministic across path spellings for ${path}`);
-		}
-		// the legacy continuation still works and is byte-identical to the built-in
-		const oracle = builtins(root);
-		const full = await oracle.read.execute("call-2", { path: "hugefirst.txt", offset: 1 }, undefined, undefined, ctx);
-		const viaOverride = await read.execute("call-2", { path: "hugefirst.txt", offset: 1 }, undefined, undefined, ctx);
-		assert.deepEqual(viaOverride, full);
-	});
-});
-
-test("a file with an oversized middle line still previews deterministically with line_truncated (no hidden truncation)", async () => {
-	await withTempDir(async (root) => {
-		await writeFile(join(root, "mid.txt"), "first\n" + "M".repeat(3000) + "\nlast\n", "utf8");
-		const stub = makeStub();
-		workbenchRuntime(stub);
-		const { read } = registered(stub);
-		const ctx = trustedCtx(root);
-		const r = await read.execute("call-1", { path: "mid.txt" }, undefined, undefined, ctx);
-		const facts = parseFacts(textOf(r));
-		assert.ok(facts);
-		assert.equal(facts.complete, false);
-		assert.equal(facts.line_truncated, true);
-		assert.equal(facts.next_offset, 2, "next_offset = the truncated line's own number");
-		assert.equal(facts.total_lines, 3);
-		// continuation at offset 2 re-reads the full oversized line
-		const page = await read.execute("call-2", { path: "mid.txt", offset: 2 }, undefined, undefined, ctx);
-		assert.ok(textOf(page).startsWith("M".repeat(3000)), "full line retrievable via legacy pagination");
-	});
-});
 
 // --------------------------------------------------------------------------
 // 4. grep/find legacy pass-through (matrix rows 9, 14; the N2 selectors

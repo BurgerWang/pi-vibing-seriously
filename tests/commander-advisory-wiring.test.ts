@@ -19,8 +19,9 @@
  *     falls back to defaults without crashing
  *   - advisory-only continuation: a HIGH-band session never steers, never
  *     sends messages, never cancels/short-circuits message_end, and leaves
- *     the tool_call guard and the command inventory untouched (no new
- *     commands, no enforcement path)
+ *     the tool_call guard intact while preserving the exact 30-command
+ *     inventory, including R8's one observation-only status command (no
+ *     enforcement path)
  */
 
 import assert from "node:assert/strict";
@@ -101,7 +102,7 @@ function pendingHugeMessage(timestamp = 1) {
 interface StubState {
 	commands: Map<string, { description?: string; handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>;
 	tools: Map<string, unknown>;
-	handlers: Map<string, (event: unknown, ctx: unknown) => unknown>;
+	handlers: Map<string, Array<(event: unknown, ctx: unknown) => unknown>>;
 	statuses: Map<string, string>;
 	notified: string[];
 	sentMessages: number;
@@ -126,7 +127,9 @@ function makeRuntimeStub(): { stub: ExtensionAPI & Record<string, unknown>; stat
 			state.tools.set(def.name, def);
 		},
 		on: (event: string, handler: (event: unknown, ctx: unknown) => unknown) => {
-			state.handlers.set(event, handler);
+			const handlers = state.handlers.get(event) ?? [];
+			handlers.push(handler);
+			state.handlers.set(event, handlers);
 		},
 		appendEntry: () => {},
 		sendMessage: () => {
@@ -185,9 +188,39 @@ async function driveMessageEnd(
 	ctx: ExtensionContext,
 	message: Record<string, unknown>,
 ): Promise<unknown> {
-	const handler = state.handlers.get("message_end");
-	assert.ok(handler, "message_end handler must be registered");
-	return handler({ message, role: "assistant" }, ctx);
+	const handlers = state.handlers.get("message_end");
+	assert.ok(handlers && handlers.length > 0, "message_end handler must be registered");
+	let result: unknown;
+	for (const handler of handlers) {
+		const next = await handler({ message, role: "assistant" }, ctx);
+		if (next !== undefined) result = next;
+	}
+	return result;
+}
+
+let advisoryGuardSerial = 0;
+
+/** Drive one fresh turn and one tool call through the registered guards. */
+async function driveFreshToolCall(
+	state: StubState,
+	ctx: ExtensionContext,
+	toolName: string,
+	input: unknown,
+): Promise<unknown> {
+	advisoryGuardSerial += 1;
+	for (const handler of state.handlers.get("turn_start") ?? []) {
+		await handler({ type: "turn_start", turnIndex: advisoryGuardSerial }, ctx);
+	}
+	for (const handler of state.handlers.get("tool_call") ?? []) {
+		const result = await handler({
+			type: "tool_call",
+			toolCallId: `advisory-guard-${advisoryGuardSerial}`,
+			toolName,
+			input,
+		}, ctx);
+		if (result !== undefined) return result;
+	}
+	return undefined;
 }
 
 // ------------------------------------------------------- config wiring (P7)
@@ -649,7 +682,7 @@ test("q-cost-status with a HIGH band renders the complete cost section (no short
 
 // --------------------------------------------- advisory-only continuation proof
 
-test("advisory paths never steer, send, cancel, or short-circuit normal processing", async () => {
+test("advisory paths never enforce and preserve the exact 30-command surface including R8 observation-only status", async () => {
 	await withTempDir(async (dir) => {
 		const { stub, state } = makeRuntimeStub();
 		workbenchRuntime(stub);
@@ -669,12 +702,13 @@ test("advisory paths never steer, send, cancel, or short-circuit normal processi
 		assert.ok((statuses.get("workbench") ?? "").includes("CMD:HIGH"), statuses.get("workbench"));
 		// the tool_call guard is untouched by advisory state: a benign read
 		// call in DEV still proceeds (no block, no short-circuit)
-		const guard = state.handlers.get("tool_call");
-		assert.ok(guard, "tool_call guard registered");
-		const allowed = await guard({ toolName: "read", input: {} }, ctx);
+		assert.ok((state.handlers.get("tool_call")?.length ?? 0) > 0, "tool_call guard registered");
+		const allowed = await driveFreshToolCall(state, ctx, "read", {});
 		assert.equal(allowed, undefined, "normal tool calls proceed unchanged");
-		// the command/tool surface is unchanged — advisory adds no commands
+		// The exact additive R8 surface is preserved: one observation-only
+		// context/output status command and no enforcement command.
 		assert.deepEqual([...state.commands.keys()].sort(), [...EXPECTED_COMMANDS].sort());
+		assert.ok(state.commands.has("q-context-output-status"), "R8 observation-only status command remains registered");
 		assert.ok(state.commands.has("q-run") && state.commands.has("q-gate"), "existing commands intact");
 	});
 });

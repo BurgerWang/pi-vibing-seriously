@@ -467,6 +467,15 @@ fails safe (0/false), and the workbench never reimplements Pi compaction.
 
 ## Worker context-budget protection
 
+Before each worker provider request, the v0.10.0 output control plane also
+validates assistant/tool-result pairing and projects complete historical
+bundles to the 64 KiB worker active-history budget. A single worker tool batch
+is reserved against a separate 48 KiB result budget before execution. The
+numeric-only progress/status facts report shown/omitted bytes, truncations,
+blocked calls and history collapse; raw worker/tool text is never telemetry.
+These controls are independent of the per-message context and cumulative
+spend limits below.
+
 The pinned worker runs on a 1,000,000-token context window. The workbench
 protects that budget with two thresholds that are model-specific and
 independent of the Commander/project compaction reserve:

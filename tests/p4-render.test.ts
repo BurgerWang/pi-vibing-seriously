@@ -115,6 +115,9 @@ const INSPECT: InspectToolDetails = {
 };
 
 const QUANT_REPORT: RunComparison = {
+	comparison_id: `cmp1-${"a".repeat(64)}`,
+	comparison_path: `.pi/workbench/comparisons/cmp1-${"a".repeat(64)}/comparison.json`,
+	comparison_bytes: 4096,
 	compatible: true,
 	notes: [],
 	a: { run_id: "20260801-001", recipe: "backtest", started_at: "t" },
@@ -255,6 +258,46 @@ test("expanded gate renderer shows per-gate rows, failed checks and the log path
 	assert.ok(lines.includes("log path    : .pi/workbench/runs/20260801-005"));
 });
 
+test("gate and inspect renderers preserve exact omission facts within their whole-result caps", () => {
+	const inspect: InspectToolDetails = {
+		...INSPECT,
+		stacks: { items: ["stack"], original_items: 1, shown_items: 1, omitted_items: 0 },
+		config_files_present: { items: ["project.yaml"], original_items: 1, shown_items: 1, omitted_items: 0 },
+		config_errors: { items: Array.from({ length: 24 }, (_, index) => `error-${index}-${"坏".repeat(1_000)}`), original_items: 500, shown_items: 24, omitted_items: 476 },
+		recipes: { items: Array.from({ length: 24 }, (_, index) => `recipe-${index}`), original_items: 500, shown_items: 24, omitted_items: 476 },
+		recipe_validation_components: {
+			...Object.fromEntries(Array.from({ length: 24 }, (_, index) => [`recipe-${index}`, ["unit-test"]])),
+			__original_items__: 500,
+			__shown_items__: 24,
+			__omitted_items__: 476,
+		},
+	};
+	const inspectLines = renderInspectLines(inspect, true);
+	const inspectText = inspectLines.join("\n");
+	assert.ok(utf8Bytes(inspectText) <= 16_384);
+	assert.ok(inspectLines.length <= 240);
+	assert.ok(inspectText.includes("config errors (500; shown=24; omitted=476)"), inspectText);
+	assert.ok(inspectText.includes("recipes (500; shown=24; omitted=476)"), inspectText);
+
+	const gate: GateToolDetails = {
+		...GATE,
+		gates: Array.from({ length: 24 }, (_, index) => ({
+			id: `g${index}`,
+			status: "FAIL",
+			title: `title-${index}-${"界".repeat(1_000)}`,
+			failure_reason: `reason-${index}-${"坏".repeat(1_000)}`,
+			blocked_reason: null,
+			failed_checks: [`g${index}.1`],
+		})),
+		counts: { pass: 476, fail: 24, blocked: 0, not_run: 0, total: 500, shown: 24, omitted: 476 },
+	};
+	const gateLines = renderGateLines(gate, true);
+	const gateText = gateLines.join("\n");
+	assert.ok(utf8Bytes(gateText) <= 16_384);
+	assert.ok(gateLines.length <= 240);
+	assert.ok(gateText.includes("total=500 shown=24 omitted=476"), gateText);
+});
+
 // ------------------------------------------- Phase 3B: read-only preflight
 
 test("Phase 3B: compact preflight is a single line with selector, readiness and the exact missing count", () => {
@@ -372,6 +415,8 @@ test("expanded compare renderer lists all deltas and the neutrality note", () =>
 	assert.ok(lines.includes("run a      : 20260801-001 (backtest)"));
 	assert.ok(lines.includes("exit code  : 0 -> 0"));
 	assert.ok(lines.includes("duration   : 1.0s -> 2.0s"));
+	assert.ok(lines.includes(`comparison : cmp1-${"a".repeat(64)}`));
+	assert.ok(lines.includes(`full record: .pi/workbench/comparisons/cmp1-${"a".repeat(64)}/comparison.json`));
 	assert.ok(lines.includes("artifacts  : +out/b.json -out/a.json (common: out/c.json)"));
 	assert.ok(lines.includes("test counts: n/a (not recorded in run JSON for recipe runs)"));
 	assert.ok(lines.includes("gate delta : n/a (neither run is a gate run)"));
@@ -384,6 +429,21 @@ test("expanded compare renderer lists all deltas and the neutrality note", () =>
 	assert.ok(lines.includes("folds           : 2 passed / 1 failed / 0 skipped / 0 pending -> 3 passed / 0 failed / 0 skipped / 0 pending"));
 	assert.ok(lines.includes("parameter lookback: 20 -> 30"));
 	assert.ok(lines.includes("deltas are descriptive facts only"));
+});
+
+test("compare renderer preserves missing quant metrics as n/a instead of fabricating zero", () => {
+	const report: RunComparison = {
+		...QUANT_REPORT,
+		quant: {
+			...QUANT_REPORT.quant!,
+			return: { a: null, b: 0, changed: true },
+			benchmark_delta: { a: null, b: null, changed: false },
+		},
+	};
+	const text = renderCompareLines(report, true).join("\n");
+	assert.ok(text.includes("return          : n/a -> 0"), text);
+	assert.ok(text.includes("benchmark delta : n/a -> n/a"), text);
+	assert.equal(text.includes("return          : 0 -> 0"), false);
 });
 
 test("comparison notes render for incompatible schemas", () => {
