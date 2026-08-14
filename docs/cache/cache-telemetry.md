@@ -2,14 +2,17 @@
 
 Observability for DeepSeek's prompt cache in the workbench. P6-A records
 hash-only telemetry of usage and context stability and infers why the cache
-missed — it does not change any request, does not control the cache, and
-does not cache anything itself.
+missed. The telemetry component does not change requests, control the cache, or
+cache anything itself; the independently gated provider hook runs before the
+telemetry digest described below.
 
 ## Scope and non-goals
 
-- **Observation only.** No cache warming, no TTL control, no
-  `cache_control`/`prompt_cache_key`/keepalive, no provider payload
-  mutation, no headers mutation.
+- **Telemetry remains observation-only.** No cache warming, TTL control,
+  `cache_control`/`prompt_cache_key`/keepalive, or headers mutation. The
+  separate v3 provider hook may return a copy-on-write payload containing only
+  exact explicit-breakpoint fields on the proven public OpenAI GPT-5.6
+  Responses shape; every unsupported or uncertain path is identity-exact.
 - **No Recipe Action Cache in P6-A.** Recipe results are never cached.
 - **No new Agent, daemon, gateway, or background service.** Everything runs
   inside the existing Pi extension on Pi-native events.
@@ -21,16 +24,44 @@ does not cache anything itself.
 | `session_start` | restore the session cache summary (custom entry `workbench-cache-state`); classify `reload`/`new` reasons |
 | `model_select` | remember the model; the next request is inferred `MODEL_CHANGED` |
 | `thinking_level_select` | remember the level; next request is inferred `THINKING_LEVEL_CHANGED` |
-| `before_provider_request` | read-only structural digest of the payload (roles, lengths, per-segment SHA-256, tool names) — payload and headers are never changed |
+| `before_provider_request` | capability-gated copy-on-write breakpoint transform, then a structural digest of the actual outgoing payload (roles, lengths, per-segment SHA-256, tool names); headers remain unchanged |
 | `message_end` | **assistant messages only**: read normalized usage, hash system prompt + tools + payload shape, classify the invalidation, append one JSONL record |
 | `session_before_compact` | the next request is inferred `COMPACTION` |
 | `session_tree` | after Pi completes tree navigation, the next request is inferred `SESSION_TREE_CHANGED` exactly once |
 | `session_shutdown` | safe flush of the session state entry |
 
-The context-output projector separately reports a stable epoch hash only when
-it crosses an active-history epoch boundary. That one request is inferred as
-`HISTORY_PROJECTION_EPOCH_CHANGED`; replaying the same projected prefix with
-an appended raw suffix does not create another epoch event.
+The context-output projector reports v3 epoch/checkpoint and segment-seal
+signals separately. Commander reserves a 65,536-byte raw turn inside its
+98,304-byte hard ceiling; worker/other reserves 49,152 inside 65,536. After
+also reserving sixteen 384-byte/one-bundle segments, their anchor caps are
+26,624/10,240 bytes and 96 bundles; the active raw suffix is capped at 16
+bundles.
+
+The initial checkpoint establishes the anchor and epoch. Seals 1–16 append one
+immutable segment while leaving the epoch hash, anchor, older segments, and
+safe boundary markers unchanged; telemetry treats `segmentSealed` /
+`segment_sealed` as an expected active-tail rewrite, not
+`HISTORY_PROJECTION_EPOCH_CHANGED`. An attempt to create segment 17 triggers a
+checkpoint that rebuilds the anchor, clears the chain, and increments the
+epoch. Replaying the
+same topology with an appended raw suffix creates neither event.
+
+The companion pressure signal is unchanged by projection-state v3. Its custom
+type and `data.schema` are `workbench-context-pressure-v1`, and its data object
+still has exactly nine fields: `schema`, `role`, `epoch`,
+`rawToolTextBytes`, `projectedToolTextBytes`, `rawBundleCount`,
+`hardHistoryBytes`, `hardBundleCount`, and `timestampMs`. It is numeric
+diagnostic evidence only; it neither changes provider usage nor establishes a
+cache hit. This workbench update requires no auto-compaction code change and
+does not install or deploy the separate companion.
+
+Provider breakpoint integration is independent of P6-A's read-only digest.
+Public OpenAI explicit breakpoints are optional and capability-gated to a
+documented supported request shape: exact public `openai` /
+`openai-responses` / `gpt-5.6*` traffic with an existing
+`prompt_cache_key`. `openai-codex` remains disabled pending successful live SSE
+and WebSocket probes; DeepSeek injection is a strict no-op while still
+receiving the stable segmented prompt.
 
 Telemetry failures are caught everywhere: they can never block, delay, or
 modify a model request, and they never throw into Pi.
@@ -59,13 +90,13 @@ hardcoded):
 - **Opt-out**: `cache: { telemetry: false }` in `project.yaml` disables
   recording (default: enabled).
 
-## Record schema (`schemaVersion: "1.1"`)
+## Record schema (`schemaVersion: "1.2"`)
 
 ```jsonc
 {
-  "schemaVersion": "1.1",
+  "schemaVersion": "1.2",
   "timestamp": "2026-01-15T09:30:00.000Z",
-  "extensionVersion": "0.6.1",
+  "extensionVersion": "0.10.0",
   "hashedSessionId": "e3b0c44298fc1c14",       // SHA-256(session id), first 16 hex
   "provider": "deepseek",
   "model": "deepseek-v4-flash",
@@ -119,7 +150,8 @@ semantic status.
 `FIRST_OBSERVED_REQUEST`, `NEW_SESSION`, `MODEL_CHANGED`,
 `THINKING_LEVEL_CHANGED`, `MODE_CHANGED`, `UNEXPECTED_DRIFT`,
 `PACKAGE_RELOADED`, `COMPACTION`, `SESSION_TREE_CHANGED`,
-`HISTORY_PROJECTION_EPOCH_CHANGED`, `CONTEXT_PREFIX_DIVERGED`,
+`HISTORY_PROJECTION_EPOCH_CHANGED`, `HISTORY_PROJECTION_SEGMENT_SEALED`,
+`CONTEXT_PREFIX_DIVERGED`,
 `PROVIDER_BEST_EFFORT_MISS`, `UNKNOWN`.
 
 P6-B: same-mode drift (system prompt / tool set / tool order / tool schema
@@ -130,7 +162,7 @@ with the specific source in **`driftSource`**. The P6-A specific reasons
 records but are no longer produced by new records.
 
 Classification is a priority chain: explicit events (model/thinking/mode/
-reload/compaction/session-tree/history-projection epoch/new-session) >
+reload/compaction/session-tree/history-projection epoch or segment/new-session) >
 same-mode drift (`UNEXPECTED_DRIFT`) > payload-prefix rewrite > provider-side
 best-effort miss (stable context but zero cache read). An exact unchanged
 payload and a payload that only appends messages are distinct from a prefix
@@ -155,12 +187,41 @@ marker on the next recorded request; later unattributed rewrites still report
   provides compatible cost metadata for every record). The report prints
   data quality and intentionally omitted oldest-record counts. A corrupt or
   unreadable source makes the aggregate ratio N/A instead of presenting a
-  partial total as complete; intentional bounded-window truncation is labeled
-  separately.
+  partial total as complete. Intentional bounded-window truncation is labeled
+  separately and, by itself, retains the existing overall `hitRatio` over the
+  retained records; that value is explicitly a bounded-window ratio, not a
+  whole-history claim.
+
+  The report and its saved JSON expose four record-derived projection and
+  breakpoint facts:
+
+  - `historyProjectionSegmentSeals` — count of retained records whose reason
+    is exactly `HISTORY_PROJECTION_SEGMENT_SEALED`.
+  - `historyProjectionEpochTransitions` — count whose reason is exactly
+    `HISTORY_PROJECTION_EPOCH_CHANGED`.
+  - `explicitBreakpointAppliedRequests` — count whose `precedingEvent` is
+    exactly `explicit_prompt_cache_breakpoints_applied`.
+  - `explicitBreakpointVerifiedUsage` — numeric-only
+    `{ requestCount, input, cacheRead, cacheWrite, hitRatio }` over that
+    applied-request subset. Usage is included only for the exact eligible
+    public `openai` + `openai-responses` + `gpt-5.6*` shape with
+    `usageSemanticStatus === "verified"` and `messageStatus === "ok"`. An
+    errored applied request remains counted by
+    `explicitBreakpointAppliedRequests` but contributes no verified usage. The
+    subset ratio is `cacheRead / (input + cacheRead)` and is `null` when there
+    is no verified applied request, the denominator is zero, or the observation
+    is incomplete, including intentionally truncated bounded windows. This
+    stricter subset does not change the overall bounded-window ratio above.
+
+  These are retained-record observations only. They never persist or render
+  boundary material or request content, and they do not establish a measured
+  cache improvement.
 - `/q-cache-doctor [json]` — health checks: usage validity, cost metadata,
   models.json/auth.json non-involvement, system prompt dynamics, current
   prefix hashes (`prefix_hashes`), same-mode drift (`same_mode_drift`),
-  expected vs unexpected counts, churn (model/thinking/mode/reload/
+  expected vs unexpected counts, projection lifecycle counts
+  (`history_projection_events`), explicit-breakpoint usage
+  (`explicit_breakpoint_usage`), churn (model/thinking/mode/reload/
   compaction), tool-metadata statics, forbidden telemetry fields, and the
   total size of the current-plus-rotated telemetry set. The doctor uses the
   same bounded chronological read as the report: oldest rotated archive to
@@ -171,6 +232,31 @@ marker on the next recorded request; later unattributed rewrites still report
   `PARTIAL`/warning evidence: retained defects can still be reported, but the
   doctor must not emit a clean whole-history or no-drift conclusion from an
   incomplete window.
+
+  `history_projection_events` reports segment-seal and epoch-transition
+  counts. `explicit_breakpoint_usage` derives eligibility and usage only from
+  actual records: complete, verified public OpenAI GPT-5.6 Responses applied
+  records can be `ok`, including the valid observation `cacheRead = 0`. With
+  complete evidence but no applied record, default-disabled Codex or
+  unsupported DeepSeek traffic is `skip`, not a failure. Partial, corrupt,
+  unreadable, write-gapped, or intentionally truncated evidence makes both
+  checks `warn`; the applied subset ratio is `N/A` in text and `null` in doctor
+  JSON. Doctor JSON includes numeric `erroredEligibleAppliedRequests`; any
+  eligible applied record with `messageStatus = "error"` makes the check warn,
+  excludes its usage from the verified subset, and cannot produce an OK or
+  authoritative-usage statement. The JSON adds only numeric
+  `history_projection` and `explicit_breakpoints` summaries.
+
+  OpenAI's documented operating guidance is exact-prefix matching, static
+  content first and variable content last, a consistent `prompt_cache_key`, at
+  most four new cache writes per request, reads from up to the latest 50
+  breakpoint candidates, and approximately 15 requests/minute per cache key.
+  Inspect `cached_tokens` and `cache_write_tokens` to distinguish reuse from
+  repeated writes. The workbench's maximum 17 logical anchor/segment markers
+  therefore do not imply 17 writes on one request. See the
+  [stable-prefix contract](stable-prefix-contract.md) for primary sources and
+  the immutable-anchor/modular-segment/rare-checkpoint design shared by
+  Commander and worker.
 
 ## Session state entry
 
@@ -213,3 +299,11 @@ historical records** identified in this checkout during the repair are not
 deleted or rewritten. Any cleanup is a separate operator action that requires
 an explicit retention decision; reports continue to expose data-quality and
 scope so old data is not silently hidden.
+
+`cacheRead` mapped from verified provider usage is the cache-hit authority;
+structural hashes and inferred invalidation reasons are diagnostics, not a
+substitute. The offline fake provider deliberately reports `cacheRead = 0`, so
+offline telemetry and projection tests cannot prove reuse or a hit-rate gain.
+After deploying the runtime, start a new session and inspect subsequent live
+requests with `/q-cache-status` or `/q-cache-report` before drawing a recovery
+conclusion.

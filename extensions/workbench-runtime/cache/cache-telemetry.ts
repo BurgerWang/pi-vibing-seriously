@@ -17,8 +17,9 @@
  *
  * Session state is persisted as a Pi custom entry (customType
  * "workbench-cache-state") holding only: schemaVersion, requestCount,
- * aggregate usage, a bounded pending-write-gap bit, last hashes, last
- * invalidation reason and the telemetry file reference. No message bodies,
+ * aggregate usage, a bounded pending-write-gap bit, last payload/tool hashes,
+ * last invalidation reason and the telemetry file reference. Projection
+ * marker text and epoch/segment hashes are in-memory only. No message bodies,
  * no large arrays.
  */
 
@@ -96,6 +97,7 @@ const CACHE_STATE_SEMANTIC_STATUSES: ReadonlySet<UsageSemanticStatus> = new Set(
 ]);
 const CACHE_STATE_TELEMETRY_FILE = ".pi/workbench/cache/telemetry.jsonl";
 const TELEMETRY_WRITE_GAP_EVENT = "telemetry_write_gap";
+const EXPLICIT_PROMPT_CACHE_BREAKPOINTS_APPLIED_EVENT = "explicit_prompt_cache_breakpoints_applied";
 const MAX_CACHE_STATE_ENTRIES = 100_000;
 const MAX_CACHE_STATE_REQUESTS = 1_000_000_000;
 const MAX_CACHE_STATE_NUMERIC_VALUE = 1_000_000_000_000_000;
@@ -194,9 +196,17 @@ export interface CacheTelemetry {
 	 * the context projector crosses an epoch boundary.
 	 */
 	observeHistoryProjectionEpoch(epoch: string | number): void;
+	/**
+	 * Observe a same-epoch immutable segment-chain identifier. The identifier
+	 * is hashed and deduplicated in memory only; no marker text or segment hash
+	 * is added to telemetry records or persisted session state.
+	 */
+	observeHistoryProjectionSegmentSeal(segmentHash: string): void;
 	observeNewSession(): void;
 	/** READ-ONLY structural peek at the provider payload. Never mutates. */
 	observePayload(payload: unknown): void;
+	/** Record that explicit breakpoints are present on the observed outgoing payload. */
+	observeExplicitPromptCacheBreakpointsApplied(): void;
 	restoreFromEntries(entries: readonly CacheStateEntryLike[]): void;
 	observeMessageEnd(facts: MessageEndFacts): Promise<TelemetryRecord | null>;
 	flush(): void;
@@ -370,7 +380,7 @@ function parseCacheStateData(value: unknown): CacheStateEntryData | undefined {
 		const record = exactOwnDataRecord(value, CACHE_STATE_KEYS, CACHE_STATE_REQUIRED_KEYS);
 		if (!record) return undefined;
 		const schemaVersion = record.values.schemaVersion;
-		if (schemaVersion !== "1.0" && schemaVersion !== TELEMETRY_SCHEMA_VERSION) return undefined;
+		if (schemaVersion !== "1.0" && schemaVersion !== "1.1" && schemaVersion !== TELEMETRY_SCHEMA_VERSION) return undefined;
 		const sessionHash = record.values.hashedSessionId;
 		if (typeof sessionHash !== "string" || !CACHE_STATE_SESSION_HASH.test(sessionHash)) return undefined;
 		const requestCount = record.values.requestCount;
@@ -405,6 +415,7 @@ function parseCacheStateData(value: unknown): CacheStateEntryData | undefined {
 		const rawReason = record.values.lastInvalidationReason;
 		if (rawReason !== undefined
 			&& (typeof rawReason !== "string" || !CACHE_STATE_INVALIDATION_REASONS.has(rawReason))) return undefined;
+		if (rawReason === "HISTORY_PROJECTION_SEGMENT_SEALED" && schemaVersion !== TELEMETRY_SCHEMA_VERSION) return undefined;
 		const rawTelemetryWriteGapPending = record.values.telemetryWriteGapPending;
 		const telemetryWriteGapPending = rawTelemetryWriteGapPending === undefined
 			? 0
@@ -453,6 +464,7 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 	let pendingCompaction = false;
 	let pendingSessionTreeChange = false;
 	let pendingHistoryProjectionEpochChange = false;
+	let pendingHistoryProjectionSegmentSeal = false;
 	let pendingNewSession = false;
 	let pendingModelChange = false;
 	let pendingThinkingChange = false;
@@ -461,6 +473,7 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 	let currentPayloadSummary: PayloadSummary | undefined;
 	let previousPayloadSummary: PayloadSummary | undefined;
 	let lastHistoryProjectionEpochHash: string | undefined;
+	let lastHistoryProjectionSegmentHash: string | undefined;
 	let lastCacheRead = 0;
 	let lastSemanticStatus: UsageSemanticStatus | null = null;
 	let lastHitRatio: number | null = null;
@@ -495,9 +508,17 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 		}
 	}
 
+	function resetProjectionObservability(): void {
+		pendingHistoryProjectionEpochChange = false;
+		pendingHistoryProjectionSegmentSeal = false;
+		lastHistoryProjectionEpochHash = undefined;
+		lastHistoryProjectionSegmentHash = undefined;
+	}
+
 	function resetRestoredState(): void {
 		state = freshState();
 		pendingNewSession = true;
+		resetProjectionObservability();
 		lastCacheRead = 0;
 		lastSemanticStatus = null;
 		lastHitRatio = null;
@@ -510,6 +531,7 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 	function acceptRestoredState(restored: CacheStateEntryData): void {
 		state = restored;
 		pendingNewSession = false;
+		resetProjectionObservability();
 		lastCacheRead = 0;
 		lastSemanticStatus = null;
 		lastHitRatio = null;
@@ -537,6 +559,7 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 			if (next !== hashedSessionId) {
 				hashedSessionId = next;
 				state.hashedSessionId = next;
+				resetProjectionObservability();
 			}
 		},
 
@@ -598,6 +621,19 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 			}
 		},
 
+		observeHistoryProjectionSegmentSeal(segmentHash: string): void {
+			try {
+				if (!CACHE_STATE_SHA256.test(segmentHash)) return;
+				if (lastHistoryProjectionSegmentHash !== segmentHash) {
+					lastHistoryProjectionSegmentHash = segmentHash;
+					pendingHistoryProjectionSegmentSeal = true;
+					lastEvent = "history_projection_segment";
+				}
+			} catch {
+				// Observability cannot affect the request path.
+			}
+		},
+
 		observeNewSession(): void {
 			pendingNewSession = true;
 			lastEvent = "session_start:new";
@@ -611,6 +647,10 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 				currentPayloadSummary = undefined;
 			}
 			lastEvent = "before_provider_request";
+		},
+
+		observeExplicitPromptCacheBreakpointsApplied(): void {
+			lastEvent = EXPLICIT_PROMPT_CACHE_BREAKPOINTS_APPLIED_EVENT;
 		},
 
 		restoreFromEntries(entries: readonly CacheStateEntryLike[]): void {
@@ -678,6 +718,7 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 					compactionOccurred: pendingCompaction,
 					sessionTreeChanged: pendingSessionTreeChange,
 					historyProjectionEpochChanged: pendingHistoryProjectionEpochChange,
+					historyProjectionSegmentSealed: pendingHistoryProjectionSegmentSeal,
 					systemPromptChanged,
 					toolSetChanged,
 					toolOrderChanged,
@@ -768,6 +809,7 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 				pendingCompaction = false;
 				pendingSessionTreeChange = false;
 				pendingHistoryProjectionEpochChange = false;
+				pendingHistoryProjectionSegmentSeal = false;
 				pendingNewSession = false;
 				pendingModelChange = false;
 				pendingThinkingChange = false;

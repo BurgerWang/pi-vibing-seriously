@@ -502,7 +502,8 @@ compaction/restoration retains the explicit handoff next step.
 
 ```
 message_end (assistant only)  → normalized usage (Pi's usage object)
-before_provider_request       → structural payload digest (read-only, in memory)
+before_provider_request       → gated copy-on-write breakpoint transform
+                              → structural digest of actual outgoing payload
 session_start / model_select / thinking_level_select / session_before_compact
   → lifecycle flags (reload/new/model/thinking/mode/compaction)
         ↓
@@ -512,7 +513,7 @@ observeMessageEnd: verify usage semantics → hash system prompt + tools
 append record: .pi/workbench/cache/telemetry.jsonl  (JSONL, 5MB rotation)
   + pi.appendEntry("workbench-cache-state", lightweight summary)
         ↓
-footer segment: CACHE 72% | read 184k | miss 71k  (or CACHE N/A)
+footer segment: CACHE last=72% cum=68% | read 184k | miss 71k
 commands: /q-cache-status /q-cache-report [--save] /q-cache-doctor
 ```
 
@@ -818,6 +819,88 @@ chat messages. Same-mode prefix changes are recorded as
 `UNEXPECTED_DRIFT` (with `driftSource`) and surfaced by `/q-cache-doctor`
 (`prefix_hashes`, `same_mode_drift`) and `/q-cache-report`
 (`same-mode mutat.`). See docs/cache/stable-prefix-contract.md.
+
+### Active-history projection state v3
+
+The history hard ceilings remain Commander 98,304 bytes (96 KiB), worker/other
+65,536 bytes (64 KiB), and 128 complete assistant/tool-result bundles. The raw
+active tail reserves one role turn—65,536 bytes for Commander or 49,152 bytes
+for worker/other—and at most 16 bundles. Sixteen immutable segment slots each
+reserve at most 384 tool-text bytes and one complete bundle. Therefore:
+
+```text
+anchorByteCap = max(0, hardToolTextBytes - roleTurnBytes - 16 * 384)
+anchorBundleCap = max(0, 128 - 16 - 16) = 96
+```
+
+The resulting anchor caps are 26,624 bytes (26 KiB) for Commander and 10,240
+bytes (10 KiB) for worker/other. At the initial checkpoint, the controller
+chooses the largest latest raw suffix that fits the role-turn byte reserve and
+16 bundles at a complete-bundle boundary; it projects the preceding history
+into the anchor and leaves the suffix raw.
+
+Inside an epoch, every request reconstructs the exact anchor, ordered immutable
+segments, and active raw suffix. When the active suffix exceeds either reserve,
+the controller projects only aged active material into one new segment (at most
+384 bytes and one bundle). Seals 1–16 leave the epoch hash, anchor, older
+segments, and their markers byte-identical; `segmentSealed` reports the
+expected tail rewrite separately from `epochTransitioned`. An attempt to create
+segment 17 instead triggers a checkpoint that rebuilds the anchor, clears the
+segment chain, and increments the epoch. If lowered policy caps cannot reserve
+the topology, the controller checkpoints or fails closed; pairing is verified
+on every branch.
+
+The projected anchor and every segment end with a deterministic bounded hidden
+marker. Its safe `boundaryId` derives only from projected/provider-visible
+structural content—not a hash of raw secret text—and the exact marker/ID list is
+exposed for a capability-gated provider hook. Old markers remain immutable
+until checkpoint.
+
+`workbench-history-projection-state-v3` is strict, numeric/hash-only, and
+bounded to 32 KiB. Reload reconstructs every slice from raw JSONL and compares
+exact counts, bytes, bundles, hashes, and chain arithmetic; a mismatch fails
+closed as `prefix_changed`. The latest recognized or structurally unsafe entry
+is authoritative, so a malformed v1/v2/v3 record, Proxy/revoked Proxy, or
+`customType`/`data` accessor blocks fallback to an older valid state without
+executing traps; a safely unrelated ordinary entry may be skipped. Strict v1/v2
+entries are migration-only: only monotonic epoch and pressure carry forward,
+never old topology or hashes. Even when current history is below the cap, the
+first post-restore request emits one `legacy_migration` boundary while returning
+the raw history unchanged; inactive v3 persistence prevents a repeat after
+reload.
+
+Canonical history identity mirrors JSONL/provider-visible structure but hashes
+strings losslessly by exact UTF-16 code units. Object keys follow JSON property
+enumeration order, object `undefined` is omitted, and array holes/`undefined`
+become `null`. Work is fail-closed and bounded to 32,768 array elements, 128
+nesting levels, 32,769 own descriptors per container, and 262,144 work units;
+Proxies, accessors, custom `toJSON`, cycles, non-plain values, and extra array
+keys are rejected without running application code.
+
+Failure state also survives reload without an extra schema key: an inactive v3
+record stores a fixed non-secret failure sentinel in `epochHash`, covered by
+`stateHash`. A repeated failure after JSONL restore is de-duplicated, the first
+healthy projection emits one fixed recovery boundary, and later healthy
+projections emit none. Raw hostile content never derives either identity.
+
+The separate `workbench-context-pressure-v1` entry remains the exact same
+nine-field diagnostic contract; v3 neither changes that wire shape nor changes
+auto-compaction. Provider breakpoint injection is independently gated: public
+OpenAI support is used only for exact `openai` / `openai-responses` /
+`gpt-5.6*` traffic with an existing `prompt_cache_key`; `openai-codex` remains
+disabled pending live SSE and WebSocket probes, and DeepSeek is an injection
+no-op. OpenAI recommends exact prefixes with static content first, variable
+content last, a consistent cache key, and measurement through `cached_tokens`
+and `cache_write_tokens`. A request creates at most four new writes and reads
+from at most the latest 50 breakpoint candidates; approximately 15 requests
+per minute should share one key. Thus the 17 logical anchor/segment markers are
+not 17 writes per request. The research-backed client conclusion is one
+immutable fixed anchor plus modular immutable segments and rare checkpoints for
+both Commander and worker/other. The segmented shape improves structural
+exact-prefix stability, but offline evidence cannot prove a future provider
+`cacheRead`. See the
+[stable-prefix contract](cache/stable-prefix-contract.md) for primary sources
+and measurement limits.
 
 ## Cache benchmark (P6-E)
 

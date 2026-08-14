@@ -44,6 +44,7 @@ import { STREAM_UPDATE_MAX_LINES } from "../extensions/workbench-runtime/core/ou
 import { TURN_CALL_LIMIT_CONTROL_TEXT } from "../extensions/workbench-runtime/core/turn-output-budget.ts";
 import { COMPARE_SUMMARY_MAX_BYTES, COMPARE_SUMMARY_MAX_LINES } from "../extensions/workbench-runtime/core/render.ts";
 import { deriveResultId } from "../extensions/workbench-runtime/core/tool-result-recovery.ts";
+import { applyExplicitPromptCacheBreakpoints } from "../extensions/workbench-runtime/core/prompt-cache-breakpoints.ts";
 import {
 	OUTPUT_CONTROL_STATUS_MAX_BYTES,
 	OUTPUT_CONTROL_TELEMETRY_ENTRY_TYPE,
@@ -173,6 +174,15 @@ async function emitMessageEnd(stub: StubAPI, message: Record<string, unknown>, c
 
 async function emitEvent(stub: StubAPI, name: string, event: Record<string, unknown>, ctx: ExtensionContext): Promise<void> {
 	for (const handler of stub.events.get(name) ?? []) await handler(event, ctx);
+}
+
+async function emitBeforeProviderRequest(stub: StubAPI, payload: unknown, ctx: ExtensionContext): Promise<unknown> {
+	let current = payload;
+	for (const handler of stub.events.get("before_provider_request") ?? []) {
+		const replacement = await handler({ type: "before_provider_request", payload: current }, ctx);
+		if (replacement !== undefined) current = replacement;
+	}
+	return current;
 }
 
 async function emitContext(
@@ -395,6 +405,201 @@ test("runtime registers one fail-closed context projector before provider teleme
 	assert.doesNotMatch(handler, /appendEntry|sessionManager|getEntries|event\.messages\s*=/);
 });
 
+test("runtime applies v3 boundary breakpoints only to public OpenAI GPT-5.6 and resets them with projection lifecycle", async () => {
+	const stub = makeRoleRuntime("other");
+	const base = trustedCtx(process.cwd(), "runtime-prompt-cache-breakpoint") as ExtensionContext;
+	const publicOpenAiCtx = {
+		...base,
+		model: { provider: "openai", id: "gpt-5.6-sol", api: "openai-responses" },
+	} as ExtensionContext;
+	const raw: AgentMessage[] = [];
+	for (let index = 0; index < 5; index += 1) {
+		const id = `runtime-cache-boundary-${index}`;
+		raw.push(
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id, name: "read", arguments: { path: `${index}.txt` } }],
+				timestamp: index * 2 + 1,
+			} as unknown as AgentMessage,
+			{
+				role: "toolResult",
+				toolCallId: id,
+				toolName: "read",
+				content: [{ type: "text", text: String(index).repeat(20 * 1_024) }],
+				isError: false,
+				timestamp: index * 2 + 2,
+			} as unknown as AgentMessage,
+		);
+	}
+	const projected = await emitContext(stub, raw, publicOpenAiCtx);
+	const markers = projected.flatMap((message) => {
+		const candidate = message as unknown as { customType?: unknown; content?: unknown };
+		return candidate.customType === "workbench-history-projection-boundary" && typeof candidate.content === "string"
+			? [candidate.content]
+			: [];
+	});
+	assert.ok(markers.length >= 1, "a projected v3 anchor exposes at least one exact provider boundary marker");
+
+	const publicPayload = breakpointPayload(markers);
+	const publicResult = await emitBeforeProviderRequest(stub, publicPayload, publicOpenAiCtx) as Record<string, unknown>;
+	assert.notEqual(publicResult, publicPayload);
+	const publicBlocks = (((publicResult.input as Array<Record<string, unknown>>)[0]!.content) as Array<Record<string, unknown>>);
+	assert.deepEqual(publicBlocks.map((block) => block.prompt_cache_breakpoint), markers.map(() => ({ mode: "explicit" })));
+	assert.deepEqual(withoutPromptCacheBreakpoints(publicResult), publicPayload);
+	assert.equal(
+		await emitBeforeProviderRequest(stub, publicResult, publicOpenAiCtx),
+		publicResult,
+		"an already-applied outgoing payload remains identity-exact",
+	);
+
+	const codexPayload = breakpointPayload(markers);
+	const codexCtx = {
+		...base,
+		model: { provider: "openai-codex", id: "gpt-5.6-sol", api: "openai-codex-responses" },
+	} as ExtensionContext;
+	assert.equal(await emitBeforeProviderRequest(stub, codexPayload, codexCtx), codexPayload, "Codex remains experimentally disabled");
+
+	const deepseekPayload = {
+		model: "deepseek-v4-flash",
+		messages: [{ role: "system", content: "stable" }, { role: "user", content: "worker" }],
+		prompt_cache_key: "must-stay-uninterpreted",
+	};
+	const deepseekBytes = Buffer.from(JSON.stringify(deepseekPayload));
+	const deepseekCtx = {
+		...base,
+		model: { provider: "deepseek", id: "deepseek-v4-flash", api: "openai-completions" },
+	} as ExtensionContext;
+	const deepseekResult = await emitBeforeProviderRequest(stub, deepseekPayload, deepseekCtx);
+	assert.equal(deepseekResult, deepseekPayload);
+	assert.deepEqual(deepseekResult, deepseekPayload);
+	assert.deepEqual(Buffer.from(JSON.stringify(deepseekResult)), deepseekBytes);
+
+	await emitEvent(stub, "session_tree", { type: "session_tree", newLeafId: "new", oldLeafId: "old" }, publicOpenAiCtx);
+	const afterReset = breakpointPayload(markers);
+	assert.equal(
+		await emitBeforeProviderRequest(stub, afterReset, publicOpenAiCtx),
+		afterReset,
+		"session-tree projection reset clears the in-memory provider markers",
+	);
+
+	const source = await readFile(join(process.cwd(), "extensions/workbench-runtime/index.ts"), "utf8");
+	const contextStart = source.indexOf('pi.on("context"');
+	const providerStart = source.indexOf('pi.on("before_provider_request"');
+	const providerEnd = source.indexOf('pi.on("message_end"', providerStart);
+	const contextHandler = source.slice(contextStart, providerStart);
+	const providerHandler = source.slice(providerStart, providerEnd);
+	assert.match(contextHandler, /if \(projection\.epochTransitioned && projection\.epochHash\)[\s\S]*else if \(projection\.segmentSealed && projection\.segmentChainHash\)/);
+	assert.match(contextHandler, /observeHistoryProjectionSegmentSeal\(projection\.segmentChainHash\)/);
+	const helperIndex = providerHandler.indexOf("applyExplicitPromptCacheBreakpoints(");
+	const observeIndex = providerHandler.indexOf("cacheTelemetry.observePayload(");
+	const appliedEventIndex = providerHandler.indexOf("cacheTelemetry.observeExplicitPromptCacheBreakpointsApplied(");
+	const returnIndex = providerHandler.indexOf("return breakpointResult.payload");
+	assert.ok(
+		helperIndex >= 0 && helperIndex < observeIndex && observeIndex < appliedEventIndex && appliedEventIndex < returnIndex,
+		"helper → transformed observation → applied preceding event → outgoing replacement order",
+	);
+	assert.match(providerHandler, /breakpointResult\.status === "applied" \|\| breakpointResult\.reason === "already_applied"/);
+	assert.match(providerHandler, /allowCodexExperimental:\s*false/);
+});
+
+test("worker runtime projects the real outgoing context and round-trips strict v3 state", async () => {
+	const stub = makeRoleRuntime("worker");
+	const ctx = trustedCtx(process.cwd(), "worker-history-v3") as ExtensionContext;
+	const raw: AgentMessage[] = [];
+	for (let index = 0; index < 5; index += 1) {
+		const id = `worker-history-${index}`;
+		raw.push(
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id, name: "read", arguments: { path: `${index}.txt` } }],
+				timestamp: index * 2 + 1,
+			} as unknown as AgentMessage,
+			{
+				role: "toolResult",
+				toolCallId: id,
+				toolName: "read",
+				content: [{ type: "text", text: String(index).repeat(20 * 1_024) }],
+				isError: false,
+				timestamp: index * 2 + 2,
+			} as unknown as AgentMessage,
+		);
+	}
+
+	await emitEvent(stub, "turn_start", { type: "turn_start", turnIndex: 61, timestamp: 1 }, ctx);
+	const projected = await emitContext(stub, raw, ctx);
+	assert.ok(historyToolTextBytes(projected) <= WORKER_HISTORY_TOOL_TEXT_MAX_BYTES);
+	assert.equal(validateContextToolPairing(projected), true);
+	const latest = projected.find((message) => (
+		(message as { role?: unknown }).role === "toolResult"
+		&& (message as { toolCallId?: unknown }).toolCallId === "worker-history-4"
+	)) as unknown as { content: Array<Record<string, unknown>> };
+	assert.equal(textOf(latest.content), "4".repeat(20 * 1_024), "latest complete worker bundle stays raw");
+
+	await emitEvent(stub, "turn_end", { type: "turn_end", turnIndex: 61, message: {}, toolResults: [] }, ctx);
+	const persisted = [...stub.appendedEntries].reverse().find((entry) => entry.customType === HISTORY_PROJECTION_ENTRY_TYPE);
+	assert.ok(persisted, "worker persists the v3 custom entry type");
+	const state = persisted.data as Record<string, unknown>;
+	assert.deepEqual(Object.keys(state).sort(), [
+		"active", "activeRawStartMessageCount", "anchor", "anchorBundles", "anchorToolTextBytes", "descriptorMaxBytes",
+		"epoch", "epochHash", "hardBundles", "hardToolTextBytes", "observedRawHash", "observedRawMessageCount",
+		"projectedBundles", "projectedToolTextBytes", "rawBundles", "rawToolTextBytes", "schemaVersion",
+		"segmentChainHash", "segments", "stateHash", "transitionCollapsedResults", "transitionRemovedBundles",
+	].sort());
+	assert.equal(state.schemaVersion, 3);
+	assert.equal(state.active, 1);
+	assert.equal(state.hardToolTextBytes, WORKER_HISTORY_TOOL_TEXT_MAX_BYTES);
+	assert.equal(state.hardBundles, HISTORY_MAX_BUNDLES);
+	assert.equal(
+		state.anchorToolTextBytes,
+		Math.max(0, WORKER_HISTORY_TOOL_TEXT_MAX_BYTES - WORKER_TURN_MAX_BYTES - 16 * 384),
+	);
+	assert.equal(state.anchorBundles, HISTORY_MAX_BUNDLES - 16 - 16);
+	assert.match(String(state.epochHash), /^[0-9a-f]{64}$/);
+	assert.match(String(state.segmentChainHash), /^[0-9a-f]{64}$/);
+	assert.match(String(state.stateHash), /^[0-9a-f]{64}$/);
+	assert.ok(Array.isArray(state.segments));
+	assert.equal(state.segments.length, 0);
+	const anchor = state.anchor as Record<string, unknown>;
+	assert.deepEqual(Object.keys(anchor).sort(), [
+		"boundaryId", "collapsedResults", "projectedBundles", "projectedHash", "projectedMessageCount",
+		"projectedToolTextBytes", "rawEndMessageCount", "rawHash", "rawStartMessageCount", "removedBundles",
+	].sort());
+	assert.equal(anchor.rawStartMessageCount, 0);
+	assert.ok(Number(anchor.rawEndMessageCount) > 0);
+	assert.ok(Number(anchor.projectedMessageCount) > 0, "the fixed anchor is nonempty");
+	assert.ok(Number(anchor.projectedToolTextBytes) <= Number(state.anchorToolTextBytes));
+	assert.ok(Number(anchor.projectedBundles) <= Number(state.anchorBundles));
+	for (const key of ["boundaryId", "projectedHash", "rawHash"]) assert.match(String(anchor[key]), /^[0-9a-f]{64}$/);
+	assert.ok(Buffer.byteLength(JSON.stringify(state), "utf8") <= 32 * 1_024);
+
+	const wireState = JSON.parse(JSON.stringify(state)) as Record<string, unknown>;
+	const resumedStub = makeRoleRuntime("worker");
+	const resumedBase = trustedCtx(process.cwd(), "worker-history-v3-resume") as ExtensionContext;
+	const resumedCtx = {
+		...resumedBase,
+		sessionManager: {
+			...resumedBase.sessionManager,
+			getEntries: () => [{ type: "custom", customType: HISTORY_PROJECTION_ENTRY_TYPE, data: wireState }],
+		},
+	} as ExtensionContext;
+	await emitEvent(resumedStub, "session_start", { type: "session_start", reason: "reload" }, resumedCtx);
+	await emitEvent(resumedStub, "turn_start", { type: "turn_start", turnIndex: 62, timestamp: 2 }, resumedCtx);
+	const replayed = await emitContext(
+		resumedStub,
+		JSON.parse(JSON.stringify(raw)) as AgentMessage[],
+		resumedCtx,
+	);
+	assert.deepEqual(
+		JSON.parse(JSON.stringify(convertToLlm(replayed))),
+		JSON.parse(JSON.stringify(convertToLlm(projected))),
+		"strict JSON-wire state restores the exact provider projection",
+	);
+	await emitEvent(resumedStub, "turn_end", { type: "turn_end", turnIndex: 62, message: {}, toolResults: [] }, resumedCtx);
+	const replayedState = [...resumedStub.appendedEntries].reverse()
+		.find((entry) => entry.customType === HISTORY_PROJECTION_ENTRY_TYPE)?.data;
+	assert.deepEqual(replayedState, wireState, "an unchanged replay preserves strict v3 state exactly");
+});
+
 test("runtime context terminal fallback never re-inspects hostile messages or exposes raw context", async () => {
 	const stub = makeRoleRuntime("other");
 	const ctx = trustedCtx(process.cwd(), "history-hostile-runtime") as ExtensionContext;
@@ -431,16 +636,36 @@ test("runtime context terminal fallback never re-inspects hostile messages or ex
 		},
 	});
 	await invoke({ type: "context", messages: hostileMessages });
-	assert.equal(proxyTrapCalls, 1, "controller failure must not inspect a hostile messages proxy twice");
+	assert.equal(proxyTrapCalls, 0, "controller must reject a hostile messages proxy without invoking any trap");
 
 	const revoked = Proxy.revocable([] as AgentMessage[], {});
 	revoked.revoke();
 	await invoke({ type: "context", messages: revoked.proxy });
 });
 
-test("runtime freezes history epochs, counts omissions once, and persists exact pressure/reset state", async () => {
+test("runtime seals v3 segments without rewriting stable prefixes and checkpoints seal 17", async () => {
 	const stub = makeRoleRuntime("other");
 	const ctx = trustedCtx(process.cwd(), "history-epoch-runtime") as ExtensionContext;
+	const providerWire = (messages: AgentMessage[]): unknown[] => (
+		JSON.parse(JSON.stringify(convertToLlm(messages))) as unknown[]
+	);
+	const boundaryMarkers = (messages: AgentMessage[]): string[] => messages.flatMap((message) => {
+		const candidate = message as unknown as { customType?: unknown; content?: unknown };
+		return candidate.customType === "workbench-history-projection-boundary" && typeof candidate.content === "string"
+			? [candidate.content]
+			: [];
+	});
+	const latestState = (): Record<string, unknown> => {
+		const entry = [...stub.appendedEntries].reverse().find((item) => item.customType === HISTORY_PROJECTION_ENTRY_TYPE);
+		assert.ok(entry, "the runtime persists a v3 history state after each completed turn");
+		return entry.data as Record<string, unknown>;
+	};
+	const stableMessageCount = (state: Record<string, unknown>): number => {
+		const anchor = state.anchor as Record<string, unknown>;
+		const segments = state.segments as Array<Record<string, unknown>>;
+		return Number(anchor.projectedMessageCount)
+			+ segments.reduce((sum, segment) => sum + Number(segment.projectedMessageCount), 0);
+	};
 	const raw: AgentMessage[] = [];
 	for (let index = 0; index < 30; index += 1) {
 		const id = `runtime-epoch-${index}`;
@@ -456,8 +681,28 @@ test("runtime freezes history epochs, counts omissions once, and persists exact 
 		&& textOf((message as { content?: Array<Record<string, unknown>> }).content ?? []).includes("[historical tool result collapsed]")
 	)).length;
 	assert.ok(firstCollapsed > 0);
-	let previousProviderVisible = convertToLlm(first);
+	const firstProviderVisible = providerWire(first);
+	raw.push({ role: "user", content: "ordinary same-epoch append", timestamp: 900 } as unknown as AgentMessage);
+	const sameEpochAppend = await emitContext(stub, raw, ctx);
+	const sameEpochProviderVisible = providerWire(sameEpochAppend);
+	assert.deepEqual(
+		sameEpochProviderVisible.slice(0, firstProviderVisible.length),
+		firstProviderVisible,
+		"a non-sealing append preserves the complete provider-visible payload prefix",
+	);
+	await emitEvent(stub, "turn_end", { type: "turn_end", turnIndex: 51, message: {}, toolResults: [] }, ctx);
+	let previousProviderVisible = sameEpochProviderVisible;
+	let previousMarkers = boundaryMarkers(sameEpochAppend);
+	let previousState = latestState();
+	assert.equal(previousState.schemaVersion, 3);
+	assert.equal(previousState.active, 1);
+	assert.equal((previousState.segments as unknown[]).length, 0);
+	const initialEpoch = Number(previousState.epoch);
+	const initialEpochHash = String(previousState.epochHash);
+	assert.match(initialEpochHash, /^[0-9a-f]{64}$/);
+	let checkpointEpoch = initialEpoch;
 	for (let index = 0; index < 25; index += 1) {
+		await emitEvent(stub, "turn_start", { type: "turn_start", turnIndex: 52 + index, timestamp: 2 + index }, ctx);
 		const id = `runtime-suffix-${index}`;
 		raw.push(
 			{ role: "user", content: `suffix-${index}`, timestamp: 1_000 + index * 3 } as unknown as AgentMessage,
@@ -465,45 +710,114 @@ test("runtime freezes history epochs, counts omissions once, and persists exact 
 			{ role: "toolResult", toolCallId: id, toolName: "read", content: [{ type: "text", text: "s".repeat(12) }], isError: false, timestamp: 1_002 + index * 3 } as unknown as AgentMessage,
 		);
 		const next = await emitContext(stub, raw, ctx);
-		const nextProviderVisible = convertToLlm(next);
-		assert.deepEqual(
-			nextProviderVisible.slice(0, previousProviderVisible.length),
-			previousProviderVisible,
-			`runtime context request ${index} rewrote the Pi provider-visible epoch prefix`,
+		await emitEvent(stub, "turn_end", {
+			type: "turn_end", turnIndex: 52 + index, message: {}, toolResults: [],
+		}, ctx);
+		const nextProviderVisible = providerWire(next);
+		const nextMarkers = boundaryMarkers(next);
+		const nextState = latestState();
+		const seal = index + 1;
+		const nextSegments = nextState.segments as Array<Record<string, unknown>>;
+		assert.equal(nextState.schemaVersion, 3, `seal ${seal}`);
+		assert.equal(nextState.active, 1, `seal ${seal}`);
+		assert.equal(nextState.hardToolTextBytes, OTHER_HISTORY_TOOL_TEXT_MAX_BYTES, `seal ${seal}`);
+		assert.equal(nextState.hardBundles, HISTORY_MAX_BUNDLES, `seal ${seal}`);
+		assert.ok(Buffer.byteLength(JSON.stringify(nextState), "utf8") <= 32 * 1_024, `seal ${seal}`);
+		const anchor = nextState.anchor as Record<string, unknown>;
+		assert.ok(Number(anchor.projectedMessageCount) > 0, `seal ${seal} nonempty anchor`);
+		for (const segment of nextSegments) {
+			assert.ok(Number(segment.projectedToolTextBytes) <= 384, `seal ${seal} segment byte reserve`);
+			assert.ok(Number(segment.projectedBundles) <= 1, `seal ${seal} segment bundle reserve`);
+		}
+		const stableBundles = Number(anchor.projectedBundles)
+			+ nextSegments.reduce((sum, segment) => sum + Number(segment.projectedBundles), 0);
+		assert.ok(Number(nextState.projectedBundles) - stableBundles <= 16, `seal ${seal} active bundle reserve`);
+		assert.ok(
+			historyToolTextBytes(raw.slice(Number(nextState.activeRawStartMessageCount))) <= WORKER_TURN_MAX_BYTES,
+			`seal ${seal} active turn reserve`,
 		);
+
+		if (seal <= 16) {
+			assert.equal(Number(nextState.epoch), initialEpoch, `seal ${seal} must not advance the epoch`);
+			assert.equal(nextState.epochHash, initialEpochHash, `seal ${seal} must keep the epoch hash`);
+			assert.equal(nextSegments.length, seal, `seal ${seal} segment count`);
+			assert.deepEqual(nextState.anchor, previousState.anchor, `seal ${seal} rewrote the anchor`);
+			assert.deepEqual(
+				nextSegments.slice(0, (previousState.segments as unknown[]).length),
+				previousState.segments,
+				`seal ${seal} rewrote a prior segment`,
+			);
+			assert.deepEqual(nextMarkers.slice(0, previousMarkers.length), previousMarkers, `seal ${seal} marker prefix`);
+			const immutableCount = stableMessageCount(previousState);
+			assert.deepEqual(
+				nextProviderVisible.slice(0, immutableCount),
+				previousProviderVisible.slice(0, immutableCount),
+				`seal ${seal} rewrote the anchor/prior-segment provider prefix`,
+			);
+		} else if (seal === 17) {
+			checkpointEpoch = initialEpoch + 1;
+			assert.equal(Number(nextState.epoch), checkpointEpoch, "seal 17 performs exactly one checkpoint");
+			assert.notEqual(nextState.epochHash, initialEpochHash, "checkpoint replaces the epoch hash");
+			assert.equal(nextSegments.length, 0, "checkpoint clears the sealed segment chain");
+			assert.equal(nextMarkers.length, 1, "checkpoint leaves one fixed anchor boundary");
+		} else {
+			assert.equal(Number(nextState.epoch), checkpointEpoch, `post-checkpoint seal ${seal} epoch`);
+			assert.equal(nextSegments.length, seal - 17, `post-checkpoint seal ${seal} segment count`);
+			assert.deepEqual(nextState.anchor, previousState.anchor, `post-checkpoint seal ${seal} rewrote the anchor`);
+			assert.deepEqual(
+				nextSegments.slice(0, (previousState.segments as unknown[]).length),
+				previousState.segments,
+				`post-checkpoint seal ${seal} rewrote a prior segment`,
+			);
+			assert.deepEqual(nextMarkers.slice(0, previousMarkers.length), previousMarkers, `post-checkpoint seal ${seal} marker prefix`);
+			const immutableCount = stableMessageCount(previousState);
+			assert.deepEqual(
+				nextProviderVisible.slice(0, immutableCount),
+				previousProviderVisible.slice(0, immutableCount),
+				`post-checkpoint seal ${seal} rewrote the stable provider prefix`,
+			);
+		}
 		previousProviderVisible = nextProviderVisible;
+		previousMarkers = nextMarkers;
+		previousState = nextState;
 	}
-	await emitEvent(stub, "turn_end", { type: "turn_end", turnIndex: 51, message: {}, toolResults: [] }, ctx);
 
 	const outputEntry = [...stub.appendedEntries].reverse().find((entry) => entry.customType === OUTPUT_CONTROL_TELEMETRY_ENTRY_TYPE);
 	const outputSnapshot = parseOutputControlTelemetry(outputEntry?.data);
 	assert.ok(outputSnapshot);
 
-	const stateEntry = [...stub.appendedEntries].reverse().find((entry) => entry.customType === HISTORY_PROJECTION_ENTRY_TYPE);
-	const state = stateEntry?.data as Record<string, unknown>;
+	const state = latestState();
 	assert.equal(state.active, 1);
+	assert.equal(state.schemaVersion, 3);
 	assert.match(String(state.epochHash), /^[0-9a-f]{64}$/);
-	assert.match(String(state.prefixHash), /^[0-9a-f]{64}$/);
+	assert.match(String(state.segmentChainHash), /^[0-9a-f]{64}$/);
+	assert.match(String(state.stateHash), /^[0-9a-f]{64}$/);
+	assert.equal((state.segments as unknown[]).length, 8, "eight seals follow checkpoint 17");
 	assert.equal(JSON.stringify(state).includes("runtime-epoch"), false);
-	assert.equal(outputSnapshot.totals.historyCollapsedResults, state.transitionCollapsedResults, "25 same-epoch requests do not re-count collapsed results");
-	assert.equal(outputSnapshot.totals.historyRemovedBundles, state.transitionRemovedBundles, "25 same-epoch requests do not re-count removed bundles");
+	assert.equal(outputSnapshot.totals.historyCollapsedResults, state.transitionCollapsedResults, "replays do not re-count collapsed results");
+	assert.equal(outputSnapshot.totals.historyRemovedBundles, state.transitionRemovedBundles, "replays do not re-count removed bundles");
+	const wireState = JSON.parse(JSON.stringify(state)) as Record<string, unknown>;
 	const resumedStub = makeRoleRuntime("other");
 	const resumedBase = trustedCtx(process.cwd(), "history-epoch-resume") as ExtensionContext;
 	const resumedCtx = {
 		...resumedBase,
 		sessionManager: {
 			...resumedBase.sessionManager,
-			getEntries: () => [{ type: "custom", customType: HISTORY_PROJECTION_ENTRY_TYPE, data: state }],
+			getEntries: () => [{ type: "custom", customType: HISTORY_PROJECTION_ENTRY_TYPE, data: wireState }],
 		},
 	} as ExtensionContext;
 	await emitEvent(resumedStub, "session_start", { type: "session_start", reason: "reload" }, resumedCtx);
-	const resumedRaw = [...raw, { role: "user", content: "bounded suffix", timestamp: 999 } as unknown as AgentMessage];
+	const resumedRaw = [
+		...(JSON.parse(JSON.stringify(raw)) as AgentMessage[]),
+		{ role: "user", content: "bounded suffix", timestamp: 2_000 } as unknown as AgentMessage,
+	];
 	const resumed = await emitContext(resumedStub, resumedRaw, resumedCtx);
 	assert.deepEqual(
-		convertToLlm(resumed).slice(0, convertToLlm(first).length),
-		convertToLlm(first),
-		"reload restores the exact provider-visible epoch prefix",
+		providerWire(resumed).slice(0, previousProviderVisible.length),
+		previousProviderVisible,
+		"strict JSON-wire reload restores the exact anchor, segments, and active provider prefix",
 	);
+	assert.deepEqual(boundaryMarkers(resumed), previousMarkers, "reload restores every persisted v3 boundary marker");
 
 	const pressureEntry = [...stub.appendedEntries].reverse().find((entry) => entry.customType === "workbench-context-pressure-v1");
 	const pressure = pressureEntry?.data as Record<string, unknown>;
@@ -520,11 +834,15 @@ test("runtime freezes history epochs, counts omissions once, and persists exact 
 
 	await emitEvent(stub, "session_tree", { type: "session_tree", newLeafId: "new", oldLeafId: "old" }, ctx);
 	const treeReset = [...stub.appendedEntries].reverse().find((entry) => entry.customType === HISTORY_PROJECTION_ENTRY_TYPE)?.data as Record<string, unknown>;
+	assert.equal(treeReset.schemaVersion, 3);
 	assert.equal(treeReset.active, 0);
+	assert.deepEqual(treeReset.segments, []);
 	await emitContext(stub, raw, ctx);
 	await emitEvent(stub, "session_compact", { type: "session_compact", compactionEntry: {}, fromExtension: false, reason: "manual", willRetry: false }, ctx);
 	const compactReset = [...stub.appendedEntries].reverse().find((entry) => entry.customType === HISTORY_PROJECTION_ENTRY_TYPE)?.data as Record<string, unknown>;
+	assert.equal(compactReset.schemaVersion, 3);
 	assert.equal(compactReset.active, 0);
+	assert.deepEqual(compactReset.segments, []);
 });
 
 test("runtime session_tree marks exactly the next cache record expected and preserves later drift detection", async () => {
@@ -572,25 +890,146 @@ test("runtime session_tree marks exactly the next cache record expected and pres
 	});
 });
 
+test("runtime marks fail-closed and recovery projection boundaries exactly once", async () => {
+	await withTempDir(async (root) => {
+		const stub = makeRoleRuntime("other");
+		const base = trustedCtx(root, "cache-history-failure-boundary") as ExtensionContext;
+		const ctx = {
+			...base,
+			model: { provider: "deepseek", id: "deepseek-v4-flash", api: "openai-completions" },
+			thinkingLevel: "high",
+			getSystemPrompt: () => "stable workbench system prompt",
+		} as ExtensionContext;
+		const assistant = (timestamp: number) => ({
+			role: "assistant",
+			content: [],
+			provider: "deepseek",
+			model: "deepseek-v4-flash",
+			api: "openai-completions",
+			usage: { input: 100, output: 10, cacheRead: 900, cacheWrite: 0, totalTokens: 1_010, cost: { total: 0.001 } },
+			stopReason: "stop",
+			timestamp,
+		});
+		const observeRequest = async (messages: AgentMessage[], timestamp: number): Promise<void> => {
+			await emitEvent(stub, "before_provider_request", {
+				type: "before_provider_request",
+				payload: { model: "deepseek-v4-flash", messages },
+			}, ctx);
+			await emitMessageEnd(stub, assistant(timestamp), ctx);
+		};
+
+		await emitEvent(stub, "session_start", { type: "session_start", reason: "new" }, ctx);
+		const healthy = [{ role: "user", content: "healthy", timestamp: 1 } as unknown as AgentMessage];
+		await observeRequest(await emitContext(stub, healthy, ctx), 1);
+		const corruptA = [
+			{ role: "user", content: "ordinary-a-FAILURE-BOUNDARY-RUNTIME-SECRET-A", timestamp: 2 } as unknown as AgentMessage,
+			{
+				role: "toolResult",
+				toolCallId: "orphan-secret-a",
+				toolName: "read",
+				content: [{ type: "text", text: "FAILURE-BOUNDARY-RUNTIME-SECRET-A" }],
+				isError: false,
+				timestamp: 3,
+			} as unknown as AgentMessage,
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id: "local-a", name: "read", arguments: { secret: "LOCAL-CALL-A" } }],
+				timestamp: 4,
+			} as unknown as AgentMessage,
+			{
+				role: "toolResult",
+				toolCallId: "local-a",
+				toolName: "read",
+				content: [{ type: "text", text: "LOCAL-RESULT-A" }],
+				isError: false,
+				timestamp: 5,
+			} as unknown as AgentMessage,
+		];
+		const corruptB = [
+			{ role: "user", content: "different-ordinary-b-FAILURE-BOUNDARY-RUNTIME-SECRET-B", timestamp: 6 } as unknown as AgentMessage,
+			{
+				role: "toolResult",
+				toolCallId: "orphan-secret-b",
+				toolName: "read",
+				content: [{ type: "text", text: "FAILURE-BOUNDARY-RUNTIME-SECRET-B".repeat(41) }],
+				isError: false,
+				timestamp: 7,
+			} as unknown as AgentMessage,
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id: "different-local-b", name: "read", arguments: { secret: "LOCAL-CALL-B" } }],
+				timestamp: 8,
+			} as unknown as AgentMessage,
+			{
+				role: "toolResult",
+				toolCallId: "different-local-b",
+				toolName: "read",
+				content: [{ type: "text", text: "DIFFERENT-LOCAL-RESULT-B".repeat(13) }],
+				isError: false,
+				timestamp: 9,
+			} as unknown as AgentMessage,
+		];
+		const firstFailure = await emitContext(stub, corruptA, ctx);
+		const repeatedFailure = await emitContext(stub, corruptB, ctx);
+		assert.deepEqual(
+			convertToLlm(repeatedFailure),
+			convertToLlm(firstFailure),
+			"runtime failure payload is fixed across ordinary text, orphan size, and latest local bundle changes",
+		);
+		assert.doesNotMatch(JSON.stringify([firstFailure, repeatedFailure]), /RUNTIME-SECRET|LOCAL-CALL|LOCAL-RESULT/);
+		await observeRequest(firstFailure, 2);
+		await observeRequest(repeatedFailure, 3);
+		await observeRequest(await emitContext(stub, healthy, ctx), 4);
+		await observeRequest(await emitContext(stub, healthy, ctx), 5);
+
+		const telemetryPath = join(root, CONFIG_DIR_NAME, "workbench", "cache", "telemetry.jsonl");
+		const records = (await readFile(telemetryPath, "utf8"))
+			.trim()
+			.split("\n")
+			.map((line) => JSON.parse(line) as { inferredInvalidationReason?: string });
+		assert.deepEqual(records.map((record) => record.inferredInvalidationReason), [
+			"NEW_SESSION",
+			"HISTORY_PROJECTION_EPOCH_CHANGED",
+			"UNKNOWN",
+			"HISTORY_PROJECTION_EPOCH_CHANGED",
+			"UNKNOWN",
+		]);
+		assert.doesNotMatch(JSON.stringify(records), /RUNTIME-SECRET|LOCAL-CALL|LOCAL-RESULT/);
+	});
+});
+
 test("context success and fail-closed projections update latest numeric history telemetry", async () => {
 	const stub = makeRoleRuntime("other");
 	const ctx = trustedCtx(process.cwd(), "history-telemetry") as ExtensionContext;
 	await emitEvent(stub, "turn_start", { type: "turn_start", turnIndex: 41, timestamp: 1 }, ctx);
 	const paired: AgentMessage[] = [
-		{ role: "assistant", content: [{ type: "toolCall", id: "history-ok", name: "read", arguments: {} }], timestamp: 1 } as unknown as AgentMessage,
-		{ role: "toolResult", toolCallId: "history-ok", toolName: "read", content: [{ type: "text", text: "x".repeat(80 * 1_024) }], isError: false, timestamp: 2 } as unknown as AgentMessage,
+		{ role: "assistant", content: [{ type: "toolCall", id: "history-old", name: "read", arguments: {} }], timestamp: 1 } as unknown as AgentMessage,
+		{ role: "toolResult", toolCallId: "history-old", toolName: "read", content: [{ type: "text", text: "x".repeat(80 * 1_024) }], isError: false, timestamp: 2 } as unknown as AgentMessage,
+		{ role: "assistant", content: [{ type: "toolCall", id: "history-latest", name: "read", arguments: {} }], timestamp: 3 } as unknown as AgentMessage,
+		{ role: "toolResult", toolCallId: "history-latest", toolName: "read", content: [{ type: "text", text: "latest" }], isError: false, timestamp: 4 } as unknown as AgentMessage,
 	];
 	const success = await emitContext(stub, paired, ctx);
 	assert.ok(historyToolTextBytes(success) <= OTHER_HISTORY_TOOL_TEXT_MAX_BYTES);
+	await emitEvent(stub, "turn_end", { type: "turn_end", turnIndex: 41, message: {}, toolResults: [] }, ctx);
+	const successEntry = [...stub.appendedEntries].reverse().find((item) => item.customType === OUTPUT_CONTROL_TELEMETRY_ENTRY_TYPE);
+	const successSnapshot = parseOutputControlTelemetry(successEntry?.data);
+	assert.ok(successSnapshot);
+	assert.ok(successSnapshot.totals.historyCollapsedResults > 0);
+
+	await emitEvent(stub, "turn_start", { type: "turn_start", turnIndex: 42, timestamp: 5 }, ctx);
 	const failed = await emitContext(stub, [
-		{ role: "toolResult", toolCallId: "orphan", toolName: "read", content: [{ type: "text", text: "orphan" }], isError: false, timestamp: 3 } as unknown as AgentMessage,
+		{ role: "toolResult", toolCallId: "orphan", toolName: "read", content: [{ type: "text", text: "orphan" }], isError: false, timestamp: 6 } as unknown as AgentMessage,
 	], ctx);
 	assert.equal(validateContextToolPairing(failed), true);
-	await emitEvent(stub, "turn_end", { type: "turn_end", turnIndex: 41, message: {}, toolResults: [] }, ctx);
+	await emitEvent(stub, "turn_end", { type: "turn_end", turnIndex: 42, message: {}, toolResults: [] }, ctx);
 	const entry = [...stub.appendedEntries].reverse().find((item) => item.customType === OUTPUT_CONTROL_TELEMETRY_ENTRY_TYPE);
 	const snapshot = parseOutputControlTelemetry(entry?.data);
 	assert.ok(snapshot);
-	assert.ok(snapshot.totals.historyCollapsedResults >= 2, "both bounded success and fail-closed history observations are counted");
+	assert.equal(
+		snapshot.totals.historyCollapsedResults,
+		successSnapshot.totals.historyCollapsedResults,
+		"fixed fail-closed boundaries do not claim input-dependent collapses",
+	);
 	assert.equal(snapshot.activeHistoryToolTextBytes, historyToolTextBytes(failed), "active history is the latest gauge, not a sum");
 });
 
@@ -1840,4 +2279,333 @@ test("forged read details cannot inject a continuation into the final truncation
 	assert.match(shown, /workbench-output truncated/);
 	assert.doesNotMatch(shown, new RegExp(forged));
 	assert.doesNotMatch(shown, /continuation=read:/);
+});
+
+function breakpointPayload(markers: readonly string[], model = "gpt-5.6-sol"): Record<string, unknown> {
+	return {
+		model,
+		prompt_cache_key: "output-control-wiring-session",
+		input: [
+			{
+				role: "developer",
+				content: markers.map((text, index) => ({
+					type: "input_text",
+					text,
+					marker_index: index,
+				})),
+			},
+			{ type: "function_call", id: "fc_keep", call_id: "call_keep", name: "read", arguments: "{}" },
+			{
+				role: "user",
+				content: [{ type: "input_text", text: "ACTIVE-TAIL-MUST-STAY-RAW", tail: true }],
+			},
+		],
+		tools: [{ type: "function", name: "read", parameters: { type: "object" } }],
+	};
+}
+
+function withoutPromptCacheBreakpoints(value: unknown): unknown {
+	if (Array.isArray(value)) return value.map(withoutPromptCacheBreakpoints);
+	if (value === null || typeof value !== "object") return value;
+	return Object.fromEntries(Object.entries(value).flatMap(([key, item]) => (
+		key === "prompt_cache_breakpoint" ? [] : [[key, withoutPromptCacheBreakpoints(item)]]
+	)));
+}
+
+function explicitBreakpointInput(input: {
+	payload: unknown;
+	provider?: string;
+	api?: string;
+	modelId?: string;
+	allowCodexExperimental?: boolean;
+	expectedMarkerTexts: readonly string[];
+}) {
+	return applyExplicitPromptCacheBreakpoints({
+		payload: input.payload,
+		provider: input.provider ?? "openai",
+		api: input.api ?? "openai-responses",
+		modelId: input.modelId ?? "gpt-5.6-sol",
+		allowCodexExperimental: input.allowCodexExperimental ?? false,
+		expectedMarkerTexts: input.expectedMarkerTexts,
+	});
+}
+
+test("explicit breakpoint helper marks only exact public-OpenAI GPT-5.6 native input_text markers with copy-on-write", () => {
+	const markers = ["SEALED-SEGMENT-A", "SEALED-SEGMENT-B"] as const;
+	const payload = breakpointPayload(markers);
+	const originalJson = JSON.stringify(payload);
+	const originalInput = payload.input as Array<Record<string, unknown>>;
+	const originalMarkerItem = originalInput[0]!;
+	const originalMarkerContent = originalMarkerItem.content as Array<Record<string, unknown>>;
+	const originalCall = originalInput[1]!;
+	const originalTail = originalInput[2]!;
+
+	const result = explicitBreakpointInput({ payload, expectedMarkerTexts: markers });
+	assert.equal(result.status, "applied");
+	assert.equal(result.reason, "breakpoints_applied");
+	assert.equal(result.markerCount, 2);
+	assert.notEqual(result.payload, payload);
+	assert.equal(JSON.stringify(payload), originalJson, "the input payload is never mutated");
+
+	const transformed = result.payload as Record<string, unknown>;
+	const transformedInput = transformed.input as Array<Record<string, unknown>>;
+	const transformedMarkerItem = transformedInput[0]!;
+	const transformedMarkerContent = transformedMarkerItem.content as Array<Record<string, unknown>>;
+	assert.notEqual(transformedInput, originalInput);
+	assert.notEqual(transformedMarkerItem, originalMarkerItem);
+	assert.notEqual(transformedMarkerContent, originalMarkerContent);
+	assert.notEqual(transformedMarkerContent[0], originalMarkerContent[0]);
+	assert.notEqual(transformedMarkerContent[1], originalMarkerContent[1]);
+	assert.equal(transformedInput[1], originalCall, "an unmodified function-call item keeps identity");
+	assert.equal(transformedInput[2], originalTail, "the active tail keeps identity and receives no breakpoint");
+	assert.deepEqual(transformedMarkerContent.map((block) => block.prompt_cache_breakpoint), [
+		{ mode: "explicit" },
+		{ mode: "explicit" },
+	]);
+	assert.equal((transformedInput[2]!.content as Array<Record<string, unknown>>)[0]!.prompt_cache_breakpoint, undefined);
+	assert.equal(transformed.prompt_cache_key, payload.prompt_cache_key);
+	assert.equal(Object.hasOwn(transformed, "prompt_cache_options"), false);
+	assert.deepEqual(withoutPromptCacheBreakpoints(transformed), payload, "only explicit breakpoint fields differ canonically");
+});
+
+test("explicit breakpoint helper gates Codex experimentally and leaves DeepSeek worker payloads byte/deep exact", () => {
+	const marker = "SEALED-CODEX-MARKER";
+	const codexPayload = breakpointPayload([marker]);
+	const disabled = explicitBreakpointInput({
+		payload: codexPayload,
+		provider: "openai-codex",
+		api: "openai-codex-responses",
+		allowCodexExperimental: false,
+		expectedMarkerTexts: [marker],
+	});
+	assert.deepEqual({ status: disabled.status, reason: disabled.reason, markerCount: disabled.markerCount }, {
+		status: "noop", reason: "codex_experimental_disabled", markerCount: 0,
+	});
+	assert.equal(disabled.payload, codexPayload);
+
+	const enabled = explicitBreakpointInput({
+		payload: codexPayload,
+		provider: "openai-codex",
+		api: "openai-codex-responses",
+		allowCodexExperimental: true,
+		expectedMarkerTexts: [marker],
+	});
+	assert.equal(enabled.status, "applied");
+	assert.equal(enabled.markerCount, 1);
+
+	const deepseekPayload = {
+		model: "deepseek-v4-flash",
+		messages: [{ role: "system", content: "stable" }, { role: "user", content: "worker" }],
+		prompt_cache_key: "must-not-be-interpreted",
+	};
+	const beforeBytes = Buffer.from(JSON.stringify(deepseekPayload));
+	const deepseek = explicitBreakpointInput({
+		payload: deepseekPayload,
+		provider: "deepseek",
+		api: "openai-completions",
+		modelId: "deepseek-v4-flash",
+		expectedMarkerTexts: [marker],
+	});
+	assert.equal(deepseek.status, "noop");
+	assert.equal(deepseek.reason, "provider_not_supported");
+	assert.equal(deepseek.payload, deepseekPayload);
+	assert.deepEqual(deepseek.payload, deepseekPayload);
+	assert.deepEqual(Buffer.from(JSON.stringify(deepseek.payload)), beforeBytes);
+});
+
+test("explicit breakpoint helper strictly noops on invalid keys, models, inputs, occurrences, and existing foreign breakpoints", () => {
+	const marker = "SEALED-STRICT-MARKER";
+	const missingKey = breakpointPayload([marker]);
+	delete missingKey.prompt_cache_key;
+	const mismatchedPayloadModel = breakpointPayload([marker], "gpt-5.6-worker");
+	const malformed = breakpointPayload([marker]);
+	((malformed.input as Array<Record<string, unknown>>)[0]!.content as Array<Record<string, unknown>>)[0]!.text = 7;
+	const duplicate = breakpointPayload([marker, marker]);
+	const missing = breakpointPayload(["DIFFERENT-MARKER"]);
+	const unordered = breakpointPayload(["SEALED-A", "SEALED-B"]);
+	const sparse = breakpointPayload([marker]);
+	const sparseInput = new Array<unknown>(2);
+	sparseInput[1] = (sparse.input as unknown[])[0];
+	sparse.input = sparseInput;
+	const malformedBreakpoint = breakpointPayload([marker]);
+	((malformedBreakpoint.input as Array<Record<string, unknown>>)[0]!.content as Array<Record<string, unknown>>)[0]!.prompt_cache_breakpoint = { mode: "automatic" };
+	const unexpectedBreakpoint = breakpointPayload([marker]);
+	((unexpectedBreakpoint.input as Array<Record<string, unknown>>)[2]!.content as Array<Record<string, unknown>>)[0]!.prompt_cache_breakpoint = { mode: "explicit" };
+
+	const cases: Array<{
+		name: string;
+		payload: unknown;
+		markers: readonly string[];
+		modelId?: string;
+		reason: string;
+	}> = [
+		{ name: "missing cache key", payload: missingKey, markers: [marker], reason: "invalid_prompt_cache_key" },
+		{ name: "older model", payload: breakpointPayload([marker], "gpt-5.5"), markers: [marker], modelId: "gpt-5.5", reason: "model_not_supported" },
+		{ name: "confusable model family", payload: breakpointPayload([marker], "gpt-5.60-sol"), markers: [marker], modelId: "gpt-5.60-sol", reason: "model_not_supported" },
+		{ name: "payload model mismatch", payload: mismatchedPayloadModel, markers: [marker], reason: "payload_model_mismatch" },
+		{ name: "malformed input_text", payload: malformed, markers: [marker], reason: "malformed_input_text" },
+		{ name: "duplicate marker", payload: duplicate, markers: [marker], reason: "marker_duplicate" },
+		{ name: "missing marker", payload: missing, markers: [marker], reason: "marker_missing" },
+		{ name: "marker order", payload: unordered, markers: ["SEALED-B", "SEALED-A"], reason: "marker_order_mismatch" },
+		{ name: "sparse input", payload: sparse, markers: [marker], reason: "invalid_payload" },
+		{ name: "malformed breakpoint", payload: malformedBreakpoint, markers: [marker], reason: "malformed_breakpoint" },
+		{ name: "breakpoint outside markers", payload: unexpectedBreakpoint, markers: [marker], reason: "unexpected_breakpoint" },
+	];
+	for (const item of cases) {
+		const before = (() => { try { return JSON.stringify(item.payload); } catch { return undefined; } })();
+		const result = explicitBreakpointInput({
+			payload: item.payload,
+			modelId: item.modelId,
+			expectedMarkerTexts: item.markers,
+		});
+		assert.equal(result.status, "noop", item.name);
+		assert.equal(result.reason, item.reason, item.name);
+		assert.equal(result.payload, item.payload, item.name);
+		assert.equal((() => { try { return JSON.stringify(item.payload); } catch { return undefined; } })(), before, item.name);
+	}
+
+	for (const markers of [[], Array.from({ length: 18 }, (_, index) => `M-${index}`), [marker, marker]]) {
+		const payload = breakpointPayload([marker]);
+		const result = explicitBreakpointInput({ payload, expectedMarkerTexts: markers });
+		assert.equal(result.status, "noop");
+		assert.equal(result.reason, "invalid_markers");
+		assert.equal(result.payload, payload);
+	}
+});
+
+test("explicit breakpoint helper never invokes accessors or proxy traps and rejects non-plain data", () => {
+	const marker = "SEALED-HOSTILE-MARKER";
+	let markerTrapCalls = 0;
+	const proxiedMarkers = new Proxy([marker], {
+		get(): never { markerTrapCalls += 1; throw new Error("must not read marker proxy"); },
+		ownKeys(): never { markerTrapCalls += 1; throw new Error("must not enumerate marker proxy"); },
+	});
+	const markerProxyResult = explicitBreakpointInput({
+		payload: breakpointPayload([marker]),
+		expectedMarkerTexts: proxiedMarkers,
+	});
+	assert.equal(markerProxyResult.status, "noop");
+	assert.equal(markerProxyResult.reason, "invalid_markers");
+	assert.equal(markerTrapCalls, 0);
+
+	let markerGetterCalls = 0;
+	const accessorMarkers: string[] = [];
+	Object.defineProperty(accessorMarkers, "0", {
+		enumerable: true,
+		configurable: true,
+		get(): never { markerGetterCalls += 1; throw new Error("must not invoke marker getter"); },
+	});
+	const markerAccessorResult = explicitBreakpointInput({
+		payload: breakpointPayload([marker]),
+		expectedMarkerTexts: accessorMarkers,
+	});
+	assert.equal(markerAccessorResult.status, "noop");
+	assert.equal(markerAccessorResult.reason, "invalid_markers");
+	assert.equal(markerGetterCalls, 0);
+
+	const ordinary = breakpointPayload([marker]);
+	let rootTrapCalls = 0;
+	const proxy = new Proxy(ordinary, {
+		get(): never { rootTrapCalls += 1; throw new Error("must not read proxy"); },
+		ownKeys(): never { rootTrapCalls += 1; throw new Error("must not enumerate proxy"); },
+	});
+	const proxied = explicitBreakpointInput({ payload: proxy, expectedMarkerTexts: [marker] });
+	assert.equal(proxied.status, "noop");
+	assert.equal(proxied.reason, "invalid_payload");
+	assert.equal(proxied.payload, proxy);
+	assert.equal(rootTrapCalls, 0);
+
+	let nestedTrapCalls = 0;
+	const nestedPayload = breakpointPayload([marker]);
+	nestedPayload.tools = new Proxy([], {
+		get(): never { nestedTrapCalls += 1; throw new Error("must not read nested proxy"); },
+		ownKeys(): never { nestedTrapCalls += 1; throw new Error("must not enumerate nested proxy"); },
+	});
+	const nested = explicitBreakpointInput({ payload: nestedPayload, expectedMarkerTexts: [marker] });
+	assert.equal(nested.status, "noop");
+	assert.equal(nested.reason, "invalid_payload");
+	assert.equal(nested.payload, nestedPayload);
+	assert.equal(nestedTrapCalls, 0);
+
+	let getterCalls = 0;
+	const accessorPayload = breakpointPayload([marker]);
+	Object.defineProperty(accessorPayload, "input", {
+		enumerable: true,
+		get(): never { getterCalls += 1; throw new Error("must not invoke input getter"); },
+	});
+	const accessor = explicitBreakpointInput({ payload: accessorPayload, expectedMarkerTexts: [marker] });
+	assert.equal(accessor.status, "noop");
+	assert.equal(accessor.reason, "invalid_payload");
+	assert.equal(accessor.payload, accessorPayload);
+	assert.equal(getterCalls, 0);
+
+	const revoked = Proxy.revocable(ordinary, {});
+	revoked.revoke();
+	const revokedResult = explicitBreakpointInput({ payload: revoked.proxy, expectedMarkerTexts: [marker] });
+	assert.equal(revokedResult.status, "noop");
+	assert.equal(revokedResult.reason, "invalid_payload");
+	assert.equal(revokedResult.payload, revoked.proxy);
+
+	const symbolPayload = breakpointPayload([marker]);
+	Object.defineProperty(symbolPayload, Symbol("hostile"), { value: "hidden", enumerable: true });
+	const symbolResult = explicitBreakpointInput({ payload: symbolPayload, expectedMarkerTexts: [marker] });
+	assert.equal(symbolResult.status, "noop");
+	assert.equal(symbolResult.reason, "invalid_payload");
+	assert.equal(symbolResult.payload, symbolPayload);
+
+	const exoticPayload = breakpointPayload([marker]);
+	exoticPayload.metadata = new Date(0);
+	const exotic = explicitBreakpointInput({ payload: exoticPayload, expectedMarkerTexts: [marker] });
+	assert.equal(exotic.status, "noop");
+	assert.equal(exotic.reason, "invalid_payload");
+	assert.equal(exotic.payload, exoticPayload);
+});
+
+test("explicit breakpoint helper safely completes a partially pre-marked payload", () => {
+	const markers = ["SEALED-PARTIAL-A", "SEALED-PARTIAL-B"] as const;
+	const payload = breakpointPayload(markers);
+	const originalInput = payload.input as Array<Record<string, unknown>>;
+	const originalContent = originalInput[0]!.content as Array<Record<string, unknown>>;
+	originalContent[0]!.prompt_cache_breakpoint = { mode: "explicit" };
+	const alreadyMarkedBlock = originalContent[0]!;
+	const unmarkedBlock = originalContent[1]!;
+	const originalJson = JSON.stringify(payload);
+
+	const result = explicitBreakpointInput({ payload, expectedMarkerTexts: markers });
+	assert.equal(result.status, "applied");
+	assert.equal(result.markerCount, 2);
+	assert.equal(JSON.stringify(payload), originalJson, "partial application never mutates its source payload");
+	const transformed = result.payload as Record<string, unknown>;
+	const transformedContent = ((transformed.input as Array<Record<string, unknown>>)[0]!.content) as Array<Record<string, unknown>>;
+	assert.equal(transformedContent[0], alreadyMarkedBlock, "an exact existing marker block keeps identity");
+	assert.notEqual(transformedContent[1], unmarkedBlock, "only the missing marker block is cloned");
+	assert.deepEqual(transformedContent.map((block) => block.prompt_cache_breakpoint), [
+		{ mode: "explicit" },
+		{ mode: "explicit" },
+	]);
+
+	const idempotent = explicitBreakpointInput({ payload: result.payload, expectedMarkerTexts: markers });
+	assert.equal(idempotent.status, "noop");
+	assert.equal(idempotent.reason, "already_applied");
+	assert.equal(idempotent.payload, result.payload);
+});
+
+test("explicit breakpoint helper supports 17 ordered markers and is payload-idempotent", () => {
+	const markers = Array.from({ length: 17 }, (_, index) => `SEALED-SEGMENT-${String(index).padStart(2, "0")}`);
+	const payload = breakpointPayload(markers);
+	const first = explicitBreakpointInput({ payload, expectedMarkerTexts: markers });
+	assert.equal(first.status, "applied");
+	assert.equal(first.markerCount, 17);
+	const firstPayload = first.payload as Record<string, unknown>;
+	const markerBlocks = (((firstPayload.input as Array<Record<string, unknown>>)[0]!.content) as Array<Record<string, unknown>>);
+	assert.deepEqual(markerBlocks.map((block) => block.text), markers);
+	assert.deepEqual(markerBlocks.map((block) => block.prompt_cache_breakpoint), markers.map(() => ({ mode: "explicit" })));
+	assert.equal((((firstPayload.input as Array<Record<string, unknown>>)[2]!.content) as Array<Record<string, unknown>>)[0]!.prompt_cache_breakpoint, undefined);
+
+	const second = explicitBreakpointInput({ payload: first.payload, expectedMarkerTexts: markers });
+	assert.equal(second.status, "noop");
+	assert.equal(second.reason, "already_applied");
+	assert.equal(second.markerCount, 17);
+	assert.equal(second.payload, first.payload, "an idempotent pass performs no extra cloning");
+	assert.deepEqual(second.payload, first.payload);
 });

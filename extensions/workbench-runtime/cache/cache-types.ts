@@ -43,13 +43,13 @@ import {
 
 /**
  * Schema version of telemetry records and the session state entry.
- * 1.1 (P6-B): `inferredInvalidationReason` now emits UNEXPECTED_DRIFT for
- * same-mode drift (with the specific source in `driftSource`); the P6-A
- * specific reasons (SYSTEM_PROMPT_CHANGED / TOOL_SET_CHANGED /
- * TOOL_ORDER_CHANGED / TOOL_SCHEMA_CHANGED) are still recognized when
- * reading older 1.0 records.
+ * 1.2: same-epoch immutable history segment seals are observable as the
+ * expected `HISTORY_PROJECTION_SEGMENT_SEALED` reason. Segment/epoch hashes
+ * and provider marker text remain in-memory only and are not record fields.
+ * Readers remain strict for the exact 1.0, 1.1 and 1.2 record shapes.
  */
-export const TELEMETRY_SCHEMA_VERSION = "1.1" as const;
+export const TELEMETRY_SCHEMA_VERSION = "1.2" as const;
+export type TelemetrySchemaVersion = "1.0" | "1.1" | typeof TELEMETRY_SCHEMA_VERSION;
 
 /** Must stay in sync with package.json version. */
 export const EXTENSION_VERSION = "0.10.0";
@@ -99,7 +99,7 @@ export interface UsageSemantics {
  * Every field is a fact about usage or a hash — never message content.
  */
 export interface TelemetryRecord {
-	schemaVersion: "1.0" | typeof TELEMETRY_SCHEMA_VERSION;
+	schemaVersion: TelemetrySchemaVersion;
 	timestamp: string;
 	extensionVersion: string;
 	/** SHA-256 of the session id/file, first 16 hex chars. */
@@ -170,14 +170,14 @@ const MAX_TELEMETRY_NUMERIC_VALUE = 1_000_000_000_000_000;
 
 /**
  * Runtime guard for persisted telemetry. JSON being syntactically valid is
- * not enough: reports may only consume the exact hash-only 1.1 record
- * contract. Accessors, proxies, inherited fields, unknown fields and invalid
- * numeric/semantic combinations all fail closed.
+ * not enough: reports may only consume the exact hash-only 1.0/1.1/1.2
+ * contracts. Accessors, proxies, inherited fields, unknown fields and
+ * invalid numeric/semantic combinations all fail closed.
  */
 export function isTelemetryRecord(value: unknown): value is TelemetryRecord {
 	try {
 		if (!isPlainOwnDataRecord(value)) return false;
-		if (value.schemaVersion === TELEMETRY_SCHEMA_VERSION) {
+		if (value.schemaVersion === TELEMETRY_SCHEMA_VERSION || value.schemaVersion === "1.1") {
 			if (!hasExactOwnKeys(value, TELEMETRY_RECORD_KEYS)) return false;
 		} else if (value.schemaVersion === "1.0") {
 			if (!hasExactOwnKeys(value, TELEMETRY_RECORD_KEYS_V1_0)) return false;
@@ -198,8 +198,10 @@ export function isTelemetryRecord(value: unknown): value is TelemetryRecord {
 		if (!nullableHash(value.activeToolSchemaHash) || !nullableHash(value.contextShapeHash)) return false;
 		if (!nullableBoundedString(value.precedingEvent, 128)) return false;
 		if (typeof value.inferredInvalidationReason !== "string" || !INVALIDATION_REASON_SET.has(value.inferredInvalidationReason)) return false;
+		if (value.inferredInvalidationReason === "HISTORY_PROJECTION_SEGMENT_SEALED"
+			&& value.schemaVersion !== TELEMETRY_SCHEMA_VERSION) return false;
 		if (typeof value.inferenceConfidence !== "string" || !INFERENCE_CONFIDENCES.has(value.inferenceConfidence as InferenceConfidence)) return false;
-		if (value.schemaVersion === TELEMETRY_SCHEMA_VERSION) {
+		if (value.schemaVersion !== "1.0") {
 			if (value.driftSource !== null && (typeof value.driftSource !== "string" || !DRIFT_SOURCE_SET.has(value.driftSource))) return false;
 		}
 		return true;

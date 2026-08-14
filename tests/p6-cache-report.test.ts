@@ -80,6 +80,150 @@ test("report aggregates totals, modes, models and hit ratio", async () => {
 	assert.equal(report.invalidationCounts["UNKNOWN"], 1);
 });
 
+test("report exposes schema 1.2 projection and only exact eligible public OpenAI explicit-breakpoint usage", async () => {
+	const records = await collectRecords([
+		{},
+		{ ev: (t) => t.observeHistoryProjectionSegmentSeal("a".repeat(64)) },
+		{ ev: (t) => t.observeHistoryProjectionEpoch("projection-epoch-2") },
+		{
+			ev: (t) => t.observeExplicitPromptCacheBreakpointsApplied(),
+			facts: {
+				provider: "openai",
+				model: "gpt-5.6",
+				apiKind: "openai-responses",
+				usage: { input: 10, output: 1, cacheRead: 0, cacheWrite: 2, totalTokens: 13, cost: { total: 0.01 } },
+			},
+		},
+		{
+			ev: (t) => t.observeExplicitPromptCacheBreakpointsApplied(),
+			facts: {
+				provider: "openai",
+				model: "gpt-5.6-sol",
+				apiKind: "openai-responses",
+				usage: { input: 30, output: 2, cacheRead: 60, cacheWrite: 5, totalTokens: 97, cost: { total: 0.02 } },
+			},
+		},
+		{
+			ev: (t) => t.observeExplicitPromptCacheBreakpointsApplied(),
+			facts: {
+				provider: "deepseek",
+				model: "gpt-5.6-sol",
+				apiKind: "openai-completions",
+				usage: { input: 100, output: 3, cacheRead: 900, cacheWrite: 0, totalTokens: 1003, cost: { total: 0.03 } },
+			},
+		},
+		{
+			ev: (t) => t.observeExplicitPromptCacheBreakpointsApplied(),
+			facts: {
+				provider: "openai-codex",
+				model: "gpt-5.6-sol",
+				apiKind: "openai-codex-responses",
+				usage: { input: 200, output: 4, cacheRead: 1_800, cacheWrite: 1, totalTokens: 2_005, cost: { total: 0.04 } },
+			},
+		},
+		{
+			ev: (t) => t.observeExplicitPromptCacheBreakpointsApplied(),
+			facts: {
+				provider: "openai",
+				model: "gpt-5.6-sol",
+				apiKind: "openai-completions",
+				usage: { input: 300, output: 5, cacheRead: 2_700, cacheWrite: 2, totalTokens: 3_007, cost: { total: 0.05 } },
+			},
+		},
+		{
+			ev: (t) => t.observeExplicitPromptCacheBreakpointsApplied(),
+			facts: {
+				provider: "openai",
+				model: "gpt-5.60-sol",
+				apiKind: "openai-responses",
+				usage: { input: 400, output: 6, cacheRead: 3_600, cacheWrite: 3, totalTokens: 4_009, cost: { total: 0.06 } },
+			},
+		},
+	]);
+	const applied = records.filter((record) => record.precedingEvent === "explicit_prompt_cache_breakpoints_applied");
+	assert.equal(applied.length, 6);
+	assert.ok(applied.every((record) => record.usageSemanticStatus === "verified"), "adversarial records have verified usage semantics");
+	const report = buildCacheReport(records, "project", rateLookup);
+	assert.equal(report.schemaVersion, "1.2");
+	assert.equal(report.historyProjectionSegmentSeals, 1);
+	assert.equal(report.historyProjectionEpochTransitions, 1);
+	assert.equal(report.explicitBreakpointAppliedRequests, 6, "all applied markers remain visible for doctor mismatch diagnostics");
+	assert.deepEqual(report.explicitBreakpointVerifiedUsage, {
+		requestCount: 2,
+		input: 40,
+		cacheRead: 60,
+		cacheWrite: 7,
+		hitRatio: 0.6,
+	});
+	const rendered = renderCacheReport(report).join("\n");
+	assert.match(rendered, /segment seals=1 epoch transitions=1/);
+	assert.match(rendered, /explicit breakpoints.*applied=6.*verified requests=2.*cacheRead=60/);
+	for (const forbidden of ["boundaryMarker", "segmentChainHash", "payload"]) assert.ok(!rendered.includes(forbidden));
+
+	const partial = buildCacheReport(records, "project", rateLookup, { sourceIncomplete: true, skippedRecords: 1 });
+	assert.equal(partial.explicitBreakpointVerifiedUsage.hitRatio, null, "partial source evidence cannot present a clean applied-request ratio");
+});
+
+test("report excludes an errored eligible applied request even when its zero usage semantics are verified", async () => {
+	const records = await collectRecords([{
+		ev: (t) => t.observeExplicitPromptCacheBreakpointsApplied(),
+		facts: {
+			provider: "openai",
+			model: "gpt-5.6-sol",
+			apiKind: "openai-responses",
+			stopReason: "error",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { total: 0 } },
+		},
+	}]);
+	assert.equal(records[0]?.messageStatus, "error");
+	assert.equal(records[0]?.usageSemanticStatus, "verified", "zero usage remains semantically valid for the API kind");
+
+	const report = buildCacheReport(records, "project", rateLookup);
+	assert.equal(report.explicitBreakpointAppliedRequests, 1, "the applied request remains visible as a shape fact");
+	assert.deepEqual(report.explicitBreakpointVerifiedUsage, {
+		requestCount: 0,
+		input: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		hitRatio: null,
+	});
+	assert.equal(report.hitRatio, null, "overall ratio retains its existing zero-denominator semantics");
+});
+
+test("truncated complete records suppress only the explicit-breakpoint ratio, not retained numeric facts", async () => {
+	const records = await collectRecords([
+		{
+			ev: (t) => t.observeExplicitPromptCacheBreakpointsApplied(),
+			facts: {
+				provider: "openai",
+				model: "gpt-5.6",
+				apiKind: "openai-responses",
+				usage: { input: 10, output: 1, cacheRead: 0, cacheWrite: 2, totalTokens: 13, cost: { total: 0.01 } },
+			},
+		},
+		{
+			ev: (t) => t.observeExplicitPromptCacheBreakpointsApplied(),
+			facts: {
+				provider: "openai",
+				model: "gpt-5.6-sol",
+				apiKind: "openai-responses",
+				usage: { input: 30, output: 2, cacheRead: 60, cacheWrite: 5, totalTokens: 97, cost: { total: 0.02 } },
+			},
+		},
+	]);
+	assert.ok(records.every((record) => record.usageSemanticStatus === "verified"));
+	const bounded = buildCacheReport(records, "project", rateLookup, { truncatedRecords: 4 });
+	assert.equal(bounded.sourceIncomplete, false);
+	assert.equal(bounded.hitRatio, 0.6, "overall hitRatio remains the verified retained-window ratio");
+	assert.deepEqual(bounded.explicitBreakpointVerifiedUsage, {
+		requestCount: 2,
+		input: 40,
+		cacheRead: 60,
+		cacheWrite: 7,
+		hitRatio: null,
+	});
+});
+
 test("report counts model/thinking/mode/reload/compaction changes", async () => {
 	const records = await collectRecords([
 		{ ev: (t) => t.observeModelChange({ provider: "deepseek", id: "deepseek-v4-pro", api: "openai-completions" }), facts: { model: "deepseek-v4-pro" } },
@@ -178,10 +322,21 @@ test("estimated avoided cost is unavailable when source evidence is partial or b
 
 test("empty report: no records, no fabrication", () => {
 	const report = buildCacheReport([], "session", rateLookup);
+	assert.equal(report.schemaVersion, "1.2", "empty/current fallback follows the telemetry schema");
 	assert.equal(report.requestCount, 0);
 	assert.equal(report.hitRatio, null);
 	assert.equal(report.semanticStatus, null);
 	assert.equal(report.estimatedAvoidedCost, null);
+	assert.equal(report.historyProjectionSegmentSeals, 0);
+	assert.equal(report.historyProjectionEpochTransitions, 0);
+	assert.equal(report.explicitBreakpointAppliedRequests, 0);
+	assert.deepEqual(report.explicitBreakpointVerifiedUsage, {
+		requestCount: 0,
+		input: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		hitRatio: null,
+	});
 });
 
 test("partial or unverified usage semantics never fabricate an aggregate hit ratio", async () => {
@@ -310,9 +465,130 @@ test("doctor: all checks pass on a healthy setup", async () => {
 	const fails = checks.filter((c) => c.status === "fail");
 	assert.deepEqual(fails, [], `unexpected fails: ${JSON.stringify(fails)}`);
 	const ids = checks.map((c) => c.id);
-	for (const expected of ["current_model", "telemetry_source_quality", "usage_fields", "model_cost_metadata", "models_json", "auth_json", "system_prompt_dynamics", "prefix_hashes", "tool_metadata_static", "tool_stability", "same_mode_drift", "expected_vs_unexpected", "churn", "forbidden_fields", "telemetry_size", "telemetry_enabled"]) {
+	for (const expected of ["current_model", "telemetry_source_quality", "usage_fields", "model_cost_metadata", "models_json", "auth_json", "system_prompt_dynamics", "prefix_hashes", "tool_metadata_static", "tool_stability", "same_mode_drift", "expected_vs_unexpected", "history_projection_events", "explicit_breakpoint_usage", "churn", "forbidden_fields", "telemetry_size", "telemetry_enabled"]) {
 		assert.ok(ids.includes(expected), expected);
 	}
+	assert.equal(checks.find((check) => check.id === "explicit_breakpoint_usage")?.status, "skip", "DeepSeek without an applied record is not warned");
+});
+
+test("doctor reports segment/checkpoint counts and accepts verified public OpenAI breakpoint usage with cacheRead zero", async () => {
+	const records = await collectRecords([
+		{},
+		{ ev: (t) => t.observeHistoryProjectionSegmentSeal("b".repeat(64)) },
+		{ ev: (t) => t.observeHistoryProjectionEpoch("projection-epoch-3") },
+		{
+			ev: (t) => t.observeExplicitPromptCacheBreakpointsApplied(),
+			facts: {
+				provider: "openai",
+				model: "gpt-5.6-sol",
+				apiKind: "openai-responses",
+				usage: { input: 100, output: 5, cacheRead: 0, cacheWrite: 8, totalTokens: 113, cost: { total: 0.01 } },
+			},
+		},
+	]);
+	const facts: DoctorFacts = {
+		provider: "deepseek",
+		model: "deepseek-v4-flash",
+		apiKind: "openai-completions",
+		modelCostPresent: true,
+		modelCostRatesValid: true,
+		systemPrompt: "stable",
+		activeToolNames: ["read", "grep", "find", "bash"],
+		tools: TOOLS,
+		records,
+		telemetryEnabled: true,
+		telemetryBytes: 1024,
+		telemetryMaxBytes: 5 * 1024 * 1024,
+		rotatedFiles: 0,
+	};
+	const checks = runDoctor(facts);
+	const projection = checks.find((check) => check.id === "history_projection_events");
+	assert.equal(projection?.status, "ok");
+	assert.match(projection?.message ?? "", /segment seals=1 epoch transitions=1/);
+	const breakpoint = checks.find((check) => check.id === "explicit_breakpoint_usage");
+	assert.equal(breakpoint?.status, "ok", "cacheRead=0 is provider authority, not a failed optimization");
+	assert.match(breakpoint?.message ?? "", /applied=1 eligible=1 verified=1.*input=100 cacheRead=0 cacheWrite=8.*ratio=0%/);
+
+	const json = doctorToJson(checks, facts) as {
+		history_projection?: { segmentSeals?: number; epochTransitions?: number };
+		explicit_breakpoints?: { appliedRequests?: number; eligibleAppliedRequests?: number; erroredEligibleAppliedRequests?: number; verifiedUsage?: { cacheRead?: number; hitRatio?: number | null } };
+	};
+	assert.deepEqual(json.history_projection, { segmentSeals: 1, epochTransitions: 1 });
+	assert.equal(json.explicit_breakpoints?.appliedRequests, 1);
+	assert.equal(json.explicit_breakpoints?.eligibleAppliedRequests, 1);
+	assert.equal(json.explicit_breakpoints?.erroredEligibleAppliedRequests, 0);
+	assert.equal(json.explicit_breakpoints?.verifiedUsage?.cacheRead, 0);
+	assert.equal(json.explicit_breakpoints?.verifiedUsage?.hitRatio, 0);
+	const serialized = JSON.stringify(json);
+	for (const forbidden of ["boundaryMarker", "segmentChainHash", "payload"]) assert.ok(!serialized.includes(forbidden));
+
+	const codexRecords = await collectRecords([{
+		facts: {
+			provider: "openai-codex",
+			model: "gpt-5.6-sol",
+			apiKind: "openai-codex-responses",
+		},
+	}]);
+	const codexChecks = runDoctor({
+		...facts,
+		provider: "openai-codex",
+		model: "gpt-5.6-sol",
+		apiKind: "openai-codex-responses",
+		records: codexRecords,
+	});
+	assert.equal(codexChecks.find((check) => check.id === "explicit_breakpoint_usage")?.status, "skip", "Codex default-disabled traffic is not warned");
+});
+
+test("doctor warns and reports an errored eligible applied request without treating zero usage as authoritative", async () => {
+	const records = await collectRecords([{
+		ev: (t) => t.observeExplicitPromptCacheBreakpointsApplied(),
+		facts: {
+			provider: "openai",
+			model: "gpt-5.6-sol",
+			apiKind: "openai-responses",
+			stopReason: "error",
+			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { total: 0 } },
+		},
+	}]);
+	const facts: DoctorFacts = {
+		provider: "openai",
+		model: "gpt-5.6-sol",
+		apiKind: "openai-responses",
+		modelCostPresent: true,
+		modelCostRatesValid: true,
+		systemPrompt: "stable",
+		activeToolNames: ["read", "grep", "find", "bash"],
+		tools: TOOLS,
+		records,
+		telemetryEnabled: true,
+		telemetryBytes: 1024,
+		telemetryMaxBytes: 5 * 1024 * 1024,
+		rotatedFiles: 0,
+	};
+	const checks = runDoctor(facts);
+	const breakpoint = checks.find((check) => check.id === "explicit_breakpoint_usage");
+	assert.equal(breakpoint?.status, "warn");
+	assert.match(breakpoint?.message ?? "", /applied=1 eligible=1 verified=0 errored eligible=1.*messageStatus=error/);
+	assert.doesNotMatch(breakpoint?.message ?? "", /provider usage is authoritative/);
+
+	const json = doctorToJson(checks, facts) as {
+		explicit_breakpoints?: {
+			appliedRequests?: number;
+			eligibleAppliedRequests?: number;
+			erroredEligibleAppliedRequests?: number;
+			verifiedUsage?: { requestCount?: number; input?: number; cacheRead?: number; cacheWrite?: number; hitRatio?: number | null };
+		};
+	};
+	assert.equal(json.explicit_breakpoints?.appliedRequests, 1);
+	assert.equal(json.explicit_breakpoints?.eligibleAppliedRequests, 1);
+	assert.equal(json.explicit_breakpoints?.erroredEligibleAppliedRequests, 1);
+	assert.deepEqual(json.explicit_breakpoints?.verifiedUsage, {
+		requestCount: 0,
+		input: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		hitRatio: null,
+	});
 });
 
 test("doctor: partial or truncated telemetry suppresses clean historical conclusions", async () => {
@@ -345,6 +621,8 @@ test("doctor: partial or truncated telemetry suppresses clean historical conclus
 	assert.equal(drift?.status, "warn");
 	assert.ok(drift?.message.includes("prevents a no-drift conclusion"));
 	assert.equal(checks.find((check) => check.id === "expected_vs_unexpected")?.status, "warn");
+	assert.equal(checks.find((check) => check.id === "history_projection_events")?.status, "warn");
+	assert.equal(checks.find((check) => check.id === "explicit_breakpoint_usage")?.status, "warn");
 	assert.equal(checks.find((check) => check.id === "forbidden_fields")?.status, "warn");
 	const json = doctorToJson(checks, facts) as { telemetry_quality?: Record<string, unknown> };
 	assert.deepEqual(json.telemetry_quality, {
@@ -354,6 +632,16 @@ test("doctor: partial or truncated telemetry suppresses clean historical conclus
 		filesRead: 3,
 		sourceUnavailable: "read_error",
 	});
+
+	const truncatedOnly = runDoctor({
+		...facts,
+		sourceIncomplete: false,
+		skippedRecords: 0,
+		sourceUnavailable: null,
+		truncatedRecords: 7,
+	});
+	assert.equal(truncatedOnly.find((check) => check.id === "history_projection_events")?.status, "warn");
+	assert.equal(truncatedOnly.find((check) => check.id === "explicit_breakpoint_usage")?.status, "warn");
 });
 
 test("doctor flags dynamic system prompt markers (ids only, never content)", () => {

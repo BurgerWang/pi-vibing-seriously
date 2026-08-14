@@ -36,16 +36,66 @@
 
 ### Fixed
 
-- Active-history projection now rewrites the provider-visible prefix only at
-  discrete 75% / 96-bundle epochs while preserving the 96/64 KiB and
-  128-bundle hard limits. Normal appended turns remain append-only inside an
-  epoch, and telemetry records the crossing as an expected invalidation.
+- Active-history projection state v3 reserves the 64/48 KiB Commander/worker
+  raw turn plus sixteen 384-byte segments inside the unchanged 96/64 KiB hard
+  ceilings. The resulting anchor caps are 26/10 KiB and 96 bundles. The raw
+  active suffix is capped at 16 bundles; each of at most 16 immutable segments
+  projects no more than 384 tool-text bytes and one complete bundle. Seals
+  1–16 preserve the epoch, anchor, old segments, and boundary markers and are
+  expected tail rewrites. An attempt to create segment 17 triggers a
+  checkpoint that rebuilds the anchor, clears the chain, and increments the
+  epoch. Strict v1/v2 state is migration-only and carries monotonic epoch plus
+  pressure—not topology. Under-cap legacy restore now emits one
+  `legacy_migration` boundary without rewriting raw history, then persists
+  inactive v3 so the boundary cannot repeat after reload.
+- V3 history identity now hashes strings losslessly by exact UTF-16 code units,
+  follows JSON property enumeration order, omits object `undefined`, and maps
+  array holes/`undefined` to `null`. Array length, nesting, property count, and
+  total work are bounded; Proxy, accessor, custom-`toJSON`, cyclic, non-plain,
+  and over-budget input fails closed without invoking hostile code. The newest
+  malformed matching or structurally unsafe session entry is authoritative and
+  cannot revive an older valid projection.
+- A fixed non-secret failure sentinel is now state-hash-protected in inactive
+  v3 state. It survives JSONL restore, suppresses repeated failure transitions,
+  and emits exactly one recovery boundary on the first healthy projection.
+- Projected anchors and immutable segments end in deterministic bounded hidden
+  markers whose safe boundary IDs derive only from provider-visible structural
+  content. Public OpenAI explicit breakpoint injection is optional and limited
+  to exact public `openai-responses` GPT-5.6 traffic with an existing cache key.
+  It stays disabled for `openai-codex` pending live SSE and WebSocket probes;
+  DeepSeek is a strict injection no-op while retaining the segmented-prefix
+  benefit. No cache-hit improvement is claimed before deployment and verified
+  provider usage.
+- The documented cache strategy now follows the primary-source synthesis of an
+  immutable fixed anchor, modular immutable segments, and rare checkpoints for
+  both Commander and worker. OpenAI operational guidance is recorded explicitly:
+  exact static-first/variable-last prefixes, a consistent `prompt_cache_key`,
+  at most four new writes per request, the latest 50 read candidates, roughly
+  15 requests/minute per key, and measurement through `cached_tokens` plus
+  `cache_write_tokens`. Seventeen logical v3 markers do not imply seventeen
+  writes on one request.
 - Cache status distinguishes last-request from cumulative-session hit ratios;
   normal payload appends are no longer reported as prefix divergence, and
   project/session reports read a bounded chronological window across rotated
   and current telemetry with explicit data-quality handling. Cache doctor now
   scans that rotation set too, reports total telemetry bytes and source quality,
   and suppresses clean/no-drift conclusions for partial or truncated evidence.
+- Cache report and offline benchmark now expose the numeric record facts
+  `historyProjectionSegmentSeals`, `historyProjectionEpochTransitions`,
+  `explicitBreakpointAppliedRequests`, and `explicitBreakpointVerifiedUsage`.
+  The verified subset is now exactly successful (`messageStatus = ok`),
+  semantically verified, eligible public OpenAI GPT-5.6 Responses traffic;
+  errored requests remain visible as applied-shape facts but contribute no
+  verified usage.
+  Doctor checks `history_projection_events` and `explicit_breakpoint_usage`
+  treat provider-reported `cacheRead = 0` as valid, skip default-disabled
+  Codex/unsupported DeepSeek on complete evidence with no application record,
+  expose numeric `erroredEligibleAppliedRequests`, and warn rather than report
+  OK/authoritative usage when an eligible applied request ended in error. They
+  also warn with an unavailable applied-subset ratio for partial, corrupt, or
+  truncated evidence. The existing overall hit ratio remains a retained
+  bounded-window metric when only oldest records were intentionally omitted.
+  No measured cache improvement is inferred from these diagnostics.
 - Formal context-output stress runs its fake provider in a temporary telemetry
   sink and proves repository telemetry files are unchanged. The 300 historical
   fake records already found in this checkout are deliberately left untouched;
@@ -55,7 +105,8 @@
   auto-compaction companion. Pi 0.83 context usage already measures raw session
   messages, so automatic thresholds use that usage alone and never add a
   raw-minus-projected delta. This package publishes the contract but does not
-  deploy that companion extension.
+  deploy that companion extension. The v3 projection state does not change
+  this diagnostic wire shape.
 
 ### Breaking
 

@@ -23,10 +23,10 @@ import {
 } from "../scripts/cache-benchmark.ts";
 import { spawnExec, withTempDir } from "./helpers.ts";
 
-/** One valid telemetry record (schema 1.1). */
+/** One valid current telemetry record (schema 1.2). */
 function record(overrides: Record<string, unknown> = {}): Record<string, unknown> {
 	return {
-		schemaVersion: "1.1",
+		schemaVersion: "1.2",
 		timestamp: "2026-08-02T01:57:35.263Z",
 		extensionVersion: "0.8.0",
 		hashedSessionId: "a".repeat(16),
@@ -227,6 +227,10 @@ test("buildBenchmarkReport: all required fields with correct aggregation", async
 			"estimatedAvoidedCost",
 			"expectedInvalidations",
 			"unexpectedDrifts",
+			"historyProjectionSegmentSeals",
+			"historyProjectionEpochTransitions",
+			"explicitBreakpointAppliedRequests",
+			"explicitBreakpointVerifiedUsage",
 			"modeChanges",
 			"modelChanges",
 			"thinkingChanges",
@@ -263,6 +267,49 @@ test("buildBenchmarkReport: all required fields with correct aggregation", async
 		assert.equal(report.skippedTelemetryLines, 1);
 		assert.equal(report.telemetrySourceIncomplete, true);
 		assert.equal(report.truncatedTelemetryRecords, 0);
+	});
+});
+
+test("buildBenchmarkReport mirrors projection and verified explicit-breakpoint record facts", async () => {
+	await withTempDir(async (root) => {
+		await makeProject(root);
+		const telemetryPath = join(root, ".pi", "workbench", "cache", "telemetry.jsonl");
+		const segment = record({
+			inferredInvalidationReason: "HISTORY_PROJECTION_SEGMENT_SEALED",
+			precedingEvent: "context_projection",
+		});
+		const epoch = record({
+			timestamp: "2026-08-02T01:58:00.000Z",
+			inferredInvalidationReason: "HISTORY_PROJECTION_EPOCH_CHANGED",
+			precedingEvent: "context_projection",
+		});
+		const applied = record({
+			timestamp: "2026-08-02T01:59:00.000Z",
+			provider: "openai",
+			model: "gpt-5.6-sol",
+			apiKind: "openai-responses",
+			precedingEvent: "explicit_prompt_cache_breakpoints_applied",
+			inferredInvalidationReason: "UNKNOWN",
+			usage: { input: 100, output: 10, cacheRead: 0, cacheWrite: 5, totalTokens: 115, cost: 0.01 },
+			cacheHitRatio: 0,
+		});
+		await writeFile(telemetryPath, `${[segment, epoch, applied].map((item) => JSON.stringify(item)).join("\n")}\n`, "utf8");
+
+		const report = await buildBenchmarkReport({ projectRoot: root, scope: "project" });
+		assert.equal(report.historyProjectionSegmentSeals, 1);
+		assert.equal(report.historyProjectionEpochTransitions, 1);
+		assert.equal(report.explicitBreakpointAppliedRequests, 1);
+		assert.deepEqual(report.explicitBreakpointVerifiedUsage, {
+			requestCount: 1,
+			input: 100,
+			cacheRead: 0,
+			cacheWrite: 5,
+			hitRatio: 0,
+		});
+		const rendered = renderBenchmarkReport(report).join("\n");
+		assert.match(rendered, /segment seals=1 epoch transitions=1/);
+		assert.match(rendered, /explicit breakpoints.*applied=1.*cacheRead=0.*ratio=0%/);
+		for (const forbidden of ["boundaryMarker", "segmentChainHash", "payload"]) assert.ok(!rendered.includes(forbidden));
 	});
 });
 
@@ -344,6 +391,10 @@ test("normalizeReport: accepts both the benchmark shape and the extension CacheR
 			expectedInvalidations: 1,
 			unexpectedDrifts: 0,
 			sameModeMutationCount: 0,
+			historyProjectionSegmentSeals: 0,
+			historyProjectionEpochTransitions: 0,
+			explicitBreakpointAppliedRequests: 0,
+			explicitBreakpointVerifiedUsage: { requestCount: 0, input: 0, cacheRead: 0, cacheWrite: 0, hitRatio: null },
 			estimatedAvoidedCost: 0.005,
 			skippedRecords: 0,
 		};

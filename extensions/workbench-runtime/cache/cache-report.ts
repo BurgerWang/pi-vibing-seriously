@@ -14,6 +14,7 @@ import {
 	cacheHitRatioFromTotals,
 	combineUsageSemanticStatus,
 	isTelemetryRecord,
+	TELEMETRY_SCHEMA_VERSION,
 	type TelemetryRecord,
 	type UsageSemanticStatus,
 } from "./cache-types.ts";
@@ -22,6 +23,22 @@ import type { CacheSnapshot } from "./cache-telemetry.ts";
 import { formatNumber } from "../core/format.ts";
 
 const TELEMETRY_WRITE_GAP_EVENT = "telemetry_write_gap";
+const EXPLICIT_PROMPT_CACHE_BREAKPOINTS_APPLIED_EVENT = "explicit_prompt_cache_breakpoints_applied";
+
+function isPublicOpenAiExplicitBreakpointEligible(record: TelemetryRecord): boolean {
+	return record.provider === "openai"
+		&& record.apiKind === "openai-responses"
+		&& (record.model === "gpt-5.6" || record.model.startsWith("gpt-5.6-"));
+}
+
+/** Numeric provider-usage facts for successful applied requests whose semantics are verified. */
+export interface ExplicitBreakpointVerifiedUsage {
+	requestCount: number;
+	input: number;
+	cacheRead: number;
+	cacheWrite: number;
+	hitRatio: number | null;
+}
 
 /** Rate lookup compatible with Pi's model registry cost metadata. */
 export interface RateLookup {
@@ -59,6 +76,14 @@ export interface CacheReport {
 	unexpectedDrifts: number;
 	/** P6-B: requests invalidated while the workbench mode did NOT change. */
 	sameModeMutationCount: number;
+	/** Same-epoch immutable projection-seal records in the retained observation. */
+	historyProjectionSegmentSeals: number;
+	/** Projection checkpoint/epoch-transition records in the retained observation. */
+	historyProjectionEpochTransitions: number;
+	/** Requests whose records say the public request carried explicit breakpoints. */
+	explicitBreakpointAppliedRequests: number;
+	/** Verified provider usage for the applied-request subset; never marker/hash/payload data. */
+	explicitBreakpointVerifiedUsage: ExplicitBreakpointVerifiedUsage;
 	/** Null unless rates resolve and the full telemetry observation is complete. */
 	estimatedAvoidedCost: number | null;
 	skippedRecords: number;
@@ -104,6 +129,10 @@ export function buildCacheReport(
 	let semantic: UsageSemanticStatus | null = null;
 	let estimatedAvoidedCost: number | null = 0;
 	let ratesReliable = true;
+	let historyProjectionSegmentSeals = 0;
+	let historyProjectionEpochTransitions = 0;
+	let explicitBreakpointAppliedRequests = 0;
+	const explicitBreakpointVerifiedTotals = { requestCount: 0, input: 0, cacheRead: 0, cacheWrite: 0 };
 
 	for (const record of validRecords) {
 		totals.input += record.usage.input;
@@ -116,6 +145,17 @@ export function buildCacheReport(
 			? record.usageSemanticStatus
 			: "unverified";
 		semantic = combineUsageSemanticStatus(semantic, recordSemantic);
+		if (record.inferredInvalidationReason === "HISTORY_PROJECTION_SEGMENT_SEALED") historyProjectionSegmentSeals += 1;
+		if (record.inferredInvalidationReason === "HISTORY_PROJECTION_EPOCH_CHANGED") historyProjectionEpochTransitions += 1;
+		if (record.precedingEvent === EXPLICIT_PROMPT_CACHE_BREAKPOINTS_APPLIED_EVENT) {
+			explicitBreakpointAppliedRequests += 1;
+			if (record.messageStatus === "ok" && recordSemantic === "verified" && isPublicOpenAiExplicitBreakpointEligible(record)) {
+				explicitBreakpointVerifiedTotals.requestCount += 1;
+				explicitBreakpointVerifiedTotals.input += record.usage.input;
+				explicitBreakpointVerifiedTotals.cacheRead += record.usage.cacheRead;
+				explicitBreakpointVerifiedTotals.cacheWrite += record.usage.cacheWrite;
+			}
+		}
 
 		// Estimated avoided cost: only when the registry gives a compatible
 		// rate for THIS record's provider/model. One unknown rate voids the
@@ -179,10 +219,13 @@ export function buildCacheReport(
 	const hitRatio = validRecords.length > 0 && semantic === "verified" && !sourceIncomplete
 		? cacheHitRatioFromTotals(totals)
 		: null;
+	const explicitBreakpointVerifiedHitRatio = explicitBreakpointVerifiedTotals.requestCount > 0 && !observationIncomplete
+		? cacheHitRatioFromTotals(explicitBreakpointVerifiedTotals)
+		: null;
 
 	return {
 		scope,
-		schemaVersion: validRecords[0]?.schemaVersion ?? "1.1",
+		schemaVersion: validRecords[0]?.schemaVersion ?? TELEMETRY_SCHEMA_VERSION,
 		generatedAt: new Date().toISOString(),
 		requestCount: validRecords.length,
 		byMode: countBy(validRecords, (r) => r.workbenchMode),
@@ -195,6 +238,13 @@ export function buildCacheReport(
 		expectedInvalidations,
 		unexpectedDrifts,
 		sameModeMutationCount,
+		historyProjectionSegmentSeals,
+		historyProjectionEpochTransitions,
+		explicitBreakpointAppliedRequests,
+		explicitBreakpointVerifiedUsage: {
+			...explicitBreakpointVerifiedTotals,
+			hitRatio: explicitBreakpointVerifiedHitRatio,
+		},
 		estimatedAvoidedCost: validRecords.length === 0 || observationIncomplete ? null : estimatedAvoidedCost,
 		skippedRecords,
 		sourceIncomplete,
@@ -279,6 +329,8 @@ export function renderCacheReport(report: CacheReport): string[] {
 		`expected         : ${report.expectedInvalidations} (mode/model/thinking/reload/new-session/compaction/session-tree/history-projection/provider-miss)`,
 		`unexpected drift : ${report.unexpectedDrifts} (same-mode UNEXPECTED_DRIFT / context prefix divergence)`,
 		`same-mode mutat. : ${report.sameModeMutationCount} (context prefix changed while the mode stayed the same)`,
+		`history projection: segment seals=${report.historyProjectionSegmentSeals} epoch transitions=${report.historyProjectionEpochTransitions}`,
+		`explicit breakpoints: applied=${report.explicitBreakpointAppliedRequests} verified requests=${report.explicitBreakpointVerifiedUsage.requestCount} input=${formatNumber(report.explicitBreakpointVerifiedUsage.input)} cacheRead=${formatNumber(report.explicitBreakpointVerifiedUsage.cacheRead)} cacheWrite=${formatNumber(report.explicitBreakpointVerifiedUsage.cacheWrite)} ratio=${pct(report.explicitBreakpointVerifiedUsage.hitRatio)} (provider usage; cacheRead=0 is not a failure)`,
 		`estimated avoided cost: ${usd(report.estimatedAvoidedCost)} (${observationIncomplete ? "incomplete telemetry observation; full estimate unavailable" : "registry cacheRead rate, USD per 1M tokens"})`,
 	];
 	return lines;

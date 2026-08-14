@@ -14,7 +14,7 @@
  */
 
 import { hasForbiddenTelemetryFields, MAX_TELEMETRY_RECORD_BYTES } from "./cache-store.ts";
-import type { TelemetryRecord } from "./cache-types.ts";
+import { cacheHitRatioFromTotals, type TelemetryRecord } from "./cache-types.ts";
 import { fingerprintTools, type ToolInfoLike } from "./prompt-fingerprint.ts";
 import { invalidationClass } from "./invalidation-classifier.ts";
 import { matchedDynamicMarkerIds, DYNAMIC_MARKERS, staticToolMetadataIssues } from "./stable-prefix.ts";
@@ -61,6 +61,68 @@ export interface DoctorFacts {
 const MAX_CHURN_TOTAL = 20;
 const MAX_CHURN_SINGLE = 10;
 const TELEMETRY_WRITE_GAP_EVENT = "telemetry_write_gap";
+const EXPLICIT_PROMPT_CACHE_BREAKPOINTS_APPLIED_EVENT = "explicit_prompt_cache_breakpoints_applied";
+
+interface DoctorCacheRecordFacts {
+	historyProjectionSegmentSeals: number;
+	historyProjectionEpochTransitions: number;
+	explicitBreakpointAppliedRequests: number;
+	explicitBreakpointEligibleAppliedRequests: number;
+	explicitBreakpointErroredEligibleAppliedRequests: number;
+	explicitBreakpointVerifiedUsage: {
+		requestCount: number;
+		input: number;
+		cacheRead: number;
+		cacheWrite: number;
+		hitRatio: number | null;
+	};
+}
+
+function isPublicOpenAiExplicitBreakpointEligible(record: TelemetryRecord): boolean {
+	return record.provider === "openai"
+		&& record.apiKind === "openai-responses"
+		&& (record.model === "gpt-5.6" || record.model.startsWith("gpt-5.6-"));
+}
+
+/** Numeric facts only; no record content, marker text, payload, or projection hash is retained. */
+function summarizeCacheRecordFacts(records: readonly TelemetryRecord[]): DoctorCacheRecordFacts {
+	let historyProjectionSegmentSeals = 0;
+	let historyProjectionEpochTransitions = 0;
+	let explicitBreakpointAppliedRequests = 0;
+	let explicitBreakpointEligibleAppliedRequests = 0;
+	let explicitBreakpointErroredEligibleAppliedRequests = 0;
+	const verifiedUsage = { requestCount: 0, input: 0, cacheRead: 0, cacheWrite: 0 };
+	for (const record of records) {
+		if (record.inferredInvalidationReason === "HISTORY_PROJECTION_SEGMENT_SEALED") historyProjectionSegmentSeals += 1;
+		if (record.inferredInvalidationReason === "HISTORY_PROJECTION_EPOCH_CHANGED") historyProjectionEpochTransitions += 1;
+		if (record.precedingEvent !== EXPLICIT_PROMPT_CACHE_BREAKPOINTS_APPLIED_EVENT) continue;
+		explicitBreakpointAppliedRequests += 1;
+		if (!isPublicOpenAiExplicitBreakpointEligible(record)) continue;
+		explicitBreakpointEligibleAppliedRequests += 1;
+		if (record.messageStatus === "error") {
+			explicitBreakpointErroredEligibleAppliedRequests = Math.min(
+				Number.MAX_SAFE_INTEGER,
+				explicitBreakpointErroredEligibleAppliedRequests + 1,
+			);
+		}
+		if (record.messageStatus !== "ok" || record.usageSemanticStatus !== "verified") continue;
+		verifiedUsage.requestCount += 1;
+		verifiedUsage.input += record.usage.input;
+		verifiedUsage.cacheRead += record.usage.cacheRead;
+		verifiedUsage.cacheWrite += record.usage.cacheWrite;
+	}
+	return {
+		historyProjectionSegmentSeals,
+		historyProjectionEpochTransitions,
+		explicitBreakpointAppliedRequests,
+		explicitBreakpointEligibleAppliedRequests,
+		explicitBreakpointErroredEligibleAppliedRequests,
+		explicitBreakpointVerifiedUsage: {
+			...verifiedUsage,
+			hitRatio: verifiedUsage.requestCount > 0 ? cacheHitRatioFromTotals(verifiedUsage) : null,
+		},
+	};
+}
 
 function telemetryWriteGapObserved(records: readonly TelemetryRecord[]): boolean {
 	return records.some((record) => record.precedingEvent === TELEMETRY_WRITE_GAP_EVENT);
@@ -82,6 +144,7 @@ export function runDoctor(facts: DoctorFacts): DoctorCheck[] {
 	const sourceIncomplete = facts.sourceIncomplete === true || skippedRecords > 0 || Boolean(facts.sourceUnavailable) || writeGapObserved;
 	const observationIncomplete = sourceIncomplete || truncatedRecords > 0;
 	const qualityDetail = `files=${filesRead} skipped=${skippedRecords} bounded-oldest-omitted=${truncatedRecords} telemetry-write-gap=${writeGapObserved ? "yes" : "no"}`;
+	const cacheRecordFacts = summarizeCacheRecordFacts(facts.records);
 
 	// Offline derivation: in CLI mode the live Pi model is unavailable, so
 	// provider/model/apiKind come from the last telemetry record instead.
@@ -298,7 +361,59 @@ export function runDoctor(facts: DoctorFacts): DoctorCheck[] {
 		message: `expected invalidations=${expectedInvalidations} unexpected drifts=${unexpectedDrifts} (out of ${facts.records.length} retained record(s)${observationIncomplete ? "; partial window" : ""})`,
 	});
 
-	// 13. Churn (frequent mode/model/thinking/reload/compaction).
+	// 13. Projection lifecycle counts. Same-epoch segment seals and epoch
+	// transitions are separate record facts; neither exposes in-memory hashes.
+	checks.push({
+		id: "history_projection_events",
+		status: observationIncomplete ? "warn" : "ok",
+		message: `history projection segment seals=${cacheRecordFacts.historyProjectionSegmentSeals} epoch transitions=${cacheRecordFacts.historyProjectionEpochTransitions}${observationIncomplete ? " (retained partial/bounded observation; no clean whole-history verdict)" : ""}`,
+	});
+
+	// 14. Explicit breakpoint evidence is the exact persisted preceding-event
+	// signal plus provider-reported usage. No applied record means skip (not a
+	// warning) for Codex/DeepSeek; cacheRead=0 is a valid provider fact.
+	const explicit = cacheRecordFacts.explicitBreakpointVerifiedUsage;
+	const explicitRatio = observationIncomplete ? null : explicit.hitRatio;
+	const explicitDetail = `applied=${cacheRecordFacts.explicitBreakpointAppliedRequests} eligible=${cacheRecordFacts.explicitBreakpointEligibleAppliedRequests} verified=${explicit.requestCount} errored eligible=${cacheRecordFacts.explicitBreakpointErroredEligibleAppliedRequests} input=${explicit.input} cacheRead=${explicit.cacheRead} cacheWrite=${explicit.cacheWrite} ratio=${formatRatio(explicitRatio)}`;
+	if (observationIncomplete) {
+		checks.push({
+			id: "explicit_breakpoint_usage",
+			status: "warn",
+			message: `${explicitDetail} (retained partial/bounded observation; no clean application or usage verdict)`,
+		});
+	} else if (cacheRecordFacts.explicitBreakpointAppliedRequests === 0) {
+		checks.push({
+			id: "explicit_breakpoint_usage",
+			status: "skip",
+			message: "no explicit prompt-cache breakpoint application record observed; unsupported/default-disabled providers are not treated as failures",
+		});
+	} else if (cacheRecordFacts.explicitBreakpointErroredEligibleAppliedRequests > 0) {
+		checks.push({
+			id: "explicit_breakpoint_usage",
+			status: "warn",
+			message: `${explicitDetail} — one or more eligible applied requests ended with messageStatus=error; failed-request usage is excluded and is not provider-success authority`,
+		});
+	} else if (cacheRecordFacts.explicitBreakpointEligibleAppliedRequests !== cacheRecordFacts.explicitBreakpointAppliedRequests) {
+		checks.push({
+			id: "explicit_breakpoint_usage",
+			status: "warn",
+			message: `${explicitDetail} — one or more applied records are not eligible public OpenAI GPT-5.6 openai-responses traffic`,
+		});
+	} else if (explicit.requestCount !== cacheRecordFacts.explicitBreakpointEligibleAppliedRequests) {
+		checks.push({
+			id: "explicit_breakpoint_usage",
+			status: "warn",
+			message: `${explicitDetail} — provider usage semantics were not verified for every eligible applied request`,
+		});
+	} else {
+		checks.push({
+			id: "explicit_breakpoint_usage",
+			status: "ok",
+			message: `${explicitDetail} (provider usage is authoritative; cacheRead=0 is not a failure)`,
+		});
+	}
+
+	// 15. Churn (frequent mode/model/thinking/reload/compaction).
 	let modelChanges = 0;
 	let thinkingChanges = 0;
 	let modeChanges = 0;
@@ -336,7 +451,7 @@ export function runDoctor(facts: DoctorFacts): DoctorCheck[] {
 		});
 	}
 
-	// 14. Forbidden fields in telemetry.
+	// 16. Forbidden fields in telemetry.
 	let forbidden = 0;
 	for (const record of facts.records) {
 		if (hasForbiddenTelemetryFields(record) !== null) forbidden += 1;
@@ -349,7 +464,7 @@ export function runDoctor(facts: DoctorFacts): DoctorCheck[] {
 		checks.push({ id: "forbidden_fields", status: "ok", message: `no forbidden fields in ${facts.records.length} record(s)` });
 	}
 
-	// 15. Telemetry file size.
+	// 17. Telemetry file size.
 	const telemetrySetCapacity = (facts.telemetryMaxBytes + MAX_TELEMETRY_RECORD_BYTES) * Math.max(1, facts.rotatedFiles + 1);
 	if (facts.telemetryBytes > telemetrySetCapacity) {
 		checks.push({ id: "telemetry_size", status: "warn", message: `telemetry set is ${facts.telemetryBytes} bytes (per-file limit ${facts.telemetryMaxBytes}, ${facts.rotatedFiles} rotated file(s)) — observed total exceeds the expected rotation-set capacity` });
@@ -357,7 +472,7 @@ export function runDoctor(facts: DoctorFacts): DoctorCheck[] {
 		checks.push({ id: "telemetry_size", status: "ok", message: `telemetry set is ${facts.telemetryBytes} bytes (per-file limit ${facts.telemetryMaxBytes}, ${facts.rotatedFiles} rotated file(s))` });
 	}
 
-	// 16. Telemetry enabled.
+	// 18. Telemetry enabled.
 	checks.push({
 		id: "telemetry_enabled",
 		status: facts.telemetryEnabled ? "ok" : "skip",
@@ -369,6 +484,10 @@ export function runDoctor(facts: DoctorFacts): DoctorCheck[] {
 
 function safeCount(value: number | undefined): number {
 	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+function formatRatio(value: number | null): string {
+	return value === null ? "N/A" : `${Math.round(value * 100)}%`;
 }
 
 function fingerprintSystemPromptHash(facts: DoctorFacts): string {
@@ -394,15 +513,33 @@ export function doctorToJson(checks: readonly DoctorCheck[], facts?: DoctorFacts
 	};
 	if (facts) {
 		const fingerprint = fingerprintTools(facts.activeToolNames, facts.tools);
-		out.telemetry_quality = {
-			sourceIncomplete: facts.sourceIncomplete === true
+		const sourceIncomplete = facts.sourceIncomplete === true
 				|| safeCount(facts.skippedRecords) > 0
 				|| Boolean(facts.sourceUnavailable)
-				|| telemetryWriteGapObserved(facts.records),
+				|| telemetryWriteGapObserved(facts.records);
+		const truncatedRecords = safeCount(facts.truncatedRecords);
+		out.telemetry_quality = {
+			sourceIncomplete,
 			skippedRecords: safeCount(facts.skippedRecords),
-			truncatedRecords: safeCount(facts.truncatedRecords),
+			truncatedRecords,
 			filesRead: safeCount(facts.filesRead),
 			sourceUnavailable: facts.sourceUnavailable ?? null,
+		};
+		const recordFacts = summarizeCacheRecordFacts(facts.records);
+		out.history_projection = {
+			segmentSeals: recordFacts.historyProjectionSegmentSeals,
+			epochTransitions: recordFacts.historyProjectionEpochTransitions,
+		};
+		out.explicit_breakpoints = {
+			appliedRequests: recordFacts.explicitBreakpointAppliedRequests,
+			eligibleAppliedRequests: recordFacts.explicitBreakpointEligibleAppliedRequests,
+			erroredEligibleAppliedRequests: recordFacts.explicitBreakpointErroredEligibleAppliedRequests,
+			verifiedUsage: {
+				...recordFacts.explicitBreakpointVerifiedUsage,
+				hitRatio: sourceIncomplete || truncatedRecords > 0
+					? null
+					: recordFacts.explicitBreakpointVerifiedUsage.hitRatio,
+			},
 		};
 		out.prefix = {
 			systemPromptHash: fingerprintSystemPromptHash(facts),

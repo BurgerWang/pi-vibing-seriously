@@ -36,7 +36,11 @@ import { fileURLToPath } from "node:url";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
-import { buildCacheReport, type CacheReport } from "../extensions/workbench-runtime/cache/cache-report.ts";
+import {
+	buildCacheReport,
+	type CacheReport,
+	type ExplicitBreakpointVerifiedUsage,
+} from "../extensions/workbench-runtime/cache/cache-report.ts";
 import { runDoctor, renderDoctor, doctorToJson, type DoctorFacts } from "../extensions/workbench-runtime/cache/cache-doctor.ts";
 import {
 	CACHE_DIR_NAME,
@@ -355,6 +359,10 @@ export interface BenchmarkReport {
 	estimatedAvoidedCost: number | null;
 	expectedInvalidations: number;
 	unexpectedDrifts: number;
+	historyProjectionSegmentSeals: number;
+	historyProjectionEpochTransitions: number;
+	explicitBreakpointAppliedRequests: number;
+	explicitBreakpointVerifiedUsage: ExplicitBreakpointVerifiedUsage;
 	modeChanges: number;
 	modelChanges: number;
 	thinkingChanges: number;
@@ -451,6 +459,10 @@ export async function buildBenchmarkReport(input: BenchmarkInput): Promise<Bench
 		estimatedAvoidedCost: report.estimatedAvoidedCost,
 		expectedInvalidations: report.expectedInvalidations,
 		unexpectedDrifts: report.unexpectedDrifts,
+		historyProjectionSegmentSeals: report.historyProjectionSegmentSeals,
+		historyProjectionEpochTransitions: report.historyProjectionEpochTransitions,
+		explicitBreakpointAppliedRequests: report.explicitBreakpointAppliedRequests,
+		explicitBreakpointVerifiedUsage: report.explicitBreakpointVerifiedUsage,
 		modeChanges: report.changeCounts.mode,
 		modelChanges: report.changeCounts.model,
 		thinkingChanges: report.changeCounts.thinking,
@@ -517,6 +529,8 @@ export function renderBenchmarkReport(report: BenchmarkReport): string[] {
 				: "n/a (no compatible --cost-map — never hardcoded)"
 			: `$${report.estimatedAvoidedCost.toFixed(6)}`}`,
 		`invalidations   : expected=${report.expectedInvalidations} unexpected=${report.unexpectedDrifts}`,
+		`history projection: segment seals=${report.historyProjectionSegmentSeals} epoch transitions=${report.historyProjectionEpochTransitions}`,
+		`explicit breakpoints: applied=${report.explicitBreakpointAppliedRequests} verified requests=${report.explicitBreakpointVerifiedUsage.requestCount} input=${report.explicitBreakpointVerifiedUsage.input} cacheRead=${report.explicitBreakpointVerifiedUsage.cacheRead} cacheWrite=${report.explicitBreakpointVerifiedUsage.cacheWrite} ratio=${pct(report.explicitBreakpointVerifiedUsage.hitRatio)} (provider usage; cacheRead=0 is not a failure)`,
 		`changes         : mode=${report.modeChanges} model=${report.modelChanges} thinking=${report.thinkingChanges} reload=${report.reloads} compaction=${report.compactions}`,
 		`recipes         : executed=${report.recipeExecutions} hits=${report.recipeCacheHits} misses=${report.recipeCacheMisses} hit=${pct(report.recipeHitRatio)}`,
 		`local time avoided: ${seconds(report.localExecutionTimeAvoided)}`,

@@ -197,7 +197,7 @@ test("tool schema change (same names/order) is inferred as UNEXPECTED_DRIFT (dri
 });
 
 test("expected vs unexpected invalidation classes", () => {
-	for (const reason of ["FIRST_OBSERVED_REQUEST", "NEW_SESSION", "MODEL_CHANGED", "THINKING_LEVEL_CHANGED", "MODE_CHANGED", "PACKAGE_RELOADED", "COMPACTION", "SESSION_TREE_CHANGED", "HISTORY_PROJECTION_EPOCH_CHANGED", "PROVIDER_BEST_EFFORT_MISS"]) {
+	for (const reason of ["FIRST_OBSERVED_REQUEST", "NEW_SESSION", "MODEL_CHANGED", "THINKING_LEVEL_CHANGED", "MODE_CHANGED", "PACKAGE_RELOADED", "COMPACTION", "SESSION_TREE_CHANGED", "HISTORY_PROJECTION_EPOCH_CHANGED", "HISTORY_PROJECTION_SEGMENT_SEALED", "PROVIDER_BEST_EFFORT_MISS"]) {
 		assert.equal(invalidationClass(reason as CacheInvalidationReason), "expected", reason);
 	}
 	for (const reason of ["UNEXPECTED_DRIFT", "SYSTEM_PROMPT_CHANGED", "TOOL_SET_CHANGED", "TOOL_ORDER_CHANGED", "TOOL_SCHEMA_CHANGED", "CONTEXT_PREFIX_DIVERGED"]) {
@@ -267,6 +267,62 @@ test("explicit history projection epoch changes are expected and deduplicated", 
 	assert.equal(unchanged.inferredInvalidationReason, "UNKNOWN");
 });
 
+test("history projection segment seals are expected, hash-only, and deduplicated", async () => {
+	const { telemetry, entries } = makeHarness();
+	await telemetry.observeMessageEnd(baseFacts());
+	telemetry.observeHistoryProjectionSegmentSeal("not-a-segment-hash");
+	assert.equal((await telemetry.observeMessageEnd(baseFacts()))?.inferredInvalidationReason, "UNKNOWN");
+	const segmentChainHash = "a".repeat(64);
+	telemetry.observeHistoryProjectionSegmentSeal(segmentChainHash);
+	const sealed = await telemetry.observeMessageEnd(baseFacts());
+	assert.ok(sealed);
+	assert.equal(sealed.inferredInvalidationReason, "HISTORY_PROJECTION_SEGMENT_SEALED");
+	assert.equal(invalidationClass(sealed.inferredInvalidationReason), "expected");
+	assert.ok(!JSON.stringify(entries).includes(segmentChainHash), "segment-chain hashes are never persisted");
+	telemetry.observeHistoryProjectionSegmentSeal(segmentChainHash);
+	const unchanged = await telemetry.observeMessageEnd(baseFacts());
+	assert.ok(unchanged);
+	assert.equal(unchanged.inferredInvalidationReason, "UNKNOWN");
+});
+
+test("lifecycle invalidation outranks and consumes epoch plus segment markers; epoch outranks seal", async () => {
+	const { telemetry } = makeHarness();
+	await telemetry.observeMessageEnd(baseFacts());
+
+	telemetry.observeHistoryProjectionSegmentSeal("b".repeat(64));
+	telemetry.observeHistoryProjectionEpoch("epoch-priority-1");
+	const epoch = await telemetry.observeMessageEnd(baseFacts());
+	assert.ok(epoch);
+	assert.equal(epoch.inferredInvalidationReason, "HISTORY_PROJECTION_EPOCH_CHANGED");
+
+	telemetry.observeHistoryProjectionSegmentSeal("c".repeat(64));
+	telemetry.observeHistoryProjectionEpoch("epoch-priority-2");
+	telemetry.observeModeChange("VERIFY");
+	const lifecycle = await telemetry.observeMessageEnd(baseFacts());
+	assert.ok(lifecycle);
+	assert.equal(lifecycle.inferredInvalidationReason, "MODE_CHANGED");
+	const consumed = await telemetry.observeMessageEnd(baseFacts());
+	assert.ok(consumed);
+	assert.equal(consumed.inferredInvalidationReason, "UNKNOWN", "the winning lifecycle event consumes both projection markers");
+});
+
+test("projection marker dedupe resets at a session restore boundary", async () => {
+	const { telemetry } = makeHarness();
+	await telemetry.observeMessageEnd(baseFacts());
+	const sessionScopedSegmentHash = "d".repeat(64);
+	telemetry.observeHistoryProjectionSegmentSeal(sessionScopedSegmentHash);
+	assert.equal((await telemetry.observeMessageEnd(baseFacts()))?.inferredInvalidationReason, "HISTORY_PROJECTION_SEGMENT_SEALED");
+
+	telemetry.restoreFromEntries([]);
+	assert.equal((await telemetry.observeMessageEnd(baseFacts()))?.inferredInvalidationReason, "NEW_SESSION");
+	telemetry.observeHistoryProjectionSegmentSeal(sessionScopedSegmentHash);
+	assert.equal(
+		(await telemetry.observeMessageEnd(baseFacts()))?.inferredInvalidationReason,
+		"HISTORY_PROJECTION_SEGMENT_SEALED",
+		"in-memory segment hashes never leak across a restored session boundary",
+	);
+});
+
 test("session-tree navigation is an expected one-shot invalidation and later prefix rewrites still drift", async () => {
 	const { telemetry } = makeHarness();
 	const payload = (text: string) => ({
@@ -306,6 +362,18 @@ test("before_provider_request never mutates the payload", () => {
 	const snapshot = JSON.parse(JSON.stringify(payload)) as unknown;
 	telemetry.observePayload(payload);
 	assert.deepEqual(payload, snapshot, "payload must be untouched (deep-equal before/after)");
+});
+
+test("explicit prompt-cache breakpoint application is a preceding event, not a cache-hit claim", async () => {
+	const { telemetry } = makeHarness();
+	await telemetry.observeMessageEnd(baseFacts());
+	telemetry.observePayload({ model: "gpt-5.6-sol", input: [] });
+	telemetry.observeExplicitPromptCacheBreakpointsApplied();
+	const record = await telemetry.observeMessageEnd(baseFacts());
+	assert.ok(record);
+	assert.equal(record.precedingEvent, "explicit_prompt_cache_breakpoints_applied");
+	assert.equal(record.inferredInvalidationReason, "UNKNOWN");
+	assert.equal(record.cacheHitRatio, 0.8, "provider usage remains the only cache-hit evidence");
 });
 
 test("payload summary keeps only structure — no text content", () => {
@@ -438,7 +506,7 @@ test("session state entry is lightweight and restored on session_start", async (
 		telemetryWriteGapPending: number;
 	};
 	assert.ok(data);
-	assert.equal(data.schemaVersion, "1.1");
+	assert.equal(data.schemaVersion, "1.2");
 	assert.equal(data.requestCount, 2);
 	assert.equal(data.usage.input, 20000);
 	assert.equal(data.usage.cost, 0.002);
@@ -489,6 +557,26 @@ test("legacy restored aggregates without semantic provenance never fabricate a c
 	assert.equal(restored.snapshot().cumulativeSemanticStatus, "unverified");
 	assert.equal(restored.snapshot().cumulativeHitRatio, null);
 	assert.equal(restored.statusSegment(), "CACHE last=80% cum=N/A | read 80k | miss 20k");
+});
+
+test("strict cache-state restoration accepts schema 1.1 and current 1.2 only with the known shape", async () => {
+	const current = await validCacheStateData();
+	for (const schemaVersion of ["1.1", "1.2"] as const) {
+		const restored = makeRestoreTarget();
+		restored.restoreFromEntries([cacheStateEntry({ ...current, schemaVersion })]);
+		assert.equal(restored.snapshot().requestCount, 1, schemaVersion);
+		assert.equal(restored.snapshot().cumulativeSemanticStatus, "verified", schemaVersion);
+	}
+
+	for (const data of [
+		{ ...current, schemaVersion: "1.3" },
+		{ ...current, schemaVersion: "1.1", projectionSegmentHash: "secret" },
+		{ ...current, schemaVersion: "1.1", lastInvalidationReason: "HISTORY_PROJECTION_SEGMENT_SEALED" },
+	]) {
+		const rejected = makeRestoreTarget();
+		rejected.restoreFromEntries([cacheStateEntry(data)]);
+		assert.equal(rejected.snapshot().requestCount, 0);
+	}
 });
 
 test("footer keeps a verified last-request ratio visible when cumulative semantics are legacy N/A", async () => {
@@ -865,6 +953,37 @@ test("hash-only record: full telemetry schema is present and minimal", async () 
 	];
 	assert.deepEqual(Object.keys(record).sort(), expectedKeys.sort());
 	assert.deepEqual(Object.keys(record.usage).sort(), ["cacheRead", "cacheWrite", "cost", "input", "output", "totalTokens"].sort());
+	assert.equal(record.schemaVersion, "1.2");
+	assert.equal(Object.hasOwn(record, "historyProjectionSegmentHash"), false);
+	assert.equal(Object.hasOwn(record, "historyProjectionMarker"), false);
+});
+
+test("strict telemetry reader accepts exact schema 1.0, 1.1, and 1.2 records", async () => {
+	const { telemetry } = makeHarness();
+	const current = await telemetry.observeMessageEnd(baseFacts());
+	assert.ok(current);
+	assert.equal(isTelemetryRecord(current), true);
+
+	const v1_1 = { ...current, schemaVersion: "1.1" };
+	assert.equal(isTelemetryRecord(v1_1), true);
+	const { driftSource: _legacyDriftSource, ...withoutDriftSource } = current;
+	const v1_0 = { ...withoutDriftSource, schemaVersion: "1.0" };
+	assert.equal(isTelemetryRecord(v1_0), true);
+	const segmentSealed = {
+		...current,
+		inferredInvalidationReason: "HISTORY_PROJECTION_SEGMENT_SEALED",
+		inferenceConfidence: "high",
+	};
+	assert.equal(isTelemetryRecord(segmentSealed), true);
+	assert.equal(isTelemetryRecord({ ...segmentSealed, schemaVersion: "1.1" }), false);
+	const { driftSource: _segmentLegacyDrift, ...segmentLegacy } = segmentSealed;
+	assert.equal(isTelemetryRecord({ ...segmentLegacy, schemaVersion: "1.0" }), false);
+
+	assert.equal(isTelemetryRecord({ ...current, schemaVersion: "1.3" }), false);
+	assert.equal(isTelemetryRecord({ ...v1_0, driftSource: null }), false, "1.0 keeps its exact legacy key set");
+	const { driftSource: _removed, ...missingCurrentField } = v1_1;
+	assert.equal(isTelemetryRecord(missingCurrentField), false, "1.1 requires the driftSource field");
+	assert.equal(isTelemetryRecord({ ...current, historyProjectionSegmentHash: "secret" }), false, "1.2 rejects marker/hash expansion");
 });
 
 test("precedingEvent tracks the last observed Pi event", async () => {

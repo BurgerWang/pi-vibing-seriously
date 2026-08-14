@@ -16,14 +16,23 @@ import { dirname, join, relative, resolve } from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { CONFIG_DIR_NAME, SessionManager } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, convertToLlm, SessionManager } from "@earendil-works/pi-coding-agent";
+
+import { classifyInvalidation, invalidationClass } from "../extensions/workbench-runtime/cache/invalidation-classifier.ts";
 
 import { compareRuns } from "../extensions/workbench-runtime/core/compare.ts";
 import {
 	COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES,
 	HISTORY_DESCRIPTOR_MAX_BYTES,
 	HISTORY_MAX_BUNDLES,
+	HISTORY_PROJECTION_ACTIVE_MAX_BUNDLES,
+	HISTORY_PROJECTION_ENTRY_TYPE,
+	HISTORY_PROJECTION_MAX_SEGMENTS,
+	HISTORY_PROJECTION_SEGMENT_MAX_BUNDLES,
+	HISTORY_PROJECTION_SEGMENT_MAX_TOOL_TEXT_BYTES,
+	HistoryProjectionController,
 	WORKER_HISTORY_TOOL_TEXT_MAX_BYTES,
+	historyToolTextBytes,
 	projectContextHistory,
 	validateContextToolPairing,
 	type AgentMessage,
@@ -53,6 +62,7 @@ import {
 	OUTPUT_HARD_CAPS,
 	RUN_LOG_RESULT_MAX_BYTES,
 	RUN_LOG_RESULT_MAX_LINES,
+	WORKER_TURN_MAX_BYTES,
 	resolveToolOutputPolicy,
 } from "../extensions/workbench-runtime/core/output-policy.ts";
 import { buildNativeReadV3Page } from "../extensions/workbench-runtime/core/native-tool-policy.ts";
@@ -205,6 +215,13 @@ interface WorkerRuntimeChildFacts {
 	finalCollapsedToolResults: number;
 	finalRemovedToolBundles: number;
 	historyCap: number;
+	contextPressureEntries: number;
+	contextPressureNineFieldValid: boolean;
+	historyProjectionV3Entries: number;
+	historyProjectionV3Valid: boolean;
+	maximumHistoryProjectionStateBytes: number;
+	minimumWorkerAnchorReserveBytes: number;
+	latestCompletedBundleRaw: boolean;
 }
 
 const MIB = 1_024 * 1_024;
@@ -256,9 +273,9 @@ function isOfflineFakeTelemetryRecord(value: unknown): boolean {
 		&& record.apiKind === "openai-completions"
 		&& totals.input === 100
 		&& totals.output === 10
-		&& totals.cacheRead === 50
+		&& totals.cacheRead === 0
 		&& totals.cacheWrite === 0
-		&& totals.totalTokens === 160;
+		&& totals.totalTokens === 110;
 }
 
 async function inspectOfflineTelemetry(projectRoot: string): Promise<OfflineTelemetryFacts> {
@@ -884,6 +901,279 @@ async function compareScenario(root: string, state: MeasurementState): Promise<S
 	);
 }
 
+interface RoleReserveEvidence {
+	hard_history_bytes: number;
+	aggregate_turn_bytes: number;
+	segment_reserve_bytes: number;
+	anchor_max_bytes: number;
+	anchor_formula_valid: boolean;
+	minimum_reserved_suffix_bytes: number;
+	fixed_anchor_provider_bytes: number;
+	fixed_anchor_provider_sha256: string;
+	fixed_anchor_nonempty: boolean;
+	initial_epoch: number;
+	final_epoch: number;
+	segment_seals_before_checkpoint: number;
+	checkpoint_ordinal: number;
+	post_checkpoint_segment_seals: number;
+	same_epoch_payload_append_only: boolean;
+	fixed_anchor_provider_visible_unchanged: boolean;
+	stable_prior_markers_across_seals: boolean;
+	stable_prior_provider_prefix_across_seals: boolean;
+	segment_caps_valid: boolean;
+	active_caps_valid: boolean;
+	state_json_bytes_max: number;
+	state_within_32k: boolean;
+	state_strict_json_roundtrip: boolean;
+	segment_seals_keep_epoch: boolean;
+	checkpoint_epoch_increment_exactly_one: boolean;
+	checkpoint_epoch_hash_changed: boolean;
+	transition_causes_expected: boolean;
+	latest_complete_aggregate_raw: boolean;
+	pairing_valid: boolean;
+	hard_and_bundle_caps_valid: boolean;
+	max_projected_tool_text_bytes: number;
+	max_projected_bundles: number;
+}
+
+function appendAggregateBundle(
+	messages: AgentMessage[],
+	prefix: string,
+	sizes: readonly number[],
+): Map<string, string> {
+	const expected = new Map<string, string>();
+	messages.push({
+		role: "assistant",
+		content: sizes.map((_, index) => ({
+			type: "toolCall",
+			id: `${prefix}-${index}`,
+			name: "read",
+			arguments: { path: `${prefix}-${index}.txt` },
+		})),
+		timestamp: messages.length + 1,
+	} as unknown as AgentMessage);
+	for (const [index, size] of sizes.entries()) {
+		const id = `${prefix}-${index}`;
+		const text = String(index % 10).repeat(size);
+		expected.set(id, text);
+		messages.push({
+			role: "toolResult",
+			toolCallId: id,
+			toolName: "read",
+			content: [{ type: "text", text }],
+			isError: false,
+			timestamp: messages.length + 1,
+		} as unknown as AgentMessage);
+	}
+	return expected;
+}
+
+function projectedResultText(messages: readonly AgentMessage[], id: string): string | undefined {
+	const message = messages.find((candidate) => (
+		(candidate as { role?: unknown }).role === "toolResult"
+		&& (candidate as { toolCallId?: unknown }).toolCallId === id
+	));
+	if (!message) return undefined;
+	const content = (message as { content?: unknown }).content;
+	if (!Array.isArray(content)) return undefined;
+	return content.filter((block): block is { type: "text"; text: string } => (
+		block !== null && typeof block === "object"
+		&& (block as { type?: unknown }).type === "text"
+		&& typeof (block as { text?: unknown }).text === "string"
+	)).map((block) => block.text).join("");
+}
+
+function historyBundleCount(messages: readonly AgentMessage[]): number {
+	return messages.filter((message) => {
+		if ((message as { role?: unknown }).role !== "assistant") return false;
+		const content = (message as { content?: unknown }).content;
+		return Array.isArray(content) && content.some((block) => (
+			block !== null && typeof block === "object" && (block as { type?: unknown }).type === "toolCall"
+		));
+	}).length;
+}
+
+function jsonProviderMessages(messages: readonly AgentMessage[]): unknown[] {
+	return JSON.parse(JSON.stringify(convertToLlm(Array.from(messages)))) as unknown[];
+}
+
+function measureRoleReserve(role: "commander" | "worker"): RoleReserveEvidence {
+	const hard = role === "commander"
+		? COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES
+		: WORKER_HISTORY_TOOL_TEXT_MAX_BYTES;
+	const aggregateTurn = role === "commander" ? COMMANDER_TURN_MAX_BYTES : WORKER_TURN_MAX_BYTES;
+	const segmentReserve = HISTORY_PROJECTION_MAX_SEGMENTS * HISTORY_PROJECTION_SEGMENT_MAX_TOOL_TEXT_BYTES;
+	const expectedAnchorBytes = Math.max(0, hard - aggregateTurn - segmentReserve);
+	const controller = new HistoryProjectionController();
+	const messages: AgentMessage[] = [{ role: "user", content: `${role} reserve fixture`, timestamp: 0 } as unknown as AgentMessage];
+	for (let index = 0; index < 6; index += 1) appendAggregateBundle(messages, `${role}-old-${index}`, [20 * 1_024]);
+	appendAggregateBundle(messages, `${role}-seed`, [40 * 1_024]);
+	const config = {
+		maxToolTextBytes: hard,
+		maxBundles: HISTORY_MAX_BUNDLES,
+		descriptorMaxBytes: HISTORY_DESCRIPTOR_MAX_BYTES,
+		role,
+	};
+	const initial = controller.project({ messages, ...config });
+	const initialState = controller.serialize();
+	const anchorMessageCount = initialState.anchor.projectedMessageCount;
+	const fixedProviderAnchor = jsonProviderMessages(initial.messages.slice(0, anchorMessageCount));
+	const fixedProviderAnchorText = JSON.stringify(fixedProviderAnchor);
+	const initialProviderPayload = jsonProviderMessages(initial.messages);
+	const projectedBytes = [historyToolTextBytes(initial.messages)];
+	const projectedBundles = [initial.projectedBundleCount];
+	const reserveBytes = [initialState.hardToolTextBytes - initialState.anchorToolTextBytes];
+	const stateBytes: number[] = [];
+	let pairingValid = validateContextToolPairing(initial.messages);
+	let anchorFormulaValid = true;
+	let segmentCapsValid = true;
+	let activeCapsValid = true;
+	let stateStrictJsonRoundTrip = true;
+	let hardAndBundleCapsValid = true;
+	const observeState = (
+		projection: ReturnType<HistoryProjectionController["project"]>,
+	): void => {
+		const state = controller.serialize();
+		const serialized = JSON.stringify(state);
+		stateBytes.push(bytes(serialized));
+		anchorFormulaValid &&= state.anchorToolTextBytes === expectedAnchorBytes
+			&& state.hardToolTextBytes - state.anchorToolTextBytes === aggregateTurn + segmentReserve;
+		segmentCapsValid &&= state.segments.length <= HISTORY_PROJECTION_MAX_SEGMENTS
+			&& state.segments.every((segment) => (
+				segment.projectedToolTextBytes <= HISTORY_PROJECTION_SEGMENT_MAX_TOOL_TEXT_BYTES
+				&& segment.projectedBundles <= HISTORY_PROJECTION_SEGMENT_MAX_BUNDLES
+			));
+		activeCapsValid &&= historyToolTextBytes(messages.slice(state.activeRawStartMessageCount)) <= aggregateTurn
+			&& historyBundleCount(messages.slice(state.activeRawStartMessageCount)) <= HISTORY_PROJECTION_ACTIVE_MAX_BUNDLES;
+		hardAndBundleCapsValid &&= historyToolTextBytes(projection.messages) <= hard
+			&& projection.projectedBundleCount <= HISTORY_MAX_BUNDLES;
+		try {
+			const normalizedState = JSON.parse(serialized) as unknown;
+			const normalizedMessages = JSON.parse(JSON.stringify(messages)) as AgentMessage[];
+			const restored = new HistoryProjectionController();
+			const restoredOk = restored.restoreFromEntries([
+				{ type: "custom", customType: HISTORY_PROJECTION_ENTRY_TYPE, data: normalizedState },
+			]);
+			const replayed = restoredOk ? restored.project({ messages: normalizedMessages, ...config }) : undefined;
+			stateStrictJsonRoundTrip &&= restoredOk
+				&& replayed !== undefined
+				&& JSON.stringify(jsonProviderMessages(replayed.messages)) === JSON.stringify(jsonProviderMessages(projection.messages))
+				&& JSON.stringify(restored.serialize()) === JSON.stringify(normalizedState);
+		} catch {
+			stateStrictJsonRoundTrip = false;
+		}
+	};
+	observeState(initial);
+
+	appendAggregateBundle(messages, `${role}-same-epoch`, [1 * 1_024]);
+	const sameEpoch = controller.project({ messages, ...config });
+	const sameState = controller.serialize();
+	projectedBytes.push(historyToolTextBytes(sameEpoch.messages));
+	projectedBundles.push(sameEpoch.projectedBundleCount);
+	reserveBytes.push(sameState.hardToolTextBytes - sameState.anchorToolTextBytes);
+	pairingValid &&= validateContextToolPairing(sameEpoch.messages);
+	const sameProviderPayload = jsonProviderMessages(sameEpoch.messages);
+	const sameEpochAppendOnly = !sameEpoch.epochTransitioned && !sameEpoch.segmentSealed
+		&& sameEpoch.epoch === initial.epoch
+		&& sameEpoch.epochHash === initial.epochHash
+		&& JSON.stringify(sameProviderPayload.slice(0, initialProviderPayload.length)) === JSON.stringify(initialProviderPayload);
+	observeState(sameEpoch);
+
+	const rollingSizes = role === "commander"
+		? [50 * 1_024, 64 * 1_024, 45 * 1_024, 60 * 1_024, 40 * 1_024]
+		: [48 * 1_024, 40 * 1_024];
+	let previous = sameEpoch;
+	let previousProviderPayload = sameProviderPayload;
+	let previousStableCount = sameState.anchor.projectedMessageCount
+		+ sameState.segments.reduce((sum, segment) => sum + segment.projectedMessageCount, 0);
+	let segmentSealsBeforeCheckpoint = 0;
+	let checkpointOrdinal = 0;
+	let postCheckpointSegmentSeals = 0;
+	let segmentSealsKeepEpoch = true;
+	let checkpointEpochIncrementExactlyOne = true;
+	let checkpointEpochHashChanged = true;
+	let transitionCausesExpected = true;
+	let fixedAnchorUnchanged = true;
+	let stablePriorMarkers = true;
+	let stablePriorProviderPrefix = true;
+	let latestCompleteRaw = true;
+	for (let ordinal = 1; ordinal <= HISTORY_PROJECTION_MAX_SEGMENTS + 3; ordinal += 1) {
+		const size = rollingSizes[(ordinal - 1) % rollingSizes.length]!;
+		const expected = appendAggregateBundle(messages, `${role}-roll-${ordinal}`, [size]);
+		const rolled = controller.project({ messages, ...config });
+		const rolledState = controller.serialize();
+		const rolledProviderPayload = jsonProviderMessages(rolled.messages);
+		projectedBytes.push(historyToolTextBytes(rolled.messages));
+		projectedBundles.push(rolled.projectedBundleCount);
+		reserveBytes.push(rolledState.hardToolTextBytes - rolledState.anchorToolTextBytes);
+		pairingValid &&= validateContextToolPairing(rolled.messages);
+		if (ordinal <= HISTORY_PROJECTION_MAX_SEGMENTS || ordinal > HISTORY_PROJECTION_MAX_SEGMENTS + 1) {
+			if (ordinal <= HISTORY_PROJECTION_MAX_SEGMENTS) segmentSealsBeforeCheckpoint += rolled.segmentSealed ? 1 : 0;
+			else postCheckpointSegmentSeals += rolled.segmentSealed ? 1 : 0;
+			segmentSealsKeepEpoch &&= rolled.segmentSealed && !rolled.epochTransitioned
+				&& rolled.epoch === previous.epoch && rolled.epochHash === previous.epochHash;
+			transitionCausesExpected &&= rolled.transitionCause === "segment_sealed";
+			stablePriorMarkers &&= JSON.stringify(rolled.boundaryMarkers.slice(0, previous.boundaryMarkers.length))
+				=== JSON.stringify(previous.boundaryMarkers);
+			stablePriorProviderPrefix &&= JSON.stringify(rolledProviderPayload.slice(0, previousStableCount))
+				=== JSON.stringify(previousProviderPayload.slice(0, previousStableCount));
+			const stableCount = rolledState.anchor.projectedMessageCount
+				+ rolledState.segments.reduce((sum, segment) => sum + segment.projectedMessageCount, 0);
+			stablePriorProviderPrefix &&= stableCount > previousStableCount;
+			previousStableCount = stableCount;
+		} else {
+			checkpointOrdinal = ordinal;
+			checkpointEpochIncrementExactlyOne &&= !rolled.segmentSealed && rolled.epochTransitioned
+				&& rolled.epoch === previous.epoch + 1 && rolledState.segments.length === 0;
+			checkpointEpochHashChanged &&= typeof rolled.epochHash === "string" && rolled.epochHash !== previous.epochHash;
+			transitionCausesExpected &&= rolled.transitionCause === "hard_bytes";
+			previousStableCount = rolledState.anchor.projectedMessageCount;
+		}
+		if (ordinal <= HISTORY_PROJECTION_MAX_SEGMENTS) {
+			fixedAnchorUnchanged &&= JSON.stringify(rolledProviderPayload.slice(0, anchorMessageCount)) === fixedProviderAnchorText;
+		}
+		for (const [id, text] of expected) latestCompleteRaw &&= projectedResultText(rolled.messages, id) === text;
+		observeState(rolled);
+		previous = rolled;
+		previousProviderPayload = rolledProviderPayload;
+	}
+
+	return {
+		hard_history_bytes: hard,
+		aggregate_turn_bytes: aggregateTurn,
+		segment_reserve_bytes: segmentReserve,
+		anchor_max_bytes: expectedAnchorBytes,
+		anchor_formula_valid: anchorFormulaValid,
+		minimum_reserved_suffix_bytes: Math.min(...reserveBytes),
+		fixed_anchor_provider_bytes: bytes(fixedProviderAnchorText),
+		fixed_anchor_provider_sha256: sha256(fixedProviderAnchorText),
+		fixed_anchor_nonempty: anchorMessageCount > 0 && fixedProviderAnchor.length > 0,
+		initial_epoch: initial.epoch,
+		final_epoch: previous.epoch,
+		segment_seals_before_checkpoint: segmentSealsBeforeCheckpoint,
+		checkpoint_ordinal: checkpointOrdinal,
+		post_checkpoint_segment_seals: postCheckpointSegmentSeals,
+		same_epoch_payload_append_only: sameEpochAppendOnly,
+		fixed_anchor_provider_visible_unchanged: fixedAnchorUnchanged,
+		stable_prior_markers_across_seals: stablePriorMarkers,
+		stable_prior_provider_prefix_across_seals: stablePriorProviderPrefix,
+		segment_caps_valid: segmentCapsValid,
+		active_caps_valid: activeCapsValid,
+		state_json_bytes_max: Math.max(...stateBytes),
+		state_within_32k: stateBytes.every((value) => value <= 32 * 1_024),
+		state_strict_json_roundtrip: stateStrictJsonRoundTrip,
+		segment_seals_keep_epoch: segmentSealsKeepEpoch,
+		checkpoint_epoch_increment_exactly_one: checkpointEpochIncrementExactlyOne,
+		checkpoint_epoch_hash_changed: checkpointEpochHashChanged,
+		transition_causes_expected: transitionCausesExpected,
+		latest_complete_aggregate_raw: latestCompleteRaw,
+		pairing_valid: pairingValid,
+		hard_and_bundle_caps_valid: hardAndBundleCapsValid,
+		max_projected_tool_text_bytes: Math.max(...projectedBytes),
+		max_projected_bundles: Math.max(...projectedBundles),
+	};
+}
+
 function historyScenario(state: MeasurementState): ScenarioEvidence {
 	const started = performance.now();
 	const messages: AgentMessage[] = [{ role: "user", content: "history fixture", timestamp: 0 } as unknown as AgentMessage];
@@ -916,18 +1206,119 @@ function historyScenario(state: MeasurementState): ScenarioEvidence {
 	state.shownBytes += finalBytes;
 	state.omittedBytes += Math.max(0, originalBytes - finalBytes);
 	const lastRetained = JSON.stringify(finalMessages).includes("history-99");
+	const commanderReserve = measureRoleReserve("commander");
+	const workerReserve = measureRoleReserve("worker");
+	state.historyBytes.push(commanderReserve.max_projected_tool_text_bytes, workerReserve.max_projected_tool_text_bytes);
+
+	const bundleCapMessages: AgentMessage[] = [];
+	for (let index = 0; index < HISTORY_MAX_BUNDLES + 12; index += 1) {
+		appendAggregateBundle(bundleCapMessages, `bundle-cap-${index}`, [1]);
+	}
+	const bundleCapProjection = new HistoryProjectionController().project({
+		messages: bundleCapMessages,
+		maxToolTextBytes: COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES,
+		maxBundles: HISTORY_MAX_BUNDLES,
+		descriptorMaxBytes: HISTORY_DESCRIPTOR_MAX_BYTES,
+		role: "commander",
+	});
+	const bundleCapEnforced = bundleCapProjection.projectedBundleCount <= HISTORY_MAX_BUNDLES
+		&& validateContextToolPairing(bundleCapProjection.messages)
+		&& projectedResultText(bundleCapProjection.messages, `bundle-cap-${HISTORY_MAX_BUNDLES + 11}-0`) === "0";
+
+	const hostile = { role: "toolResult", toolCallId: "hostile", toolName: "read" } as Record<string, unknown>;
+	Object.defineProperty(hostile, "content", {
+		enumerable: true,
+		get: () => { throw new Error("HOSTILE-RAW-HISTORY"); },
+	});
+	const hostileProjection = new HistoryProjectionController().project({
+		messages: [hostile as unknown as AgentMessage],
+		maxToolTextBytes: COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES,
+		maxBundles: HISTORY_MAX_BUNDLES,
+		descriptorMaxBytes: HISTORY_DESCRIPTOR_MAX_BYTES,
+		role: "commander",
+	});
+	const failClosedHostile = hostileProjection.transitionCause === "failure"
+		&& historyToolTextBytes(hostileProjection.messages) === 0
+		&& validateContextToolPairing(hostileProjection.messages)
+		&& !JSON.stringify(hostileProjection.messages).includes("HOSTILE-RAW-HISTORY");
+
+	const cacheVerdict = classifyInvalidation({
+		isFirstRequest: false,
+		isNewSession: false,
+		modelChanged: false,
+		thinkingChanged: false,
+		modeChanged: false,
+		packageReloaded: false,
+		compactionOccurred: false,
+		historyProjectionEpochChanged: true,
+		systemPromptChanged: false,
+		toolSetChanged: false,
+		toolOrderChanged: false,
+		toolSchemaChanged: false,
+		contextShapeChanged: true,
+		cacheReadTokens: 0,
+		previousCacheReadTokens: 0,
+	});
+	const cacheClass = invalidationClass(cacheVerdict.reason);
 	return scenario(
 		"active-history-100-turns",
 		started,
 		{ kind: "generated-tool-history", turns: 100, result_payload_bytes: 16 * 1_024, sha256: sha256(JSON.stringify(messages)) },
-		{ original_tool_text_bytes: originalBytes, final_tool_text_bytes: finalBytes, max_active_history_bytes: sampleStats(state.historyBytes).max, paired, newest_retained: lastRetained, transform_wall_ms: sampleStats(state.contextWallMs) },
+		{
+			original_tool_text_bytes: originalBytes,
+			final_tool_text_bytes: finalBytes,
+			max_active_history_bytes: sampleStats(state.historyBytes).max,
+			paired,
+			newest_retained: lastRetained,
+			transform_wall_ms: sampleStats(state.contextWallMs),
+			role_reserve: { commander: commanderReserve, worker: workerReserve },
+			bundle_cap: HISTORY_MAX_BUNDLES,
+			bundle_cap_enforced: bundleCapEnforced,
+			fail_closed_hostile_history: failClosedHostile,
+			cache_invalidation_reason: cacheVerdict.reason,
+			cache_invalidation_class: cacheClass,
+			provider_cache_read_measurement: "not_measured_offline",
+		},
 		[
 			acceptance("turn-count", 100, "=", 100),
 			acceptance("history-cap", sampleStats(state.historyBytes).max, "<=", COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES),
 			acceptance("paired", paired, "=", true),
 			acceptance("newest-retained", lastRetained, "=", true),
+			acceptance("commander-anchor-formula", commanderReserve.anchor_formula_valid, "=", true),
+			acceptance("worker-anchor-formula", workerReserve.anchor_formula_valid, "=", true),
+			acceptance("commander-same-epoch-append-only", commanderReserve.same_epoch_payload_append_only, "=", true),
+			acceptance("worker-same-epoch-append-only", workerReserve.same_epoch_payload_append_only, "=", true),
+			acceptance("fixed-anchor-stable", commanderReserve.fixed_anchor_provider_visible_unchanged && workerReserve.fixed_anchor_provider_visible_unchanged, "=", true),
+			acceptance("fixed-anchor-nonempty", commanderReserve.fixed_anchor_nonempty && workerReserve.fixed_anchor_nonempty, "=", true),
+			acceptance("sixteen-seals-before-checkpoint", commanderReserve.segment_seals_before_checkpoint === HISTORY_PROJECTION_MAX_SEGMENTS
+				&& workerReserve.segment_seals_before_checkpoint === HISTORY_PROJECTION_MAX_SEGMENTS, "=", true),
+			acceptance("checkpoint-seventeen", commanderReserve.checkpoint_ordinal === HISTORY_PROJECTION_MAX_SEGMENTS + 1
+				&& workerReserve.checkpoint_ordinal === HISTORY_PROJECTION_MAX_SEGMENTS + 1, "=", true),
+			acceptance("post-checkpoint-seals", commanderReserve.post_checkpoint_segment_seals === 2
+				&& workerReserve.post_checkpoint_segment_seals === 2, "=", true),
+			acceptance("stable-seal-prefixes", commanderReserve.stable_prior_markers_across_seals
+				&& workerReserve.stable_prior_markers_across_seals
+				&& commanderReserve.stable_prior_provider_prefix_across_seals
+				&& workerReserve.stable_prior_provider_prefix_across_seals, "=", true),
+			acceptance("segment-active-caps", commanderReserve.segment_caps_valid && workerReserve.segment_caps_valid
+				&& commanderReserve.active_caps_valid && workerReserve.active_caps_valid, "=", true),
+			acceptance("strict-state-roundtrip", commanderReserve.state_within_32k && workerReserve.state_within_32k
+				&& commanderReserve.state_strict_json_roundtrip && workerReserve.state_strict_json_roundtrip, "=", true),
+			acceptance("segment-epoch-stable", commanderReserve.segment_seals_keep_epoch && workerReserve.segment_seals_keep_epoch, "=", true),
+			acceptance("checkpoint-epoch-split", commanderReserve.checkpoint_epoch_increment_exactly_one
+				&& workerReserve.checkpoint_epoch_increment_exactly_one
+				&& commanderReserve.checkpoint_epoch_hash_changed && workerReserve.checkpoint_epoch_hash_changed, "=", true),
+			acceptance("v3-transition-causes", commanderReserve.transition_causes_expected && workerReserve.transition_causes_expected, "=", true),
+			acceptance("latest-aggregate-raw", commanderReserve.latest_complete_aggregate_raw && workerReserve.latest_complete_aggregate_raw, "=", true),
+			acceptance("role-pairing", commanderReserve.pairing_valid && workerReserve.pairing_valid, "=", true),
+			acceptance("role-hard-bundle-caps", commanderReserve.hard_and_bundle_caps_valid && workerReserve.hard_and_bundle_caps_valid, "=", true),
+			acceptance("commander-role-hard-cap", commanderReserve.max_projected_tool_text_bytes, "<=", COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES),
+			acceptance("worker-role-hard-cap", workerReserve.max_projected_tool_text_bytes, "<=", WORKER_HISTORY_TOOL_TEXT_MAX_BYTES),
+			acceptance("bundle-cap", bundleCapEnforced, "=", true),
+			acceptance("fail-closed", failClosedHostile, "=", true),
+			acceptance("cache-classification", cacheVerdict.reason === "HISTORY_PROJECTION_EPOCH_CHANGED" && cacheClass === "expected", "=", true),
 		],
-		"Every turn projects the growing original history; the outgoing view remains bounded and exact call/result pairing is revalidated.",
+		"Offline projection evidence proves role-derived anchors, sixteen immutable segment seals before checkpoint seventeen, post-checkpoint seals, strict JSON state replay, hard caps, pairing, and fail-closed behavior. It never claims or synthesizes a live provider cache hit.",
 	);
 }
 
@@ -969,7 +1360,7 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 		expectedSourceHashes.push(sha256(content));
 	}
 	const fakeChildSource = `
-		import { historyToolTextBytes, validateContextToolPairing } from ${JSON.stringify(historyModule)};
+		import { HistoryProjectionController, historyToolTextBytes, validateContextToolPairing } from ${JSON.stringify(historyModule)};
 		import {
 			createAgentSession,
 			DefaultResourceLoader,
@@ -985,6 +1376,13 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 
 		const sourceBytes = ${WORKER_SOURCE_FILE_BYTES};
 		const historyCap = ${WORKER_HISTORY_TOOL_TEXT_MAX_BYTES};
+		const workerTurnCap = ${WORKER_TURN_MAX_BYTES};
+		const projectionEntryType = ${JSON.stringify(HISTORY_PROJECTION_ENTRY_TYPE)};
+		const maxSegments = ${HISTORY_PROJECTION_MAX_SEGMENTS};
+		const segmentByteCap = ${HISTORY_PROJECTION_SEGMENT_MAX_TOOL_TEXT_BYTES};
+		const segmentBundleCap = ${HISTORY_PROJECTION_SEGMENT_MAX_BUNDLES};
+		const activeBundleCap = ${HISTORY_PROJECTION_ACTIVE_MAX_BUNDLES};
+		const expectedAnchorBytes = historyCap - workerTurnCap - maxSegments * segmentByteCap;
 		const projectRoot = process.env.WORKBENCH_WORKER_PROJECT_ROOT ?? process.cwd();
 		const sessionRoot = projectRoot;
 		const runtimePackageSource = ${JSON.stringify(MODULE_REPO_ROOT)};
@@ -1023,8 +1421,16 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 		const turnEndToolIndexes = [];
 		const actualToolResultMessageBytes = [];
 		const forwardedRawToolResultEventBytes = [];
+		const preHistoryToolResultHashes = [];
+		const contextPressureSnapshots = [];
+		const historyProjectionSnapshots = [];
+		const pressureKeys = [
+			"epoch", "hardBundleCount", "hardHistoryBytes", "projectedToolTextBytes",
+			"rawBundleCount", "rawToolTextBytes", "role", "schema", "timestampMs",
+		].sort();
 		let pairingValid = true;
 		let requestBoundaryOrderValid = true;
+		let latestCompletedBundleRaw = true;
 		let contextHandlerCount = 0;
 		let providerRequestHandlerCount = 0;
 		let projectTrusted = false;
@@ -1033,7 +1439,9 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 		const observerExtension = (pi) => {
 			pi.on("tool_result", (event) => {
 				const index = preHistoryToolResultBytes.length;
-				preHistoryToolResultBytes.push(utf8(textOf(event.content)));
+				const rawText = textOf(event.content);
+				preHistoryToolResultBytes.push(utf8(rawText));
+				preHistoryToolResultHashes.push(digest(rawText));
 				preHistoryToolResultEventBytes.push(utf8(JSON.stringify(event)) + 1);
 				lifecycle.push("tool-result:" + index);
 				return undefined;
@@ -1087,6 +1495,53 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 			const latestCanonical = canonicalTelemetrySnapshots.at(-1);
 			const totalSourceBytes = sourcePaths.length * sourceBytes;
 			const totalPreHistoryToolResultBytes = preHistoryToolResultBytes.reduce((sum, value) => sum + value, 0);
+			const contextPressureNineFieldValid = contextPressureSnapshots.length > 0
+				&& contextPressureSnapshots.every((value) => value && typeof value === "object"
+					&& !Array.isArray(value)
+					&& JSON.stringify(Object.keys(value).sort()) === JSON.stringify(pressureKeys)
+					&& value.schema === "workbench-context-pressure-v1"
+					&& value.role === "worker"
+					&& value.hardHistoryBytes === historyCap
+					&& value.hardBundleCount === ${HISTORY_MAX_BUNDLES}
+					&& [value.epoch, value.rawToolTextBytes, value.projectedToolTextBytes, value.rawBundleCount, value.timestampMs]
+						.every((item) => Number.isSafeInteger(item) && item >= 0));
+			const strictProjectionState = (value) => {
+				try {
+					const serialized = JSON.stringify(value);
+					if (utf8(serialized) > 32 * 1024) return false;
+					const normalized = JSON.parse(serialized);
+					const restored = new HistoryProjectionController();
+					if (!restored.restoreFromEntries([{ type: "custom", customType: projectionEntryType, data: normalized }])) return false;
+					if (JSON.stringify(restored.serialize()) !== JSON.stringify(normalized)) return false;
+					if (normalized.schemaVersion !== 3 || (normalized.active !== 0 && normalized.active !== 1)) return false;
+					if (normalized.active === 0) return true;
+					if (normalized.hardToolTextBytes !== historyCap
+						|| normalized.anchorToolTextBytes !== expectedAnchorBytes
+						|| normalized.hardToolTextBytes - normalized.anchorToolTextBytes !== workerTurnCap + maxSegments * segmentByteCap
+						|| normalized.hardBundles !== ${HISTORY_MAX_BUNDLES}
+						|| !Array.isArray(normalized.segments) || normalized.segments.length > maxSegments
+						|| normalized.segments.some((segment) => segment.projectedToolTextBytes > segmentByteCap
+							|| segment.projectedBundles > segmentBundleCap)) return false;
+					const stableBytes = normalized.anchor.projectedToolTextBytes
+						+ normalized.segments.reduce((sum, segment) => sum + segment.projectedToolTextBytes, 0);
+					const stableBundles = normalized.anchor.projectedBundles
+						+ normalized.segments.reduce((sum, segment) => sum + segment.projectedBundles, 0);
+					return normalized.projectedToolTextBytes - stableBytes <= workerTurnCap
+						&& normalized.projectedBundles - stableBundles <= activeBundleCap
+						&& normalized.projectedToolTextBytes <= historyCap
+						&& normalized.projectedBundles <= ${HISTORY_MAX_BUNDLES};
+				} catch {
+					return false;
+				}
+			};
+			const activeProjectionStates = historyProjectionSnapshots.filter((value) => value?.active === 1);
+			const historyProjectionV3Valid = historyProjectionSnapshots.length > 0
+				&& activeProjectionStates.length > 0
+				&& historyProjectionSnapshots.every(strictProjectionState);
+			const maximumHistoryProjectionStateBytes = maxOf(historyProjectionSnapshots.map((value) => utf8(JSON.stringify(value))));
+			const minimumWorkerAnchorReserveBytes = activeProjectionStates.length === 0
+				? 0
+				: Math.min(...activeProjectionStates.map((value) => value.hardToolTextBytes - value.anchorToolTextBytes));
 			return {
 				projectTrusted,
 				runtimePackageProvenanceValid,
@@ -1121,6 +1576,13 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 				finalCollapsedToolResults: latestCanonical?.totals?.historyCollapsedResults ?? 0,
 				finalRemovedToolBundles: latestCanonical?.totals?.historyRemovedBundles ?? 0,
 				historyCap,
+				contextPressureEntries: contextPressureSnapshots.length,
+				contextPressureNineFieldValid,
+				historyProjectionV3Entries: historyProjectionSnapshots.length,
+				historyProjectionV3Valid,
+				maximumHistoryProjectionStateBytes,
+				minimumWorkerAnchorReserveBytes,
+				latestCompletedBundleRaw,
 			};
 		};
 
@@ -1169,6 +1631,14 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 					const outgoingToolBytes = providerToolTextBytes(outgoingPayload);
 					providerHistoryToolTextBytes.push(outgoingToolBytes);
 					providerPayloadBytes.push(utf8(JSON.stringify(outgoingPayload)));
+					if (requestNumber > 1) {
+						const outgoingResults = Array.isArray(outgoingPayload.messages)
+							? outgoingPayload.messages.filter((message) => message?.role === "toolResult")
+							: [];
+						const latestResultText = textOf(outgoingResults.at(-1)?.content);
+						latestCompletedBundleRaw &&= utf8(latestResultText) === preHistoryToolResultBytes.at(-1)
+							&& digest(latestResultText) === preHistoryToolResultHashes.at(-1);
+					}
 					boundaryValid &&= outgoingToolBytes === projectedHistoryToolTextBytes[requestNumber - 1]
 						&& outgoingToolBytes <= historyCap;
 					requestBoundaryOrderValid &&= boundaryValid;
@@ -1176,9 +1646,9 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 					const usage = {
 						input: 100,
 						output: 10,
-						cacheRead: 50,
+						cacheRead: 0,
 						cacheWrite: 0,
-						totalTokens: 160,
+						totalTokens: 110,
 						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 					};
 					const output = {
@@ -1297,6 +1767,10 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 				} else if (event.entry.customType === "workbench-output-turn-telemetry-v1") {
 					turnTelemetrySnapshots.push(event.entry.data);
 					enqueueActualEvent(event);
+				} else if (event.entry.customType === "workbench-context-pressure-v1") {
+					contextPressureSnapshots.push(event.entry.data);
+				} else if (event.entry.customType === projectionEntryType) {
+					historyProjectionSnapshots.push(event.entry.data);
 				}
 				return;
 			}
@@ -1393,6 +1867,8 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 		childFacts.maxPreHistoryToolResultBytes, childFacts.maxProjectedHistoryBytes, childFacts.totalSourceBytes,
 		childFacts.totalPreHistoryToolResultBytes, childFacts.totalSourceBytesOmitted, childFacts.finalCollapsedToolResults,
 		childFacts.finalRemovedToolBundles, childFacts.finalActiveHistoryToolTextBytes, childFacts.historyCap,
+		childFacts.contextPressureEntries, childFacts.historyProjectionV3Entries,
+		childFacts.maximumHistoryProjectionStateBytes, childFacts.minimumWorkerAnchorReserveBytes,
 	];
 	if (!numericCounts.every((value) => Number.isSafeInteger(value) && value >= 0)
 		|| typeof childFacts.projectTrusted !== "boolean"
@@ -1400,6 +1876,9 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 		|| typeof childFacts.sessionProjectRootIsolated !== "boolean"
 		|| typeof childFacts.requestBoundaryOrderValid !== "boolean"
 		|| typeof childFacts.pairingValid !== "boolean" || typeof childFacts.sourceFilesUnchanged !== "boolean"
+		|| typeof childFacts.contextPressureNineFieldValid !== "boolean"
+		|| typeof childFacts.historyProjectionV3Valid !== "boolean"
+		|| typeof childFacts.latestCompletedBundleRaw !== "boolean"
 		|| !Array.isArray(childFacts.preHistoryToolResultBytes) || childFacts.preHistoryToolResultBytes.length !== 24
 		|| !childFacts.preHistoryToolResultBytes.every((value) => Number.isSafeInteger(value) && value >= 0)
 		|| !Array.isArray(childFacts.projectedHistoryToolTextBytes) || childFacts.projectedHistoryToolTextBytes.length !== 25
@@ -1456,7 +1935,15 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 		&& childFacts.totalSourceBytesOmitted === childFacts.totalSourceBytes - childFacts.totalPreHistoryToolResultBytes
 		&& childFacts.maxPreHistoryToolResultBytes === sampleStats(childFacts.preHistoryToolResultBytes).max
 		&& childFacts.maxProjectedHistoryBytes === sampleStats(childFacts.projectedHistoryToolTextBytes).max
-		&& childFacts.finalActiveHistoryToolTextBytes === childFacts.projectedHistoryToolTextBytes.at(-2);
+		&& childFacts.finalActiveHistoryToolTextBytes === childFacts.projectedHistoryToolTextBytes.at(-2)
+		&& childFacts.contextPressureEntries >= 24
+		&& childFacts.contextPressureNineFieldValid
+		&& childFacts.historyProjectionV3Entries >= 24
+		&& childFacts.historyProjectionV3Valid
+		&& childFacts.maximumHistoryProjectionStateBytes <= 32 * 1_024
+		&& childFacts.minimumWorkerAnchorReserveBytes === WORKER_TURN_MAX_BYTES
+			+ HISTORY_PROJECTION_MAX_SEGMENTS * HISTORY_PROJECTION_SEGMENT_MAX_TOOL_TEXT_BYTES
+		&& childFacts.latestCompletedBundleRaw;
 	const outputControl = result.outputControl;
 	const finalOutputControlObserved = outputControl !== undefined
 		&& outputControl.currentToolTextBytes === childFacts.projectedHistoryToolTextBytes.at(-1)
@@ -1486,6 +1973,7 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 		&& preflightObservedBeforeEveryProviderResponse
 		&& finalOutputControlObserved
 		&& historyBounded
+		&& result.usage.cacheRead === 0
 		&& (outputControl?.collapsedToolResults ?? 0) > 0
 		&& childFacts.pairingValid
 		&& childFacts.sourceFilesUnchanged;
@@ -1553,10 +2041,19 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 			final_collapsed_tool_results: outputControl?.collapsedToolResults ?? 0,
 			last_pre_final_response_collapsed_tool_results: childFacts.finalCollapsedToolResults,
 			final_removed_tool_bundles: childFacts.finalRemovedToolBundles,
+			context_pressure_entries: childFacts.contextPressureEntries,
+			context_pressure_nine_fields_valid: childFacts.contextPressureNineFieldValid,
+			history_projection_v3_entries: childFacts.historyProjectionV3Entries,
+			history_projection_v3_valid: childFacts.historyProjectionV3Valid,
+			maximum_history_projection_state_bytes: childFacts.maximumHistoryProjectionStateBytes,
+			minimum_worker_anchor_reserve_bytes: childFacts.minimumWorkerAnchorReserveBytes,
+			latest_completed_bundle_raw: childFacts.latestCompletedBundleRaw,
 			source_files_unchanged: childFacts.sourceFilesUnchanged,
 			provider_payload_structural_bytes: providerStructuralBytes,
 			provider_request_structural_bytes: sampleStats(childFacts.providerPayloadBytes),
 			usage: { input: result.usage.input, cache_read: result.usage.cacheRead, output: result.usage.output },
+			offline_provider_cache_read_tokens: result.usage.cacheRead,
+			real_provider_cache_read_measured: false,
 			success,
 			failure_reason: success ? "none" : "runner_failure",
 		},
@@ -1580,13 +2077,20 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 			acceptance("provider-preflight-observed", preflightObservedBeforeEveryProviderResponse, "=", true),
 			acceptance("canonical-output-control-observed", finalOutputControlObserved, "=", true),
 			acceptance("history-collapse-observed", (outputControl?.collapsedToolResults ?? 0) > 0, "=", true),
+			acceptance("context-pressure-nine-fields", childFacts.contextPressureNineFieldValid, "=", true),
+			acceptance("history-projection-v3-state", childFacts.historyProjectionV3Valid, "=", true),
+			acceptance("history-projection-state-size", childFacts.maximumHistoryProjectionStateBytes, "<=", 32 * 1_024),
+			acceptance("worker-anchor-reserve", childFacts.minimumWorkerAnchorReserveBytes,
+				"=", WORKER_TURN_MAX_BYTES + HISTORY_PROJECTION_MAX_SEGMENTS * HISTORY_PROJECTION_SEGMENT_MAX_TOOL_TEXT_BYTES),
+			acceptance("latest-completed-bundle-raw", childFacts.latestCompletedBundleRaw, "=", true),
+			acceptance("offline-cache-read-zero", result.usage.cacheRead, "=", 0),
 			acceptance("worker-history-cap", childFacts.maxProjectedHistoryBytes, "<=", WORKER_HISTORY_TOOL_TEXT_MAX_BYTES),
 			acceptance("worker-pairing", childFacts.pairingValid, "=", true),
 			acceptance("source-files-unchanged", childFacts.sourceFilesUnchanged, "=", true),
 			acceptance("worker-compaction", result.compactionCount, "=", 0),
 			acceptance("model-calls", 0, "=", 0),
 		],
-		"createAgentSession drives the real Pi agent loop with a deterministic local ModelRuntime provider: each of 24 production native reads consumes a distinct 512 KiB local source file, its actual bounded tool result crosses AgentSession middleware, turn_end completes, and only then does the next context/before_provider_request pair run. Canonical telemetry and actual assistant message_end events cross the runner transport; raw tool-result events do not.",
+		"createAgentSession drives the real Pi agent loop with a deterministic local ModelRuntime provider: each of 24 production native reads consumes a distinct 512 KiB local source file, its actual bounded tool result crosses AgentSession middleware, turn_end completes, and only then does the next context/before_provider_request pair run. Strict v3 projection state and the exact nine-field pressure protocol are observed locally. Offline cacheRead is fixed to zero; this scenario never substitutes synthetic usage for live provider cache telemetry.",
 	);
 }
 

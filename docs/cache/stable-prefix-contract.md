@@ -1,11 +1,10 @@
 # Stable Prefix Contract (P6-B)
 
-DeepSeek's prompt cache is a **full-prefix cache**: a request is only billed
-cache reads when the entire prefix — system prompt, tool definitions, and
-message history — is byte-identical to a previously cached prefix. The
-workbench therefore formalizes which parts of the model-request input may
-vary and which must stay byte-identical, and enforces that split in code and
-tests.
+DeepSeek's prompt cache is a **full-prefix cache**: reuse requires an identical
+prefix starting at the first token. The workbench treats the rendered system
+prompt, tool definitions, and message history through a boundary as exact
+provider-visible structure. It therefore formalizes which request parts may
+vary and which must stay identical, and enforces that split in code and tests.
 
 This contract is the P6-B companion to the P6-A telemetry docs
 (`cache-telemetry.md`) and the provider-facts doc
@@ -53,8 +52,8 @@ re-hashes the prefix and silently defeats caching.
 6. **Context projection** — a deterministic runtime transform may replace
    older complete assistant-tool bundles with bounded descriptors before a
    provider request. It never changes the system prompt or tool definitions.
-   The projection is frozen into a discrete epoch: inside that epoch the
-   provider-visible history is append-only.
+   Projection state v3 freezes one anchor and up to 16 immutable segments;
+   only the active raw tail grows between declared seals/checkpoints.
 
 ## What the workbench audited (and what it does not do)
 
@@ -79,17 +78,20 @@ discovery.
   ("telemetry never enters the model context").
 - **Compaction writes no cache statistics.** The compaction supplement note
   carries task/mode/gates/runs/evidence pointers only (tested).
-- **`before_provider_request` stays read-only.** It produces a structural
-  digest in memory; the payload and headers are never mutated (tested).
+- **`before_provider_request` is copy-on-write and capability-gated.** For the
+  proven public OpenAI GPT-5.6 Responses shape only, it may return a cloned
+  payload with explicit breakpoints on exact marker blocks. Unsupported,
+  uncertain, Codex-default, and DeepSeek paths return the original payload by
+  identity. Headers are never changed; telemetry hashes the actual outgoing
+  shape.
 - **The `context` event is enforcement, not cache observation.** Below the
-  hard ceiling it returns the raw history unchanged. A hard-ceiling crossing
-  starts one projection epoch at the 75% tool-text / 96-bundle low watermark;
-  later requests replay that exact frozen projection and append the untouched
-  raw suffix. A new epoch begins only when the combined projected prefix and
-  suffix reaches a hard ceiling, or when a branch/compaction/policy mismatch
-  invalidates the frozen boundary. The epoch transition is one expected cache
-  invalidation (`HISTORY_PROJECTION_EPOCH_CHANGED`); ordinary append-only
-  turns inside it are not `CONTEXT_PREFIX_DIVERGED`. Tool/system stable-zone
+  hard ceiling it returns raw history unchanged. At an initial checkpoint,
+  projection-state v3 freezes a 26/10 KiB Commander/worker anchor, reserves
+  one 64/48 KiB raw turn, and may later append up to 16 immutable
+  384-byte/one-bundle segments. Seals 1–16 preserve the epoch and every older
+  boundary; only an attempt to create segment 17 triggers a checkpoint and
+  increments the epoch.
+  Ordinary appends are not `CONTEXT_PREFIX_DIVERGED`; tool/system stable-zone
   hashes are unaffected.
 
 Old session JSONL remains readable but can carry large legacy details before
@@ -205,40 +207,160 @@ The hashes are pinned by `tests/p6-b-stable-prefix.test.ts`; the baseline is
 derived read-only from the frozen commit, while the current hash is computed
 from the registered static sources. Reloading v0.10.0 therefore produces one
 expected `TOOL_SCHEMA` drift and cold cache prefix. Repeated builds in the same
-mode must then be stable. Runtime history projection changes the normal
-message-history prefix only at a discrete epoch transition. Within that epoch
-the provider-visible prefix is append-only; neither a normal appended message
-nor replaying the frozen projection is classified as prefix divergence. These
-guarantees do not alter the stable-zone tool hashes.
+mode must then be stable. Runtime history projection changes only a bounded
+active tail at a declared seal, or resets the segmented topology at a declared
+checkpoint. Neither a normal append nor exact replay is classified as prefix
+divergence. These guarantees do not alter the stable-zone tool hashes.
 
-## History-projection epochs
+## History-projection segmented epochs
 
-The active-history hard ceilings remain **96 KiB for Commander**, **64 KiB
-for worker/other roles**, and **128 complete assistant/tool-result bundles**.
-The projection controller adds hysteresis without weakening those limits:
+The active-history hard ceilings remain **98,304 bytes (96 KiB) for
+Commander**, **65,536 bytes (64 KiB) for worker/other**, and **128 complete
+assistant/tool-result bundles**. Projection-state v3 reserves the active turn
+and segment chain before sizing the anchor:
 
-| Role | Hard tool text | Epoch low-water tool text | Hard bundles | Epoch low-water bundles |
-| --- | ---: | ---: | ---: | ---: |
-| Commander | 96 KiB | 72 KiB (75%) | 128 | 96 |
-| Worker / other | 64 KiB | 48 KiB (75%) | 128 | 96 |
+```text
+anchorByteCap = max(0, hardToolTextBytes - roleTurnBytes - 16 * 384)
+anchorBundleCap = max(0, 128 - 16 segment bundles - 16 active bundles) = 96
+```
 
-When raw history first exceeds a hard ceiling, the complete current prefix is
-projected once to the low watermark and its numeric/hash-only epoch state is
-stored as `workbench-history-projection-state-v1`. The runtime deterministically
-recreates that same prefix and appends new raw messages until another hard
-crossing. Reload/resume restores a strict state entry; branching and completed
-compaction reset it. Invalid call/result pairing still fails closed and never
-emits an orphaned tool message.
+| Role | Hard tool text | Raw turn reserve | Segment reserve | Anchor cap | Active bundles | Anchor bundles |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Commander | 98,304 B | 65,536 B | 16 × 384 B | 26,624 B (26 KiB) | 16 | 96 |
+| Worker / other | 65,536 B | 49,152 B | 16 × 384 B | 10,240 B (10 KiB) | 16 | 96 |
 
-This is a structural cache-cooperation contract, not evidence of a recovered
-provider hit rate. Provider cache reuse remains best-effort and must be
-measured from subsequent real requests.
+At the initial checkpoint, the controller validates global tool-call/result
+pairing and chooses the largest latest **raw** suffix that fits the role-turn
+bytes and 16 bundles, with the split on a complete assistant-bundle boundary.
+It projects `[0, split)` into the fixed anchor and leaves `[split, end)` raw.
+On a same-state request it reconstructs the exact anchor, ordered segments, and
+active raw suffix. Small suffix growth is therefore whole-payload append-only.
+
+If the active suffix exceeds either its role-turn bytes or 16 bundles, the
+controller seals only aged active material into one new immutable segment. A
+segment contains at most 384 total UTF-8 tool-text bytes and one complete
+bundle. Seals 1 through 16 append to the chain without changing the epoch hash;
+the anchor, all older segments, and their markers remain exact. The separate
+`segmentSealed` signal classifies this as an expected active-tail rewrite—not a
+full fixed-prefix invalidation. An attempt to create segment 17 never seals
+early: it checkpoints, rebuilds the anchor, clears the segment chain,
+increments the epoch, and emits the separate checkpoint/epoch signal.
+
+The projected anchor and every immutable segment end with a deterministic,
+bounded hidden custom marker. Its safe `boundaryId` is derived only from
+projected/provider-visible structural content, never a raw secret hash. The
+projection result exposes the exact bounded marker strings and IDs required by
+the provider hook. Once sealed, a marker/message pair is immutable until the
+next checkpoint.
+
+The `workbench-history-projection-state-v3` custom entry uses
+`schemaVersion: 3`, persists only strict numeric/hash topology, and is bounded
+to 32 KiB; it contains no message text. Frozen slices
+must be contiguous raw boundaries, at most 16, and each must satisfy the exact
+384-byte/one-bundle limits. Reload reconstructs every slice from raw JSONL and
+compares exact hashes, counts, bytes, bundles, chain arithmetic, and hard
+totals. Any mismatch fails closed as `prefix_changed`. The newest recognized
+entry is authoritative: a malformed matching entry or a structurally unsafe
+newer entry (including a Proxy, revoked Proxy, or `customType`/`data` accessor)
+blocks fallback to an older valid state without executing its traps. A safely
+unrelated ordinary-data entry may still be skipped.
+
+Strict v1 and v2 are migration input only; monotonic epoch and the existing
+pressure observation carry forward, but no prior topology or hash is reused.
+This also holds below the hard cap: the first projection after restore returns
+the raw history unchanged, emits one `legacy_migration` boundary, advances the
+epoch once, and persists inactive v3 state. Restoring that v3 state does not
+emit the migration boundary again.
+
+Failure/recovery is similarly durable without adding a schema key. An inactive
+v3 record may carry one fixed, non-secret failure sentinel in `epochHash`,
+covered by `stateHash`. After JSONL restore, another failure reuses the sentinel
+without another transition; the first healthy projection emits one fixed
+recovery boundary and later healthy projections emit none. Neither identity is
+derived from hostile/raw history. Branching, completed compaction, invalid
+pairing, and policy mismatch retain these fixed fail-closed semantics. Lowered
+test/policy caps clamp the formula; if the topology cannot be reserved, the
+controller checkpoints or fails closed rather than weakening a hard limit.
+
+## Provider integration and research limits
+
+- [OpenAI Prompt Caching](https://developers.openai.com/api/docs/guides/prompt-caching)
+  documents exact-prefix matching: stable instructions, examples, tools, and
+  schemas belong first, while user-specific values, timestamps, and other
+  variable content belong after the reusable prefix. For GPT-5.6+, supported
+  content blocks may carry explicit breakpoints via
+  `prompt_cache_breakpoint: { "mode": "explicit" }`. The workbench may map a
+  safe boundary marker only to the exact public `openai` +
+  `openai-responses` + `gpt-5.6*` request shape; the marker is not injected
+  into unsupported blocks. The helper requires and preserves Pi's existing
+  `prompt_cache_key`, so related requests must keep that key and exact prefix
+  consistent; it never invents a key, sets `prompt_cache_options`, or marks the
+  active tail.
+
+  OpenAI limits each request to at most four **new cache writes** (the latest
+  four eligible breakpoints in explicit mode; in implicit mode the latest
+  message consumes one slot), while cache reads consider up to the latest 50
+  breakpoint candidates and choose the longest match. Therefore the
+  workbench's maximum 17 logical boundaries (anchor plus 16 immutable
+  segments) do **not** mean 17 new writes on one request. Keep aggregate
+  traffic for one `prompt_cache_key` at approximately 15 requests per minute,
+  partitioning higher-volume traffic with a stable mapping. Measure the result
+  with provider `cached_tokens` and `cache_write_tokens`; marker count is not a
+  hit metric.
+
+  The [latest-model guide](https://developers.openai.com/api/docs/guides/latest-model)
+  is the companion model-level source. `openai-codex` remains disabled by
+  default until live SSE and WebSocket probes both prove field acceptance and
+  no provider `400`.
+- [DeepSeek context caching](https://api-docs.deepseek.com/guides/kv_cache)
+  is automatic and matches identical prefixes starting at token zero. The
+  DeepSeek hook is therefore a strict explicit-breakpoint no-op. Immutable
+  segmentation can still preserve a longer matching prefix, but that is an
+  architectural expectation, not a measured improvement.
+- [vLLM Automatic Prefix Caching](https://docs.vllm.ai/en/v0.9.1/design/automatic_prefix_caching.html)
+  and [SGLang RadixAttention](https://arxiv.org/abs/2312.07104) support the
+  exact-prefix/block-reuse rationale. They do not establish the internals or
+  hit rate of either hosted provider used by Pi.
+- The MLSys [Prompt Cache paper](https://proceedings.mlsys.org/paper_files/paper/2024/hash/a66caa1703fe34705a4368c3014c1966-Abstract-Conference.html)
+  motivates reusable modular prompt segments at the serving layer. It is
+  research inspiration only; a Pi client cannot assume hosted server-side
+  module placement or eviction control.
+
+The resulting client-side architecture is a synthesis, not a hosted-provider
+implementation claim: keep one immutable fixed anchor, append modular immutable
+segments, and rebuild them only at rare checkpoints. The same design applies
+to Commander and worker/other; only their byte caps differ. It follows the
+common exact-prefix/block-reuse principle while preserving development quality
+through strict pairing, bounded state, and fail-closed restoration.
+
+This is a structural cache-cooperation contract, not evidence of recovered
+provider cache reuse. Only verified provider usage mapped to `cacheRead` is
+authoritative. The offline fake provider deliberately reports `cacheRead = 0`,
+so offline tests and benchmarks cannot substantiate a hit-rate improvement.
+Deploy first, start a new live session, and measure subsequent provider usage
+before making any recovery claim.
 
 ## Hashing rules
 
 - Canonical hashing: `cache/canonical-hash.ts` — sorted object keys,
   preserved array order, explicit `undefined`, Date and non-JSON values
   rejected. Comparisons always use the canonical JSON form.
+- Projection history hashing is a separate v3 JSONL/provider boundary:
+  strings are framed losslessly by their exact UTF-16 code units, so a lone
+  surrogate cannot collide with U+FFFD. Object properties follow JSON's
+  enumeration order (array-index keys ascending, then other string keys in
+  insertion order), object `undefined`/function/symbol values are omitted, and
+  array holes or `undefined`/function/symbol entries become `null`. Only
+  top-level message `timestamp`, `details`, `usage`, and `diagnostics` are
+  ignored. Provider-visible roles/content, tool call ids/names/arguments,
+  result text/images, error state, and added-tool fields remain hashed,
+  including nested fields that happen to use a metadata name.
+- Projection canonicalization is explicitly bounded: arrays are at most 32,768
+  elements, nesting at most 128 levels, own descriptors at most 32,769 per
+  container, and total work at most 262,144 units. Proxies, revoked proxies,
+  accessors, custom `toJSON`, cycles, non-plain prototypes, symbols/extra array
+  keys, and over-budget structures fail closed without invoking application
+  code. These are safety bounds, not cache-hit heuristics.
 - System prompt hash = `sha256Hex(prompt)` (same definition as telemetry).
 - Tool fingerprint = names (set), order, and schema
   `{name, description, promptSnippet, parameters, promptGuidelines}` in

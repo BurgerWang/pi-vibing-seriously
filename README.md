@@ -67,7 +67,7 @@ For onboarding details, nested projects, and recipe examples, see
 | **Gates decide readiness** | b0–b6 base and q0–q5 quant gates return exactly PASS / FAIL / BLOCKED / NOT_RUN; model prose never substitutes for machine or recorded manual evidence |
 | **Workers own routine writes** | Bounded workers implement parent-approved slices; the commander owns architecture, reviews the actual git diff, and runs final gates |
 | **Output stays bounded** | Result envelopes, turn/history budgets, stale-safe cursors, bounded DTOs, numeric telemetry, and a legacy-session sanitizer control model-visible context |
-| **Prompt prefixes stay cooperative** | Active-history projection changes the provider-visible prefix only at discrete low-watermark epochs; ordinary turns remain append-only inside an epoch |
+| **Prompt prefixes stay cooperative** | Active-history projection freezes a bounded anchor plus immutable segments; ordinary turns append to a raw active tail, while seals and checkpoints are explicit |
 | **Caching is explicit** | Opt-in, success-only recipe result caching uses declared content inputs; it never caches LLM answers or arbitrary bash |
 | **Quant work has contracts** | Mid/low-frequency profiles add Q0–Q5 plus versioned DATA_SNAPSHOT / FEATURE_SET / BACKTEST_RESULT and `quant-result.json` contracts |
 | **Everything stays Pi-native** | Extensions, 30 commands, 14 registered tools, 14 skills, 7 prompt templates, and compact status/widget renderers—no companion runtime |
@@ -177,12 +177,51 @@ history.
 | Active-history bundles | 128 complete assistant/tool-result bundles |
 | Details value / streaming update | 8 KiB / 4 KiB |
 
-When active history crosses a hard limit, the runtime starts one projection
-epoch at a 75% byte / 96-bundle low watermark. It then reuses that exact
-projected prefix and appends new raw messages until the next hard crossing.
-The hard limits above are unchanged; invalid tool pairing still fails closed.
-This avoids per-turn history rewrites but does not claim or guarantee a
-provider cache-hit recovery.
+Projection-state v3 reserves the current raw turn before freezing history. Its
+anchor byte cap is
+`max(0, hard tool text - role turn - 16 * 384)`: **26 KiB for Commander**
+(`96 KiB - 64 KiB - 6 KiB`) and **10 KiB for worker/other**
+(`64 KiB - 48 KiB - 6 KiB`). The anchor holds at most 96 bundles; the active
+raw suffix holds at most 16. Up to 16 immutable segments may follow the anchor,
+each projecting no more than 384 UTF-8 tool-text bytes and one complete bundle.
+
+Normal requests replay the exact anchor, ordered segments, and raw active
+suffix. When the active suffix exceeds its role turn or 16-bundle reserve, the
+controller seals aged material once: seals 1–16 append a new immutable segment,
+keep the epoch and every older boundary byte-identical, and are an expected
+tail rewrite. An attempt to create segment 17 instead triggers a checkpoint
+that rebuilds the anchor, clears the segment chain, and increments the epoch.
+Deterministic hidden boundary markers expose safe IDs derived only from
+provider-visible structure, never raw secret hashes. Invalid tool pairing still
+fails closed.
+
+Strict v1/v2 records are migration input only: they carry forward monotonic
+epoch and nine-field pressure diagnostics, never old topology or hashes. An
+under-cap migration emits one boundary while preserving raw history, then
+persists inactive v3 so reload cannot repeat it. A fixed, non-secret failure
+sentinel likewise survives JSONL restore: repeated failure is de-duplicated and
+the first healthy request emits one recovery boundary. The newest malformed or
+hostile state entry is authoritative and fails closed; Proxies/accessors are
+never executed.
+
+History identity follows JSON semantics with lossless UTF-16 code units, JSON
+property enumeration order, omitted object `undefined`, and array holes as
+`null`. Array/depth/work limits bound hostile input, and Proxy/accessor/
+non-plain structures fail closed.
+
+This is a structural cache-cooperation guarantee, not proof of provider cache
+reuse. Public OpenAI explicit breakpoints are optional and capability-gated;
+only exact public `openai-responses` GPT-5.6 traffic is eligible. The Codex
+backend path remains disabled until both live transports are probed, and
+DeepSeek receives no breakpoint fields. OpenAI's operating guidance is exact
+prefixes, static content first, variable content last, a consistent
+`prompt_cache_key`, at most four new writes per request, the latest 50
+breakpoints as read candidates, and about 15 requests/minute per key. The 17
+logical anchor/segment markers therefore are not 17 new writes. Only verified
+provider `cacheRead`/`cached_tokens` and `cacheWrite`/`cache_write_tokens` usage
+is authoritative; the offline fake provider deliberately reports zero. See the
+[stable-prefix contract](docs/cache/stable-prefix-contract.md) for the primary
+sources and deployment caveats.
 
 Cache visibility is explicit: the footer shows `CACHE last=… cum=…`,
 `/q-cache-status` labels the last request and cumulative session ratios, and

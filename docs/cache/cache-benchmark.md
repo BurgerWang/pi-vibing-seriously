@@ -22,7 +22,8 @@ write into `reports/<name>.json`).
 ## Data sources (the ONLY things read)
 
 1. **Workbench telemetry JSONL** — `.pi/workbench/cache/telemetry.jsonl` and
-   rotated `telemetry.N.jsonl` (P6-A records, schema version 1.0/1.1).
+   rotated `telemetry.N.jsonl` (strict P6-A records, schema version
+   1.0/1.1/1.2).
 2. **Pi normalized usage** — the `usage` object inside each telemetry
    record (input/output/cacheRead/cacheWrite/totalTokens/cost as Pi exposed
    them on the assistant message).
@@ -61,12 +62,16 @@ equal in-Pi numbers.
 | `outputTokens` | Σ `usage.output`. |
 | `cacheWriteTokens` | Σ `usage.cacheWrite` (0 for DeepSeek — it reports no cache writes; a zero is NOT an error). |
 | `totalTokens` | Σ `usage.totalTokens` (input + output + cacheRead + cacheWrite per record). |
-| `cacheHitRatio` | `cacheRead / (input + cacheRead)` over the scope totals; `null` when usage semantics are not verified or the denominator is 0. Only meaningful for api kinds whose semantics were confirmed in the installed Pi source (`openai-completions`, `openai-responses`, `azure-openai-responses`, `openai-codex-responses`, `anthropic-messages`). |
+| `cacheHitRatio` | `cacheRead / (input + cacheRead)` over the retained scope totals; `null` when usage semantics are not verified, the source is incomplete/corrupt, or the denominator is 0. Intentional oldest-record truncation alone keeps this existing bounded-window ratio available and labels the scope as bounded; it is not a whole-history ratio. Only meaningful for api kinds whose semantics were confirmed in the installed Pi source (`openai-completions`, `openai-responses`, `azure-openai-responses`, `openai-codex-responses`, `anthropic-messages`). |
 | `usageSemanticStatus` | Worst status across records: `verified` (api kind verified + internally consistent numbers), `partial` (structure ok, api kind unverified), `unverified` (invalid/missing usage). Never guessed. |
 | `providerReportedCost` | Σ `usage.cost` — Pi's `usage.cost.total`, the cost fact from the provider's own billing fields. |
 | `estimatedAvoidedCost` | Σ (`cacheRead` × `cacheRead` rate)/1M tokens using the **explicit `--cost-map`**; `null` if any record's provider/model has no rate in the map (strict — no partial estimates) or no map is given. |
-| `expectedInvalidations` | Records whose `inferredInvalidationReason` classifies as expected: FIRST_OBSERVED_REQUEST, NEW_SESSION, MODEL_CHANGED, THINKING_LEVEL_CHANGED, MODE_CHANGED, PACKAGE_RELOADED, COMPACTION, SESSION_TREE_CHANGED, HISTORY_PROJECTION_EPOCH_CHANGED, PROVIDER_BEST_EFFORT_MISS. |
+| `expectedInvalidations` | Records whose `inferredInvalidationReason` classifies as expected: FIRST_OBSERVED_REQUEST, NEW_SESSION, MODEL_CHANGED, THINKING_LEVEL_CHANGED, MODE_CHANGED, PACKAGE_RELOADED, COMPACTION, SESSION_TREE_CHANGED, HISTORY_PROJECTION_EPOCH_CHANGED, HISTORY_PROJECTION_SEGMENT_SEALED, PROVIDER_BEST_EFFORT_MISS. |
 | `unexpectedDrifts` | Records classified as unexpected: UNEXPECTED_DRIFT (same-mode system-prompt/tool drift, with `driftSource` detail) and CONTEXT_PREFIX_DIVERGED (a previously observed payload prefix item was rewritten, deleted, or reordered without an attributable lifecycle event). Ordinary UNCHANGED and APPEND_ONLY payload relationships are healthy and are not counted as drift. |
+| `historyProjectionSegmentSeals` | Count of retained records whose reason is exactly `HISTORY_PROJECTION_SEGMENT_SEALED`. |
+| `historyProjectionEpochTransitions` | Count of retained records whose reason is exactly `HISTORY_PROJECTION_EPOCH_CHANGED`. |
+| `explicitBreakpointAppliedRequests` | Count of retained records whose `precedingEvent` is exactly `explicit_prompt_cache_breakpoints_applied`. |
+| `explicitBreakpointVerifiedUsage` | Numeric `{ requestCount, input, cacheRead, cacheWrite, hitRatio }` for the applied-request subset. Sums include only exact eligible public `openai` + `openai-responses` + `gpt-5.6*` records with `usageSemanticStatus === "verified"` **and** `messageStatus === "ok"`; an errored request remains in `explicitBreakpointAppliedRequests` but contributes no verified usage. `hitRatio` is `cacheRead / (input + cacheRead)` and is `null` when there is no verified applied request, the denominator is zero, or the observation is incomplete, including intentionally truncated bounded windows. This stricter subset does not change the overall bounded-window ratio above. |
 | `modeChanges` / `modelChanges` / `thinkingChanges` | Adjacent-record transitions of `workbenchMode` / `model` / `thinkingLevel`. |
 | `reloads` / `compactions` | Records with `inferredInvalidationReason` PACKAGE_RELOADED / COMPACTION. |
 | `recipeExecutions` | Run manifests found under `.pi/workbench/runs/` (each manifest = one recipe invocation, exec or cache-hit materialization). |
@@ -93,6 +98,53 @@ their explicit expected reason, including `SESSION_TREE_CHANGED` and
 (SYSTEM_PROMPT / TOOL_SET / TOOL_ORDER / TOOL_SCHEMA) identifies a stable-zone
 mutation. Both unexpected reasons are actionable evidence, while all reasons
 remain workbench inferences rather than provider-issued miss verdicts.
+
+Projection-state v3 preserves that relationship with a fixed anchor, ordered
+immutable segments, and a raw active suffix. Commander uses a 98,304-byte hard
+ceiling, 65,536-byte turn reserve, and 26,624-byte anchor; worker/other uses
+65,536, 49,152, and 10,240 bytes. Both reserve sixteen segments of at most 384
+tool-text bytes/one complete bundle, cap the raw active suffix at 16 bundles,
+and cap the anchor at 96 bundles.
+
+Seals 1–16 append one segment while leaving the epoch, anchor, older segments,
+and safe boundary markers exact. The benchmark must classify that signal as an
+expected active-tail rewrite rather than a full epoch invalidation. An
+attempt to create segment 17 triggers a checkpoint that rebuilds the anchor,
+clears the chain, and produces the expected
+`HISTORY_PROJECTION_EPOCH_CHANGED`. Same-state suffix appends remain
+whole-payload append-only.
+
+This CLI is offline and observation-only. It can validate stored arithmetic
+and structural relationships, but its fake provider deliberately reports
+`cacheRead = 0`. Only verified provider usage is cache-hit authority. After
+deployment, use a new live session and subsequent real `cacheRead` values to
+measure reuse; do not claim improvement from the offline benchmark.
+
+The offline doctor exposes the same retained-record facts through
+`history_projection_events` and `explicit_breakpoint_usage`. A complete set of
+verified applied records for eligible public OpenAI GPT-5.6 Responses traffic
+can be `ok`; provider-reported `cacheRead = 0` remains a valid observation, not
+an instrumentation failure. On complete evidence, no applied record for
+default-disabled Codex or unsupported DeepSeek traffic is `skip`, not `fail`.
+Doctor JSON also exposes numeric `erroredEligibleAppliedRequests`. If any
+eligible applied request has `messageStatus = error`, the check is `warn`, its
+usage is excluded from `explicitBreakpointVerifiedUsage`, and neither the text
+nor JSON may describe that failed-request usage as authoritative or OK.
+Partial, corrupt, unreadable, or intentionally truncated evidence makes both
+checks `warn` and the applied-subset ratio `N/A` (`null` in JSON). These
+summaries retain numeric counts and usage only; they do not retain request
+content and cannot prove a cache-hit improvement.
+
+Provider-side operating guidance is documented, not exercised, by this offline
+CLI. OpenAI requires exact prefixes, recommends static content first and
+variable content last, and uses a consistent `prompt_cache_key` for reliable
+GPT-5.6 matching. Each request creates at most four new cache writes, reads from
+up to the latest 50 breakpoint candidates, and should keep traffic near 15
+requests/minute per key; inspect `cached_tokens` and `cache_write_tokens` to
+measure results. Consequently, the workbench's 17 logical anchor/segment
+markers are not 17 new writes per request. See the
+[stable-prefix contract](stable-prefix-contract.md) for primary sources and the
+Commander/worker immutable-anchor, modular-segment, rare-checkpoint rationale.
 
 ## Statistics, reproducibility
 

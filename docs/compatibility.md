@@ -51,6 +51,49 @@ opaque and continue with the latest returned value. Run-log cursors keep the
 changes no tool parameter schema, registration order, mode inventory, or
 tool-schema fingerprint.
 
+Active-history projection has an explicit state-wire transition too. New
+entries use strict `workbench-history-projection-state-v3` with
+`schemaVersion: 3`, a numeric/hash-only record capped at 32 KiB. The 96/64 KiB
+and 128-bundle hard ceilings remain.
+After reserving the 64/48 KiB raw role turn and sixteen 384-byte/one-bundle
+immutable segments, the Commander/worker anchor caps are 26/10 KiB and 96
+bundles; the raw active suffix is capped at 16 bundles. Seals 1–16 preserve the
+epoch and all existing markers/slices, while an attempt to create segment 17
+triggers a checkpoint and increments the epoch.
+
+An exact v3 entry reconstructs every contiguous slice from raw JSONL. The
+newest recognized malformed or structurally unsafe entry is authoritative: a
+Proxy/revoked Proxy or `customType`/`data` accessor fails closed without
+executing traps instead of falling back to older valid state; safely unrelated
+plain entries remain skippable. Strict v1 and v2 are migration input only:
+monotonic epoch and pressure carry forward, but topology and old hashes never
+do. Below the cap, migration preserves raw history and emits one
+`legacy_migration` boundary; its inactive v3 replacement prevents repetition
+after reload.
+
+Inactive v3 also encodes a fixed non-secret failure sentinel inside the
+existing signed fields. It de-duplicates a repeated failure across JSONL
+restore and emits one recovery boundary on the first healthy projection. No
+new wire key is introduced. Projection identity uses exact UTF-16 code units,
+JSON property enumeration order, omitted object `undefined`, and array holes as
+`null`; bounded array/depth/work checks reject Proxies, accessors, and hostile
+or over-budget values without running application code. Boundary marker IDs
+derive only from projected, provider-visible structure. No old session file is
+rewritten, and the nine-field `workbench-context-pressure-v1` diagnostic
+contract is unchanged.
+
+Provider breakpoint fields are a separate capability surface. The public
+OpenAI path is optional and limited to exact `openai-responses` GPT-5.6 traffic
+with an existing `prompt_cache_key`;
+`openai-codex` stays disabled pending successful live SSE and WebSocket probes.
+DeepSeek injection is a strict no-op. OpenAI may create at most four new writes
+per request and read from the latest 50 breakpoint candidates, so the 17
+logical v3 boundaries do not alter the provider wire into 17 writes. Operators
+must keep exact prefixes/cache keys stable, place static content before
+variable content, keep traffic near 15 requests/minute per key, and inspect
+`cached_tokens`/`cache_write_tokens`. These choices do not weaken the segmented
+prefix contract and do not claim a measured provider cache improvement.
+
 The public tool schema/metadata intentionally changes once in 0.10.0. Old
 prompt-cache prefixes are cold after reload; repeated same-mode static
 fingerprints remain deterministic. Internal full `record`, `report`, and
@@ -543,3 +586,7 @@ path (custom entries are read on every `session_start`):
   (DEV) development work; it is not evidence of long-term savings — see
   [docs/cache/P6_BENCHMARK_REPORT.md](../docs/cache/P6_BENCHMARK_REPORT.md)
   Limitations.
+- Offline projection/cache checks cannot guarantee a real provider
+  `cacheRead`; the fake provider deliberately reports zero. After deployment,
+  a new live session and verified subsequent provider usage are required
+  before claiming cache-hit recovery.

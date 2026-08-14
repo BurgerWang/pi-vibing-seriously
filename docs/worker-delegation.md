@@ -476,13 +476,42 @@ blocked calls and history collapse; raw worker/tool text is never telemetry.
 These controls are independent of the per-message context and cumulative
 spend limits below.
 
-History projection is epoch-based. A worker stays raw and append-only until it
-crosses the unchanged 64 KiB or 128-bundle hard limit; the transition projects
-the frozen prefix to the 48 KiB (75%) / 96-bundle low watermark. That projected
-prefix then remains provider-visible and append-only while new raw suffixes are
-added. The next hard crossing starts another expected epoch invalidation.
-Branching or completed compaction resets the frozen boundary; reload restores
-only the strict numeric/hash-only state.
+History projection is segmented and epoch-based. A worker stays raw until it
+crosses the unchanged 65,536-byte or 128-bundle hard limit. Projection-state v3
+reserves its full 49,152-byte raw turn plus sixteen 384-byte/one-bundle segment
+slots, leaving a fixed anchor cap of
+`max(0, 65,536 - 49,152 - 16 * 384) = 10,240` bytes and 96 bundles. The active
+raw suffix is capped at 16 bundles.
+
+At the initial checkpoint the worker keeps the largest latest raw suffix that
+fits those turn limits and projects only the older prefix into the anchor.
+Normal requests replay the exact anchor, immutable ordered segments, and raw
+active suffix. When the active suffix exceeds either reserve, seals 1–16
+project aged material into one new segment (at most 384 tool-text bytes and one
+complete bundle) while keeping the epoch, anchor, every older segment, and
+their safe boundary markers byte-identical. This is an expected tail rewrite,
+not an epoch invalidation. An attempt to create segment 17 triggers a
+checkpoint that rebuilds the anchor, clears the chain, and increments the
+epoch. Branching or completed compaction resets the boundary.
+
+Reload restores only an exact strict v3 numeric/hash state (at most 32 KiB),
+reconstructing every contiguous slice from raw JSONL. Strict v1/v2 entries are
+migration-only and carry monotonic epoch and pressure, never topology or old
+hashes. An under-cap migration leaves raw worker history unchanged, emits one
+`legacy_migration` boundary, and persists inactive v3 so reload cannot repeat
+it. A fixed non-secret failure sentinel also survives JSONL restore: repeated
+failure is de-duplicated and the first healthy request emits one recovery
+boundary.
+
+The newest recognized malformed or structurally unsafe entry is authoritative;
+a Proxy/revoked Proxy or `customType`/`data` accessor fails closed without
+executing traps rather than falling back to older valid state. Worker history
+identity hashes exact UTF-16 code units in JSON property enumeration order,
+omits object `undefined`, and maps array holes/`undefined` to `null`. Bounded
+array/depth/property/work budgets reject hostile, accessor, non-plain, cyclic,
+or over-budget values. The hidden marker after the anchor and each segment
+contains a safe ID derived only from projected/provider-visible structure,
+never raw worker text.
 
 The shared runtime writes a `workbench-context-pressure-v1` custom entry with
 exactly nine numeric/fixed fields (`schema`, `role`, `epoch`, raw/projected
@@ -493,7 +522,25 @@ trigger percentage comes solely from Pi 0.83 `getContextUsage()`, which already
 measures raw session messages; it never adds a raw-minus-projected token delta.
 Worker-role entries are deliberately ignored and never alter the worker's
 independent 80% soft / 90% hard policy. This repository publishes the contract
-but does not install or deploy the companion extension.
+but does not install or deploy the companion extension. Projection-state v3
+does not change the nine-field pressure wire contract and requires no companion
+code change.
+
+DeepSeek worker requests receive no OpenAI-specific breakpoint fields. The
+immutable segmented shape can still increase the exact reusable prefix, but
+that is an architectural benefit rather than a measured cache-hit claim. Only
+verified provider `cacheRead` usage can establish reuse; offline fake-provider
+usage is zero by design.
+
+The same researched design rule applies to Commander and worker: immutable
+fixed anchor, modular immutable segments, and rare checkpoints. Public OpenAI
+GPT-5.6 Responses traffic is independently gated and requires an existing,
+consistent `prompt_cache_key`; Codex remains disabled. OpenAI documents exact
+static-first/variable-last prefixes, no more than four new writes per request,
+the latest 50 breakpoint candidates for reads, and approximately 15
+requests/minute per key, measured through `cached_tokens` and
+`cache_write_tokens`. Thus 17 logical anchor/segment markers do not mean 17 new
+writes. DeepSeek stays automatic/no-op at the field layer.
 
 The pinned worker runs on a 1,000,000-token context window. The workbench
 protects that budget with two thresholds that are model-specific and

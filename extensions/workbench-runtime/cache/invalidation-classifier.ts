@@ -11,9 +11,9 @@
  * Expected vs unexpected (P6-B stable-prefix contract):
  *   - expected invalidation: mode switch, model switch, thinking level
  *     switch, reload, new session, compaction, session-tree navigation,
- *     history-projection epoch transition, first request, provider-side
- *     best-effort miss — normal lifecycle events that legitimately change
- *     the context prefix.
+ *     history-projection epoch transition or immutable segment seal, first
+ *     request, provider-side best-effort miss — normal lifecycle events that
+ *     legitimately change the context prefix.
  *   - UNEXPECTED_DRIFT: the system prompt or the active tool set/order/
  *     schema changed WITHIN the same mode/model/thinking with no explicit
  *     lifecycle event — a sign the context prefix is not stable, which
@@ -28,7 +28,7 @@
  * The P6-A specific reasons (SYSTEM_PROMPT_CHANGED, TOOL_SET_CHANGED,
  * TOOL_ORDER_CHANGED, TOOL_SCHEMA_CHANGED) are kept in INVALIDATION_REASONS
  * so old telemetry records (schemaVersion 1.0) still classify correctly;
- * new records (schemaVersion 1.1) always carry UNEXPECTED_DRIFT plus the
+ * new records (schemaVersion 1.1+) always carry UNEXPECTED_DRIFT plus the
  * `driftSource` detail.
  *
  * Pure logic, no Pi imports.
@@ -49,6 +49,7 @@ export const INVALIDATION_REASONS = [
 	"COMPACTION",
 	"SESSION_TREE_CHANGED",
 	"HISTORY_PROJECTION_EPOCH_CHANGED",
+	"HISTORY_PROJECTION_SEGMENT_SEALED",
 	"CONTEXT_PREFIX_DIVERGED",
 	"PROVIDER_BEST_EFFORT_MISS",
 	"UNKNOWN",
@@ -75,6 +76,7 @@ const EXPECTED_REASONS: ReadonlySet<CacheInvalidationReason> = new Set([
 	"COMPACTION",
 	"SESSION_TREE_CHANGED",
 	"HISTORY_PROJECTION_EPOCH_CHANGED",
+	"HISTORY_PROJECTION_SEGMENT_SEALED",
 	"PROVIDER_BEST_EFFORT_MISS",
 ]);
 
@@ -114,6 +116,8 @@ export interface InvalidationInput {
 	sessionTreeChanged?: boolean;
 	/** An explicit history-projection epoch transition was observed. */
 	historyProjectionEpochChanged?: boolean;
+	/** A new immutable history-projection segment was sealed in the same epoch. */
+	historyProjectionSegmentSealed?: boolean;
 	systemPromptChanged: boolean;
 	toolSetChanged: boolean;
 	toolOrderChanged: boolean;
@@ -151,10 +155,15 @@ export function classifyInvalidation(input: InvalidationInput): InvalidationVerd
 	if (input.packageReloaded) return { reason: "PACKAGE_RELOADED", confidence: "high", driftSource: null };
 	if (input.compactionOccurred) return { reason: "COMPACTION", confidence: "high", driftSource: null };
 	if (input.sessionTreeChanged) return { reason: "SESSION_TREE_CHANGED", confidence: "high", driftSource: null };
-	if (input.historyProjectionEpochChanged) return { reason: "HISTORY_PROJECTION_EPOCH_CHANGED", confidence: "high", driftSource: null };
 	if (input.modelChanged) return { reason: "MODEL_CHANGED", confidence: "high", driftSource: null };
 	if (input.thinkingChanged) return { reason: "THINKING_LEVEL_CHANGED", confidence: "high", driftSource: null };
 	if (input.modeChanged) return { reason: "MODE_CHANGED", confidence: "high", driftSource: null };
+	// Projection events are lower priority than every explicit lifecycle event:
+	// when both are pending, the lifecycle reason wins and the telemetry
+	// observer consumes both one-shot markers together. Within projection
+	// observability, an epoch transition is stronger than a same-epoch seal.
+	if (input.historyProjectionEpochChanged) return { reason: "HISTORY_PROJECTION_EPOCH_CHANGED", confidence: "high", driftSource: null };
+	if (input.historyProjectionSegmentSealed) return { reason: "HISTORY_PROJECTION_SEGMENT_SEALED", confidence: "high", driftSource: null };
 	// P6-B: same-mode drift. The specific source is preserved in driftSource;
 	// the record's headline reason is always UNEXPECTED_DRIFT so reports and
 	// the doctor can count "same-mode mutations" by one stable label.

@@ -13,6 +13,11 @@ import {
 	writeJsonAtomic,
 	type ContextOutputEvidence,
 } from "../scripts/context-output-evidence.ts";
+import {
+	HISTORY_MAX_BUNDLES,
+	HISTORY_PROJECTION_MAX_SEGMENTS,
+	HISTORY_PROJECTION_SEGMENT_MAX_TOOL_TEXT_BYTES,
+} from "../extensions/workbench-runtime/core/context-history-budget.ts";
 import { OUTPUT_HARD_CAPS } from "../extensions/workbench-runtime/core/output-policy.ts";
 
 export const CONTEXT_OUTPUT_STRESS_ARTIFACT = ".pi/workbench/runs/context-output-stress/context-output-evidence.json";
@@ -55,9 +60,9 @@ function isOfflineFakeTelemetryRecord(record: Record<string, unknown>): boolean 
 		&& record.apiKind === "openai-completions"
 		&& usage?.input === 100
 		&& usage.output === 10
-		&& usage.cacheRead === 50
+		&& usage.cacheRead === 0
 		&& usage.cacheWrite === 0
-		&& usage.totalTokens === 160;
+		&& usage.totalTokens === 110;
 }
 
 test("ordinary npm test leaves formal stress disabled and does not touch its evidence artifact", { skip: FORMAL_STRESS }, async () => {
@@ -132,6 +137,57 @@ function assertEvidence(evidence: ContextOutputEvidence): void {
 	assert.equal(diff?.metrics.persisted_read_back, true);
 	assert.equal(diff?.metrics.scope_violation_observed, true);
 	const worker = evidence.scenarios.find((scenario) => scenario.id === "worker-standard-24-turns");
+	const history = evidence.scenarios.find((scenario) => scenario.id === "active-history-100-turns");
+	const roleReserve = history?.metrics.role_reserve as Record<string, Record<string, unknown>> | undefined;
+	for (const role of ["commander", "worker"] as const) {
+		assert.equal(roleReserve?.[role]?.same_epoch_payload_append_only, true, role);
+		assert.equal(roleReserve?.[role]?.fixed_anchor_provider_visible_unchanged, true, role);
+		assert.equal(roleReserve?.[role]?.fixed_anchor_nonempty, true, role);
+		assert.equal(roleReserve?.[role]?.anchor_formula_valid, true, role);
+		assert.equal(roleReserve?.[role]?.segment_seals_before_checkpoint, HISTORY_PROJECTION_MAX_SEGMENTS, role);
+		assert.equal(roleReserve?.[role]?.checkpoint_ordinal, HISTORY_PROJECTION_MAX_SEGMENTS + 1, role);
+		assert.equal(roleReserve?.[role]?.post_checkpoint_segment_seals, 2, role);
+		assert.equal(roleReserve?.[role]?.stable_prior_markers_across_seals, true, role);
+		assert.equal(roleReserve?.[role]?.stable_prior_provider_prefix_across_seals, true, role);
+		assert.equal(roleReserve?.[role]?.segment_caps_valid, true, role);
+		assert.equal(roleReserve?.[role]?.active_caps_valid, true, role);
+		assert.equal(roleReserve?.[role]?.state_within_32k, true, role);
+		assert.equal(roleReserve?.[role]?.state_strict_json_roundtrip, true, role);
+		assert.equal(roleReserve?.[role]?.segment_seals_keep_epoch, true, role);
+		assert.equal(roleReserve?.[role]?.checkpoint_epoch_increment_exactly_one, true, role);
+		assert.equal(roleReserve?.[role]?.checkpoint_epoch_hash_changed, true, role);
+		assert.equal(roleReserve?.[role]?.transition_causes_expected, true, role);
+		assert.equal(roleReserve?.[role]?.latest_complete_aggregate_raw, true, role);
+		assert.equal(roleReserve?.[role]?.pairing_valid, true, role);
+		assert.equal(roleReserve?.[role]?.hard_and_bundle_caps_valid, true, role);
+		assert.ok(Number(roleReserve?.[role]?.max_projected_tool_text_bytes) <= Number(roleReserve?.[role]?.hard_history_bytes), role);
+		assert.ok(Number(roleReserve?.[role]?.max_projected_bundles) <= HISTORY_MAX_BUNDLES, role);
+		assert.equal(
+			Number(roleReserve?.[role]?.segment_reserve_bytes),
+			HISTORY_PROJECTION_MAX_SEGMENTS * HISTORY_PROJECTION_SEGMENT_MAX_TOOL_TEXT_BYTES,
+			role,
+		);
+		assert.equal(
+			Number(roleReserve?.[role]?.anchor_max_bytes),
+			Number(roleReserve?.[role]?.hard_history_bytes)
+				- Number(roleReserve?.[role]?.aggregate_turn_bytes)
+				- Number(roleReserve?.[role]?.segment_reserve_bytes),
+			role,
+		);
+		assert.equal(
+			Number(roleReserve?.[role]?.minimum_reserved_suffix_bytes),
+			Number(roleReserve?.[role]?.aggregate_turn_bytes) + Number(roleReserve?.[role]?.segment_reserve_bytes),
+			role,
+		);
+		assert.ok(Number(roleReserve?.[role]?.state_json_bytes_max) <= 32 * 1_024, role);
+		assert.match(String(roleReserve?.[role]?.fixed_anchor_provider_sha256), /^[0-9a-f]{64}$/, role);
+	}
+	assert.equal(history?.metrics.bundle_cap, 128);
+	assert.equal(history?.metrics.bundle_cap_enforced, true);
+	assert.equal(history?.metrics.fail_closed_hostile_history, true);
+	assert.equal(history?.metrics.cache_invalidation_reason, "HISTORY_PROJECTION_EPOCH_CHANGED");
+	assert.equal(history?.metrics.cache_invalidation_class, "expected");
+	assert.equal(history?.metrics.provider_cache_read_measurement, "not_measured_offline");
 	assert.equal(worker?.metrics.production_read_tool_results, 24);
 	assert.equal(worker?.fixture.source_file_bytes_each, 512 * 1_024);
 	assert.equal(worker?.fixture.total_source_bytes, 24 * 512 * 1_024);
@@ -159,6 +215,18 @@ function assertEvidence(evidence: ContextOutputEvidence): void {
 	assert.equal(worker?.metrics.canonical_progress_one_turn_lag_observed, true);
 	assert.equal(worker?.metrics.final_output_control_observed, true);
 	assert.ok(Number(worker?.metrics.final_collapsed_tool_results) > 0);
+	assert.ok(Number(worker?.metrics.context_pressure_entries) >= 24);
+	assert.equal(worker?.metrics.context_pressure_nine_fields_valid, true);
+	assert.ok(Number(worker?.metrics.history_projection_v3_entries) >= 24);
+	assert.equal(worker?.metrics.history_projection_v3_valid, true);
+	assert.ok(Number(worker?.metrics.maximum_history_projection_state_bytes) <= 32 * 1_024);
+	assert.equal(
+		worker?.metrics.minimum_worker_anchor_reserve_bytes,
+		48 * 1_024 + HISTORY_PROJECTION_MAX_SEGMENTS * HISTORY_PROJECTION_SEGMENT_MAX_TOOL_TEXT_BYTES,
+	);
+	assert.equal(worker?.metrics.latest_completed_bundle_raw, true);
+	assert.equal(worker?.metrics.offline_provider_cache_read_tokens, 0);
+	assert.equal(worker?.metrics.real_provider_cache_read_measured, false);
 	assert.equal(worker?.metrics.source_files_unchanged, true);
 	assert.equal(evidence.metrics.compaction_count, 0);
 	assert.deepEqual(evidence.metrics.worker, { success: true, failure_reason: "none" });

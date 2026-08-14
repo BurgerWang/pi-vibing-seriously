@@ -789,6 +789,7 @@ import {
 	safeHistoryProjectionFailureMessages,
 	type HistoryProjectionFacts,
 } from "./core/context-history-budget.ts";
+import { applyExplicitPromptCacheBreakpoints } from "./core/prompt-cache-breakpoints.ts";
 import {
 	blockedControlText,
 	createTurnOutputBudgetState,
@@ -1439,7 +1440,13 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		protectedLatestBundles: 0,
 	};
 	const historyProjectionController = new HistoryProjectionController();
-	let latestHistoryPressure = {
+	let latestHistoryProjectionBoundaryMarkers: readonly string[] = [];
+	let latestHistoryPressure: {
+		epoch: number;
+		rawBundleCount: number;
+		hardHistoryBytes: number;
+		hardBundleCount: number;
+	} = {
 		epoch: 0,
 		rawBundleCount: 0,
 		hardHistoryBytes: OTHER_HISTORY_TOOL_TEXT_MAX_BYTES,
@@ -1505,6 +1512,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 
 	function resetHistoryProjection(): void {
 		historyProjectionController.reset();
+		latestHistoryProjectionBoundaryMarkers = [];
 		latestHistoryProjectionFacts = {
 			originalToolTextBytes: 0,
 			finalToolTextBytes: 0,
@@ -2289,6 +2297,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		// /reload all reach this handler via session_start); /new starts a
 		// fresh session file, so it falls back to the DEV default.
 		const entries = ctx.sessionManager.getEntries();
+		latestHistoryProjectionBoundaryMarkers = [];
 		mode = loadModeFromEntries(entries);
 		compactState = loadCompactStateFromEntries(entries, mode);
 		// P7: restore the delegation review lifecycle and the commander write
@@ -2570,6 +2579,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				role,
 			});
 			latestHistoryProjectionFacts = { ...projection.facts };
+			latestHistoryProjectionBoundaryMarkers = projection.boundaryMarkers.map((boundary) => boundary.marker);
 			latestHistoryPressure = {
 				epoch: projection.epoch,
 				rawBundleCount: projection.rawBundleCount,
@@ -2583,6 +2593,8 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			}, role);
 			if (projection.epochTransitioned && projection.epochHash) {
 				cacheTelemetry.observeHistoryProjectionEpoch(projection.epochHash);
+			} else if (projection.segmentSealed && projection.segmentChainHash) {
+				cacheTelemetry.observeHistoryProjectionSegmentSeal(projection.segmentChainHash);
 			}
 			mirrorOutputControlCompactFacts();
 			return { messages: projection.messages };
@@ -2592,6 +2604,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			// Pi falls back to raw context if this handler throws, so the terminal
 			// catch path must be fixed, bounded, and independently no-throw.
 			const messages = safeHistoryProjectionFailureMessages();
+			latestHistoryProjectionBoundaryMarkers = [];
 			latestHistoryProjectionFacts = {
 				originalToolTextBytes: 0,
 				finalToolTextBytes: 0,
@@ -2615,12 +2628,26 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		}
 	});
 
-	// READ-ONLY structural peek: the payload is never replaced, mutated or
-	// stored — only a structural digest (roles, lengths, per-segment hashes,
-	// tool names) is kept in memory for contextShapeHash classification.
-	pi.on("before_provider_request", (event) => {
-		cacheTelemetry.observePayload(event.payload);
-		return undefined;
+	// Apply exact, core-proven immutable cache boundaries only for the public
+	// OpenAI GPT-5.6 Responses path. The helper is copy-on-write and fails
+	// closed to the original payload for every unsupported/uncertain shape;
+	// Codex stays experimentally disabled and DeepSeek remains identity-exact.
+	// Telemetry observes the actual outgoing replacement, never the pre-transform
+	// payload, and retains only its structural digest.
+	pi.on("before_provider_request", (event, ctx) => {
+		const breakpointResult = applyExplicitPromptCacheBreakpoints({
+			payload: event.payload,
+			provider: ctx.model?.provider ?? "",
+			api: ctx.model?.api ?? "",
+			modelId: ctx.model?.id ?? "",
+			allowCodexExperimental: false,
+			expectedMarkerTexts: latestHistoryProjectionBoundaryMarkers,
+		});
+		cacheTelemetry.observePayload(breakpointResult.payload);
+		if (breakpointResult.status === "applied" || breakpointResult.reason === "already_applied") {
+			cacheTelemetry.observeExplicitPromptCacheBreakpointsApplied();
+		}
+		return breakpointResult.payload;
 	});
 
 	// The first message_end handler plans assistant batches before Pi starts
