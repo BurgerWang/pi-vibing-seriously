@@ -2,6 +2,7 @@ import { types as utilTypes } from "node:util";
 
 import { DETAILS_MAX_BYTES } from "./output-policy.ts";
 import type { OutputEnvelopeFacts, OutputEnvelopeReason } from "./output-envelope.ts";
+import type { ToolResultIngressProjectionMetadata } from "./tool-result-ingress-projection.ts";
 
 /** A session-safe projection of one tool result's details payload. */
 export interface DetailsProjectionResult {
@@ -25,6 +26,7 @@ export interface ProjectToolResultDetailsInput {
 	details: unknown;
 	envelope: OutputEnvelopeFacts;
 	receipt?: BoundedReceiptFacts;
+	ingressProjection?: ToolResultIngressProjectionMetadata;
 }
 
 const MAX_DEPTH = 4;
@@ -34,7 +36,7 @@ const MAX_STRING_BYTES = 512;
 const MAX_KEY_BYTES = 128;
 const OBJECT_OMITTED_KEY = "details_projection_omitted_keys";
 
-const SECURITY_KEYS = new Set(["output_envelope", "receipt"]);
+const SECURITY_KEYS = new Set(["output_envelope", "receipt", "ingress_projection"]);
 const FORBIDDEN_KEYS = new Set([
 	"record",
 	"gates_full",
@@ -54,6 +56,16 @@ const POLICY_IDS = new Set([
 const ENVELOPE_REASONS = new Set<OutputEnvelopeReason | string>([
 	"none", "per-tool-cap", "turn-reservation", "runtime-failure",
 ]);
+const INGRESS_SOURCE_KINDS = new Set([
+	"finalized_recipe_run", "executed_gate_run", "immutable_comparison",
+	"completed_worker_report", "finalized_run_page", "run_id_gate_page",
+]);
+const INGRESS_METADATA_FIELDS = [
+	"schema", "sourceKind", "sourcePath", "sourceIdentityKind", "sourceIdentityHash",
+	"authorityHash", "projectionHash", "originalBytes", "projectedBytes", "bodyShownBytes",
+	"omittedBytes", "budgetBytes", "requiredFactCount",
+] as const;
+const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
 const TRUSTED_BUILTIN_TOOL_NAMES = new Set(["bash", "edit", "write"]);
 /** Bash's nested native DTO excludes `content`: model-visible content is already bounded separately. */
@@ -462,6 +474,72 @@ function normalizeReceipt(value: BoundedReceiptFacts | undefined, state: Sanitiz
 	return output;
 }
 
+function normalizeIngressProjection(
+	value: ToolResultIngressProjectionMetadata | undefined,
+	state: SanitizeState,
+): Record<string, unknown> | undefined {
+	if (value === undefined) return undefined;
+	const descriptors = descriptorsOf(value);
+	const keys = Object.keys(descriptors);
+	if (keys.length !== INGRESS_METADATA_FIELDS.length
+		|| keys.some((key) => !INGRESS_METADATA_FIELDS.includes(key as (typeof INGRESS_METADATA_FIELDS)[number]))) {
+		state.truncated = true;
+		return undefined;
+	}
+	for (const field of INGRESS_METADATA_FIELDS) {
+		const descriptor = descriptors[field];
+		if (!descriptor || descriptor.enumerable !== true || !Object.prototype.hasOwnProperty.call(descriptor, "value")) {
+			state.truncated = true;
+			return undefined;
+		}
+	}
+	const schema = ownData(value, "schema");
+	const sourceKind = ownData(value, "sourceKind");
+	const sourcePath = ownData(value, "sourcePath");
+	const sourceIdentityKind = ownData(value, "sourceIdentityKind");
+	const sourceIdentityHash = ownData(value, "sourceIdentityHash");
+	const authorityHash = ownData(value, "authorityHash");
+	const projectionHash = ownData(value, "projectionHash");
+	const originalBytes = ownData(value, "originalBytes");
+	const projectedBytes = ownData(value, "projectedBytes");
+	const bodyShownBytes = ownData(value, "bodyShownBytes");
+	const omittedBytes = ownData(value, "omittedBytes");
+	const budgetBytes = ownData(value, "budgetBytes");
+	const requiredFactCount = ownData(value, "requiredFactCount");
+	if (schema !== "workbench-tool-result-ingress-metadata-v1"
+		|| typeof sourceKind !== "string" || !INGRESS_SOURCE_KINDS.has(sourceKind)
+		|| typeof sourcePath !== "string" || utf8Bytes(sourcePath) > 512 || sourcePath.length === 0
+		|| sourcePath.startsWith("/") || sourcePath.includes("\\") || !sourcePath.startsWith(".pi/workbench/")
+		|| (sourceIdentityKind !== "digest" && sourceIdentityKind !== "snapshot")
+		|| typeof sourceIdentityHash !== "string" || !SHA256_PATTERN.test(sourceIdentityHash)
+		|| typeof authorityHash !== "string" || !SHA256_PATTERN.test(authorityHash)
+		|| typeof projectionHash !== "string" || !SHA256_PATTERN.test(projectionHash)
+		|| !Number.isSafeInteger(originalBytes) || (originalBytes as number) < 0
+		|| !Number.isSafeInteger(projectedBytes) || (projectedBytes as number) < 0 || (projectedBytes as number) > 4_096
+		|| !Number.isSafeInteger(bodyShownBytes) || (bodyShownBytes as number) < 0 || (bodyShownBytes as number) > (originalBytes as number)
+		|| !Number.isSafeInteger(omittedBytes) || (omittedBytes as number) !== (originalBytes as number) - (bodyShownBytes as number)
+		|| budgetBytes !== 4_096
+		|| !Number.isSafeInteger(requiredFactCount) || (requiredFactCount as number) < 1 || (requiredFactCount as number) > 16) {
+		state.truncated = true;
+		return undefined;
+	}
+	return {
+		schema,
+		sourceKind,
+		sourcePath,
+		sourceIdentityKind,
+		sourceIdentityHash,
+		authorityHash,
+		projectionHash,
+		originalBytes,
+		projectedBytes,
+		bodyShownBytes,
+		omittedBytes,
+		budgetBytes,
+		requiredFactCount,
+	};
+}
+
 function arrayFacts(value: unknown[], state: SanitizeState): ArrayProjectionFacts {
 	const recorded = state.arrayFacts.get(value);
 	if (recorded) return recorded;
@@ -584,11 +662,13 @@ function mergeBounded(
 	ordinary: Record<string, unknown>,
 	envelope: Record<string, unknown>,
 	receipt: Record<string, unknown> | undefined,
+	ingressProjection: Record<string, unknown> | undefined,
 	state: SanitizeState,
 ): DetailsProjectionResult {
 	const security: Record<string, unknown> = {};
 	defineData(security, "output_envelope", envelope);
 	if (receipt) defineData(security, "receipt", receipt);
+	if (ingressProjection) defineData(security, "ingress_projection", ingressProjection);
 	const attachSecurity = (candidate: Record<string, unknown>): Record<string, unknown> => {
 		const combined: Record<string, unknown> = {};
 		for (const [key, value] of Object.entries(candidate)) {
@@ -611,32 +691,40 @@ function mergeBounded(
 	return { details: accepted, serializedBytes, truncated: state.truncated };
 }
 
-function failureProjection(envelope: Record<string, unknown>, receipt: Record<string, unknown> | undefined): DetailsProjectionResult {
+function failureProjection(
+	envelope: Record<string, unknown>,
+	receipt: Record<string, unknown> | undefined,
+	ingressProjection: Record<string, unknown> | undefined,
+): DetailsProjectionResult {
 	const details: Record<string, unknown> = {
 		details_projection: { available: false, code: "projection_error" },
 		output_envelope: envelope,
 		...(receipt ? { receipt } : {}),
+		...(ingressProjection ? { ingress_projection: ingressProjection } : {}),
 	};
 	return { details, serializedBytes: utf8Bytes(JSON.stringify(details)), truncated: true };
 }
 
 /**
  * Project one live tool-result details object into the bounded session DTO.
- * Ordinary details can never provide output_envelope or receipt facts: those
- * fields are rebuilt solely from the separately supplied trusted arguments.
+ * Ordinary details can never provide output_envelope, receipt, or
+ * ingress_projection facts: those fields are rebuilt solely from the
+ * separately supplied trusted arguments.
  */
 export function projectToolResultDetails(input: ProjectToolResultDetailsInput): DetailsProjectionResult {
 	const state = createSanitizeState();
 	let envelope: Record<string, unknown> = normalizeEnvelope({} as OutputEnvelopeFacts, state);
 	let receipt: Record<string, unknown> | undefined;
+	let ingressProjection: Record<string, unknown> | undefined;
 	try {
 		envelope = normalizeEnvelope(input.envelope, state);
 		receipt = normalizeReceipt(input.receipt, state);
+		ingressProjection = normalizeIngressProjection(input.ingressProjection, state);
 		const toolName = typeof input.toolName === "string" ? utf8Prefix(input.toolName, MAX_STRING_BYTES) : "";
 		const ordinary = rootProjection(toolName, input.details, state);
-		return mergeBounded(ordinary, envelope, receipt, state);
+		return mergeBounded(ordinary, envelope, receipt, ingressProjection, state);
 	} catch {
-		return failureProjection(envelope, receipt);
+		return failureProjection(envelope, receipt, ingressProjection);
 	}
 }
 

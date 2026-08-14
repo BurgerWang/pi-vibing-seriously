@@ -1,5 +1,75 @@
 # Changelog
 
+## [Unreleased] — Cache-prefix P0–P2
+
+This section describes working-tree changes only. It does not claim a commit,
+deployment, tag, package publish, or measured provider cache improvement.
+
+### Added
+
+- Strict cache-telemetry schema 1.3 correlates one context projection, one
+  local `before_provider_request` observation, and one assistant
+  `message_end`. Correlation code `1` is exact; codes `0`/`2`/`3`
+  (unwired/multiple-or-stale-or-invalid/missing) fail closed to unknown actor
+  and `historyProjection: null`.
+- Numeric-only projection anatomy covers event/cause, hard caps, overflow at
+  the decision, segment counts, raw/projected totals, stable/active slices,
+  aged material, and retained suffix. The local wire observation always has
+  `finalityCode: 0`: it is not an observation of the final provider wire.
+- Trusted recoverable ingress covers exactly finalized recipe summaries,
+  executed gate records, immutable comparisons, completed worker reports,
+  finalized run pages, and run-id gate pages. Text at or below 4 KiB remains
+  byte-exact with bounded metadata; larger text receives a deterministic 4 KiB
+  recovery wrapper, and a low allocation falls back to the ordinary envelope
+  over the original result without stale wrapper metadata. Allocation-aware
+  gate pagination preserves every semantic row and cursor position.
+- Durable ingress authority hashes source content and binds it to the stable
+  size/device/inode/`mtimeNs`/`ctimeNs` snapshot of an in-project regular file
+  no larger than 4 MiB. Collapsed history prefers this durable source pointer
+  over receipt summaries. The same mechanism serves Commander, worker, and
+  other roles; only their surrounding budgets differ.
+- Reports and the offline benchmark expose whole-item LCP facts, separate
+  Commander/worker cohorts, and disjoint prompt-input shares:
+  `cacheRead / (input + cacheRead + cacheWrite)` and, only when its semantics
+  are available, `cacheWrite / (input + cacheRead + cacheWrite)`. Numeric
+  quality codes distinguish complete 1.3 evidence, mixed legacy data, partial
+  or bounded sources, unverified usage, and unavailable/unverified write
+  semantics. Responses write status `2` means normalized absence-or-zero—not
+  provider-presence verification. Status `7` (`aggregate_overflow`) means the
+  exact aggregate exceeds the safe numeric publication surface, so both shares
+  remain `null`.
+- Schema 1.3 validates the complete event/cause/overflow/segment matrix.
+  Impossible projection anatomy degrades correlation to unknown rather than
+  being persisted as actor evidence. Cache doctor also treats hostile or
+  uninspectable telemetry objects as partial evidence without invoking Proxy
+  traps or accessors.
+
+### Changed
+
+- Crossing the 64/48 KiB turn reserve or 16-bundle suffix target alone no
+  longer seals history. Under the unchanged Commander/worker hard caps
+  (96/64 KiB and 128 bundles), history stays byte-identical. Only a true hard
+  byte or bundle crossing selects the protected suffix and seals aged
+  material.
+- At most 16 immutable segments remain in one epoch. A later true hard crossing
+  performs the deterministic, model-free safety checkpoint: rebuild the
+  anchor, clear the segment chain, and advance the epoch. Role hard caps and
+  failure/recovery behavior are unchanged.
+- The cache-design audit now records which principles were borrowed from
+  [DeepSeek Harness at pinned commit `47f943859bef60e4160492346772ded9b24f765a`](https://github.com/deepseek-ai/deepseek-harness/tree/47f943859bef60e4160492346772ded9b24f765a):
+  preserve an append-only reusable prefix, keep dynamic material late, and
+  separate model-visible summaries from durable evidence. Provider MLA,
+  server scheduling, and disk-KV ownership are explicitly non-transferable to
+  this Pi client; no harness number is a workbench benchmark promise.
+
+### Blocked
+
+- Warm-prefix auxiliary compaction is
+  `BLOCKED_BY_PI_0_83_PUBLIC_API`. Pi 0.83 has no public post-summary payload
+  transform or same-cache-domain guarantee, so the workbench does not duplicate
+  private authentication, headers, streaming, retry, or provider-call logic.
+  Built-in/native Pi compaction remains unchanged.
+
 ## [0.10.0] — Context Output Control Plane
 
 ### Added

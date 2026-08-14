@@ -39,6 +39,7 @@ import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import {
 	buildCacheReport,
 	type CacheReport,
+	type CacheObservabilityReport,
 	type ExplicitBreakpointVerifiedUsage,
 } from "../extensions/workbench-runtime/cache/cache-report.ts";
 import { runDoctor, renderDoctor, doctorToJson, type DoctorFacts } from "../extensions/workbench-runtime/cache/cache-doctor.ts";
@@ -347,6 +348,8 @@ export interface BenchmarkReport {
 		actionRecords: number;
 	};
 	requestCount: number;
+	schema13Rows: number;
+	observability: CacheObservabilityReport | null;
 	uncachedInputTokens: number;
 	cacheReadTokens: number;
 	outputTokens: number;
@@ -448,6 +451,8 @@ export async function buildBenchmarkReport(input: BenchmarkInput): Promise<Bench
 			actionRecords: actionCache.records,
 		},
 		requestCount: report.requestCount,
+		schema13Rows: report.schema13Rows,
+		observability: report.observability,
 		uncachedInputTokens: report.totals.input,
 		cacheReadTokens: report.totals.cacheRead,
 		outputTokens: report.totals.output,
@@ -541,6 +546,19 @@ export function renderBenchmarkReport(report: BenchmarkReport): string[] {
 		`data quality    : ${qualityLabel}; bounded oldest omitted=${report.truncatedTelemetryRecords}`,
 		`run manifests   : ${report.sources.runManifests} (action records: ${report.sources.actionRecords})`,
 	];
+	const observed = report.observability;
+	lines.push(`schema 1.3      : rows=${report.schema13Rows} observed=${observed === null ? 0 : 1}`);
+	if (observed !== null) {
+		lines.push(
+			`request correlation: unwired=${observed.correlationCounts.unwired} exact=${observed.correlationCounts.exact} multiple-or-stale=${observed.correlationCounts.multipleOrStale} missing=${observed.correlationCounts.missing}`,
+			`local wire observation: requests=${observed.localObservedRequests} nonfinal=${observed.nonFinalObservedRequests} finalityCode=0`,
+			`whole-item LCP  : eligible=${observed.wholeItemLcp.eligibleRequests} items=${observed.wholeItemLcp.itemCount} utf8Bytes=${observed.wholeItemLcp.utf8Bytes}`,
+			`projection overflow: byte=${observed.projection.byteOverflowRequests} bundle=${observed.projection.bundleOverflowRequests}`,
+			`v1.3 usage shares: read=${pct(observed.retainedWindowUsage.cacheReadShare)} readStatusCode=${observed.retainedWindowUsage.cacheReadShareStatusCode} write=${pct(observed.retainedWindowUsage.cacheWriteShare)} writeStatusCode=${observed.retainedWindowUsage.cacheWriteShareStatusCode}`,
+			`actor cohorts   : unknown=${observed.actorCohorts.unknown.requestCount} commander=${observed.actorCohorts.commander.requestCount} worker=${observed.actorCohorts.worker.requestCount}`,
+			`projection cohorts: segmentSeal=${observed.projectionCohorts.segmentSeal.requestCount} epochTransition=${observed.projectionCohorts.epochTransition.requestCount}`,
+		);
+	}
 	return lines;
 }
 

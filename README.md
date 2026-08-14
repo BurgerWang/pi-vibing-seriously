@@ -177,23 +177,50 @@ history.
 | Active-history bundles | 128 complete assistant/tool-result bundles |
 | Details value / streaming update | 8 KiB / 4 KiB |
 
-Projection-state v3 reserves the current raw turn before freezing history. Its
-anchor byte cap is
+The P0–P2 refinements below are **Unreleased working-tree behavior**; this page
+does not claim that they are committed, installed, or deployed.
+
+Trusted tool-result ingress now applies to exactly six finalized durable
+sources: recipe summaries, executed gate records, immutable comparisons,
+completed worker reports, finalized run pages, and run-id gate pages. For a
+trusted text result at or below 4,096 UTF-8 bytes, provider-visible content
+stays byte-exact and only bounded recovery metadata is attached. Larger
+results use one deterministic recovery wrapper capped at 4,096 bytes. If the
+turn allocation or final envelope cannot preserve that candidate, the runtime
+re-applies the ordinary bounded envelope to the original result and removes
+both the wrapper and its metadata. Gate pages render against the call's real
+allocation before advancing their cursor, so pagination never skips semantic
+rows that were not shown.
+
+Authority is role-neutral: Commander, worker, and other roles use the same
+content-bound path and differ only in their outer turn/history budgets. A
+durable source of at most 4 MiB is opened as a regular in-project file and
+bound to its SHA-256 content plus size/device/inode/`mtimeNs`/`ctimeNs` stable
+snapshot; symlinks, path escape, mutation, missing files, and oversized files
+receive no trusted authority. Later history collapse strictly validates the
+metadata and prefers the durable source path over a receipt-summary fallback.
+
+Projection-state v3 uses one role turn and 16 one-bundle segment slots to size
+the fixed anchor. Its anchor byte cap is
 `max(0, hard tool text - role turn - 16 * 384)`: **26 KiB for Commander**
 (`96 KiB - 64 KiB - 6 KiB`) and **10 KiB for worker/other**
 (`64 KiB - 48 KiB - 6 KiB`). The anchor holds at most 96 bundles; the active
-raw suffix holds at most 16. Up to 16 immutable segments may follow the anchor,
-each projecting no more than 384 UTF-8 tool-text bytes and one complete bundle.
+suffix target is at most 16 bundles once a hard-limit projection is required.
+Up to 16 immutable segments may follow the anchor, each projecting no more
+than 384 UTF-8 tool-text bytes and one complete bundle.
 
 Normal requests replay the exact anchor, ordered segments, and raw active
-suffix. When the active suffix exceeds its role turn or 16-bundle reserve, the
-controller seals aged material once: seals 1–16 append a new immutable segment,
-keep the epoch and every older boundary byte-identical, and are an expected
-tail rewrite. An attempt to create segment 17 instead triggers a checkpoint
-that rebuilds the anchor, clears the segment chain, and increments the epoch.
-Deterministic hidden boundary markers expose safe IDs derived only from
-provider-visible structure, never raw secret hashes. Invalid tool pairing still
-fails closed.
+suffix. Crossing only the turn or 16-bundle reserve does **not** seal or rewrite
+an under-cap request. The controller acts only when the complete reconstructed
+history crosses the unchanged 96/64 KiB or 128-bundle hard ceiling; at that
+decision it keeps the largest complete raw suffix that fits the reserve and
+seals aged material once. Seals 1–16 append a new immutable segment, keep the
+epoch and every older boundary byte-identical, and are an expected tail
+rewrite. A hard crossing that would create segment 17 instead triggers a
+model-free deterministic checkpoint: rebuild the anchor, clear the segment
+chain, and increment the epoch. Deterministic hidden boundary markers expose
+safe IDs derived only from provider-visible structure, never raw secret
+hashes. Invalid tool pairing still fails closed.
 
 Strict v1/v2 records are migration input only: they carry forward monotonic
 epoch and nine-field pressure diagnostics, never old topology or hashes. An
@@ -230,6 +257,26 @@ current telemetry. Corrupt/unreadable sources make the aggregate ratio N/A.
 `/q-cache-doctor` uses the same oldest-archive-to-current bounded window and
 suppresses clean/no-drift conclusions whenever sources are partial, corrupt,
 unavailable, or intentionally truncated.
+Unreleased schema 1.3 adds strict request correlation and content-free
+projection anatomy. Its `before_provider_request` digest is explicitly a local
+`finalityCode=0` observation—not the final provider wire—and prefix comparison
+uses whole-item LCP only. Reports keep cache-read and cache-write shares
+disjoint, attach numeric quality/status codes, and split Commander and worker
+cohorts; non-exact correlation is fail-closed to an unknown actor with no
+projection facts. Event/cause/overflow/segment combinations are validated as
+one strict semantic matrix rather than independent numbers. Aggregate status
+code `7` means an exact token sum exceeded the safe numeric publication
+surface; both shares are then `null`, never saturated into a ratio. Cache
+doctor treats Proxy/accessor/symbol/exotic telemetry as uninspectable partial
+evidence without invoking application code.
+
+Warm-prefix auxiliary compaction is intentionally not implemented and is
+recorded as `BLOCKED_BY_PI_0_83_PUBLIC_API`: Pi 0.83 exposes pre-compaction
+cancel/replace-summary control but no post-summary payload transform or
+same-cache-domain guarantee. The workbench does not reimplement private
+authentication, headers, streaming, or retries. Pi's built-in/native
+compaction behavior remains unchanged.
+
 The formal stress recipe writes fake-provider telemetry only to its temporary
 project and verifies repository telemetry hashes are unchanged.
 

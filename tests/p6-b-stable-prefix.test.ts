@@ -48,6 +48,7 @@ import {
 import {
 	classifyPayloadRelationship,
 	fingerprintTools,
+	wholeItemLcpFacts,
 	summarizePayload,
 	type ToolInfoLike,
 } from "../extensions/workbench-runtime/cache/prompt-fingerprint.ts";
@@ -827,6 +828,55 @@ test("payload relationship distinguishes unchanged, append-only, rewritten, and 
 	assert.equal(classifyPayloadRelationship(base, summarizePayload(null)), "UNKNOWN");
 	assert.ok(!JSON.stringify(base).includes("stable system"), "summary keeps only lengths and hashes");
 	assert.ok(!JSON.stringify(base).includes("first request"), "summary never retains message content");
+});
+
+test("provider observation reports only whole-item LCP count and UTF-8 scalar bytes", () => {
+	const first = { role: "user", content: "A🙂" };
+	const base = summarizePayload({ messages: [first] });
+	const appended = summarizePayload({ messages: [first, { role: "assistant", content: "next" }] });
+	const partiallyRewritten = summarizePayload({ messages: [{ role: "user", content: "A🙃" }] });
+
+	assert.deepEqual(wholeItemLcpFacts(base, appended), {
+		itemCount: 2,
+		itemLcpCount: 1,
+		itemLcpUtf8Bytes: 9,
+		relationship: "APPEND_ONLY",
+	});
+	assert.deepEqual(wholeItemLcpFacts(base, partiallyRewritten), {
+		itemCount: 1,
+		itemLcpCount: 0,
+		itemLcpUtf8Bytes: 0,
+		relationship: "PREFIX_REWRITTEN",
+	}, "a shared text prefix never becomes a fabricated partial-item LCP");
+	assert.equal(JSON.stringify(base).includes("A🙂"), false, "byte accounting retains no provider text");
+});
+
+test("provider observation treats object key order and __proto__ as wire-significant", () => {
+	const ordered = { alpha: "A", beta: "B" };
+	const reordered = { beta: "B", alpha: "A" };
+	assert.notEqual(JSON.stringify(ordered), JSON.stringify(reordered), "the provider wire preserves enumerable key order");
+	const base = summarizePayload({ messages: [{ role: "user", content: "same", metadata: ordered }] });
+	const keyOrderRewrite = summarizePayload({ messages: [{ role: "user", content: "same", metadata: reordered }] });
+	assert.deepEqual(wholeItemLcpFacts(base, keyOrderRewrite), {
+		itemCount: 1,
+		itemLcpCount: 0,
+		itemLcpUtf8Bytes: 0,
+		relationship: "PREFIX_REWRITTEN",
+	});
+
+	const emptyMetadata = Object.create(null) as Record<string, unknown>;
+	const protoMetadata = Object.create(null) as Record<string, unknown>;
+	Object.defineProperty(protoMetadata, "__proto__", {
+		value: "provider-visible",
+		enumerable: true,
+		configurable: true,
+		writable: true,
+	});
+	assert.notEqual(JSON.stringify(emptyMetadata), JSON.stringify(protoMetadata));
+	const withoutProtoKey = summarizePayload({ messages: [{ role: "user", content: "same", metadata: emptyMetadata }] });
+	const withProtoKey = summarizePayload({ messages: [{ role: "user", content: "same", metadata: protoMetadata }] });
+	assert.equal(classifyPayloadRelationship(withoutProtoKey, withProtoKey), "PREFIX_REWRITTEN");
+	assert.equal(wholeItemLcpFacts(withoutProtoKey, withProtoKey).itemLcpCount, 0);
 });
 
 test("payload relationship hashes complete items, including part types, images, scalar structure, and tool calls", () => {

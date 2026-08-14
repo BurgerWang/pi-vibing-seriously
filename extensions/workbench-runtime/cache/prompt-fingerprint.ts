@@ -86,6 +86,8 @@ export interface PayloadSummary {
 	itemRoles: string[];
 	/** Canonical hash of each complete provider-visible item, in order. */
 	itemHashes: string[];
+	/** UTF-8 bytes of string scalar values in each complete item. */
+	itemUtf8Bytes: number[];
 	toolCount: number;
 	/** Tool names in payload order. */
 	toolNames: string[];
@@ -120,6 +122,7 @@ export function summarizePayload(payload: unknown): PayloadSummary {
 		topLevelFields: [],
 		itemRoles: [],
 		itemHashes: [],
+		itemUtf8Bytes: [],
 		toolCount: 0,
 		toolNames: [],
 		toolSchemaHash: canonicalHash([]),
@@ -169,6 +172,7 @@ export function summarizePayload(payload: unknown): PayloadSummary {
 					break;
 				}
 				summary.itemHashes.push(canonicalHash(digest.value));
+				summary.itemUtf8Bytes.push(digest.stringBytes);
 				summary.itemRoles.push(itemKind(item.value));
 			}
 		}
@@ -214,17 +218,17 @@ interface DigestBudget {
 	seen: WeakSet<object>;
 }
 
-type DigestResult = { ok: true; value: unknown } | { ok: false };
+type DigestResult = { ok: true; value: unknown; stringBytes: number } | { ok: false };
 
 function digestProviderValue(value: unknown, budget: DigestBudget, depth: number): DigestResult {
 	budget.nodes += 1;
 	if (budget.nodes > MAX_DIGEST_NODES || depth > MAX_DIGEST_DEPTH) return { ok: false };
-	if (value === null || typeof value === "boolean") return { ok: true, value };
-	if (typeof value === "number") return Number.isFinite(value) ? { ok: true, value } : { ok: false };
+	if (value === null || typeof value === "boolean") return { ok: true, value, stringBytes: 0 };
+	if (typeof value === "number") return Number.isFinite(value) ? { ok: true, value, stringBytes: 0 } : { ok: false };
 	if (typeof value === "string") {
 		const bytes = Buffer.byteLength(value, "utf8");
 		if (bytes > MAX_DIGEST_STRING_BYTES) return { ok: false };
-		return { ok: true, value: { scalar: "string", bytes, sha256: sha256Hex(value) } };
+		return { ok: true, value: { scalar: "string", bytes, sha256: sha256Hex(value) }, stringBytes: bytes };
 	}
 	if (typeof value !== "object" || value === undefined) return { ok: false };
 	if (budget.seen.has(value)) return { ok: false };
@@ -233,31 +237,42 @@ function digestProviderValue(value: unknown, budget: DigestBudget, depth: number
 		if (Array.isArray(value)) {
 			if (value.length > MAX_DIGEST_ARRAY_ITEMS) return { ok: false };
 			const digested: unknown[] = [];
+			let stringBytes = 0;
 			for (let index = 0; index < value.length; index += 1) {
 				const item = ownArrayDataValue(value, index);
 				if (!item.ok) return item;
 				const nested = digestProviderValue(item.value, budget, depth + 1);
 				if (!nested.ok) return nested;
 				digested.push(nested.value);
+				stringBytes += nested.stringBytes;
+				if (!Number.isSafeInteger(stringBytes)) return { ok: false };
 			}
-			return { ok: true, value: digested };
+			return { ok: true, value: digested, stringBytes };
 		}
 		if (!isRecord(value)) return { ok: false };
 		const prototype = Object.getPrototypeOf(value);
 		if (prototype !== Object.prototype && prototype !== null) return { ok: false };
 		if (Object.getOwnPropertySymbols(value).length > 0) return { ok: false };
 		const descriptors = Object.getOwnPropertyDescriptors(value);
-		const keys = Object.keys(descriptors).sort();
+		// JSON wire serialization follows Object.keys enumeration order and
+		// omits non-enumerable properties. Preserve that exact order in an
+		// array: canonicalHash deliberately sorts object keys, so rebuilding a
+		// plain object here would erase a provider-visible prefix change. The
+		// ordered tuple form also avoids `__proto__` assignment semantics.
+		const keys = Object.keys(value);
 		if (keys.length > MAX_DIGEST_OBJECT_KEYS) return { ok: false };
-		const digested: Record<string, unknown> = {};
+		const entries: Array<readonly [string, unknown]> = [];
+		let stringBytes = 0;
 		for (const key of keys) {
 			const descriptor = descriptors[key];
 			if (!descriptor || !("value" in descriptor) || descriptor.get !== undefined || descriptor.set !== undefined) return { ok: false };
 			const nested = digestProviderValue(descriptor.value, budget, depth + 1);
 			if (!nested.ok) return nested;
-			digested[key] = nested.value;
+			entries.push([key, nested.value]);
+			stringBytes += nested.stringBytes;
+			if (!Number.isSafeInteger(stringBytes)) return { ok: false };
 		}
-		return { ok: true, value: digested };
+		return { ok: true, value: { scalar: "object", entries }, stringBytes };
 	} finally {
 		budget.seen.delete(value);
 	}
@@ -350,4 +365,42 @@ export function classifyPayloadRelationship(
 		return "APPEND_ONLY";
 	}
 	return "PREFIX_REWRITTEN";
+}
+
+export interface WholeItemLcpFacts {
+	itemCount: number;
+	itemLcpCount: number;
+	itemLcpUtf8Bytes: number;
+	relationship: PayloadRelationship;
+}
+
+/**
+ * Compare only complete provider-visible items. Byte accounting is the sum
+ * of UTF-8 string scalar bytes in the complete matching items; it never
+ * guesses a token or partial-item prefix and retains no provider text.
+ */
+export function wholeItemLcpFacts(
+	previous: PayloadSummary | undefined,
+	current: PayloadSummary | undefined,
+): WholeItemLcpFacts {
+	const relationship = classifyPayloadRelationship(previous, current);
+	if (!current) return { itemCount: 0, itemLcpCount: 0, itemLcpUtf8Bytes: 0, relationship };
+	if (!previous || relationship === "UNKNOWN") {
+		return { itemCount: current.itemHashes.length, itemLcpCount: 0, itemLcpUtf8Bytes: 0, relationship };
+	}
+	const limit = Math.min(previous.itemHashes.length, current.itemHashes.length);
+	let itemLcpCount = 0;
+	let itemLcpUtf8Bytes = 0;
+	while (
+		itemLcpCount < limit
+		&& previous.itemRoles[itemLcpCount] === current.itemRoles[itemLcpCount]
+		&& previous.itemHashes[itemLcpCount] === current.itemHashes[itemLcpCount]
+	) {
+		itemLcpUtf8Bytes += current.itemUtf8Bytes[itemLcpCount] ?? 0;
+		if (!Number.isSafeInteger(itemLcpUtf8Bytes)) {
+			return { itemCount: current.itemHashes.length, itemLcpCount: 0, itemLcpUtf8Bytes: 0, relationship: "UNKNOWN" };
+		}
+		itemLcpCount += 1;
+	}
+	return { itemCount: current.itemHashes.length, itemLcpCount, itemLcpUtf8Bytes, relationship };
 }

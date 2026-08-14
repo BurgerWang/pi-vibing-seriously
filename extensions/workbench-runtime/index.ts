@@ -52,8 +52,9 @@
  *     record its own fail-closed loader rejects.
  *
  * P6-A additions (DeepSeek prompt-cache telemetry — observability only):
- *   - hash-only telemetry of usage, context fingerprints and inferred cache
- *     invalidations (cache/ directory); records go to
+ *   - hash + content-free numeric telemetry of usage, context fingerprints,
+ *     projection anatomy and inferred cache invalidations (cache/ directory);
+ *     records go to
  *     <root>/<CONFIG_DIR_NAME>/workbench/cache/telemetry.jsonl (append-only,
  *     rotated, privacy-filtered — no prompt/message/tool/schema text, no
  *     secrets, no full session ids)
@@ -782,13 +783,26 @@ import {
 	COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES,
 	HISTORY_DESCRIPTOR_MAX_BYTES,
 	HISTORY_MAX_BUNDLES,
+	HISTORY_PROJECTION_EVENT_KINDS,
+	HISTORY_PROJECTION_OBSERVATION_CAUSES,
 	HISTORY_PROJECTION_ENTRY_TYPE,
 	HistoryProjectionController,
 	OTHER_HISTORY_TOOL_TEXT_MAX_BYTES,
 	WORKER_HISTORY_TOOL_TEXT_MAX_BYTES,
 	safeHistoryProjectionFailureMessages,
 	type HistoryProjectionFacts,
+	type HistoryProjectionObservability,
 } from "./core/context-history-budget.ts";
+import {
+	buildTrustedRecoveryAuthority,
+	toolResultTextContentDigest,
+} from "./core/trusted-recovery-authority.ts";
+import {
+	TOOL_RESULT_INGRESS_BUDGET_BYTES,
+	projectToolResultIngress,
+	type ToolResultIngressProjectionMetadata,
+	type TrustedRecoveryAuthority,
+} from "./core/tool-result-ingress-projection.ts";
 import { applyExplicitPromptCacheBreakpoints } from "./core/prompt-cache-breakpoints.ts";
 import {
 	blockedControlText,
@@ -863,6 +877,20 @@ import {
 } from "./core/milestone-handoff.ts";
 
 const STATUS_KEY = "workbench";
+const MAX_PENDING_TRUSTED_INGRESS_SLOTS = 64;
+
+interface BoundTrustedIngressAuthority {
+	readonly authority: TrustedRecoveryAuthority;
+	readonly contentDigest: string;
+}
+
+interface TrustedIngressAuthoritySlot {
+	readonly bound?: BoundTrustedIngressAuthority;
+}
+
+type CacheHistoryProjectionInput = NonNullable<
+	Parameters<CacheTelemetry["observeContextProjection"]>[0]["historyProjection"]
+>;
 const OUTPUT_TURN_TELEMETRY_ENTRY_TYPE = "workbench-output-turn-telemetry-v1";
 const CONTEXT_PRESSURE_ENTRY_TYPE = "workbench-context-pressure-v1";
 
@@ -1399,6 +1427,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	/** Per-result side-channel facts keyed by Pi's SAME mutable middleware event. */
 	const outputEnvelopeFactsByEvent = new WeakMap<object, OutputEnvelopeFacts>();
 	const receiptFactsByEvent = new WeakMap<object, BoundedReceiptFacts>();
+	const ingressProjectionFactsByEvent = new WeakMap<object, ToolResultIngressProjectionMetadata>();
 	/** Trusted continuation comes only from the registered tool result details. */
 	/** Latest known commander identity facts (updated on session_start/model_select). */
 	let currentModelFacts: { provider?: string; model?: string } = {};
@@ -1425,12 +1454,17 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	const trustedRunLogContinuations = new Map<string, Array<{ kind: "run-log"; value: string }>>();
 	/** Gate-page cursors created by read_gate execute, never accepted from details. */
 	const trustedGateContinuations = new Map<string, Array<{ kind: "gate-read"; value: string }>>();
+	/** Exact private FIFO slots created only by eligible tool executions. */
+	const pendingTrustedIngressAuthorities = new Map<string, TrustedIngressAuthoritySlot[]>();
+	let pendingTrustedIngressSlotCount = 0;
+	let trustedIngressAuthoritySaturated = false;
 	/** Exact FIFO counts for results that already traversed all tool_result middleware. */
 	const processedNormalResults = new Map<string, number>();
 	/**
-	 * Numeric-only outgoing-history side channel. R8 consumes this in-memory
-	 * snapshot when it persists the unified output-control telemetry; R7 does
-	 * not append an entry per provider request and never retains message text.
+	 * Numeric-only local projected-history side channel. R8 consumes this
+	 * in-memory snapshot when it persists unified output-control telemetry; it
+	 * is not a final-wire observation, does not append an entry per provider
+	 * request, and never retains message text.
 	 */
 	let latestHistoryProjectionFacts: HistoryProjectionFacts = {
 		originalToolTextBytes: 0,
@@ -1461,6 +1495,45 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			provider: currentModelFacts.provider,
 			model: currentModelFacts.model,
 		}) === "sol-commander" ? "commander" : "other";
+	}
+
+	function cacheActorRoleCode(role: TurnRole): 0 | 1 | 2 {
+		return role === "commander" ? 1 : role === "worker" ? 2 : 0;
+	}
+
+	function cacheHistoryProjectionInput(
+		observation: HistoryProjectionObservability,
+	): CacheHistoryProjectionInput | null {
+		const eventCode = HISTORY_PROJECTION_EVENT_KINDS.indexOf(observation.eventKind);
+		const causeCode = HISTORY_PROJECTION_OBSERVATION_CAUSES.indexOf(observation.transitionCause);
+		if (eventCode < 0 || eventCode > 6 || causeCode < 0 || causeCode > 9) return null;
+		return {
+			eventCode: eventCode as 0 | 1 | 2 | 3 | 4 | 5 | 6,
+			causeCode: causeCode as 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9,
+			epoch: observation.epoch,
+			epochTransitioned: observation.epochTransitioned,
+			segmentSealed: observation.segmentSealed,
+			byteOverflow: observation.byteOverflow,
+			bundleOverflow: observation.bundleOverflow,
+			segmentsBefore: observation.segmentsBefore,
+			segmentsAfter: observation.segmentsAfter,
+			hardToolTextBytes: observation.hardToolTextBytes,
+			hardBundles: observation.hardBundles,
+			rawToolTextBytes: observation.rawToolTextBytes,
+			rawBundles: observation.rawBundles,
+			projectedToolTextBytes: observation.projectedToolTextBytes,
+			projectedBundles: observation.projectedBundles,
+			stableToolTextBytesBefore: observation.stableToolTextBytesBefore,
+			stableBundlesBefore: observation.stableBundlesBefore,
+			activeToolTextBytesBefore: observation.activeToolTextBytesBefore,
+			activeBundlesBefore: observation.activeBundlesBefore,
+			agedRawToolTextBytes: observation.agedRawToolTextBytes,
+			agedRawBundles: observation.agedRawBundles,
+			agedProjectedToolTextBytes: observation.agedProjectedToolTextBytes,
+			agedProjectedBundles: observation.agedProjectedBundles,
+			suffixRawToolTextBytes: observation.suffixRawToolTextBytes,
+			suffixRawBundles: observation.suffixRawBundles,
+		};
 	}
 
 	function ensureOutputControlTelemetry(entries?: readonly unknown[]): OutputControlTelemetryAccumulator {
@@ -1624,6 +1697,56 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		return continuation;
 	}
 
+	function bindTrustedIngressAuthority(
+		authority: TrustedRecoveryAuthority | undefined,
+		content: unknown,
+	): BoundTrustedIngressAuthority | undefined {
+		if (!authority) return undefined;
+		const contentDigest = toolResultTextContentDigest(content);
+		if (!contentDigest) return undefined;
+		return Object.freeze({ authority, contentDigest });
+	}
+
+	function rememberTrustedIngressAuthority(
+		toolCallId: unknown,
+		toolName: unknown,
+		bound: BoundTrustedIngressAuthority | undefined,
+	): void {
+		if (trustedIngressAuthoritySaturated) return;
+		const key = exactCallKey(toolCallId, toolName);
+		if (!key) return;
+		if (pendingTrustedIngressSlotCount >= MAX_PENDING_TRUSTED_INGRESS_SLOTS) {
+			pendingTrustedIngressAuthorities.clear();
+			pendingTrustedIngressSlotCount = 0;
+			trustedIngressAuthoritySaturated = true;
+			return;
+		}
+		const queue = pendingTrustedIngressAuthorities.get(key) ?? [];
+		queue.push(Object.freeze({ ...(bound ? { bound } : {}) }));
+		pendingTrustedIngressAuthorities.set(key, queue);
+		pendingTrustedIngressSlotCount += 1;
+	}
+
+	function takeTrustedIngressAuthority(
+		toolCallId: unknown,
+		toolName: unknown,
+	): BoundTrustedIngressAuthority | undefined {
+		if (trustedIngressAuthoritySaturated) return undefined;
+		const key = exactCallKey(toolCallId, toolName);
+		if (!key) return undefined;
+		const queue = pendingTrustedIngressAuthorities.get(key);
+		const slot = queue?.shift();
+		if (slot) pendingTrustedIngressSlotCount = Math.max(0, pendingTrustedIngressSlotCount - 1);
+		if (queue?.length === 0) pendingTrustedIngressAuthorities.delete(key);
+		return slot?.bound;
+	}
+
+	function resetTrustedIngressAuthorities(): void {
+		pendingTrustedIngressAuthorities.clear();
+		pendingTrustedIngressSlotCount = 0;
+		trustedIngressAuthoritySaturated = false;
+	}
+
 	function authorizeOutput(toolCallId: unknown, toolName: unknown, args: unknown): TurnOutputAuthorization {
 		return turnOutputBudget.authorizeToolCall({ toolCallId, toolName, args });
 	}
@@ -1663,7 +1786,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 
 	// ---------------------------------------------------------- P6-A cache
 
-	/** Session-scoped prompt-cache telemetry (hash-only, never blocking). */
+	/** Session-scoped prompt-cache telemetry (hash + content-free numeric, never blocking). */
 	const cacheTelemetry: CacheTelemetry = createCacheTelemetry({
 		appendEntry: (customType, data) => pi.appendEntry(customType, data),
 	});
@@ -1991,7 +2114,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			const config = await loadProjectConfig(projectRoot, { trusted: true });
 			cacheTelemetry.setEnabled(config.cacheTelemetry);
 		} catch {
-			// default on — telemetry is best-effort and hash-only
+			// default on — telemetry is best-effort, hashed and content-free numeric
 			cacheTelemetry.setEnabled(true);
 		}
 	}
@@ -2291,6 +2414,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	// -------------------------------------------------------------- lifecycle
 
 	pi.on("session_start", async (event, ctx) => {
+		resetTrustedIngressAuthorities();
 		// Restore the most recent persisted mode and workbench state from the
 		// current session's custom entries. Custom entries survive compaction
 		// and every session-replacement path (/new, /resume, /fork, /clone,
@@ -2357,12 +2481,14 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	});
 
 	pi.on("session_compact", () => {
+		resetTrustedIngressAuthorities();
 		resetHistoryProjection();
 		persistHistoryProjectionState();
 		persistContextPressure();
 	});
 
 	pi.on("session_tree", () => {
+		resetTrustedIngressAuthorities();
 		resetHistoryProjection();
 		persistHistoryProjectionState();
 		persistContextPressure();
@@ -2420,6 +2546,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		trustedGateContinuations.clear();
 		processedNormalResults.clear();
 		pendingReceiptHandles.clear();
+		resetTrustedIngressAuthorities();
 		turnOutputBudget.startTurn({ turnSerial: event.turnIndex, role: outputTurnRole() });
 		ensureOutputControlTelemetry();
 	});
@@ -2461,6 +2588,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		trustedGateContinuations.clear();
 		processedNormalResults.clear();
 		pendingReceiptHandles.clear();
+		resetTrustedIngressAuthorities();
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
@@ -2578,6 +2706,10 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				descriptorMaxBytes: HISTORY_DESCRIPTOR_MAX_BYTES,
 				role,
 			});
+			cacheTelemetry.observeContextProjection({
+				actorRoleCode: cacheActorRoleCode(role),
+				historyProjection: cacheHistoryProjectionInput(projection.observability),
+			});
 			latestHistoryProjectionFacts = { ...projection.facts };
 			latestHistoryProjectionBoundaryMarkers = projection.boundaryMarkers.map((boundary) => boundary.marker);
 			latestHistoryPressure = {
@@ -2603,6 +2735,10 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			// an accessor that already threw, or another hostile structured value.
 			// Pi falls back to raw context if this handler throws, so the terminal
 			// catch path must be fixed, bounded, and independently no-throw.
+			cacheTelemetry.observeContextProjection({
+				actorRoleCode: cacheActorRoleCode(role),
+				historyProjection: null,
+			});
 			const messages = safeHistoryProjectionFailureMessages();
 			latestHistoryProjectionBoundaryMarkers = [];
 			latestHistoryProjectionFacts = {
@@ -2632,8 +2768,10 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	// OpenAI GPT-5.6 Responses path. The helper is copy-on-write and fails
 	// closed to the original payload for every unsupported/uncertain shape;
 	// Codex stays experimentally disabled and DeepSeek remains identity-exact.
-	// Telemetry observes the actual outgoing replacement, never the pre-transform
-	// payload, and retains only its structural digest.
+	// Telemetry records a local, nonfinal observation of the post-breakpoint
+	// payload at this extension boundary, never the pre-transform payload. The
+	// provider/SDK may still transform it; retained facts are structural hashes
+	// and content-free numeric anatomy, never verified final-wire claims.
 	pi.on("before_provider_request", (event, ctx) => {
 		const breakpointResult = applyExplicitPromptCacheBreakpoints({
 			payload: event.payload,
@@ -2898,6 +3036,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	// Safe flush: persist the session state entry (append-only JSONL records
 	// are already written per request; nothing is buffered here).
 	pi.on("session_shutdown", () => {
+		resetTrustedIngressAuthorities();
 		cacheTelemetry.flush();
 		// P7: a commander write lease never outlives its session.
 		if (writeLease) {
@@ -4458,7 +4597,8 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	pi.registerTool({
 		...WORKBENCH_TOOL_METADATA.workbench_run_recipe,
 		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_run_recipe,
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			let trustedIngress: BoundTrustedIngressAuthority | undefined;
 			try {
 				const trustError = trustedOrError(ctx);
 				if (trustError) return fixedToolFailure("workbench_run_recipe", "untrusted_project");
@@ -4556,9 +4696,29 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 					content: [{ type: "text", text }],
 					details: { ...details },
 				});
-				return { content: [{ type: "text", text }], details };
+				const toolResult = { content: [{ type: "text" as const, text }], details };
+				if (result.ok) {
+					const authority = await buildTrustedRecoveryAuthority({
+						projectRoot,
+						sourceKind: "finalized_recipe_run",
+						toolCallId,
+						toolName: "workbench_run_recipe",
+						sourcePath: `${CONFIG_DIR_NAME}/workbench/runs/${summary.run_id}/summary.json`,
+						requiredFacts: [
+							{ key: "run_id", value: summary.run_id },
+							{ key: "recipe", value: summary.recipe },
+							{ key: "status", value: status },
+							{ key: "exit_code", value: summary.exit_code },
+							{ key: "duration_ms", value: summary.duration_ms },
+						],
+					});
+					trustedIngress = bindTrustedIngressAuthority(authority, toolResult.content);
+				}
+				return toolResult;
 			} catch {
 				return fixedToolFailure("workbench_run_recipe", "runtime_error");
+			} finally {
+				rememberTrustedIngressAuthority(toolCallId, "workbench_run_recipe", trustedIngress);
 			}
 		},
 		...workbenchToolRenderer("recipe", "workbench_run_recipe"),
@@ -4568,6 +4728,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		...WORKBENCH_TOOL_METADATA.workbench_read_run,
 		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_read_run,
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			let trustedIngress: BoundTrustedIngressAuthority | undefined;
 			// R0 emergency boundary: EVERY return path (early validation,
 			// missing/corrupt records, normal rendering, and caught runtime
 			// failures) passes through this one final whole-result clamp. Later
@@ -4707,14 +4868,41 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				stderr_log: displayRelative(projectRoot, `${CONFIG_DIR_NAME}/workbench/runs/${manifest.run_id}/stderr.log`),
 				...runLogDetails,
 				};
-				return {
-					content: [{ type: "text", text }],
-					details,
-				};
+				const toolResult = { content: [{ type: "text" as const, text }], details };
+				let sourcePath: string | undefined;
+				let logStream: "stdout" | "stderr" | null = null;
+				let page = 0;
+				if (include === "summary" || include === "manifest") {
+					sourcePath = `${runDirRel}/manifest.json`;
+				} else if (include === "logs" && logPage?.ok && logPage.value.selection !== "both") {
+					logStream = logPage.value.selection;
+					const streamPage = logStream === "stdout" ? logPage.value.stdout : logPage.value.stderr;
+					page = streamPage.startByte;
+					sourcePath = logStream === "stdout" ? stdoutPath : stderrPath;
+				}
+				if (sourcePath) {
+					const authority = await buildTrustedRecoveryAuthority({
+						projectRoot,
+						sourceKind: "finalized_run_page",
+						toolCallId,
+						toolName: "workbench_read_run",
+						sourcePath,
+						requiredFacts: [
+							{ key: "run_id", value: manifest.run_id },
+							{ key: "include", value: include },
+							{ key: "log_stream", value: logStream },
+							{ key: "page", value: page },
+						],
+					});
+					trustedIngress = bindTrustedIngressAuthority(authority, toolResult.content);
+				}
+				return toolResult;
 			} catch (error) {
 				// Passing the value directly keeps hostile Error/string coercion
 				// inside clampWholeResultText's fail-closed boundary.
 				return { content: [{ type: "text", text: readRunText(error) }], details: {} };
+			} finally {
+				rememberTrustedIngressAuthority(toolCallId, "workbench_read_run", trustedIngress);
 			}
 		},
 		...workbenchToolRenderer("read_run", "workbench_read_run"),
@@ -4723,7 +4911,8 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	pi.registerTool({
 		...WORKBENCH_TOOL_METADATA.workbench_run_gate,
 		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_run_gate,
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			let trustedIngress: BoundTrustedIngressAuthority | undefined;
 			try {
 				const trustError = trustedOrError(ctx);
 				if (trustError) return fixedToolFailure("workbench_run_gate", "untrusted_project");
@@ -4781,9 +4970,25 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				const text = boundedToolText(gateParentSummaryLines(result, projectRoot).join("\n"));
 				const details = boundedGateDetails(result, projectRoot);
 				onUpdate?.({ content: [{ type: "text", text }], details: { ...details } });
-				return { content: [{ type: "text", text }], details };
+				const toolResult = { content: [{ type: "text" as const, text }], details };
+				const authority = await buildTrustedRecoveryAuthority({
+					projectRoot,
+					sourceKind: "executed_gate_run",
+					toolCallId,
+					toolName: "workbench_run_gate",
+					sourcePath: `${CONFIG_DIR_NAME}/workbench/runs/${result.runId}/gates.json`,
+					requiredFacts: [
+						{ key: "run_id", value: result.runId },
+						{ key: "status", value: result.status },
+						{ key: "gate_count", value: result.gates.length },
+					],
+				});
+				trustedIngress = bindTrustedIngressAuthority(authority, toolResult.content);
+				return toolResult;
 			} catch {
 				return fixedToolFailure("workbench_run_gate", "runtime_error");
+			} finally {
+				rememberTrustedIngressAuthority(toolCallId, "workbench_run_gate", trustedIngress);
 			}
 		},
 		...workbenchToolRenderer("gate", "workbench_run_gate"),
@@ -4793,6 +4998,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		...WORKBENCH_TOOL_METADATA.workbench_read_gate,
 		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_read_gate,
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			let trustedIngress: BoundTrustedIngressAuthority | undefined;
 			try {
 				const pendingAuthorization = peekOutputAuthorization(toolCallId, "workbench_read_gate");
 				const maxOutputBytes = pendingAuthorization === undefined
@@ -4823,10 +5029,24 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 					});
 					if (!page.ok) return fixedToolFailure("workbench_read_gate", page.code, page.details.source_path);
 					if (page.details.next_cursor) rememberTrustedGateContinuation(toolCallId, page.details.next_cursor);
-					return {
-						content: [{ type: "text", text: boundedToolText(page.text, maxOutputBytes, 320) }],
+					const toolResult = {
+						content: [{ type: "text" as const, text: boundedToolText(page.text, maxOutputBytes, 320) }],
 						details: page.details,
 					};
+					const authority = await buildTrustedRecoveryAuthority({
+						projectRoot,
+						sourceKind: "run_id_gate_page",
+						toolCallId,
+						toolName: "workbench_read_gate",
+						sourcePath: `${CONFIG_DIR_NAME}/workbench/runs/${runId}/gates.json`,
+						requiredFacts: [
+							{ key: "run_id", value: runId },
+							{ key: "include", value: params.include ?? "failures" },
+							{ key: "page", value: page.details.remaining_count },
+						],
+					});
+					trustedIngress = bindTrustedIngressAuthority(authority, toolResult.content);
+					return toolResult;
 				}
 				const gates = await loadGates(projectRoot);
 				const gate = gates.find((candidate) => candidate.id === params.gate_id);
@@ -4849,9 +5069,11 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				};
 			} catch {
 				return fixedToolFailure("workbench_read_gate", "runtime_error");
+			} finally {
+				rememberTrustedIngressAuthority(toolCallId, "workbench_read_gate", trustedIngress);
 			}
-			},
-		});
+		},
+	});
 
 	pi.registerTool({
 		...WORKBENCH_TOOL_METADATA.workbench_list_gates,
@@ -4890,7 +5112,9 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	pi.registerTool({
 		...WORKBENCH_TOOL_METADATA.workbench_compare_runs,
 		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_compare_runs,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			let trustedIngress: BoundTrustedIngressAuthority | undefined;
+			try {
 			const trustError = trustedOrError(ctx);
 			if (trustError) {
 				return { content: [{ type: "text", text: `workbench_compare_runs: ${trustError}` }], details: { ok: false, error: trustError } };
@@ -4922,21 +5146,39 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				parameter_changed_count: quant?.parameters.length ?? 0,
 				comparison_path: outcome.comparison_path,
 			};
-			return {
-				content: [{ type: "text", text: renderCompareLines(outcome.report, true).join("\n") }],
+			const toolResult = {
+				content: [{ type: "text" as const, text: renderCompareLines(outcome.report, true).join("\n") }],
 				details,
 			};
+			const authority = await buildTrustedRecoveryAuthority({
+				projectRoot,
+				sourceKind: "immutable_comparison",
+				toolCallId,
+				toolName: "workbench_compare_runs",
+				sourcePath: outcome.comparison_path,
+				requiredFacts: [
+					{ key: "comparison_id", value: outcome.comparison_id },
+					{ key: "a_run_id", value: outcome.report.a.run_id },
+					{ key: "b_run_id", value: outcome.report.b.run_id },
+					{ key: "compatible", value: outcome.report.compatible },
+				],
+			});
+			trustedIngress = bindTrustedIngressAuthority(authority, toolResult.content);
+			return toolResult;
+			} finally {
+				rememberTrustedIngressAuthority(toolCallId, "workbench_compare_runs", trustedIngress);
+			}
 		},
 		...workbenchToolRenderer("compare", "workbench_compare_runs"),
 	});
-
-
 
 	pi.registerTool({
 		...WORKBENCH_TOOL_METADATA.workbench_delegate_worker,
 		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker,
 		executionMode: "sequential",
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			let trustedIngress: BoundTrustedIngressAuthority | undefined;
+			try {
 			const trustError = trustedOrError(ctx);
 			if (trustError) throw new Error(`workbench_delegate_worker: ${trustError}`);
 			const commanderError = commanderBlockReason(ctx.model?.provider, ctx.model?.id);
@@ -5200,7 +5442,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			// safe fallback), usage/cache/budget summary, the durable report
 			// path, parse/review warnings, and the explicit instruction that
 			// Sol must inspect the actual diff.
-			return buildDelegateWorkerResult({
+			const toolResult = buildDelegateWorkerResult({
 				delegationId,
 				provider: result.provider,
 				model: result.model,
@@ -5227,6 +5469,24 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				spend: handoffSummary.spend,
 				reviewStatus: delegationState.status,
 			});
+			const authority = await buildTrustedRecoveryAuthority({
+				projectRoot,
+				sourceKind: "completed_worker_report",
+				toolCallId,
+				toolName: "workbench_delegate_worker",
+				sourcePath: handoffSummary.report_path,
+				requiredFacts: [
+					{ key: "delegation_id", value: delegationId },
+					{ key: "status", value: "success" },
+					{ key: "turns", value: result.turns },
+					{ key: "exit_code", value: result.exitCode },
+				],
+			});
+			trustedIngress = bindTrustedIngressAuthority(authority, toolResult.content);
+			return toolResult;
+			} finally {
+				rememberTrustedIngressAuthority(toolCallId, "workbench_delegate_worker", trustedIngress);
+			}
 		},
 	});
 
@@ -5455,10 +5715,13 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	/** tool_result #1 — final envelope using only this call's reservation. */
 	pi.on("tool_result", (event) => {
 		let envelope: OutputEnvelopeResult;
+		let ingressMetadata: ToolResultIngressProjectionMetadata | undefined;
+		let ingressContentDigest: string | undefined;
 		try {
-				const trustedContinuation = takeTrustedReadContinuation(event.toolCallId, event.toolName)
-					?? takeTrustedRunLogContinuation(event.toolCallId, event.toolName)
-					?? takeTrustedGateContinuation(event.toolCallId, event.toolName);
+			const originalContent = event.content;
+			const trustedContinuation = takeTrustedReadContinuation(event.toolCallId, event.toolName)
+				?? takeTrustedRunLogContinuation(event.toolCallId, event.toolName)
+				?? takeTrustedGateContinuation(event.toolCallId, event.toolName);
 			const authorization = takeOutputAuthorization(event.toolCallId, event.toolName)
 				?? authorizeOutput(event.toolCallId, event.toolName, event.input);
 			const policy = resolveToolOutputPolicy({
@@ -5466,30 +5729,71 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				args: event.input,
 				role: outputTurnRole(),
 			});
+			const trustedIngress = takeTrustedIngressAuthority(event.toolCallId, event.toolName);
 			if (!authorization.allowed || !authorization.authorizationId) {
 				envelope = enforceOutputEnvelope({ toolName: event.toolName, content: [], isError: true, policy, allocatedBytes: 0 });
 			} else {
-				envelope = enforceOutputEnvelope({
+				const applyEnvelope = (content: unknown): OutputEnvelopeResult => enforceOutputEnvelope({
 					toolName: event.toolName,
-					content: event.content,
+					content: content as Parameters<typeof enforceOutputEnvelope>[0]["content"],
 					isError: event.isError,
 					policy,
 					allocatedBytes: authorization.allocatedBytes,
 					continuation: trustedContinuation,
 				});
+				let contentForEnvelope: unknown = originalContent;
+				if (trustedIngress) {
+					const observedDigest = toolResultTextContentDigest(originalContent);
+					if (observedDigest && observedDigest === trustedIngress.contentDigest) {
+						const ingress = projectToolResultIngress({
+							toolCallId: event.toolCallId,
+							toolName: event.toolName,
+							content: originalContent,
+							isError: event.isError,
+							authority: trustedIngress.authority,
+						});
+						const allocationCanHoldWrapper = !ingress.changed
+							|| authorization.allocatedBytes >= TOOL_RESULT_INGRESS_BUDGET_BYTES;
+						if (ingress.status === "projected" && allocationCanHoldWrapper) {
+							const projectedDigest = toolResultTextContentDigest(ingress.content);
+							if (projectedDigest) {
+								contentForEnvelope = ingress.content;
+								ingressContentDigest = projectedDigest;
+								ingressMetadata = ingress.metadata;
+							}
+						}
+					}
+				}
+				envelope = applyEnvelope(contentForEnvelope);
+				if (ingressMetadata) {
+					const finalContentDigest = envelope.isError ? undefined : toolResultTextContentDigest(envelope.content);
+					if (!ingressContentDigest || finalContentDigest !== ingressContentDigest) {
+						// The generic envelope could not preserve the candidate. Rebuild from
+						// the original raw result so no metadata-free partial recovery wrapper
+						// can become provider-visible or enter the bounded receipt.
+						envelope = applyEnvelope(originalContent);
+						ingressMetadata = undefined;
+						ingressContentDigest = undefined;
+					}
+				}
 				const accounting = turnOutputBudget.consumeResult({
 					authorizationId: authorization.authorizationId,
 					actualBytes: envelope.facts.shownTextBytes,
 				});
 				if (!accounting.accepted) {
 					envelope = enforceOutputEnvelope({ toolName: event.toolName, content: [], isError: true, policy, allocatedBytes: 0 });
+					ingressMetadata = undefined;
+					ingressContentDigest = undefined;
 				}
 			}
 		} catch {
+			ingressMetadata = undefined;
 			const policy = resolveToolOutputPolicy({ toolName: event.toolName, args: undefined, role: outputTurnRole() });
 			envelope = enforceOutputEnvelope({ toolName: event.toolName, content: [], isError: true, policy, allocatedBytes: 0 });
 		}
 		outputEnvelopeFactsByEvent.set(event, envelope.facts);
+		ingressProjectionFactsByEvent.delete(event);
+		if (ingressMetadata) ingressProjectionFactsByEvent.set(event, ingressMetadata);
 		observeOutputEnvelope(event.toolName, envelope.facts);
 		// Even a fail-closed normal middleware result is already bounded and its
 		// authorization has been settled/released. Preserve FIFO multiplicity for
@@ -5556,6 +5860,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		try {
 			const envelope = outputEnvelopeFactsByEvent.get(event) ?? runtimeFailureEnvelope().facts;
 			const receipt = receiptFactsByEvent.get(event);
+			const ingressProjection = ingressProjectionFactsByEvent.get(event);
 			let details: unknown;
 			try {
 				details = event.details;
@@ -5568,11 +5873,13 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 					details,
 					envelope,
 					receipt,
+					ingressProjection,
 				}).details,
 			};
 		} finally {
 			outputEnvelopeFactsByEvent.delete(event);
 			receiptFactsByEvent.delete(event);
+			ingressProjectionFactsByEvent.delete(event);
 		}
 	});
 

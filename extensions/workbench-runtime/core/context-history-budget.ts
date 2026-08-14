@@ -55,6 +55,66 @@ export interface ProjectContextHistoryResult {
 	facts: HistoryProjectionFacts;
 }
 
+/** Stable, content-free event vocabulary mapped to telemetry event codes by index.ts. */
+export const HISTORY_PROJECTION_EVENT_KINDS = Object.freeze([
+	"none",
+	"initial_hard_projection",
+	"segment_seal",
+	"epoch_checkpoint",
+	"inactive_boundary",
+	"fixed_failure",
+	"recovery_boundary",
+] as const);
+export type HistoryProjectionEventKind = typeof HISTORY_PROJECTION_EVENT_KINDS[number];
+
+/** Stable, content-free cause vocabulary mapped to telemetry cause codes by index.ts. */
+export const HISTORY_PROJECTION_OBSERVATION_CAUSES = Object.freeze([
+	"none",
+	"initial_hard_limit",
+	"hard_bytes",
+	"hard_bundles",
+	"segment_sealed",
+	"prefix_changed",
+	"policy_changed",
+	"legacy_migration",
+	"failure",
+	"recovery",
+] as const);
+export type HistoryProjectionObservationCause = typeof HISTORY_PROJECTION_OBSERVATION_CAUSES[number];
+
+/**
+ * Exact numeric anatomy of one projection decision. This surface contains no
+ * message text, marker text, hashes, paths, provider claims, or estimates.
+ * Slice-only fields are zero when that slice is structurally inapplicable.
+ */
+export interface HistoryProjectionObservability {
+	eventKind: HistoryProjectionEventKind;
+	transitionCause: HistoryProjectionObservationCause;
+	epoch: number;
+	epochTransitioned: 0 | 1;
+	segmentSealed: 0 | 1;
+	byteOverflow: 0 | 1;
+	bundleOverflow: 0 | 1;
+	segmentsBefore: number;
+	segmentsAfter: number;
+	hardToolTextBytes: number;
+	hardBundles: number;
+	rawToolTextBytes: number;
+	rawBundles: number;
+	projectedToolTextBytes: number;
+	projectedBundles: number;
+	stableToolTextBytesBefore: number;
+	stableBundlesBefore: number;
+	activeToolTextBytesBefore: number;
+	activeBundlesBefore: number;
+	agedRawToolTextBytes: number;
+	agedRawBundles: number;
+	agedProjectedToolTextBytes: number;
+	agedProjectedBundles: number;
+	suffixRawToolTextBytes: number;
+	suffixRawBundles: number;
+}
+
 export interface HistoryProjectionControllerResult extends ProjectContextHistoryResult {
 	epoch: number;
 	epochHash: string | null;
@@ -67,6 +127,7 @@ export interface HistoryProjectionControllerResult extends ProjectContextHistory
 	newlyRemovedBundles: number;
 	rawBundleCount: number;
 	projectedBundleCount: number;
+	observability: HistoryProjectionObservability;
 }
 
 export interface HistoryProjectionBoundaryMarker {
@@ -167,6 +228,26 @@ const BOUNDED_DETAILS_MAX_BYTES = 8_192;
 const BOUNDED_DETAILS_MAX_STRING_BYTES = 512;
 const BOUNDED_DETAILS_MAX_DEPTH = 4;
 const BOUNDED_DETAILS_MAX_KEYS = 32;
+const INGRESS_METADATA_SCHEMA = "workbench-tool-result-ingress-metadata-v1";
+const INGRESS_METADATA_BUDGET_BYTES = 4_096;
+const INGRESS_METADATA_FIELDS = [
+	"schema", "sourceKind", "sourcePath", "sourceIdentityKind", "sourceIdentityHash",
+	"authorityHash", "projectionHash", "originalBytes", "projectedBytes", "bodyShownBytes",
+	"omittedBytes", "budgetBytes", "requiredFactCount",
+] as const;
+const INGRESS_SHA256_PATTERN = /^[0-9a-f]{64}$/;
+const SAFE_INGRESS_PATH_PATTERN = /^[A-Za-z0-9._/+-]+$/;
+const SAFE_INGRESS_RECORD_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,191}$/;
+const INGRESS_COMPARISON_ID_PATTERN = /^cmp1-[0-9a-f]{64}$/;
+const INGRESS_SOURCE_CONTRACTS = Object.freeze({
+	finalized_recipe_run: Object.freeze({ toolName: "workbench_run_recipe", requiredFactCount: 5 }),
+	executed_gate_run: Object.freeze({ toolName: "workbench_run_gate", requiredFactCount: 3 }),
+	immutable_comparison: Object.freeze({ toolName: "workbench_compare_runs", requiredFactCount: 4 }),
+	completed_worker_report: Object.freeze({ toolName: "workbench_delegate_worker", requiredFactCount: 4 }),
+	finalized_run_page: Object.freeze({ toolName: "workbench_read_run", requiredFactCount: 4 }),
+	run_id_gate_page: Object.freeze({ toolName: "workbench_read_gate", requiredFactCount: 3 }),
+});
+type IngressSourceKind = keyof typeof INGRESS_SOURCE_CONTRACTS;
 const ENVELOPE_POLICIES = new Set([
 	"native-read-page", "native-search", "run-summary", "run-log-page", "gate-summary", "gate-read",
 	"diff-review", "compare", "worker-handoff", "recovery", "default",
@@ -459,6 +540,94 @@ function hasTrustedEnvelope(details: object): boolean {
 	return true;
 }
 
+function exactIngressMetadataRecord(value: unknown): Readonly<Record<string, unknown>> | undefined {
+	if (value === null || typeof value !== "object" || utilTypes.isProxy(value)) return undefined;
+	const prototype = Object.getPrototypeOf(value);
+	if (prototype !== Object.prototype && prototype !== null) return undefined;
+	const keys = Reflect.ownKeys(value);
+	if (keys.length !== INGRESS_METADATA_FIELDS.length || keys.some((key) => typeof key !== "string")) return undefined;
+	const expected = new Set<string>(INGRESS_METADATA_FIELDS);
+	const record: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+	for (const key of keys) {
+		if (typeof key !== "string" || !expected.has(key)) return undefined;
+		const descriptor = Object.getOwnPropertyDescriptor(value, key);
+		if (!descriptor || descriptor.enumerable !== true || !Object.prototype.hasOwnProperty.call(descriptor, "value")) {
+			return undefined;
+		}
+		record[key] = descriptor.value;
+	}
+	return record;
+}
+
+function safeIngressInteger(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && !Object.is(value, -0);
+}
+
+function ingressSourcePathMatches(sourceKind: IngressSourceKind, sourcePath: unknown): sourcePath is string {
+	if (typeof sourcePath !== "string"
+		|| utf8Bytes(sourcePath) > HISTORY_DESCRIPTOR_MAX_BYTES
+		|| !SAFE_INGRESS_PATH_PATTERN.test(sourcePath)
+		|| sourcePath.startsWith("/")
+		|| sourcePath.includes("\\")) return false;
+	const parts = sourcePath.split("/");
+	if (parts.some((part) => part.length === 0 || part === "." || part === "..")) return false;
+	if (sourceKind === "immutable_comparison") {
+		return parts.length === 5
+			&& parts[0] === ".pi"
+			&& parts[1] === "workbench"
+			&& parts[2] === "comparisons"
+			&& INGRESS_COMPARISON_ID_PATTERN.test(parts[3] ?? "")
+			&& parts[4] === "comparison.json";
+	}
+	if (sourceKind === "completed_worker_report") {
+		return parts.length === 5
+			&& parts[0] === ".pi"
+			&& parts[1] === "workbench"
+			&& parts[2] === "delegations"
+			&& SAFE_INGRESS_RECORD_ID_PATTERN.test(parts[3] ?? "")
+			&& parts[4] === "worker-report.md";
+	}
+	if (parts.length !== 5
+		|| parts[0] !== ".pi"
+		|| parts[1] !== "workbench"
+		|| parts[2] !== "runs"
+		|| !SAFE_INGRESS_RECORD_ID_PATTERN.test(parts[3] ?? "")) return false;
+	if (sourceKind === "finalized_recipe_run") return parts[4] === "summary.json";
+	if (sourceKind === "executed_gate_run" || sourceKind === "run_id_gate_page") return parts[4] === "gates.json";
+	return sourceKind === "finalized_run_page"
+		&& (parts[4] === "manifest.json" || parts[4] === "stdout.log" || parts[4] === "stderr.log");
+}
+
+function ingressPointerFromDetails(details: object, toolName: string): string | undefined {
+	const ingressDescriptor = Object.getOwnPropertyDescriptor(details, "ingress_projection");
+	if (!ingressDescriptor
+		|| ingressDescriptor.enumerable !== true
+		|| !Object.prototype.hasOwnProperty.call(ingressDescriptor, "value")) return undefined;
+	const metadata = exactIngressMetadataRecord(ingressDescriptor.value);
+	if (!metadata
+		|| metadata.schema !== INGRESS_METADATA_SCHEMA
+		|| typeof metadata.sourceKind !== "string"
+		|| !Object.prototype.hasOwnProperty.call(INGRESS_SOURCE_CONTRACTS, metadata.sourceKind)) return undefined;
+	const sourceKind = metadata.sourceKind as IngressSourceKind;
+	const contract = INGRESS_SOURCE_CONTRACTS[sourceKind];
+	if (contract.toolName !== toolName
+		|| !ingressSourcePathMatches(sourceKind, metadata.sourcePath)
+		|| (metadata.sourceIdentityKind !== "digest" && metadata.sourceIdentityKind !== "snapshot")
+		|| typeof metadata.sourceIdentityHash !== "string" || !INGRESS_SHA256_PATTERN.test(metadata.sourceIdentityHash)
+		|| typeof metadata.authorityHash !== "string" || !INGRESS_SHA256_PATTERN.test(metadata.authorityHash)
+		|| typeof metadata.projectionHash !== "string" || !INGRESS_SHA256_PATTERN.test(metadata.projectionHash)
+		|| !safeIngressInteger(metadata.originalBytes)
+		|| !safeIngressInteger(metadata.projectedBytes)
+		|| metadata.projectedBytes > INGRESS_METADATA_BUDGET_BYTES
+		|| !safeIngressInteger(metadata.bodyShownBytes)
+		|| metadata.bodyShownBytes > metadata.originalBytes
+		|| !safeIngressInteger(metadata.omittedBytes)
+		|| metadata.omittedBytes !== metadata.originalBytes - metadata.bodyShownBytes
+		|| metadata.budgetBytes !== INGRESS_METADATA_BUDGET_BYTES
+		|| metadata.requiredFactCount !== contract.requiredFactCount) return undefined;
+	return metadata.sourcePath;
+}
+
 function pointerFromDetails(details: unknown, toolName: string): { key: "source" | "receipt"; value: string } | undefined {
 	if (details === null || typeof details !== "object" || utilTypes.isProxy(details)) return undefined;
 	if (!isBoundedProjectedDetails(details)) return undefined;
@@ -469,6 +638,8 @@ function pointerFromDetails(details: unknown, toolName: string): { key: "source"
 	for (const descriptor of Object.values(descriptors)) {
 		if (descriptor.enumerable === true && !Object.prototype.hasOwnProperty.call(descriptor, "value")) return undefined;
 	}
+	const ingressSource = ingressPointerFromDetails(details, toolName);
+	if (ingressSource) return { key: "source", value: ingressSource };
 
 	const receipt = dataValue(details, "receipt");
 	if (receipt !== null && typeof receipt === "object" && !utilTypes.isProxy(receipt)) {
@@ -1063,6 +1234,38 @@ interface HistoryPressureFacts {
 	projectedToolTextBytes: number;
 	projectedBundles: number;
 }
+
+interface HistoryProjectionObservationSeed {
+	eventKind: Exclude<HistoryProjectionEventKind, "recovery_boundary">;
+	transitionCause: Exclude<HistoryProjectionObservationCause, "recovery">;
+	hardToolTextBytes: number;
+	hardBundles: number;
+	byteOverflow: boolean;
+	bundleOverflow: boolean;
+	segmentsBefore: number;
+	stableToolTextBytesBefore: number;
+	stableBundlesBefore: number;
+	activeToolTextBytesBefore: number;
+	activeBundlesBefore: number;
+	agedRawToolTextBytes: number;
+	agedRawBundles: number;
+	agedProjectedToolTextBytes: number;
+	agedProjectedBundles: number;
+	suffixRawToolTextBytes: number;
+	suffixRawBundles: number;
+}
+
+type HistoryProjectionDecisionFacts = Pick<HistoryProjectionObservationSeed,
+	| "hardToolTextBytes"
+	| "hardBundles"
+	| "byteOverflow"
+	| "bundleOverflow"
+	| "segmentsBefore"
+	| "stableToolTextBytesBefore"
+	| "stableBundlesBefore"
+	| "activeToolTextBytesBefore"
+	| "activeBundlesBefore"
+>;
 
 interface ReplayProjection {
 	anchor: ProjectContextHistoryResult;
@@ -1846,19 +2049,6 @@ function validRestoredV3AnchorCap(hardToolTextBytes: number, anchorToolTextBytes
 	return anchorToolTextBytes === commanderCandidate || anchorToolTextBytes === workerCandidate;
 }
 
-function restoredV3ActiveByteCap(hardToolTextBytes: number, anchorToolTextBytes: number): number {
-	const segmentReserve = HISTORY_PROJECTION_MAX_SEGMENTS * HISTORY_PROJECTION_SEGMENT_MAX_TOOL_TEXT_BYTES;
-	let cap = 0;
-	if (anchorToolTextBytes === Math.max(0, hardToolTextBytes - COMMANDER_TURN_MAX_BYTES - segmentReserve)) {
-		cap = Math.max(cap, Math.min(hardToolTextBytes, COMMANDER_TURN_MAX_BYTES));
-	}
-	if (hardToolTextBytes <= WORKER_HISTORY_MAX_BYTES
-		&& anchorToolTextBytes === Math.max(0, hardToolTextBytes - WORKER_TURN_MAX_BYTES - segmentReserve)) {
-		cap = Math.max(cap, Math.min(hardToolTextBytes, WORKER_TURN_MAX_BYTES));
-	}
-	return cap;
-}
-
 function strictProjectionStateV3(value: unknown): HistoryProjectionStateEntryData | undefined {
 	try {
 		const record = strictPlainRecord(value, HISTORY_PROJECTION_STATE_KEYS);
@@ -1922,11 +2112,9 @@ function strictProjectionStateV3(value: unknown): HistoryProjectionStateEntryDat
 			|| parsed.observedRawMessageCount < expectedStart) return undefined;
 		if (parsed.transitionCollapsedResults !== collapsedResults || parsed.transitionRemovedBundles !== removedBundles) return undefined;
 		if (parsed.projectedToolTextBytes < stableToolTextBytes || parsed.projectedBundles < stableBundles) return undefined;
+		// The active turn reserve sizes the suffix retained after a real hard-cap crossing;
+		// an append-only active tail may grow beyond that reserve while these total caps still hold.
 		if (parsed.projectedToolTextBytes > parsed.hardToolTextBytes || parsed.projectedBundles > parsed.hardBundles) return undefined;
-		const activeBytes = parsed.projectedToolTextBytes - stableToolTextBytes;
-		const activeBundles = parsed.projectedBundles - stableBundles;
-		if (activeBytes > restoredV3ActiveByteCap(parsed.hardToolTextBytes, parsed.anchorToolTextBytes)
-			|| activeBundles > HISTORY_PROJECTION_ACTIVE_MAX_BUNDLES) return undefined;
 		if (parsed.rawBundles !== parsed.projectedBundles + parsed.transitionRemovedBundles) return undefined;
 		if (parsed.rawBundles < 1 || parsed.rawBundles > parsed.observedRawMessageCount) return undefined;
 		if (parsed.transitionCollapsedResults > parsed.observedRawMessageCount) return undefined;
@@ -1983,6 +2171,20 @@ function boundaryMarkersFor(frozen: FrozenHistoryProjectionEpoch | undefined): H
 		boundaryId: slice.boundaryId,
 		marker: boundaryMarkerText(slice.boundaryId),
 	}));
+}
+
+function stableProjectionPressure(frozen: FrozenHistoryProjectionEpoch | undefined): {
+	toolTextBytes: number;
+	bundles: number;
+} {
+	if (!frozen) return { toolTextBytes: 0, bundles: 0 };
+	let toolTextBytes = frozen.anchor.projectedToolTextBytes;
+	let bundles = frozen.anchor.projectedBundles;
+	for (const segment of frozen.segments) {
+		toolTextBytes += segment.projectedToolTextBytes;
+		bundles += segment.projectedBundles;
+	}
+	return { toolTextBytes, bundles };
 }
 
 /**
@@ -2207,12 +2409,13 @@ export class HistoryProjectionController {
 		cause: Exclude<HistoryProjectionTransitionCause, "none" | "segment_sealed" | "failure">,
 		previousCollapsedResults: number,
 		previousRemovedBundles: number,
+		decision: HistoryProjectionDecisionFacts,
 	): HistoryProjectionControllerResult {
 		const currentEpoch = Math.max(this.epochCounter, this.frozen?.epoch ?? 0);
 		const epoch = advanceHistoryProjectionEpoch(currentEpoch);
 		if (epoch === undefined) {
 			this.epochCounter = currentEpoch;
-			return this.failure(input, rawToolTextBytes, rawBundles);
+			return this.failure(rawToolTextBytes, rawBundles, decision);
 		}
 		const activeBytes = Math.min(turnCapForRole(input.role), hardToolTextBytes);
 		const activeBundles = Math.min(HISTORY_PROJECTION_ACTIVE_MAX_BUNDLES, hardBundles);
@@ -2232,11 +2435,12 @@ export class HistoryProjectionController {
 		const combinedBundles = historyBundleCount(combined);
 		const combinedBytes = historyToolTextBytes(combined);
 		const suffixBundles = historyBundleCount(suffix);
+		const suffixToolTextBytes = historyToolTextBytes(suffix);
 		if (combinedBundles === undefined || suffixBundles === undefined
 			|| combinedBytes > hardToolTextBytes || combinedBundles > hardBundles
-			|| historyToolTextBytes(suffix) > activeBytes || suffixBundles > activeBundles
+			|| suffixToolTextBytes > activeBytes || suffixBundles > activeBundles
 			|| !validateContextToolPairing(combined)) {
-			return this.failure(input, rawToolTextBytes, rawBundles);
+			return this.failure(rawToolTextBytes, rawBundles, decision);
 		}
 
 		this.epochCounter = epoch;
@@ -2273,7 +2477,17 @@ export class HistoryProjectionController {
 			},
 		}, rawToolTextBytes, rawBundles, true, false, cause,
 			Math.max(0, anchor.collapsedResults - previousCollapsedResults),
-			Math.max(0, anchor.removedBundles - previousRemovedBundles));
+			Math.max(0, anchor.removedBundles - previousRemovedBundles), undefined, {
+				...decision,
+				eventKind: cause === "initial_hard_limit" ? "initial_hard_projection" : "epoch_checkpoint",
+				transitionCause: cause,
+				agedRawToolTextBytes: historyToolTextBytes(anchorRaw),
+				agedRawBundles: analysis.bundles.filter((bundle) => bundle.assistantIndex < split).length,
+				agedProjectedToolTextBytes: anchor.projectedToolTextBytes,
+				agedProjectedBundles: anchor.projectedBundles,
+				suffixRawToolTextBytes: suffixToolTextBytes,
+				suffixRawBundles: suffixBundles,
+			});
 	}
 
 	private sealSegment(
@@ -2285,6 +2499,32 @@ export class HistoryProjectionController {
 		cause: "hard_bytes" | "hard_bundles",
 	): HistoryProjectionControllerResult {
 		const previous = this.frozen!;
+		const stableBefore = stableProjectionPressure(previous);
+		const activeBundlesBefore = historyBundleCount(replay.active);
+		if (activeBundlesBefore === undefined) {
+			return this.failure(rawToolTextBytes, rawBundles, {
+				hardToolTextBytes: previous.hardToolTextBytes,
+				hardBundles: previous.hardBundles,
+				byteOverflow: false,
+				bundleOverflow: false,
+				segmentsBefore: previous.segments.length,
+				stableToolTextBytesBefore: stableBefore.toolTextBytes,
+				stableBundlesBefore: stableBefore.bundles,
+				activeToolTextBytesBefore: 0,
+				activeBundlesBefore: 0,
+			});
+		}
+		const decision: HistoryProjectionDecisionFacts = {
+			hardToolTextBytes: previous.hardToolTextBytes,
+			hardBundles: previous.hardBundles,
+			byteOverflow: replay.projectedToolTextBytes > previous.hardToolTextBytes,
+			bundleOverflow: replay.projectedBundles > previous.hardBundles,
+			segmentsBefore: previous.segments.length,
+			stableToolTextBytesBefore: stableBefore.toolTextBytes,
+			stableBundlesBefore: stableBefore.bundles,
+			activeToolTextBytesBefore: historyToolTextBytes(replay.active),
+			activeBundlesBefore,
+		};
 		if (previous.segments.length >= HISTORY_PROJECTION_MAX_SEGMENTS) {
 			return this.checkpoint(
 				input,
@@ -2296,6 +2536,7 @@ export class HistoryProjectionController {
 				cause,
 				previous.transitionCollapsedResults,
 				previous.transitionRemovedBundles,
+				decision,
 			);
 		}
 		const activeBytes = Math.min(turnCapForRole(input.role), previous.hardToolTextBytes);
@@ -2312,6 +2553,7 @@ export class HistoryProjectionController {
 				cause,
 				previous.transitionCollapsedResults,
 				previous.transitionRemovedBundles,
+				decision,
 			);
 		}
 		const agedRaw = input.messages.slice(previous.activeRawStartMessageCount, split);
@@ -2340,11 +2582,12 @@ export class HistoryProjectionController {
 		const combinedBundles = historyBundleCount(combined);
 		const suffixBundles = historyBundleCount(suffix);
 		const combinedBytes = historyToolTextBytes(combined);
+		const suffixToolTextBytes = historyToolTextBytes(suffix);
 		if (combinedBundles === undefined || suffixBundles === undefined
 			|| combinedBytes > previous.hardToolTextBytes || combinedBundles > previous.hardBundles
-			|| historyToolTextBytes(suffix) > activeBytes || suffixBundles > activeBundles
+			|| suffixToolTextBytes > activeBytes || suffixBundles > activeBundles
 			|| !validateContextToolPairing(combined)) {
-			return this.failure(input, rawToolTextBytes, rawBundles);
+			return this.failure(rawToolTextBytes, rawBundles, decision);
 		}
 
 		this.frozen = {
@@ -2367,13 +2610,24 @@ export class HistoryProjectionController {
 				removedBundles: this.frozen.transitionRemovedBundles,
 				protectedLatestBundles: suffixBundles,
 			},
-		}, rawToolTextBytes, rawBundles, false, true, "segment_sealed", segment.collapsedResults, segment.removedBundles);
+		}, rawToolTextBytes, rawBundles, false, true, "segment_sealed", segment.collapsedResults, segment.removedBundles,
+			undefined, {
+				...decision,
+				eventKind: "segment_seal",
+				transitionCause: "segment_sealed",
+				agedRawToolTextBytes: historyToolTextBytes(agedRaw),
+				agedRawBundles: historyBundleCount(agedRaw) ?? 0,
+				agedProjectedToolTextBytes: segment.projectedToolTextBytes,
+				agedProjectedBundles: segment.projectedBundles,
+				suffixRawToolTextBytes: suffixToolTextBytes,
+				suffixRawBundles: suffixBundles,
+			});
 	}
 
 	private failure(
-		_input: ProjectContextHistoryInput,
 		rawToolTextBytes: number,
 		rawBundles: number,
+		decision: HistoryProjectionDecisionFacts,
 	): HistoryProjectionControllerResult {
 		this.frozen = undefined;
 		this.legacyMigrationPending = false;
@@ -2386,38 +2640,97 @@ export class HistoryProjectionController {
 				removedBundles: 0,
 				protectedLatestBundles: 0,
 			},
-		}, rawToolTextBytes, rawBundles, true, false, "failure", 0, 0);
+		}, rawToolTextBytes, rawBundles, true, false, "failure", 0, 0, undefined, {
+			...decision,
+			eventKind: "fixed_failure",
+			transitionCause: "failure",
+			agedRawToolTextBytes: 0,
+			agedRawBundles: 0,
+			agedProjectedToolTextBytes: 0,
+			agedProjectedBundles: 0,
+			suffixRawToolTextBytes: 0,
+			suffixRawBundles: 0,
+		});
 	}
 
 	project(input: ProjectContextHistoryInput): HistoryProjectionControllerResult {
 		let rawToolTextBytes = 0;
 		let rawBundles = 0;
+		const entryFrozen = this.frozen;
+		const entryStable = stableProjectionPressure(entryFrozen);
+		let failureDecision: HistoryProjectionDecisionFacts = {
+			hardToolTextBytes: 0,
+			hardBundles: 0,
+			byteOverflow: false,
+			bundleOverflow: false,
+			segmentsBefore: entryFrozen?.segments.length ?? 0,
+			stableToolTextBytesBefore: entryStable.toolTextBytes,
+			stableBundlesBefore: entryStable.bundles,
+			activeToolTextBytesBefore: 0,
+			activeBundlesBefore: 0,
+		};
 		try {
+			const hardToolTextBytes = effectiveByteCap(input);
+			const hardBundles = effectiveBundleCap(input.maxBundles);
+			failureDecision = { ...failureDecision, hardToolTextBytes, hardBundles };
 			const rawHash = hashHistoryMessages(input.messages);
 			rawToolTextBytes = historyToolTextBytes(input.messages);
 			const analysis = analyzeContextHistory(input.messages);
-			if (!analysis.valid) return this.failure(input, rawToolTextBytes, 0);
+			if (!analysis.valid) return this.failure(rawToolTextBytes, 0, failureDecision);
 			rawBundles = analysis.bundles.length;
-			const hardToolTextBytes = effectiveByteCap(input);
-			const hardBundles = effectiveBundleCap(input.maxBundles);
+			const rawDecision: HistoryProjectionDecisionFacts = {
+				hardToolTextBytes,
+				hardBundles,
+				byteOverflow: rawToolTextBytes > hardToolTextBytes,
+				bundleOverflow: rawBundles > hardBundles,
+				segmentsBefore: 0,
+				stableToolTextBytesBefore: 0,
+				stableBundlesBefore: 0,
+				activeToolTextBytesBefore: rawToolTextBytes,
+				activeBundlesBefore: rawBundles,
+			};
+			failureDecision = rawDecision;
 			let invalidationCause: "prefix_changed" | "policy_changed" | undefined;
 			let invalidatedEpochHash: string | undefined;
 			let previousCollapsedResults = 0;
 			let previousRemovedBundles = 0;
+			let decision = rawDecision;
 
 			if (this.frozen) {
 				const previous = this.frozen;
+				const stableBefore = stableProjectionPressure(previous);
+				const invalidationDecision: HistoryProjectionDecisionFacts = {
+					...rawDecision,
+					segmentsBefore: previous.segments.length,
+					stableToolTextBytesBefore: stableBefore.toolTextBytes,
+					stableBundlesBefore: stableBefore.bundles,
+					activeToolTextBytesBefore: 0,
+					activeBundlesBefore: 0,
+				};
+				failureDecision = invalidationDecision;
 				previousCollapsedResults = previous.transitionCollapsedResults;
 				previousRemovedBundles = previous.transitionRemovedBundles;
 				const replayed = this.replay(input, hardToolTextBytes, hardBundles);
 				if (replayed.status === "ok") {
-					const activeBytes = historyToolTextBytes(replayed.replay.active);
 					const activeBundles = historyBundleCount(replayed.replay.active);
-					if (activeBundles === undefined) return this.failure(input, rawToolTextBytes, rawBundles);
-					const byteOverflow = activeBytes > Math.min(turnCapForRole(input.role), hardToolTextBytes)
-						|| replayed.replay.projectedToolTextBytes > hardToolTextBytes;
-					const bundleOverflow = activeBundles > Math.min(HISTORY_PROJECTION_ACTIVE_MAX_BUNDLES, hardBundles)
-						|| replayed.replay.projectedBundles > hardBundles;
+					if (activeBundles === undefined) return this.failure(rawToolTextBytes, rawBundles, invalidationDecision);
+					// Turn reserves choose the protected suffix during sealing; only complete projected
+					// history crossing a hard cap is allowed to rewrite the existing provider tail.
+					const byteOverflow = replayed.replay.projectedToolTextBytes > hardToolTextBytes;
+					const bundleOverflow = replayed.replay.projectedBundles > hardBundles;
+					const activeToolTextBytes = historyToolTextBytes(replayed.replay.active);
+					decision = {
+						hardToolTextBytes,
+						hardBundles,
+						byteOverflow,
+						bundleOverflow,
+						segmentsBefore: previous.segments.length,
+						stableToolTextBytesBefore: stableBefore.toolTextBytes,
+						stableBundlesBefore: stableBefore.bundles,
+						activeToolTextBytesBefore: activeToolTextBytes,
+						activeBundlesBefore: activeBundles,
+					};
+					failureDecision = decision;
 					if (!byteOverflow && !bundleOverflow) {
 						this.observeRaw(input.messages);
 						return this.finish({
@@ -2429,7 +2742,17 @@ export class HistoryProjectionController {
 								removedBundles: previous.transitionRemovedBundles,
 								protectedLatestBundles: activeBundles,
 							},
-						}, rawToolTextBytes, rawBundles, false, false, "none", 0, 0);
+						}, rawToolTextBytes, rawBundles, false, false, "none", 0, 0, undefined, {
+							...decision,
+							eventKind: "none",
+							transitionCause: "none",
+							agedRawToolTextBytes: 0,
+							agedRawBundles: 0,
+							agedProjectedToolTextBytes: 0,
+							agedProjectedBundles: 0,
+							suffixRawToolTextBytes: activeToolTextBytes,
+							suffixRawBundles: activeBundles,
+						});
 					}
 					return this.sealSegment(
 						input,
@@ -2441,6 +2764,7 @@ export class HistoryProjectionController {
 					);
 				}
 				invalidationCause = replayed.status;
+				decision = invalidationDecision;
 				invalidatedEpochHash = previous.epochHash;
 				this.epochCounter = Math.max(this.epochCounter, previous.epoch);
 				this.frozen = undefined;
@@ -2453,9 +2777,9 @@ export class HistoryProjectionController {
 					const previousEpochHash = underCapCause === "legacy_migration"
 						? EMPTY_HISTORY_HASH
 						: invalidatedEpochHash;
-					if (previousEpochHash === undefined) return this.failure(input, rawToolTextBytes, rawBundles);
+					if (previousEpochHash === undefined) return this.failure(rawToolTextBytes, rawBundles, decision);
 					const epoch = advanceHistoryProjectionEpoch(this.epochCounter);
-					if (epoch === undefined) return this.failure(input, rawToolTextBytes, rawBundles);
+					if (epoch === undefined) return this.failure(rawToolTextBytes, rawBundles, decision);
 					this.epochCounter = epoch;
 					this.legacyMigrationPending = false;
 					boundaryHash = inactiveHistoryProjectionBoundaryHash({
@@ -2479,7 +2803,17 @@ export class HistoryProjectionController {
 						protectedLatestBundles: rawBundles,
 					},
 					}, rawToolTextBytes, rawBundles, boundaryHash !== undefined, false,
-						underCapCause ?? "none", 0, 0, boundaryHash);
+						underCapCause ?? "none", 0, 0, boundaryHash, {
+							...decision,
+							eventKind: underCapCause === undefined ? "none" : "inactive_boundary",
+							transitionCause: underCapCause ?? "none",
+							agedRawToolTextBytes: 0,
+							agedRawBundles: 0,
+							agedProjectedToolTextBytes: 0,
+							agedProjectedBundles: 0,
+							suffixRawToolTextBytes: rawToolTextBytes,
+							suffixRawBundles: rawBundles,
+						});
 			}
 
 			const cause = this.legacyMigrationPending
@@ -2495,9 +2829,10 @@ export class HistoryProjectionController {
 				cause,
 				previousCollapsedResults,
 				previousRemovedBundles,
+				decision,
 			);
 		} catch {
-			return this.failure(input, rawToolTextBytes, rawBundles);
+			return this.failure(rawToolTextBytes, rawBundles, failureDecision);
 		}
 	}
 
@@ -2510,10 +2845,13 @@ export class HistoryProjectionController {
 		transitionCause: HistoryProjectionTransitionCause,
 		newlyCollapsedResults: number,
 		newlyRemovedBundles: number,
-		reportedBoundaryHash?: string,
+		reportedBoundaryHash: string | undefined,
+		observation: HistoryProjectionObservationSeed,
 	): HistoryProjectionControllerResult {
 		const projectedBundles = historyBundleCount(projection.messages) ?? 0;
 		let reportedEpochHash = reportedBoundaryHash ?? this.frozen?.epochHash ?? null;
+		let observationEventKind: HistoryProjectionEventKind = observation.eventKind;
+		let observationTransitionCause: HistoryProjectionObservationCause = observation.transitionCause;
 		if (transitionCause === "failure") {
 			epochTransitioned = !this.failureBoundaryActive;
 			this.failureBoundaryActive = true;
@@ -2522,6 +2860,8 @@ export class HistoryProjectionController {
 			this.failureBoundaryActive = false;
 			epochTransitioned = true;
 			reportedEpochHash ??= RECOVERY_BOUNDARY_HASH;
+			observationEventKind = "recovery_boundary";
+			observationTransitionCause = "recovery";
 		}
 		this.pressure = {
 			rawToolTextBytes: Math.max(0, rawToolTextBytes),
@@ -2542,6 +2882,33 @@ export class HistoryProjectionController {
 			newlyRemovedBundles: Math.max(0, newlyRemovedBundles),
 			rawBundleCount: Math.max(0, rawBundles),
 			projectedBundleCount: projectedBundles,
+			observability: {
+				eventKind: observationEventKind,
+				transitionCause: observationTransitionCause,
+				epoch: this.frozen?.epoch ?? this.epochCounter,
+				epochTransitioned: epochTransitioned ? 1 : 0,
+				segmentSealed: segmentSealed ? 1 : 0,
+				byteOverflow: observation.byteOverflow ? 1 : 0,
+				bundleOverflow: observation.bundleOverflow ? 1 : 0,
+				segmentsBefore: observation.segmentsBefore,
+				segmentsAfter: this.frozen?.segments.length ?? 0,
+				hardToolTextBytes: observation.hardToolTextBytes,
+				hardBundles: observation.hardBundles,
+				rawToolTextBytes: Math.max(0, rawToolTextBytes),
+				rawBundles: Math.max(0, rawBundles),
+				projectedToolTextBytes: Math.max(0, projection.facts.finalToolTextBytes),
+				projectedBundles,
+				stableToolTextBytesBefore: observation.stableToolTextBytesBefore,
+				stableBundlesBefore: observation.stableBundlesBefore,
+				activeToolTextBytesBefore: observation.activeToolTextBytesBefore,
+				activeBundlesBefore: observation.activeBundlesBefore,
+				agedRawToolTextBytes: observation.agedRawToolTextBytes,
+				agedRawBundles: observation.agedRawBundles,
+				agedProjectedToolTextBytes: observation.agedProjectedToolTextBytes,
+				agedProjectedBundles: observation.agedProjectedBundles,
+				suffixRawToolTextBytes: observation.suffixRawToolTextBytes,
+				suffixRawBundles: observation.suffixRawBundles,
+			},
 		};
 	}
 }

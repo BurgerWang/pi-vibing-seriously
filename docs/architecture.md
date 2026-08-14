@@ -40,7 +40,7 @@ extensions/workbench-runtime/
 ├── worker/
 │   ├── runner.ts            # short-lived pinned DeepSeek Pi child process + JSON event/usage capture
 │   └── path-scope.ts        # realpath/symlink enforcement for parent-approved worker writes
-└── cache/                   # P6-A prompt-cache telemetry (hash-only)
+└── cache/                   # P6-A prompt-cache telemetry (content-free hashes + numbers)
     ├── cache-types.ts       # record schema (1.1), usage semantics (verified api kinds)
     ├── canonical-hash.ts    # deterministic SHA-256 canonicalization
     ├── prompt-fingerprint.ts# system prompt / tool / payload digests (no text kept)
@@ -500,15 +500,20 @@ compaction/restoration retains the explicit handoff next step.
 
 ## Prompt-cache telemetry (P6-A)
 
+The schema-1.3 and P0–P2 statements in this section describe the Unreleased
+working tree, not a committed or deployed runtime.
+
 ```
-message_end (assistant only)  → normalized usage (Pi's usage object)
+context                       → numeric projection anatomy + exact actor role
 before_provider_request       → gated copy-on-write breakpoint transform
-                              → structural digest of actual outgoing payload
+                              → local structural digest (finalityCode=0)
+message_end (assistant only)  → normalized usage (Pi's usage object)
 session_start / model_select / thinking_level_select / session_before_compact
   → lifecycle flags (reload/new/model/thinking/mode/compaction)
         ↓
-observeMessageEnd: verify usage semantics → hash system prompt + tools
-  + payload shape → classify invalidation (priority chain)
+schema 1.3: correlate exactly one context + one local payload + one message
+  → verify usage semantics → hash system prompt + tools + payload shape
+  → classify invalidation (priority chain)
         ↓
 append record: .pi/workbench/cache/telemetry.jsonl  (JSONL, 5MB rotation)
   + pi.appendEntry("workbench-cache-state", lightweight summary)
@@ -517,10 +522,30 @@ footer segment: CACHE last=72% cum=68% | read 184k | miss 71k
 commands: /q-cache-status /q-cache-report [--save] /q-cache-doctor
 ```
 
-Rules: hash-only (never text), `usage.cost.total` is the cost fact,
-cacheHitRatio only for verified api kinds, telemetry never blocks or mutates
-requests, opt-out via `project.yaml` `cache.telemetry: false`. See
-docs/cache/ for details.
+Rules: content-free hashes/numbers only, `usage.cost.total` is the cost fact,
+and the local provider-hook digest is explicitly **not** the final actual wire.
+Prefix comparison is whole-item LCP; no partial item/token match is invented.
+Correlation `1` is exact. Unwired, multiple/stale/invalid, and missing
+correlation fail closed to unknown actor plus no projection anatomy.
+The projection reader and writer also enforce the semantic event/cause matrix
+and its overflow, epoch, seal, and segment-count invariants; a numerically
+well-formed but impossible combination is invalid. Pending correlation is
+single-use, is consumed at `message_end`, becomes ambiguous on extra
+context/provider observations, and is cleared on a restored or changed
+session identity.
+
+Schema 1.3 computes disjoint shares over
+`promptInputTokens = input + cacheRead + cacheWrite`. Read share is
+`cacheRead / promptInputTokens`; write share is separately available only when
+write semantics permit it. Responses status `2` is normalized absence-or-zero,
+not provider-presence verification. Reports attach numeric source/semantic
+quality codes and separate Commander from worker cohorts. Aggregate code `7`
+means exact sums exceed the safe numeric publication surface and both shares
+stay `null`; capped display totals never create a ratio. Cache doctor treats
+Proxy/accessor/symbol/exotic records as uninspectable partial evidence without
+executing application code. Telemetry never blocks or mutates requests; opt
+out with `project.yaml`
+`cache.telemetry: false`. See docs/cache/ for details.
 
 ## Session cost breakdown (commander / worker / other)
 
@@ -823,9 +848,10 @@ chat messages. Same-mode prefix changes are recorded as
 ### Active-history projection state v3
 
 The history hard ceilings remain Commander 98,304 bytes (96 KiB), worker/other
-65,536 bytes (64 KiB), and 128 complete assistant/tool-result bundles. The raw
-active tail reserves one role turn—65,536 bytes for Commander or 49,152 bytes
-for worker/other—and at most 16 bundles. Sixteen immutable segment slots each
+65,536 bytes (64 KiB), and 128 complete assistant/tool-result bundles. One role
+turn—65,536 bytes for Commander or 49,152 bytes for worker/other—and a
+16-bundle suffix target are used only after a true hard crossing to choose the
+raw suffix protected from projection. Sixteen immutable segment slots each
 reserve at most 384 tool-text bytes and one complete bundle. Therefore:
 
 ```text
@@ -840,15 +866,18 @@ chooses the largest latest raw suffix that fits the role-turn byte reserve and
 into the anchor and leaves the suffix raw.
 
 Inside an epoch, every request reconstructs the exact anchor, ordered immutable
-segments, and active raw suffix. When the active suffix exceeds either reserve,
-the controller projects only aged active material into one new segment (at most
-384 bytes and one bundle). Seals 1–16 leave the epoch hash, anchor, older
-segments, and their markers byte-identical; `segmentSealed` reports the
-expected tail rewrite separately from `epochTransitioned`. An attempt to create
-segment 17 instead triggers a checkpoint that rebuilds the anchor, clears the
-segment chain, and increments the epoch. If lowered policy caps cannot reserve
-the topology, the controller checkpoints or fails closed; pairing is verified
-on every branch.
+segments, and active raw suffix. Crossing the role-turn or 16-bundle reserve
+alone does nothing: while the complete reconstruction remains at or below both
+hard limits, the request stays byte-identical and reports no projection event.
+Only a true hard byte/bundle crossing projects aged active material into one
+new segment (at most 384 bytes and one bundle) after choosing the protected
+suffix. Seals 1–16 leave the epoch hash, anchor, older segments, and their
+markers byte-identical; `segmentSealed` reports the expected tail rewrite
+separately from `epochTransitioned`. A later true hard crossing that would
+create segment 17 instead performs the deterministic, model-free safety
+checkpoint: rebuild the anchor, clear the chain, and advance the epoch. If
+lowered policy caps cannot reserve the topology, the controller checkpoints or
+fails closed; pairing is verified on every branch.
 
 The projected anchor and every segment end with a deterministic bounded hidden
 marker. Its safe `boundaryId` derives only from projected/provider-visible
@@ -901,6 +930,55 @@ exact-prefix stability, but offline evidence cannot prove a future provider
 `cacheRead`. See the
 [stable-prefix contract](cache/stable-prefix-contract.md) for primary sources
 and measurement limits.
+
+Warm-prefix auxiliary compaction remains
+`BLOCKED_BY_PI_0_83_PUBLIC_API`. The installed Pi 0.83 public hook can cancel
+or replace the compaction result before persistence, but it exposes neither a
+post-summary payload transform nor a guarantee that a separate summary call
+shares the original cache domain. This runtime therefore does not reimplement
+private authentication, headers, streaming, retries, or provider invocation.
+Pi's built-in/native compaction flow is unchanged.
+
+## Trusted recoverable tool-result ingress (P0)
+
+The runtime mints private authority for exactly six finalized sources:
+
+| Source kind | Tool | Durable source |
+| --- | --- | --- |
+| `finalized_recipe_run` | `workbench_run_recipe` | `.pi/workbench/runs/<run-id>/summary.json` |
+| `executed_gate_run` | `workbench_run_gate` | `.pi/workbench/runs/<run-id>/gates.json` |
+| `immutable_comparison` | `workbench_compare_runs` | `.pi/workbench/comparisons/<comparison-id>/comparison.json` |
+| `completed_worker_report` | `workbench_delegate_worker` | `.pi/workbench/delegations/<delegation-id>/worker-report.md` |
+| `finalized_run_page` | `workbench_read_run` | the selected `manifest.json`, `stdout.log`, or `stderr.log` |
+| `run_id_gate_page` | `workbench_read_gate` | `.pi/workbench/runs/<run-id>/gates.json` |
+
+Authority requires an in-project regular file no larger than 4 MiB. One
+descriptor is opened without following symlinks; SHA-256 is streamed from that
+descriptor, pre/post file stats must match, and the namespace is rechecked.
+The snapshot identity commits to source path, content, size, device, inode,
+`mtimeNs`, and `ctimeNs`. Missing, escaped, linked, mutated, or oversized
+sources fail the trust check and continue through the ordinary bounded result
+path without recovery authority.
+
+The ingress projector is pure and role-neutral. Text at or below 4,096 UTF-8
+bytes retains the exact original block sequence/reference and receives
+content-bound metadata with zero omission. Only larger text receives the
+deterministic 4,096-byte recovery wrapper. If the call allocation or final
+envelope changes that candidate, the runtime discards it and re-runs the
+ordinary envelope over the original result; a partial metadata-free recovery
+wrapper can never reach the provider or receipt. Budget accounting consumes
+the final result once. `workbench_read_gate` renders each page against this
+call's actual reservation before cursor advancement, preserving every
+semantic row across pages.
+
+The middleware sequence is final envelope, receipt finalization over that
+bounded content, then bounded details projection. Trusted
+`ingress_projection` metadata is rebuilt from the private side channel, never
+accepted from caller details. Historical collapse strictly validates the
+exact metadata and tool/source contract, prefers its durable `sourcePath`, and
+only then falls back to a receipt or legacy source pointer. Commander, worker,
+and other roles share all of this code; role only selects the outer turn and
+history caps.
 
 ## Cache benchmark (P6-E)
 
@@ -1205,8 +1283,8 @@ run/cache/gate/delegation artifacts or execution counts.
   artifact snapshots
 - P5 path protection, token-based command guard, state recovery, compaction
   supplements, milestone session handoff, compatibility docs
-- P6-A DeepSeek prompt-cache telemetry and baseline: hash-only usage/context
-  observability, inferred invalidations, JSONL store with rotation,
+- P6-A DeepSeek prompt-cache telemetry and baseline: content-free hash/numeric
+  usage/context observability, inferred invalidations, JSONL store with rotation,
   /q-cache-status /q-cache-report /q-cache-doctor, footer cache segment
   (observation only — no Recipe Action Cache yet)
 - P7: split session-cost observability — pure cost-breakdown module

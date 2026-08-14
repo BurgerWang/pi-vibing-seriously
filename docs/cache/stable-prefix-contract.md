@@ -11,6 +11,9 @@ This contract is the P6-B companion to the P6-A telemetry docs
 (`deepseek-prompt-cache.md`). Read `cache-efficient-workflow.md` for the
 day-to-day workflow rules that follow from this contract.
 
+The P0–P2 sections below describe Unreleased working-tree behavior, not a
+committed, installed, or deployed cache improvement.
+
 ## The two zones
 
 ### Stable zone — must hash identically within a mode
@@ -45,8 +48,8 @@ re-hashes the prefix and silently defeats caching.
    `workbench-state`, `workbench-cache-state`).
 3. **Tool results** — the `content`/`details` of `workbench_*` tool
    executions (run ids, gate statuses, paths).
-4. **Telemetry hash metadata** — hashes of dynamic facts in telemetry
-   records, never their text.
+4. **Telemetry hash/numeric metadata** — hashes plus bounded numeric event,
+   correlation, usage, and projection facts; never their text.
 5. **Normal chat messages** — the compaction supplement note
    (`workbench-compact-note`, bounded, redacted, display:false).
 6. **Context projection** — a deterministic runtime transform may replace
@@ -82,15 +85,18 @@ discovery.
   proven public OpenAI GPT-5.6 Responses shape only, it may return a cloned
   payload with explicit breakpoints on exact marker blocks. Unsupported,
   uncertain, Codex-default, and DeepSeek paths return the original payload by
-  identity. Headers are never changed; telemetry hashes the actual outgoing
-  shape.
+  identity. Headers are never changed. Telemetry hashes the payload observed
+  locally at this hook with `finalityCode=0`; it does not claim the final
+  provider wire.
 - **The `context` event is enforcement, not cache observation.** Below the
   hard ceiling it returns raw history unchanged. At an initial checkpoint,
-  projection-state v3 freezes a 26/10 KiB Commander/worker anchor, reserves
-  one 64/48 KiB raw turn, and may later append up to 16 immutable
-  384-byte/one-bundle segments. Seals 1–16 preserve the epoch and every older
-  boundary; only an attempt to create segment 17 triggers a checkpoint and
-  increments the epoch.
+  projection-state v3 freezes a 26/10 KiB Commander/worker anchor and uses one
+  64/48 KiB raw turn plus a 16-bundle target to select the suffix only when a
+  true 96/64 KiB or 128-bundle hard crossing occurs. Reserve-only crossing
+  leaves the request byte-identical. Up to 16 immutable
+  384-byte/one-bundle segments may be appended. Seals 1–16 preserve the epoch
+  and every older boundary; a later hard crossing at the 16-segment safety
+  ceiling performs a model-free checkpoint and increments the epoch.
   Ordinary appends are not `CONTEXT_PREFIX_DIVERGED`; tool/system stable-zone
   hashes are unaffected.
 
@@ -236,15 +242,20 @@ It projects `[0, split)` into the fixed anchor and leaves `[split, end)` raw.
 On a same-state request it reconstructs the exact anchor, ordered segments, and
 active raw suffix. Small suffix growth is therefore whole-payload append-only.
 
-If the active suffix exceeds either its role-turn bytes or 16 bundles, the
-controller seals only aged active material into one new immutable segment. A
-segment contains at most 384 total UTF-8 tool-text bytes and one complete
-bundle. Seals 1 through 16 append to the chain without changing the epoch hash;
-the anchor, all older segments, and their markers remain exact. The separate
-`segmentSealed` signal classifies this as an expected active-tail rewrite—not a
-full fixed-prefix invalidation. An attempt to create segment 17 never seals
-early: it checkpoints, rebuilds the anchor, clears the segment chain,
-increments the epoch, and emits the separate checkpoint/epoch signal.
+The role-turn bytes and 16 bundles are selection reserves, not independent
+seal thresholds. If only either reserve is exceeded while the complete
+reconstruction remains within both hard limits, the controller emits no event
+and returns the exact same history. On a true hard byte/bundle crossing it
+seals only aged active material into one new immutable segment, after keeping
+the largest complete suffix that fits the reserves. A segment contains at most
+384 total UTF-8 tool-text bytes and one complete bundle. Seals 1 through 16
+append to the chain without changing the epoch hash; the anchor, all older
+segments, and their markers remain exact. The separate `segmentSealed` signal
+classifies this as an expected active-tail rewrite—not a full fixed-prefix
+invalidation. A later true hard crossing at the 16-segment ceiling never seals
+early: it performs the deterministic model-free checkpoint, rebuilds the
+anchor, clears the segment chain, increments the epoch, and emits the separate
+checkpoint/epoch signal.
 
 The projected anchor and every immutable segment end with a deterministic,
 bounded hidden custom marker. Its safe `boundaryId` is derived only from
@@ -282,6 +293,28 @@ pairing, and policy mismatch retain these fixed fail-closed semantics. Lowered
 test/policy caps clamp the formula; if the topology cannot be reserved, the
 controller checkpoints or fails closed rather than weakening a hard limit.
 
+## Recoverable ingress before history projection
+
+The stable-prefix design starts at the first provider-visible tool result, not
+only when old history is projected. Exactly six finalized durable authorities
+are eligible: recipe summaries, executed gate records, immutable comparisons,
+completed worker reports, finalized run pages, and run-id gate pages. The
+authority is role-neutral and binds an in-project regular source of at most
+4 MiB to its content hash and stable size/device/inode/`mtimeNs`/`ctimeNs`
+snapshot. Commander, worker, and other roles share this mechanism; their only
+difference is the surrounding byte budget.
+
+Eligible text at or below 4,096 UTF-8 bytes is replayed byte-for-byte with
+content-bound metadata. Only larger text receives the deterministic bounded
+recovery wrapper. If the current allocation cannot preserve that wrapper, the
+ordinary envelope is recomputed from the original result and recovery metadata
+is removed. Gate-page rendering uses the call allocation before it mints the
+next cursor, so a cursor cannot advance past a semantic row absent from final
+content. When that result later ages into projected history, strict metadata
+validation selects the durable source path before any receipt-summary
+fallback. These controls reduce avoidable prefix rewriting; they do not prove
+or promise a provider cache hit.
+
 ## Provider integration and research limits
 
 - [OpenAI Prompt Caching](https://developers.openai.com/api/docs/guides/prompt-caching)
@@ -317,6 +350,14 @@ controller checkpoints or fails closed rather than weakening a hard limit.
   DeepSeek hook is therefore a strict explicit-breakpoint no-op. Immutable
   segmentation can still preserve a longer matching prefix, but that is an
   architectural expectation, not a measured improvement.
+- [DeepSeek Harness at pinned commit
+  `47f943859bef60e4160492346772ded9b24f765a`](https://github.com/deepseek-ai/deepseek-harness/tree/47f943859bef60e4160492346772ded9b24f765a)
+  reinforces three client-applicable principles: preserve an append-only
+  reusable prefix, put changing material after stable material, and keep
+  durable/cold evidence outside the bounded model-visible surface. Its MLA
+  serving path, scheduler/eviction behavior, and disk-KV or block-cache
+  ownership are provider-side mechanisms and do **not** transfer to this Pi
+  client. Harness measurements are not workbench benchmark promises.
 - [vLLM Automatic Prefix Caching](https://docs.vllm.ai/en/v0.9.1/design/automatic_prefix_caching.html)
   and [SGLang RadixAttention](https://arxiv.org/abs/2312.07104) support the
   exact-prefix/block-reuse rationale. They do not establish the internals or
@@ -333,12 +374,59 @@ to Commander and worker/other; only their byte caps differ. It follows the
 common exact-prefix/block-reuse principle while preserving development quality
 through strict pairing, bounded state, and fail-closed restoration.
 
+### Warm-prefix auxiliary compaction boundary
+
+Status: `BLOCKED_BY_PI_0_83_PUBLIC_API`.
+
+The installed Pi 0.83 public
+[`session_before_compact` contract](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/compaction.md)
+can cancel compaction or provide a replacement compaction result. Its public
+[extension types](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/extensions/types.ts)
+do not expose a post-summary provider-payload transform. Pi's
+[compaction implementation](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/compaction.ts)
+also does not guarantee that a separate auxiliary summary call shares the
+original request's cache domain. A client implementation would therefore have
+to duplicate private authentication, headers, streaming, retry, and
+provider-call behavior. The workbench will not reimplement those internals.
+Built-in/native Pi compaction is unchanged; no warm-prefix auxiliary compactor
+is claimed here.
+
 This is a structural cache-cooperation contract, not evidence of recovered
 provider cache reuse. Only verified provider usage mapped to `cacheRead` is
 authoritative. The offline fake provider deliberately reports `cacheRead = 0`,
 so offline tests and benchmarks cannot substantiate a hit-rate improvement.
 Deploy first, start a new live session, and measure subsequent provider usage
 before making any recovery claim.
+
+## Canary evaluation targets (not guarantees)
+
+These thresholds are go/no-go **evaluation targets**, not promised hit rates,
+release evidence, or results already achieved. Evaluate only fresh-session
+schema-1.3 rows with exact request correlation, verified usage semantics, a
+complete/untruncated source, and no telemetry write gap. The percentage metric
+is the cohort's disjoint `cacheReadShare = cacheRead / (input + cacheRead +
+cacheWrite)`; do not substitute the older `cacheRead / (input + cacheRead)`
+display ratio.
+
+| Cohort | Minimum sample | Overall read-share target | Stable/no-event target | Segment-seal target |
+| --- | ---: | ---: | ---: | ---: |
+| Commander (`actorRoleCode=1`) | 300 requests | ≥ 82% | ≥ 94% | ≥ 80% |
+| Worker (`actorRoleCode=2`) | 1,000 requests | ≥ 78% | ≥ 93% | ≥ 65% |
+
+“Overall” uses the named actor cohort. The two subcohorts require strict-row
+filters: “segment-seal” intersects that actor with
+`historyProjection.segmentSealed=1`, while “stable/no-event” intersects it with
+`historyProjection.eventCode=0`. The current report exposes actor and
+projection cohorts separately; it does not fabricate their intersection.
+
+For each actor separately, epoch-checkpoint requests should be no more than 5%
+of exact rows, and unattributed stable-zone drift should be zero. A cohort with
+non-exact correlation, unknown actor, mixed legacy rows, a non-available read
+share, partial sources, or too few requests is **not evaluable**; it does not
+pass by treating missing data as zero. Write-share conclusions separately
+require write status `1`; unavailable/normalized-absence semantics are not
+promoted to presence verification. Commander and worker totals must not be
+pooled to hide a regression in either actor.
 
 ## Hashing rules
 

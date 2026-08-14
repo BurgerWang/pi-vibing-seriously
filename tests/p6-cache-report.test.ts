@@ -8,10 +8,39 @@ import { test } from "node:test";
 
 import { buildCacheReport, renderCacheReport, renderCacheStatus } from "../extensions/workbench-runtime/cache/cache-report.ts";
 import { runDoctor, doctorToJson, renderDoctor, type DoctorFacts } from "../extensions/workbench-runtime/cache/cache-doctor.ts";
+import { hasForbiddenTelemetryFields } from "../extensions/workbench-runtime/cache/cache-store.ts";
 import { createCacheTelemetry, type CacheTelemetry, type MessageEndFacts } from "../extensions/workbench-runtime/cache/cache-telemetry.ts";
-import type { TelemetryRecord } from "../extensions/workbench-runtime/cache/cache-types.ts";
+import { isTelemetryRecord, type TelemetryRecord } from "../extensions/workbench-runtime/cache/cache-types.ts";
 
 const BASE_TIME = 1_700_000_000_000;
+
+const PROJECTION_ANATOMY = {
+	eventCode: 2 as const,
+	causeCode: 4 as const,
+	epoch: 7,
+	epochTransitioned: 0 as const,
+	segmentSealed: 1 as const,
+	byteOverflow: 1 as const,
+	bundleOverflow: 0 as const,
+	segmentsBefore: 2,
+	segmentsAfter: 3,
+	hardToolTextBytes: 1_000_000,
+	hardBundles: 5_000,
+	rawToolTextBytes: 120_000,
+	rawBundles: 80,
+	projectedToolTextBytes: 90_000,
+	projectedBundles: 70,
+	stableToolTextBytesBefore: 60_000,
+	stableBundlesBefore: 50,
+	activeToolTextBytesBefore: 30_000,
+	activeBundlesBefore: 20,
+	agedRawToolTextBytes: 20_000,
+	agedRawBundles: 10,
+	agedProjectedToolTextBytes: 10_000,
+	agedProjectedBundles: 8,
+	suffixRawToolTextBytes: 100_000,
+	suffixRawBundles: 70,
+};
 
 const TOOLS = [
 	{ name: "read", description: "read a file", parameters: { type: "object" } },
@@ -80,7 +109,242 @@ test("report aggregates totals, modes, models and hit ratio", async () => {
 	assert.equal(report.invalidationCounts["UNKNOWN"], 1);
 });
 
-test("report exposes schema 1.2 projection and only exact eligible public OpenAI explicit-breakpoint usage", async () => {
+test("schema 1.3 report aggregates exact local observations and disjoint read/write shares by actor", async () => {
+	const records = await collectRecords([
+		{
+			ev: (t) => {
+				t.observeContextProjection({ actorRoleCode: 1, historyProjection: PROJECTION_ANATOMY });
+				t.observePayload({ messages: [{ role: "user", content: "A🙂" }] });
+			},
+			facts: {
+				provider: "openai",
+				model: "gpt-5.6",
+				apiKind: "openai-responses",
+				usage: { input: 9, output: 1, cacheRead: 90, cacheWrite: 1, totalTokens: 101, cost: { total: 0.01 } },
+			},
+		},
+		{
+			ev: (t) => {
+				t.observeContextProjection({
+					actorRoleCode: 2,
+					historyProjection: { ...PROJECTION_ANATOMY, eventCode: 3, causeCode: 3, epochTransitioned: 1, segmentSealed: 0, byteOverflow: 0, bundleOverflow: 1, segmentsAfter: 0 },
+				});
+				t.observePayload({ messages: [{ role: "user", content: "A🙂" }, { role: "assistant", content: "next" }] });
+			},
+			facts: {
+				usage: { input: 20, output: 1, cacheRead: 80, cacheWrite: 0, totalTokens: 101, cost: { total: 0.01 } },
+			},
+		},
+	]);
+
+	const report = buildCacheReport(records, "project", rateLookup);
+	assert.equal(report.schema13Rows, 2);
+	assert.ok(report.observability);
+	assert.deepEqual(report.observability.correlationCounts, { unwired: 0, exact: 2, multipleOrStale: 0, missing: 0 });
+	assert.equal(report.observability.localObservedRequests, 2);
+	assert.equal(report.observability.nonFinalObservedRequests, 2);
+	assert.deepEqual(report.observability.wholeItemLcp, { eligibleRequests: 2, itemCount: 1, utf8Bytes: 9 });
+	assert.equal(report.observability.projection.eventCounts[2], 1);
+	assert.equal(report.observability.projection.eventCounts[3], 1);
+	assert.equal(report.observability.projection.byteOverflowRequests, 1);
+	assert.equal(report.observability.projection.bundleOverflowRequests, 1);
+	assert.equal(report.observability.retainedWindowUsage.cacheReadShare, 0.85, "shares are recomputed from disjoint totals");
+	assert.equal(report.observability.retainedWindowUsage.cacheWriteShare, null, "DeepSeek write-unavailable prevents a fabricated whole-window write share");
+	assert.equal(report.observability.actorCohorts.commander.cacheWriteShare, 0.01);
+	assert.equal(report.observability.actorCohorts.worker.cacheWriteShare, null);
+	assert.equal(report.observability.actorCohorts.unknown.requestCount, 0, "unknown actors are not guessed");
+	assert.equal(report.observability.projectionCohorts.segmentSeal.requestCount, 1);
+	assert.equal(report.observability.projectionCohorts.epochTransition.requestCount, 1);
+	const facts: DoctorFacts = {
+		provider: "openai",
+		model: "gpt-5.6",
+		apiKind: "openai-responses",
+		modelCostPresent: true,
+		modelCostRatesValid: true,
+		systemPrompt: "stable",
+		activeToolNames: ["read", "grep", "find", "bash"],
+		tools: TOOLS,
+		records,
+		telemetryEnabled: true,
+		telemetryBytes: 1024,
+		telemetryMaxBytes: 5 * 1024 * 1024,
+		rotatedFiles: 0,
+	};
+	const checks = runDoctor(facts);
+	assert.equal(checks.find((check) => check.id === "provider_wire_observation")?.status, "warn");
+	assert.match(checks.find((check) => check.id === "provider_wire_observation")?.message ?? "", /not final actual wire/);
+	assert.equal(checks.find((check) => check.id === "request_correlation")?.status, "ok");
+	const doctorJson = doctorToJson(checks, facts) as { cache_observability?: { schema13Rows?: number; facts?: { nonFinalObservedRequests?: number } } };
+	assert.equal(doctorJson.cache_observability?.schema13Rows, 2);
+	assert.equal(doctorJson.cache_observability?.facts?.nonFinalObservedRequests, 2);
+
+	const bounded = buildCacheReport(records, "project", rateLookup, { truncatedRecords: 1 });
+	assert.equal(bounded.hitRatio, 170 / 199, "legacy retained-window cacheHitRatio semantics stay unchanged");
+	assert.equal(bounded.observability?.retainedWindowUsage.cacheReadShare, null);
+	assert.equal(bounded.observability?.retainedWindowUsage.cacheReadShareStatusCode, 4);
+	const {
+		promptInputTokens: _promptInputTokens,
+		cacheReadShare: _cacheReadShare,
+		cacheWriteShare: _cacheWriteShare,
+		cacheWriteStatusCode: _cacheWriteStatusCode,
+		actorRoleCode: _actorRoleCode,
+		requestCorrelationCode: _requestCorrelationCode,
+		historyProjection: _historyProjection,
+		wireObservation: _wireObservation,
+		...legacyFields
+	} = records[1]!;
+	const mixed = buildCacheReport([records[0]!, { ...legacyFields, schemaVersion: "1.2" }], "project", rateLookup);
+	assert.equal(mixed.schema13Rows, 1);
+	assert.equal(mixed.hitRatio, 170 / 199, "legacy overall ratio remains available for a verified complete mixed source");
+	assert.equal(mixed.observability?.retainedWindowUsage.cacheReadShare, null);
+	assert.equal(mixed.observability?.retainedWindowUsage.cacheReadShareStatusCode, 2);
+
+	const missingWire = { ...records[0] } as Record<string, unknown>;
+	delete missingWire.wireObservation;
+	const invalid = buildCacheReport([missingWire as unknown as TelemetryRecord], "project", rateLookup);
+	assert.equal(invalid.schema13Rows, 0);
+	assert.equal(invalid.observability, null, "missing 1.3 facts mean unobserved, never zero-filled");
+	assert.equal(invalid.sourceIncomplete, true);
+});
+
+test("doctor fails correlation closed for multiple and missing schema 1.3 request events", async () => {
+	const records = await collectRecords([
+		{
+			ev: (t) => {
+				t.observeContextProjection({ actorRoleCode: 1, historyProjection: PROJECTION_ANATOMY });
+				t.observeContextProjection({ actorRoleCode: 1, historyProjection: PROJECTION_ANATOMY });
+				t.observePayload({ messages: [] });
+			},
+		},
+		{ ev: (t) => t.observeContextProjection({ actorRoleCode: 2, historyProjection: PROJECTION_ANATOMY }) },
+	]);
+	assert.deepEqual(records.map((record) => record.actorRoleCode), [0, 0], "the emitter clears actor attribution on non-exact correlation");
+	const report = buildCacheReport(records, "project", rateLookup);
+	assert.deepEqual(report.observability?.correlationCounts, { unwired: 0, exact: 0, multipleOrStale: 1, missing: 1 });
+	assert.equal(report.observability?.actorCohorts.unknown.requestCount, 2);
+	assert.equal(report.observability?.actorCohorts.commander.requestCount, 0);
+	assert.equal(report.observability?.actorCohorts.worker.requestCount, 0);
+
+	const corruptAttribution = [
+		{ ...records[0]!, actorRoleCode: 1 as const },
+		{ ...records[1]!, actorRoleCode: 2 as const },
+	];
+	const invalidReport = buildCacheReport(corruptAttribution, "project", rateLookup);
+	assert.equal(invalidReport.requestCount, 0, "non-exact actor attribution is rejected before aggregation");
+	assert.equal(invalidReport.schema13Rows, 0);
+	assert.equal(invalidReport.observability, null, "invalid rows never populate Commander or worker cohorts");
+	assert.equal(invalidReport.skippedRecords, 2);
+	assert.equal(invalidReport.sourceIncomplete, true);
+	const checks = runDoctor({
+		provider: "deepseek",
+		model: "deepseek-v4-flash",
+		apiKind: "openai-completions",
+		modelCostPresent: true,
+		modelCostRatesValid: true,
+		systemPrompt: "stable",
+		activeToolNames: ["read", "grep", "find", "bash"],
+		tools: TOOLS,
+		records,
+		telemetryEnabled: true,
+		telemetryBytes: 1024,
+		telemetryMaxBytes: 5 * 1024 * 1024,
+		rotatedFiles: 0,
+	});
+	const correlation = checks.find((check) => check.id === "request_correlation");
+	assert.equal(correlation?.status, "warn");
+	assert.match(correlation?.message ?? "", /multiple-or-stale=1 missing=1/);
+});
+
+test("report rejects impossible projection anatomy before it can poison projection cohorts", async () => {
+	const records = await collectRecords([{
+		ev: (t) => {
+			t.observeContextProjection({ actorRoleCode: 1, historyProjection: PROJECTION_ANATOMY });
+			t.observePayload({ messages: [] });
+		},
+	}]);
+	assert.equal(records.length, 1);
+	const poisoned = {
+		...records[0]!,
+		historyProjection: { ...records[0]!.historyProjection!, eventCode: 2 as const, causeCode: 3 as const },
+	};
+	const report = buildCacheReport([records[0]!, poisoned], "project", rateLookup);
+	assert.equal(report.requestCount, 1);
+	assert.equal(report.schema13Rows, 1);
+	assert.equal(report.skippedRecords, 1);
+	assert.equal(report.sourceIncomplete, true);
+	assert.equal(report.observability?.projection.observedRequests, 1);
+	assert.deepEqual(report.observability?.projection.eventCounts, { "2": 1 });
+	assert.equal(report.observability?.projectionCohorts.segmentSeal.requestCount, 1);
+	assert.equal(report.observability?.retainedWindowUsage.cacheReadShare, null);
+	assert.equal(report.observability?.retainedWindowUsage.cacheReadShareStatusCode, 3);
+});
+
+test("schema 1.3 cohort shares use exact BigInt sums and fail only overflowing cohorts closed", async () => {
+	const [commanderTemplate, workerTemplate] = await collectRecords([
+		{
+			ev: (t) => {
+				t.observeContextProjection({ actorRoleCode: 1, historyProjection: PROJECTION_ANATOMY });
+				t.observePayload({ messages: [] });
+			},
+		},
+		{
+			ev: (t) => {
+				t.observeContextProjection({
+					actorRoleCode: 2,
+					historyProjection: {
+						...PROJECTION_ANATOMY,
+						eventCode: 3,
+						causeCode: 2,
+						epochTransitioned: 1,
+						segmentSealed: 0,
+						segmentsAfter: 0,
+					},
+				});
+				t.observePayload({ messages: [] });
+			},
+		},
+	]);
+	assert.ok(commanderTemplate && workerTemplate);
+
+	const half = 500_000_000_000_000;
+	const hugeCommanderRows = Array.from({ length: 20 }, () => ({
+		...commanderTemplate,
+		usage: { input: half, output: 0, cacheRead: half, cacheWrite: 0, totalTokens: 1_000_000_000_000_000, cost: 0 },
+		cacheHitRatio: 0.5,
+		promptInputTokens: 1_000_000_000_000_000,
+		cacheReadShare: 0.5,
+		cacheWriteShare: null,
+		cacheWriteStatusCode: 1 as const,
+	}));
+	for (const row of hugeCommanderRows) assert.equal(isTelemetryRecord(row), true, "each source row remains independently valid");
+
+	const report = buildCacheReport([...hugeCommanderRows, workerTemplate], "project", rateLookup);
+	const retained = report.observability?.retainedWindowUsage;
+	const commander = report.observability?.actorCohorts.commander;
+	const worker = report.observability?.actorCohorts.worker;
+	const segment = report.observability?.projectionCohorts.segmentSeal;
+	const checkpoint = report.observability?.projectionCohorts.epochTransition;
+	assert.ok(retained && commander && worker && segment && checkpoint);
+
+	for (const cohort of [retained, commander, segment]) {
+		assert.equal(cohort.promptInputTokens, Number.MAX_SAFE_INTEGER, "overflowing published totals saturate");
+		assert.equal(cohort.uncachedInputTokens, Number.MAX_SAFE_INTEGER);
+		assert.equal(cohort.cacheReadTokens, Number.MAX_SAFE_INTEGER);
+		assert.equal(cohort.cacheReadShare, null, "a true 50% share is never distorted toward 100%");
+		assert.equal(cohort.cacheWriteShare, null);
+		assert.equal(cohort.cacheReadShareStatusCode, 7);
+		assert.equal(cohort.cacheWriteShareStatusCode, 7);
+	}
+
+	assert.equal(worker.cacheReadShare, 0.8, "a disjoint non-overflowing actor cohort remains exact");
+	assert.equal(worker.cacheReadShareStatusCode, 1);
+	assert.equal(worker.cacheWriteShare, null);
+	assert.equal(worker.cacheWriteShareStatusCode, 6);
+	assert.equal(checkpoint.cacheReadShare, 0.8, "a disjoint non-overflowing projection cohort remains exact");
+	assert.equal(checkpoint.cacheReadShareStatusCode, 1);
+});
+
+test("report preserves projection counters and only exact eligible public OpenAI explicit-breakpoint usage", async () => {
 	const records = await collectRecords([
 		{},
 		{ ev: (t) => t.observeHistoryProjectionSegmentSeal("a".repeat(64)) },
@@ -144,7 +408,7 @@ test("report exposes schema 1.2 projection and only exact eligible public OpenAI
 	assert.equal(applied.length, 6);
 	assert.ok(applied.every((record) => record.usageSemanticStatus === "verified"), "adversarial records have verified usage semantics");
 	const report = buildCacheReport(records, "project", rateLookup);
-	assert.equal(report.schemaVersion, "1.2");
+	assert.equal(report.schemaVersion, "1.3");
 	assert.equal(report.historyProjectionSegmentSeals, 1);
 	assert.equal(report.historyProjectionEpochTransitions, 1);
 	assert.equal(report.explicitBreakpointAppliedRequests, 6, "all applied markers remain visible for doctor mismatch diagnostics");
@@ -162,6 +426,8 @@ test("report exposes schema 1.2 projection and only exact eligible public OpenAI
 
 	const partial = buildCacheReport(records, "project", rateLookup, { sourceIncomplete: true, skippedRecords: 1 });
 	assert.equal(partial.explicitBreakpointVerifiedUsage.hitRatio, null, "partial source evidence cannot present a clean applied-request ratio");
+	assert.equal(partial.observability?.retainedWindowUsage.cacheReadShare, null);
+	assert.equal(partial.observability?.retainedWindowUsage.cacheReadShareStatusCode, 3);
 });
 
 test("report excludes an errored eligible applied request even when its zero usage semantics are verified", async () => {
@@ -322,7 +588,7 @@ test("estimated avoided cost is unavailable when source evidence is partial or b
 
 test("empty report: no records, no fabrication", () => {
 	const report = buildCacheReport([], "session", rateLookup);
-	assert.equal(report.schemaVersion, "1.2", "empty/current fallback follows the telemetry schema");
+	assert.equal(report.schemaVersion, "1.3", "empty/current fallback follows the telemetry schema");
 	assert.equal(report.requestCount, 0);
 	assert.equal(report.hitRatio, null);
 	assert.equal(report.semanticStatus, null);
@@ -341,9 +607,12 @@ test("empty report: no records, no fabrication", () => {
 
 test("partial or unverified usage semantics never fabricate an aggregate hit ratio", async () => {
 	const records = await collectRecords([{}]);
-	const partial = [{ ...records[0]!, usageSemanticStatus: "partial" as const, cacheHitRatio: null }];
-	const unverified = [{ ...records[0]!, usageSemanticStatus: "unverified" as const, cacheHitRatio: null }];
-	assert.equal(buildCacheReport(partial, "project", rateLookup).hitRatio, null);
+	const partial = [{ ...records[0]!, usageSemanticStatus: "partial" as const, cacheHitRatio: null, cacheReadShare: null, cacheWriteShare: null, cacheWriteStatusCode: 0 as const }];
+	const unverified = [{ ...records[0]!, usageSemanticStatus: "unverified" as const, cacheHitRatio: null, cacheReadShare: null, cacheWriteShare: null, cacheWriteStatusCode: 0 as const }];
+	const partialReport = buildCacheReport(partial, "project", rateLookup);
+	assert.equal(partialReport.hitRatio, null);
+	assert.equal(partialReport.observability?.retainedWindowUsage.cacheReadShare, null);
+	assert.equal(partialReport.observability?.retainedWindowUsage.cacheReadShareStatusCode, 5);
 	assert.equal(buildCacheReport(unverified, "project", rateLookup).hitRatio, null);
 	assert.equal(
 		buildCacheReport(records, "project", rateLookup, { skippedRecords: 2, sourceIncomplete: true }).hitRatio,
@@ -359,6 +628,9 @@ test("durable telemetry write gaps make reports and doctor conclusions partial",
 		precedingEvent: "telemetry_write_gap",
 		usageSemanticStatus: "unverified",
 		cacheHitRatio: null,
+		cacheReadShare: null,
+		cacheWriteShare: null,
+		cacheWriteStatusCode: 0,
 	};
 	const gappedRecords = [records[0]!, gapRecord];
 	const report = buildCacheReport(gappedRecords, "project", rateLookup);
@@ -442,6 +714,17 @@ test("report rejects malformed runtime records without throwing or producing NaN
 	assert.equal(report.hitRatio, null);
 	assert.ok(Object.values(report.totals).every(Number.isFinite));
 	assert.doesNotThrow(() => renderCacheReport(report));
+	const facts: DoctorFacts = {
+		provider: "deepseek", model: "deepseek-v4-flash", apiKind: "openai-completions",
+		modelCostPresent: true, modelCostRatesValid: true, systemPrompt: "stable",
+		activeToolNames: ["read"], tools: TOOLS, records: [records[0]!, malformed],
+		telemetryEnabled: true, telemetryBytes: 1024, telemetryMaxBytes: 5 * 1024 * 1024, rotatedFiles: 0,
+	};
+	const checks = runDoctor(facts);
+	assert.equal(checks.find((check) => check.id === "telemetry_source_quality")?.status, "warn");
+	assert.match(checks.find((check) => check.id === "telemetry_source_quality")?.message ?? "", /schema-invalid=1/);
+	const json = doctorToJson(checks, facts) as { telemetry_quality?: { invalidSchemaRecords?: number } };
+	assert.equal(json.telemetry_quality?.invalidSchemaRecords, 1);
 });
 
 test("doctor: all checks pass on a healthy setup", async () => {
@@ -465,7 +748,7 @@ test("doctor: all checks pass on a healthy setup", async () => {
 	const fails = checks.filter((c) => c.status === "fail");
 	assert.deepEqual(fails, [], `unexpected fails: ${JSON.stringify(fails)}`);
 	const ids = checks.map((c) => c.id);
-	for (const expected of ["current_model", "telemetry_source_quality", "usage_fields", "model_cost_metadata", "models_json", "auth_json", "system_prompt_dynamics", "prefix_hashes", "tool_metadata_static", "tool_stability", "same_mode_drift", "expected_vs_unexpected", "history_projection_events", "explicit_breakpoint_usage", "churn", "forbidden_fields", "telemetry_size", "telemetry_enabled"]) {
+	for (const expected of ["current_model", "telemetry_source_quality", "provider_wire_observation", "request_correlation", "usage_fields", "model_cost_metadata", "models_json", "auth_json", "system_prompt_dynamics", "prefix_hashes", "tool_metadata_static", "tool_stability", "same_mode_drift", "expected_vs_unexpected", "history_projection_events", "explicit_breakpoint_usage", "churn", "forbidden_fields", "telemetry_size", "telemetry_enabled"]) {
 		assert.ok(ids.includes(expected), expected);
 	}
 	assert.equal(checks.find((check) => check.id === "explicit_breakpoint_usage")?.status, "skip", "DeepSeek without an applied record is not warned");
@@ -628,6 +911,7 @@ test("doctor: partial or truncated telemetry suppresses clean historical conclus
 	assert.deepEqual(json.telemetry_quality, {
 		sourceIncomplete: true,
 		skippedRecords: 1,
+		invalidSchemaRecords: 0,
 		truncatedRecords: 7,
 		filesRead: 3,
 		sourceUnavailable: "read_error",
@@ -691,6 +975,70 @@ test("doctor flags forbidden fields in records", async () => {
 	const forbidden = checks.find((c) => c.id === "forbidden_fields");
 	assert.ok(forbidden);
 	assert.equal(forbidden.status, "fail");
+});
+
+test("doctor treats hostile telemetry records as partial without invoking traps or accessors", () => {
+	let proxyTrapCalls = 0;
+	const proxy = new Proxy(Object.create(null) as Record<string, unknown>, {
+		get() {
+			proxyTrapCalls += 1;
+			throw new Error("telemetry proxy get trap executed");
+		},
+		ownKeys() {
+			proxyTrapCalls += 1;
+			throw new Error("telemetry proxy ownKeys trap executed");
+		},
+		getOwnPropertyDescriptor() {
+			proxyTrapCalls += 1;
+			throw new Error("telemetry proxy descriptor trap executed");
+		},
+	});
+	const revoked = Proxy.revocable(Object.create(null), {});
+	revoked.revoke();
+	let getterCalls = 0;
+	const accessor = Object.create(null) as Record<string, unknown>;
+	Object.defineProperty(accessor, "content", {
+		enumerable: true,
+		get() {
+			getterCalls += 1;
+			throw new Error("telemetry accessor executed");
+		},
+	});
+	const symbolRecord = Object.create(null) as Record<string | symbol, unknown>;
+	symbolRecord[Symbol("hidden")] = "secret";
+	const exoticRecord = new Date(0);
+	const hostileRecords = [proxy, revoked.proxy, accessor, symbolRecord, exoticRecord];
+
+	for (const hostile of hostileRecords) {
+		assert.doesNotThrow(() => hasForbiddenTelemetryFields(hostile));
+		assert.notEqual(hasForbiddenTelemetryFields(hostile), null, "uninspectable values fail closed");
+	}
+
+	const facts: DoctorFacts = {
+		provider: "deepseek",
+		model: "deepseek-v4-flash",
+		apiKind: "openai-completions",
+		modelCostPresent: true,
+		modelCostRatesValid: true,
+		systemPrompt: "sp",
+		activeToolNames: [],
+		tools: [],
+		records: hostileRecords as unknown as readonly TelemetryRecord[],
+		telemetryEnabled: true,
+		telemetryBytes: 10,
+		telemetryMaxBytes: 5 * 1024 * 1024,
+		rotatedFiles: 0,
+	};
+	let checks: ReturnType<typeof runDoctor> = [];
+	assert.doesNotThrow(() => {
+		checks = runDoctor(facts);
+	});
+	assert.equal(checks.find((check) => check.id === "telemetry_source_quality")?.status, "warn");
+	assert.equal(checks.find((check) => check.id === "forbidden_fields")?.status, "warn");
+	assert.match(checks.find((check) => check.id === "forbidden_fields")?.message ?? "", /uninspectable=5/);
+	assert.doesNotThrow(() => doctorToJson(checks, facts));
+	assert.equal(proxyTrapCalls, 0);
+	assert.equal(getterCalls, 0);
 });
 
 test("doctor flags same-mode drift (UNEXPECTED_DRIFT within a stable mode)", async () => {

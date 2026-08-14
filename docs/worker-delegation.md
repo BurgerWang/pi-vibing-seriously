@@ -467,6 +467,9 @@ fails safe (0/false), and the workbench never reimplements Pi compaction.
 
 ## Worker context-budget protection
 
+The P0–P2 cache/history refinements in this section are Unreleased working-tree
+behavior, not a claim that the runtime has been committed or deployed.
+
 Before each worker provider request, the v0.10.0 output control plane also
 validates assistant/tool-result pairing and projects complete historical
 bundles to the 64 KiB worker active-history budget. A single worker tool batch
@@ -481,18 +484,22 @@ crosses the unchanged 65,536-byte or 128-bundle hard limit. Projection-state v3
 reserves its full 49,152-byte raw turn plus sixteen 384-byte/one-bundle segment
 slots, leaving a fixed anchor cap of
 `max(0, 65,536 - 49,152 - 16 * 384) = 10,240` bytes and 96 bundles. The active
-raw suffix is capped at 16 bundles.
+suffix target is 16 bundles when a hard-limit projection is actually required.
 
 At the initial checkpoint the worker keeps the largest latest raw suffix that
 fits those turn limits and projects only the older prefix into the anchor.
 Normal requests replay the exact anchor, immutable ordered segments, and raw
-active suffix. When the active suffix exceeds either reserve, seals 1–16
-project aged material into one new segment (at most 384 tool-text bytes and one
-complete bundle) while keeping the epoch, anchor, every older segment, and
-their safe boundary markers byte-identical. This is an expected tail rewrite,
-not an epoch invalidation. An attempt to create segment 17 triggers a
-checkpoint that rebuilds the anchor, clears the chain, and increments the
-epoch. Branching or completed compaction resets the boundary.
+active suffix. Crossing the 49,152-byte or 16-bundle reserve alone does not
+seal: while the complete reconstruction remains at or below 65,536 bytes and
+128 bundles, the worker request stays byte-identical and emits no projection
+event. Only a true hard crossing selects the protected suffix and lets seals
+1–16 project aged material into one new segment (at most 384 tool-text bytes
+and one complete bundle) while keeping the epoch, anchor, every older segment,
+and their safe boundary markers byte-identical. This is an expected tail
+rewrite, not an epoch invalidation. A later true hard crossing at the
+16-segment ceiling performs the deterministic model-free checkpoint: rebuild
+the anchor, clear the chain, and increment the epoch. Branching or completed
+compaction resets the boundary.
 
 Reload restores only an exact strict v3 numeric/hash state (at most 32 KiB),
 reconstructing every contiguous slice from raw JSONL. Strict v1/v2 entries are
@@ -532,6 +539,19 @@ that is an architectural benefit rather than a measured cache-hit claim. Only
 verified provider `cacheRead` usage can establish reuse; offline fake-provider
 usage is zero by design.
 
+Schema-1.3 telemetry attributes a row to the worker cohort only when one
+worker `context` projection, one local `before_provider_request` observation,
+and one assistant `message_end` correlate exactly. The local observation has
+`finalityCode=0` and is not the final provider wire. Unwired,
+multiple/stale/invalid, or missing correlation forces unknown actor and no
+projection facts. Reports therefore keep Commander and worker read/write
+shares in separate cohorts; they never pool an ambiguous row into the worker
+numbers. Responses write status `2` means normalized absence-or-zero, not
+presence-verified provider evidence. Event/cause/overflow/segment facts must
+match the strict schema-1.3 semantic matrix, and aggregate status `7` forces
+both shares to `null` when an exact sum exceeds the safe numeric publication
+surface.
+
 The same researched design rule applies to Commander and worker: immutable
 fixed anchor, modular immutable segments, and rare checkpoints. Public OpenAI
 GPT-5.6 Responses traffic is independently gated and requires an existing,
@@ -541,6 +561,18 @@ the latest 50 breakpoint candidates for reads, and approximately 15
 requests/minute per key, measured through `cached_tokens` and
 `cache_write_tokens`. Thus 17 logical anchor/segment markers do not mean 17 new
 writes. DeepSeek stays automatic/no-op at the field layer.
+
+The [DeepSeek Harness audit at pinned commit
+`47f943859bef60e4160492346772ded9b24f765a`](https://github.com/deepseek-ai/deepseek-harness/tree/47f943859bef60e4160492346772ded9b24f765a)
+contributes append-only-prefix, stable-before-dynamic, and bounded-model-surface
+principles only. Its MLA serving, scheduler, disk-KV ownership, and benchmark
+numbers do not transfer to this Pi worker.
+
+Warm-prefix auxiliary compaction is
+`BLOCKED_BY_PI_0_83_PUBLIC_API`: there is no public post-summary payload
+transform or same-cache-domain guarantee. The worker runtime does not duplicate
+private auth/header/stream/retry behavior. Existing worker compaction
+cancellation and Commander built-in/native compaction behavior are unchanged.
 
 The pinned worker runs on a 1,000,000-token context window. The workbench
 protects that budget with two thresholds that are model-specific and
@@ -814,7 +846,7 @@ third (and final, for this repair) — the cache telemetry records each as
 `UNEXPECTED_DRIFT` (expected, not a defect); see
 [docs/compatibility.md](compatibility.md). DeepSeek usage is
 returned as nested tool usage and the child workbench can continue using the
-existing hash-only cache telemetry.
+existing content-free hash-and-numeric cache telemetry.
 
 NRO N1/N2 (Commander Native Tool Optimization,
 `docs/plans/commander-native-tool-optimization.md`) adds the three fixed
@@ -851,6 +883,25 @@ aggregated `usage` and a nullable `cache_hit_ratio`
 denominator) renders `hit ratio N/A` and `cache_hit_ratio: null` — never
 NaN or a fabricated number. The complete final worker report is NEVER
 embedded: it is the durable `worker-report.md` artifact.
+
+That durable report is one of exactly six trusted recoverable-ingress sources,
+alongside finalized recipe summaries, executed gate records, immutable
+comparisons, finalized run pages, and run-id gate pages. The execution layer
+opens an in-project regular source no larger than 4 MiB without following
+symlinks and binds its content plus size/device/inode/`mtimeNs`/`ctimeNs`
+snapshot. Text no larger than 4,096 UTF-8 bytes remains byte-exact with bounded
+metadata; only larger text receives the deterministic recovery wrapper. If a
+low turn allocation cannot preserve that wrapper, the ordinary envelope is
+rebuilt from the original result and no stale wrapper metadata survives.
+Later history collapse prefers the validated durable source path over a
+receipt-summary pointer.
+
+This ingress implementation has no worker-specific branch: Commander, worker,
+and other use the same authority, byte threshold, content binding, receipt
+ordering, and history-pointer validation. Role selection changes only the
+outer turn/history caps. Gate-page cursors are also allocation-aware, so the
+worker never loses an undisplayed semantic row when following a run-id gate
+page.
 
 On the commander side, GPT-5.6 Sol's own usage (`apiKind`
 `openai-codex-responses`) is a verified Responses-style semantic in the

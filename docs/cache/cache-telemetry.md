@@ -1,10 +1,13 @@
 # Cache Telemetry (P6-A)
 
 Observability for DeepSeek's prompt cache in the workbench. P6-A records
-hash-only telemetry of usage and context stability and infers why the cache
-missed. The telemetry component does not change requests, control the cache, or
-cache anything itself; the independently gated provider hook runs before the
-telemetry digest described below.
+content-free hash-and-numeric telemetry of usage and context stability and
+infers why the cache missed. The telemetry component does not change requests,
+control the cache, or cache anything itself; the independently gated provider
+hook runs before the local telemetry digest described below.
+
+Schema 1.3 is Unreleased working-tree behavior. This documentation does not
+claim that it has been committed, installed, deployed, or measured live.
 
 ## Scope and non-goals
 
@@ -24,27 +27,29 @@ telemetry digest described below.
 | `session_start` | restore the session cache summary (custom entry `workbench-cache-state`); classify `reload`/`new` reasons |
 | `model_select` | remember the model; the next request is inferred `MODEL_CHANGED` |
 | `thinking_level_select` | remember the level; next request is inferred `THINKING_LEVEL_CHANGED` |
-| `before_provider_request` | capability-gated copy-on-write breakpoint transform, then a structural digest of the actual outgoing payload (roles, lengths, per-segment SHA-256, tool names); headers remain unchanged |
-| `message_end` | **assistant messages only**: read normalized usage, hash system prompt + tools + payload shape, classify the invalidation, append one JSONL record |
+| `context` | record exact content-free projection anatomy and runtime actor code for correlation with the next request |
+| `before_provider_request` | capability-gated copy-on-write breakpoint transform, then a structural digest of that **local hook payload**; `finalityCode=0` means it is not the final actual provider wire; headers remain unchanged |
+| `message_end` | **assistant messages only**: correlate exactly one context + one local payload + one completion, read normalized usage, hash system prompt + tools + payload shape, classify the invalidation, append one JSONL record |
 | `session_before_compact` | the next request is inferred `COMPACTION` |
 | `session_tree` | after Pi completes tree navigation, the next request is inferred `SESSION_TREE_CHANGED` exactly once |
 | `session_shutdown` | safe flush of the session state entry |
 
 The context-output projector reports v3 epoch/checkpoint and segment-seal
-signals separately. Commander reserves a 65,536-byte raw turn inside its
-98,304-byte hard ceiling; worker/other reserves 49,152 inside 65,536. After
-also reserving sixteen 384-byte/one-bundle segments, their anchor caps are
-26,624/10,240 bytes and 96 bundles; the active raw suffix is capped at 16
-bundles.
+signals separately. Commander uses a 65,536-byte raw-turn reserve inside its
+98,304-byte hard ceiling; worker/other uses 49,152 inside 65,536. After also
+reserving sixteen 384-byte/one-bundle segments, their anchor caps are
+26,624/10,240 bytes and 96 bundles. The turn and 16-bundle values select the
+protected suffix only after a true hard byte/bundle crossing; crossing a
+reserve alone leaves under-cap history byte-identical and emits no event.
 
-The initial checkpoint establishes the anchor and epoch. Seals 1–16 append one
+The initial hard projection establishes the anchor and epoch. Seals 1–16 append one
 immutable segment while leaving the epoch hash, anchor, older segments, and
 safe boundary markers unchanged; telemetry treats `segmentSealed` /
 `segment_sealed` as an expected active-tail rewrite, not
 `HISTORY_PROJECTION_EPOCH_CHANGED`. An attempt to create segment 17 triggers a
-checkpoint that rebuilds the anchor, clears the chain, and increments the
-epoch. Replaying the
-same topology with an appended raw suffix creates neither event.
+checkpoint only on the next true hard crossing; it rebuilds the anchor, clears
+the chain, and increments the epoch without a model call. Replaying the same
+topology with an appended raw suffix creates neither event.
 
 The companion pressure signal is unchanged by projection-state v3. Its custom
 type and `data.schema` are `workbench-context-pressure-v1`, and its data object
@@ -64,7 +69,9 @@ and WebSocket probes; DeepSeek injection is a strict no-op while still
 receiving the stable segmented prompt.
 
 Telemetry failures are caught everywhere: they can never block, delay, or
-modify a model request, and they never throw into Pi.
+modify a model request, and they never throw into Pi. Prefix comparison uses a
+longest common prefix of **whole payload items** and records only item counts
+plus UTF-8 byte totals; it never promotes a partial item/token match.
 
 ## Storage
 
@@ -90,11 +97,11 @@ hardcoded):
 - **Opt-out**: `cache: { telemetry: false }` in `project.yaml` disables
   recording (default: enabled).
 
-## Record schema (`schemaVersion: "1.2"`)
+## Record schema (`schemaVersion: "1.3"`)
 
 ```jsonc
 {
-  "schemaVersion": "1.2",
+  "schemaVersion": "1.3",
   "timestamp": "2026-01-15T09:30:00.000Z",
   "extensionVersion": "0.10.0",
   "hashedSessionId": "e3b0c44298fc1c14",       // SHA-256(session id), first 16 hex
@@ -114,6 +121,50 @@ hardcoded):
   },
   "usageSemanticStatus": "verified",            // verified | partial | unverified
   "cacheHitRatio": 0.8,                         // cacheRead/(input+cacheRead); null if unverified or zero denominator
+  "promptInputTokens": 50000,                   // input+cacheRead+cacheWrite
+  "cacheReadShare": 0.8,                        // cacheRead/promptInputTokens
+  "cacheWriteShare": null,                      // separate share; unavailable for this DeepSeek row
+  "cacheWriteStatusCode": 1,                    // DeepSeek completions write semantics unavailable
+  "actorRoleCode": 2,                           // 0 unknown | 1 Commander | 2 worker
+  "requestCorrelationCode": 1,                  // exact context/request/message correlation
+  "historyProjection": {
+    "contextSerial": 12,
+    "eventCode": 0,
+    "causeCode": 0,
+    "epoch": 0,
+    "epochTransitioned": 0,
+    "segmentSealed": 0,
+    "byteOverflow": 0,
+    "bundleOverflow": 0,
+    "segmentsBefore": 0,
+    "segmentsAfter": 0,
+    "hardToolTextBytes": 65536,
+    "hardBundles": 128,
+    "rawToolTextBytes": 0,
+    "rawBundles": 0,
+    "projectedToolTextBytes": 0,
+    "projectedBundles": 0,
+    "stableToolTextBytesBefore": 0,
+    "stableBundlesBefore": 0,
+    "activeToolTextBytesBefore": 0,
+    "activeBundlesBefore": 0,
+    "agedRawToolTextBytes": 0,
+    "agedRawBundles": 0,
+    "agedProjectedToolTextBytes": 0,
+    "agedProjectedBundles": 0,
+    "suffixRawToolTextBytes": 0,
+    "suffixRawBundles": 0
+  },
+  "wireObservation": {
+    "requestSerial": 12,
+    "finalityCode": 0,                          // local hook only; never final actual wire
+    "digestStatusCode": 1,
+    "apiShapeCode": 1,
+    "relationshipCode": 2,
+    "itemCount": 24,
+    "itemLcpCount": 20,
+    "itemLcpUtf8Bytes": 18000
+  },
   "systemPromptHash": "…",                      // SHA-256 of the system prompt string
   "activeToolNamesHash": "…",                   // hash of active tool names (set)
   "activeToolOrderHash": "…",                   // hash of active tool names (order)
@@ -125,6 +176,37 @@ hardcoded):
   "driftSource": "TOOL_SET"          // SYSTEM_PROMPT | TOOL_SET | TOOL_ORDER | TOOL_SCHEMA | null
 }
 ```
+
+Schema 1.3 readers are strict: exact own keys, bounded numeric values, and
+recomputed usage/share consistency are required. Strict 1.0–1.2 rows remain
+readable as legacy records but never fabricate 1.3 correlation or projection
+facts.
+
+`requestCorrelationCode` values are `0` unwired, `1` exact, `2`
+multiple/stale/invalid, and `3` missing. Non-exact codes (`0`/`2`/`3`) must
+carry `actorRoleCode: 0` and `historyProjection: null`; a reader rejects any
+row that attributes an actor or projection to ambiguous correlation.
+
+`wireObservation.finalityCode` is contractually `0`. It describes the local
+payload seen at `before_provider_request`, not the final bytes delivered to a
+provider. `relationshipCode` is derived from a whole-item longest common
+prefix; `itemLcpCount` and `itemLcpUtf8Bytes` never include a partially matching
+item.
+
+Projection event codes are `0 none`, `1 initial_hard_projection`, `2
+segment_seal`, `3 epoch_checkpoint`, `4 inactive_boundary`, `5 fixed_failure`,
+and `6 recovery_boundary`. Cause codes are `0 none`, `1 initial_hard_limit`, `2
+hard_bytes`, `3 hard_bundles`, `4 segment_sealed`, `5 prefix_changed`, `6
+policy_changed`, `7 legacy_migration`, `8 failure`, and `9 recovery`. Every
+projection return path emits the exact numeric anatomy shown above; slice-only
+values are zero only when that slice is structurally inapplicable.
+
+Those codes are a strict semantic matrix, not independent enums. The only
+event/cause pairs are `0:0`, `1:1`, `2:4`, `3:{2,3,5,6,7}`,
+`4:{5,6,7}`, `5:8`, and `6:9`; each pair also has exact requirements for hard
+overflow, epoch transition, segment sealing, and segment counts. A writer that
+receives impossible anatomy marks request correlation invalid and clears actor
+and projection attribution. A strict reader rejects the row.
 
 `usageSemanticStatus` rules:
 
@@ -142,8 +224,16 @@ hardcoded):
   `precedingEvent: "telemetry_write_gap"` marker after one or more failed
   JSONL appends: the ratio is `null`. The workbench never guesses.
 
-`cacheWrite = 0` (DeepSeek reports no cache writes) does not affect the
-semantic status.
+Schema 1.3 intentionally separates reads and writes. Its common denominator is
+`promptInputTokens = input + cacheRead + cacheWrite`;
+`cacheReadShare = cacheRead / promptInputTokens` and
+`cacheWriteShare = cacheWrite / promptInputTokens` are not complements.
+`cacheWriteStatusCode` means `0` unverified, `1` unavailable for DeepSeek Chat
+Completions, `2` normalized absence-or-zero for Responses, and `3` reserved for
+presence-verified evidence. Current emitters do not fabricate code `3`.
+Therefore a Responses `cacheWrite = 0` under status `2` is not proof that the
+provider explicitly reported a zero write; a DeepSeek zero under status `1`
+remains unavailable, not an error.
 
 ## Invalidation reasons (inferred)
 
@@ -192,6 +282,20 @@ marker on the next recorded request; later unattributed rewrites still report
   retained records; that value is explicitly a bounded-window ratio, not a
   whole-history claim.
 
+  For schema-1.3 rows, `observability` adds correlation counts
+  (`unwired`/`exact`/`multipleOrStale`/`missing`), local/nonfinal observation
+  counts, whole-item LCP totals, projection event/cause and hard-overflow
+  counts, and usage cohorts for the retained window, Commander, worker,
+  unknown actor, segment seals, and epoch transitions. Each usage cohort keeps
+  read and write shares disjoint. Its numeric status code is `0` empty, `1`
+  complete verified all-1.3 evidence, `2` mixed legacy/1.3, `3` partial or
+  schema-invalid, `4` bounded/truncated, `5` usage semantics unverified, or
+  `6` write semantics unavailable/unverified. Code `7`
+  (`aggregate_overflow`) means the exact BigInt aggregate exceeds the safe
+  numeric publication surface; published display totals may cap, but both
+  shares are `null` and no saturated ratio is fabricated. A `null` share is
+  unavailable, not zero.
+
   The report and its saved JSON expose four record-derived projection and
   breakpoint facts:
 
@@ -219,6 +323,8 @@ marker on the next recorded request; later unattributed rewrites still report
 - `/q-cache-doctor [json]` — health checks: usage validity, cost metadata,
   models.json/auth.json non-involvement, system prompt dynamics, current
   prefix hashes (`prefix_hashes`), same-mode drift (`same_mode_drift`),
+  local nonfinal provider observation (`provider_wire_observation`), exact
+  context/request/message attribution (`request_correlation`),
   expected vs unexpected counts, projection lifecycle counts
   (`history_projection_events`), explicit-breakpoint usage
   (`explicit_breakpoint_usage`), churn (model/thinking/mode/reload/
@@ -247,6 +353,22 @@ marker on the next recorded request; later unattributed rewrites still report
   authoritative-usage statement. The JSON adds only numeric
   `history_projection` and `explicit_breakpoints` summaries.
 
+  `provider_wire_observation` never reports OK from a local hook digest: when
+  observations exist it warns that `finalityCode=0` is nonfinal.
+  `request_correlation` is OK only when retained schema-1.3 rows are exactly
+  correlated, usage semantics are verified, and the evidence window is
+  complete. Any unwired/multiple/stale/invalid/missing row or partial source
+  warns; actor-specific conclusions must not use those ambiguous rows. One
+  request observation is consumed exactly once at `message_end`; extra
+  context/provider observations become ambiguous, a missing provider
+  observation is missing, and session identity/restore resets pending
+  correlation state.
+
+  Doctor record inspection reads only ordinary own-data descriptors. Proxy,
+  revoked Proxy, accessor, symbol-keyed, or exotic records are counted as
+  uninspectable partial evidence; their traps/getters are not invoked and the
+  doctor cannot emit a clean whole-source conclusion from them.
+
   OpenAI's documented operating guidance is exact-prefix matching, static
   content first and variable content last, a consistent `prompt_cache_key`, at
   most four new cache writes per request, reads from up to the latest 50
@@ -257,6 +379,19 @@ marker on the next recorded request; later unattributed rewrites still report
   [stable-prefix contract](stable-prefix-contract.md) for primary sources and
   the immutable-anchor/modular-segment/rare-checkpoint design shared by
   Commander and worker.
+
+The audit also pins [DeepSeek Harness commit
+`47f943859bef60e4160492346772ded9b24f765a`](https://github.com/deepseek-ai/deepseek-harness/tree/47f943859bef60e4160492346772ded9b24f765a).
+Only its append-only prefix, stable-before-dynamic ordering, and bounded
+model-surface principles are borrowed. MLA/provider scheduling and disk-KV
+ownership are non-transferable, and its measurements are not telemetry
+targets or benchmark promises.
+
+Warm-prefix auxiliary compaction is
+`BLOCKED_BY_PI_0_83_PUBLIC_API`: Pi 0.83 exposes no post-summary payload
+transform or same-cache-domain guarantee. The workbench does not duplicate
+private auth/header/stream/retry behavior; built-in/native compaction remains
+unchanged.
 
 ## Session state entry
 
@@ -287,6 +422,12 @@ aggregate without verified semantic provenance never receives a fabricated
 cumulative ratio. Nothing is shown before the first request, in print/json
 modes, or when telemetry is disabled.
 
+This footer ratio is the retained compatibility display
+`cacheRead / (input + cacheRead)`. It is not schema 1.3's disjoint
+`cacheReadShare`, whose denominator also includes `cacheWrite`; canary
+evaluation must use the labeled schema-1.3 cohort share rather than silently
+substituting the footer value.
+
 ## Formal-stress isolation and existing history
 
 The context-output formal stress recipe now runs its real `AgentSession` in a
@@ -307,3 +448,9 @@ offline telemetry and projection tests cannot prove reuse or a hit-rate gain.
 After deploying the runtime, start a new session and inspect subsequent live
 requests with `/q-cache-status` or `/q-cache-report` before drawing a recovery
 conclusion.
+
+For live rollout evaluation, use the separate Commander and worker targets in
+the [stable-prefix canary section](stable-prefix-contract.md#canary-evaluation-targets-not-guarantees).
+They are targets—not guarantees—and require fresh, exact-correlated,
+complete-source schema-1.3 cohorts; missing or ambiguous evidence is not zero
+and cannot pass a canary.

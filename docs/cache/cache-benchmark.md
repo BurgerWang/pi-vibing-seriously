@@ -5,6 +5,9 @@ prompt-cache and action-cache behavior. It turns local evidence into a
 repeatable report so that "did caching help?" can be answered with the same
 numbers every time.
 
+Schema-1.3/P0–P2 fields described below are Unreleased working-tree behavior;
+their documentation is not a commit, deployment, or benchmark result.
+
 ## Commands
 
 | Command | npm script | What it does |
@@ -23,7 +26,7 @@ write into `reports/<name>.json`).
 
 1. **Workbench telemetry JSONL** — `.pi/workbench/cache/telemetry.jsonl` and
    rotated `telemetry.N.jsonl` (strict P6-A records, schema version
-   1.0/1.1/1.2).
+   1.0/1.1/1.2/1.3).
 2. **Pi normalized usage** — the `usage` object inside each telemetry
    record (input/output/cacheRead/cacheWrite/totalTokens/cost as Pi exposed
    them on the assistant message).
@@ -60,9 +63,16 @@ equal in-Pi numbers.
 | `uncachedInputTokens` | Σ `usage.input` — tokens billed as cache-miss input. |
 | `cacheReadTokens` | Σ `usage.cacheRead` — tokens billed as cache-hit input. |
 | `outputTokens` | Σ `usage.output`. |
-| `cacheWriteTokens` | Σ `usage.cacheWrite` (0 for DeepSeek — it reports no cache writes; a zero is NOT an error). |
+| `cacheWriteTokens` | Σ `usage.cacheWrite`. Schema 1.3 keeps its provenance separate: DeepSeek Completions status `1` means write semantics unavailable; Responses status `2` means normalized absence-or-zero, not provider-presence verification. |
 | `totalTokens` | Σ `usage.totalTokens` (input + output + cacheRead + cacheWrite per record). |
 | `cacheHitRatio` | `cacheRead / (input + cacheRead)` over the retained scope totals; `null` when usage semantics are not verified, the source is incomplete/corrupt, or the denominator is 0. Intentional oldest-record truncation alone keeps this existing bounded-window ratio available and labels the scope as bounded; it is not a whole-history ratio. Only meaningful for api kinds whose semantics were confirmed in the installed Pi source (`openai-completions`, `openai-responses`, `azure-openai-responses`, `openai-codex-responses`, `anthropic-messages`). |
+| `observability.retainedWindowUsage.cacheReadShare` | Schema-1.3 disjoint share `cacheRead / (input + cacheRead + cacheWrite)`, available only for a complete, verified, all-1.3 retained cohort. This—not `cacheHitRatio`—is the canary read-share metric. |
+| `observability.retainedWindowUsage.cacheWriteShare` | Separate schema-1.3 share `cacheWrite / (input + cacheRead + cacheWrite)`; `null` when write semantics are unavailable/unverified. Read and write shares are never treated as complements. |
+| `cacheReadShareStatusCode` / `cacheWriteShareStatusCode` | `0` empty, `1` complete verified all-1.3, `2` mixed legacy/1.3, `3` partial/schema-invalid, `4` bounded/truncated, `5` usage semantics unverified, `6` write semantics unavailable/unverified, `7` `aggregate_overflow` (the exact aggregate exceeds the safe numeric publication surface). Code `7` forces both shares to `null`; capped display totals are not used to fabricate a ratio. |
+| `observability.correlationCounts` | Counts of `unwired`, `exact`, `multipleOrStale`, and `missing`. Non-exact rows are unknown-actor rows with no projection facts and cannot support actor/cohort conclusions. |
+| `observability.wholeItemLcp` | Eligible exact-correlated local observations plus whole-item LCP item and UTF-8 byte totals. The local observation has `finalityCode=0`; no final-wire or partial-item/token claim is made. |
+| `observability.actorCohorts` | Separate `unknown`, `commander`, and `worker` usage cohorts. Commander and worker must be evaluated separately. |
+| `observability.projectionCohorts` | Separate `segmentSeal` and `epochTransition` usage cohorts with numeric event/cause and hard-overflow counts. |
 | `usageSemanticStatus` | Worst status across records: `verified` (api kind verified + internally consistent numbers), `partial` (structure ok, api kind unverified), `unverified` (invalid/missing usage). Never guessed. |
 | `providerReportedCost` | Σ `usage.cost` — Pi's `usage.cost.total`, the cost fact from the provider's own billing fields. |
 | `estimatedAvoidedCost` | Σ (`cacheRead` × `cacheRead` rate)/1M tokens using the **explicit `--cost-map`**; `null` if any record's provider/model has no rate in the map (strict — no partial estimates) or no map is given. |
@@ -103,16 +113,18 @@ Projection-state v3 preserves that relationship with a fixed anchor, ordered
 immutable segments, and a raw active suffix. Commander uses a 98,304-byte hard
 ceiling, 65,536-byte turn reserve, and 26,624-byte anchor; worker/other uses
 65,536, 49,152, and 10,240 bytes. Both reserve sixteen segments of at most 384
-tool-text bytes/one complete bundle, cap the raw active suffix at 16 bundles,
-and cap the anchor at 96 bundles.
+tool-text bytes/one complete bundle and cap the anchor at 96 bundles. The
+turn/16-bundle values select the protected suffix only at a true hard crossing;
+reserve-only growth under both hard limits remains byte-identical and produces
+event `none`.
 
 Seals 1–16 append one segment while leaving the epoch, anchor, older segments,
 and safe boundary markers exact. The benchmark must classify that signal as an
 expected active-tail rewrite rather than a full epoch invalidation. An
-attempt to create segment 17 triggers a checkpoint that rebuilds the anchor,
-clears the chain, and produces the expected
-`HISTORY_PROJECTION_EPOCH_CHANGED`. Same-state suffix appends remain
-whole-payload append-only.
+additional true hard crossing at the 16-segment ceiling triggers the
+deterministic model-free checkpoint, rebuilds the anchor, clears the chain, and
+produces the expected `HISTORY_PROJECTION_EPOCH_CHANGED`. Same-state suffix
+appends—including reserve-only crossing—remain whole-payload append-only.
 
 This CLI is offline and observation-only. It can validate stored arithmetic
 and structural relationships, but its fake provider deliberately reports
@@ -135,6 +147,17 @@ checks `warn` and the applied-subset ratio `N/A` (`null` in JSON). These
 summaries retain numeric counts and usage only; they do not retain request
 content and cannot prove a cache-hit improvement.
 
+Schema 1.3 adds `provider_wire_observation` and `request_correlation` doctor
+checks. A local observation is always reported as nonfinal (`finalityCode=0`),
+never as an OK final-wire proof. Correlation warns on any
+unwired/multiple/stale/invalid/missing row, unverified semantics, or incomplete
+window; only exact rows can enter Commander/worker projection cohorts. The
+schema accepts only the defined event/cause pairs with matching overflow,
+epoch, seal, and segment transitions; impossible numeric anatomy is invalid
+rather than a new category. Doctor inspection is descriptor-only and treats
+Proxy/accessor/symbol/exotic records as partial/uninspectable evidence without
+executing traps or getters.
+
 Provider-side operating guidance is documented, not exercised, by this offline
 CLI. OpenAI requires exact prefixes, recommends static content first and
 variable content last, and uses a consistent `prompt_cache_key` for reliable
@@ -145,6 +168,17 @@ measure results. Consequently, the workbench's 17 logical anchor/segment
 markers are not 17 new writes per request. See the
 [stable-prefix contract](stable-prefix-contract.md) for primary sources and the
 Commander/worker immutable-anchor, modular-segment, rare-checkpoint rationale.
+
+The source synthesis also pins [DeepSeek Harness commit
+`47f943859bef60e4160492346772ded9b24f765a`](https://github.com/deepseek-ai/deepseek-harness/tree/47f943859bef60e4160492346772ded9b24f765a).
+Append-only-prefix and bounded-model-surface principles are borrowed; MLA,
+server scheduling, disk-KV ownership, and harness measurements are not
+transferable benchmark claims. Warm-prefix auxiliary compaction remains
+`BLOCKED_BY_PI_0_83_PUBLIC_API`; built-in/native Pi compaction is unchanged.
+The separate Commander and worker canary thresholds in the
+[stable-prefix contract](stable-prefix-contract.md#canary-evaluation-targets-not-guarantees)
+are evaluation targets only and cannot be satisfied by offline/fake-provider
+data.
 
 ## Statistics, reproducibility
 

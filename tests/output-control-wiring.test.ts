@@ -1,9 +1,10 @@
 /** R2 final-envelope, receipt-ordering and persistence fail-safe wiring. */
 
 import assert from "node:assert/strict";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { isAbsolute, join, relative } from "node:path";
-import { before, test } from "node:test";
+import { createHash } from "node:crypto";
+import { mkdir, readFile, stat, symlink, utimes, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative } from "node:path";
+import { before, describe, test } from "node:test";
 
 import {
 	CONFIG_DIR_NAME,
@@ -41,9 +42,24 @@ import {
 	WORKER_TURN_MAX_BYTES,
 } from "../extensions/workbench-runtime/core/output-policy.ts";
 import { STREAM_UPDATE_MAX_LINES } from "../extensions/workbench-runtime/core/output-envelope.ts";
-import { TURN_CALL_LIMIT_CONTROL_TEXT } from "../extensions/workbench-runtime/core/turn-output-budget.ts";
+import {
+	DEFENSIVE_DYNAMIC_RESERVATION_BYTES,
+	TURN_CALL_LIMIT_CONTROL_TEXT,
+} from "../extensions/workbench-runtime/core/turn-output-budget.ts";
 import { COMPARE_SUMMARY_MAX_BYTES, COMPARE_SUMMARY_MAX_LINES } from "../extensions/workbench-runtime/core/render.ts";
 import { deriveResultId } from "../extensions/workbench-runtime/core/tool-result-recovery.ts";
+import {
+	TOOL_RESULT_INGRESS_BUDGET_BYTES,
+	TOOL_RESULT_INGRESS_METADATA_MAX_BYTES,
+	projectToolResultIngress,
+	type TrustedRecoveryAuthority,
+	type TrustedRecoverySourceKind,
+} from "../extensions/workbench-runtime/core/tool-result-ingress-projection.ts";
+import {
+	TRUSTED_RECOVERY_SOURCE_MAX_BYTES,
+	buildTrustedRecoveryAuthority,
+	toolResultTextContentDigest,
+} from "../extensions/workbench-runtime/core/trusted-recovery-authority.ts";
 import { applyExplicitPromptCacheBreakpoints } from "../extensions/workbench-runtime/core/prompt-cache-breakpoints.ts";
 import {
 	OUTPUT_CONTROL_STATUS_MAX_BYTES,
@@ -643,7 +659,7 @@ test("runtime context terminal fallback never re-inspects hostile messages or ex
 	await invoke({ type: "context", messages: revoked.proxy });
 });
 
-test("runtime seals v3 segments without rewriting stable prefixes and checkpoints seal 17", async () => {
+test("runtime seals v3 segments on true hard crossings without rewriting stable prefixes and checkpoints seal 17", async () => {
 	const stub = makeRoleRuntime("other");
 	const ctx = trustedCtx(process.cwd(), "history-epoch-runtime") as ExtensionContext;
 	const providerWire = (messages: AgentMessage[]): unknown[] => (
@@ -704,10 +720,15 @@ test("runtime seals v3 segments without rewriting stable prefixes and checkpoint
 	for (let index = 0; index < 25; index += 1) {
 		await emitEvent(stub, "turn_start", { type: "turn_start", turnIndex: 52 + index, timestamp: 2 + index }, ctx);
 		const id = `runtime-suffix-${index}`;
+		const suffixBytes = index % 2 === 0 ? 48 * 1_024 : 40 * 1_024;
 		raw.push(
 			{ role: "user", content: `suffix-${index}`, timestamp: 1_000 + index * 3 } as unknown as AgentMessage,
 			{ role: "assistant", content: [{ type: "toolCall", id, name: "read", arguments: {} }], timestamp: 1_001 + index * 3 } as unknown as AgentMessage,
-			{ role: "toolResult", toolCallId: id, toolName: "read", content: [{ type: "text", text: "s".repeat(12) }], isError: false, timestamp: 1_002 + index * 3 } as unknown as AgentMessage,
+			{ role: "toolResult", toolCallId: id, toolName: "read", content: [{ type: "text", text: String(index % 10).repeat(suffixBytes) }], isError: false, timestamp: 1_002 + index * 3 } as unknown as AgentMessage,
+		);
+		assert.ok(
+			Number(previousState.projectedToolTextBytes) + suffixBytes > OTHER_HISTORY_TOOL_TEXT_MAX_BYTES,
+			`seal ${index + 1} fixture must cross the complete projected-history hard byte cap`,
 		);
 		const next = await emitContext(stub, raw, ctx);
 		await emitEvent(stub, "turn_end", {
@@ -729,6 +750,8 @@ test("runtime seals v3 segments without rewriting stable prefixes and checkpoint
 			assert.ok(Number(segment.projectedToolTextBytes) <= 384, `seal ${seal} segment byte reserve`);
 			assert.ok(Number(segment.projectedBundles) <= 1, `seal ${seal} segment bundle reserve`);
 		}
+		assert.ok(historyToolTextBytes(next) <= OTHER_HISTORY_TOOL_TEXT_MAX_BYTES, `seal ${seal} hard byte cap`);
+		assert.equal(validateContextToolPairing(next), true, `seal ${seal} pairing`);
 		const stableBundles = Number(anchor.projectedBundles)
 			+ nextSegments.reduce((sum, segment) => sum + Number(segment.projectedBundles), 0);
 		assert.ok(Number(nextState.projectedBundles) - stableBundles <= 16, `seal ${seal} active bundle reserve`);
@@ -2094,8 +2117,15 @@ test("registered read_gate reconstructs every semantic row through exact 4 KiB t
 			});
 			const finalText = textOf(final.content);
 			assert.equal(finalText, rawText, "generic result envelope is a no-op after allocation-aware semantic rendering");
+			assert.doesNotMatch(finalText, /^\[workbench-tool-result-ingress v1\]/, "an already-bounded semantic page is never inflated by a recovery wrapper");
 			const details = final.details as Record<string, unknown>;
 			const envelope = details.output_envelope as Record<string, unknown>;
+			const ingress = details.ingress_projection as Record<string, unknown>;
+			assert.ok(ingress, "the byte-exact page still carries trusted durable-source metadata");
+			assert.equal(ingress.originalBytes, bytes(rawText));
+			assert.equal(ingress.projectedBytes, bytes(rawText));
+			assert.equal(ingress.bodyShownBytes, bytes(rawText));
+			assert.equal(ingress.omittedBytes, 0);
 			assert.equal(envelope.truncated, false);
 			assert.equal(envelope.shownTextBytes, bytes(finalText));
 			const rowKeys = finalText.split("\n").flatMap((line) => {
@@ -2608,4 +2638,1077 @@ test("explicit breakpoint helper supports 17 ordered markers and is payload-idem
 	assert.equal(second.markerCount, 17);
 	assert.equal(second.payload, first.payload, "an idempotent pass performs no extra cloning");
 	assert.deepEqual(second.payload, first.payload);
+});
+
+describe("tool-result ingress projection", () => {
+	const ingressDigest = "ab".repeat(32);
+	const ingressFacts = [
+		{ key: "run_id", value: "run-ingress-01" },
+		{ key: "exit_code", value: 0 },
+		{ key: "complete", value: true },
+	] as const;
+
+	const eligibleCases: ReadonlyArray<{
+		sourceKind: TrustedRecoverySourceKind;
+		toolName: string;
+		sourcePath: string;
+	}> = [
+		{
+			sourceKind: "finalized_recipe_run",
+			toolName: "workbench_run_recipe",
+			sourcePath: ".pi/workbench/runs/run-recipe-01/summary.json",
+		},
+		{
+			sourceKind: "executed_gate_run",
+			toolName: "workbench_run_gate",
+			sourcePath: ".pi/workbench/runs/run-gate-01/gates.json",
+		},
+		{
+			sourceKind: "immutable_comparison",
+			toolName: "workbench_compare_runs",
+			sourcePath: `.pi/workbench/comparisons/cmp1-${"cd".repeat(32)}/comparison.json`,
+		},
+		{
+			sourceKind: "completed_worker_report",
+			toolName: "workbench_delegate_worker",
+			sourcePath: ".pi/workbench/delegations/delegation-01/worker-report.md",
+		},
+		{
+			sourceKind: "finalized_run_page",
+			toolName: "workbench_read_run",
+			sourcePath: ".pi/workbench/runs/run-page-01/stdout.log",
+		},
+		{
+			sourceKind: "run_id_gate_page",
+			toolName: "workbench_read_gate",
+			sourcePath: ".pi/workbench/runs/run-page-01/gates.json",
+		},
+	];
+
+	function ingressAuthority(
+		entry: (typeof eligibleCases)[number],
+		toolCallId = `call-${entry.sourceKind}`,
+	): TrustedRecoveryAuthority {
+		return {
+			schema: "workbench-trusted-recovery-authority-v1",
+			sourceKind: entry.sourceKind,
+			toolCallId,
+			toolName: entry.toolName,
+			sourcePath: entry.sourcePath,
+			sourceIdentity: { kind: "digest", sha256: ingressDigest },
+			finalized: 1,
+			budgetBytes: TOOL_RESULT_INGRESS_BUDGET_BYTES,
+			requiredFacts: ingressFacts,
+		};
+	}
+
+	function assertUnchanged(
+		input: Parameters<typeof projectToolResultIngress>[0],
+		content: unknown,
+	): void {
+		const result = projectToolResultIngress(input);
+		assert.equal(result.status, "unchanged");
+		assert.equal(result.changed, false);
+		assert.equal(result.content, content, "fail-open paths preserve the exact provider content reference");
+	}
+
+	test("projects exactly the six trusted recovery sources with one deterministic bounded format", () => {
+		const middleOnlySecret = "RAW_MIDDLE_SECRET_MUST_NOT_SURVIVE";
+		const sourceText = `HEAD-世界-🙂\n${"A".repeat(6_000)}${middleOnlySecret}${"Z".repeat(6_000)}\nTAIL-终`;
+
+		for (const entry of eligibleCases) {
+			const content = [
+				{ type: "text", text: sourceText.slice(0, 6_500) },
+				{ type: "text", text: sourceText.slice(6_500) },
+			];
+			const originalJson = JSON.stringify(content);
+			const toolCallId = `call-${entry.sourceKind}`;
+			const authority = ingressAuthority(entry, toolCallId);
+			const input = { toolCallId, toolName: entry.toolName, content, isError: false, authority };
+
+			const first = projectToolResultIngress(input);
+			assert.equal(first.status, "projected", entry.sourceKind);
+			if (first.status !== "projected") assert.fail(`projection missing for ${entry.sourceKind}`);
+			assert.equal(first.changed, true);
+			assert.notEqual(first.content, content);
+			assert.equal(JSON.stringify(content), originalJson, "projection is copy-on-write");
+			assert.equal(first.content.length, 1);
+			const text = first.content[0]!.text;
+			assert.ok(Buffer.byteLength(text, "utf8") <= TOOL_RESULT_INGRESS_BUDGET_BYTES);
+			assert.match(text, /^\[workbench-tool-result-ingress v1\]\n/);
+			assert.ok(text.includes('fact.run_id="run-ingress-01"'));
+			assert.ok(text.includes("fact.exit_code=0"));
+			assert.ok(text.includes("fact.complete=true"));
+			assert.ok(text.includes(`source_kind=${entry.sourceKind}`));
+			assert.ok(text.includes(`source_path=${entry.sourcePath}`));
+			assert.ok(text.includes(`source_ref=digest:${ingressDigest.slice(0, 16)}`));
+			assert.match(text, /original_bytes=\d+\n/);
+			assert.match(text, /projected_bytes=\d+\n/);
+			assert.match(text, /omitted_bytes=[1-9]\d*\n/);
+			assert.match(text, /projection_hash=[0-9a-f]{64}\n?$/);
+			assert.ok(!text.includes(middleOnlySecret), "the bounded body omits unselected middle bytes");
+			assert.ok(!text.includes("/home/"));
+			assert.ok(!text.includes("argv="));
+			assert.ok(!text.includes(toolCallId), "private call identity is hashed, never rendered");
+			assert.ok(!text.includes("commander"));
+			assert.ok(!text.includes("worker_role"));
+
+			assert.equal(first.metadata.schema, "workbench-tool-result-ingress-metadata-v1");
+			assert.equal(first.metadata.sourceKind, entry.sourceKind);
+			assert.equal(first.metadata.sourcePath, entry.sourcePath);
+			assert.equal(first.metadata.sourceIdentityKind, "digest");
+			assert.equal(first.metadata.budgetBytes, TOOL_RESULT_INGRESS_BUDGET_BYTES);
+			assert.equal(first.metadata.requiredFactCount, ingressFacts.length);
+			assert.equal(first.metadata.projectedBytes, Buffer.byteLength(text, "utf8"));
+			assert.ok(first.metadata.omittedBytes > 0);
+			assert.ok(Buffer.byteLength(JSON.stringify(first.metadata), "utf8") <= TOOL_RESULT_INGRESS_METADATA_MAX_BYTES);
+			assert.ok(!JSON.stringify(first.metadata).includes(toolCallId));
+
+			const repeat = projectToolResultIngress(input);
+			assert.deepEqual(repeat, first, "same authoritative source yields byte-identical first projection");
+
+			const idempotent = projectToolResultIngress({ ...input, content: first.content });
+			assert.equal(idempotent.status, "projected");
+			if (idempotent.status !== "projected") assert.fail("projected content must be recognized");
+			assert.equal(idempotent.changed, false);
+			assert.equal(idempotent.content, first.content, "idempotence performs no additional cloning");
+			assert.deepEqual(idempotent.metadata, first.metadata);
+		}
+	});
+
+	test("keeps trusted text at or below 4 KiB byte-exact while binding metadata to the ordered block content", () => {
+		const entry = eligibleCases.find((candidate) => candidate.sourceKind === "run_id_gate_page")!;
+		const toolCallId = "call-small-byte-exact";
+		const authority = ingressAuthority(entry, toolCallId);
+		const cases = [
+			[
+				{ type: "text", text: "gate page alpha" },
+				{ type: "text", text: "gate page beta 🙂" },
+			],
+			[{ type: "text", text: "x".repeat(TOOL_RESULT_INGRESS_BUDGET_BYTES) }],
+		] as const;
+
+		for (const content of cases) {
+			const providerText = content.map((block) => block.text).join("\n");
+			const providerBytes = Buffer.byteLength(providerText, "utf8");
+			assert.ok(providerBytes <= TOOL_RESULT_INGRESS_BUDGET_BYTES);
+			const result = projectToolResultIngress({
+				toolCallId,
+				toolName: entry.toolName,
+				content,
+				isError: false,
+				authority,
+			});
+			assert.equal(result.status, "projected");
+			if (result.status !== "projected") assert.fail("trusted small content must carry projection metadata");
+			assert.equal(result.changed, false);
+			assert.equal(result.content, content, "the exact content array reference survives");
+			assert.equal(result.content[0], content[0], "the exact content block reference survives");
+			assert.equal(result.metadata.originalBytes, providerBytes);
+			assert.equal(result.metadata.projectedBytes, providerBytes);
+			assert.equal(result.metadata.bodyShownBytes, providerBytes);
+			assert.equal(result.metadata.omittedBytes, 0);
+			assert.equal(result.metadata.projectionHash, toolResultTextContentDigest(content));
+			assert.doesNotMatch(providerText, /\[workbench-tool-result-ingress|\[workbench-recovery|projection_hash=/);
+		}
+	});
+
+	test("fails open without traps for ineligible, erroneous, non-text, or malformed authority", () => {
+		const entry = eligibleCases[0]!;
+		const toolCallId = "call-invalid-matrix";
+		const authority = ingressAuthority(entry, toolCallId);
+		const content = [{ type: "text", text: "small finalized output" }];
+		const baseInput = { toolCallId, toolName: entry.toolName, content, isError: false, authority };
+
+		for (const sourceKind of ["receipt", "current_state", "native_read", "search", "edit", "image", "error", "foreign"]) {
+			assertUnchanged({ ...baseInput, authority: { ...authority, sourceKind } }, content);
+		}
+
+		const malformedAuthorities: unknown[] = [
+			{ ...authority, schema: "foreign-v1" },
+			{ ...authority, toolCallId: "different-call" },
+			{ ...authority, toolName: "workbench_read_current" },
+			{ ...authority, finalized: 0 },
+			{ ...authority, budgetBytes: TOOL_RESULT_INGRESS_BUDGET_BYTES + 1 },
+			{ ...authority, sourcePath: "/home/operator/raw.log" },
+			{ ...authority, sourcePath: ".pi/workbench/runs/../secrets.txt" },
+			{ ...authority, sourceIdentity: { kind: "digest", sha256: "short" } },
+			{
+				...authority,
+				sourceIdentity: {
+					kind: "snapshot",
+					snapshotId: "cd".repeat(32),
+					byteLength: -1,
+					modifiedNs: "01",
+					device: 1,
+					inode: null,
+				},
+			},
+			{ ...authority, requiredFacts: [{ key: "argv", value: "--show-secret" }] },
+			{ ...authority, requiredFacts: [{ key: "note", value: "/home/operator/token" }] },
+			{ ...authority, requiredFacts: [{ key: "note", value: "x".repeat(300) }] },
+			{ ...authority, unexpected: true },
+			new Date(0),
+		];
+		for (const malformed of malformedAuthorities) {
+			assert.doesNotThrow(() => assertUnchanged({ ...baseInput, authority: malformed }, content));
+		}
+
+		assertUnchanged({ ...baseInput, isError: true }, content);
+		const imageContent = [{ type: "image", data: "base64", mimeType: "image/png" }];
+		assertUnchanged({ ...baseInput, content: imageContent }, imageContent);
+		const mixedContent = [{ type: "text", text: "text" }, { type: "image", data: "base64", mimeType: "image/png" }];
+		assertUnchanged({ ...baseInput, content: mixedContent }, mixedContent);
+
+		let authorityTrapCalls = 0;
+		const authorityProxy = new Proxy({}, {
+			get(): never { authorityTrapCalls += 1; throw new Error("authority proxy trap must not run"); },
+			ownKeys(): never { authorityTrapCalls += 1; throw new Error("authority proxy trap must not run"); },
+		});
+		assert.doesNotThrow(() => assertUnchanged({ ...baseInput, authority: authorityProxy }, content));
+		assert.equal(authorityTrapCalls, 0);
+
+		let accessorCalls = 0;
+		const accessorAuthority = Object.create(null) as Record<string, unknown>;
+		for (const [key, value] of Object.entries(authority)) {
+			Object.defineProperty(accessorAuthority, key, { value, enumerable: true, configurable: true });
+		}
+		Object.defineProperty(accessorAuthority, "sourcePath", {
+			enumerable: true,
+			configurable: true,
+			get(): never { accessorCalls += 1; throw new Error("authority accessor must not run"); },
+		});
+		assert.doesNotThrow(() => assertUnchanged({ ...baseInput, authority: accessorAuthority }, content));
+		assert.equal(accessorCalls, 0);
+
+		const symbolAuthority = { ...authority } as TrustedRecoveryAuthority & { [key: symbol]: unknown };
+		Object.defineProperty(symbolAuthority, Symbol("hidden"), { value: true, enumerable: true });
+		assertUnchanged({ ...baseInput, authority: symbolAuthority }, content);
+
+		const revokedAuthority = Proxy.revocable({ ...authority }, {});
+		revokedAuthority.revoke();
+		assert.doesNotThrow(() => assertUnchanged({ ...baseInput, authority: revokedAuthority.proxy }, content));
+
+		let contentTrapCalls = 0;
+		const contentProxy = new Proxy([], {
+			get(): never { contentTrapCalls += 1; throw new Error("content proxy trap must not run"); },
+			ownKeys(): never { contentTrapCalls += 1; throw new Error("content proxy trap must not run"); },
+		});
+		assert.doesNotThrow(() => assertUnchanged({ ...baseInput, content: contentProxy }, contentProxy));
+		assert.equal(contentTrapCalls, 0);
+	});
+
+	test("accepts a strict immutable snapshot and truncates on Unicode code-point boundaries", () => {
+		const entry = eligibleCases.find((candidate) => candidate.sourceKind === "finalized_run_page")!;
+		const toolCallId = "call-snapshot-unicode";
+		const authority: TrustedRecoveryAuthority = {
+			...ingressAuthority(entry, toolCallId),
+			sourceIdentity: {
+				kind: "snapshot",
+				snapshotId: "ef".repeat(32),
+				byteLength: 24_001,
+				modifiedNs: "1723600000000000000",
+				device: 2049,
+				inode: 912345,
+			},
+		};
+		const content = [{ type: "text", text: `${"🙂世界".repeat(2_000)}\ud800${"终点🚀".repeat(2_000)}` }];
+		const result = projectToolResultIngress({ toolCallId, toolName: entry.toolName, content, isError: false, authority });
+		assert.equal(result.status, "projected");
+		if (result.status !== "projected") assert.fail("strict snapshot must project");
+		const text = result.content[0]!.text;
+		assert.equal(result.metadata.sourceIdentityKind, "snapshot");
+		assert.ok(text.includes("source_ref=snapshot:efefefefefefefef"));
+		assert.ok(Buffer.byteLength(text, "utf8") <= TOOL_RESULT_INGRESS_BUDGET_BYTES);
+		assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(text));
+		assert.ok(text.includes("🙂"));
+		assert.ok(text.includes("🚀"));
+	});
+});
+
+describe("trusted recovery authority and runtime ingress wiring", () => {
+	type RuntimeResult = {
+		content: Array<Record<string, unknown>>;
+		details: Record<string, unknown>;
+		usage?: unknown;
+	};
+	type RuntimeTool = {
+		execute: (
+			toolCallId: string,
+			params: Record<string, unknown>,
+			signal: undefined,
+			onUpdate: undefined,
+			ctx: ExtensionContext,
+		) => Promise<RuntimeResult>;
+	};
+
+	const authorityFacts: Readonly<Record<TrustedRecoverySourceKind, ReadonlyArray<{ key: string; value: string | number | boolean | null }>>> = {
+		finalized_recipe_run: [
+			{ key: "run_id", value: "20260814-170000-recp" },
+			{ key: "recipe", value: "ingress-large" },
+			{ key: "status", value: "OK" },
+			{ key: "exit_code", value: 0 },
+			{ key: "duration_ms", value: 1 },
+		],
+		executed_gate_run: [
+			{ key: "run_id", value: "20260814-170001-gate" },
+			{ key: "status", value: "PASS" },
+			{ key: "gate_count", value: 1 },
+		],
+		immutable_comparison: [
+			{ key: "comparison_id", value: `cmp1-${"a".repeat(64)}` },
+			{ key: "a_run_id", value: "20260814-170002-left" },
+			{ key: "b_run_id", value: "20260814-170003-rght" },
+			{ key: "compatible", value: true },
+		],
+		completed_worker_report: [
+			{ key: "delegation_id", value: "20260814-170004-work" },
+			{ key: "status", value: "success" },
+			{ key: "turns", value: 1 },
+			{ key: "exit_code", value: 0 },
+		],
+		finalized_run_page: [
+			{ key: "run_id", value: "20260814-170005-page" },
+			{ key: "include", value: "logs" },
+			{ key: "log_stream", value: "stdout" },
+			{ key: "page", value: 0 },
+		],
+		run_id_gate_page: [
+			{ key: "run_id", value: "20260814-170006-gate" },
+			{ key: "include", value: "summary" },
+			{ key: "page", value: 0 },
+		],
+	};
+
+	const authorityPaths: Readonly<Record<TrustedRecoverySourceKind, string>> = {
+		finalized_recipe_run: ".pi/workbench/runs/20260814-170000-recp/summary.json",
+		executed_gate_run: ".pi/workbench/runs/20260814-170001-gate/gates.json",
+		immutable_comparison: `.pi/workbench/comparisons/cmp1-${"a".repeat(64)}/comparison.json`,
+		completed_worker_report: ".pi/workbench/delegations/20260814-170004-work/worker-report.md",
+		finalized_run_page: ".pi/workbench/runs/20260814-170005-page/stdout.log",
+		run_id_gate_page: ".pi/workbench/runs/20260814-170006-gate/gates.json",
+	};
+
+	const toolBySource: Readonly<Record<TrustedRecoverySourceKind, string>> = {
+		finalized_recipe_run: "workbench_run_recipe",
+		executed_gate_run: "workbench_run_gate",
+		immutable_comparison: "workbench_compare_runs",
+		completed_worker_report: "workbench_delegate_worker",
+		finalized_run_page: "workbench_read_run",
+		run_id_gate_page: "workbench_read_gate",
+	};
+
+	function assertIngressResult(
+		result: ResultEvent,
+		sourceKind: TrustedRecoverySourceKind,
+		sourceSuffix: string,
+	): Record<string, unknown> {
+		const text = textOf(result.content);
+		assert.ok(bytes(text) <= TOOL_RESULT_INGRESS_BUDGET_BYTES);
+		const details = result.details as Record<string, unknown>;
+		const metadata = details.ingress_projection as Record<string, unknown>;
+		assert.ok(metadata, `missing ingress metadata for ${sourceKind}`);
+		assert.equal(metadata.schema, "workbench-tool-result-ingress-metadata-v1");
+		assert.equal(metadata.sourceKind, sourceKind);
+		assert.equal(metadata.sourceIdentityKind, "snapshot");
+		assert.equal(typeof metadata.sourceIdentityHash, "string");
+		assert.equal(typeof metadata.authorityHash, "string");
+		assert.equal(typeof metadata.projectionHash, "string");
+		assert.equal(metadata.budgetBytes, TOOL_RESULT_INGRESS_BUDGET_BYTES);
+		assert.equal(metadata.projectedBytes, bytes(text));
+		if (Number(metadata.originalBytes) > TOOL_RESULT_INGRESS_BUDGET_BYTES) {
+			assert.match(text, /^\[workbench-tool-result-ingress v1\]\n/);
+			assert.ok(Number(metadata.omittedBytes) > 0);
+		} else {
+			assert.doesNotMatch(text, /^\[workbench-tool-result-ingress v1\]/);
+			assert.equal(metadata.originalBytes, metadata.projectedBytes);
+			assert.equal(metadata.bodyShownBytes, metadata.projectedBytes);
+			assert.equal(metadata.omittedBytes, 0);
+		}
+		assert.match(String(metadata.sourcePath), new RegExp(`${sourceSuffix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`));
+		assert.ok(Buffer.byteLength(JSON.stringify(details), "utf8") <= DETAILS_MAX_BYTES);
+		assert.doesNotMatch(JSON.stringify(metadata), /toolCallId|\/tmp\/|worker-report body|RAW-INGRESS-MIDDLE/);
+		return metadata;
+	}
+
+	test("authority is minted only for exact durable regular sources below the real project root", async () => {
+		await withTempDir(async (outer) => {
+			const projectRoot = join(outer, "project");
+			await mkdir(projectRoot, { recursive: true });
+			for (const sourceKind of Object.keys(authorityPaths) as TrustedRecoverySourceKind[]) {
+				const sourcePath = authorityPaths[sourceKind];
+				const absolute = join(projectRoot, sourcePath);
+				await mkdir(dirname(absolute), { recursive: true });
+				await writeFile(absolute, `${sourceKind}\n`, "utf8");
+				const toolName = toolBySource[sourceKind];
+				const authority = await buildTrustedRecoveryAuthority({
+					projectRoot,
+					sourceKind,
+					toolCallId: `authority-${sourceKind}`,
+					toolName,
+					sourcePath,
+					requiredFacts: authorityFacts[sourceKind],
+				});
+				assert.ok(authority, sourceKind);
+				assert.equal(authority.sourcePath, sourcePath);
+				assert.equal(authority.sourceIdentity.kind, "snapshot");
+				if (authority.sourceIdentity.kind !== "snapshot") assert.fail("durable sources require snapshot identity");
+				const sourceStat = await stat(absolute, { bigint: true });
+				const contentDigest = createHash("sha256").update(`${sourceKind}\n`, "utf8").digest("hex");
+				const expectedSnapshotId = createHash("sha256").update(JSON.stringify([
+					"trusted-recovery-source-v2",
+					sourcePath,
+					contentDigest,
+					Number(sourceStat.size),
+					sourceStat.mtimeNs.toString(10),
+					sourceStat.ctimeNs.toString(10),
+					Number(sourceStat.dev),
+					Number(sourceStat.ino),
+				]), "utf8").digest("hex");
+				assert.equal(authority.sourceIdentity.snapshotId, expectedSnapshotId, `${sourceKind} identity binds bytes and complete stable stat facts`);
+				assert.equal(JSON.stringify(authority).includes(projectRoot), false);
+			}
+
+			const outside = join(outer, "outside.txt");
+			await writeFile(outside, "outside", "utf8");
+			const outsideDir = join(outer, "outside-dir");
+			await mkdir(outsideDir, { recursive: true });
+			await writeFile(join(outsideDir, "stdout.log"), "outside-dir", "utf8");
+			const linkedPath = ".pi/workbench/runs/20260814-170007-link/stdout.log";
+			const linkedAbsolute = join(projectRoot, linkedPath);
+			await mkdir(dirname(linkedAbsolute), { recursive: true });
+			await symlink(outside, linkedAbsolute);
+			const linkedDirectoryPath = ".pi/workbench/runs/20260814-170007-dir/stdout.log";
+			await symlink(outsideDir, dirname(join(projectRoot, linkedDirectoryPath)), "dir");
+			const base = {
+				projectRoot,
+				sourceKind: "finalized_run_page" as const,
+				toolCallId: "authority-rejected",
+				toolName: "workbench_read_run",
+				requiredFacts: authorityFacts.finalized_run_page,
+			};
+			assert.equal(await buildTrustedRecoveryAuthority({ ...base, sourcePath: linkedPath }), undefined, "final symlink is never authority");
+			assert.equal(await buildTrustedRecoveryAuthority({ ...base, sourcePath: linkedDirectoryPath }), undefined, "symlinked path components are never authority");
+			assert.equal(await buildTrustedRecoveryAuthority({ ...base, sourcePath: "../outside.txt" }), undefined, "outside path is never authority");
+			assert.equal(await buildTrustedRecoveryAuthority({ ...base, sourcePath: ".pi/workbench/runs/missing/stdout.log" }), undefined);
+			assert.equal(await buildTrustedRecoveryAuthority({
+				...base,
+				sourcePath: authorityPaths.finalized_run_page,
+				requiredFacts: [{ key: "run_id", value: "wrong-contract" }],
+			}), undefined, "tool-specific fact sets are exact");
+
+			const joined = [{ type: "text", text: "first" }, { type: "text", text: "second🙂" }];
+			const digest = toolResultTextContentDigest(joined);
+			assert.match(digest ?? "", /^[0-9a-f]{64}$/);
+			assert.notEqual(toolResultTextContentDigest([{ type: "text", text: "first\nsecond🙂" }]), digest, "block segmentation is part of the private digest");
+			assert.equal(toolResultTextContentDigest([{ type: "text", text: "first" }, { type: "image", data: "x", mimeType: "image/png" }]), undefined);
+			const hostileBlock = { type: "text", text: "first", extra: "not-provider-text" };
+			assert.equal(toolResultTextContentDigest([hostileBlock]), undefined);
+		});
+	});
+
+	test("authority fails closed on same-size sub-millisecond mutation and oversized durable sources", async () => {
+		await withTempDir(async (outer) => {
+			const projectRoot = join(outer, "project");
+			const racePath = ".pi/workbench/runs/20260814-170008-race/stdout.log";
+			const raceAbsolute = join(projectRoot, racePath);
+			await mkdir(dirname(raceAbsolute), { recursive: true });
+			await writeFile(raceAbsolute, "AAAA", "utf8");
+			const fixedSeconds = 1_723_600_000;
+			await utimes(raceAbsolute, fixedSeconds, fixedSeconds);
+			let hookSnapshot: { byteLength: number; modifiedNs: string; changedNs: string; device: number; inode: number } | undefined;
+			let mutatedSnapshot: { byteLength: number; modifiedNs: string; changedNs: string; device: number; inode: number } | undefined;
+			let hookCalled = false;
+			const raced = await buildTrustedRecoveryAuthority({
+				projectRoot,
+				sourceKind: "finalized_run_page",
+				toolCallId: "authority-raced",
+				toolName: "workbench_read_run",
+				sourcePath: racePath,
+				requiredFacts: authorityFacts.finalized_run_page,
+				testHooks: {
+					afterInitialStat: async (snapshot) => {
+						hookCalled = true;
+						hookSnapshot = { ...snapshot };
+						await writeFile(raceAbsolute, "BBBB", "utf8");
+						await utimes(raceAbsolute, fixedSeconds, fixedSeconds);
+						const mutated = await stat(raceAbsolute, { bigint: true });
+						mutatedSnapshot = {
+							byteLength: Number(mutated.size),
+							modifiedNs: mutated.mtimeNs.toString(10),
+							changedNs: mutated.ctimeNs.toString(10),
+							device: Number(mutated.dev),
+							inode: Number(mutated.ino),
+						};
+					},
+				},
+			});
+			assert.equal(hookCalled, true);
+			assert.ok(hookSnapshot);
+			assert.ok(mutatedSnapshot);
+			assert.equal(mutatedSnapshot.byteLength, hookSnapshot.byteLength, "mutation preserves byte length");
+			assert.equal(mutatedSnapshot.modifiedNs, hookSnapshot.modifiedNs, "mutation restores the same high-resolution mtime");
+			assert.equal(mutatedSnapshot.device, hookSnapshot.device);
+			assert.equal(mutatedSnapshot.inode, hookSnapshot.inode);
+			assert.notEqual(mutatedSnapshot.changedNs, hookSnapshot.changedNs, "unforgeable ctime still exposes the sub-millisecond mutation");
+			assert.equal(raced, undefined, "a source mutated between same-handle observations never mints authority");
+
+			const oversizedPath = ".pi/workbench/runs/20260814-170009-large/stdout.log";
+			const oversizedAbsolute = join(projectRoot, oversizedPath);
+			await mkdir(dirname(oversizedAbsolute), { recursive: true });
+			await writeFile(oversizedAbsolute, Buffer.alloc(TRUSTED_RECOVERY_SOURCE_MAX_BYTES + 1, 0x78));
+			assert.equal(await buildTrustedRecoveryAuthority({
+				projectRoot,
+				sourceKind: "finalized_run_page",
+				toolCallId: "authority-oversized",
+				toolName: "workbench_read_run",
+				sourcePath: oversizedPath,
+				requiredFacts: authorityFacts.finalized_run_page,
+			}), undefined, "sources above the fixed 4 MiB authority cap fail open");
+		});
+	});
+
+	test("Commander and worker runtimes project each eligible durable tool source before the generic envelope", async () => {
+		await withTempDir(async (root) => {
+			await writeConfigFile(root, "project.yaml", "name: ingress-runtime\nprofile: generic\n");
+			await writeConfigFile(root, "recipes.yaml", [
+				"recipes:",
+				"  - name: ingress-large",
+				'    command: ["node", "-e", "process.stdout.write(\'R\'.repeat(12000))"]',
+				"",
+			].join("\n"));
+			await writeConfigFile(root, "gates.yaml", [
+				"gates:",
+				"  - id: g1",
+				"    title: Ingress gate",
+				"    checks:",
+				"      - { id: g1.1, title: Present, kind: file, path: present.txt }",
+				"",
+			].join("\n"));
+			await writeFile(join(root, "present.txt"), "present", "utf8");
+			await writeComparisonManifest(root, "20260814-171000-left", "2026-08-14T17:10:00.000Z");
+			await writeComparisonManifest(root, "20260814-171001-rght", "2026-08-14T17:10:01.000Z");
+
+			const stub = makeRoleRuntime("commander");
+			const base = trustedCtx(root, "ingress-runtime-session") as ExtensionContext;
+			const ctx = {
+				...base,
+				model: { provider: "openai-codex", id: "gpt-5.6-sol", api: "responses" },
+			} as ExtensionContext;
+			await emitEvent(stub, "model_select", {
+				type: "model_select",
+				model: ctx.model,
+				previousModel: undefined,
+				source: "set",
+			}, ctx);
+
+			const recipe = stub.tools.get("workbench_run_recipe") as RuntimeTool;
+			const recipeRaw = await recipe.execute("ingress-recipe", { recipe: "ingress-large", cache: "no-cache" }, undefined, undefined, ctx);
+			const recipeResult = await emitToolResult(stub, {
+				type: "tool_result", toolCallId: "ingress-recipe", toolName: "workbench_run_recipe",
+				input: { recipe: "ingress-large", cache: "no-cache" }, content: recipeRaw.content, details: {
+					...recipeRaw.details,
+					ingress_projection: { schema: "caller-forged", sourcePath: "/tmp/forged" },
+				}, isError: false,
+			});
+			assertIngressResult(recipeResult, "finalized_recipe_run", "/summary.json");
+			assert.notEqual((recipeResult.details as Record<string, unknown>).ingress_projection, (recipeRaw.details as Record<string, unknown>).ingress_projection);
+			const recipeRunId = String((recipeRaw.details as Record<string, unknown>).run_id);
+
+			const readRun = stub.tools.get("workbench_read_run") as RuntimeTool;
+			const plannedCommanderCalls = [
+				{ id: "ingress-read-run", name: "workbench_read_run", arguments: { run_id: recipeRunId, include: "logs", log_stream: "stdout", max_bytes: 32768 } },
+				{ id: "ingress-read-run-small", name: "workbench_read_run", arguments: { run_id: recipeRunId, include: "logs", log_stream: "stdout", max_bytes: 2048 } },
+				{ id: "ingress-compare", name: "workbench_compare_runs", arguments: { a: "20260814-171000-left", b: "20260814-171001-rght" } },
+				{ id: "ingress-gate", name: "workbench_run_gate", arguments: { gates: "g1" } },
+				{ id: "ingress-read-gate", name: "workbench_read_gate", arguments: { run_id: "planned-after-gate", include: "summary" } },
+				{ id: "ingress-read-both", name: "workbench_read_run", arguments: { run_id: recipeRunId, include: "logs", log_stream: "both" } },
+				{ id: "ingress-preflight", name: "workbench_run_gate", arguments: { gates: "g1", preflight: true } },
+				{ id: "ingress-current-gate", name: "workbench_read_gate", arguments: { gate_id: "g1", include: "summary" } },
+			];
+			await startBudgetTurn(stub, ctx, "commander", 70, plannedCommanderCalls);
+			const runPageRaw = await readRun.execute("ingress-read-run", {
+				run_id: recipeRunId, include: "logs", log_stream: "stdout", max_bytes: 32768,
+			}, undefined, undefined, ctx);
+			const runPage = await emitToolResult(stub, {
+				type: "tool_result", toolCallId: "ingress-read-run", toolName: "workbench_read_run",
+				input: { run_id: recipeRunId, include: "logs", log_stream: "stdout", max_bytes: 32768 },
+				content: runPageRaw.content, details: runPageRaw.details, isError: false,
+			});
+			assertIngressResult(runPage, "finalized_run_page", "/stdout.log");
+
+			const smallRunPageRaw = await readRun.execute("ingress-read-run-small", {
+				run_id: recipeRunId, include: "logs", log_stream: "stdout", max_bytes: 2048,
+			}, undefined, undefined, ctx);
+			const smallRunPageRawText = textOf(smallRunPageRaw.content);
+			assert.ok(bytes(smallRunPageRawText) <= TOOL_RESULT_INGRESS_BUDGET_BYTES);
+			const smallRunPage = await emitToolResult(stub, {
+				type: "tool_result", toolCallId: "ingress-read-run-small", toolName: "workbench_read_run",
+				input: { run_id: recipeRunId, include: "logs", log_stream: "stdout", max_bytes: 2048 },
+				content: smallRunPageRaw.content, details: smallRunPageRaw.details, isError: false,
+			});
+			assert.equal(textOf(smallRunPage.content), smallRunPageRawText, "a <=4 KiB run-log cursor page is byte-exact through the generic envelope");
+			assertIngressResult(smallRunPage, "finalized_run_page", "/stdout.log");
+
+			const compare = stub.tools.get("workbench_compare_runs") as RuntimeTool;
+			const compareRaw = await compare.execute("ingress-compare", {
+				a: "20260814-171000-left", b: "20260814-171001-rght",
+			}, undefined, undefined, ctx);
+			const comparison = await emitToolResult(stub, {
+				type: "tool_result", toolCallId: "ingress-compare", toolName: "workbench_compare_runs",
+				input: { a: "20260814-171000-left", b: "20260814-171001-rght" },
+				content: compareRaw.content, details: compareRaw.details, isError: false,
+			});
+			assertIngressResult(comparison, "immutable_comparison", "/comparison.json");
+
+			const gate = stub.tools.get("workbench_run_gate") as RuntimeTool;
+			const gateRaw = await gate.execute("ingress-gate", { gates: "g1" }, undefined, undefined, ctx);
+			const gateResult = await emitToolResult(stub, {
+				type: "tool_result", toolCallId: "ingress-gate", toolName: "workbench_run_gate",
+				input: { gates: "g1" }, content: gateRaw.content, details: gateRaw.details, isError: false,
+			});
+			assertIngressResult(gateResult, "executed_gate_run", "/gates.json");
+			const gateRunId = String((gateRaw.details as Record<string, unknown>).run_id);
+
+			const readGate = stub.tools.get("workbench_read_gate") as RuntimeTool;
+			const gatePageRaw = await readGate.execute("ingress-read-gate", {
+				run_id: gateRunId, include: "summary",
+			}, undefined, undefined, ctx);
+			const gatePage = await emitToolResult(stub, {
+				type: "tool_result", toolCallId: "ingress-read-gate", toolName: "workbench_read_gate",
+				input: { run_id: gateRunId, include: "summary" }, content: gatePageRaw.content, details: gatePageRaw.details, isError: false,
+			});
+			assertIngressResult(gatePage, "run_id_gate_page", "/gates.json");
+
+			const bothRaw = await readRun.execute("ingress-read-both", {
+				run_id: recipeRunId, include: "logs", log_stream: "both",
+			}, undefined, undefined, ctx);
+			const both = await emitToolResult(stub, {
+				type: "tool_result", toolCallId: "ingress-read-both", toolName: "workbench_read_run",
+				input: { run_id: recipeRunId, include: "logs", log_stream: "both" },
+				content: bothRaw.content, details: { ...bothRaw.details, ingress_projection: { schema: "caller-forged" } }, isError: false,
+			});
+			assert.equal(textOf(both.content).startsWith("[workbench-tool-result-ingress v1]"), false, "multi-source log page stays unchanged");
+			assert.equal(Object.hasOwn(both.details as Record<string, unknown>, "ingress_projection"), false, "caller metadata is dropped on an ineligible result");
+
+			const preflightRaw = await gate.execute("ingress-preflight", { gates: "g1", preflight: true }, undefined, undefined, ctx);
+			const preflight = await emitToolResult(stub, {
+				type: "tool_result", toolCallId: "ingress-preflight", toolName: "workbench_run_gate",
+				input: { gates: "g1", preflight: true }, content: preflightRaw.content, details: preflightRaw.details, isError: false,
+			});
+			assert.equal(Object.hasOwn(preflight.details as Record<string, unknown>, "ingress_projection"), false);
+
+			const currentGateRaw = await readGate.execute("ingress-current-gate", { gate_id: "g1", include: "summary" }, undefined, undefined, ctx);
+			const currentGate = await emitToolResult(stub, {
+				type: "tool_result", toolCallId: "ingress-current-gate", toolName: "workbench_read_gate",
+				input: { gate_id: "g1", include: "summary" }, content: currentGateRaw.content, details: currentGateRaw.details, isError: false,
+			});
+			assert.equal(Object.hasOwn(currentGate.details as Record<string, unknown>, "ingress_projection"), false);
+
+			const workerStub = makeRoleRuntime("worker");
+			const workerRecipe = workerStub.tools.get("workbench_run_recipe") as RuntimeTool;
+			const workerRaw = await workerRecipe.execute("ingress-worker-recipe", {
+				recipe: "ingress-large", cache: "no-cache",
+			}, undefined, undefined, trustedCtx(root, "ingress-worker-session") as ExtensionContext);
+			const workerResult = await emitToolResult(workerStub, {
+				type: "tool_result", toolCallId: "ingress-worker-recipe", toolName: "workbench_run_recipe",
+				input: { recipe: "ingress-large", cache: "no-cache" }, content: workerRaw.content, details: workerRaw.details, isError: false,
+			});
+			assertIngressResult(workerResult, "finalized_recipe_run", "/summary.json");
+		});
+	});
+
+	test("a completed real delegate execution authorizes only its durable worker report", async () => {
+		await withTempDir(async (root) => {
+			await writeConfigFile(root, "project.yaml", "name: ingress-worker-report\nprofile: generic\n");
+			const initialized = await spawnExec("git", ["init", "-q"], { cwd: root });
+			assert.equal(initialized.code, 0, initialized.stderr);
+			const fakeWorker = join(root, "fake-worker.cjs");
+			const report = [
+				"## Completed",
+				"- Recorded a bounded no-change handoff.",
+				"## Files Changed",
+				"- None.",
+				"## Verification",
+				"- No command requested.",
+				"## Remaining Risks",
+				"- None.",
+			].join("\n");
+			await writeFile(fakeWorker, [
+				"const message = {",
+				"  role: 'assistant',",
+				`  content: [{ type: 'text', text: ${JSON.stringify(report)} }],`,
+				"  provider: 'deepseek', model: 'deepseek-v4-flash', stopReason: 'stop',",
+				"  usage: { input: 8, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 12, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },",
+				"};",
+				"process.stdout.write(JSON.stringify({ type: 'message_end', message }) + '\\n');",
+				"",
+			].join("\n"), "utf8");
+
+			const stub = makeRoleRuntime("commander");
+			const base = trustedCtx(root, "ingress-delegate-session") as ExtensionContext;
+			const ctx = {
+				...base,
+				model: { provider: "openai-codex", id: "gpt-5.6-sol", api: "responses" },
+			} as ExtensionContext;
+			const tool = stub.tools.get("workbench_delegate_worker") as RuntimeTool;
+			const previousScript = process.argv[1];
+			let raw: RuntimeResult;
+			try {
+				process.argv[1] = fakeWorker;
+				raw = await tool.execute("ingress-worker-report", {
+					task: "Return the fixed bounded report without changing files.",
+					allowed_paths: ["extensions/workbench-runtime/index.ts"],
+					acceptance_criteria: ["A durable worker report is recorded."],
+					verification: [],
+					timeout_seconds: 60,
+				}, undefined, undefined, ctx);
+			} finally {
+				if (previousScript === undefined) delete process.argv[1];
+				else process.argv[1] = previousScript;
+			}
+			const projected = await emitToolResult(stub, {
+				type: "tool_result", toolCallId: "ingress-worker-report", toolName: "workbench_delegate_worker",
+				input: { task: "bounded", allowed_paths: ["extensions/workbench-runtime/index.ts"] },
+				content: raw.content, details: raw.details, usage: raw.usage, isError: false,
+			});
+			const metadata = assertIngressResult(projected, "completed_worker_report", "/worker-report.md");
+			assert.equal(metadata.requiredFactCount, 4);
+			assert.equal(Object.hasOwn(projected.details as Record<string, unknown>, "summary"), false, "ordinary worker report summary is not retained in projected details");
+		});
+	});
+
+	test("exact FIFO correlation fails open for stale, mismatched, failed, lifecycle-cleared, and immediate-only results", async () => {
+		await withTempDir(async (root) => {
+			await writeConfigFile(root, "project.yaml", "name: ingress-fifo\nprofile: generic\n");
+			await writeConfigFile(root, "recipes.yaml", [
+				"recipes:",
+				"  - name: ingress-ok",
+				'    command: ["node", "-e", "process.stdout.write(\'ok\')"]',
+				"",
+			].join("\n"));
+			const stub = makeRoleRuntime("other");
+			const ctx = trustedCtx(root, "ingress-fifo-session") as ExtensionContext;
+			const tool = stub.tools.get("workbench_run_recipe") as RuntimeTool;
+
+			const failedRaw = await tool.execute("ingress-failed-slot", { recipe: "missing" }, undefined, undefined, ctx);
+			const successRaw = await tool.execute("ingress-success-slot", { recipe: "ingress-ok", cache: "no-cache" }, undefined, undefined, ctx);
+			const failed = await emitToolResult(stub, {
+				type: "tool_result", toolCallId: "ingress-failed-slot", toolName: "workbench_run_recipe",
+				input: { recipe: "missing" }, content: failedRaw.content, details: failedRaw.details, isError: true,
+			});
+			assert.equal(Object.hasOwn(failed.details as Record<string, unknown>, "ingress_projection"), false, "the failed FIFO slot cannot steal the next authority");
+			const success = await emitToolResult(stub, {
+				type: "tool_result", toolCallId: "ingress-success-slot", toolName: "workbench_run_recipe",
+				input: { recipe: "ingress-ok" }, content: successRaw.content, details: successRaw.details, isError: false,
+			});
+			assertIngressResult(success, "finalized_recipe_run", "/summary.json");
+
+			const mismatchRaw = await tool.execute("ingress-name-mismatch", { recipe: "ingress-ok", cache: "no-cache" }, undefined, undefined, ctx);
+			const mismatch = await emitToolResult(stub, {
+				type: "tool_result", toolCallId: "ingress-name-mismatch", toolName: "workbench_compare_runs",
+				input: {}, content: mismatchRaw.content, details: {}, isError: false,
+			});
+			assert.equal(Object.hasOwn(mismatch.details as Record<string, unknown>, "ingress_projection"), false);
+			const matchedLater = await emitToolResult(stub, {
+				type: "tool_result", toolCallId: "ingress-name-mismatch", toolName: "workbench_run_recipe",
+				input: { recipe: "ingress-ok" }, content: mismatchRaw.content, details: mismatchRaw.details, isError: false,
+			});
+			assertIngressResult(matchedLater, "finalized_recipe_run", "/summary.json");
+
+			const lifecycleRaw = await tool.execute("ingress-lifecycle", { recipe: "ingress-ok", cache: "no-cache" }, undefined, undefined, ctx);
+			await emitEvent(stub, "session_tree", { type: "session_tree", newLeafId: "next", oldLeafId: "old" }, ctx);
+			const lifecycle = await emitToolResult(stub, {
+				type: "tool_result", toolCallId: "ingress-lifecycle", toolName: "workbench_run_recipe",
+				input: { recipe: "ingress-ok" }, content: lifecycleRaw.content, details: lifecycleRaw.details, isError: false,
+			});
+			assert.equal(Object.hasOwn(lifecycle.details as Record<string, unknown>, "ingress_projection"), false, "tree lifecycle clears private authority");
+
+			const immediateRaw = await tool.execute("ingress-immediate", { recipe: "ingress-ok", cache: "no-cache" }, undefined, undefined, ctx);
+			const immediate = await emitMessageEnd(stub, {
+				role: "toolResult", toolCallId: "ingress-immediate", toolName: "workbench_run_recipe",
+				content: immediateRaw.content, details: immediateRaw.details, isError: false, timestamp: 1,
+			}, ctx);
+			assert.equal(textOf(immediate.content as Array<Record<string, unknown>>).startsWith("[workbench-tool-result-ingress v1]"), false, "message_end never mints or consumes ingress authority");
+			assert.equal(Object.hasOwn(immediate.details as Record<string, unknown>, "ingress_projection"), false);
+			await emitEvent(stub, "session_start", { type: "session_start", reason: "reload" }, ctx);
+		});
+	});
+
+	test("byte-exact content binding fails open on replacement and receipt finalization sees only the real projected result", async () => {
+		await withTempDir(async (root) => {
+			await writeConfigFile(root, "project.yaml", "name: ingress-receipt\nprofile: generic\n");
+			await writeConfigFile(root, "recipes.yaml", [
+				"recipes:",
+				"  - name: ingress-receipt",
+				'    command: ["node", "-e", "process.stdout.write(\'R\'.repeat(12000))"]',
+				"",
+			].join("\n"));
+			const stub = makeRoleRuntime("other");
+			const ctx = trustedCtx(root, "ingress-receipt-session") as ExtensionContext;
+			const mismatchCall = { id: "ingress-content-mismatch", name: "workbench_run_recipe", arguments: { recipe: "ingress-receipt", cache: "no-cache" } };
+			await startBudgetTurn(stub, ctx, "other", 91, [mismatchCall]);
+			assert.equal((await emitToolCall(stub, ctx, {
+				type: "tool_call", toolCallId: mismatchCall.id, toolName: mismatchCall.name, input: mismatchCall.arguments,
+			})).block, undefined);
+			const tool = stub.tools.get("workbench_run_recipe") as RuntimeTool;
+			const mismatchRaw = await tool.execute(mismatchCall.id, mismatchCall.arguments, undefined, undefined, ctx);
+			const replacementMarker = "BYTE-EXACT-MISMATCH-REMAINS-UNPROJECTED";
+			const mismatch = await emitToolResult(stub, {
+				type: "tool_result", toolCallId: mismatchCall.id, toolName: mismatchCall.name, input: mismatchCall.arguments,
+				content: [{ type: "text", text: replacementMarker }], details: mismatchRaw.details, isError: false,
+			});
+			assert.equal(textOf(mismatch.content), replacementMarker);
+			assert.equal(Object.hasOwn(mismatch.details as Record<string, unknown>, "ingress_projection"), false);
+			const recipeRunId = String(mismatchRaw.details.run_id);
+			await emitEvent(stub, "turn_end", { type: "turn_end", turnIndex: 91, message: {}, toolResults: [] }, ctx);
+
+			const realCall = {
+				id: "ingress-receipt-call",
+				name: "workbench_read_run",
+				arguments: { run_id: recipeRunId, include: "logs", log_stream: "stdout", max_bytes: 32768 },
+			};
+			await startBudgetTurn(stub, ctx, "other", 92, [realCall]);
+			assert.equal((await emitToolCall(stub, ctx, {
+				type: "tool_call", toolCallId: realCall.id, toolName: realCall.name, input: realCall.arguments,
+			})).block, undefined);
+			const readRun = stub.tools.get("workbench_read_run") as RuntimeTool;
+			const raw = await readRun.execute(realCall.id, realCall.arguments, undefined, undefined, ctx);
+			assert.ok(bytes(textOf(raw.content)) > TOOL_RESULT_INGRESS_BUDGET_BYTES, "the real provider input exceeds the ingress budget before projection");
+			const result = await emitToolResult(stub, {
+				type: "tool_result", toolCallId: realCall.id, toolName: realCall.name, input: realCall.arguments,
+				content: raw.content, details: raw.details, isError: false,
+			});
+			assertIngressResult(result, "finalized_run_page", "/stdout.log");
+			const receiptFacts = (result.details as Record<string, unknown>).receipt as Record<string, unknown>;
+			assert.equal(receiptFacts.available, true);
+			const receiptPath = String(receiptFacts.path);
+			const receipt = JSON.parse(await readFile(join(root, receiptPath), "utf8")) as { summary: string };
+			assert.match(receipt.summary, /^\[workbench-tool-result-ingress v1\]\n/);
+			assert.ok(bytes(receipt.summary) <= TOOL_RESULT_INGRESS_BUDGET_BYTES);
+		});
+	});
+
+	test("falls back to the original raw result when a low turn reservation cannot preserve the ingress projection", async () => {
+		await withTempDir(async (root) => {
+			await writeConfigFile(root, "project.yaml", "name: ingress-low-reservation\nprofile: generic\n");
+			const leftRunId = "20260814-172000-left";
+			const rightRunId = "20260814-172001-rght";
+			await writeGatePagingFixture(root, leftRunId, 48);
+			await writeGatePagingFixture(root, rightRunId, 48);
+			const gateIds = Array.from(
+				{ length: 48 },
+				(_, index) => `gate-${String(index).padStart(2, "0")}-${"g".repeat(119)}`,
+			);
+			for (const [runId, status] of [[leftRunId, "BLOCKED"], [rightRunId, "NOT_RUN"]] as const) {
+				await writeFile(join(runsDir(root), runId, "gates.json"), JSON.stringify({
+					schema_version: 1,
+					run_id: runId,
+					requested: ["all"],
+					profile: "generic",
+					mode: "VERIFY",
+					gates: gateIds.map((id) => ({ id, status })),
+				}), "utf8");
+			}
+
+			const stub = makeRoleRuntime("other");
+			const ctx = trustedCtx(root, "ingress-low-reservation-session") as ExtensionContext;
+			const target = {
+				id: "ingress-low-reservation",
+				name: "workbench_compare_runs",
+				arguments: { a: leftRunId, b: rightRunId },
+			};
+			await emitEvent(stub, "turn_start", { type: "turn_start", turnIndex: 93, timestamp: 1 }, ctx);
+			assert.equal((await emitToolCall(stub, ctx, {
+				type: "tool_call", toolCallId: target.id, toolName: target.name, input: target.arguments,
+			})).block, undefined);
+			const compare = stub.tools.get("workbench_compare_runs") as RuntimeTool;
+			const raw = await compare.execute(target.id, target.arguments, undefined, undefined, ctx);
+			const rawText = textOf(raw.content);
+			assert.ok(bytes(rawText) > TOOL_RESULT_INGRESS_BUDGET_BYTES, "the finalized immutable-comparison presentation deterministically exercises the oversized ingress wrapper path");
+			assert.equal(rawText.startsWith("[workbench-tool-result-ingress v1]"), false);
+			const rawDigest = toolResultTextContentDigest(raw.content);
+			assert.match(rawDigest ?? "", /^[0-9a-f]{64}$/, "the runtime authority is bound to this exact ordered tool content");
+			const rawDetails = raw.details as Record<string, unknown>;
+			const comparisonId = rawDetails.comparison_id;
+			const aRunId = rawDetails.a_run_id;
+			const bRunId = rawDetails.b_run_id;
+			const compatible = rawDetails.compatible;
+			if (typeof comparisonId !== "string"
+				|| typeof aRunId !== "string"
+				|| typeof bRunId !== "string"
+				|| typeof compatible !== "boolean") {
+				assert.fail("immutable comparison details must expose typed recovery facts");
+			}
+			const authority = await buildTrustedRecoveryAuthority({
+				projectRoot: root,
+				sourceKind: "immutable_comparison",
+				toolCallId: target.id,
+				toolName: target.name,
+				sourcePath: String(rawDetails.comparison_path),
+				requiredFacts: [
+					{ key: "comparison_id", value: comparisonId },
+					{ key: "a_run_id", value: aRunId },
+					{ key: "b_run_id", value: bRunId },
+					{ key: "compatible", value: compatible },
+				],
+			});
+			assert.ok(authority, "the persisted comparison is a valid trusted recovery source");
+			const candidate = projectToolResultIngress({
+				toolCallId: target.id,
+				toolName: target.name,
+				content: raw.content,
+				isError: false,
+				authority,
+			});
+			assert.equal(candidate.status, "projected");
+			if (candidate.status !== "projected") assert.fail("trusted oversized comparison must produce an ingress candidate");
+			assert.equal(candidate.changed, true);
+			const candidateText = candidate.content.map((block) => block.text).join("");
+			assert.match(candidateText, /^\[workbench-tool-result-ingress v1\]\n/);
+			assert.ok(bytes(candidateText) <= TOOL_RESULT_INGRESS_BUDGET_BYTES);
+
+			const result = await emitToolResult(stub, {
+				type: "tool_result", toolCallId: target.id, toolName: target.name, input: target.arguments,
+				content: raw.content, details: raw.details, isError: false,
+			});
+			const shown = textOf(result.content);
+			const details = result.details as Record<string, unknown>;
+			const envelope = details.output_envelope as Record<string, unknown>;
+			assert.match(shown, /\[workbench-output truncated /);
+			assert.doesNotMatch(shown, /\[workbench-tool-result-ingress|\[workbench-recovery|projection_hash=/, "metadata-free output is rebuilt from the original result, never a partial ingress wrapper");
+			assert.ok(bytes(shown) <= DEFENSIVE_DYNAMIC_RESERVATION_BYTES);
+			assert.equal(shown.startsWith(rawText.slice(0, 256)), true, "the generic envelope is rebuilt from the byte-exact raw comparison prefix");
+			assert.equal(envelope.reason, "turn-reservation");
+			assert.equal(envelope.policy, "compare");
+			assert.equal(envelope.truncated, true);
+			assert.equal(envelope.originalTextBytes, bytes(rawText), "envelope accounting is based on the original raw result exactly once");
+			assert.equal(envelope.shownTextBytes, bytes(shown));
+			assert.equal(Object.hasOwn(details, "ingress_projection"), false, "post-envelope content cannot retain the pre-envelope projection hash or byte facts");
+
+			const receiptFacts = details.receipt as Record<string, unknown>;
+			assert.equal(receiptFacts.available, true);
+			const receipt = JSON.parse(await readFile(join(root, String(receiptFacts.path)), "utf8")) as {
+				summary: string;
+				summary_omitted_bytes: number;
+			};
+			assert.doesNotMatch(receipt.summary, /\[workbench-tool-result-ingress|\[workbench-recovery|projection_hash=/, "the receipt scans only the final generic envelope");
+			assert.ok(bytes(receipt.summary) <= DEFENSIVE_DYNAMIC_RESERVATION_BYTES);
+			assert.equal(shown.startsWith(receipt.summary.slice(0, 256)), true);
+			assert.ok(receipt.summary_omitted_bytes >= 0);
+
+			await emitEvent(stub, "turn_end", { type: "turn_end", turnIndex: 93, message: {}, toolResults: [] }, ctx);
+			const telemetryEntries = stub.appendedEntries.filter((entry) => entry.customType === "workbench-output-turn-telemetry-v1");
+			assert.equal(telemetryEntries.length, 1);
+			const telemetry = telemetryEntries[0]!.data as Record<string, unknown>;
+			assert.equal(telemetry.planning, "dynamic");
+			assert.equal(telemetry.reservationCount, 1);
+			assert.equal(telemetry.reservedBytes, DEFENSIVE_DYNAMIC_RESERVATION_BYTES);
+			assert.equal(telemetry.consumedCalls, 1);
+			assert.equal(telemetry.consumedBytes, bytes(shown));
+			assert.equal(telemetry.totalAccountedBytes, bytes(shown));
+		});
+	});
+});
+
+test("runtime correlates exactly one numeric context projection to the next provider request for every actor role", async () => {
+	for (const [role, actorRoleCode] of [["commander", 1], ["worker", 2], ["other", 0]] as const) {
+		await withTempDir(async (root) => {
+			await writeConfigFile(root, "project.yaml", `name: context-correlation-${role}\nprofile: generic\n`);
+			const stub = makeRoleRuntime(role);
+			const base = trustedCtx(root, `context-correlation-${role}`) as ExtensionContext;
+			const model = role === "commander"
+				? { provider: "openai-codex", id: "gpt-5.6-sol", api: "responses" }
+				: { provider: "deepseek", id: "deepseek-v4-flash", api: "openai-completions" };
+			const ctx = {
+				...base,
+				model,
+				thinkingLevel: "high",
+				getSystemPrompt: () => "stable numeric correlation prompt",
+			} as ExtensionContext;
+			await emitEvent(stub, "session_start", { type: "session_start", reason: "new" }, ctx);
+			if (role === "commander") {
+				await emitEvent(stub, "model_select", { type: "model_select", model, previousModel: undefined, source: "set" }, ctx);
+			}
+			const cacheStatus = stub.commands.get("q-cache-status") as { handler: (args: string, context: ExtensionCommandContext) => Promise<void> };
+			await cacheStatus.handler("", ctx as ExtensionCommandContext);
+
+			const projected = await emitContext(stub, [
+				{ role: "user", content: `ordinary-${role}`, timestamp: 1 } as unknown as AgentMessage,
+			], ctx);
+			await emitBeforeProviderRequest(stub, {
+				model: model.id,
+				messages: [{ role: "system", content: "stable numeric correlation prompt" }, { role: "user", content: `ordinary-${role}` }],
+			}, ctx);
+			await emitMessageEnd(stub, {
+				role: "assistant", content: [], provider: model.provider, model: model.id, api: model.api,
+				usage: { input: 10, output: 2, cacheRead: 20, cacheWrite: 0, totalTokens: 32, cost: { total: 0 } },
+				stopReason: "stop", timestamp: 2,
+			}, ctx);
+			assert.equal(projected.length, 1);
+			const telemetryPath = join(root, CONFIG_DIR_NAME, "workbench", "cache", "telemetry.jsonl");
+			const records = (await readFile(telemetryPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+			const record = records.at(-1)!;
+			assert.equal(record.schemaVersion, "1.3");
+			assert.equal(record.actorRoleCode, actorRoleCode, role);
+			assert.equal(record.requestCorrelationCode, 1, role);
+			const anatomy = record.historyProjection as Record<string, unknown>;
+			assert.equal(anatomy.contextSerial, 1, role);
+			assert.equal(anatomy.eventCode, 0, role);
+			assert.equal(anatomy.causeCode, 0, role);
+			assert.equal(Object.values(anatomy).every((value) => typeof value === "number"), true, role);
+			assert.doesNotMatch(JSON.stringify(record), new RegExp(`ordinary-${role}|stable numeric correlation prompt`));
+		});
+	}
+});
+
+test("runtime context correlation fails closed for multiple contexts and retains the controller's fixed-failure anatomy", async () => {
+	await withTempDir(async (root) => {
+		await writeConfigFile(root, "project.yaml", "name: context-correlation-failure\nprofile: generic\n");
+		const stub = makeRoleRuntime("other");
+		const base = trustedCtx(root, "context-correlation-failure") as ExtensionContext;
+		const model = { provider: "deepseek", id: "deepseek-v4-flash", api: "openai-completions" };
+		const ctx = {
+			...base,
+			model,
+			thinkingLevel: "high",
+			getSystemPrompt: () => "stable fail-closed prompt",
+		} as ExtensionContext;
+		await emitEvent(stub, "session_start", { type: "session_start", reason: "new" }, ctx);
+		const cacheStatus = stub.commands.get("q-cache-status") as { handler: (args: string, context: ExtensionCommandContext) => Promise<void> };
+		await cacheStatus.handler("", ctx as ExtensionCommandContext);
+		const assistant = (timestamp: number) => ({
+			role: "assistant", content: [], provider: model.provider, model: model.id, api: model.api,
+			usage: { input: 10, output: 2, cacheRead: 20, cacheWrite: 0, totalTokens: 32, cost: { total: 0 } },
+			stopReason: "stop", timestamp,
+		});
+		const observeProvider = async (timestamp: number): Promise<void> => {
+			await emitBeforeProviderRequest(stub, { model: model.id, messages: [] }, ctx);
+			await emitMessageEnd(stub, assistant(timestamp), ctx);
+		};
+
+		await emitContext(stub, [{ role: "user", content: "first", timestamp: 1 } as unknown as AgentMessage], ctx);
+		await emitContext(stub, [{ role: "user", content: "second", timestamp: 2 } as unknown as AgentMessage], ctx);
+		await observeProvider(3);
+
+		const fixed = await emitContext(stub, [{
+			role: "toolResult", toolCallId: "orphan-correlation", toolName: "read",
+			content: [{ type: "text", text: "HOSTILE-CONTEXT-TEXT" }], isError: false, timestamp: 4,
+		} as unknown as AgentMessage], ctx);
+		assert.equal(validateContextToolPairing(fixed), true);
+		await observeProvider(5);
+
+		const telemetryPath = join(root, CONFIG_DIR_NAME, "workbench", "cache", "telemetry.jsonl");
+		const records = (await readFile(telemetryPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as Record<string, unknown>);
+		const multiple = records.at(-2)!;
+		assert.equal(multiple.requestCorrelationCode, 2);
+		assert.equal(multiple.actorRoleCode, 0);
+		assert.equal(multiple.historyProjection, null);
+		const failure = records.at(-1)!;
+		assert.equal(failure.requestCorrelationCode, 1);
+		assert.equal(failure.actorRoleCode, 0);
+		assert.equal((failure.historyProjection as Record<string, unknown>).eventCode, 5);
+		assert.equal((failure.historyProjection as Record<string, unknown>).causeCode, 8);
+		assert.doesNotMatch(JSON.stringify(records), /HOSTILE-CONTEXT-TEXT|stable fail-closed prompt/);
+	});
 });

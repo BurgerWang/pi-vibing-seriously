@@ -151,6 +151,9 @@ function assertEvidence(evidence: ContextOutputEvidence): void {
 		assert.equal(roleReserve?.[role]?.stable_prior_provider_prefix_across_seals, true, role);
 		assert.equal(roleReserve?.[role]?.segment_caps_valid, true, role);
 		assert.equal(roleReserve?.[role]?.active_caps_valid, true, role);
+		assert.equal(roleReserve?.[role]?.seal_selection_reserve_valid, true, role);
+		assert.equal(roleReserve?.[role]?.reserve_only_crossing_observed, true, role);
+		assert.equal(roleReserve?.[role]?.reserve_only_crossing_same_epoch_no_seal, true, role);
 		assert.equal(roleReserve?.[role]?.state_within_32k, true, role);
 		assert.equal(roleReserve?.[role]?.state_strict_json_roundtrip, true, role);
 		assert.equal(roleReserve?.[role]?.segment_seals_keep_epoch, true, role);
@@ -219,6 +222,16 @@ function assertEvidence(evidence: ContextOutputEvidence): void {
 	assert.equal(worker?.metrics.context_pressure_nine_fields_valid, true);
 	assert.ok(Number(worker?.metrics.history_projection_v3_entries) >= 24);
 	assert.equal(worker?.metrics.history_projection_v3_valid, true);
+	assert.equal(worker?.metrics.history_projection_hard_caps_valid, true);
+	assert.equal(worker?.metrics.history_projection_remaining_capacity_valid, true);
+	assert.equal(worker?.metrics.history_projection_selection_reserve_valid, true);
+	assert.equal(worker?.metrics.history_projection_reserve_only_growth_observed, true);
+	assert.equal(worker?.metrics.history_projection_reserve_only_growth_stayed_same_topology, true);
+	assert.equal(
+		worker?.metrics.maximum_history_projection_active_tool_text_bytes,
+		5 * 12_288,
+		"the deterministic worker must expose the 60 KiB under-hard active tail that crossed only the 48 KiB selection reserve",
+	);
 	assert.ok(Number(worker?.metrics.maximum_history_projection_state_bytes) <= 32 * 1_024);
 	assert.equal(
 		worker?.metrics.minimum_worker_anchor_reserve_bytes,

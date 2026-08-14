@@ -13,8 +13,13 @@
  * compaction). Rendering supports print (text lines) and json output.
  */
 
-import { hasForbiddenTelemetryFields, MAX_TELEMETRY_RECORD_BYTES } from "./cache-store.ts";
-import { cacheHitRatioFromTotals, type TelemetryRecord } from "./cache-types.ts";
+import {
+	hasForbiddenTelemetryFields,
+	MAX_TELEMETRY_RECORD_BYTES,
+	UNINSPECTABLE_TELEMETRY_VALUE,
+} from "./cache-store.ts";
+import { cacheHitRatioFromTotals, isTelemetryRecord, type TelemetryRecord } from "./cache-types.ts";
+import { buildCacheReport } from "./cache-report.ts";
 import { fingerprintTools, type ToolInfoLike } from "./prompt-fingerprint.ts";
 import { invalidationClass } from "./invalidation-classifier.ts";
 import { matchedDynamicMarkerIds, DYNAMIC_MARKERS, staticToolMetadataIssues } from "./stable-prefix.ts";
@@ -134,17 +139,34 @@ function isSameModeMutation(record: TelemetryRecord): boolean {
 	return reason === "UNEXPECTED_DRIFT" || reason === "CONTEXT_PREFIX_DIVERGED";
 }
 
+function safelyIsTelemetryRecord(value: unknown): value is TelemetryRecord {
+	try {
+		return isTelemetryRecord(value);
+	} catch {
+		return false;
+	}
+}
+
 export function runDoctor(facts: DoctorFacts): DoctorCheck[] {
 	const checks: DoctorCheck[] = [];
 	const cli = facts.context === "cli";
-	const skippedRecords = safeCount(facts.skippedRecords);
+	const originalRecords = facts.records as readonly unknown[];
+	const records = originalRecords.filter(safelyIsTelemetryRecord);
+	const invalidSchemaRecords = originalRecords.length - records.length;
+	facts = { ...facts, records };
+	const skippedRecords = Math.min(Number.MAX_SAFE_INTEGER, safeCount(facts.skippedRecords) + invalidSchemaRecords);
 	const truncatedRecords = safeCount(facts.truncatedRecords);
 	const filesRead = safeCount(facts.filesRead);
 	const writeGapObserved = telemetryWriteGapObserved(facts.records);
 	const sourceIncomplete = facts.sourceIncomplete === true || skippedRecords > 0 || Boolean(facts.sourceUnavailable) || writeGapObserved;
 	const observationIncomplete = sourceIncomplete || truncatedRecords > 0;
-	const qualityDetail = `files=${filesRead} skipped=${skippedRecords} bounded-oldest-omitted=${truncatedRecords} telemetry-write-gap=${writeGapObserved ? "yes" : "no"}`;
+	const qualityDetail = `files=${filesRead} skipped=${skippedRecords} schema-invalid=${invalidSchemaRecords} bounded-oldest-omitted=${truncatedRecords} telemetry-write-gap=${writeGapObserved ? "yes" : "no"}`;
 	const cacheRecordFacts = summarizeCacheRecordFacts(facts.records);
+	const observabilityReport = buildCacheReport(facts.records, "project", () => undefined, {
+		skippedRecords,
+		sourceIncomplete,
+		truncatedRecords,
+	});
 
 	// Offline derivation: in CLI mode the live Pi model is unavailable, so
 	// provider/model/apiKind come from the last telemetry record instead.
@@ -183,6 +205,31 @@ export function runDoctor(facts: DoctorFacts): DoctorCheck[] {
 		});
 	} else {
 		checks.push({ id: "telemetry_source_quality", status: "ok", message: `complete retained telemetry evidence (${qualityDetail})` });
+	}
+
+	// Schema 1.3 observes the local provider-hook projection only. finalityCode
+	// is contractually 0 and must never be presented as final actual wire.
+	const observed = observabilityReport.observability;
+	if (observed === null || observed.localObservedRequests === 0) {
+		checks.push({ id: "provider_wire_observation", status: "skip", message: "local provider observation unobserved; no final actual-wire claim" });
+	} else {
+		checks.push({
+			id: "provider_wire_observation",
+			status: "warn",
+			message: `local observations=${observed.localObservedRequests} nonfinal=${observed.nonFinalObservedRequests} finalityCode=0 — local observation is not final actual wire`,
+		});
+	}
+	if (observed === null) {
+		checks.push({ id: "request_correlation", status: observationIncomplete ? "warn" : "skip", message: "schema13Rows=0 correlation unobserved" });
+	} else {
+		const correlation = observed.correlationCounts;
+		const ambiguous = correlation.unwired + correlation.multipleOrStale + correlation.missing;
+		const semanticUnverified = facts.records.filter((record) => record.schemaVersion === "1.3" && record.usageSemanticStatus !== "verified").length;
+		checks.push({
+			id: "request_correlation",
+			status: ambiguous > 0 || semanticUnverified > 0 || observationIncomplete ? "warn" : "ok",
+			message: `unwired=${correlation.unwired} exact=${correlation.exact} multiple-or-stale=${correlation.multipleOrStale} missing=${correlation.missing} semantic-unverified=${semanticUnverified}${observationIncomplete ? " partial-window=1" : " partial-window=0"}`,
+		});
 	}
 
 	// 4. Usage field validity across records.
@@ -453,15 +500,18 @@ export function runDoctor(facts: DoctorFacts): DoctorCheck[] {
 
 	// 16. Forbidden fields in telemetry.
 	let forbidden = 0;
-	for (const record of facts.records) {
-		if (hasForbiddenTelemetryFields(record) !== null) forbidden += 1;
+	let uninspectable = 0;
+	for (const record of originalRecords) {
+		const hit = hasForbiddenTelemetryFields(record);
+		if (hit === UNINSPECTABLE_TELEMETRY_VALUE) uninspectable += 1;
+		else if (hit !== null) forbidden += 1;
 	}
 	if (forbidden > 0) {
-		checks.push({ id: "forbidden_fields", status: "fail", message: `${forbidden} record(s) contain forbidden fields (prompt/content/secret/... keys) — fix the schema before continuing` });
-	} else if (observationIncomplete) {
-		checks.push({ id: "forbidden_fields", status: "warn", message: `no forbidden fields in ${facts.records.length} retained record(s); partial/omitted telemetry prevents a whole-source conclusion` });
+		checks.push({ id: "forbidden_fields", status: "fail", message: `${forbidden} record(s) contain forbidden fields (prompt/content/secret/... keys); uninspectable=${uninspectable} — fix the schema before continuing` });
+	} else if (observationIncomplete || uninspectable > 0) {
+		checks.push({ id: "forbidden_fields", status: "warn", message: `no forbidden fields in ${facts.records.length} retained record(s); uninspectable=${uninspectable}; partial/omitted telemetry prevents a whole-source conclusion` });
 	} else {
-		checks.push({ id: "forbidden_fields", status: "ok", message: `no forbidden fields in ${facts.records.length} record(s)` });
+		checks.push({ id: "forbidden_fields", status: "ok", message: `no forbidden fields in ${facts.records.length} record(s); uninspectable=0` });
 	}
 
 	// 17. Telemetry file size.
@@ -512,20 +562,24 @@ export function doctorToJson(checks: readonly DoctorCheck[], facts?: DoctorFacts
 		warn_count: checks.filter((c) => c.status === "warn").length,
 	};
 	if (facts) {
+		const records = (facts.records as readonly unknown[]).filter(safelyIsTelemetryRecord);
+		const invalidSchemaRecords = facts.records.length - records.length;
 		const fingerprint = fingerprintTools(facts.activeToolNames, facts.tools);
 		const sourceIncomplete = facts.sourceIncomplete === true
 				|| safeCount(facts.skippedRecords) > 0
+				|| invalidSchemaRecords > 0
 				|| Boolean(facts.sourceUnavailable)
-				|| telemetryWriteGapObserved(facts.records);
+				|| telemetryWriteGapObserved(records);
 		const truncatedRecords = safeCount(facts.truncatedRecords);
 		out.telemetry_quality = {
 			sourceIncomplete,
-			skippedRecords: safeCount(facts.skippedRecords),
+			skippedRecords: Math.min(Number.MAX_SAFE_INTEGER, safeCount(facts.skippedRecords) + invalidSchemaRecords),
+			invalidSchemaRecords,
 			truncatedRecords,
 			filesRead: safeCount(facts.filesRead),
 			sourceUnavailable: facts.sourceUnavailable ?? null,
 		};
-		const recordFacts = summarizeCacheRecordFacts(facts.records);
+		const recordFacts = summarizeCacheRecordFacts(records);
 		out.history_projection = {
 			segmentSeals: recordFacts.historyProjectionSegmentSeals,
 			epochTransitions: recordFacts.historyProjectionEpochTransitions,
@@ -540,6 +594,15 @@ export function doctorToJson(checks: readonly DoctorCheck[], facts?: DoctorFacts
 					? null
 					: recordFacts.explicitBreakpointVerifiedUsage.hitRatio,
 			},
+		};
+		const observability = buildCacheReport(records, "project", () => undefined, {
+			skippedRecords: Math.min(Number.MAX_SAFE_INTEGER, safeCount(facts.skippedRecords) + invalidSchemaRecords),
+			sourceIncomplete,
+			truncatedRecords,
+		});
+		out.cache_observability = {
+			schema13Rows: observability.schema13Rows,
+			facts: observability.observability,
 		};
 		out.prefix = {
 			systemPromptHash: fingerprintSystemPromptHash(facts),

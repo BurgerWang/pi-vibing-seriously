@@ -5,6 +5,51 @@ environments that were actually exercised are listed; no untested
 compatibility is claimed. The machine-readable copy lives in
 [`compatibility/pi.json`](../compatibility/pi.json).
 
+## Unreleased cache-prefix P0–P2 compatibility
+
+This is working-tree documentation only; it does not claim a commit,
+deployment, tag, package publish, or new Pi-version qualification.
+
+- Telemetry writers move to strict schema 1.3 while strict 1.0–1.2 records
+  remain readable. New rows add disjoint read/write shares, numeric quality
+  codes, exact context/request/message correlation, whole-item LCP, actor
+  cohorts, and content-free history-projection anatomy. A local
+  `before_provider_request` observation has `finalityCode=0` and is not the
+  final provider wire. Non-exact correlation is accepted only with unknown
+  actor and `historyProjection: null`. Event/cause/overflow/segment facts are
+  accepted only in the strict schema-1.3 semantic matrix. Aggregate status
+  code `7` (`aggregate_overflow`) means the exact sum exceeds the safe numeric
+  publication surface and both shares are `null`; it is not a saturated ratio.
+- Trusted recoverable ingress is additive for exactly finalized recipe
+  summaries, executed gate records, immutable comparisons, completed worker
+  reports, finalized run pages, and run-id gate pages. Sources must be regular
+  in-project files no larger than 4 MiB, content-hashed and bound to stable
+  size/device/inode/`mtimeNs`/`ctimeNs`; any mismatch simply leaves the result
+  on the ordinary bounded path. Text at or below 4 KiB remains byte-exact,
+  larger text may use the deterministic recovery wrapper, and a low allocation
+  removes that wrapper/metadata together before applying the ordinary
+  envelope. Gate-page cursors advance only across complete rows visible in the
+  final page; projected history prefers the validated durable source pointer.
+  The implementation is shared by Commander, worker, and other roles.
+- The 96/64 KiB and 128-bundle role hard caps do not change. The 64/48 KiB
+  turn and 16-bundle values become suffix-selection reserves only: crossing a
+  reserve alone stays byte-identical. Sealing requires a true hard byte/bundle
+  crossing; a later true crossing at the 16-segment safety ceiling performs a
+  deterministic model-free checkpoint.
+- Responses cache-write status `2` means normalized absence-or-zero and is not
+  promoted to provider-presence verification. DeepSeek Completions write
+  status remains unavailable. Legacy `cacheHitRatio` remains readable while
+  schema-1.3 canaries use the separately labeled disjoint read share.
+- Warm-prefix auxiliary compaction is
+  `BLOCKED_BY_PI_0_83_PUBLIC_API`. The public Pi 0.83 surface has no
+  post-summary transform or same-cache-domain guarantee, and the workbench does
+  not reimplement private authentication, headers, streams, retries, or
+  provider calls. Built-in/native compaction is unchanged.
+- Cache doctor remains non-executing for hostile evidence: Proxy/accessor/
+  symbol/exotic rows are uninspectable partial input, never a clean result.
+  Pending request correlation is single-use and resets with session identity
+  or restored state.
+
 ## v0.10.0 context-output compatibility
 
 The control plane is implemented and tested against Pi 0.83.0's event order
@@ -57,9 +102,11 @@ entries use strict `workbench-history-projection-state-v3` with
 and 128-bundle hard ceilings remain.
 After reserving the 64/48 KiB raw role turn and sixteen 384-byte/one-bundle
 immutable segments, the Commander/worker anchor caps are 26/10 KiB and 96
-bundles; the raw active suffix is capped at 16 bundles. Seals 1–16 preserve the
-epoch and all existing markers/slices, while an attempt to create segment 17
-triggers a checkpoint and increments the epoch.
+bundles. In the Unreleased controller these values select a protected suffix
+only after a true hard crossing; reserve-only growth is unchanged. Seals 1–16
+preserve the epoch and all existing markers/slices, while a later true hard
+crossing at the 16-segment ceiling triggers a checkpoint and increments the
+epoch.
 
 An exact v3 entry reconstructs every contiguous slice from raw JSONL. The
 newest recognized malformed or structurally unsafe entry is authoritative: a
@@ -524,8 +571,9 @@ max, DEV mode) and `openai-codex-responses` (tested live: openai-codex /
 gpt-5.6-sol, thinking high, DEV mode), plus `openai-responses`,
 `azure-openai-responses` and `anthropic-messages` (mapped, not live-tested).
 Any other api kind is recorded `partial`/`unverified` — the workbench never
-guesses. `cacheWrite = 0` is
-normal for DeepSeek and never treated as an error. Controlled worker
+guesses. A normalized DeepSeek `cacheWrite = 0` remains non-error data, but
+schema 1.3 status `1` correctly describes its write semantics as unavailable
+rather than presence-verified zero. Controlled worker
 execution was live-tested with `deepseek-v4-flash:max`: 2 turns, verified
 provider/model, stop reason `stop`, exit 0, and no file modifications.
 

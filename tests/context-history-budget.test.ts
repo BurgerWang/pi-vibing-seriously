@@ -8,8 +8,10 @@ import {
 	HISTORY_MAX_BUNDLES,
 	HISTORY_PROJECTION_ACTIVE_MAX_BUNDLES,
 	HISTORY_PROJECTION_ENTRY_TYPE,
+	HISTORY_PROJECTION_EVENT_KINDS,
 	HISTORY_PROJECTION_MAX_EPOCH,
 	HISTORY_PROJECTION_MAX_SEGMENTS,
+	HISTORY_PROJECTION_OBSERVATION_CAUSES,
 	HISTORY_PROJECTION_SEGMENT_MAX_BUNDLES,
 	HISTORY_PROJECTION_SEGMENT_MAX_TOOL_TEXT_BYTES,
 	HistoryProjectionController,
@@ -109,6 +111,68 @@ function trustedDetails(extra: Record<string, unknown> = {}): Record<string, unk
 			omittedImageCount: 0,
 			reason: "none",
 		},
+	};
+}
+
+const ingressCases = [
+	{
+		sourceKind: "finalized_recipe_run",
+		toolName: "workbench_run_recipe",
+		sourcePath: ".pi/workbench/runs/20260814-180000-recp/summary.json",
+		requiredFactCount: 5,
+	},
+	{
+		sourceKind: "executed_gate_run",
+		toolName: "workbench_run_gate",
+		sourcePath: ".pi/workbench/runs/20260814-180001-gate/gates.json",
+		requiredFactCount: 3,
+	},
+	{
+		sourceKind: "immutable_comparison",
+		toolName: "workbench_compare_runs",
+		sourcePath: `.pi/workbench/comparisons/cmp1-${"a".repeat(64)}/comparison.json`,
+		requiredFactCount: 4,
+	},
+	{
+		sourceKind: "completed_worker_report",
+		toolName: "workbench_delegate_worker",
+		sourcePath: ".pi/workbench/delegations/20260814-180002-work/worker-report.md",
+		requiredFactCount: 4,
+	},
+	{
+		sourceKind: "finalized_run_page",
+		toolName: "workbench_read_run",
+		sourcePath: ".pi/workbench/runs/20260814-180003-page/stdout.log",
+		requiredFactCount: 4,
+	},
+	{
+		sourceKind: "run_id_gate_page",
+		toolName: "workbench_read_gate",
+		sourcePath: ".pi/workbench/runs/20260814-180004-gate/gates.json",
+		requiredFactCount: 3,
+	},
+] as const;
+
+function ingressMetadata(
+	input: (typeof ingressCases)[number],
+	originalBytes: number,
+	overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+	return {
+		schema: "workbench-tool-result-ingress-metadata-v1",
+		sourceKind: input.sourceKind,
+		sourcePath: input.sourcePath,
+		sourceIdentityKind: "snapshot",
+		sourceIdentityHash: "1".repeat(64),
+		authorityHash: "2".repeat(64),
+		projectionHash: "3".repeat(64),
+		originalBytes,
+		projectedBytes: originalBytes,
+		bodyShownBytes: originalBytes,
+		omittedBytes: 0,
+		budgetBytes: 4_096,
+		requiredFactCount: input.requiredFactCount,
+		...overrides,
 	};
 }
 
@@ -503,6 +567,220 @@ test("descriptors sanitize UTF-8 and controls, omit images/raw text, and never e
 	assert.match(textOf(trustedSource), /source=\.pi\/workbench\/runs\/run-safe\/stdout\.log/);
 });
 
+test("strict ingress metadata chooses the durable source ahead of receipt for all six source contracts", () => {
+	const receiptId = `wtr1-${"f".repeat(64)}`;
+	for (const [index, candidate] of ingressCases.entries()) {
+		const raw = `RAW-INGRESS-${candidate.sourceKind}-SECRET`;
+		const metadata = JSON.parse(JSON.stringify(
+			ingressMetadata(candidate, Buffer.byteLength(raw, "utf8")),
+		)) as Record<string, unknown>;
+		const collapsed = collapseHistoricalToolResult(result(`ingress-${index}`, raw, {
+			name: candidate.toolName,
+			details: trustedDetails({
+				ingress_projection: metadata,
+				receipt: {
+					available: true,
+					result_id: receiptId,
+					path: `.pi/workbench/tool-results/${receiptId}/finalized.json`,
+				},
+			}),
+		}));
+		const descriptor = textOf(collapsed);
+		const lines = descriptor.split("\n");
+		assert.equal(lines.length, 4, candidate.sourceKind);
+		assert.equal(lines[3], `source=${candidate.sourcePath}`, candidate.sourceKind);
+		assert.doesNotMatch(descriptor, /receipt=|RAW-INGRESS|source_kind=|authority_hash=|projection_hash=/);
+		assert.doesNotMatch(descriptor, /1111111111111111|2222222222222222|3333333333333333/);
+	}
+});
+
+test("malformed ingress metadata fails closed while bounded plain-data failures preserve receipt and legacy fallbacks", () => {
+	const candidate = ingressCases[4];
+	const raw = "RAW-MALFORMED-INGRESS-SECRET";
+	const valid = ingressMetadata(candidate, Buffer.byteLength(raw, "utf8"));
+	const malformed: unknown[] = [
+		{ ...valid, schema: "foreign-v1" },
+		{ ...valid, sourceKind: "unknown_source" },
+		{ ...valid, sourceIdentityKind: "foreign" },
+		{ ...valid, sourceIdentityHash: "short" },
+		{ ...valid, authorityHash: "A".repeat(64) },
+		{ ...valid, projectionHash: "short" },
+		{ ...valid, sourcePath: "/home/operator/raw.log" },
+		{ ...valid, sourcePath: ".pi/workbench/runs/../secret.log" },
+		{ ...valid, sourcePath: ingressCases[2].sourcePath },
+		{ ...valid, projectedBytes: 4_097 },
+		{ ...valid, bodyShownBytes: (valid.originalBytes as number) + 1 },
+		{ ...valid, omittedBytes: 1 },
+		{ ...valid, budgetBytes: 4_095 },
+		{ ...valid, requiredFactCount: 3 },
+		{ ...valid, unexpected: true },
+		new Date(0),
+	];
+	const hiddenExtra = { ...valid };
+	Object.defineProperty(hiddenExtra, "hidden", { value: true, enumerable: false });
+	malformed.push(hiddenExtra);
+	for (const [index, metadata] of malformed.entries()) {
+		const collapsed = collapseHistoricalToolResult(result(`malformed-${index}`, raw, {
+			name: candidate.toolName,
+			details: trustedDetails({ ingress_projection: metadata }),
+		}));
+		const descriptor = textOf(collapsed);
+		assert.match(descriptor, /action=re-query this tool with a bounded request/, `case=${index}`);
+		assert.doesNotMatch(descriptor, /source=|receipt=|RAW-MALFORMED|1111111111111111|2222222222222222|3333333333333333/);
+	}
+
+	const wrongTool = collapseHistoricalToolResult(result("wrong-tool", raw, {
+		name: "workbench_run_recipe",
+		details: trustedDetails({ ingress_projection: valid }),
+	}));
+	assert.match(textOf(wrongTool), /action=re-query this tool with a bounded request/);
+	assert.doesNotMatch(textOf(wrongTool), /source=/);
+
+	const receiptId = `wtr1-${"d".repeat(64)}`;
+	const receiptFallback = collapseHistoricalToolResult(result("receipt-fallback", raw, {
+		name: candidate.toolName,
+		details: trustedDetails({
+			ingress_projection: { ...valid, unexpected: true },
+			receipt: {
+				available: true,
+				result_id: receiptId,
+				path: `.pi/workbench/tool-results/${receiptId}/finalized.json`,
+			},
+		}),
+	}));
+	assert.match(textOf(receiptFallback), /receipt=\.pi\/workbench\/tool-results\/wtr1-/);
+	assert.doesNotMatch(textOf(receiptFallback), /source=/);
+
+	const legacyPath = ".pi/workbench/runs/20260814-180099-legacy/stdout.log";
+	const legacyFallback = collapseHistoricalToolResult(result("legacy-fallback", raw, {
+		name: candidate.toolName,
+		details: trustedDetails({
+			ingress_projection: { ...valid, schema: "foreign-v1" },
+			stdout_log: legacyPath,
+		}),
+	}));
+	assert.match(textOf(legacyFallback), new RegExp(`source=${legacyPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+	assert.doesNotMatch(textOf(legacyFallback), /RAW-MALFORMED|1111111111111111|2222222222222222|3333333333333333/);
+});
+
+test("hostile ingress metadata executes no proxy or accessor traps and emits no recovery pointer", () => {
+	const candidate = ingressCases[4];
+	const raw = "RAW-HOSTILE-INGRESS-SECRET";
+	const valid = ingressMetadata(candidate, Buffer.byteLength(raw, "utf8"));
+
+	let wholeDetailsProxyTrapCalls = 0;
+	const wholeDetailsProxy = new Proxy(trustedDetails({ ingress_projection: valid }), {
+		get(): never { wholeDetailsProxyTrapCalls += 1; throw new Error("whole details proxy get"); },
+		ownKeys(): never { wholeDetailsProxyTrapCalls += 1; throw new Error("whole details proxy ownKeys"); },
+		getOwnPropertyDescriptor(): never {
+			wholeDetailsProxyTrapCalls += 1;
+			throw new Error("whole details proxy descriptor");
+		},
+	});
+	const wholeDetailsProxied = collapseHistoricalToolResult(result("hostile-whole-details-proxy", raw, {
+		name: candidate.toolName,
+		details: wholeDetailsProxy,
+	}));
+	assert.equal(wholeDetailsProxyTrapCalls, 0);
+	assert.match(textOf(wholeDetailsProxied), /action=re-query this tool with a bounded request/);
+	assert.doesNotMatch(textOf(wholeDetailsProxied), /source=|receipt=|RAW-HOSTILE|whole details proxy/);
+
+	let wholeDetailsAccessorCalls = 0;
+	const wholeDetailsAccessor = trustedDetails();
+	Object.defineProperty(wholeDetailsAccessor, "ingress_projection", {
+		enumerable: true,
+		configurable: true,
+		get(): never {
+			wholeDetailsAccessorCalls += 1;
+			throw new Error("whole details ingress accessor");
+		},
+	});
+	const wholeDetailsAccessed = collapseHistoricalToolResult(result("hostile-whole-details-accessor", raw, {
+		name: candidate.toolName,
+		details: wholeDetailsAccessor,
+	}));
+	assert.equal(wholeDetailsAccessorCalls, 0);
+	assert.match(textOf(wholeDetailsAccessed), /action=re-query this tool with a bounded request/);
+	assert.doesNotMatch(textOf(wholeDetailsAccessed), /source=|receipt=|RAW-HOSTILE|whole details ingress/);
+
+	const oversizedDetails = trustedDetails({ ingress_projection: valid });
+	for (let index = 0; index < 18; index += 1) {
+		oversizedDetails[`padding_${index}`] = "x".repeat(500);
+	}
+	const oversized = collapseHistoricalToolResult(result("oversized-whole-details", raw, {
+		name: candidate.toolName,
+		details: oversizedDetails,
+	}));
+	assert.match(textOf(oversized), /action=re-query this tool with a bounded request/);
+	assert.doesNotMatch(textOf(oversized), /source=|receipt=|RAW-HOSTILE|1111111111111111|2222222222222222|3333333333333333/);
+
+	let proxyTrapCalls = 0;
+	const proxy = new Proxy(valid, {
+		get(): never { proxyTrapCalls += 1; throw new Error("ingress proxy get"); },
+		ownKeys(): never { proxyTrapCalls += 1; throw new Error("ingress proxy ownKeys"); },
+		getOwnPropertyDescriptor(): never { proxyTrapCalls += 1; throw new Error("ingress proxy descriptor"); },
+	});
+	const proxied = collapseHistoricalToolResult(result("hostile-proxy", raw, {
+		name: candidate.toolName,
+		details: trustedDetails({ ingress_projection: proxy }),
+	}));
+	assert.equal(proxyTrapCalls, 0);
+	assert.match(textOf(proxied), /action=re-query this tool with a bounded request/);
+	assert.doesNotMatch(textOf(proxied), /source=|receipt=|RAW-HOSTILE/);
+
+	let accessorCalls = 0;
+	const accessor = { ...valid };
+	Object.defineProperty(accessor, "sourcePath", {
+		enumerable: true,
+		configurable: true,
+		get(): never { accessorCalls += 1; throw new Error("ingress sourcePath accessor"); },
+	});
+	const accessed = collapseHistoricalToolResult(result("hostile-accessor", raw, {
+		name: candidate.toolName,
+		details: trustedDetails({ ingress_projection: accessor }),
+	}));
+	assert.equal(accessorCalls, 0);
+	assert.match(textOf(accessed), /action=re-query this tool with a bounded request/);
+	assert.doesNotMatch(textOf(accessed), /source=|receipt=|RAW-HOSTILE/);
+
+	const symbol = { ...valid } as Record<PropertyKey, unknown>;
+	Object.defineProperty(symbol, Symbol("hidden"), { value: "secret", enumerable: true });
+	const symbolized = collapseHistoricalToolResult(result("hostile-symbol", raw, {
+		name: candidate.toolName,
+		details: trustedDetails({ ingress_projection: symbol }),
+	}));
+	assert.match(textOf(symbolized), /action=re-query this tool with a bounded request/);
+	assert.doesNotMatch(textOf(symbolized), /source=|receipt=|RAW-HOSTILE|secret/);
+});
+
+test("Commander, worker, and unknown roles collapse ingress-backed history identically", () => {
+	const candidate = ingressCases[0];
+	const raw = "ROLE-RAW-SECRET".repeat(100);
+	const messages = [
+		assistant([{ id: "role-old", name: candidate.toolName }]),
+		result("role-old", raw, {
+			name: candidate.toolName,
+			details: trustedDetails({
+				ingress_projection: ingressMetadata(candidate, Buffer.byteLength(raw, "utf8")),
+			}),
+		}),
+		...bundle("role-latest", "latest"),
+	];
+	const descriptors = (["commander", "worker", "other"] as const).map((role) => {
+		const projected = project(messages, {
+			role,
+			maxToolTextBytes: 300,
+			maxBundles: 2,
+		});
+		assert.equal(validateContextToolPairing(projected.messages), true, role);
+		const descriptor = textOf(resultById(projected.messages, "role-old")!);
+		assert.match(descriptor, new RegExp(`source=${candidate.sourcePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`), role);
+		assert.doesNotMatch(descriptor, /ROLE-RAW-SECRET|authority_hash=|projection_hash=/, role);
+		return descriptor;
+	});
+	assert.deepEqual(descriptors, [descriptors[0], descriptors[0], descriptors[0]]);
+});
+
 test("old image results collapse without copying image data or raw text", () => {
 	const messages = [
 		assistant([{ id: "old-image" }]),
@@ -640,7 +918,7 @@ test("seeded exact-pairing fuzz remains reproducible through projection and corr
 	}
 });
 
-test("history projection preserves immutable provider prefixes across proactive segment seals", () => {
+test("history projection preserves the complete provider prefix while projected history stays under hard limits", () => {
 	const controller = new HistoryProjectionController();
 	const raw: AgentMessage[] = [user("epoch-start")];
 	for (let index = 0; index < 8; index += 1) raw.push(...bundle(`epoch-seed-${index}`, "x".repeat(10 * 1_024)));
@@ -658,15 +936,10 @@ test("history projection preserves immutable provider prefixes across proactive 
 	assert.equal(validateContextToolPairing(projected.messages), true);
 	let providerVisible = providerMessages(projected.messages);
 	let state = controller.serialize();
-	let stableProviderCount = state.anchor.projectedMessageCount
-		+ state.segments.reduce((sum, segment) => sum + segment.projectedMessageCount, 0);
 	let transitionCount = 1;
 	let segmentSealCount = 0;
-	let firstSegmentSealTurn: number | undefined;
 	let collapsedDelta = projected.newlyCollapsedResults;
 	let removedDelta = projected.newlyRemovedBundles;
-	const expectedFirstSegmentSealTurn = HISTORY_PROJECTION_ACTIVE_MAX_BUNDLES
-		- projected.facts.protectedLatestBundles;
 
 	for (let turn = 0; turn < 25; turn += 1) {
 		raw.push(user(`suffix-user-${turn}`), ...bundle(`epoch-suffix-${turn}`, "s".repeat(12)));
@@ -676,28 +949,15 @@ test("history projection preserves immutable provider prefixes across proactive 
 		removedDelta += next.newlyRemovedBundles;
 		const nextProviderVisible = providerMessages(next.messages);
 		const nextState = controller.serialize();
-		if (next.segmentSealed) {
-			segmentSealCount += 1;
-			firstSegmentSealTurn ??= turn;
-			assert.equal(next.epochTransitioned, false, `turn=${turn}`);
-			assert.equal(next.transitionCause, "segment_sealed", `turn=${turn}`);
-			assert.deepEqual(
-				nextProviderVisible.slice(0, stableProviderCount),
-				providerVisible.slice(0, stableProviderCount),
-				`turn ${turn} rewrote an immutable provider prefix`,
-			);
-			const nextStableProviderCount = nextState.anchor.projectedMessageCount
-				+ nextState.segments.reduce((sum, segment) => sum + segment.projectedMessageCount, 0);
-			assert.ok(nextStableProviderCount > stableProviderCount, `turn=${turn} did not grow the stable prefix`);
-			stableProviderCount = nextStableProviderCount;
-		} else {
-			assert.equal(next.transitionCause, "none", `turn=${turn}`);
-			assert.deepEqual(
-				nextProviderVisible.slice(0, providerVisible.length),
-				providerVisible,
-				`turn ${turn} rewrote the append-only provider payload`,
-			);
-		}
+		if (next.segmentSealed) segmentSealCount += 1;
+		assert.equal(next.segmentSealed, false, `turn=${turn}`);
+		assert.equal(next.epochTransitioned, false, `turn=${turn}`);
+		assert.equal(next.transitionCause, "none", `turn=${turn}`);
+		assert.deepEqual(
+			nextProviderVisible.slice(0, providerVisible.length),
+			providerVisible,
+			`turn ${turn} rewrote the append-only provider payload`,
+		);
 		assert.ok(historyToolTextBytes(next.messages) <= WORKER_HISTORY_TOOL_TEXT_MAX_BYTES, `turn=${turn}`);
 		assert.ok(next.projectedBundleCount <= 128, `turn=${turn}`);
 		assert.equal(validateContextToolPairing(next.messages), true, `turn=${turn}`);
@@ -706,9 +966,8 @@ test("history projection preserves immutable provider prefixes across proactive 
 		projected = next;
 	}
 
-	assert.equal(firstSegmentSealTurn, expectedFirstSegmentSealTurn, "the seventeenth active bundle seals proactively");
-	assert.equal(segmentSealCount, 25 - expectedFirstSegmentSealTurn);
-	assert.equal(state.segments.length, segmentSealCount);
+	assert.equal(segmentSealCount, 0, "an active-reserve crossing alone must not seal");
+	assert.equal(state.segments.length, 0);
 	assert.equal(transitionCount, 1, "segment seals do not change the projection epoch");
 	assert.equal(collapsedDelta, projected.facts.collapsedResults, "same epoch never re-counts collapsed results");
 	assert.equal(removedDelta, projected.facts.removedBundles, "same epoch never re-counts removed bundles");
@@ -745,12 +1004,19 @@ test("rolling projection reserves one role turn and keeps a fixed provider ancho
 	raw.push(user("same-epoch-small"), ...batchBundle("same-epoch-small", [4 * 1_024]));
 	const sameEpoch = controller.project({ messages: raw, ...config });
 	assert.equal(sameEpoch.epochTransitioned, false);
-	assert.equal(sameEpoch.segmentSealed, true);
-	assert.equal(sameEpoch.transitionCause, "segment_sealed");
+	assert.equal(sameEpoch.segmentSealed, false);
+	assert.equal(sameEpoch.transitionCause, "none");
+	assert.ok(historyToolTextBytes(raw.slice(controller.serialize().activeRawStartMessageCount)) > COMMANDER_TURN_MAX_BYTES);
+	assert.ok(historyToolTextBytes(sameEpoch.messages) <= COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES);
+	assert.deepEqual(
+		convertToLlm(sameEpoch.messages).slice(0, convertToLlm(initial.messages).length),
+		convertToLlm(initial.messages),
+		"an under-hard active-reserve crossing must remain wholly append-only",
+	);
 	assert.deepEqual(convertToLlm(sameEpoch.messages).slice(0, fixedAnchor.length), fixedAnchor);
 
 	for (const [label, sizes, expectedSeal, expectedActiveBytes] of [
-		["batch-50k", [25 * 1_024, 25 * 1_024], false, 54 * 1_024],
+		["batch-50k", [25 * 1_024, 25 * 1_024], true, 54 * 1_024],
 		["batch-64k", [16 * 1_024, 16 * 1_024, 16 * 1_024, 16 * 1_024], true, 64 * 1_024],
 	] as const) {
 		raw.push(user(label), ...batchBundle(label, sizes));
@@ -773,6 +1039,202 @@ test("rolling projection reserves one role turn and keeps a fixed provider ancho
 		for (const id of sizes.map((_, index) => `${label}-${index}`)) {
 			assert.match(textOf(resultById(transitioned.messages, id)!), /^\d+$/, `${label}/${id} latest batch must stay raw`);
 		}
+	}
+});
+
+test("role controllers append past the active byte reserve until projected history crosses the hard byte cap", () => {
+	for (const scenario of [
+		{
+			role: "commander" as const,
+			hard: COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES,
+			turn: COMMANDER_TURN_MAX_BYTES,
+			seedBundles: 8,
+			seedBytes: 15 * 1_024,
+			underBytes: 5 * 1_024,
+			crossingBytes: 35 * 1_024,
+		},
+		{
+			role: "worker" as const,
+			hard: WORKER_HISTORY_TOOL_TEXT_MAX_BYTES,
+			turn: WORKER_TURN_MAX_BYTES,
+			seedBundles: 8,
+			seedBytes: 10 * 1_024,
+			underBytes: 10 * 1_024,
+			crossingBytes: 20 * 1_024,
+		},
+		{
+			role: "other" as const,
+			hard: OTHER_HISTORY_TOOL_TEXT_MAX_BYTES,
+			turn: WORKER_TURN_MAX_BYTES,
+			seedBundles: 8,
+			seedBytes: 10 * 1_024,
+			underBytes: 10 * 1_024,
+			crossingBytes: 20 * 1_024,
+		},
+	] as const) {
+		const controller = new HistoryProjectionController();
+		const raw: AgentMessage[] = [user(`${scenario.role}-byte-anchor`)];
+		for (let index = 0; index < scenario.seedBundles; index += 1) {
+			raw.push(...bundle(`${scenario.role}-byte-seed-${index}`, "s".repeat(scenario.seedBytes)));
+		}
+		const config = {
+			maxToolTextBytes: scenario.hard,
+			maxBundles: HISTORY_MAX_BUNDLES,
+			descriptorMaxBytes: HISTORY_DESCRIPTOR_MAX_BYTES,
+			role: scenario.role,
+		};
+		const initial = controller.project({ messages: raw, ...config });
+		assert.equal(initial.epochTransitioned, true, scenario.role);
+		assert.equal(initial.segmentSealed, false, scenario.role);
+		assert.equal(initial.transitionCause, "initial_hard_limit", scenario.role);
+		assert.equal(controller.serialize().segments.length, 0, scenario.role);
+
+		const underId = `${scenario.role}-byte-under`;
+		raw.push(user(`${underId}-turn`), ...bundle(underId, "u".repeat(scenario.underBytes)));
+		const under = controller.project({ messages: raw, ...config });
+		const underState = controller.serialize();
+		assert.equal(under.segmentSealed, false, scenario.role);
+		assert.equal(under.epochTransitioned, false, scenario.role);
+		assert.equal(under.transitionCause, "none", scenario.role);
+		assert.equal(underState.segments.length, 0, scenario.role);
+		assert.ok(
+			historyToolTextBytes(raw.slice(underState.activeRawStartMessageCount)) > scenario.turn,
+			`${scenario.role} active bytes must exceed the turn reserve`,
+		);
+		assert.ok(historyToolTextBytes(under.messages) <= scenario.hard, `${scenario.role} projected bytes`);
+		assert.deepEqual(
+			providerMessages(under.messages).slice(0, providerMessages(initial.messages).length),
+			providerMessages(initial.messages),
+			`${scenario.role} rewrote the under-hard provider prefix`,
+		);
+		assert.equal(textOf(resultById(under.messages, underId)!), "u".repeat(scenario.underBytes), scenario.role);
+
+		const persisted = JSON.parse(JSON.stringify(underState)) as SerializedV3ProjectionState;
+		const reloaded = new HistoryProjectionController();
+		assert.equal(reloaded.restoreFromEntries([
+			{ type: "custom", customType: HISTORY_PROJECTION_ENTRY_TYPE, data: persisted },
+		]), true, `${scenario.role} restores an under-hard active tail above the byte reserve`);
+		const replayed = reloaded.project({
+			messages: JSON.parse(JSON.stringify(raw)) as AgentMessage[],
+			...config,
+		});
+		assert.equal(replayed.segmentSealed, false, scenario.role);
+		assert.equal(replayed.transitionCause, "none", scenario.role);
+		assert.deepEqual(jsonNormalizedProviderMessages(replayed.messages), jsonNormalizedProviderMessages(under.messages), scenario.role);
+
+		const crossingId = `${scenario.role}-byte-crossing`;
+		raw.push(user(`${crossingId}-turn`), ...bundle(crossingId, "h".repeat(scenario.crossingBytes)));
+		const crossing = controller.project({ messages: raw, ...config });
+		assert.equal(crossing.segmentSealed, true, scenario.role);
+		assert.equal(crossing.epochTransitioned, false, scenario.role);
+		assert.equal(crossing.transitionCause, "segment_sealed", scenario.role);
+		assert.equal(controller.serialize().segments.length, 1, `${scenario.role} seals exactly once`);
+		assert.ok(historyToolTextBytes(crossing.messages) <= scenario.hard, scenario.role);
+		assert.equal(validateContextToolPairing(crossing.messages), true, scenario.role);
+		assert.equal(
+			textOf(resultById(crossing.messages, crossingId)!),
+			"h".repeat(scenario.crossingBytes),
+			`${scenario.role} latest hard-crossing bundle stays raw`,
+		);
+
+		const crossingProvider = providerMessages(crossing.messages);
+		const stableId = `${scenario.role}-byte-stable`;
+		raw.push(user(`${stableId}-turn`), ...bundle(stableId, "n"));
+		const stable = controller.project({ messages: raw, ...config });
+		assert.equal(stable.segmentSealed, false, scenario.role);
+		assert.equal(stable.epochTransitioned, false, scenario.role);
+		assert.equal(stable.transitionCause, "none", scenario.role);
+		assert.equal(controller.serialize().segments.length, 1, `${scenario.role} ordinary append must not reseal`);
+		assert.deepEqual(
+			providerMessages(stable.messages).slice(0, crossingProvider.length),
+			crossingProvider,
+			`${scenario.role} rewrote the post-seal provider prefix`,
+		);
+	}
+});
+
+test("role controllers append past the active bundle reserve until projected history crosses the hard bundle cap", () => {
+	for (const [role, hard] of [
+		["commander", COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES],
+		["worker", WORKER_HISTORY_TOOL_TEXT_MAX_BYTES],
+		["other", OTHER_HISTORY_TOOL_TEXT_MAX_BYTES],
+	] as const) {
+		const controller = new HistoryProjectionController();
+		const raw: AgentMessage[] = [user(`${role}-bundle-anchor`)];
+		for (let index = 0; index < 140; index += 1) raw.push(...bundle(`${role}-bundle-seed-${index}`, "s"));
+		const config = {
+			maxToolTextBytes: hard,
+			maxBundles: HISTORY_MAX_BUNDLES,
+			descriptorMaxBytes: HISTORY_DESCRIPTOR_MAX_BYTES,
+			role,
+		};
+		let previous = controller.project({ messages: raw, ...config });
+		assert.equal(previous.epochTransitioned, true, role);
+		assert.equal(previous.segmentSealed, false, role);
+		assert.equal(previous.transitionCause, "initial_hard_limit", role);
+		assert.equal(controller.serialize().segments.length, 0, role);
+		const headroom = HISTORY_MAX_BUNDLES - previous.projectedBundleCount;
+		assert.ok(headroom > 0, `${role} initial checkpoint must reserve active bundle headroom`);
+
+		for (let index = 0; index < headroom; index += 1) {
+			const previousProvider = providerMessages(previous.messages);
+			raw.push(...bundle(`${role}-bundle-under-${index}`, "u"));
+			const appended = controller.project({ messages: raw, ...config });
+			assert.equal(appended.segmentSealed, false, `${role}/${index}`);
+			assert.equal(appended.epochTransitioned, false, `${role}/${index}`);
+			assert.equal(appended.transitionCause, "none", `${role}/${index}`);
+			assert.equal(controller.serialize().segments.length, 0, `${role}/${index}`);
+			assert.equal(appended.projectedBundleCount, previous.projectedBundleCount + 1, `${role}/${index}`);
+			assert.deepEqual(
+				providerMessages(appended.messages).slice(0, previousProvider.length),
+				previousProvider,
+				`${role}/${index} rewrote the under-hard provider prefix`,
+			);
+			previous = appended;
+		}
+
+		const underState = controller.serialize();
+		assert.equal(previous.projectedBundleCount, HISTORY_MAX_BUNDLES, role);
+		assert.ok(
+			callBundleCount(raw.slice(underState.activeRawStartMessageCount)) > HISTORY_PROJECTION_ACTIVE_MAX_BUNDLES,
+			`${role} active bundles must exceed the turn reserve`,
+		);
+		const persisted = JSON.parse(JSON.stringify(underState)) as SerializedV3ProjectionState;
+		const reloaded = new HistoryProjectionController();
+		assert.equal(reloaded.restoreFromEntries([
+			{ type: "custom", customType: HISTORY_PROJECTION_ENTRY_TYPE, data: persisted },
+		]), true, `${role} restores an under-hard active tail above the bundle reserve`);
+		const replayed = reloaded.project({
+			messages: JSON.parse(JSON.stringify(raw)) as AgentMessage[],
+			...config,
+		});
+		assert.equal(replayed.segmentSealed, false, role);
+		assert.equal(replayed.transitionCause, "none", role);
+		assert.deepEqual(jsonNormalizedProviderMessages(replayed.messages), jsonNormalizedProviderMessages(previous.messages), role);
+
+		const overflowId = `${role}-bundle-overflow`;
+		raw.push(...bundle(overflowId, "h"));
+		const crossing = controller.project({ messages: raw, ...config });
+		assert.equal(crossing.segmentSealed, true, role);
+		assert.equal(crossing.epochTransitioned, false, role);
+		assert.equal(crossing.transitionCause, "segment_sealed", role);
+		assert.equal(controller.serialize().segments.length, 1, `${role} seals exactly once`);
+		assert.ok(crossing.projectedBundleCount <= HISTORY_MAX_BUNDLES, role);
+		assert.equal(validateContextToolPairing(crossing.messages), true, role);
+		assert.equal(textOf(resultById(crossing.messages, overflowId)!), "h", `${role} latest overflow bundle stays raw`);
+
+		const crossingProvider = providerMessages(crossing.messages);
+		raw.push(...bundle(`${role}-bundle-stable`, "n"));
+		const stable = controller.project({ messages: raw, ...config });
+		assert.equal(stable.segmentSealed, false, role);
+		assert.equal(stable.epochTransitioned, false, role);
+		assert.equal(stable.transitionCause, "none", role);
+		assert.equal(controller.serialize().segments.length, 1, `${role} ordinary append must not reseal`);
+		assert.deepEqual(
+			providerMessages(stable.messages).slice(0, crossingProvider.length),
+			crossingProvider,
+			`${role} rewrote the post-seal provider prefix`,
+		);
 	}
 });
 
@@ -2019,17 +2481,33 @@ test("history projection state restores strictly and reset invalidates the froze
 	);
 	assert.deepEqual(restored.serialize(), persisted);
 
-	const stableProviderCount = persisted.anchor.projectedMessageCount
-		+ persisted.segments.reduce((sum, segment) => sum + segment.projectedMessageCount, 0);
+	const initialProvider = jsonNormalizedProviderMessages(initial.messages);
 	reloadedRaw.push(user("after-reload"), ...bundle("restore-suffix", "suffix"));
 	const continued = restored.project({ messages: reloadedRaw, ...config });
 	assert.equal(continued.epochTransitioned, false);
-	assert.equal(continued.segmentSealed, true, "the seventeenth active bundle seals after reload");
-	assert.equal(continued.transitionCause, "segment_sealed");
+	assert.equal(continued.segmentSealed, false, "an active-reserve crossing under the hard cap stays append-only after reload");
+	assert.equal(continued.transitionCause, "none");
 	assert.deepEqual(
-		jsonNormalizedProviderMessages(continued.messages).slice(0, stableProviderCount),
-		jsonNormalizedProviderMessages(initial.messages).slice(0, stableProviderCount),
+		jsonNormalizedProviderMessages(continued.messages).slice(0, initialProvider.length),
+		initialProvider,
 	);
+	const continuedState = JSON.parse(JSON.stringify(restored.serialize())) as SerializedV3ProjectionState;
+	assert.ok(
+		callBundleCount(reloadedRaw.slice(continuedState.activeRawStartMessageCount)) > HISTORY_PROJECTION_ACTIVE_MAX_BUNDLES,
+		"restored active tail exceeds its reserved bundle count without exceeding the hard cap",
+	);
+	assert.ok(continued.projectedBundleCount <= config.maxBundles);
+	const continuedReload = new HistoryProjectionController();
+	assert.equal(continuedReload.restoreFromEntries([
+		{ type: "custom", customType: HISTORY_PROJECTION_ENTRY_TYPE, data: continuedState },
+	]), true, "v3 restore accepts an under-hard active tail above the turn reserve");
+	const continuedReplay = continuedReload.project({
+		messages: JSON.parse(JSON.stringify(reloadedRaw)) as AgentMessage[],
+		...config,
+	});
+	assert.equal(continuedReplay.segmentSealed, false);
+	assert.equal(continuedReplay.transitionCause, "none");
+	assert.deepEqual(jsonNormalizedProviderMessages(continuedReplay.messages), jsonNormalizedProviderMessages(continued.messages));
 
 	const hostile = new HistoryProjectionController();
 	assert.equal(hostile.restoreFromEntries([
@@ -2369,7 +2847,7 @@ test("v3 immutable segments optimize Commander and worker through sixteen seals 
 	}
 });
 
-test("v3 same-state append is wholly append-only and a 17-bundle active tail seals proactively", () => {
+test("v3 same-state append remains wholly append-only when the active bundle reserve is crossed under the hard cap", () => {
 	const controller = new HistoryProjectionController();
 	const raw: AgentMessage[] = [];
 	for (let index = 0; index < 8; index += 1) raw.push(...bundle(`same-${index}`, "x".repeat(10 * 1_024)));
@@ -2393,10 +2871,16 @@ test("v3 same-state append is wholly append-only and a 17-bundle active tail sea
 		raw.push(...bundle(`bundle-pressure-${index}`, "b"));
 	}
 	const bundlePressure = controller.project({ messages: raw, ...config });
-	assert.equal(bundlePressure.segmentSealed, true);
-	assert.equal(bundlePressure.transitionCause, "segment_sealed");
+	assert.equal(bundlePressure.segmentSealed, false);
+	assert.equal(bundlePressure.epochTransitioned, false);
+	assert.equal(bundlePressure.transitionCause, "none");
 	assert.ok(callBundleCount(bundlePressure.messages) <= HISTORY_MAX_BUNDLES);
-	assert.ok(callBundleCount(raw.slice(controller.serialize().activeRawStartMessageCount)) <= HISTORY_PROJECTION_ACTIVE_MAX_BUNDLES);
+	assert.ok(callBundleCount(raw.slice(controller.serialize().activeRawStartMessageCount)) > HISTORY_PROJECTION_ACTIVE_MAX_BUNDLES);
+	assert.equal(controller.serialize().segments.length, 0);
+	assert.deepEqual(
+		providerMessages(bundlePressure.messages).slice(0, providerMessages(appended.messages).length),
+		providerMessages(appended.messages),
+	);
 });
 
 test("v3 keeps the newest complete multi-call batch raw and collapses an exact 65 KiB oversize batch safely", () => {
@@ -2528,4 +3012,336 @@ test("v3 lowered bundle reserves fail closed without exceeding caller caps", () 
 	assert.equal(validateContextToolPairing(projected.messages), true);
 	assert.ok(historyToolTextBytes(projected.messages) <= 4_096);
 	assert.ok(callBundleCount(projected.messages) <= 16);
+});
+
+test("history projection observability is exact and content-free for Commander, worker, and strict JSON restore", () => {
+	assert.deepEqual(HISTORY_PROJECTION_EVENT_KINDS, [
+		"none",
+		"initial_hard_projection",
+		"segment_seal",
+		"epoch_checkpoint",
+		"inactive_boundary",
+		"fixed_failure",
+		"recovery_boundary",
+	]);
+	assert.deepEqual(HISTORY_PROJECTION_OBSERVATION_CAUSES, [
+		"none",
+		"initial_hard_limit",
+		"hard_bytes",
+		"hard_bundles",
+		"segment_sealed",
+		"prefix_changed",
+		"policy_changed",
+		"legacy_migration",
+		"failure",
+		"recovery",
+	]);
+	const expectedKeys = [
+		"eventKind", "transitionCause", "epoch", "epochTransitioned", "segmentSealed",
+		"byteOverflow", "bundleOverflow", "segmentsBefore", "segmentsAfter",
+		"hardToolTextBytes", "hardBundles", "rawToolTextBytes", "rawBundles",
+		"projectedToolTextBytes", "projectedBundles", "stableToolTextBytesBefore",
+		"stableBundlesBefore", "activeToolTextBytesBefore", "activeBundlesBefore",
+		"agedRawToolTextBytes", "agedRawBundles", "agedProjectedToolTextBytes",
+		"agedProjectedBundles", "suffixRawToolTextBytes", "suffixRawBundles",
+	].sort();
+
+	for (const [role, hard, secret] of [
+		["commander", COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES, "COMMANDER-OBSERVABILITY-SECRET"],
+		["worker", WORKER_HISTORY_TOOL_TEXT_MAX_BYTES, "WORKER-OBSERVABILITY-SECRET"],
+	] as const) {
+		const messages = [user(`${role}-ordinary`), ...bundle(`${role}-under-cap`, secret)];
+		const projected = new HistoryProjectionController().project({
+			messages,
+			maxToolTextBytes: hard,
+			maxBundles: HISTORY_MAX_BUNDLES,
+			descriptorMaxBytes: HISTORY_DESCRIPTOR_MAX_BYTES,
+			role,
+		});
+		const observation = projected.observability;
+		assert.deepEqual(Object.keys(observation).sort(), expectedKeys, role);
+		assert.equal(observation.eventKind, "none", role);
+		assert.equal(observation.transitionCause, "none", role);
+		assert.equal(observation.epoch, 0, role);
+		assert.equal(observation.epochTransitioned, 0, role);
+		assert.equal(observation.segmentSealed, 0, role);
+		assert.equal(observation.byteOverflow, 0, role);
+		assert.equal(observation.bundleOverflow, 0, role);
+		assert.equal(observation.segmentsBefore, 0, role);
+		assert.equal(observation.segmentsAfter, 0, role);
+		assert.equal(observation.hardToolTextBytes, hard, role);
+		assert.equal(observation.hardBundles, HISTORY_MAX_BUNDLES, role);
+		assert.equal(observation.rawToolTextBytes, Buffer.byteLength(secret), role);
+		assert.equal(observation.rawBundles, 1, role);
+		assert.equal(observation.projectedToolTextBytes, Buffer.byteLength(secret), role);
+		assert.equal(observation.projectedBundles, 1, role);
+		assert.equal(observation.stableToolTextBytesBefore, 0, role);
+		assert.equal(observation.stableBundlesBefore, 0, role);
+		assert.equal(observation.activeToolTextBytesBefore, Buffer.byteLength(secret), role);
+		assert.equal(observation.activeBundlesBefore, 1, role);
+		assert.equal(observation.agedRawToolTextBytes, 0, role);
+		assert.equal(observation.agedRawBundles, 0, role);
+		assert.equal(observation.agedProjectedToolTextBytes, 0, role);
+		assert.equal(observation.agedProjectedBundles, 0, role);
+		assert.equal(observation.suffixRawToolTextBytes, Buffer.byteLength(secret), role);
+		assert.equal(observation.suffixRawBundles, 1, role);
+		for (const [key, value] of Object.entries(observation)) {
+			if (key === "eventKind" || key === "transitionCause") continue;
+			assert.equal(typeof value, "number", `${role}/${key}`);
+			assert.ok(Number.isSafeInteger(value) && value >= 0, `${role}/${key}`);
+		}
+		assert.doesNotMatch(JSON.stringify(observation), new RegExp(secret), role);
+	}
+
+	const raw: AgentMessage[] = [];
+	for (let index = 0; index < 8; index += 1) raw.push(...bundle(`observability-restore-${index}`, "r".repeat(10 * 1_024)));
+	const config = {
+		maxToolTextBytes: WORKER_HISTORY_TOOL_TEXT_MAX_BYTES,
+		maxBundles: HISTORY_MAX_BUNDLES,
+		descriptorMaxBytes: HISTORY_DESCRIPTOR_MAX_BYTES,
+		role: "worker" as const,
+	};
+	const source = new HistoryProjectionController();
+	source.project({ messages: raw, ...config });
+	const persisted = JSON.parse(JSON.stringify(source.serialize())) as SerializedV3ProjectionState;
+	const restored = new HistoryProjectionController();
+	assert.equal(restored.restoreFromEntries([
+		{ type: "custom", customType: HISTORY_PROJECTION_ENTRY_TYPE, data: persisted },
+	]), true);
+	const replayed = restored.project({ messages: structuredClone(raw), ...config });
+	const stableBytes = persisted.anchor.projectedToolTextBytes
+		+ persisted.segments.reduce((sum, segment) => sum + segment.projectedToolTextBytes, 0);
+	const stableBundles = persisted.anchor.projectedBundles
+		+ persisted.segments.reduce((sum, segment) => sum + segment.projectedBundles, 0);
+	const active = raw.slice(persisted.activeRawStartMessageCount);
+	assert.equal(replayed.observability.eventKind, "none");
+	assert.equal(replayed.observability.transitionCause, "none");
+	assert.equal(replayed.observability.segmentsBefore, persisted.segments.length);
+	assert.equal(replayed.observability.segmentsAfter, persisted.segments.length);
+	assert.equal(replayed.observability.stableToolTextBytesBefore, stableBytes);
+	assert.equal(replayed.observability.stableBundlesBefore, stableBundles);
+	assert.equal(replayed.observability.activeToolTextBytesBefore, historyToolTextBytes(active));
+	assert.equal(replayed.observability.activeBundlesBefore, callBundleCount(active));
+	assert.equal(replayed.observability.suffixRawToolTextBytes, historyToolTextBytes(active));
+	assert.equal(replayed.observability.suffixRawBundles, callBundleCount(active));
+	assert.deepEqual(restored.serialize(), persisted, "observability is not persisted and cannot perturb strict restore");
+});
+
+test("history projection observability distinguishes initial projection, byte and bundle seals, and the seventeenth checkpoint", () => {
+	const workerConfig = {
+		maxToolTextBytes: WORKER_HISTORY_TOOL_TEXT_MAX_BYTES,
+		maxBundles: HISTORY_MAX_BUNDLES,
+		descriptorMaxBytes: HISTORY_DESCRIPTOR_MAX_BYTES,
+		role: "worker" as const,
+	};
+	const controller = new HistoryProjectionController();
+	const raw: AgentMessage[] = [];
+	for (let index = 0; index < 8; index += 1) raw.push(...bundle(`observation-byte-${index}`, "b".repeat(10 * 1_024)));
+	const initial = controller.project({ messages: raw, ...workerConfig });
+	const initialState = controller.serialize();
+	const initialAged = raw.slice(0, initialState.activeRawStartMessageCount);
+	const initialSuffix = raw.slice(initialState.activeRawStartMessageCount);
+	assert.equal(initial.observability.eventKind, "initial_hard_projection");
+	assert.equal(initial.observability.transitionCause, "initial_hard_limit");
+	assert.equal(initial.observability.byteOverflow, 1);
+	assert.equal(initial.observability.bundleOverflow, 0);
+	assert.equal(initial.observability.activeToolTextBytesBefore, historyToolTextBytes(raw));
+	assert.equal(initial.observability.activeBundlesBefore, callBundleCount(raw));
+	assert.equal(initial.observability.agedRawToolTextBytes, historyToolTextBytes(initialAged));
+	assert.equal(initial.observability.agedRawBundles, callBundleCount(initialAged));
+	assert.equal(initial.observability.agedProjectedToolTextBytes, initialState.anchor.projectedToolTextBytes);
+	assert.equal(initial.observability.agedProjectedBundles, initialState.anchor.projectedBundles);
+	assert.equal(initial.observability.suffixRawToolTextBytes, historyToolTextBytes(initialSuffix));
+	assert.equal(initial.observability.suffixRawBundles, callBundleCount(initialSuffix));
+	assert.equal(initial.observability.projectedToolTextBytes, historyToolTextBytes(initial.messages));
+	assert.equal(initial.observability.projectedBundles, callBundleCount(initial.messages));
+
+	const byteStateBefore = controller.serialize();
+	raw.push(...bundle("observation-byte-seal", "n".repeat(20 * 1_024)));
+	const byteActiveBefore = raw.slice(byteStateBefore.activeRawStartMessageCount);
+	const byteStableBefore = byteStateBefore.anchor.projectedToolTextBytes
+		+ byteStateBefore.segments.reduce((sum, segment) => sum + segment.projectedToolTextBytes, 0);
+	const byteStableBundlesBefore = byteStateBefore.anchor.projectedBundles
+		+ byteStateBefore.segments.reduce((sum, segment) => sum + segment.projectedBundles, 0);
+	const byteSeal = controller.project({ messages: raw, ...workerConfig });
+	const byteStateAfter = controller.serialize();
+	const byteSegment = byteStateAfter.segments.at(-1)!;
+	const byteAged = raw.slice(byteSegment.rawStartMessageCount, byteSegment.rawEndMessageCount);
+	const byteSuffix = raw.slice(byteStateAfter.activeRawStartMessageCount);
+	assert.equal(byteSeal.observability.eventKind, "segment_seal");
+	assert.equal(byteSeal.observability.transitionCause, "segment_sealed");
+	assert.equal(byteSeal.observability.byteOverflow, 1);
+	assert.equal(byteSeal.observability.bundleOverflow, 0);
+	assert.equal(byteSeal.observability.segmentsBefore, 0);
+	assert.equal(byteSeal.observability.segmentsAfter, 1);
+	assert.equal(byteSeal.observability.stableToolTextBytesBefore, byteStableBefore);
+	assert.equal(byteSeal.observability.stableBundlesBefore, byteStableBundlesBefore);
+	assert.equal(byteSeal.observability.activeToolTextBytesBefore, historyToolTextBytes(byteActiveBefore));
+	assert.equal(byteSeal.observability.activeBundlesBefore, callBundleCount(byteActiveBefore));
+	assert.equal(byteSeal.observability.agedRawToolTextBytes, historyToolTextBytes(byteAged));
+	assert.equal(byteSeal.observability.agedRawBundles, callBundleCount(byteAged));
+	assert.equal(byteSeal.observability.agedProjectedToolTextBytes, byteSegment.projectedToolTextBytes);
+	assert.equal(byteSeal.observability.agedProjectedBundles, byteSegment.projectedBundles);
+	assert.equal(byteSeal.observability.suffixRawToolTextBytes, historyToolTextBytes(byteSuffix));
+	assert.equal(byteSeal.observability.suffixRawBundles, callBundleCount(byteSuffix));
+
+	const bundleController = new HistoryProjectionController();
+	const bundleRaw: AgentMessage[] = [];
+	for (let index = 0; index < 35; index += 1) bundleRaw.push(...bundle(`observation-bundle-${index}`, "x"));
+	const bundleConfig = {
+		maxToolTextBytes: COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES,
+		maxBundles: 34,
+		descriptorMaxBytes: HISTORY_DESCRIPTOR_MAX_BYTES,
+		role: "commander" as const,
+	};
+	const bundleInitial = bundleController.project({ messages: bundleRaw, ...bundleConfig });
+	assert.equal(bundleInitial.observability.eventKind, "initial_hard_projection");
+	assert.equal(bundleInitial.observability.byteOverflow, 0);
+	assert.equal(bundleInitial.observability.bundleOverflow, 1);
+	const bundleStateBefore = bundleController.serialize();
+	for (let index = 0; index < 17; index += 1) bundleRaw.push(...bundle(`observation-bundle-tail-${index}`, "y"));
+	const bundleSeal = bundleController.project({ messages: bundleRaw, ...bundleConfig });
+	assert.equal(bundleSeal.observability.eventKind, "segment_seal");
+	assert.equal(bundleSeal.observability.transitionCause, "segment_sealed");
+	assert.equal(bundleSeal.observability.byteOverflow, 0);
+	assert.equal(bundleSeal.observability.bundleOverflow, 1);
+	assert.equal(bundleSeal.observability.segmentsBefore, bundleStateBefore.segments.length);
+	assert.equal(bundleSeal.observability.segmentsAfter, bundleStateBefore.segments.length + 1);
+
+	const checkpointController = new HistoryProjectionController();
+	const checkpointRaw: AgentMessage[] = [user("checkpoint-anchor")];
+	for (let index = 0; index < 6; index += 1) {
+		checkpointRaw.push(...bundle(`observation-checkpoint-old-${index}`, "o".repeat(20 * 1_024)));
+	}
+	checkpointRaw.push(...bundle("observation-checkpoint-seed", "s".repeat(40 * 1_024)));
+	checkpointController.project({ messages: checkpointRaw, ...workerConfig });
+	for (let seal = 1; seal <= HISTORY_PROJECTION_MAX_SEGMENTS; seal += 1) {
+		checkpointRaw.push(
+			user(`observation-checkpoint-turn-${seal}`),
+			...bundle(`observation-checkpoint-${seal}`, String(seal % 10).repeat(seal % 2 === 0 ? 40 * 1_024 : 48 * 1_024)),
+		);
+		const sealed = checkpointController.project({ messages: checkpointRaw, ...workerConfig });
+		assert.equal(sealed.observability.eventKind, "segment_seal", `seal ${seal}`);
+	}
+	const checkpointBefore = checkpointController.serialize();
+	assert.equal(checkpointBefore.segments.length, HISTORY_PROJECTION_MAX_SEGMENTS);
+	checkpointRaw.push(user("observation-checkpoint-turn-17"), ...bundle("observation-checkpoint-17", "z".repeat(48 * 1_024)));
+	const checkpointActiveBefore = checkpointRaw.slice(checkpointBefore.activeRawStartMessageCount);
+	const checkpoint = checkpointController.project({ messages: checkpointRaw, ...workerConfig });
+	const checkpointAfter = checkpointController.serialize();
+	const checkpointAged = checkpointRaw.slice(0, checkpointAfter.activeRawStartMessageCount);
+	const checkpointSuffix = checkpointRaw.slice(checkpointAfter.activeRawStartMessageCount);
+	assert.equal(checkpoint.observability.eventKind, "epoch_checkpoint");
+	assert.ok(checkpoint.observability.transitionCause === "hard_bytes" || checkpoint.observability.transitionCause === "hard_bundles");
+	assert.equal(checkpoint.observability.epochTransitioned, 1);
+	assert.equal(checkpoint.observability.segmentSealed, 0);
+	assert.equal(checkpoint.observability.segmentsBefore, HISTORY_PROJECTION_MAX_SEGMENTS);
+	assert.equal(checkpoint.observability.segmentsAfter, 0);
+	assert.equal(checkpoint.observability.activeToolTextBytesBefore, historyToolTextBytes(checkpointActiveBefore));
+	assert.equal(checkpoint.observability.activeBundlesBefore, callBundleCount(checkpointActiveBefore));
+	assert.equal(checkpoint.observability.agedRawToolTextBytes, historyToolTextBytes(checkpointAged));
+	assert.equal(checkpoint.observability.agedRawBundles, callBundleCount(checkpointAged));
+	assert.equal(checkpoint.observability.agedProjectedToolTextBytes, checkpointAfter.anchor.projectedToolTextBytes);
+	assert.equal(checkpoint.observability.agedProjectedBundles, checkpointAfter.anchor.projectedBundles);
+	assert.equal(checkpoint.observability.suffixRawToolTextBytes, historyToolTextBytes(checkpointSuffix));
+	assert.equal(checkpoint.observability.suffixRawBundles, callBundleCount(checkpointSuffix));
+});
+
+test("history projection observability identifies inactive boundaries, fixed failure, and one-shot recovery", () => {
+	const workerConfig = {
+		maxToolTextBytes: WORKER_HISTORY_TOOL_TEXT_MAX_BYTES,
+		maxBundles: HISTORY_MAX_BUNDLES,
+		descriptorMaxBytes: HISTORY_DESCRIPTOR_MAX_BYTES,
+		role: "worker" as const,
+	};
+	const frozenRaw: AgentMessage[] = [];
+	for (let index = 0; index < 8; index += 1) frozenRaw.push(...bundle(`observation-boundary-${index}`, "q".repeat(10 * 1_024)));
+
+	const prefixController = new HistoryProjectionController();
+	prefixController.project({ messages: frozenRaw, ...workerConfig });
+	const prefixBefore = prefixController.serialize();
+	const shortened = frozenRaw.slice(0, 4);
+	const prefix = prefixController.project({ messages: shortened, ...workerConfig });
+	assert.equal(prefix.observability.eventKind, "inactive_boundary");
+	assert.equal(prefix.observability.transitionCause, "prefix_changed");
+	assert.equal(prefix.observability.segmentsBefore, prefixBefore.segments.length);
+	assert.equal(prefix.observability.segmentsAfter, 0);
+	assert.equal(prefix.observability.activeToolTextBytesBefore, 0, "invalidated active topology is structurally unavailable");
+	assert.equal(prefix.observability.activeBundlesBefore, 0);
+	assert.equal(prefix.observability.suffixRawToolTextBytes, historyToolTextBytes(shortened));
+	assert.equal(prefix.observability.suffixRawBundles, callBundleCount(shortened));
+
+	const policyController = new HistoryProjectionController();
+	policyController.project({ messages: frozenRaw, ...workerConfig });
+	const policyBefore = policyController.serialize();
+	const policy = policyController.project({
+		messages: frozenRaw,
+		...workerConfig,
+		maxToolTextBytes: COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES,
+		role: "commander",
+	});
+	assert.equal(policy.observability.eventKind, "inactive_boundary");
+	assert.equal(policy.observability.transitionCause, "policy_changed");
+	assert.equal(policy.observability.segmentsBefore, policyBefore.segments.length);
+	assert.equal(policy.observability.segmentsAfter, 0);
+	assert.equal(policy.observability.hardToolTextBytes, COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES);
+
+	const legacy = {
+		schemaVersion: 1,
+		active: 1,
+		epoch: 7,
+		epochHash: "1".repeat(64),
+		prefixMessageCount: 4,
+		prefixHash: "2".repeat(64),
+		projectedPrefixHash: "3".repeat(64),
+		hardToolTextBytes: WORKER_HISTORY_TOOL_TEXT_MAX_BYTES,
+		hardBundles: HISTORY_MAX_BUNDLES,
+		lowToolTextBytes: 48 * 1_024,
+		lowBundles: 96,
+		transitionCollapsedResults: 2,
+		transitionRemovedBundles: 1,
+		rawToolTextBytes: 70 * 1_024,
+		rawBundles: 9,
+		projectedToolTextBytes: 40 * 1_024,
+		projectedBundles: 8,
+	};
+	const legacyController = new HistoryProjectionController();
+	assert.equal(legacyController.restoreFromEntries([
+		{ type: "custom", customType: "workbench-history-projection-state-v1", data: legacy },
+	]), true);
+	const legacyRaw = [user("legacy-observation"), ...bundle("legacy-observation", "legacy")];
+	const legacyProjection = legacyController.project({ messages: legacyRaw, ...workerConfig });
+	assert.equal(legacyProjection.observability.eventKind, "inactive_boundary");
+	assert.equal(legacyProjection.observability.transitionCause, "legacy_migration");
+	assert.equal(legacyProjection.observability.segmentsBefore, 0);
+	assert.equal(legacyProjection.observability.segmentsAfter, 0);
+	assert.equal(legacyProjection.observability.activeToolTextBytesBefore, historyToolTextBytes(legacyRaw));
+	assert.equal(legacyProjection.observability.suffixRawToolTextBytes, historyToolTextBytes(legacyRaw));
+
+	const failureController = new HistoryProjectionController();
+	const corrupt = [user("failure-observation"), result("orphan-observation", "FAILURE-OBSERVATION-SECRET")];
+	const failure = failureController.project({ messages: corrupt, ...workerConfig });
+	assert.equal(failure.observability.eventKind, "fixed_failure");
+	assert.equal(failure.observability.transitionCause, "failure");
+	assert.equal(failure.observability.epochTransitioned, 1);
+	assert.equal(failure.observability.projectedToolTextBytes, 0);
+	assert.equal(failure.observability.projectedBundles, 0);
+	assert.equal(failure.observability.agedRawToolTextBytes, 0);
+	assert.equal(failure.observability.suffixRawToolTextBytes, 0);
+	assert.doesNotMatch(JSON.stringify(failure.observability), /FAILURE-OBSERVATION-SECRET/);
+
+	const repeatedFailure = failureController.project({ messages: structuredClone(corrupt), ...workerConfig });
+	assert.equal(repeatedFailure.observability.eventKind, "fixed_failure");
+	assert.equal(repeatedFailure.observability.epochTransitioned, 0);
+	const healthy = [user("healthy-observation"), ...bundle("healthy-observation", "ok")];
+	const recovery = failureController.project({ messages: healthy, ...workerConfig });
+	assert.equal(recovery.observability.eventKind, "recovery_boundary");
+	assert.equal(recovery.observability.transitionCause, "recovery");
+	assert.equal(recovery.observability.epochTransitioned, 1);
+	assert.equal(recovery.observability.activeToolTextBytesBefore, historyToolTextBytes(healthy));
+	assert.equal(recovery.observability.suffixRawToolTextBytes, historyToolTextBytes(healthy));
+	const stable = failureController.project({ messages: [...healthy, user("post-recovery")], ...workerConfig });
+	assert.equal(stable.observability.eventKind, "none");
+	assert.equal(stable.observability.transitionCause, "none");
+	assert.equal(stable.observability.epochTransitioned, 0);
 });

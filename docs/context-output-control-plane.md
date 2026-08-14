@@ -4,6 +4,9 @@ Version 0.10.0 makes model-visible tool output a bounded control-plane
 resource. Full domain evidence stays in project artifacts; returned text and
 session details are bounded presentations and are never acceptance evidence.
 
+The P0–P2 refinements below are Unreleased working-tree behavior. Their
+presence here does not claim a commit, installation, or deployment.
+
 ## Fixed limits
 
 | Surface | Limit |
@@ -18,10 +21,11 @@ session details are bounded presentations and are never acceptance evidence.
 | Commander / worker active tool-result history | 96 KiB / 64 KiB |
 | Active-history bundle count (all roles) | 128 complete bundles |
 
-The final result envelope applies after tool execution and receipt handling,
-so a renderer, error, or finalize path cannot enlarge the result again. A
-turn planner reserves the role budget deterministically before execution and
-blocks calls beyond the fixed call/budget limits.
+The final result envelope applies after tool execution and before receipt
+finalization, so the receipt sees only final bounded content and a renderer,
+error, or later details path cannot enlarge it again. A turn planner reserves
+the role budget deterministically before execution and blocks calls beyond the
+fixed call/budget limits.
 
 ## Paging and durable evidence
 
@@ -48,12 +52,44 @@ run, gate, and sanitizer artifacts remain the authoritative evidence. DTO
 details contain counts, bounded paths, artifact pointers, output-envelope
 facts, and receipt facts—never full reports, patches, logs, or gate arrays.
 
+### Trusted recoverable ingress
+
+Exactly six finalized sources can receive private recovery authority:
+
+- `finalized_recipe_run` → a recipe run's `summary.json`;
+- `executed_gate_run` → an executed gate run's `gates.json`;
+- `immutable_comparison` → the immutable `comparison.json`;
+- `completed_worker_report` → the durable `worker-report.md`;
+- `finalized_run_page` → the selected run `manifest.json`, `stdout.log`, or
+  `stderr.log`;
+- `run_id_gate_page` → a run-id gate page backed by `gates.json`.
+
+The source must be a regular in-project file no larger than 4 MiB. Authority
+streams a SHA-256 from one no-follow descriptor, requires stable pre/post and
+namespace stats, and binds content plus size/device/inode/`mtimeNs`/`ctimeNs`.
+A symlink, path escape, missing/oversized source, or concurrent mutation gets
+no authority and stays on the ordinary bounded path.
+
+At or below 4,096 UTF-8 bytes, the exact provider text blocks are unchanged
+and metadata records zero omission. Above 4,096 bytes, a deterministic wrapper
+contains required facts, a bounded head/tail body, and the durable source
+pointer. If the call allocation or generic envelope cannot preserve the
+candidate, the final envelope is rebuilt from the original result and the
+wrapper/metadata are removed together. Accounting consumes only that final
+result. `workbench_read_gate` renders within its real per-call allocation
+before advancing the cursor, so its complete semantic rows are lossless across
+pages. Receipt finalization follows the envelope, and details projection then
+adds only trusted side-channel metadata. Historical collapse strictly
+validates that metadata and prefers the durable source path before a receipt or
+legacy pointer. The implementation is identical for Commander, worker, and
+other roles; only outer budgets differ.
+
 ## Active history and legacy migration
 
 Before provider requests, the runtime validates assistant tool calls and tool
 results as complete bundles. Below the hard ceiling it returns raw history
-unchanged. Projection-state v3 reserves one raw role turn and 16 one-bundle
-segment slots before sizing the fixed anchor:
+unchanged. Projection-state v3 uses one role turn and 16 one-bundle segment
+slots to size the fixed anchor:
 
 ```text
 anchorByteCap = max(0, hardToolTextBytes - roleTurnBytes - 16 * 384)
@@ -68,16 +104,18 @@ complete-bundle boundary, projects the preceding history into the anchor, and
 leaves that suffix raw.
 
 Every later request in the same state reconstructs the exact provider-visible
-anchor, its ordered immutable segments, and the raw active suffix. When the
-active suffix exceeds either its byte or bundle reserve, the controller seals
-only aged active material into one new segment of at most 384 tool-text bytes
-and one complete bundle. Seals 1–16 keep the epoch, anchor, all older segments,
-and their deterministic boundary markers byte-identical; only the active tail
-is rewritten, and `segmentSealed` reports that expected event separately from
-`epochTransitioned`. An attempt to create segment 17 instead triggers a
-checkpoint that rebuilds the anchor, clears segments, and increments the
-epoch. Invalid pairing
-still fails closed instead of producing orphan calls.
+anchor, its ordered immutable segments, and the raw active suffix. The
+role-turn and 16-bundle values are suffix-selection reserves, not independent
+seal thresholds: crossing either alone while the complete reconstruction is
+still under both hard limits returns byte-identical history and event `none`.
+Only a true hard byte/bundle crossing seals aged active material into one new
+segment of at most 384 tool-text bytes and one complete bundle. Seals 1–16 keep
+the epoch, anchor, all older segments, and their deterministic boundary markers
+byte-identical; only the active tail is rewritten, and `segmentSealed` reports
+that expected event separately from `epochTransitioned`. A later true hard
+crossing that would create segment 17 performs the deterministic, model-free
+safety checkpoint: rebuild the anchor, clear segments, and increment the epoch.
+Invalid pairing still fails closed instead of producing orphan calls.
 
 The anchor and each immutable segment end in a bounded hidden marker with a
 safe `boundaryId` derived only from projected/provider-visible structure, never
@@ -99,7 +137,8 @@ boundary, then persists inactive v3 so a reload cannot repeat it. Branch
 changes and completed compaction reset the boundary.
 
 An inactive v3 state also carries a fixed non-secret failure sentinel in its
-existing signed `epochHash`. After JSONL restore, a repeated failure is
+existing `epochHash`; the unkeyed `stateHash` integrity coverage includes that
+value. After JSONL restore, a repeated failure is
 de-duplicated; the first healthy projection emits one fixed recovery boundary,
 and later healthy projections emit none. Neither boundary derives from raw
 hostile content and no schema key is added.
@@ -118,8 +157,63 @@ fails closed without invoking application code.
 
 Cache telemetry distinguishes the initial/checkpoint epoch transition from a
 segment seal. Seals 1–16 are expected active-tail rewrites with a stable epoch
-hash; an attempted 17th segment produces the expected epoch transition. A
-normal appended suffix is not prefix divergence.
+hash; the later hard crossing at the 16-segment safety ceiling produces the
+expected epoch transition. A normal appended suffix—including reserve-only
+growth—is not prefix divergence.
+
+### Strict cache observability (schema 1.3)
+
+Each eligible request is correlated as the exact sequence of one `context`
+projection, one local `before_provider_request` observation, and one assistant
+`message_end`. `requestCorrelationCode` is `1` only for that exact sequence;
+`0` means unwired, `2` means multiple/stale/invalid, and `3` means missing.
+Codes `0`/`2`/`3` must carry `actorRoleCode: 0` and
+`historyProjection: null`. Exact rows may identify Commander (`1`) or worker
+(`2`), with `0` retained only when the exact actor is genuinely unknown.
+
+The `wireObservation` is content-free and local. Its `finalityCode` is always
+`0`, so it is **not** evidence of the final actual provider wire. It records a
+bounded structural digest status, API-shape code, relationship code, item
+count, and longest common prefix measured only in complete payload items plus
+their UTF-8 bytes. It never claims a partial-item or token-level match.
+
+Projection anatomy is numeric-only. Core event names map in order to codes:
+`none` (0), `initial_hard_projection` (1), `segment_seal` (2),
+`epoch_checkpoint` (3), `inactive_boundary` (4), `fixed_failure` (5), and
+`recovery_boundary` (6). Causes map to `none` (0), `initial_hard_limit` (1),
+`hard_bytes` (2), `hard_bundles` (3), `segment_sealed` (4),
+`prefix_changed` (5), `policy_changed` (6), `legacy_migration` (7),
+`failure` (8), and `recovery` (9). The record also carries exact hard caps,
+byte/bundle overflow at the decision, segments before/after, raw/projected
+totals, stable and active slices before the decision, aged raw/projected
+material, retained raw suffix, epoch transition, and seal flags. A slice field
+is zero only when structurally inapplicable.
+
+The numeric enums are semantically strict. Allowed event/cause pairs are
+`0:0`, `1:1`, `2:4`, `3:{2,3,5,6,7}`, `4:{5,6,7}`, `5:8`, and `6:9`, with
+matching overflow, epoch, seal, and segment-transition invariants. Impossible
+anatomy fails correlation closed instead of becoming actor evidence.
+
+Usage shares use the disjoint denominator
+`promptInputTokens = input + cacheRead + cacheWrite`:
+`cacheReadShare = cacheRead / promptInputTokens`, while
+`cacheWriteShare = cacheWrite / promptInputTokens` is available separately
+only when write semantics allow it. `cacheWriteStatusCode` is `0` unverified,
+`1` unavailable for DeepSeek Completions, `2` normalized absence-or-zero for
+Responses, and `3` reserved for presence-verified evidence; current emitters do
+not fabricate code `3`. Report quality codes are `0` empty, `1` complete
+verified all-1.3 evidence, `2` mixed legacy/1.3, `3` partial or schema-invalid,
+`4` bounded/truncated, `5` usage semantics unverified, and `6` write semantics
+unavailable/unverified. Code `7` (`aggregate_overflow`) means an exact
+aggregate exceeds the safe numeric publication surface and forces both shares
+to `null`. Reports separate Commander and worker cohorts plus
+segment-seal and epoch-transition cohorts; ambiguous rows stay in `unknown`.
+
+Request observations are one-shot: one context plus one local payload is
+consumed by one assistant `message_end`; extras become ambiguous, missing
+events become missing, and session restore/identity change clears pending
+state. Doctor inspection never invokes Proxy traps or accessors; hostile or
+exotic rows make the evidence partial and suppress clean conclusions.
 
 At turn end the runtime also publishes one strict numeric custom entry for
 companion diagnostics. Its custom type and `schema` are both
@@ -155,6 +249,24 @@ immutable fixed anchor, modular immutable segments, and rare checkpoints. Only
 verified provider `cacheRead` usage is authoritative, and the offline fake
 provider intentionally reports zero. See the
 [stable-prefix contract](cache/stable-prefix-contract.md) for primary sources.
+
+The [DeepSeek Harness audit at pinned commit
+`47f943859bef60e4160492346772ded9b24f765a`](https://github.com/deepseek-ai/deepseek-harness/tree/47f943859bef60e4160492346772ded9b24f765a)
+supports the client-side principles of append-only reusable prefixes,
+deterministic bounded summaries, and keeping durable evidence outside the
+model-visible surface. Its MLA-serving behavior, scheduler, and disk-KV/block
+ownership are not transferable to this Pi extension and none of its measured
+numbers is a workbench benchmark promise.
+
+Warm-prefix auxiliary compaction is
+`BLOCKED_BY_PI_0_83_PUBLIC_API`. Pi 0.83's public
+[`session_before_compact` surface](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/compaction.md)
+allows cancellation or replacement of the compaction result, but no
+post-summary payload transform and no same-cache-domain guarantee are exposed.
+Implementing a separate summarizer would require duplicating private
+authentication, headers, streaming, retry, and provider-call behavior, which
+this workbench deliberately does not do. Built-in/native Pi compaction remains
+unchanged.
 
 Pi clones legacy entries before a runtime context hook can shrink their clone
 peak. Create a separate safe session copy first:

@@ -219,7 +219,13 @@ interface WorkerRuntimeChildFacts {
 	contextPressureNineFieldValid: boolean;
 	historyProjectionV3Entries: number;
 	historyProjectionV3Valid: boolean;
+	historyProjectionHardCapsValid: boolean;
+	historyProjectionRemainingCapacityValid: boolean;
+	historyProjectionSelectionReserveValid: boolean;
+	historyProjectionReserveOnlyGrowthObserved: boolean;
+	historyProjectionReserveOnlyGrowthStayedSameTopology: boolean;
 	maximumHistoryProjectionStateBytes: number;
+	maximumHistoryProjectionActiveToolTextBytes: number;
 	minimumWorkerAnchorReserveBytes: number;
 	latestCompletedBundleRaw: boolean;
 }
@@ -922,6 +928,9 @@ interface RoleReserveEvidence {
 	stable_prior_provider_prefix_across_seals: boolean;
 	segment_caps_valid: boolean;
 	active_caps_valid: boolean;
+	seal_selection_reserve_valid: boolean;
+	reserve_only_crossing_observed: boolean;
+	reserve_only_crossing_same_epoch_no_seal: boolean;
 	state_json_bytes_max: number;
 	state_within_32k: boolean;
 	state_strict_json_roundtrip: boolean;
@@ -1028,6 +1037,7 @@ function measureRoleReserve(role: "commander" | "worker"): RoleReserveEvidence {
 	let anchorFormulaValid = true;
 	let segmentCapsValid = true;
 	let activeCapsValid = true;
+	let sealSelectionReserveValid = true;
 	let stateStrictJsonRoundTrip = true;
 	let hardAndBundleCapsValid = true;
 	const observeState = (
@@ -1043,8 +1053,21 @@ function measureRoleReserve(role: "commander" | "worker"): RoleReserveEvidence {
 				segment.projectedToolTextBytes <= HISTORY_PROJECTION_SEGMENT_MAX_TOOL_TEXT_BYTES
 				&& segment.projectedBundles <= HISTORY_PROJECTION_SEGMENT_MAX_BUNDLES
 			));
-		activeCapsValid &&= historyToolTextBytes(messages.slice(state.activeRawStartMessageCount)) <= aggregateTurn
-			&& historyBundleCount(messages.slice(state.activeRawStartMessageCount)) <= HISTORY_PROJECTION_ACTIVE_MAX_BUNDLES;
+		const stableToolTextBytes = state.anchor.projectedToolTextBytes
+			+ state.segments.reduce((sum, segment) => sum + segment.projectedToolTextBytes, 0);
+		const stableBundles = state.anchor.projectedBundles
+			+ state.segments.reduce((sum, segment) => sum + segment.projectedBundles, 0);
+		const activeMessages = messages.slice(state.activeRawStartMessageCount);
+		const activeToolTextBytes = historyToolTextBytes(activeMessages);
+		const activeBundles = historyBundleCount(activeMessages);
+		activeCapsValid &&= activeBundles !== undefined
+			&& activeToolTextBytes <= state.hardToolTextBytes - stableToolTextBytes
+			&& activeBundles <= state.hardBundles - stableBundles;
+		if (projection.epochTransitioned || projection.segmentSealed) {
+			sealSelectionReserveValid &&= activeBundles !== undefined
+				&& activeToolTextBytes <= aggregateTurn
+				&& activeBundles <= HISTORY_PROJECTION_ACTIVE_MAX_BUNDLES;
+		}
 		hardAndBundleCapsValid &&= historyToolTextBytes(projection.messages) <= hard
 			&& projection.projectedBundleCount <= HISTORY_MAX_BUNDLES;
 		try {
@@ -1079,13 +1102,42 @@ function measureRoleReserve(role: "commander" | "worker"): RoleReserveEvidence {
 		&& JSON.stringify(sameProviderPayload.slice(0, initialProviderPayload.length)) === JSON.stringify(initialProviderPayload);
 	observeState(sameEpoch);
 
+	// The turn reserve selects a safe raw suffix only when the complete replay
+	// crosses a true hard cap. Growing past that reserve alone must remain
+	// append-only while the total projected topology still fits the hard cap.
+	const reserveOnlyBytes = role === "commander" ? 4 * 1_024 : 8 * 1_024;
+	appendAggregateBundle(messages, `${role}-reserve-only`, [reserveOnlyBytes]);
+	const reserveOnly = controller.project({ messages, ...config });
+	const reserveOnlyState = controller.serialize();
+	const reserveOnlyActiveMessages = messages.slice(reserveOnlyState.activeRawStartMessageCount);
+	const reserveOnlyActiveBytes = historyToolTextBytes(reserveOnlyActiveMessages);
+	const reserveOnlyActiveBundles = historyBundleCount(reserveOnlyActiveMessages);
+	const reserveOnlyCrossingObserved = reserveOnlyActiveBytes > aggregateTurn
+		|| (reserveOnlyActiveBundles ?? 0) > HISTORY_PROJECTION_ACTIVE_MAX_BUNDLES;
+	const reserveOnlyCrossingSameEpochNoSeal = reserveOnlyCrossingObserved
+		&& !reserveOnly.epochTransitioned
+		&& !reserveOnly.segmentSealed
+		&& reserveOnly.transitionCause === "none"
+		&& reserveOnly.epoch === sameEpoch.epoch
+		&& reserveOnly.epochHash === sameEpoch.epochHash
+		&& reserveOnlyState.segmentChainHash === sameState.segmentChainHash
+		&& reserveOnlyState.activeRawStartMessageCount === sameState.activeRawStartMessageCount
+		&& reserveOnlyState.segments.length === sameState.segments.length
+		&& historyToolTextBytes(reserveOnly.messages) <= hard
+		&& reserveOnly.projectedBundleCount <= HISTORY_MAX_BUNDLES;
+	projectedBytes.push(historyToolTextBytes(reserveOnly.messages));
+	projectedBundles.push(reserveOnly.projectedBundleCount);
+	reserveBytes.push(reserveOnlyState.hardToolTextBytes - reserveOnlyState.anchorToolTextBytes);
+	pairingValid &&= validateContextToolPairing(reserveOnly.messages);
+	observeState(reserveOnly);
+
 	const rollingSizes = role === "commander"
 		? [50 * 1_024, 64 * 1_024, 45 * 1_024, 60 * 1_024, 40 * 1_024]
 		: [48 * 1_024, 40 * 1_024];
-	let previous = sameEpoch;
-	let previousProviderPayload = sameProviderPayload;
-	let previousStableCount = sameState.anchor.projectedMessageCount
-		+ sameState.segments.reduce((sum, segment) => sum + segment.projectedMessageCount, 0);
+	let previous = reserveOnly;
+	let previousProviderPayload = jsonProviderMessages(reserveOnly.messages);
+	let previousStableCount = reserveOnlyState.anchor.projectedMessageCount
+		+ reserveOnlyState.segments.reduce((sum, segment) => sum + segment.projectedMessageCount, 0);
 	let segmentSealsBeforeCheckpoint = 0;
 	let checkpointOrdinal = 0;
 	let postCheckpointSegmentSeals = 0;
@@ -1159,6 +1211,9 @@ function measureRoleReserve(role: "commander" | "worker"): RoleReserveEvidence {
 		stable_prior_provider_prefix_across_seals: stablePriorProviderPrefix,
 		segment_caps_valid: segmentCapsValid,
 		active_caps_valid: activeCapsValid,
+		seal_selection_reserve_valid: sealSelectionReserveValid,
+		reserve_only_crossing_observed: reserveOnlyCrossingObserved,
+		reserve_only_crossing_same_epoch_no_seal: reserveOnlyCrossingSameEpochNoSeal,
 		state_json_bytes_max: Math.max(...stateBytes),
 		state_within_32k: stateBytes.every((value) => value <= 32 * 1_024),
 		state_strict_json_roundtrip: stateStrictJsonRoundTrip,
@@ -1302,6 +1357,12 @@ function historyScenario(state: MeasurementState): ScenarioEvidence {
 				&& workerReserve.stable_prior_provider_prefix_across_seals, "=", true),
 			acceptance("segment-active-caps", commanderReserve.segment_caps_valid && workerReserve.segment_caps_valid
 				&& commanderReserve.active_caps_valid && workerReserve.active_caps_valid, "=", true),
+			acceptance("seal-selection-reserve", commanderReserve.seal_selection_reserve_valid
+				&& workerReserve.seal_selection_reserve_valid, "=", true),
+			acceptance("reserve-only-crossing-observed", commanderReserve.reserve_only_crossing_observed
+				&& workerReserve.reserve_only_crossing_observed, "=", true),
+			acceptance("reserve-only-crossing-no-seal", commanderReserve.reserve_only_crossing_same_epoch_no_seal
+				&& workerReserve.reserve_only_crossing_same_epoch_no_seal, "=", true),
 			acceptance("strict-state-roundtrip", commanderReserve.state_within_32k && workerReserve.state_within_32k
 				&& commanderReserve.state_strict_json_roundtrip && workerReserve.state_strict_json_roundtrip, "=", true),
 			acceptance("segment-epoch-stable", commanderReserve.segment_seals_keep_epoch && workerReserve.segment_seals_keep_epoch, "=", true),
@@ -1505,43 +1566,88 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 					&& value.hardBundleCount === ${HISTORY_MAX_BUNDLES}
 					&& [value.epoch, value.rawToolTextBytes, value.projectedToolTextBytes, value.rawBundleCount, value.timestampMs]
 						.every((item) => Number.isSafeInteger(item) && item >= 0));
-			const strictProjectionState = (value) => {
+			const inspectProjectionState = (value) => {
 				try {
 					const serialized = JSON.stringify(value);
-					if (utf8(serialized) > 32 * 1024) return false;
+					if (utf8(serialized) > 32 * 1024) return undefined;
 					const normalized = JSON.parse(serialized);
 					const restored = new HistoryProjectionController();
-					if (!restored.restoreFromEntries([{ type: "custom", customType: projectionEntryType, data: normalized }])) return false;
-					if (JSON.stringify(restored.serialize()) !== JSON.stringify(normalized)) return false;
-					if (normalized.schemaVersion !== 3 || (normalized.active !== 0 && normalized.active !== 1)) return false;
-					if (normalized.active === 0) return true;
+					if (!restored.restoreFromEntries([{ type: "custom", customType: projectionEntryType, data: normalized }])) return undefined;
+					if (JSON.stringify(restored.serialize()) !== JSON.stringify(normalized)) return undefined;
+					if (normalized.schemaVersion !== 3 || (normalized.active !== 0 && normalized.active !== 1)) return undefined;
+					if (normalized.active === 0) return {
+						normalized,
+						activeToolTextBytes: 0,
+						activeBundles: 0,
+						stableToolTextBytes: 0,
+						stableBundles: 0,
+					};
 					if (normalized.hardToolTextBytes !== historyCap
 						|| normalized.anchorToolTextBytes !== expectedAnchorBytes
 						|| normalized.hardToolTextBytes - normalized.anchorToolTextBytes !== workerTurnCap + maxSegments * segmentByteCap
 						|| normalized.hardBundles !== ${HISTORY_MAX_BUNDLES}
 						|| !Array.isArray(normalized.segments) || normalized.segments.length > maxSegments
 						|| normalized.segments.some((segment) => segment.projectedToolTextBytes > segmentByteCap
-							|| segment.projectedBundles > segmentBundleCap)) return false;
+							|| segment.projectedBundles > segmentBundleCap)) return undefined;
 					const stableBytes = normalized.anchor.projectedToolTextBytes
 						+ normalized.segments.reduce((sum, segment) => sum + segment.projectedToolTextBytes, 0);
 					const stableBundles = normalized.anchor.projectedBundles
 						+ normalized.segments.reduce((sum, segment) => sum + segment.projectedBundles, 0);
-					return normalized.projectedToolTextBytes - stableBytes <= workerTurnCap
-						&& normalized.projectedBundles - stableBundles <= activeBundleCap
-						&& normalized.projectedToolTextBytes <= historyCap
-						&& normalized.projectedBundles <= ${HISTORY_MAX_BUNDLES};
+					const activeToolTextBytes = normalized.projectedToolTextBytes - stableBytes;
+					const activeBundles = normalized.projectedBundles - stableBundles;
+					if (activeToolTextBytes < 0 || activeBundles < 0) return undefined;
+					return { normalized, activeToolTextBytes, activeBundles, stableToolTextBytes: stableBytes, stableBundles };
 				} catch {
-					return false;
+					return undefined;
 				}
 			};
-			const activeProjectionStates = historyProjectionSnapshots.filter((value) => value?.active === 1);
+			const inspectedProjectionStates = historyProjectionSnapshots.map(inspectProjectionState);
+			const activeProjectionStates = inspectedProjectionStates.filter((value) => value?.normalized.active === 1);
+			const historyProjectionHardCapsValid = inspectedProjectionStates.every((value) => value !== undefined
+				&& value.normalized.projectedToolTextBytes <= historyCap
+				&& value.normalized.projectedBundles <= ${HISTORY_MAX_BUNDLES});
+			const historyProjectionRemainingCapacityValid = inspectedProjectionStates.every((value) => value !== undefined
+				&& value.activeToolTextBytes <= value.normalized.hardToolTextBytes - value.stableToolTextBytes
+				&& value.activeBundles <= value.normalized.hardBundles - value.stableBundles);
+			const topologyChanged = (value, previous) => value?.normalized.active === 1 && (
+				previous?.normalized.active !== 1
+				|| value.normalized.epoch !== previous.normalized.epoch
+				|| value.normalized.epochHash !== previous.normalized.epochHash
+				|| value.normalized.segmentChainHash !== previous.normalized.segmentChainHash
+				|| value.normalized.activeRawStartMessageCount !== previous.normalized.activeRawStartMessageCount
+			);
+			const historyProjectionSelectionReserveValid = inspectedProjectionStates.every((value, index) => (
+				!topologyChanged(value, inspectedProjectionStates[index - 1])
+				|| (value.activeToolTextBytes <= workerTurnCap && value.activeBundles <= activeBundleCap)
+			));
+			const reserveOnlyGrowthStates = inspectedProjectionStates.filter((value) => value?.normalized.active === 1
+				&& (value.activeToolTextBytes > workerTurnCap || value.activeBundles > activeBundleCap));
+			const historyProjectionReserveOnlyGrowthObserved = reserveOnlyGrowthStates.length > 0;
+			const historyProjectionReserveOnlyGrowthStayedSameTopology = historyProjectionReserveOnlyGrowthObserved
+				&& inspectedProjectionStates.every((value, index) => {
+					if (value?.normalized.active !== 1
+						|| (value.activeToolTextBytes <= workerTurnCap && value.activeBundles <= activeBundleCap)) return true;
+					const previous = inspectedProjectionStates[index - 1];
+					return previous?.normalized.active === 1
+						&& value.normalized.epoch === previous.normalized.epoch
+						&& value.normalized.epochHash === previous.normalized.epochHash
+						&& value.normalized.segmentChainHash === previous.normalized.segmentChainHash
+						&& value.normalized.activeRawStartMessageCount === previous.normalized.activeRawStartMessageCount
+						&& value.normalized.segments.length === previous.normalized.segments.length;
+				});
 			const historyProjectionV3Valid = historyProjectionSnapshots.length > 0
 				&& activeProjectionStates.length > 0
-				&& historyProjectionSnapshots.every(strictProjectionState);
+				&& inspectedProjectionStates.every((value) => value !== undefined)
+				&& historyProjectionHardCapsValid
+				&& historyProjectionRemainingCapacityValid
+				&& historyProjectionSelectionReserveValid
+				&& historyProjectionReserveOnlyGrowthObserved
+				&& historyProjectionReserveOnlyGrowthStayedSameTopology;
 			const maximumHistoryProjectionStateBytes = maxOf(historyProjectionSnapshots.map((value) => utf8(JSON.stringify(value))));
+			const maximumHistoryProjectionActiveToolTextBytes = maxOf(activeProjectionStates.map((value) => value.activeToolTextBytes));
 			const minimumWorkerAnchorReserveBytes = activeProjectionStates.length === 0
 				? 0
-				: Math.min(...activeProjectionStates.map((value) => value.hardToolTextBytes - value.anchorToolTextBytes));
+				: Math.min(...activeProjectionStates.map((value) => value.normalized.hardToolTextBytes - value.normalized.anchorToolTextBytes));
 			return {
 				projectTrusted,
 				runtimePackageProvenanceValid,
@@ -1580,7 +1686,13 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 				contextPressureNineFieldValid,
 				historyProjectionV3Entries: historyProjectionSnapshots.length,
 				historyProjectionV3Valid,
+				historyProjectionHardCapsValid,
+				historyProjectionRemainingCapacityValid,
+				historyProjectionSelectionReserveValid,
+				historyProjectionReserveOnlyGrowthObserved,
+				historyProjectionReserveOnlyGrowthStayedSameTopology,
 				maximumHistoryProjectionStateBytes,
+				maximumHistoryProjectionActiveToolTextBytes,
 				minimumWorkerAnchorReserveBytes,
 				latestCompletedBundleRaw,
 			};
@@ -1868,7 +1980,8 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 		childFacts.totalPreHistoryToolResultBytes, childFacts.totalSourceBytesOmitted, childFacts.finalCollapsedToolResults,
 		childFacts.finalRemovedToolBundles, childFacts.finalActiveHistoryToolTextBytes, childFacts.historyCap,
 		childFacts.contextPressureEntries, childFacts.historyProjectionV3Entries,
-		childFacts.maximumHistoryProjectionStateBytes, childFacts.minimumWorkerAnchorReserveBytes,
+		childFacts.maximumHistoryProjectionStateBytes, childFacts.maximumHistoryProjectionActiveToolTextBytes,
+		childFacts.minimumWorkerAnchorReserveBytes,
 	];
 	if (!numericCounts.every((value) => Number.isSafeInteger(value) && value >= 0)
 		|| typeof childFacts.projectTrusted !== "boolean"
@@ -1878,6 +1991,11 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 		|| typeof childFacts.pairingValid !== "boolean" || typeof childFacts.sourceFilesUnchanged !== "boolean"
 		|| typeof childFacts.contextPressureNineFieldValid !== "boolean"
 		|| typeof childFacts.historyProjectionV3Valid !== "boolean"
+		|| typeof childFacts.historyProjectionHardCapsValid !== "boolean"
+		|| typeof childFacts.historyProjectionRemainingCapacityValid !== "boolean"
+		|| typeof childFacts.historyProjectionSelectionReserveValid !== "boolean"
+		|| typeof childFacts.historyProjectionReserveOnlyGrowthObserved !== "boolean"
+		|| typeof childFacts.historyProjectionReserveOnlyGrowthStayedSameTopology !== "boolean"
 		|| typeof childFacts.latestCompletedBundleRaw !== "boolean"
 		|| !Array.isArray(childFacts.preHistoryToolResultBytes) || childFacts.preHistoryToolResultBytes.length !== 24
 		|| !childFacts.preHistoryToolResultBytes.every((value) => Number.isSafeInteger(value) && value >= 0)
@@ -1940,6 +2058,13 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 		&& childFacts.contextPressureNineFieldValid
 		&& childFacts.historyProjectionV3Entries >= 24
 		&& childFacts.historyProjectionV3Valid
+		&& childFacts.historyProjectionHardCapsValid
+		&& childFacts.historyProjectionRemainingCapacityValid
+		&& childFacts.historyProjectionSelectionReserveValid
+		&& childFacts.historyProjectionReserveOnlyGrowthObserved
+		&& childFacts.historyProjectionReserveOnlyGrowthStayedSameTopology
+		&& childFacts.maximumHistoryProjectionActiveToolTextBytes > WORKER_TURN_MAX_BYTES
+		&& childFacts.maximumHistoryProjectionActiveToolTextBytes <= WORKER_HISTORY_TOOL_TEXT_MAX_BYTES
 		&& childFacts.maximumHistoryProjectionStateBytes <= 32 * 1_024
 		&& childFacts.minimumWorkerAnchorReserveBytes === WORKER_TURN_MAX_BYTES
 			+ HISTORY_PROJECTION_MAX_SEGMENTS * HISTORY_PROJECTION_SEGMENT_MAX_TOOL_TEXT_BYTES
@@ -2045,7 +2170,13 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 			context_pressure_nine_fields_valid: childFacts.contextPressureNineFieldValid,
 			history_projection_v3_entries: childFacts.historyProjectionV3Entries,
 			history_projection_v3_valid: childFacts.historyProjectionV3Valid,
+			history_projection_hard_caps_valid: childFacts.historyProjectionHardCapsValid,
+			history_projection_remaining_capacity_valid: childFacts.historyProjectionRemainingCapacityValid,
+			history_projection_selection_reserve_valid: childFacts.historyProjectionSelectionReserveValid,
+			history_projection_reserve_only_growth_observed: childFacts.historyProjectionReserveOnlyGrowthObserved,
+			history_projection_reserve_only_growth_stayed_same_topology: childFacts.historyProjectionReserveOnlyGrowthStayedSameTopology,
 			maximum_history_projection_state_bytes: childFacts.maximumHistoryProjectionStateBytes,
+			maximum_history_projection_active_tool_text_bytes: childFacts.maximumHistoryProjectionActiveToolTextBytes,
 			minimum_worker_anchor_reserve_bytes: childFacts.minimumWorkerAnchorReserveBytes,
 			latest_completed_bundle_raw: childFacts.latestCompletedBundleRaw,
 			source_files_unchanged: childFacts.sourceFilesUnchanged,
@@ -2079,6 +2210,11 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 			acceptance("history-collapse-observed", (outputControl?.collapsedToolResults ?? 0) > 0, "=", true),
 			acceptance("context-pressure-nine-fields", childFacts.contextPressureNineFieldValid, "=", true),
 			acceptance("history-projection-v3-state", childFacts.historyProjectionV3Valid, "=", true),
+			acceptance("history-projection-hard-caps", childFacts.historyProjectionHardCapsValid, "=", true),
+			acceptance("history-projection-remaining-capacity", childFacts.historyProjectionRemainingCapacityValid, "=", true),
+			acceptance("history-projection-selection-reserve", childFacts.historyProjectionSelectionReserveValid, "=", true),
+			acceptance("history-projection-reserve-only-growth", childFacts.historyProjectionReserveOnlyGrowthObserved, "=", true),
+			acceptance("history-projection-reserve-only-same-topology", childFacts.historyProjectionReserveOnlyGrowthStayedSameTopology, "=", true),
 			acceptance("history-projection-state-size", childFacts.maximumHistoryProjectionStateBytes, "<=", 32 * 1_024),
 			acceptance("worker-anchor-reserve", childFacts.minimumWorkerAnchorReserveBytes,
 				"=", WORKER_TURN_MAX_BYTES + HISTORY_PROJECTION_MAX_SEGMENTS * HISTORY_PROJECTION_SEGMENT_MAX_TOOL_TEXT_BYTES),

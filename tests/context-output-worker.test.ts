@@ -315,6 +315,7 @@ test("worker runtime persists strict v3 segments through sixteen seals, checkpoi
 		state: HistoryProjectionStateEntryData,
 		projected: readonly AgentMessage[],
 		label: string,
+		reserveSelected: boolean,
 	): void => {
 		const serialized = JSON.stringify(state);
 		assert.ok(Buffer.byteLength(serialized, "utf8") <= 32 * 1_024, label);
@@ -340,8 +341,19 @@ test("worker runtime persists strict v3 segments through sixteen seals, checkpoi
 			assert.ok(segment.projectedToolTextBytes <= HISTORY_PROJECTION_SEGMENT_MAX_TOOL_TEXT_BYTES, label);
 			assert.ok(segment.projectedBundles <= HISTORY_PROJECTION_SEGMENT_MAX_BUNDLES, label);
 		}
-		assert.ok(historyToolTextBytes(raw.slice(state.activeRawStartMessageCount)) <= WORKER_TURN_MAX_BYTES, label);
-		assert.ok(toolBundleCount(raw.slice(state.activeRawStartMessageCount)) <= HISTORY_PROJECTION_ACTIVE_MAX_BUNDLES, label);
+		const stableToolTextBytes = state.anchor.projectedToolTextBytes
+			+ state.segments.reduce((sum, segment) => sum + segment.projectedToolTextBytes, 0);
+		const stableBundles = state.anchor.projectedBundles
+			+ state.segments.reduce((sum, segment) => sum + segment.projectedBundles, 0);
+		const activeMessages = raw.slice(state.activeRawStartMessageCount);
+		const activeToolTextBytes = historyToolTextBytes(activeMessages);
+		const activeBundles = toolBundleCount(activeMessages);
+		assert.ok(activeToolTextBytes <= state.hardToolTextBytes - stableToolTextBytes, label);
+		assert.ok(activeBundles <= state.hardBundles - stableBundles, label);
+		if (reserveSelected) {
+			assert.ok(activeToolTextBytes <= WORKER_TURN_MAX_BYTES, label);
+			assert.ok(activeBundles <= HISTORY_PROJECTION_ACTIVE_MAX_BUNDLES, label);
+		}
 		assert.ok(historyToolTextBytes(projected) <= WORKER_HISTORY_TOOL_TEXT_MAX_BYTES, label);
 		assert.ok(toolBundleCount(projected) <= HISTORY_MAX_BUNDLES, label);
 		assert.equal(validateContextToolPairing(projected), true, label);
@@ -353,7 +365,7 @@ test("worker runtime persists strict v3 segments through sixteen seals, checkpoi
 	assert.equal(initialState.schemaVersion, 3);
 	assert.equal(initialState.active, 1);
 	assert.equal(initialState.segments.length, 0);
-	assertStrictState(initialState, initial, "initial");
+	assertStrictState(initialState, initial, "initial", true);
 	const anchorMessageCount = initialState.anchor.projectedMessageCount;
 	const fixedProviderAnchor = jsonProviderMessages(initial.slice(0, anchorMessageCount));
 	assert.ok(fixedProviderAnchor.length > 0, "the immutable provider anchor must be nonempty");
@@ -371,24 +383,45 @@ test("worker runtime persists strict v3 segments through sixteen seals, checkpoi
 		initialProviderPayload,
 		"the complete provider payload is append-only before the active tail seals",
 	);
-	assertStrictState(sameState, sameEpoch, "same-state append");
+	assertStrictState(sameState, sameEpoch, "same-state append", false);
 
-	let previousState = sameState;
-	let previousProvider = jsonProviderMessages(sameEpoch);
-	let previousStableCount = sameState.anchor.projectedMessageCount;
-	let previousBoundaryIds = [sameState.anchor.boundaryId];
+	// The 48 KiB turn reserve is a suffix-selection budget, not a second hard
+	// cap. This append grows the active tail from 41 KiB to 49 KiB while the
+	// complete projected history remains below the real 64 KiB worker limit.
+	raw.push(...aggregateBundle("reserve-only-8k", [8 * 1_024]));
+	const reserveOnly = await emitContext(stub, raw, ctx);
+	await emitRuntimeEvent(stub, "turn_end", { type: "turn_end", turnIndex: 3, message: {}, toolResults: [] }, ctx);
+	const reserveOnlyState = latestProjectionState(stub);
+	assert.ok(historyToolTextBytes(raw.slice(reserveOnlyState.activeRawStartMessageCount)) > WORKER_TURN_MAX_BYTES);
+	assert.ok(historyToolTextBytes(reserveOnly) <= WORKER_HISTORY_TOOL_TEXT_MAX_BYTES);
+	assert.equal(reserveOnlyState.epoch, sameState.epoch);
+	assert.equal(reserveOnlyState.epochHash, sameState.epochHash);
+	assert.equal(reserveOnlyState.segmentChainHash, sameState.segmentChainHash);
+	assert.equal(reserveOnlyState.activeRawStartMessageCount, sameState.activeRawStartMessageCount);
+	assert.equal(reserveOnlyState.segments.length, sameState.segments.length);
+	assert.deepEqual(
+		jsonProviderMessages(reserveOnly).slice(0, jsonProviderMessages(sameEpoch).length),
+		jsonProviderMessages(sameEpoch),
+		"reserve-only growth must keep the provider prefix append-only",
+	);
+	assertStrictState(reserveOnlyState, reserveOnly, "reserve-only append", false);
+
+	let previousState = reserveOnlyState;
+	let previousProvider = jsonProviderMessages(reserveOnly);
+	let previousStableCount = reserveOnlyState.anchor.projectedMessageCount;
+	let previousBoundaryIds = [reserveOnlyState.anchor.boundaryId];
 	for (let ordinal = 1; ordinal <= HISTORY_PROJECTION_MAX_SEGMENTS + 3; ordinal += 1) {
 		const size = ordinal % 2 === 1 ? 48 * 1_024 : 40 * 1_024;
 		const id = `roll-${ordinal}`;
 		raw.push(...aggregateBundle(id, [size]));
 		const projected = await emitContext(stub, raw, ctx);
 		await emitRuntimeEvent(stub, "turn_end", {
-			type: "turn_end", turnIndex: ordinal + 2, message: {}, toolResults: [],
+			type: "turn_end", turnIndex: ordinal + 3, message: {}, toolResults: [],
 		}, ctx);
 		const state = latestProjectionState(stub);
 		const provider = jsonProviderMessages(projected);
 		const boundaryIds = [state.anchor.boundaryId, ...state.segments.map((segment) => segment.boundaryId)];
-		assertStrictState(state, projected, `ordinal=${ordinal}`);
+		assertStrictState(state, projected, `ordinal=${ordinal}`, true);
 		assert.equal(resultText(projected, `${id}-0`), "0".repeat(size), `ordinal=${ordinal} latest raw`);
 
 		if (ordinal <= HISTORY_PROJECTION_MAX_SEGMENTS) {

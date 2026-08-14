@@ -52,6 +52,30 @@ function record(overrides: Record<string, unknown> = {}): Record<string, unknown
 	};
 }
 
+function recordV13(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+	return record({
+		schemaVersion: "1.3",
+		promptInputTokens: 10000,
+		cacheReadShare: 0.9,
+		cacheWriteShare: null,
+		cacheWriteStatusCode: 1,
+		actorRoleCode: 2,
+		requestCorrelationCode: 1,
+		historyProjection: null,
+		wireObservation: {
+			requestSerial: 1,
+			finalityCode: 0,
+			digestStatusCode: 1,
+			apiShapeCode: 1,
+			relationshipCode: 1,
+			itemCount: 1,
+			itemLcpCount: 0,
+			itemLcpUtf8Bytes: 0,
+		},
+		...overrides,
+	});
+}
+
 async function makeProject(root: string): Promise<void> {
 	const cache = join(root, ".pi", "workbench", "cache");
 	await mkdir(join(cache, "actions"), { recursive: true });
@@ -218,6 +242,8 @@ test("buildBenchmarkReport: all required fields with correct aggregation", async
 		// Field presence: the P6-E contract list.
 		const expected: Array<keyof BenchmarkReport> = [
 			"requestCount",
+			"schema13Rows",
+			"observability",
 			"uncachedInputTokens",
 			"cacheReadTokens",
 			"outputTokens",
@@ -267,6 +293,56 @@ test("buildBenchmarkReport: all required fields with correct aggregation", async
 		assert.equal(report.skippedTelemetryLines, 1);
 		assert.equal(report.telemetrySourceIncomplete, true);
 		assert.equal(report.truncatedTelemetryRecords, 0);
+		assert.equal(report.schema13Rows, 0);
+		assert.equal(report.observability, null, "legacy rows remain unobserved rather than zero-filled 1.3 facts");
+	});
+});
+
+test("buildBenchmarkReport mirrors schema 1.3 observability without claiming final actual wire", async () => {
+	await withTempDir(async (root) => {
+		await makeProject(root);
+		const telemetryPath = join(root, ".pi", "workbench", "cache", "telemetry.jsonl");
+		const commander = recordV13({
+			provider: "openai",
+			model: "gpt-5.6",
+			apiKind: "openai-responses",
+			usage: { input: 9, output: 1, cacheRead: 90, cacheWrite: 1, totalTokens: 101, cost: 0.01 },
+			cacheHitRatio: 90 / 99,
+			promptInputTokens: 100,
+			cacheReadShare: 0.9,
+			cacheWriteShare: 0.01,
+			cacheWriteStatusCode: 2,
+			actorRoleCode: 1,
+		});
+		const worker = recordV13({
+			timestamp: "2026-08-02T01:58:00.000Z",
+			usage: { input: 20, output: 1, cacheRead: 80, cacheWrite: 0, totalTokens: 101, cost: 0.01 },
+			cacheHitRatio: 0.8,
+			promptInputTokens: 100,
+			cacheReadShare: 0.8,
+			wireObservation: {
+				requestSerial: 2,
+				finalityCode: 0,
+				digestStatusCode: 1,
+				apiShapeCode: 1,
+				relationshipCode: 2,
+				itemCount: 2,
+				itemLcpCount: 1,
+				itemLcpUtf8Bytes: 9,
+			},
+		});
+		await writeFile(telemetryPath, `${JSON.stringify(commander)}\n${JSON.stringify(worker)}\n`, "utf8");
+
+		const report = await buildBenchmarkReport({ projectRoot: root, scope: "project" });
+		assert.equal(report.schema13Rows, 2);
+		assert.equal(report.observability?.retainedWindowUsage.cacheReadShare, 0.85);
+		assert.equal(report.observability?.retainedWindowUsage.cacheWriteShare, null);
+		assert.equal(report.observability?.actorCohorts.commander.cacheWriteShare, 0.01);
+		assert.equal(report.observability?.actorCohorts.worker.cacheWriteShare, null);
+		assert.deepEqual(report.observability?.wholeItemLcp, { eligibleRequests: 2, itemCount: 1, utf8Bytes: 9 });
+		const rendered = renderBenchmarkReport(report).join("\n");
+		assert.match(rendered, /local wire observation: requests=2 nonfinal=2 finalityCode=0/);
+		assert.ok(!rendered.includes("verified wire"));
 	});
 });
 
@@ -381,6 +457,8 @@ test("normalizeReport: accepts both the benchmark shape and the extension CacheR
 			schemaVersion: "1.0",
 			generatedAt: "x",
 			requestCount: 10,
+			schema13Rows: 0,
+			observability: null,
 			byMode: {},
 			byModel: {},
 			totals: { input: 100, cacheRead: 200, output: 50, cacheWrite: 0, totalTokens: 350, cost: 0.01 },

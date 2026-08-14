@@ -21,7 +21,7 @@
 
 import { appendFile, mkdir, open, readdir, rename, rm, stat, writeFile, type FileHandle } from "node:fs/promises";
 import { join } from "node:path";
-import { TextDecoder } from "node:util";
+import { TextDecoder, types as nodeTypes } from "node:util";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { isTelemetryRecord, type TelemetryRecord } from "./cache-types.ts";
@@ -39,6 +39,11 @@ export const DEFAULT_MAX_CHRONOLOGICAL_RECORDS = 100_000;
 export const MAX_CHRONOLOGICAL_RECORDS = 1_000_000;
 /** Includes the terminating JSONL newline. */
 export const MAX_TELEMETRY_RECORD_BYTES = 64 * 1024;
+export const UNINSPECTABLE_TELEMETRY_VALUE = "<uninspectable-telemetry-value>";
+const MAX_TELEMETRY_SCAN_DEPTH = 32;
+const MAX_TELEMETRY_SCAN_NODES = 4_096;
+const MAX_TELEMETRY_SCAN_PROPERTIES = 16_384;
+const MAX_TELEMETRY_SCAN_ARRAY_LENGTH = 16_384;
 
 /**
  * Field names that must never appear in a telemetry record. The record
@@ -93,32 +98,110 @@ export const FORBIDDEN_TELEMETRY_KEYS: readonly string[] = [
 /**
  * Deep-scan a value for forbidden field names. Returns the first forbidden
  * key found, or null when the value is clean. Exact key matching only —
- * `systemPromptHash` is allowed, `systemPrompt` is not.
+ * `systemPromptHash` is allowed, `systemPrompt` is not. Values that cannot
+ * be inspected without executing application code return the fixed
+ * UNINSPECTABLE_TELEMETRY_VALUE sentinel and are refused by the store.
  */
 export function hasForbiddenTelemetryFields(value: unknown): string | null {
 	const forbidden = new Set(FORBIDDEN_TELEMETRY_KEYS);
-	return scan(value, forbidden);
+	const result = scan(value, forbidden, { nodes: 0, properties: 0, ancestors: new WeakSet<object>() });
+	if (result.kind === "clean") return null;
+	return result.kind === "forbidden" ? result.key : UNINSPECTABLE_TELEMETRY_VALUE;
 }
 
-function scan(value: unknown, forbidden: ReadonlySet<string>, depth = 0): string | null {
-	if (depth > 32 || value === null || value === undefined) return null;
-	if (typeof value !== "object") return null;
-	if (Array.isArray(value)) {
-		for (const item of value) {
-			const hit = scan(item, forbidden, depth + 1);
-			if (hit !== null) return hit;
+type TelemetryScanResult =
+	| { readonly kind: "clean" }
+	| { readonly kind: "forbidden"; readonly key: string }
+	| { readonly kind: "unsafe" };
+
+interface TelemetryScanBudget {
+	nodes: number;
+	properties: number;
+	ancestors: WeakSet<object>;
+}
+
+const CLEAN_TELEMETRY_SCAN: TelemetryScanResult = { kind: "clean" };
+const UNSAFE_TELEMETRY_SCAN: TelemetryScanResult = { kind: "unsafe" };
+
+/** Descriptor-only recursive scan. Proxy brand checks happen before reflection. */
+function scan(
+	value: unknown,
+	forbidden: ReadonlySet<string>,
+	budget: TelemetryScanBudget,
+	depth = 0,
+): TelemetryScanResult {
+	try {
+		if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+			return CLEAN_TELEMETRY_SCAN;
 		}
-		return null;
+		if (typeof value !== "object") return UNSAFE_TELEMETRY_SCAN;
+		if (nodeTypes.isProxy(value)) return UNSAFE_TELEMETRY_SCAN;
+		if (depth >= MAX_TELEMETRY_SCAN_DEPTH || budget.nodes >= MAX_TELEMETRY_SCAN_NODES) return UNSAFE_TELEMETRY_SCAN;
+		if (budget.ancestors.has(value)) return UNSAFE_TELEMETRY_SCAN;
+		budget.nodes += 1;
+		budget.ancestors.add(value);
+		try {
+			const prototype = Object.getPrototypeOf(value);
+			const isArray = Array.isArray(value);
+			if (isArray ? prototype !== Array.prototype : prototype !== Object.prototype && prototype !== null) {
+				return UNSAFE_TELEMETRY_SCAN;
+			}
+			const descriptors = Object.getOwnPropertyDescriptors(value);
+			const ownKeys = Reflect.ownKeys(descriptors);
+			if (ownKeys.some((key) => typeof key === "symbol")) return UNSAFE_TELEMETRY_SCAN;
+			if (budget.properties + ownKeys.length > MAX_TELEMETRY_SCAN_PROPERTIES) return UNSAFE_TELEMETRY_SCAN;
+			budget.properties += ownKeys.length;
+			const keys = ownKeys as string[];
+
+			if (isArray) {
+				const lengthDescriptor = descriptors.length;
+				if (!isDataDescriptor(lengthDescriptor) || lengthDescriptor.enumerable !== false) return UNSAFE_TELEMETRY_SCAN;
+				const length = lengthDescriptor.value;
+				if (typeof length !== "number" || !Number.isSafeInteger(length) || length < 0 || length > MAX_TELEMETRY_SCAN_ARRAY_LENGTH) {
+					return UNSAFE_TELEMETRY_SCAN;
+				}
+				for (const key of keys) {
+					if (key === "length") continue;
+					if (!isCanonicalArrayIndex(key, length)) return UNSAFE_TELEMETRY_SCAN;
+					const descriptor = descriptors[key];
+					if (!isDataDescriptor(descriptor) || descriptor.enumerable !== true) return UNSAFE_TELEMETRY_SCAN;
+					const nested = scan(descriptor.value, forbidden, budget, depth + 1);
+					if (nested.kind !== "clean") return nested;
+				}
+				return CLEAN_TELEMETRY_SCAN;
+			}
+
+			for (const key of keys) {
+				const descriptor = descriptors[key];
+				if (!isDataDescriptor(descriptor) || descriptor.enumerable !== true) return UNSAFE_TELEMETRY_SCAN;
+				if (forbidden.has(key)) return { kind: "forbidden", key };
+			}
+			for (const key of keys) {
+				const descriptor = descriptors[key];
+				if (!isDataDescriptor(descriptor)) return UNSAFE_TELEMETRY_SCAN;
+				const nested = scan(descriptor.value, forbidden, budget, depth + 1);
+				if (nested.kind !== "clean") return nested;
+			}
+			return CLEAN_TELEMETRY_SCAN;
+		} finally {
+			budget.ancestors.delete(value);
+		}
+	} catch {
+		return UNSAFE_TELEMETRY_SCAN;
 	}
-	const record = value as Record<string, unknown>;
-	for (const key of Object.keys(record)) {
-		if (forbidden.has(key)) return key;
-	}
-	for (const key of Object.keys(record)) {
-		const hit = scan(record[key], forbidden, depth + 1);
-		if (hit !== null) return hit;
-	}
-	return null;
+}
+
+function isDataDescriptor(descriptor: PropertyDescriptor | undefined): descriptor is PropertyDescriptor & { value: unknown } {
+	return descriptor !== undefined
+		&& Object.prototype.hasOwnProperty.call(descriptor, "value")
+		&& descriptor.get === undefined
+		&& descriptor.set === undefined;
+}
+
+function isCanonicalArrayIndex(key: string, length: number): boolean {
+	if (!/^(?:0|[1-9][0-9]*)$/.test(key)) return false;
+	const index = Number(key);
+	return Number.isSafeInteger(index) && index >= 0 && index < length;
 }
 
 export interface CacheStoreOptions {
@@ -206,6 +289,9 @@ export class CacheStore {
 		try {
 			const forbidden = hasForbiddenTelemetryFields(record);
 			if (forbidden !== null) {
+				if (forbidden === UNINSPECTABLE_TELEMETRY_VALUE) {
+					return { ok: false, error: "refused: telemetry record cannot be safely inspected" };
+				}
 				return { ok: false, error: `refused: record contains forbidden field "${forbidden}"` };
 			}
 			const serialized = JSON.stringify(record);

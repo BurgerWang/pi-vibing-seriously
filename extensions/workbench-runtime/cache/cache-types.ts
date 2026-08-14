@@ -43,13 +43,13 @@ import {
 
 /**
  * Schema version of telemetry records and the session state entry.
- * 1.2: same-epoch immutable history segment seals are observable as the
- * expected `HISTORY_PROJECTION_SEGMENT_SEALED` reason. Segment/epoch hashes
- * and provider marker text remain in-memory only and are not record fields.
- * Readers remain strict for the exact 1.0, 1.1 and 1.2 record shapes.
+ * 1.3: adds numeric-only request correlation, projection anatomy, local
+ * provider-observation facts and cache-read/write shares. Provider text,
+ * SDK payload bodies and projection marker text are never persisted.
+ * Readers remain strict for every exact 1.0 through 1.3 record shape.
  */
-export const TELEMETRY_SCHEMA_VERSION = "1.2" as const;
-export type TelemetrySchemaVersion = "1.0" | "1.1" | typeof TELEMETRY_SCHEMA_VERSION;
+export const TELEMETRY_SCHEMA_VERSION = "1.3" as const;
+export type TelemetrySchemaVersion = "1.0" | "1.1" | "1.2" | typeof TELEMETRY_SCHEMA_VERSION;
 
 /** Must stay in sync with package.json version. */
 export const EXTENSION_VERSION = "0.10.0";
@@ -94,6 +94,52 @@ export interface UsageSemantics {
 	cacheHitRatio: number | null;
 }
 
+export type ActorRoleCode = 0 | 1 | 2;
+export type RequestCorrelationCode = 0 | 1 | 2 | 3;
+export type CacheWriteStatusCode = 0 | 1 | 2 | 3;
+
+/** Numeric-only anatomy supplied by the context projector; no core type dependency. */
+export interface HistoryProjectionFacts {
+	contextSerial: number;
+	eventCode: 0 | 1 | 2 | 3 | 4 | 5 | 6;
+	causeCode: 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9;
+	epoch: number;
+	epochTransitioned: 0 | 1;
+	segmentSealed: 0 | 1;
+	byteOverflow: 0 | 1;
+	bundleOverflow: 0 | 1;
+	segmentsBefore: number;
+	segmentsAfter: number;
+	hardToolTextBytes: number;
+	hardBundles: number;
+	rawToolTextBytes: number;
+	rawBundles: number;
+	projectedToolTextBytes: number;
+	projectedBundles: number;
+	stableToolTextBytesBefore: number;
+	stableBundlesBefore: number;
+	activeToolTextBytesBefore: number;
+	activeBundlesBefore: number;
+	agedRawToolTextBytes: number;
+	agedRawBundles: number;
+	agedProjectedToolTextBytes: number;
+	agedProjectedBundles: number;
+	suffixRawToolTextBytes: number;
+	suffixRawBundles: number;
+}
+
+/** Local before_provider_request observation, explicitly not final actual wire. */
+export interface WireObservationFacts {
+	requestSerial: number;
+	finalityCode: 0;
+	digestStatusCode: 0 | 1 | 2;
+	apiShapeCode: 0 | 1 | 2 | 3;
+	relationshipCode: 0 | 1 | 2 | 3;
+	itemCount: number;
+	itemLcpCount: number;
+	itemLcpUtf8Bytes: number;
+}
+
 /**
  * Per-request telemetry record (one JSONL line).
  * Every field is a fact about usage or a hash — never message content.
@@ -114,6 +160,15 @@ export interface TelemetryRecord {
 	usage: UsageTotalsLike;
 	usageSemanticStatus: UsageSemanticStatus;
 	cacheHitRatio: number | null;
+	/** 1.3 only; absent from strict legacy 1.0-1.2 records. */
+	promptInputTokens?: number;
+	cacheReadShare?: number | null;
+	cacheWriteShare?: number | null;
+	cacheWriteStatusCode?: CacheWriteStatusCode;
+	actorRoleCode?: ActorRoleCode;
+	requestCorrelationCode?: RequestCorrelationCode;
+	historyProjection?: HistoryProjectionFacts | null;
+	wireObservation?: WireObservationFacts | null;
 	systemPromptHash: string;
 	activeToolNamesHash: string;
 	activeToolOrderHash: string;
@@ -131,7 +186,7 @@ export interface TelemetryRecord {
 	driftSource?: DriftSource | null;
 }
 
-const TELEMETRY_RECORD_KEYS = [
+const TELEMETRY_RECORD_KEYS_V1_2 = [
 	"schemaVersion",
 	"timestamp",
 	"extensionVersion",
@@ -156,7 +211,30 @@ const TELEMETRY_RECORD_KEYS = [
 	"driftSource",
 ] as const;
 
-const TELEMETRY_RECORD_KEYS_V1_0 = TELEMETRY_RECORD_KEYS.filter((key) => key !== "driftSource");
+const TELEMETRY_RECORD_KEYS_V1_3 = [
+	...TELEMETRY_RECORD_KEYS_V1_2,
+	"promptInputTokens",
+	"cacheReadShare",
+	"cacheWriteShare",
+	"cacheWriteStatusCode",
+	"actorRoleCode",
+	"requestCorrelationCode",
+	"historyProjection",
+	"wireObservation",
+] as const;
+const TELEMETRY_RECORD_KEYS_V1_0 = TELEMETRY_RECORD_KEYS_V1_2.filter((key) => key !== "driftSource");
+
+const HISTORY_PROJECTION_KEYS = [
+	"contextSerial", "eventCode", "causeCode", "epoch", "epochTransitioned", "segmentSealed", "byteOverflow", "bundleOverflow",
+	"segmentsBefore", "segmentsAfter", "hardToolTextBytes", "hardBundles", "rawToolTextBytes", "rawBundles",
+	"projectedToolTextBytes", "projectedBundles", "stableToolTextBytesBefore", "stableBundlesBefore",
+	"activeToolTextBytesBefore", "activeBundlesBefore", "agedRawToolTextBytes", "agedRawBundles",
+	"agedProjectedToolTextBytes", "agedProjectedBundles", "suffixRawToolTextBytes", "suffixRawBundles",
+] as const;
+const WIRE_OBSERVATION_KEYS = [
+	"requestSerial", "finalityCode", "digestStatusCode", "apiShapeCode", "relationshipCode",
+	"itemCount", "itemLcpCount", "itemLcpUtf8Bytes",
+] as const;
 
 const USAGE_TOTAL_KEYS = ["input", "output", "cacheRead", "cacheWrite", "totalTokens", "cost"] as const;
 const TELEMETRY_HASH = /^[0-9a-f]{64}$/;
@@ -167,18 +245,22 @@ const INVALIDATION_REASON_SET: ReadonlySet<string> = new Set(INVALIDATION_REASON
 const DRIFT_SOURCE_SET: ReadonlySet<string> = new Set(DRIFT_SOURCES);
 /** A single record cannot plausibly exceed this and remains safely aggregatable. */
 const MAX_TELEMETRY_NUMERIC_VALUE = 1_000_000_000_000_000;
+/** Must match the core controller's fixed immutable-segment window. */
+const HISTORY_PROJECTION_MAX_SEGMENTS = 16;
 
 /**
  * Runtime guard for persisted telemetry. JSON being syntactically valid is
- * not enough: reports may only consume the exact hash-only 1.0/1.1/1.2
+ * not enough: reports may only consume the exact hash-only 1.0-1.3
  * contracts. Accessors, proxies, inherited fields, unknown fields and
  * invalid numeric/semantic combinations all fail closed.
  */
 export function isTelemetryRecord(value: unknown): value is TelemetryRecord {
 	try {
 		if (!isPlainOwnDataRecord(value)) return false;
-		if (value.schemaVersion === TELEMETRY_SCHEMA_VERSION || value.schemaVersion === "1.1") {
-			if (!hasExactOwnKeys(value, TELEMETRY_RECORD_KEYS)) return false;
+		if (value.schemaVersion === TELEMETRY_SCHEMA_VERSION) {
+			if (!hasExactOwnKeys(value, TELEMETRY_RECORD_KEYS_V1_3)) return false;
+		} else if (value.schemaVersion === "1.1" || value.schemaVersion === "1.2") {
+			if (!hasExactOwnKeys(value, TELEMETRY_RECORD_KEYS_V1_2)) return false;
 		} else if (value.schemaVersion === "1.0") {
 			if (!hasExactOwnKeys(value, TELEMETRY_RECORD_KEYS_V1_0)) return false;
 		} else {
@@ -194,12 +276,13 @@ export function isTelemetryRecord(value: unknown): value is TelemetryRecord {
 		if (!isUsageTotals(value.usage)) return false;
 		if (typeof value.usageSemanticStatus !== "string" || !USAGE_STATUSES.has(value.usageSemanticStatus as UsageSemanticStatus)) return false;
 		if (!validCacheHitRatio(value.cacheHitRatio, value.usageSemanticStatus as UsageSemanticStatus, value.usage)) return false;
+		if (value.schemaVersion === TELEMETRY_SCHEMA_VERSION && !validV1_3Facts(value)) return false;
 		if (!isHash(value.systemPromptHash) || !isHash(value.activeToolNamesHash) || !isHash(value.activeToolOrderHash)) return false;
 		if (!nullableHash(value.activeToolSchemaHash) || !nullableHash(value.contextShapeHash)) return false;
 		if (!nullableBoundedString(value.precedingEvent, 128)) return false;
 		if (typeof value.inferredInvalidationReason !== "string" || !INVALIDATION_REASON_SET.has(value.inferredInvalidationReason)) return false;
 		if (value.inferredInvalidationReason === "HISTORY_PROJECTION_SEGMENT_SEALED"
-			&& value.schemaVersion !== TELEMETRY_SCHEMA_VERSION) return false;
+			&& value.schemaVersion !== "1.2" && value.schemaVersion !== TELEMETRY_SCHEMA_VERSION) return false;
 		if (typeof value.inferenceConfidence !== "string" || !INFERENCE_CONFIDENCES.has(value.inferenceConfidence as InferenceConfidence)) return false;
 		if (value.schemaVersion !== "1.0") {
 			if (value.driftSource !== null && (typeof value.driftSource !== "string" || !DRIFT_SOURCE_SET.has(value.driftSource))) return false;
@@ -216,7 +299,8 @@ function isPlainOwnDataRecord(value: unknown): value is Record<string, unknown> 
 	if (prototype !== Object.prototype && prototype !== null) return false;
 	if (Object.getOwnPropertySymbols(value).length > 0) return false;
 	const descriptors = Object.getOwnPropertyDescriptors(value);
-	return Object.values(descriptors).every((descriptor) => "value" in descriptor && descriptor.get === undefined && descriptor.set === undefined);
+	return Object.values(descriptors).every((descriptor) => descriptor.enumerable === true
+		&& "value" in descriptor && descriptor.get === undefined && descriptor.set === undefined);
 }
 
 function hasExactOwnKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
@@ -273,6 +357,127 @@ function validCacheHitRatio(value: unknown, status: UsageSemanticStatus, usage: 
 	return Math.abs(value - expected) <= Number.EPSILON * 4;
 }
 
+function sameRatio(value: unknown, expected: number | null): boolean {
+	if (expected === null) return value === null;
+	return typeof value === "number"
+		&& Number.isFinite(value)
+		&& value >= 0
+		&& value <= 1
+		&& Math.abs(value - expected) <= Number.EPSILON * 4;
+}
+
+function isCode(value: unknown, maximum: number): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= maximum;
+}
+
+/**
+ * Strict cache-side semantic guard for the core projector's numeric anatomy.
+ * Kept independent of the core module so persisted-record readers and the
+ * best-effort writer share one fail-closed contract without a runtime cycle.
+ */
+export function isHistoryProjectionFacts(value: unknown): value is HistoryProjectionFacts {
+	if (!isPlainOwnDataRecord(value) || !hasExactOwnKeys(value, HISTORY_PROJECTION_KEYS)) return false;
+	const facts = value as unknown as HistoryProjectionFacts;
+	for (const key of HISTORY_PROJECTION_KEYS) {
+		if (!safeTelemetryToken(facts[key])) return false;
+	}
+	if (facts.contextSerial > 1_000_000_000) return false;
+	if (!isCode(facts.eventCode, 6) || !isCode(facts.causeCode, 9)) return false;
+	for (const key of ["epochTransitioned", "segmentSealed", "byteOverflow", "bundleOverflow"] as const) {
+		if (!isCode(facts[key], 1)) return false;
+	}
+	if (facts.segmentsBefore > HISTORY_PROJECTION_MAX_SEGMENTS || facts.segmentsAfter > HISTORY_PROJECTION_MAX_SEGMENTS) {
+		return false;
+	}
+
+	const noOverflow = facts.byteOverflow === 0 && facts.bundleOverflow === 0;
+	const hasOverflow = facts.byteOverflow === 1 || facts.bundleOverflow === 1;
+	switch (facts.eventCode) {
+		case 0: // none
+			return facts.causeCode === 0
+				&& facts.epochTransitioned === 0
+				&& facts.segmentSealed === 0
+				&& noOverflow
+				&& facts.segmentsAfter === facts.segmentsBefore;
+		case 1: // initial_hard_projection
+			return facts.causeCode === 1
+				&& facts.epochTransitioned === 1
+				&& facts.segmentSealed === 0
+				&& hasOverflow
+				&& facts.segmentsBefore === 0
+				&& facts.segmentsAfter === 0;
+		case 2: // segment_seal
+			return facts.causeCode === 4
+				&& facts.epochTransitioned === 0
+				&& facts.segmentSealed === 1
+				&& hasOverflow
+				&& facts.segmentsAfter === facts.segmentsBefore + 1;
+		case 3: // epoch_checkpoint
+			return (facts.causeCode === 2 || facts.causeCode === 3 || facts.causeCode === 5
+					|| facts.causeCode === 6 || facts.causeCode === 7)
+				&& facts.epochTransitioned === 1
+				&& facts.segmentSealed === 0
+				&& hasOverflow
+				&& facts.segmentsAfter === 0
+				&& (facts.causeCode !== 7 || facts.segmentsBefore === 0);
+		case 4: // inactive_boundary
+			return (facts.causeCode === 5 || facts.causeCode === 6 || facts.causeCode === 7)
+				&& facts.epochTransitioned === 1
+				&& facts.segmentSealed === 0
+				&& noOverflow
+				&& facts.segmentsAfter === 0
+				&& (facts.causeCode !== 7 || facts.segmentsBefore === 0);
+		case 5: // fixed_failure; the same fixed boundary may repeat without a transition
+			return facts.causeCode === 8
+				&& facts.segmentSealed === 0
+				&& facts.segmentsAfter === 0;
+		case 6: // one-shot recovery after failure clears all frozen segments
+			return facts.causeCode === 9
+				&& facts.epochTransitioned === 1
+				&& facts.segmentSealed === 0
+				&& facts.segmentsBefore === 0
+				&& facts.segmentsAfter === 0;
+	}
+	return false;
+}
+
+function isWireObservationFacts(value: unknown): value is WireObservationFacts {
+	if (!isPlainOwnDataRecord(value) || !hasExactOwnKeys(value, WIRE_OBSERVATION_KEYS)) return false;
+	const facts = value as unknown as WireObservationFacts;
+	if (!safeTelemetryToken(facts.requestSerial) || facts.requestSerial > 1_000_000_000) return false;
+	if (facts.finalityCode !== 0) return false;
+	if (!isCode(facts.digestStatusCode, 2) || !isCode(facts.apiShapeCode, 3) || !isCode(facts.relationshipCode, 3)) return false;
+	if (!safeTelemetryToken(facts.itemCount) || !safeTelemetryToken(facts.itemLcpCount) || !safeTelemetryToken(facts.itemLcpUtf8Bytes)) return false;
+	if (facts.itemLcpCount > facts.itemCount) return false;
+	if (facts.itemLcpCount === 0 && facts.itemLcpUtf8Bytes !== 0) return false;
+	if (facts.relationshipCode === 0 && (facts.itemLcpCount !== 0 || facts.itemLcpUtf8Bytes !== 0)) return false;
+	if (facts.digestStatusCode === 0 && (
+		facts.apiShapeCode !== 0 || facts.relationshipCode !== 0 || facts.itemCount !== 0
+		|| facts.itemLcpCount !== 0 || facts.itemLcpUtf8Bytes !== 0
+	)) return false;
+	return true;
+}
+
+function validV1_3Facts(value: Record<string, unknown>): boolean {
+	if (!isUsageTotals(value.usage)) return false;
+	if (typeof value.provider !== "string" || !nullableBoundedString(value.apiKind, 128)) return false;
+	if (typeof value.usageSemanticStatus !== "string" || !USAGE_STATUSES.has(value.usageSemanticStatus as UsageSemanticStatus)) return false;
+	const status = value.usageSemanticStatus as UsageSemanticStatus;
+	const expected = cacheUsageMetrics(value.provider, value.apiKind as string | null, value.usage, status);
+	if (value.promptInputTokens !== expected.promptInputTokens) return false;
+	if (!sameRatio(value.cacheReadShare, expected.cacheReadShare) || !sameRatio(value.cacheWriteShare, expected.cacheWriteShare)) return false;
+	if (value.cacheWriteStatusCode !== expected.cacheWriteStatusCode) return false;
+	if (!isCode(value.actorRoleCode, 2) || !isCode(value.requestCorrelationCode, 3)) return false;
+	if (value.historyProjection !== null && !isHistoryProjectionFacts(value.historyProjection)) return false;
+	if (value.wireObservation !== null && !isWireObservationFacts(value.wireObservation)) return false;
+	if (value.requestCorrelationCode === 1) {
+		if (value.wireObservation === null) return false;
+	} else if (value.actorRoleCode !== 0 || value.historyProjection !== null) {
+		return false;
+	}
+	return true;
+}
+
 /**
  * Verify the semantics of a normalized Pi usage object and compute the
  * cache hit ratio. The workbench never guesses: `verified` requires the api
@@ -299,6 +504,54 @@ export function cacheHitRatioFromTotals(usage: { input: number; cacheRead: numbe
 	const denominator = usage.input + usage.cacheRead;
 	if (!Number.isFinite(denominator) || denominator <= 0) return null;
 	return usage.cacheRead / denominator;
+}
+
+export interface CacheUsageMetrics {
+	promptInputTokens: number;
+	cacheReadShare: number | null;
+	cacheWriteShare: number | null;
+	cacheWriteStatusCode: CacheWriteStatusCode;
+}
+
+/**
+ * Compute 1.3 cache metrics from Pi-normalized prompt components. DeepSeek's
+ * Chat Completions adapter cannot expose writes; Responses adapters coalesce
+ * absent and zero writes, so neither is promoted to presence-verified.
+ */
+export function cacheUsageMetrics(
+	provider: string,
+	apiKind: string | null | undefined,
+	usage: Pick<PiUsageLike, "input" | "cacheRead" | "cacheWrite">,
+	status: UsageSemanticStatus,
+): CacheUsageMetrics {
+	const parts = [usage.input, usage.cacheRead, usage.cacheWrite];
+	const validParts = parts.every((part) => safeTelemetryToken(part));
+	const sum = validParts ? usage.input + usage.cacheRead + usage.cacheWrite : 0;
+	const promptInputTokens = Number.isSafeInteger(sum) && sum <= MAX_TELEMETRY_NUMERIC_VALUE ? sum : 0;
+	if (status !== "verified") {
+		return { promptInputTokens, cacheReadShare: null, cacheWriteShare: null, cacheWriteStatusCode: 0 };
+	}
+
+	const normalizedProvider = provider.toLowerCase();
+	let cacheWriteStatusCode: CacheWriteStatusCode = 0;
+	if (apiKind === "openai-completions" && normalizedProvider === "deepseek") {
+		cacheWriteStatusCode = 1;
+	} else if (
+		apiKind === "openai-responses"
+		|| apiKind === "azure-openai-responses"
+		|| apiKind === "openai-codex-responses"
+	) {
+		cacheWriteStatusCode = 2;
+	}
+	if (promptInputTokens <= 0) {
+		return { promptInputTokens, cacheReadShare: null, cacheWriteShare: null, cacheWriteStatusCode };
+	}
+	return {
+		promptInputTokens,
+		cacheReadShare: usage.cacheRead / promptInputTokens,
+		cacheWriteShare: cacheWriteStatusCode === 2 ? usage.cacheWrite / promptInputTokens : null,
+		cacheWriteStatusCode,
+	};
 }
 
 /**

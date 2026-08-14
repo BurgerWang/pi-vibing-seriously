@@ -27,16 +27,22 @@ import { types as nodeTypes } from "node:util";
 
 import {
 	addUsageTotals,
+	cacheUsageMetrics,
 	cacheHitRatioFromTotals,
 	combineUsageSemanticStatus,
 	emptyUsageTotals,
 	EXTENSION_VERSION,
+	isHistoryProjectionFacts,
 	TELEMETRY_SCHEMA_VERSION,
 	verifyUsageSemantics,
 	type PiUsageLike,
+	type ActorRoleCode,
+	type HistoryProjectionFacts,
+	type RequestCorrelationCode,
 	type TelemetryRecord,
 	type UsageSemanticStatus,
 	type UsageTotalsLike,
+	type WireObservationFacts,
 } from "./cache-types.ts";
 import { hashSessionId, sha256Hex } from "./canonical-hash.ts";
 import {
@@ -45,6 +51,7 @@ import {
 	payloadShapeHash,
 	summarizePayload,
 	systemPromptHash,
+	wholeItemLcpFacts,
 	type PayloadSummary,
 	type ToolFingerprint,
 	type ToolInfoLike,
@@ -101,6 +108,14 @@ const EXPLICIT_PROMPT_CACHE_BREAKPOINTS_APPLIED_EVENT = "explicit_prompt_cache_b
 const MAX_CACHE_STATE_ENTRIES = 100_000;
 const MAX_CACHE_STATE_REQUESTS = 1_000_000_000;
 const MAX_CACHE_STATE_NUMERIC_VALUE = 1_000_000_000_000_000;
+const PROJECTION_INPUT_KEYS = [
+	"eventCode", "causeCode", "epoch", "epochTransitioned", "segmentSealed", "byteOverflow", "bundleOverflow",
+	"segmentsBefore", "segmentsAfter", "hardToolTextBytes", "hardBundles", "rawToolTextBytes", "rawBundles",
+	"projectedToolTextBytes", "projectedBundles", "stableToolTextBytesBefore", "stableBundlesBefore",
+	"activeToolTextBytesBefore", "activeBundlesBefore", "agedRawToolTextBytes", "agedRawBundles",
+	"agedProjectedToolTextBytes", "agedProjectedBundles", "suffixRawToolTextBytes", "suffixRawBundles",
+] as const;
+const CONTEXT_OBSERVATION_KEYS = ["actorRoleCode", "historyProjection"] as const;
 
 /** Structural shape of the Pi custom entry (mirrors CustomEntry). */
 export interface CacheStateEntryLike {
@@ -137,6 +152,14 @@ export interface CacheTelemetryDeps {
 	now?: () => number;
 	/** Persist the session state entry (pi.appendEntry). */
 	appendEntry: (customType: string, data: unknown) => void;
+}
+
+export type HistoryProjectionInput = Omit<HistoryProjectionFacts, "contextSerial">;
+
+/** Independent numeric API: callers need not import the projector's core type. */
+export interface ContextProjectionObservation {
+	actorRoleCode: ActorRoleCode;
+	historyProjection?: HistoryProjectionInput | null;
 }
 
 /** Facts assembled by the extension at message_end. */
@@ -202,6 +225,8 @@ export interface CacheTelemetry {
 	 * is added to telemetry records or persisted session state.
 	 */
 	observeHistoryProjectionSegmentSeal(segmentHash: string): void;
+	/** Bind one context construction to the next observed provider request. */
+	observeContextProjection(observation: ContextProjectionObservation): void;
 	observeNewSession(): void;
 	/** READ-ONLY structural peek at the provider payload. Never mutates. */
 	observePayload(payload: unknown): void;
@@ -319,6 +344,67 @@ function boundedCost(value: unknown): value is number {
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= MAX_CACHE_STATE_NUMERIC_VALUE;
 }
 
+function boundedCode(value: unknown, maximum: number): value is number {
+	return boundedSafeInteger(value, maximum);
+}
+
+function parseProjectionInput(value: unknown, contextSerial: number): HistoryProjectionFacts | null | undefined {
+	if (value === undefined || value === null) return null;
+	const record = exactOwnDataRecord(value, PROJECTION_INPUT_KEYS);
+	if (!record) return undefined;
+	const facts = { contextSerial, ...(record.values as unknown as HistoryProjectionInput) };
+	return isHistoryProjectionFacts(facts) ? facts : undefined;
+}
+
+function parseContextProjectionObservation(
+	value: unknown,
+	contextSerial: number,
+): { actorRoleCode: ActorRoleCode; historyProjection: HistoryProjectionFacts | null } | undefined {
+	const record = exactOwnDataRecord(value, CONTEXT_OBSERVATION_KEYS, ["actorRoleCode"]);
+	if (!record || !boundedCode(record.values.actorRoleCode, 2)) return undefined;
+	const historyProjection = parseProjectionInput(record.values.historyProjection, contextSerial);
+	if (historyProjection === undefined) return undefined;
+	return { actorRoleCode: record.values.actorRoleCode as ActorRoleCode, historyProjection };
+}
+
+function apiShapeCode(summary: PayloadSummary | undefined): 0 | 1 | 2 | 3 {
+	if (!summary || summary.apiShape === "unknown") return 0;
+	if (summary.apiShape === "chat-completions") return 1;
+	if (summary.apiShape === "responses") return 2;
+	return 3;
+}
+
+function relationshipCode(relationship: ReturnType<typeof classifyPayloadRelationship>): 0 | 1 | 2 | 3 {
+	if (relationship === "UNCHANGED") return 1;
+	if (relationship === "APPEND_ONLY") return 2;
+	if (relationship === "PREFIX_REWRITTEN") return 3;
+	return 0;
+}
+
+function localWireObservation(
+	requestSerial: number,
+	previous: PayloadSummary | undefined,
+	current: PayloadSummary | undefined,
+): WireObservationFacts {
+	if (!current) {
+		return {
+			requestSerial, finalityCode: 0, digestStatusCode: 0, apiShapeCode: 0, relationshipCode: 0,
+			itemCount: 0, itemLcpCount: 0, itemLcpUtf8Bytes: 0,
+		};
+	}
+	const lcp = wholeItemLcpFacts(previous, current);
+	return {
+		requestSerial,
+		finalityCode: 0,
+		digestStatusCode: current.degraded ? 2 : 1,
+		apiShapeCode: apiShapeCode(current),
+		relationshipCode: relationshipCode(lcp.relationship),
+		itemCount: lcp.itemCount,
+		itemLcpCount: lcp.itemLcpCount,
+		itemLcpUtf8Bytes: lcp.itemLcpUtf8Bytes,
+	};
+}
+
 function cacheStateUsage(value: unknown): UsageTotalsLike | undefined {
 	const record = exactOwnDataRecord(value, CACHE_STATE_USAGE_KEYS);
 	if (!record) return undefined;
@@ -380,7 +466,7 @@ function parseCacheStateData(value: unknown): CacheStateEntryData | undefined {
 		const record = exactOwnDataRecord(value, CACHE_STATE_KEYS, CACHE_STATE_REQUIRED_KEYS);
 		if (!record) return undefined;
 		const schemaVersion = record.values.schemaVersion;
-		if (schemaVersion !== "1.0" && schemaVersion !== "1.1" && schemaVersion !== TELEMETRY_SCHEMA_VERSION) return undefined;
+		if (schemaVersion !== "1.0" && schemaVersion !== "1.1" && schemaVersion !== "1.2" && schemaVersion !== TELEMETRY_SCHEMA_VERSION) return undefined;
 		const sessionHash = record.values.hashedSessionId;
 		if (typeof sessionHash !== "string" || !CACHE_STATE_SESSION_HASH.test(sessionHash)) return undefined;
 		const requestCount = record.values.requestCount;
@@ -415,7 +501,7 @@ function parseCacheStateData(value: unknown): CacheStateEntryData | undefined {
 		const rawReason = record.values.lastInvalidationReason;
 		if (rawReason !== undefined
 			&& (typeof rawReason !== "string" || !CACHE_STATE_INVALIDATION_REASONS.has(rawReason))) return undefined;
-		if (rawReason === "HISTORY_PROJECTION_SEGMENT_SEALED" && schemaVersion !== TELEMETRY_SCHEMA_VERSION) return undefined;
+		if (rawReason === "HISTORY_PROJECTION_SEGMENT_SEALED" && schemaVersion !== "1.2" && schemaVersion !== TELEMETRY_SCHEMA_VERSION) return undefined;
 		const rawTelemetryWriteGapPending = record.values.telemetryWriteGapPending;
 		const telemetryWriteGapPending = rawTelemetryWriteGapPending === undefined
 			? 0
@@ -445,6 +531,13 @@ function parseCacheStateData(value: unknown): CacheStateEntryData | undefined {
 	}
 }
 
+interface BoundRequestObservation {
+	actorRoleCode: ActorRoleCode;
+	requestCorrelationCode: RequestCorrelationCode;
+	historyProjection: HistoryProjectionFacts | null;
+	wireObservation: WireObservationFacts | null;
+}
+
 export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 	const version = deps.extensionVersion ?? EXTENSION_VERSION;
 	const now = deps.now ?? (() => Date.now());
@@ -472,6 +565,13 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 	let state: CacheStateEntryData = freshState();
 	let currentPayloadSummary: PayloadSummary | undefined;
 	let previousPayloadSummary: PayloadSummary | undefined;
+	let contextSerial = 0;
+	let requestSerial = 0;
+	let contextsSinceLastPayload = 0;
+	let correlationApiActive = false;
+	let contextObservationInvalid = false;
+	let latestContextObservation: { actorRoleCode: ActorRoleCode; historyProjection: HistoryProjectionFacts | null } | undefined;
+	let pendingRequestObservation: BoundRequestObservation | undefined;
 	let lastHistoryProjectionEpochHash: string | undefined;
 	let lastHistoryProjectionSegmentHash: string | undefined;
 	let lastCacheRead = 0;
@@ -513,6 +613,30 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 		pendingHistoryProjectionSegmentSeal = false;
 		lastHistoryProjectionEpochHash = undefined;
 		lastHistoryProjectionSegmentHash = undefined;
+		contextSerial = 0;
+		requestSerial = 0;
+		contextsSinceLastPayload = 0;
+		correlationApiActive = false;
+		contextObservationInvalid = false;
+		latestContextObservation = undefined;
+		pendingRequestObservation = undefined;
+	}
+
+	function consumeRequestObservation(): BoundRequestObservation {
+		if (pendingRequestObservation) {
+			const observed = pendingRequestObservation;
+			pendingRequestObservation = undefined;
+			return observed;
+		}
+		if (!correlationApiActive) {
+			return { actorRoleCode: 0, requestCorrelationCode: 0, historyProjection: null, wireObservation: null };
+		}
+		// A message_end without exactly one pending provider observation cannot
+		// be joined to a context. Consume any unmatched context as stale.
+		contextsSinceLastPayload = 0;
+		contextObservationInvalid = false;
+		latestContextObservation = undefined;
+		return { actorRoleCode: 0, requestCorrelationCode: 3, historyProjection: null, wireObservation: null };
 	}
 
 	function resetRestoredState(): void {
@@ -634,6 +758,43 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 			}
 		},
 
+		observeContextProjection(observation: ContextProjectionObservation): void {
+			try {
+				correlationApiActive = true;
+				if (contextSerial >= MAX_CACHE_STATE_REQUESTS) {
+					contextObservationInvalid = true;
+					contextsSinceLastPayload = 2;
+					latestContextObservation = undefined;
+					return;
+				}
+				contextSerial += 1;
+				contextsSinceLastPayload = Math.min(2, contextsSinceLastPayload + 1);
+				const parsed = parseContextProjectionObservation(observation, contextSerial);
+				if (!parsed) {
+					contextObservationInvalid = true;
+					latestContextObservation = undefined;
+				} else {
+					latestContextObservation = parsed;
+				}
+				if (pendingRequestObservation) {
+					pendingRequestObservation = {
+						actorRoleCode: 0,
+						requestCorrelationCode: 2,
+						historyProjection: null,
+						wireObservation: pendingRequestObservation.wireObservation,
+					};
+					contextsSinceLastPayload = 0;
+					contextObservationInvalid = false;
+					latestContextObservation = undefined;
+				}
+			} catch {
+				correlationApiActive = true;
+				contextObservationInvalid = true;
+				contextsSinceLastPayload = 2;
+				latestContextObservation = undefined;
+			}
+		},
+
 		observeNewSession(): void {
 			pendingNewSession = true;
 			lastEvent = "session_start:new";
@@ -645,6 +806,53 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 				currentPayloadSummary = summarizePayload(payload);
 			} catch {
 				currentPayloadSummary = undefined;
+			}
+			try {
+				requestSerial += 1;
+				if (!Number.isSafeInteger(requestSerial) || requestSerial > MAX_CACHE_STATE_REQUESTS) {
+					requestSerial = MAX_CACHE_STATE_REQUESTS;
+					pendingRequestObservation = {
+						actorRoleCode: 0, requestCorrelationCode: 2, historyProjection: null, wireObservation: null,
+					};
+				} else if (pendingRequestObservation) {
+					// Multiple provider observations before one message_end cannot be
+					// attributed to a particular response.
+					pendingRequestObservation = {
+						actorRoleCode: 0, requestCorrelationCode: 2, historyProjection: null, wireObservation: null,
+					};
+				} else {
+					const wireObservation = localWireObservation(requestSerial, previousPayloadSummary, currentPayloadSummary);
+					if (!correlationApiActive) {
+						pendingRequestObservation = {
+							actorRoleCode: 0, requestCorrelationCode: 0, historyProjection: null, wireObservation,
+						};
+					} else if (
+						!contextObservationInvalid
+						&& contextsSinceLastPayload === 1
+						&& latestContextObservation !== undefined
+					) {
+						pendingRequestObservation = {
+							actorRoleCode: latestContextObservation.actorRoleCode,
+							requestCorrelationCode: 1,
+							historyProjection: latestContextObservation.historyProjection,
+							wireObservation,
+						};
+					} else {
+						pendingRequestObservation = {
+							actorRoleCode: 0,
+							requestCorrelationCode: contextsSinceLastPayload > 1 || contextObservationInvalid ? 2 : 3,
+							historyProjection: null,
+							wireObservation,
+						};
+					}
+				}
+				contextsSinceLastPayload = 0;
+				contextObservationInvalid = false;
+				latestContextObservation = undefined;
+			} catch {
+				pendingRequestObservation = {
+					actorRoleCode: 0, requestCorrelationCode: 2, historyProjection: null, wireObservation: null,
+				};
 			}
 			lastEvent = "before_provider_request";
 		},
@@ -687,9 +895,11 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 
 		async observeMessageEnd(facts: MessageEndFacts): Promise<TelemetryRecord | null> {
 			try {
+				const requestObservation = consumeRequestObservation();
 				if (!enabled || store === undefined || facts.usage === undefined) return null;
 
-				const semantics = verifyUsageSemantics(facts.apiKind ?? lastApiKind, facts.usage);
+				const apiKind = facts.apiKind ?? lastApiKind;
+				const semantics = verifyUsageSemantics(apiKind, facts.usage);
 				const fingerprint = fingerprintTools(facts.activeToolNames, facts.tools);
 				const sysHash = systemPromptHash(facts.systemPrompt);
 				const ctxShapeHash = currentPayloadSummary ? payloadShapeHash(currentPayloadSummary) : null;
@@ -734,6 +944,8 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 					: facts.usage.input + facts.usage.output + facts.usage.cacheRead + facts.usage.cacheWrite;
 
 				const carriesTelemetryWriteGap = state.telemetryWriteGapPending === 1;
+				const usageSemanticStatus = carriesTelemetryWriteGap ? "unverified" : semantics.status;
+				const cacheMetrics = cacheUsageMetrics(facts.provider, apiKind, facts.usage, usageSemanticStatus);
 				const record: TelemetryRecord = {
 					schemaVersion: TELEMETRY_SCHEMA_VERSION,
 					timestamp: new Date(now()).toISOString(),
@@ -741,7 +953,7 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 					hashedSessionId,
 					provider: facts.provider,
 					model: facts.model,
-					apiKind: facts.apiKind ?? lastApiKind,
+					apiKind,
 					thinkingLevel: facts.thinkingLevel ?? thinkingLevel ?? null,
 					workbenchMode: mode ?? "unknown",
 					messageStatus,
@@ -753,8 +965,16 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 						totalTokens,
 						cost: facts.usage.cost.total,
 					},
-					usageSemanticStatus: carriesTelemetryWriteGap ? "unverified" : semantics.status,
+					usageSemanticStatus,
 					cacheHitRatio: carriesTelemetryWriteGap ? null : semantics.cacheHitRatio,
+					promptInputTokens: cacheMetrics.promptInputTokens,
+					cacheReadShare: cacheMetrics.cacheReadShare,
+					cacheWriteShare: cacheMetrics.cacheWriteShare,
+					cacheWriteStatusCode: cacheMetrics.cacheWriteStatusCode,
+					actorRoleCode: requestObservation.actorRoleCode,
+					requestCorrelationCode: requestObservation.requestCorrelationCode,
+					historyProjection: requestObservation.historyProjection,
+					wireObservation: requestObservation.wireObservation,
 					systemPromptHash: sysHash,
 					activeToolNamesHash: fingerprint.namesHash,
 					activeToolOrderHash: fingerprint.orderHash,
@@ -777,6 +997,9 @@ export function createCacheTelemetry(deps: CacheTelemetryDeps): CacheTelemetry {
 					record.precedingEvent = TELEMETRY_WRITE_GAP_EVENT;
 					record.usageSemanticStatus = "unverified";
 					record.cacheHitRatio = null;
+					record.cacheReadShare = null;
+					record.cacheWriteShare = null;
+					record.cacheWriteStatusCode = 0;
 				}
 
 				// Advance the session state.

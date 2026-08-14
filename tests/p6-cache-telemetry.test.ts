@@ -25,6 +25,34 @@ import { withTempDir } from "./helpers.ts";
 
 const BASE_TIME = 1_700_000_000_000;
 
+const PROJECTION_ANATOMY = {
+	eventCode: 2 as const,
+	causeCode: 4 as const,
+	epoch: 7,
+	epochTransitioned: 0 as const,
+	segmentSealed: 1 as const,
+	byteOverflow: 1 as const,
+	bundleOverflow: 0 as const,
+	segmentsBefore: 2,
+	segmentsAfter: 3,
+	hardToolTextBytes: 1_000_000,
+	hardBundles: 5_000,
+	rawToolTextBytes: 120_000,
+	rawBundles: 80,
+	projectedToolTextBytes: 90_000,
+	projectedBundles: 70,
+	stableToolTextBytesBefore: 60_000,
+	stableBundlesBefore: 50,
+	activeToolTextBytesBefore: 30_000,
+	activeBundlesBefore: 20,
+	agedRawToolTextBytes: 20_000,
+	agedRawBundles: 10,
+	agedProjectedToolTextBytes: 10_000,
+	agedProjectedBundles: 8,
+	suffixRawToolTextBytes: 100_000,
+	suffixRawBundles: 70,
+};
+
 interface TelemetryHarness {
 	telemetry: CacheTelemetry;
 	entries: CacheStateEntryLike[];
@@ -486,6 +514,49 @@ test("disabled telemetry records nothing", async () => {
 	assert.equal(telemetry.statusSegment(), undefined);
 });
 
+test("usage-less, disabled, and store-less message_end settle request correlation before the next request", async () => {
+	const cases: Array<{
+		label: string;
+		telemetry: CacheTelemetry;
+		earlyFacts: MessageEndFacts;
+		recover: () => void;
+	}> = [];
+
+	const usageLess = makeHarness().telemetry;
+	cases.push({ label: "usage-less", telemetry: usageLess, earlyFacts: baseFacts({ usage: undefined }), recover: () => {} });
+
+	const disabled = makeHarness().telemetry;
+	disabled.setEnabled(false);
+	cases.push({ label: "disabled", telemetry: disabled, earlyFacts: baseFacts(), recover: () => disabled.setEnabled(true) });
+
+	const storeLess = createCacheTelemetry({ now: () => BASE_TIME, appendEntry: () => {} });
+	storeLess.setSessionId("session-file-A");
+	storeLess.setMode("DEV");
+	storeLess.setThinkingLevel("high");
+	cases.push({
+		label: "store-less",
+		telemetry: storeLess,
+		earlyFacts: baseFacts(),
+		recover: () => storeLess.setProjectRoot("/tmp/unused-project-root"),
+	});
+
+	for (const scenario of cases) {
+		scenario.telemetry.observeContextProjection({ actorRoleCode: 1, historyProjection: PROJECTION_ANATOMY });
+		scenario.telemetry.observePayload({ messages: [{ role: "user", content: `dropped-${scenario.label}` }] });
+		assert.equal(await scenario.telemetry.observeMessageEnd(scenario.earlyFacts), null, scenario.label);
+		scenario.recover();
+
+		scenario.telemetry.observeContextProjection({ actorRoleCode: 2, historyProjection: PROJECTION_ANATOMY });
+		scenario.telemetry.observePayload({ messages: [{ role: "user", content: `healthy-${scenario.label}` }] });
+		const healthy = await scenario.telemetry.observeMessageEnd(baseFacts());
+		assert.ok(healthy, scenario.label);
+		assert.equal(healthy.requestCorrelationCode, 1, scenario.label);
+		assert.equal(healthy.actorRoleCode, 2, scenario.label);
+		assert.equal(healthy.historyProjection?.contextSerial, 2, scenario.label);
+		assert.equal(healthy.wireObservation?.requestSerial, 2, scenario.label);
+	}
+});
+
 test("session state entry is lightweight and restored on session_start", async () => {
 	const { telemetry, entries } = makeHarness();
 	await telemetry.observeMessageEnd(baseFacts());
@@ -506,7 +577,7 @@ test("session state entry is lightweight and restored on session_start", async (
 		telemetryWriteGapPending: number;
 	};
 	assert.ok(data);
-	assert.equal(data.schemaVersion, "1.2");
+	assert.equal(data.schemaVersion, "1.3");
 	assert.equal(data.requestCount, 2);
 	assert.equal(data.usage.input, 20000);
 	assert.equal(data.usage.cost, 0.002);
@@ -559,9 +630,9 @@ test("legacy restored aggregates without semantic provenance never fabricate a c
 	assert.equal(restored.statusSegment(), "CACHE last=80% cum=N/A | read 80k | miss 20k");
 });
 
-test("strict cache-state restoration accepts schema 1.1 and current 1.2 only with the known shape", async () => {
+test("strict cache-state restoration accepts schema 1.1 through current 1.3 only with the known shape", async () => {
 	const current = await validCacheStateData();
-	for (const schemaVersion of ["1.1", "1.2"] as const) {
+	for (const schemaVersion of ["1.1", "1.2", "1.3"] as const) {
 		const restored = makeRestoreTarget();
 		restored.restoreFromEntries([cacheStateEntry({ ...current, schemaVersion })]);
 		assert.equal(restored.snapshot().requestCount, 1, schemaVersion);
@@ -569,7 +640,7 @@ test("strict cache-state restoration accepts schema 1.1 and current 1.2 only wit
 	}
 
 	for (const data of [
-		{ ...current, schemaVersion: "1.3" },
+		{ ...current, schemaVersion: "1.4" },
 		{ ...current, schemaVersion: "1.1", projectionSegmentHash: "secret" },
 		{ ...current, schemaVersion: "1.1", lastInvalidationReason: "HISTORY_PROJECTION_SEGMENT_SEALED" },
 	]) {
@@ -941,6 +1012,14 @@ test("hash-only record: full telemetry schema is present and minimal", async () 
 		"usage",
 		"usageSemanticStatus",
 		"cacheHitRatio",
+		"promptInputTokens",
+		"cacheReadShare",
+		"cacheWriteShare",
+		"cacheWriteStatusCode",
+		"actorRoleCode",
+		"requestCorrelationCode",
+		"historyProjection",
+		"wireObservation",
 		"systemPromptHash",
 		"activeToolNamesHash",
 		"activeToolOrderHash",
@@ -953,20 +1032,113 @@ test("hash-only record: full telemetry schema is present and minimal", async () 
 	];
 	assert.deepEqual(Object.keys(record).sort(), expectedKeys.sort());
 	assert.deepEqual(Object.keys(record.usage).sort(), ["cacheRead", "cacheWrite", "cost", "input", "output", "totalTokens"].sort());
-	assert.equal(record.schemaVersion, "1.2");
+	assert.equal(record.schemaVersion, "1.3");
+	assert.equal(record.promptInputTokens, 50_000);
+	assert.equal(record.cacheReadShare, 0.8);
+	assert.equal(record.cacheWriteShare, null);
+	assert.equal(record.cacheWriteStatusCode, 1);
+	assert.equal(record.actorRoleCode, 0);
+	assert.equal(record.requestCorrelationCode, 0);
+	assert.equal(record.historyProjection, null);
+	assert.equal(record.wireObservation, null);
 	assert.equal(Object.hasOwn(record, "historyProjectionSegmentHash"), false);
 	assert.equal(Object.hasOwn(record, "historyProjectionMarker"), false);
 });
 
-test("strict telemetry reader accepts exact schema 1.0, 1.1, and 1.2 records", async () => {
+test("telemetry 1.3 correlates one context, one local provider observation, and one message_end", async () => {
+	const { telemetry } = makeHarness();
+	telemetry.observeContextProjection({ actorRoleCode: 1, historyProjection: PROJECTION_ANATOMY });
+	telemetry.observePayload({ messages: [{ role: "user", content: "A🙂" }] });
+	const first = await telemetry.observeMessageEnd(baseFacts());
+	assert.ok(first);
+	assert.equal(first.requestCorrelationCode, 1);
+	assert.equal(first.actorRoleCode, 1);
+	assert.equal(first.historyProjection?.contextSerial, 1);
+	assert.equal(first.wireObservation?.requestSerial, 1);
+	assert.equal(first.wireObservation?.finalityCode, 0, "this hook is local observation, never claimed as final actual wire");
+	assert.equal(first.wireObservation?.itemLcpCount, 0);
+
+	telemetry.observeContextProjection({
+		actorRoleCode: 2,
+		historyProjection: {
+			...PROJECTION_ANATOMY,
+			eventCode: 0,
+			causeCode: 0,
+			epochTransitioned: 0,
+			segmentSealed: 0,
+			byteOverflow: 0,
+			bundleOverflow: 0,
+			segmentsAfter: PROJECTION_ANATOMY.segmentsBefore,
+		},
+	});
+	telemetry.observePayload({ messages: [{ role: "user", content: "A🙂" }, { role: "assistant", content: "next" }] });
+	const second = await telemetry.observeMessageEnd(baseFacts({ provider: "openai-codex", apiKind: "openai-codex-responses" }));
+	assert.ok(second);
+	assert.equal(second.requestCorrelationCode, 1);
+	assert.equal(second.actorRoleCode, 2);
+	assert.equal(second.historyProjection?.contextSerial, 2);
+	assert.equal(second.wireObservation?.requestSerial, 2);
+	assert.equal(second.wireObservation?.relationshipCode, 2);
+	assert.equal(second.wireObservation?.itemLcpCount, 1);
+	assert.equal(second.wireObservation?.itemLcpUtf8Bytes, 9);
+	assert.equal(isTelemetryRecord(second), true);
+});
+
+test("telemetry 1.3 correlation fails closed for multiple, stale, and missing request events", async () => {
+	const { telemetry } = makeHarness();
+	telemetry.observeContextProjection({ actorRoleCode: 1, historyProjection: PROJECTION_ANATOMY });
+	telemetry.observeContextProjection({ actorRoleCode: 1, historyProjection: PROJECTION_ANATOMY });
+	telemetry.observePayload({ messages: [] });
+	const multiple = await telemetry.observeMessageEnd(baseFacts());
+	assert.ok(multiple);
+	assert.equal(multiple.requestCorrelationCode, 2);
+	assert.equal(multiple.historyProjection, null);
+
+	telemetry.observeContextProjection({ actorRoleCode: 2, historyProjection: PROJECTION_ANATOMY });
+	const missing = await telemetry.observeMessageEnd(baseFacts());
+	assert.ok(missing);
+	assert.equal(missing.requestCorrelationCode, 3);
+	assert.equal(missing.historyProjection, null);
+	assert.equal(missing.wireObservation, null);
+});
+
+test("telemetry writer rejects semantically impossible projection anatomy before request correlation", async () => {
+	const { telemetry } = makeHarness();
+	telemetry.observeContextProjection({
+		actorRoleCode: 1,
+		historyProjection: { ...PROJECTION_ANATOMY, eventCode: 2, causeCode: 3 },
+	});
+	telemetry.observePayload({ messages: [] });
+	const record = await telemetry.observeMessageEnd(baseFacts());
+	assert.ok(record);
+	assert.equal(record.requestCorrelationCode, 2);
+	assert.equal(record.actorRoleCode, 0);
+	assert.equal(record.historyProjection, null);
+	assert.equal(isTelemetryRecord(record), true, "the fail-closed writer still emits a strict record");
+});
+
+test("strict telemetry reader accepts exact 1.0-1.3 shapes and rejects hostile 1.3 nested facts", async () => {
 	const { telemetry } = makeHarness();
 	const current = await telemetry.observeMessageEnd(baseFacts());
 	assert.ok(current);
 	assert.equal(isTelemetryRecord(current), true);
 
-	const v1_1 = { ...current, schemaVersion: "1.1" };
+	const {
+		actorRoleCode: _actorRoleCode,
+		requestCorrelationCode: _requestCorrelationCode,
+		historyProjection: _historyProjection,
+		wireObservation: _wireObservation,
+		promptInputTokens: _promptInputTokens,
+		cacheReadShare: _cacheReadShare,
+		cacheWriteShare: _cacheWriteShare,
+		cacheWriteStatusCode: _cacheWriteStatusCode,
+		...preV1_3
+	} = current;
+	const v1_2 = { ...preV1_3, schemaVersion: "1.2" };
+	assert.equal(isTelemetryRecord(v1_2), true);
+	const v1_1 = { ...preV1_3, schemaVersion: "1.1" };
 	assert.equal(isTelemetryRecord(v1_1), true);
-	const { driftSource: _legacyDriftSource, ...withoutDriftSource } = current;
+	const { driftSource: _legacyDriftSource, ...withoutDriftSource } = preV1_3;
 	const v1_0 = { ...withoutDriftSource, schemaVersion: "1.0" };
 	assert.equal(isTelemetryRecord(v1_0), true);
 	const segmentSealed = {
@@ -975,15 +1147,26 @@ test("strict telemetry reader accepts exact schema 1.0, 1.1, and 1.2 records", a
 		inferenceConfidence: "high",
 	};
 	assert.equal(isTelemetryRecord(segmentSealed), true);
-	assert.equal(isTelemetryRecord({ ...segmentSealed, schemaVersion: "1.1" }), false);
-	const { driftSource: _segmentLegacyDrift, ...segmentLegacy } = segmentSealed;
+	assert.equal(isTelemetryRecord({ ...v1_2, inferredInvalidationReason: "HISTORY_PROJECTION_SEGMENT_SEALED" }), true);
+	assert.equal(isTelemetryRecord({ ...v1_1, inferredInvalidationReason: "HISTORY_PROJECTION_SEGMENT_SEALED" }), false);
+	const {
+		driftSource: _segmentLegacyDrift,
+		...segmentLegacy
+	} = { ...v1_1, inferredInvalidationReason: "HISTORY_PROJECTION_SEGMENT_SEALED" };
 	assert.equal(isTelemetryRecord({ ...segmentLegacy, schemaVersion: "1.0" }), false);
 
-	assert.equal(isTelemetryRecord({ ...current, schemaVersion: "1.3" }), false);
+	assert.equal(isTelemetryRecord({ ...current, schemaVersion: "1.4" }), false);
 	assert.equal(isTelemetryRecord({ ...v1_0, driftSource: null }), false, "1.0 keeps its exact legacy key set");
 	const { driftSource: _removed, ...missingCurrentField } = v1_1;
 	assert.equal(isTelemetryRecord(missingCurrentField), false, "1.1 requires the driftSource field");
 	assert.equal(isTelemetryRecord({ ...current, historyProjectionSegmentHash: "secret" }), false, "1.2 rejects marker/hash expansion");
+	assert.equal(isTelemetryRecord({ ...current, wireObservation: { requestSerial: 1, finalityCode: 1 } }), false);
+	const hostileProjection = Object.create(null) as Record<string, unknown>;
+	Object.assign(hostileProjection, { ...PROJECTION_ANATOMY, contextSerial: 1, extra: 1 });
+	assert.equal(isTelemetryRecord({ ...current, requestCorrelationCode: 1, historyProjection: hostileProjection }), false);
+	const accessor = { ...current } as Record<string, unknown>;
+	Object.defineProperty(accessor, "promptInputTokens", { enumerable: true, get: () => 50_000 });
+	assert.equal(isTelemetryRecord(accessor), false);
 });
 
 test("precedingEvent tracks the last observed Pi event", async () => {
