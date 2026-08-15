@@ -6,6 +6,7 @@ import {
 	COMMANDER_HISTORY_MAX_BYTES,
 	COMMANDER_TURN_MAX_BYTES,
 	HISTORY_MAX_TOOL_BUNDLES,
+	OTHER_HISTORY_MAX_BYTES,
 	WORKER_HISTORY_MAX_BYTES,
 	WORKER_TURN_MAX_BYTES,
 } from "./output-policy.ts";
@@ -17,7 +18,7 @@ export type HistoryProjectionRole = "commander" | "worker" | "other";
 
 export const COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES = COMMANDER_HISTORY_MAX_BYTES;
 export const WORKER_HISTORY_TOOL_TEXT_MAX_BYTES = WORKER_HISTORY_MAX_BYTES;
-export const OTHER_HISTORY_TOOL_TEXT_MAX_BYTES = WORKER_HISTORY_MAX_BYTES;
+export const OTHER_HISTORY_TOOL_TEXT_MAX_BYTES = OTHER_HISTORY_MAX_BYTES;
 export const HISTORY_MAX_BUNDLES = HISTORY_MAX_TOOL_BUNDLES;
 export const HISTORY_DESCRIPTOR_MAX_BYTES = 384;
 export const HISTORY_PROJECTION_MAX_SEGMENTS = 16;
@@ -767,7 +768,11 @@ export function safeHistoryProjectionFailureMessages(): AgentMessage[] {
 }
 
 function roleCeiling(role: ProjectContextHistoryInput["role"]): number {
-	return role === "commander" ? COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES : WORKER_HISTORY_TOOL_TEXT_MAX_BYTES;
+	return role === "commander"
+		? COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES
+		: role === "worker"
+			? WORKER_HISTORY_TOOL_TEXT_MAX_BYTES
+			: OTHER_HISTORY_TOOL_TEXT_MAX_BYTES;
 }
 
 function effectiveByteCap(input: ProjectContextHistoryInput): number {

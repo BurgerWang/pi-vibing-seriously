@@ -387,7 +387,7 @@ test("worker runtime persists strict v3 segments through sixteen seals, checkpoi
 
 	// The 48 KiB turn reserve is a suffix-selection budget, not a second hard
 	// cap. This append grows the active tail from 41 KiB to 49 KiB while the
-	// complete projected history remains below the real 64 KiB worker limit.
+	// complete projected history remains below the real 128 KiB worker limit.
 	raw.push(...aggregateBundle("reserve-only-8k", [8 * 1_024]));
 	const reserveOnly = await emitContext(stub, raw, ctx);
 	await emitRuntimeEvent(stub, "turn_end", { type: "turn_end", turnIndex: 3, message: {}, toolResults: [] }, ctx);

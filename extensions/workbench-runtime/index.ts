@@ -125,7 +125,7 @@
  *     ctx.ui.setStatus flow — the Pi footer is never replaced
  *   - status refresh after assistant/tool-result message_end; the pending
  *     message is included exactly once so COST/CACHE update immediately
- *     despite Pi 0.83 persisting messages after extension handlers
+ *     despite Pi 0.84.2 persisting messages after extension handlers
  *   - /q-cost-status prints exact commander/worker/other/total and the
  *     per-model commander breakdown from ctx.sessionManager.getEntries()
  *     in TUI and print/json modes
@@ -706,6 +706,7 @@ import {
 	shouldSupplement,
 	type CompactState,
 } from "./core/compact.ts";
+import { evaluateCompactSummaryPreflight } from "./core/compact-preflight.ts";
 import {
 	renderCompareLines,
 	renderGatePreflightLines,
@@ -1032,7 +1033,7 @@ function wrapStreamingToolDefinition<TParams extends TSchema, TDetails, TState>(
 }
 
 /**
- * Pi 0.83 does not let an extension replace a tool_execution_update event, but
+ * Pi 0.84.2 does not let an extension replace a tool_execution_update event, but
  * AgentSession currently passes the same mutable AgentToolResult object to
  * extension handlers before notifying downstream subscribers. Replace its two
  * presentation fields in place as defense in depth for exact trusted built-ins.
@@ -1072,7 +1073,7 @@ function boundGlobalStreamingUpdate(event: unknown): void {
 		});
 	} catch {
 		// A non-conforming foreign object cannot be safely rewritten through
-		// Pi 0.83's observation-only event API. Never invoke accessors as a
+		// Pi 0.84.2's observation-only event API. Never invoke accessors as a
 		// fallback and never claim it is inside the supported global scope.
 	}
 }
@@ -2497,19 +2498,34 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 
 	// ----------------------------------------------------- P5 compaction
 
-	// Never cancels Pi compaction and never replaces its summary — the note
-	// only supplements the compacted context with authoritative workbench
-	// facts (task, mode, gates, runs, evidence paths, next step, do-not-retry
-	// notes). The state entry persists across compaction and session
-	// replacement; the hidden custom message (display: false, nextTurn) makes
-	// the facts visible to the model without putting any log content into the
-	// session context.
-	pi.on("session_before_compact", (_event, _ctx) => {
+	// Workers always cancel before reading preparation. Commander compaction
+	// keeps Pi's native summarizer unless a content-free capacity preflight
+	// conservatively estimates one of its provider request envelopes at or
+	// above the model window. This is an engineering guard, not a tokenizer proof.
+	// The workbench never replaces Pi's summary.
+	pi.on("session_before_compact", (event, ctx) => {
 		// Worker role only: a delegated worker must never silently continue
 		// through lossy compaction — cancel it and let the runner's pinned
-		// budget policy decide the outcome. Commander compaction behavior is
-		// unchanged (supplement, never cancel).
+		// budget policy decide the outcome. This check must remain before any
+		// access to event.preparation.
 		if (workerRoleContext.role === "worker") return { cancel: true };
+
+		const preflight = evaluateCompactSummaryPreflight({
+			preparation: event.preparation,
+			model: ctx.model,
+			customInstructions: event.customInstructions,
+		});
+		if (preflight.verdict === "block") {
+			const notice = `Commander compaction blocked by summary-capacity preflight: summary request envelope ${preflight.worstRequestEnvelopeTokens}/${preflight.contextWindowTokens} tokens. No summary provider call was made. Use /q-milestone-handoff <next step>.`;
+			if (ctx.hasUI) ctx.ui.notify(notice, "warning");
+			else console.warn(notice);
+			return { cancel: true };
+		}
+		if (preflight.verdict === "warn") {
+			const notice = `Commander compaction preflight warning: summary request envelope ${preflight.worstRequestEnvelopeTokens}/${preflight.contextWindowTokens} tokens; native Pi compaction will continue.`;
+			if (ctx.hasUI) ctx.ui.notify(notice, "warning");
+			else console.warn(notice);
+		}
 		cacheTelemetry.observeCompaction();
 		if (!shouldSupplement(compactState)) return undefined;
 		const note = buildCompactNote(compactState);
@@ -2686,7 +2702,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		cacheTelemetry.observeThinkingChange(event.level);
 	});
 
-	// Pi 0.83 calls `context` before constructing every provider request. It
+	// Pi 0.84.2 calls `context` before constructing every provider request. It
 	// structured-clones the active messages first, so this replacement affects
 	// only the outgoing copy and can never rewrite session entries. The handler
 	// catches its own failures because Pi otherwise swallows an extension error
@@ -3021,7 +3037,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				}
 			}
 		}
-		// Pi 0.83 persists message_end after extension handlers. Include this
+		// Pi 0.84.2 persists message_end after extension handlers. Include this
 		// pending assistant/tool-result message exactly once so COST is current
 		// immediately; buildCostBreakdown deduplicates if persistence ordering
 		// changes in a future compatible Pi version.

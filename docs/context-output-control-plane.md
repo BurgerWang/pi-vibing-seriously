@@ -4,8 +4,8 @@ Version 0.10.0 makes model-visible tool output a bounded control-plane
 resource. Full domain evidence stays in project artifacts; returned text and
 session details are bounded presentations and are never acceptance evidence.
 
-The P0–P2 refinements below are Unreleased working-tree behavior. Their
-presence here does not claim a commit, installation, or deployment.
+The P0–P2 refinements below are Unreleased source behavior. No deployment,
+tag, package publication, `/reload`, or live qualification is claimed.
 
 ## Fixed limits
 
@@ -18,7 +18,7 @@ presence here does not claim a commit, installation, or deployment.
 | Project inspect / gate list / recipe result | 16 KiB defense-in-depth |
 | One new-session details value | 8 KiB |
 | Commander / worker tool-result batch | 64 KiB / 48 KiB |
-| Commander / worker active tool-result history | 96 KiB / 64 KiB |
+| Commander / worker / other active tool-result history | 192 / 128 / 64 KiB |
 | Active-history bundle count (all roles) | 128 complete bundles |
 
 The final result envelope applies after tool execution and before receipt
@@ -96,12 +96,13 @@ anchorByteCap = max(0, hardToolTextBytes - roleTurnBytes - 16 * 384)
 anchorBundleCap = max(0, 128 - 16 segments - 16 active bundles) = 96
 ```
 
-Commander uses a 98,304-byte hard ceiling and 65,536-byte turn reserve, so its
-anchor cap is 26,624 bytes. Worker/other uses 65,536 and 49,152 bytes, so its
-anchor cap is 10,240 bytes. At the initial checkpoint the controller chooses
-the largest latest raw suffix that fits the role turn and 16 bundles at a
-complete-bundle boundary, projects the preceding history into the anchor, and
-leaves that suffix raw.
+Commander uses a 196,608-byte hard ceiling and 65,536-byte turn reserve, so its
+anchor cap is 124,928 bytes (122 KiB). Worker uses 131,072 and 49,152 bytes,
+so its anchor cap is 75,776 bytes (74 KiB). Other remains at 65,536 and 49,152
+bytes, so its anchor cap is 10,240 bytes (10 KiB). At the initial checkpoint,
+the controller chooses the largest latest raw suffix that fits the role turn
+and 16 bundles at a complete-bundle boundary, projects the preceding history
+into the anchor, and leaves that suffix raw.
 
 Every later request in the same state reconstructs the exact provider-visible
 anchor, its ordered immutable segments, and the raw active suffix. The
@@ -135,6 +136,14 @@ topology and hashes are never reused. If current history is under the cap, the
 first post-restore request remains raw but emits one `legacy_migration`
 boundary, then persists inactive v3 so a reload cannot repeat it. Branch
 changes and completed compaction reset the boundary.
+
+The cap expansion does not bump projection state v3 or telemetry schema 1.3.
+A valid restored v3 record created under the former Commander/worker cap is
+accepted, emits one deterministic `policy_changed` transition, and then
+replays under the new role policy without repeating that transition. If the
+raw history now fits the expanded cap it returns to an inactive/raw boundary;
+if it still exceeds the cap the existing deterministic checkpoint path
+rebuilds bounded state.
 
 An inactive v3 state also carries a fixed non-secret failure sentinel in its
 existing `epochHash`; the unkeyed `stateHash` integrity coverage includes that
@@ -220,7 +229,7 @@ companion diagnostics. Its custom type and `schema` are both
 `workbench-context-pressure-v1`, and its data has exactly these nine fields:
 `schema`, `role`, `epoch`, `rawToolTextBytes`, `projectedToolTextBytes`,
 `rawBundleCount`, `hardHistoryBytes`, `hardBundleCount`, and `timestampMs`.
-It contains no message text. Pi 0.83 `getContextUsage()` already estimates the
+It contains no message text. Pi 0.84.2 `getContextUsage()` still estimates the
 raw session messages before provider-view projection, so this entry is only an
 epoch/churn and raw-versus-projected diagnostic. A companion must not convert
 `rawToolTextBytes - projectedToolTextBytes` into supplemental tokens or add it
@@ -258,15 +267,44 @@ model-visible surface. Its MLA-serving behavior, scheduler, and disk-KV/block
 ownership are not transferable to this Pi extension and none of its measured
 numbers is a workbench benchmark promise.
 
-Warm-prefix auxiliary compaction is
-`BLOCKED_BY_PI_0_83_PUBLIC_API`. Pi 0.83's public
-[`session_before_compact` surface](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/compaction.md)
-allows cancellation or replacement of the compaction result, but no
-post-summary payload transform and no same-cache-domain guarantee are exposed.
+### Native compact-summary capacity preflight
+
+Commander manual, threshold, and overflow compaction share one preflight over
+the actual Pi 0.84.2 preparation. It derives a conservative engineering
+estimate from Pi's public serialized `messagesToSummarize` and optional
+`turnPrefixMessages`, includes the previous summary and custom instructions
+where Pi includes them, and evaluates the history and split-turn provider
+requests independently. The result is content-free numeric/enum data only,
+not a formal tokenizer/context-fit proof.
+
+`allow` continues silently. `warn` means the conservative request envelope is
+at least 90% of the model window and continues with a bounded warning.
+`block` means the conservative estimate is at or above the model window: the
+hook cancels before the summary provider call and directs the operator to
+`/q-milestone-handoff <next step>`. A blocked event records neither compaction
+telemetry nor a workbench compact supplement. `unknown` (missing model facts,
+malformed preparation, or estimation failure) preserves the previous native
+path. Workers return `{ cancel: true }` before reading preparation and remain
+under their independent 80%/90% budget policy.
+
+This guard does not generate or replace summaries. Allowed and warned
+Commander events still use Pi's native summarizer and normal workbench
+supplement path.
+
+Warm-prefix auxiliary compaction remains
+`BLOCKED_BY_PI_0_84_2_PUBLIC_API`. The public surface was rechecked against
+[Pi v0.84.2](https://github.com/earendil-works/pi/releases/tag/v0.84.2) at
+[commit `914cf1472e715297caa30db4b9535d534a9eb718`](https://github.com/earendil-works/pi/commit/914cf1472e715297caa30db4b9535d534a9eb718).
+Its pinned public
+[`session_before_compact` types](https://github.com/earendil-works/pi/blob/914cf1472e715297caa30db4b9535d534a9eb718/packages/coding-agent/src/core/extensions/types.ts)
+allow cancellation or replacement of the compaction result, but its pinned
+[compaction implementation](https://github.com/earendil-works/pi/blob/914cf1472e715297caa30db4b9535d534a9eb718/packages/coding-agent/src/core/compaction/compaction.ts)
+exposes no post-summary payload transform or same-cache-domain guarantee and
+makes summary calls standalone with `cacheRetention: "none"` plus a fresh
+`sessionId`.
 Implementing a separate summarizer would require duplicating private
 authentication, headers, streaming, retry, and provider-call behavior, which
-this workbench deliberately does not do. Built-in/native Pi compaction remains
-unchanged.
+this workbench deliberately does not do.
 
 Pi clones legacy entries before a runtime context hook can shrink their clone
 peak. Create a separate safe session copy first:
@@ -301,8 +339,11 @@ run `ctx1`; do not use an earlier standalone `ctx1` run as prerequisite
 evidence. The benchmark summary is observational, not acceptance evidence.
 Offline projection tests, stress evidence, and cache reports can prove the
 structural contract but cannot guarantee a provider-issued `cacheRead`. After
-deploying the runtime, use a new session and observe subsequent live requests;
-only verified provider usage can establish whether cache reuse recovered.
+verifying the Pi 0.84.2 repository dependencies (the current tree resolves
+them) and passing the declared gates, deploy with `/reload`, use a new session,
+and observe subsequent live Commander and worker requests. Only verified
+provider usage can establish whether cache reuse recovered; the larger caps do
+not promise an improvement.
 The stable-prefix transition and canonical old/new hashes are recorded in
 [the stable-prefix contract](cache/stable-prefix-contract.md).
 

@@ -6,8 +6,8 @@ infers why the cache missed. The telemetry component does not change requests,
 control the cache, or cache anything itself; the independently gated provider
 hook runs before the local telemetry digest described below.
 
-Schema 1.3 is Unreleased working-tree behavior. This documentation does not
-claim that it has been committed, installed, deployed, or measured live.
+Schema 1.3 is Unreleased source behavior. No deployment, tag, package
+publication, `/reload`, or live measurement is claimed.
 
 ## Scope and non-goals
 
@@ -30,15 +30,16 @@ claim that it has been committed, installed, deployed, or measured live.
 | `context` | record exact content-free projection anatomy and runtime actor code for correlation with the next request |
 | `before_provider_request` | capability-gated copy-on-write breakpoint transform, then a structural digest of that **local hook payload**; `finalityCode=0` means it is not the final actual provider wire; headers remain unchanged |
 | `message_end` | **assistant messages only**: correlate exactly one context + one local payload + one completion, read normalized usage, hash system prompt + tools + payload shape, classify the invalidation, append one JSONL record |
-| `session_before_compact` | the next request is inferred `COMPACTION` |
+| `session_before_compact` | allowed/warned Commander events mark the next request `COMPACTION`; a capacity-blocked event returns before telemetry/supplement, and workers always cancel before reading preparation |
 | `session_tree` | after Pi completes tree navigation, the next request is inferred `SESSION_TREE_CHANGED` exactly once |
 | `session_shutdown` | safe flush of the session state entry |
 
 The context-output projector reports v3 epoch/checkpoint and segment-seal
 signals separately. Commander uses a 65,536-byte raw-turn reserve inside its
-98,304-byte hard ceiling; worker/other uses 49,152 inside 65,536. After also
-reserving sixteen 384-byte/one-bundle segments, their anchor caps are
-26,624/10,240 bytes and 96 bundles. The turn and 16-bundle values select the
+196,608-byte hard ceiling; worker uses 49,152 inside 131,072, while other uses
+49,152 inside 65,536. After also reserving sixteen 384-byte/one-bundle
+segments, their anchor caps are 124,928/75,776/10,240 bytes
+(122/74/10 KiB) and 96 bundles. The turn and 16-bundle values select the
 protected suffix only after a true hard byte/bundle crossing; crossing a
 reserve alone leaves under-cap history byte-identical and emits no event.
 
@@ -50,6 +51,16 @@ safe boundary markers unchanged; telemetry treats `segmentSealed` /
 checkpoint only on the next true hard crossing; it rebuilds the anchor, clears
 the chain, and increments the epoch without a model call. Replaying the same
 topology with an appended raw suffix creates neither event.
+
+Projection state remains v3 and telemetry remains schema 1.3. Restoring a
+valid v3 state created under a former role cap emits one `policy_changed`
+transition and then stabilizes under the new cap; it does not rewrite the
+telemetry wire. The increased caps are a structural experiment, not measured
+provider cache improvement. Their current size qualification is limited to the
+272k Commander model and pinned 1M worker; `other` and arbitrary 64k/128k
+model windows are unqualified. The current tree resolves the repository Pi
+0.84.2 dependencies; pass declared gates, `/reload`, and collect fresh
+exact-correlated Commander and worker rows before evaluating the canary.
 
 The companion pressure signal is unchanged by projection-state v3. Its custom
 type and `data.schema` are `workbench-context-pressure-v1`, and its data object
@@ -388,10 +399,16 @@ ownership are non-transferable, and its measurements are not telemetry
 targets or benchmark promises.
 
 Warm-prefix auxiliary compaction is
-`BLOCKED_BY_PI_0_83_PUBLIC_API`: Pi 0.83 exposes no post-summary payload
-transform or same-cache-domain guarantee. The workbench does not duplicate
-private auth/header/stream/retry behavior; built-in/native compaction remains
-unchanged.
+`BLOCKED_BY_PI_0_84_2_PUBLIC_API`. The official
+[Pi v0.84.2 release](https://github.com/earendil-works/pi/releases/tag/v0.84.2)
+at [commit `914cf1472e715297caa30db4b9535d534a9eb718`](https://github.com/earendil-works/pi/commit/914cf1472e715297caa30db4b9535d534a9eb718)
+still exposes no post-summary payload transform or same-cache-domain guarantee.
+The workbench does not duplicate private auth/header/stream/retry behavior.
+Its Commander capacity preflight only blocks when the conservative summary
+envelope estimate is at or above model capacity and then records no compaction
+telemetry/supplement; the estimate is not a formal tokenizer-fit proof.
+Allow/warn/unknown retain native Pi compaction, and workers still cancel
+immediately.
 
 ## Session state entry
 

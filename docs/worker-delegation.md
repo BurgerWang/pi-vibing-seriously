@@ -467,12 +467,13 @@ fails safe (0/false), and the workbench never reimplements Pi compaction.
 
 ## Worker context-budget protection
 
-The P0–P2 cache/history refinements in this section are Unreleased working-tree
-behavior, not a claim that the runtime has been committed or deployed.
+The P0–P2 cache/history refinements in this section are Unreleased source
+behavior. No deployment, tag, package publication, `/reload`, or live
+qualification is claimed.
 
 Before each worker provider request, the v0.10.0 output control plane also
 validates assistant/tool-result pairing and projects complete historical
-bundles to the 64 KiB worker active-history budget. A single worker tool batch
+bundles to the 128 KiB worker active-history budget. A single worker tool batch
 is reserved against a separate 48 KiB result budget before execution. The
 numeric-only progress/status facts report shown/omitted bytes, truncations,
 blocked calls and history collapse; raw worker/tool text is never telemetry.
@@ -480,17 +481,18 @@ These controls are independent of the per-message context and cumulative
 spend limits below.
 
 History projection is segmented and epoch-based. A worker stays raw until it
-crosses the unchanged 65,536-byte or 128-bundle hard limit. Projection-state v3
+crosses the 131,072-byte or 128-bundle hard limit. Projection-state v3
 reserves its full 49,152-byte raw turn plus sixteen 384-byte/one-bundle segment
 slots, leaving a fixed anchor cap of
-`max(0, 65,536 - 49,152 - 16 * 384) = 10,240` bytes and 96 bundles. The active
-suffix target is 16 bundles when a hard-limit projection is actually required.
+`max(0, 131,072 - 49,152 - 16 * 384) = 75,776` bytes (74 KiB) and 96
+bundles. The active suffix target is 16 bundles when a hard-limit projection
+is actually required.
 
 At the initial checkpoint the worker keeps the largest latest raw suffix that
 fits those turn limits and projects only the older prefix into the anchor.
 Normal requests replay the exact anchor, immutable ordered segments, and raw
 active suffix. Crossing the 49,152-byte or 16-bundle reserve alone does not
-seal: while the complete reconstruction remains at or below 65,536 bytes and
+seal: while the complete reconstruction remains at or below 131,072 bytes and
 128 bundles, the worker request stays byte-identical and emits no projection
 event. Only a true hard crossing selects the protected suffix and lets seals
 1–16 project aged material into one new segment (at most 384 tool-text bytes
@@ -510,6 +512,19 @@ it. A fixed non-secret failure sentinel also survives JSONL restore: repeated
 failure is de-duplicated and the first healthy request emits one recovery
 boundary.
 
+The cap change does not bump v3 or telemetry schema 1.3. A valid restored
+worker v3 state created under the former 65,536-byte policy is accepted and
+produces one deterministic `policy_changed` transition; subsequent replay uses
+the 131,072-byte policy without repeating the transition. A raw history that
+fits the expanded cap becomes inactive/raw, while a still-oversized history
+uses the existing deterministic checkpoint path.
+
+The 128 KiB cap is qualified only against the pinned worker's 1,000,000-token
+window, not arbitrary 64k/128k models. It is Unreleased source behavior until
+the Pi 0.84.2 dependency tree is verified (the current tree resolves it), the
+declared gates pass, and `/reload` activates it. Only a fresh exact-correlated
+live worker cohort can establish a cache-read change.
+
 The newest recognized malformed or structurally unsafe entry is authoritative;
 a Proxy/revoked Proxy or `customType`/`data` accessor fails closed without
 executing traps rather than falling back to older valid state. Worker history
@@ -525,7 +540,7 @@ exactly nine numeric/fixed fields (`schema`, `role`, `epoch`, raw/projected
 tool-text bytes, raw bundle count, both hard limits, and `timestampMs`). The
 separate Commander auto-compaction companion accepts only strict Commander
 entries as epoch/churn and raw-versus-projected diagnostics. Its automatic
-trigger percentage comes solely from Pi 0.83 `getContextUsage()`, which already
+trigger percentage comes solely from Pi 0.84.2 `getContextUsage()`, which already
 measures raw session messages; it never adds a raw-minus-projected token delta.
 Worker-role entries are deliberately ignored and never alter the worker's
 independent 80% soft / 90% hard policy. This repository publishes the contract
@@ -569,10 +584,14 @@ principles only. Its MLA serving, scheduler, disk-KV ownership, and benchmark
 numbers do not transfer to this Pi worker.
 
 Warm-prefix auxiliary compaction is
-`BLOCKED_BY_PI_0_83_PUBLIC_API`: there is no public post-summary payload
-transform or same-cache-domain guarantee. The worker runtime does not duplicate
-private auth/header/stream/retry behavior. Existing worker compaction
-cancellation and Commander built-in/native compaction behavior are unchanged.
+`BLOCKED_BY_PI_0_84_2_PUBLIC_API`: the official
+[Pi v0.84.2](https://github.com/earendil-works/pi/releases/tag/v0.84.2)
+surface at [commit `914cf1472e715297caa30db4b9535d534a9eb718`](https://github.com/earendil-works/pi/commit/914cf1472e715297caa30db4b9535d534a9eb718)
+still exposes no public post-summary payload transform or same-cache-domain
+guarantee. The worker runtime does not duplicate private
+auth/header/stream/retry behavior. Worker compaction cancellation remains
+unchanged; Commander now preflights native summary capacity and otherwise
+keeps Pi's native summarizer.
 
 The pinned worker runs on a 1,000,000-token context window. The workbench
 protects that budget with two thresholds that are model-specific and
@@ -590,8 +609,14 @@ negative values contribute zero — never NaN.
 
 Inside the worker process the extension also cancels
 `session_before_compact` (`{ cancel: true }`) so a worker never silently
-continues through lossy compaction; the Commander's compaction supplement
-behavior is unchanged. Defense in depth: the runner independently parses
+continues through lossy compaction. This return occurs before the handler reads
+Pi's compaction preparation. Commander manual/threshold/overflow events instead
+use the content-free allow/warn/block summary-capacity preflight: a conservative
+envelope estimate at or above model capacity is cancelled before provider
+invocation and directs `/q-milestone-handoff <next step>`, with no compaction
+telemetry or supplement. The estimate is not a formal tokenizer-fit proof;
+allow/warn/unknown keep Pi's native summary and existing supplement behavior.
+Defense in depth: the runner independently parses
 `compaction_start` events from the child JSON stream (count + distinct
 reasons) and any compaction attempt fails the invocation closed — even if
 the child would otherwise exit 0.

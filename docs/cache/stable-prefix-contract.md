@@ -11,8 +11,8 @@ This contract is the P6-B companion to the P6-A telemetry docs
 (`deepseek-prompt-cache.md`). Read `cache-efficient-workflow.md` for the
 day-to-day workflow rules that follow from this contract.
 
-The P0–P2 sections below describe Unreleased working-tree behavior, not a
-committed, installed, or deployed cache improvement.
+The P0–P2 sections below describe Unreleased source behavior. No deployment,
+tag, package publication, `/reload`, or live cache improvement is claimed.
 
 ## The two zones
 
@@ -81,6 +81,11 @@ discovery.
   ("telemetry never enters the model context").
 - **Compaction writes no cache statistics.** The compaction supplement note
   carries task/mode/gates/runs/evidence pointers only (tested).
+- **A blocked compact writes neither telemetry nor a supplement.** Commander
+  summary-capacity preflight cancels only when its conservative envelope
+  estimate is at or above model capacity and directs
+  `/q-milestone-handoff <next step>`; workers cancel before reading the
+  preparation. Allowed/warned Commander events keep native Pi compaction.
 - **`before_provider_request` is copy-on-write and capability-gated.** For the
   proven public OpenAI GPT-5.6 Responses shape only, it may return a cloned
   payload with explicit breakpoints on exact marker blocks. Unsupported,
@@ -90,10 +95,10 @@ discovery.
   provider wire.
 - **The `context` event is enforcement, not cache observation.** Below the
   hard ceiling it returns raw history unchanged. At an initial checkpoint,
-  projection-state v3 freezes a 26/10 KiB Commander/worker anchor and uses one
-  64/48 KiB raw turn plus a 16-bundle target to select the suffix only when a
-  true 96/64 KiB or 128-bundle hard crossing occurs. Reserve-only crossing
-  leaves the request byte-identical. Up to 16 immutable
+  projection-state v3 freezes a 122/74/10 KiB Commander/worker/other anchor
+  and uses one 64/48/48 KiB raw turn plus a 16-bundle target to select the
+  suffix only when a true 192/128/64 KiB or 128-bundle hard crossing occurs.
+  Reserve-only crossing leaves the request byte-identical. Up to 16 immutable
   384-byte/one-bundle segments may be appended. Seals 1–16 preserve the epoch
   and every older boundary; a later hard crossing at the 16-segment safety
   ceiling performs a model-free checkpoint and increments the epoch.
@@ -220,10 +225,11 @@ divergence. These guarantees do not alter the stable-zone tool hashes.
 
 ## History-projection segmented epochs
 
-The active-history hard ceilings remain **98,304 bytes (96 KiB) for
-Commander**, **65,536 bytes (64 KiB) for worker/other**, and **128 complete
-assistant/tool-result bundles**. Projection-state v3 reserves the active turn
-and segment chain before sizing the anchor:
+The active-history hard ceilings are **196,608 bytes (192 KiB) for
+Commander**, **131,072 bytes (128 KiB) for worker**, **65,536 bytes (64 KiB)
+for other**, and **128 complete assistant/tool-result bundles**.
+Projection-state v3 reserves the active turn and segment chain before sizing
+the anchor:
 
 ```text
 anchorByteCap = max(0, hardToolTextBytes - roleTurnBytes - 16 * 384)
@@ -232,8 +238,9 @@ anchorBundleCap = max(0, 128 - 16 segment bundles - 16 active bundles) = 96
 
 | Role | Hard tool text | Raw turn reserve | Segment reserve | Anchor cap | Active bundles | Anchor bundles |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Commander | 98,304 B | 65,536 B | 16 × 384 B | 26,624 B (26 KiB) | 16 | 96 |
-| Worker / other | 65,536 B | 49,152 B | 16 × 384 B | 10,240 B (10 KiB) | 16 | 96 |
+| Commander | 196,608 B | 65,536 B | 16 × 384 B | 124,928 B (122 KiB) | 16 | 96 |
+| Worker | 131,072 B | 49,152 B | 16 × 384 B | 75,776 B (74 KiB) | 16 | 96 |
+| Other | 65,536 B | 49,152 B | 16 × 384 B | 10,240 B (10 KiB) | 16 | 96 |
 
 At the initial checkpoint, the controller validates global tool-call/result
 pairing and chooses the largest latest **raw** suffix that fits the role-turn
@@ -264,6 +271,13 @@ projection result exposes the exact bounded marker strings and IDs required by
 the provider hook. Once sealed, a marker/message pair is immutable until the
 next checkpoint.
 
+The cap expansion does not bump projection state v3 or telemetry schema 1.3.
+A valid v3 state created under an earlier role policy is accepted and emits
+one `policy_changed` transition; the new state then replays deterministically.
+The exact anchor and already sealed segments remain whole-item byte-identical
+through an ordinary seal. The contract does not claim that the entire previous
+request remains a prefix after a bounded active-tail replacement.
+
 The `workbench-history-projection-state-v3` custom entry uses
 `schemaVersion: 3`, persists only strict numeric/hash topology, and is bounded
 to 32 KiB; it contains no message text. Frozen slices
@@ -289,8 +303,8 @@ covered by `stateHash`. After JSONL restore, another failure reuses the sentinel
 without another transition; the first healthy projection emits one fixed
 recovery boundary and later healthy projections emit none. Neither identity is
 derived from hostile/raw history. Branching, completed compaction, invalid
-pairing, and policy mismatch retain these fixed fail-closed semantics. Lowered
-test/policy caps clamp the formula; if the topology cannot be reserved, the
+pairing, and invalid policy state retain these fixed fail-closed semantics.
+Lowered test/policy caps clamp the formula; if the topology cannot be reserved, the
 controller checkpoints or fails closed rather than weakening a hard limit.
 
 ## Recoverable ingress before history projection
@@ -370,33 +384,46 @@ or promise a provider cache hit.
 The resulting client-side architecture is a synthesis, not a hosted-provider
 implementation claim: keep one immutable fixed anchor, append modular immutable
 segments, and rebuild them only at rare checkpoints. The same design applies
-to Commander and worker/other; only their byte caps differ. It follows the
+to Commander, worker, and other; only their byte caps differ. It follows the
 common exact-prefix/block-reuse principle while preserving development quality
 through strict pairing, bounded state, and fail-closed restoration.
 
 ### Warm-prefix auxiliary compaction boundary
 
-Status: `BLOCKED_BY_PI_0_83_PUBLIC_API`.
+Status: `BLOCKED_BY_PI_0_84_2_PUBLIC_API`.
 
-The installed Pi 0.83 public
-[`session_before_compact` contract](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/compaction.md)
+The public surface was rechecked against the official
+[Pi v0.84.2 release](https://github.com/earendil-works/pi/releases/tag/v0.84.2)
+at [commit `914cf1472e715297caa30db4b9535d534a9eb718`](https://github.com/earendil-works/pi/commit/914cf1472e715297caa30db4b9535d534a9eb718).
+Its pinned
+[`session_before_compact` contract](https://github.com/earendil-works/pi/blob/914cf1472e715297caa30db4b9535d534a9eb718/packages/coding-agent/docs/compaction.md)
 can cancel compaction or provide a replacement compaction result. Its public
-[extension types](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/extensions/types.ts)
+[extension types](https://github.com/earendil-works/pi/blob/914cf1472e715297caa30db4b9535d534a9eb718/packages/coding-agent/src/core/extensions/types.ts)
 do not expose a post-summary provider-payload transform. Pi's
-[compaction implementation](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/compaction/compaction.ts)
+[compaction implementation](https://github.com/earendil-works/pi/blob/914cf1472e715297caa30db4b9535d534a9eb718/packages/coding-agent/src/core/compaction/compaction.ts)
 also does not guarantee that a separate auxiliary summary call shares the
-original request's cache domain. A client implementation would therefore have
-to duplicate private authentication, headers, streaming, retry, and
-provider-call behavior. The workbench will not reimplement those internals.
-Built-in/native Pi compaction is unchanged; no warm-prefix auxiliary compactor
-is claimed here.
+original request's cache domain; native summary calls are standalone with
+`cacheRetention: "none"` and a fresh `sessionId`. A client implementation
+would therefore have to duplicate private authentication, headers, streaming,
+retry, and provider-call behavior. The workbench will not reimplement those
+internals.
+The new capacity preflight is not an auxiliary compactor: it estimates the
+actual Pi preparation, blocks only when its conservative envelope estimate is
+at or above model capacity, and never supplies a summary. The estimate is not a
+formal tokenizer/context-fit proof. Allowed/warned Commander requests still use
+native Pi compaction; no warm-prefix auxiliary compactor is claimed here.
 
 This is a structural cache-cooperation contract, not evidence of recovered
 provider cache reuse. Only verified provider usage mapped to `cacheRead` is
 authoritative. The offline fake provider deliberately reports `cacheRead = 0`,
 so offline tests and benchmarks cannot substantiate a hit-rate improvement.
-Deploy first, start a new live session, and measure subsequent provider usage
-before making any recovery claim.
+Verify the Pi 0.84.2 repository dependencies (the current tree resolves them),
+pass declared gates, deploy with `/reload`, start a new live session, and
+measure subsequent Commander and worker provider usage before making any
+recovery claim. Current size qualification is limited to the 272k Commander
+model and pinned 1M worker;
+`other` and arbitrary 64k/128k model windows are not qualified by the cap
+expansion.
 
 ## Canary evaluation targets (not guarantees)
 

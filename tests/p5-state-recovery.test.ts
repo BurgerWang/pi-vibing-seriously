@@ -9,8 +9,7 @@
  *
  * These tests exercise the real extension wiring (index.ts) through a stub
  * ExtensionAPI: session_start restore, before_agent_start tracking, and the
- * session_before_compact supplement (persist entry + hidden next-turn
- * message; never cancel, never replace Pi's compaction).
+ * session_before_compact supplement and Commander capacity preflight.
  */
 
 import assert from "node:assert/strict";
@@ -60,6 +59,7 @@ interface StubAPI {
 	messages: Array<{ customType: string; content: string; display: boolean; options?: unknown }>;
 	activeTools: string[];
 	appendEntryCalls: Array<{ customType: string; data: unknown }>;
+	notifications: Array<{ message: string; level: string | undefined }>;
 }
 
 function makeStub(): StubAPI & ExtensionAPI {
@@ -71,6 +71,7 @@ function makeStub(): StubAPI & ExtensionAPI {
 		messages: [],
 		activeTools: [],
 		appendEntryCalls: [],
+		notifications: [],
 		registerCommand: (name: string, def: unknown) => {
 			stub.commands.set(name, def);
 		},
@@ -123,6 +124,38 @@ function fakeCtx(entries: StubAPI["entries"], overrides: Partial<ExtensionContex
 		signal: undefined,
 		...overrides,
 	} as unknown as ExtensionContext;
+}
+
+const COMPACT_MODEL = {
+	contextWindow: 272_000,
+	maxTokens: 128_000,
+} as never;
+
+function compactPreparation(history: string, prefix?: string): Record<string, unknown> {
+	return {
+		firstKeptEntryId: "kept-1",
+		messagesToSummarize: [{ role: "user", content: [{ type: "text", text: history }], timestamp: 1 }],
+		turnPrefixMessages: prefix === undefined
+			? []
+			: [{ role: "user", content: [{ type: "text", text: prefix }], timestamp: 2 }],
+		isSplitTurn: prefix !== undefined,
+		tokensBefore: 1,
+		fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+		settings: { enabled: false, reserveTokens: 27_200, keepRecentTokens: 20_000 },
+	};
+}
+
+function compactCtx(stub: StubAPI, entries: StubAPI["entries"]): ExtensionContext {
+	return fakeCtx(entries, {
+		hasUI: true,
+		model: COMPACT_MODEL,
+		ui: {
+			setStatus: () => {},
+			setWidget: () => {},
+			notify: (message: string, level?: string) => stub.notifications.push({ message, level }),
+			confirm: async () => false,
+		} as unknown as ExtensionContext["ui"],
+	});
 }
 
 function entry(customType: string, data: unknown): { type: string; customType: string; data?: unknown } {
@@ -222,7 +255,7 @@ test("fresh session (reason=new) falls back to the DEV default", async () => {
 	assert.ok(stub.activeTools.includes("bash"), "DEV tools active for a fresh session");
 });
 
-test("session_before_compact never cancels and never replaces Pi compaction", async () => {
+test("unknown Commander preflight preserves Pi compaction and never replaces it", async () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	const beforeStart = stub.events.get("before_agent_start");
@@ -256,16 +289,66 @@ test("compaction notes are deduplicated", async () => {
 // Worker context-budget protection (extension lifecycle, worker role only)
 // ---------------------------------------------------------------------------
 
-test("commander session_before_compact never cancels compaction (unchanged)", async () => {
+test("allowed Commander preflight preserves compaction and its supplement", async () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	const beforeStart = stub.events.get("before_agent_start");
 	await beforeStart![0]!({ type: "before_agent_start", prompt: "commander task", systemPrompt: "" } as never, fakeCtx([]) as never);
 	const compact = stub.events.get("session_before_compact");
-	const result = await compact![0]!({ type: "session_before_compact", preparation: {}, branchEntries: [], reason: "threshold", willRetry: true, signal: new AbortController().signal } as never, fakeCtx([]) as never);
-	assert.equal(result, undefined, "commander compaction is never cancelled");
+	const result = await compact![0]!({ type: "session_before_compact", preparation: compactPreparation("small"), branchEntries: [], reason: "threshold", willRetry: true, signal: new AbortController().signal } as never, compactCtx(stub, []) as never);
+	assert.equal(result, undefined, "allowed Commander compaction continues");
 	assert.ok(stub.messages.length > 0, "the commander supplement note is still sent");
 	assert.equal(stub.messages[0]?.customType, COMPACT_NOTE_MESSAGE_TYPE);
+});
+
+test("near-capacity Commander preflight warns and preserves the native supplement path", async () => {
+	const stub = makeStub();
+	workbenchRuntime(stub);
+	const beforeStart = stub.events.get("before_agent_start")![0]!;
+	await beforeStart({ type: "before_agent_start", prompt: "near-capacity warning task", systemPrompt: "" } as never, fakeCtx([]) as never);
+	const compact = stub.events.get("session_before_compact")![0]!;
+	const result = await compact({
+		type: "session_before_compact",
+		preparation: compactPreparation("w".repeat(600_000)),
+		branchEntries: [],
+		reason: "manual",
+		willRetry: false,
+		signal: new AbortController().signal,
+	} as never, compactCtx(stub, []) as never);
+
+	assert.equal(result, undefined, "warning is advisory and native compaction continues");
+	assert.equal(stub.messages.length, 1, "normal supplement still runs after the warning");
+	assert.equal(stub.notifications.length, 1);
+	assert.match(stub.notifications[0]!.message, /warning/i);
+	assert.match(stub.notifications[0]!.message, /summary request envelope/i);
+});
+
+test("oversized Commander preflight blocks manual, threshold and overflow before any supplement", async () => {
+	for (const reason of ["manual", "threshold", "overflow"] as const) {
+		const stub = makeStub();
+		workbenchRuntime(stub);
+		const beforeStart = stub.events.get("before_agent_start")![0]!;
+		await beforeStart({ type: "before_agent_start", prompt: "commander task", systemPrompt: "" } as never, fakeCtx([]) as never);
+		const compact = stub.events.get("session_before_compact")![0]!;
+		const secret = `NEVER-RENDER-${reason}`;
+		const result = await compact({
+			type: "session_before_compact",
+			preparation: compactPreparation(`${secret}${"x".repeat(674_179 - secret.length)}`, "p".repeat(51_071)),
+			branchEntries: [],
+			reason,
+			willRetry: reason === "overflow",
+			signal: new AbortController().signal,
+		} as never, compactCtx(stub, []) as never);
+
+		assert.deepEqual(result, { cancel: true });
+		assert.equal(stub.messages.length, 0, "blocked compaction writes no supplement message");
+		assert.equal(stub.appendEntryCalls.some((call) => call.customType === COMPACT_STATE_ENTRY_TYPE), false, "blocked compaction persists no supplement state");
+		assert.equal(stub.notifications.length, 1);
+		const notice = stub.notifications[0]!.message;
+		assert.match(notice, /blocked/i);
+		assert.ok(notice.includes("/q-milestone-handoff <next step>"));
+		assert.equal(notice.includes(secret), false, "notice carries no raw session content");
+	}
 });
 
 test("worker session_before_compact cancels compaction (never silently continues)", async () => {
@@ -273,7 +356,12 @@ test("worker session_before_compact cancels compaction (never silently continues
 	withWorkerRole(() => workbenchRuntime(stub));
 	const compact = stub.events.get("session_before_compact");
 	assert.ok(compact && compact.length > 0);
-	const result = await compact[0]!({ type: "session_before_compact", preparation: {}, branchEntries: [], reason: "threshold", willRetry: true, signal: new AbortController().signal } as never, fakeCtx([]) as never);
+	const unreadablePreparation = new Proxy({}, {
+		get() {
+			throw new Error("worker preparation must not be read");
+		},
+	});
+	const result = await compact[0]!({ type: "session_before_compact", preparation: unreadablePreparation, branchEntries: [], reason: "threshold", willRetry: true, signal: new AbortController().signal } as never, fakeCtx([]) as never);
 	assert.deepEqual(result, { cancel: true }, "worker role cancels compaction");
 	assert.equal(stub.messages.length, 0, "no supplement note for a cancelled worker compaction");
 	// A second worker compaction event also cancels.

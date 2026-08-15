@@ -1832,12 +1832,19 @@ test("preflightSystemForCollectorV2: success reproduces every frozen pin and ret
 	});
 });
 
-test("preflightSystemForCollectorV2: the real repository package.json pins the frozen Pi version exactly (read-only)", async () => {
+test("preflightSystemForCollectorV2: the current Pi 0.84.2 repository fails closed against the historical Pi 0.83.0 collector (read-only)", async () => {
 	const raw = await readFile(join(REPO_ROOT, PACKAGE_JSON_RELATIVE_V2), "utf8");
 	const root = JSON.parse(raw) as Record<string, unknown>;
 	const devDeps = root.devDependencies;
 	assert.ok(typeof devDeps === "object" && devDeps !== null && !Array.isArray(devDeps), "real package.json must carry devDependencies");
-	assert.equal((devDeps as Record<string, unknown>)["@earendil-works/pi-coding-agent"], FROZEN_ENVIRONMENT.piVersion, "the real pi pin must equal the frozen Pi pin");
+	assert.equal((devDeps as Record<string, unknown>)["@earendil-works/pi-coding-agent"], "0.84.2", "the real repository must carry the currently qualified Pi pin");
+	assert.equal(FROZEN_ENVIRONMENT.piVersion, "0.83.0", "the historical paid benchmark authority must retain its frozen Pi pin");
+	await expectSystemError(
+		REPO_ROOT,
+		{ nodeVersion: FROZEN_ENVIRONMENT.nodeVersion },
+		"PACKAGE_PIN_MISMATCH",
+		`devDependencies["@earendil-works/pi-coding-agent"] must be pinned exactly to the frozen Pi version (${FROZEN_ENVIRONMENT.piVersion})`,
+	);
 });
 
 test("preflightSystemForCollectorV2: every protocol pin and environment drift fails closed BEFORE any filesystem access", async () => {

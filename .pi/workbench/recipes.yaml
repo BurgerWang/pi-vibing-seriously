@@ -17,6 +17,39 @@
 #   .pi/workbench/cache/{actions,cas,locks,tmp,cache-index.json}
 
 recipes:
+  - name: compact-preflight-test
+    description: Commander compact-summary capacity preflight pure and lifecycle wiring tests
+    command: [npm, run, test:compact-preflight]
+    cwd: .
+    timeout_ms: 600000
+    allowed_modes: [DEV, VERIFY]
+    expected_exit_codes: [0]
+    writes: []
+    mutation: none
+    artifacts: []
+    environment: []
+    output_strategy: tail
+    max_lines: 300
+    max_bytes: 30720
+    cache:
+      enabled: true
+      version: 1
+      mode: result-only
+      successOnly: true
+      inputs:
+        - package.json
+        - package-lock.json
+        - tsconfig.json
+        - .pi/workbench/recipes.yaml
+        - extensions/**/*.ts
+        - tests/compact-preflight.test.ts
+        - tests/p5-state-recovery.test.ts
+        - tests/helpers.ts
+      outputs: []
+      environment: []
+      toolchain: [node, npm]
+      maxAgeSeconds: null
+
   - name: read-v3-test
     description: R4 native read v3 focused integration tests
     command: [npm, run, test:read-v3]

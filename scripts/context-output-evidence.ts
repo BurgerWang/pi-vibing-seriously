@@ -226,6 +226,8 @@ interface WorkerRuntimeChildFacts {
 	historyProjectionReserveOnlyGrowthStayedSameTopology: boolean;
 	maximumHistoryProjectionStateBytes: number;
 	maximumHistoryProjectionActiveToolTextBytes: number;
+	reserveCrossingResultTextBytes: number;
+	reserveCrossingExpectedActiveToolTextBytes: number;
 	minimumWorkerAnchorReserveBytes: number;
 	latestCompletedBundleRaw: boolean;
 }
@@ -237,6 +239,8 @@ const SOURCE_LINES = 100_000;
 const SINGLE_LINE_BYTES = 10 * MIB;
 const SPARSE_STREAM_BYTES = GIB / 2;
 const WORKER_SOURCE_FILE_BYTES = 512 * 1_024;
+const WORKER_RESERVE_CROSSING_TOOL_INDEX = 11;
+const WORKER_RESERVE_CROSSING_FIRST_LINE_BYTES = 4 * 1_024;
 const CHILD_STDIO_MAX_BYTES = 128 * 1_024;
 const COMMAND_STDIO_MAX_BYTES = 2 * MIB;
 const MODULE_REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -1015,8 +1019,10 @@ function measureRoleReserve(role: "commander" | "worker"): RoleReserveEvidence {
 	const expectedAnchorBytes = Math.max(0, hard - aggregateTurn - segmentReserve);
 	const controller = new HistoryProjectionController();
 	const messages: AgentMessage[] = [{ role: "user", content: `${role} reserve fixture`, timestamp: 0 } as unknown as AgentMessage];
-	for (let index = 0; index < 6; index += 1) appendAggregateBundle(messages, `${role}-old-${index}`, [20 * 1_024]);
-	appendAggregateBundle(messages, `${role}-seed`, [40 * 1_024]);
+	const oldBundleBytes = role === "commander" ? 24 * 1_024 : 20 * 1_024;
+	const seedBytes = role === "commander" ? 64 * 1_024 : 40 * 1_024;
+	for (let index = 0; index < 6; index += 1) appendAggregateBundle(messages, `${role}-old-${index}`, [oldBundleBytes]);
+	appendAggregateBundle(messages, `${role}-seed`, [seedBytes]);
 	const config = {
 		maxToolTextBytes: hard,
 		maxBundles: HISTORY_MAX_BUNDLES,
@@ -1388,17 +1394,9 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 	const runtimeSourcePath = join(MODULE_REPO_ROOT, "extensions", "workbench-runtime", "index.ts");
 	const historyModule = pathToFileURL(join(MODULE_REPO_ROOT, "extensions", "workbench-runtime", "core", "context-history-budget.ts")).href;
 	const codingAgentModule = import.meta.resolve("@earendil-works/pi-coding-agent");
-	const piAiModule = pathToFileURL(join(
-		MODULE_REPO_ROOT,
-		"node_modules",
-		"@earendil-works",
-		"pi-coding-agent",
-		"node_modules",
-		"@earendil-works",
-		"pi-ai",
-		"dist",
-		"index.js",
-	)).href;
+	// Resolve through coding-agent's package graph so the fixture is agnostic
+	// to whether npm installs pi-ai nested below coding-agent or hoists it.
+	const piAiModule = import.meta.resolve("@earendil-works/pi-ai", codingAgentModule);
 	// The worker runs with the supplied temporary project as cwd. Resolve the
 	// TypeScript preload from this repository now; a bare `tsx` specifier would
 	// be resolved from that isolated cwd and fail before fake-worker.mjs starts.
@@ -1416,7 +1414,12 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 	const expectedSourceHashes: string[] = [];
 	for (let index = 0; index < 24; index += 1) {
 		const prefix = `SOURCE-WORKER-${index}:`;
-		const content = prefix + "x".repeat(WORKER_SOURCE_FILE_BYTES - bytes(prefix));
+		const content = index === WORKER_RESERVE_CROSSING_TOOL_INDEX
+			? prefix
+				+ "x".repeat(WORKER_RESERVE_CROSSING_FIRST_LINE_BYTES - bytes(prefix))
+				+ "\n"
+				+ "x".repeat(WORKER_SOURCE_FILE_BYTES - WORKER_RESERVE_CROSSING_FIRST_LINE_BYTES - 1)
+			: prefix + "x".repeat(WORKER_SOURCE_FILE_BYTES - bytes(prefix));
 		await writeFile(join(sourceDirectory, `worker-large-${index}.txt`), content, { encoding: "utf8", mode: 0o600 });
 		expectedSourceHashes.push(sha256(content));
 	}
@@ -1436,6 +1439,7 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 		import { performance } from "node:perf_hooks";
 
 		const sourceBytes = ${WORKER_SOURCE_FILE_BYTES};
+		const reserveCrossingToolIndex = ${WORKER_RESERVE_CROSSING_TOOL_INDEX};
 		const historyCap = ${WORKER_HISTORY_TOOL_TEXT_MAX_BYTES};
 		const workerTurnCap = ${WORKER_TURN_MAX_BYTES};
 		const projectionEntryType = ${JSON.stringify(HISTORY_PROJECTION_ENTRY_TYPE)};
@@ -1645,6 +1649,8 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 				&& historyProjectionReserveOnlyGrowthStayedSameTopology;
 			const maximumHistoryProjectionStateBytes = maxOf(historyProjectionSnapshots.map((value) => utf8(JSON.stringify(value))));
 			const maximumHistoryProjectionActiveToolTextBytes = maxOf(activeProjectionStates.map((value) => value.activeToolTextBytes));
+			const reserveCrossingResultTextBytes = preHistoryToolResultBytes[reserveCrossingToolIndex] ?? 0;
+			const reserveCrossingExpectedActiveToolTextBytes = workerTurnCap + reserveCrossingResultTextBytes;
 			const minimumWorkerAnchorReserveBytes = activeProjectionStates.length === 0
 				? 0
 				: Math.min(...activeProjectionStates.map((value) => value.normalized.hardToolTextBytes - value.normalized.anchorToolTextBytes));
@@ -1693,6 +1699,8 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 				historyProjectionReserveOnlyGrowthStayedSameTopology,
 				maximumHistoryProjectionStateBytes,
 				maximumHistoryProjectionActiveToolTextBytes,
+				reserveCrossingResultTextBytes,
+				reserveCrossingExpectedActiveToolTextBytes,
 				minimumWorkerAnchorReserveBytes,
 				latestCompletedBundleRaw,
 			};
@@ -1776,9 +1784,12 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 					if (requestNumber <= 24) {
 						output.content = [{
 							type: "toolCall",
-				id: "worker-large-" + (requestNumber - 1),
-				name: "read",
-				arguments: { path: sourcePaths[requestNumber - 1] },
+							id: "worker-large-" + (requestNumber - 1),
+							name: "read",
+							arguments: {
+								path: sourcePaths[requestNumber - 1],
+								...(requestNumber - 1 === reserveCrossingToolIndex ? { limit: 1 } : {}),
+							},
 						}];
 					} else {
 						output.content = [{
@@ -1981,6 +1992,7 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 		childFacts.finalRemovedToolBundles, childFacts.finalActiveHistoryToolTextBytes, childFacts.historyCap,
 		childFacts.contextPressureEntries, childFacts.historyProjectionV3Entries,
 		childFacts.maximumHistoryProjectionStateBytes, childFacts.maximumHistoryProjectionActiveToolTextBytes,
+		childFacts.reserveCrossingResultTextBytes, childFacts.reserveCrossingExpectedActiveToolTextBytes,
 		childFacts.minimumWorkerAnchorReserveBytes,
 	];
 	if (!numericCounts.every((value) => Number.isSafeInteger(value) && value >= 0)
@@ -2064,6 +2076,12 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 		&& childFacts.historyProjectionReserveOnlyGrowthObserved
 		&& childFacts.historyProjectionReserveOnlyGrowthStayedSameTopology
 		&& childFacts.maximumHistoryProjectionActiveToolTextBytes > WORKER_TURN_MAX_BYTES
+		&& childFacts.reserveCrossingResultTextBytes > 0
+		&& childFacts.reserveCrossingResultTextBytes < NATIVE_READ_MAX_BYTES
+		&& childFacts.reserveCrossingExpectedActiveToolTextBytes === WORKER_TURN_MAX_BYTES
+			+ childFacts.reserveCrossingResultTextBytes
+		&& childFacts.maximumHistoryProjectionActiveToolTextBytes
+			=== childFacts.reserveCrossingExpectedActiveToolTextBytes
 		&& childFacts.maximumHistoryProjectionActiveToolTextBytes <= WORKER_HISTORY_TOOL_TEXT_MAX_BYTES
 		&& childFacts.maximumHistoryProjectionStateBytes <= 32 * 1_024
 		&& childFacts.minimumWorkerAnchorReserveBytes === WORKER_TURN_MAX_BYTES
@@ -2124,6 +2142,9 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 			kind: "local-json-transport-with-real-pi-agent-session-and-offline-provider",
 			tool_result_turns: 24,
 			provider_responses: 25,
+			reserve_crossing_tool_turn: WORKER_RESERVE_CROSSING_TOOL_INDEX + 1,
+			reserve_crossing_read_limit_lines: 1,
+			reserve_crossing_first_line_bytes: WORKER_RESERVE_CROSSING_FIRST_LINE_BYTES,
 			event_order: "Pi tool execute -> tool_result -> turn_end telemetry -> next context projection -> before_provider_request -> offline provider response",
 			history_source: "24 production native read executions over distinct 512 KiB local source files; actual pre-history tool-result bytes are measured separately",
 			source_file_bytes_each: WORKER_SOURCE_FILE_BYTES,
@@ -2177,6 +2198,8 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 			history_projection_reserve_only_growth_stayed_same_topology: childFacts.historyProjectionReserveOnlyGrowthStayedSameTopology,
 			maximum_history_projection_state_bytes: childFacts.maximumHistoryProjectionStateBytes,
 			maximum_history_projection_active_tool_text_bytes: childFacts.maximumHistoryProjectionActiveToolTextBytes,
+			reserve_crossing_result_text_bytes: childFacts.reserveCrossingResultTextBytes,
+			reserve_crossing_expected_active_tool_text_bytes: childFacts.reserveCrossingExpectedActiveToolTextBytes,
 			minimum_worker_anchor_reserve_bytes: childFacts.minimumWorkerAnchorReserveBytes,
 			latest_completed_bundle_raw: childFacts.latestCompletedBundleRaw,
 			source_files_unchanged: childFacts.sourceFilesUnchanged,
@@ -2215,6 +2238,8 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 			acceptance("history-projection-selection-reserve", childFacts.historyProjectionSelectionReserveValid, "=", true),
 			acceptance("history-projection-reserve-only-growth", childFacts.historyProjectionReserveOnlyGrowthObserved, "=", true),
 			acceptance("history-projection-reserve-only-same-topology", childFacts.historyProjectionReserveOnlyGrowthStayedSameTopology, "=", true),
+			acceptance("history-projection-reserve-only-exact-active", childFacts.maximumHistoryProjectionActiveToolTextBytes
+				=== childFacts.reserveCrossingExpectedActiveToolTextBytes, "=", true),
 			acceptance("history-projection-state-size", childFacts.maximumHistoryProjectionStateBytes, "<=", 32 * 1_024),
 			acceptance("worker-anchor-reserve", childFacts.minimumWorkerAnchorReserveBytes,
 				"=", WORKER_TURN_MAX_BYTES + HISTORY_PROJECTION_MAX_SEGMENTS * HISTORY_PROJECTION_SEGMENT_MAX_TOOL_TEXT_BYTES),

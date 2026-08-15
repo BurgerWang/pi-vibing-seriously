@@ -7,8 +7,16 @@ compatibility is claimed. The machine-readable copy lives in
 
 ## Unreleased cache-prefix P0–P2 compatibility
 
-This is working-tree documentation only; it does not claim a commit,
-deployment, tag, package publish, or new Pi-version qualification.
+These are Unreleased source compatibility statements. No deployment, tag,
+package publication, `/reload`, or completed live Pi-version qualification is
+claimed. The operator's global `pi --version` reports 0.84.2, repository package
+specifications target 0.84.2, and the current dependency tree resolves
+Pi/pi-tui 0.84.2. Public compaction types and implementation were
+source-audited at the official
+[Pi v0.84.2 release](https://github.com/earendil-works/pi/releases/tag/v0.84.2),
+[commit `914cf1472e715297caa30db4b9535d534a9eb718`](https://github.com/earendil-works/pi/commit/914cf1472e715297caa30db4b9535d534a9eb718).
+That audit and dependency resolution are narrower than the declared
+typecheck/test/gate/live matrix.
 
 - Telemetry writers move to strict schema 1.3 while strict 1.0–1.2 records
   remain readable. New rows add disjoint read/write shares, numeric quality
@@ -31,20 +39,28 @@ deployment, tag, package publish, or new Pi-version qualification.
   envelope. Gate-page cursors advance only across complete rows visible in the
   final page; projected history prefers the validated durable source pointer.
   The implementation is shared by Commander, worker, and other roles.
-- The 96/64 KiB and 128-bundle role hard caps do not change. The 64/48 KiB
-  turn and 16-bundle values become suffix-selection reserves only: crossing a
-  reserve alone stays byte-identical. Sealing requires a true hard byte/bundle
+- Commander/worker role hard caps expand to 192/128 KiB; other remains 64 KiB
+  and all roles remain capped at 128 bundles. The 64/48/48 KiB turn and
+  16-bundle values remain suffix-selection reserves only: crossing a reserve
+  alone stays byte-identical. Sealing requires a true role hard byte/bundle
   crossing; a later true crossing at the 16-segment safety ceiling performs a
-  deterministic model-free checkpoint.
+  deterministic model-free checkpoint. Anchors are 122/74/10 KiB. State v3
+  and telemetry schema 1.3 do not change; an old valid state emits one
+  `policy_changed` transition.
 - Responses cache-write status `2` means normalized absence-or-zero and is not
   promoted to provider-presence verification. DeepSeek Completions write
   status remains unavailable. Legacy `cacheHitRatio` remains readable while
   schema-1.3 canaries use the separately labeled disjoint read share.
 - Warm-prefix auxiliary compaction is
-  `BLOCKED_BY_PI_0_83_PUBLIC_API`. The public Pi 0.83 surface has no
+  `BLOCKED_BY_PI_0_84_2_PUBLIC_API`. The public Pi 0.84.2 surface has no
   post-summary transform or same-cache-domain guarantee, and the workbench does
   not reimplement private authentication, headers, streams, retries, or
-  provider calls. Built-in/native compaction is unchanged.
+  provider calls. Commander instead evaluates the actual prepared native
+  summary request: allow/warn/unknown preserve Pi's summarizer, while a
+  conservative envelope estimate at or above model capacity returns a block
+  before provider invocation, telemetry, or supplement and directs
+  `/q-milestone-handoff <next step>`. The estimate is not a formal tokenizer-fit
+  proof. Workers still cancel before reading preparation.
 - Cache doctor remains non-executing for hostile evidence: Proxy/accessor/
   symbol/exotic rows are uninspectable partial input, never a clean result.
   Pending request correlation is single-use and resets with session identity
@@ -98,15 +114,20 @@ tool-schema fingerprint.
 
 Active-history projection has an explicit state-wire transition too. New
 entries use strict `workbench-history-projection-state-v3` with
-`schemaVersion: 3`, a numeric/hash-only record capped at 32 KiB. The 96/64 KiB
-and 128-bundle hard ceilings remain.
-After reserving the 64/48 KiB raw role turn and sixteen 384-byte/one-bundle
-immutable segments, the Commander/worker anchor caps are 26/10 KiB and 96
-bundles. In the Unreleased controller these values select a protected suffix
+`schemaVersion: 3`, a numeric/hash-only record capped at 32 KiB. The
+Unreleased hard ceilings are Commander/worker/other 192/128/64 KiB and 128
+bundles. After reserving the 64/48/48 KiB raw role turn and sixteen
+384-byte/one-bundle immutable segments, the Commander/worker/other anchor caps
+are 122/74/10 KiB and 96 bundles. These values select a protected suffix
 only after a true hard crossing; reserve-only growth is unchanged. Seals 1–16
 preserve the epoch and all existing markers/slices, while a later true hard
 crossing at the 16-segment ceiling triggers a checkpoint and increments the
 epoch.
+
+A valid restored v3 state under an earlier cap remains accepted. The first
+request emits one `policy_changed` transition and persists the current policy;
+subsequent replay is stable. This is a policy migration within v3, not a new
+wire schema.
 
 An exact v3 entry reconstructs every contiguous slice from raw JSONL. The
 newest recognized malformed or structurally unsafe entry is authoritative: a

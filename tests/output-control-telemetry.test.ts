@@ -4,6 +4,7 @@ import { test } from "node:test";
 import {
 	COMMANDER_HISTORY_MAX_BYTES,
 	COMMANDER_TURN_MAX_BYTES,
+	OTHER_HISTORY_MAX_BYTES,
 	WORKER_HISTORY_MAX_BYTES,
 	WORKER_TURN_MAX_BYTES,
 } from "../extensions/workbench-runtime/core/output-policy.ts";
@@ -127,7 +128,7 @@ test("role hard caps are fixed and telemetry observes violations without changin
 	for (const [role, expectedTurn, expectedHistory] of [
 		["commander", COMMANDER_TURN_MAX_BYTES, COMMANDER_HISTORY_MAX_BYTES],
 		["worker", WORKER_TURN_MAX_BYTES, WORKER_HISTORY_MAX_BYTES],
-		["other", WORKER_TURN_MAX_BYTES, WORKER_HISTORY_MAX_BYTES],
+		["other", WORKER_TURN_MAX_BYTES, OTHER_HISTORY_MAX_BYTES],
 	] as const) {
 		const telemetry = createOutputControlTelemetry(role);
 		assert.equal(telemetry.snapshot().turnHardCapBytes, expectedTurn);

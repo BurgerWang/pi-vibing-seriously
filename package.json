@@ -22,6 +22,7 @@
 		"test:gate-preflight": "tsx --test tests/gates.test.ts tests/p4-render.test.ts tests/result-summary-wiring.test.ts",
 		"test:worker-efficiency": "tsx --test tests/worker-policy.test.ts tests/worker-runner.test.ts tests/delegation-ledger.test.ts tests/p6-b-stable-prefix.test.ts",
 		"test:diff-review-efficiency": "tsx --test tests/diff-review.test.ts tests/diff-review-wiring.test.ts",
+		"test:compact-preflight": "tsx --test tests/compact-preflight.test.ts tests/p5-state-recovery.test.ts",
 		"test:context-output-baseline": "tsx --test tests/context-output-baseline.test.ts",
 		"test:context-output-core": "tsx --test tests/output-envelope.test.ts tests/turn-output-budget.test.ts tests/continuation-cursor.test.ts tests/bounded-file-io.test.ts tests/details-projection.test.ts tests/context-history-budget.test.ts tests/output-control-telemetry.test.ts",
 		"test:context-output-integration": "tsx --test tests/output-control-wiring.test.ts tests/read-v3.test.ts tests/read-run-log-page.test.ts tests/compare-output-bounds.test.ts tests/gate-output-bounds.test.ts tests/context-output-worker.test.ts",
@@ -48,8 +49,8 @@
 		"typebox": "*"
 	},
 	"devDependencies": {
-		"@earendil-works/pi-coding-agent": "0.83.0",
-		"@earendil-works/pi-tui": "0.83.0",
+		"@earendil-works/pi-coding-agent": "0.84.2",
+		"@earendil-works/pi-tui": "0.84.2",
 		"@types/node": "^24.0.0",
 		"tsx": "^4.23.0",
 		"typebox": "1.3.7",

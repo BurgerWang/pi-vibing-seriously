@@ -100,6 +100,8 @@ extensions/workbench-runtime/
     ├── path-guard.ts        # lexical + realpath containment for recipe paths
     ├── redact.ts            # secret-name/value detection and redaction
     ├── compact.ts           # P5 compaction supplement state + bounded note builder
+    ├── compact-preflight.ts # Unreleased: content-free Pi-preparation summary
+    │                        #   capacity estimator (allow/warn/block/unknown)
     ├── milestone-handoff.ts # P5 user-only milestone session handoff: explicit
     │                        #   bounded next-step parser, normalized/redacted
     │                        #   schema-v1 lifecycle records (the explicit next
@@ -193,7 +195,7 @@ GPT-5.6 Sol parent in DEV
   → child role matrix + hard guard: no recursion, no bash, no final gates
   → edit/write limited to parent-approved paths
   → worker-role lifecycle: one hidden soft-budget steer at 80%, cancel
-       session_before_compact (commander compaction unchanged)
+       session_before_compact before reading its preparation
   → bounded JSON event stream + verified model identity + nested usage
   → per-message context tracking (max tokens/ratio, 80% soft flag),
        compaction_start counting, 90% hard-stop termination, fail-closed
@@ -417,16 +419,35 @@ workbench events (task, phases, run/gate outcomes, edited files)
 session_before_compact
   → if role == worker: return { cancel: true }   (worker never continues
        through lossy compaction; runner budget policy owns the outcome)
-  → else (commander, unchanged):
+  → else evaluate Pi's actual prepared history and optional split-turn
+       request with numeric-only summary-capacity preflight facts
+      → unknown/allow: continue
+      → warn: bounded warning, then continue
+      → block: bounded notice naming
+           /q-milestone-handoff <next step>; return { cancel: true }
+           before summary provider call, compaction telemetry, or supplement
+  → for unknown/allow/warn Commander events:
       if shouldSupplement(state):
         pi.appendEntry("workbench-state", state)        (durable across compaction
                                                          and session replacement)
         pi.sendMessage({customType: "workbench-compact-note",
                         display: false}, {deliverAs: "nextTurn"})
         → hidden, bounded ASCII note in the next turn's context
-      → never cancels, never replaces Pi's own compaction summary
+      → never replaces Pi's own compaction summary
 session_start → loadCompactStateFromEntries(entries)   (restore)
 ```
+
+The estimator uses Pi 0.84.2's public `convertToLlm` and
+`serializeConversation` over `messagesToSummarize` and
+`turnPrefixMessages`, adds previous/custom instructions to the history-call
+estimate, and checks the two provider requests independently. Its base is the
+larger of `ceil(serializedChars/4)` and `ceil(serializedUtf8Bytes/3)`. It
+reserves Pi's native 80% history-summary or 50% turn-prefix output budget, a
+5% tokenizer headroom, 2,048 fixed input tokens, and a 5% context-window
+safety margin.
+This is a conservative engineering estimate, not a formal tokenizer/context-fit
+proof. Only an envelope it estimates at or above the model context window
+blocks; malformed or unmeasurable input is `unknown` and preserves the old path.
 
 Custom entries (`workbench-mode`, `workbench-state`, `workbench-cache-state`,
 and the P7 `workbench-delegation-state` / `workbench-write-lease`)
@@ -500,8 +521,9 @@ compaction/restoration retains the explicit handoff next step.
 
 ## Prompt-cache telemetry (P6-A)
 
-The schema-1.3 and P0–P2 statements in this section describe the Unreleased
-working tree, not a committed or deployed runtime.
+The schema-1.3 and P0–P2 statements in this section describe Unreleased source
+behavior. No deployment, tag, package publication, `/reload`, or live
+qualification is claimed.
 
 ```
 context                       → numeric projection anatomy + exact actor role
@@ -573,7 +595,7 @@ The status line appends a deterministic `COST S:$… W:$… O:$…` segment
 zero) through the existing `refreshStatus`/`ctx.ui.setStatus` flow — the Pi
 footer is never replaced and no other TUI surface changes. `refreshStatus`
 also runs after assistant and tool-result `message_end` events (in addition
-to the existing session/tool refreshes). Pi 0.83 persists the finished
+to the existing session/tool refreshes). Pi 0.84.2 persists the finished
 message after extension handlers, so the event message is included as a
 pending fact exactly once; identity/timestamp deduplication prevents double
 counting if persistence ordering changes in a future compatible Pi version.
@@ -847,9 +869,10 @@ chat messages. Same-mode prefix changes are recorded as
 
 ### Active-history projection state v3
 
-The history hard ceilings remain Commander 98,304 bytes (96 KiB), worker/other
-65,536 bytes (64 KiB), and 128 complete assistant/tool-result bundles. One role
-turn—65,536 bytes for Commander or 49,152 bytes for worker/other—and a
+The history hard ceilings are Commander 196,608 bytes (192 KiB), worker
+131,072 bytes (128 KiB), other 65,536 bytes (64 KiB), and 128 complete
+assistant/tool-result bundles. One role turn—65,536 bytes for Commander or
+49,152 bytes for worker/other—and a
 16-bundle suffix target are used only after a true hard crossing to choose the
 raw suffix protected from projection. Sixteen immutable segment slots each
 reserve at most 384 tool-text bytes and one complete bundle. Therefore:
@@ -859,11 +882,11 @@ anchorByteCap = max(0, hardToolTextBytes - roleTurnBytes - 16 * 384)
 anchorBundleCap = max(0, 128 - 16 - 16) = 96
 ```
 
-The resulting anchor caps are 26,624 bytes (26 KiB) for Commander and 10,240
-bytes (10 KiB) for worker/other. At the initial checkpoint, the controller
-chooses the largest latest raw suffix that fits the role-turn byte reserve and
-16 bundles at a complete-bundle boundary; it projects the preceding history
-into the anchor and leaves the suffix raw.
+The resulting anchor caps are 124,928 bytes (122 KiB) for Commander, 75,776
+bytes (74 KiB) for worker, and 10,240 bytes (10 KiB) for other. At the initial
+checkpoint, the controller chooses the largest latest raw suffix that fits the
+role-turn byte reserve and 16 bundles at a complete-bundle boundary; it
+projects the preceding history into the anchor and leaves the suffix raw.
 
 Inside an epoch, every request reconstructs the exact anchor, ordered immutable
 segments, and active raw suffix. Crossing the role-turn or 16-bundle reserve
@@ -893,7 +916,10 @@ is authoritative, so a malformed v1/v2/v3 record, Proxy/revoked Proxy, or
 `customType`/`data` accessor blocks fallback to an older valid state without
 executing traps; a safely unrelated ordinary entry may be skipped. Strict v1/v2
 entries are migration-only: only monotonic epoch and pressure carry forward,
-never old topology or hashes. Even when current history is below the cap, the
+never old topology or hashes. The schema remains v3; a valid state whose saved
+role cap differs from the current policy is accepted and emits one
+`policy_changed` transition, then replay is stable under the new policy. Even
+when current history is below the cap, the
 first post-restore request emits one `legacy_migration` boundary while returning
 the raw history unchanged; inactive v3 persistence prevents a repeat after
 reload.
@@ -925,19 +951,31 @@ from at most the latest 50 breakpoint candidates; approximately 15 requests
 per minute should share one key. Thus the 17 logical anchor/segment markers are
 not 17 writes per request. The research-backed client conclusion is one
 immutable fixed anchor plus modular immutable segments and rare checkpoints for
-both Commander and worker/other. The segmented shape improves structural
+Commander, worker, and other. The segmented shape improves structural
 exact-prefix stability, but offline evidence cannot prove a future provider
 `cacheRead`. See the
 [stable-prefix contract](cache/stable-prefix-contract.md) for primary sources
 and measurement limits.
 
 Warm-prefix auxiliary compaction remains
-`BLOCKED_BY_PI_0_83_PUBLIC_API`. The installed Pi 0.83 public hook can cancel
-or replace the compaction result before persistence, but it exposes neither a
-post-summary payload transform nor a guarantee that a separate summary call
-shares the original cache domain. This runtime therefore does not reimplement
-private authentication, headers, streaming, retries, or provider invocation.
-Pi's built-in/native compaction flow is unchanged.
+`BLOCKED_BY_PI_0_84_2_PUBLIC_API`. The surface was rechecked against the
+official [Pi v0.84.2 release](https://github.com/earendil-works/pi/releases/tag/v0.84.2)
+and [commit `914cf1472e715297caa30db4b9535d534a9eb718`](https://github.com/earendil-works/pi/commit/914cf1472e715297caa30db4b9535d534a9eb718).
+Its public hook can cancel or replace a compaction result before persistence,
+but exposes neither a post-summary payload transform nor a guarantee that a
+separate summary call shares the original cache domain. Its native summary call
+is standalone with `cacheRetention: "none"` and a fresh `sessionId`. This
+runtime therefore does not reimplement private authentication, headers,
+streaming, retries, or provider invocation. Allowed/warned Commander events
+keep Pi's native summary; the capacity preflight only cancels an envelope
+conservatively estimated at or above model context capacity.
+
+These cap values are currently sized for the 272k Commander model and pinned
+1M worker only. `other` and arbitrary 64k/128k model windows remain
+unqualified. The source change is not a cache-hit result: verify the repository
+Pi 0.84.2 dependencies (the current tree resolves them), pass declared gates,
+`/reload`, and collect fresh exact-correlated Commander and worker provider
+usage before judging it.
 
 ## Trusted recoverable tool-result ingress (P0)
 

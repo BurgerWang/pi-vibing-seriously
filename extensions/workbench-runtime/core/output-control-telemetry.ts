@@ -3,6 +3,7 @@ import { types as utilTypes } from "node:util";
 import {
 	COMMANDER_HISTORY_MAX_BYTES,
 	COMMANDER_TURN_MAX_BYTES,
+	OTHER_HISTORY_MAX_BYTES,
 	WORKER_HISTORY_MAX_BYTES,
 	WORKER_TURN_MAX_BYTES,
 	resolveOutputPolicyHardCeiling,
@@ -186,7 +187,11 @@ function turnCap(role: OutputControlRole): number {
 }
 
 function historyCap(role: OutputControlRole): number {
-	return role === "commander" ? COMMANDER_HISTORY_MAX_BYTES : WORKER_HISTORY_MAX_BYTES;
+	return role === "commander"
+		? COMMANDER_HISTORY_MAX_BYTES
+		: role === "worker"
+			? WORKER_HISTORY_MAX_BYTES
+			: OTHER_HISTORY_MAX_BYTES;
 }
 
 function toolId(value: unknown): OutputControlToolId {

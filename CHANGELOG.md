@@ -2,8 +2,8 @@
 
 ## [Unreleased] — Cache-prefix P0–P2
 
-This section describes working-tree changes only. It does not claim a commit,
-deployment, tag, package publish, or measured provider cache improvement.
+This section describes Unreleased source changes. No deployment, tag, package
+publication, `/reload`, or measured live provider cache improvement is claimed.
 
 ### Added
 
@@ -43,18 +43,36 @@ deployment, tag, package publish, or measured provider cache improvement.
   being persisted as actor evidence. Cache doctor also treats hostile or
   uninspectable telemetry objects as partial evidence without invoking Proxy
   traps or accessors.
+- Commander native compaction now runs a content-free capacity preflight over
+  Pi's actual `messagesToSummarize` and optional split-turn preparation. An
+  envelope estimated below the warning threshold continues, a near-capacity
+  estimate warns and continues, and a conservative estimate at or above model
+  capacity is cancelled before its summary provider call with a bounded
+  `/q-milestone-handoff <next step>` recovery notice. This engineering estimate
+  is not a formal tokenizer-fit proof. A blocked event writes no compaction
+  telemetry or supplement. Worker compaction remains cancelled before the
+  preparation is read.
 
 ### Changed
 
-- Crossing the 64/48 KiB turn reserve or 16-bundle suffix target alone no
-  longer seals history. Under the unchanged Commander/worker hard caps
-  (96/64 KiB and 128 bundles), history stays byte-identical. Only a true hard
-  byte or bundle crossing selects the protected suffix and seals aged
-  material.
+- Commander/worker active-history hard caps increase to 192/128 KiB; `other`
+  remains 64 KiB. With the unchanged 64/48 KiB turn reserves and sixteen
+  384-byte segment slots, the fixed anchors become 122/74/10 KiB for
+  Commander/worker/other. Crossing a turn reserve or 16-bundle suffix target
+  alone remains byte-identical; only a true role hard-byte or 128-bundle
+  crossing selects the protected suffix and seals aged material.
 - At most 16 immutable segments remain in one epoch. A later true hard crossing
   performs the deterministic, model-free safety checkpoint: rebuild the
-  anchor, clear the segment chain, and advance the epoch. Role hard caps and
-  failure/recovery behavior are unchanged.
+  anchor, clear the segment chain, and advance the epoch. Projection state v3
+  and telemetry schema 1.3 remain unchanged; old v3 role-policy state is
+  accepted and produces one deterministic `policy_changed` transition.
+- Package specifications target Pi/pi-tui 0.84.2. Its public compaction types
+  and implementation were rechecked at the official
+  [v0.84.2 release](https://github.com/earendil-works/pi/releases/tag/v0.84.2)
+  ([commit `914cf1472e715297caa30db4b9535d534a9eb718`](https://github.com/earendil-works/pi/commit/914cf1472e715297caa30db4b9535d534a9eb718));
+  the repository dependency tree resolves Pi/pi-tui 0.84.2, but this
+  Unreleased source entry makes no deployment, tag, package-publication,
+  `/reload`, or live-qualification claim.
 - The cache-design audit now records which principles were borrowed from
   [DeepSeek Harness at pinned commit `47f943859bef60e4160492346772ded9b24f765a`](https://github.com/deepseek-ai/deepseek-harness/tree/47f943859bef60e4160492346772ded9b24f765a):
   preserve an append-only reusable prefix, keep dynamic material late, and
@@ -65,10 +83,12 @@ deployment, tag, package publish, or measured provider cache improvement.
 ### Blocked
 
 - Warm-prefix auxiliary compaction is
-  `BLOCKED_BY_PI_0_83_PUBLIC_API`. Pi 0.83 has no public post-summary payload
-  transform or same-cache-domain guarantee, so the workbench does not duplicate
-  private authentication, headers, streaming, retry, or provider-call logic.
-  Built-in/native Pi compaction remains unchanged.
+  `BLOCKED_BY_PI_0_84_2_PUBLIC_API`. Pi 0.84.2 still has no public post-summary
+  payload transform or same-cache-domain guarantee, so the workbench does not
+  duplicate private authentication, headers, streaming, retry, or provider-call
+  logic. Allowed/warned requests use native Pi compaction; the new capacity
+  preflight only cancels when its conservative envelope estimate reaches or
+  exceeds the model context capacity.
 
 ## [0.10.0] — Context Output Control Plane
 

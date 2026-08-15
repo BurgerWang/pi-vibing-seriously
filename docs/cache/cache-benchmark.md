@@ -5,8 +5,9 @@ prompt-cache and action-cache behavior. It turns local evidence into a
 repeatable report so that "did caching help?" can be answered with the same
 numbers every time.
 
-Schema-1.3/P0–P2 fields described below are Unreleased working-tree behavior;
-their documentation is not a commit, deployment, or benchmark result.
+Schema-1.3/P0–P2 fields described below are Unreleased source behavior. No
+deployment, tag, package publication, `/reload`, live qualification, or
+benchmark result is claimed.
 
 ## Commands
 
@@ -110,10 +111,11 @@ mutation. Both unexpected reasons are actionable evidence, while all reasons
 remain workbench inferences rather than provider-issued miss verdicts.
 
 Projection-state v3 preserves that relationship with a fixed anchor, ordered
-immutable segments, and a raw active suffix. Commander uses a 98,304-byte hard
-ceiling, 65,536-byte turn reserve, and 26,624-byte anchor; worker/other uses
-65,536, 49,152, and 10,240 bytes. Both reserve sixteen segments of at most 384
-tool-text bytes/one complete bundle and cap the anchor at 96 bundles. The
+immutable segments, and a raw active suffix. Commander uses a 196,608-byte
+hard ceiling, 65,536-byte turn reserve, and 124,928-byte anchor; worker uses
+131,072, 49,152, and 75,776 bytes; other uses 65,536, 49,152, and 10,240
+bytes. All roles reserve sixteen segments of at most 384 tool-text bytes/one
+complete bundle and cap the anchor at 96 bundles. The
 turn/16-bundle values select the protected suffix only at a true hard crossing;
 reserve-only growth under both hard limits remains byte-identical and produces
 event `none`.
@@ -125,6 +127,8 @@ additional true hard crossing at the 16-segment ceiling triggers the
 deterministic model-free checkpoint, rebuilds the anchor, clears the chain, and
 produces the expected `HISTORY_PROJECTION_EPOCH_CHANGED`. Same-state suffix
 appends—including reserve-only crossing—remain whole-payload append-only.
+State stays v3 and telemetry stays schema 1.3; one `policy_changed` transition
+adapts a valid restored state created under an earlier role cap.
 
 This CLI is offline and observation-only. It can validate stored arithmetic
 and structural relationships, but its fake provider deliberately reports
@@ -174,11 +178,22 @@ The source synthesis also pins [DeepSeek Harness commit
 Append-only-prefix and bounded-model-surface principles are borrowed; MLA,
 server scheduling, disk-KV ownership, and harness measurements are not
 transferable benchmark claims. Warm-prefix auxiliary compaction remains
-`BLOCKED_BY_PI_0_83_PUBLIC_API`; built-in/native Pi compaction is unchanged.
+`BLOCKED_BY_PI_0_84_2_PUBLIC_API`, rechecked against the official
+[Pi v0.84.2 release](https://github.com/earendil-works/pi/releases/tag/v0.84.2)
+at [commit `914cf1472e715297caa30db4b9535d534a9eb718`](https://github.com/earendil-works/pi/commit/914cf1472e715297caa30db4b9535d534a9eb718).
+Commander capacity preflight does not replace summaries: block stops before
+provider/telemetry/supplement and points to
+`/q-milestone-handoff <next step>`; allow/warn/unknown retain native Pi
+compaction, while workers still cancel.
 The separate Commander and worker canary thresholds in the
 [stable-prefix contract](stable-prefix-contract.md#canary-evaluation-targets-not-guarantees)
 are evaluation targets only and cannot be satisfied by offline/fake-provider
-data.
+data. The larger caps likewise make no cache-hit promise until repository
+dependencies resolve (the current tree resolves Pi 0.84.2), declared gates
+pass, `/reload` is applied, and a fresh live Commander/worker cohort is
+measured. Current size qualification is
+limited to the 272k Commander model and pinned 1M worker; `other` and arbitrary
+64k/128k model windows remain unqualified.
 
 ## Statistics, reproducibility
 

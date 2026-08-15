@@ -18,7 +18,7 @@ import {
 	HISTORY_PROJECTION_MAX_SEGMENTS,
 	HISTORY_PROJECTION_SEGMENT_MAX_TOOL_TEXT_BYTES,
 } from "../extensions/workbench-runtime/core/context-history-budget.ts";
-import { OUTPUT_HARD_CAPS } from "../extensions/workbench-runtime/core/output-policy.ts";
+import { OUTPUT_HARD_CAPS, WORKER_TURN_MAX_BYTES } from "../extensions/workbench-runtime/core/output-policy.ts";
 
 export const CONTEXT_OUTPUT_STRESS_ARTIFACT = ".pi/workbench/runs/context-output-stress/context-output-evidence.json";
 const FORMAL_STRESS = process.env.npm_lifecycle_event === "test:context-output-stress";
@@ -122,7 +122,7 @@ function assertEvidence(evidence: ContextOutputEvidence): void {
 	assert.ok(evidence.metrics.per_result_text_bytes.count > 0);
 	assert.ok(evidence.metrics.per_result_text_bytes.max <= 32_768);
 	assert.ok(evidence.metrics.per_turn_tool_text_bytes.max <= 65_536);
-	assert.ok(evidence.metrics.active_history_tool_text_bytes.max <= 98_304);
+	assert.ok(evidence.metrics.active_history_tool_text_bytes.max <= OUTPUT_HARD_CAPS.commander.historyMaxBytes);
 	assert.equal(evidence.metrics.rss.sparse_log_child.measurement, "process.resourceUsage().maxRSS");
 	assert.ok(evidence.metrics.rss.sparse_log_child.baseline_peak_bytes > 0);
 	assert.ok(evidence.metrics.rss.sparse_log_child.peak_bytes >= evidence.metrics.rss.sparse_log_child.baseline_peak_bytes);
@@ -194,6 +194,9 @@ function assertEvidence(evidence: ContextOutputEvidence): void {
 	assert.equal(worker?.metrics.production_read_tool_results, 24);
 	assert.equal(worker?.fixture.source_file_bytes_each, 512 * 1_024);
 	assert.equal(worker?.fixture.total_source_bytes, 24 * 512 * 1_024);
+	assert.equal(worker?.fixture.reserve_crossing_tool_turn, 12);
+	assert.equal(worker?.fixture.reserve_crossing_read_limit_lines, 1);
+	assert.equal(worker?.fixture.reserve_crossing_first_line_bytes, 4 * 1_024);
 	assert.ok(Number(worker?.metrics.max_pre_history_tool_result_text_bytes) <= 32_768);
 	assert.equal(worker?.metrics.actual_tool_result_message_events, 24);
 	assert.equal(worker?.metrics.forwarded_raw_tool_result_events, 0);
@@ -227,11 +230,17 @@ function assertEvidence(evidence: ContextOutputEvidence): void {
 	assert.equal(worker?.metrics.history_projection_selection_reserve_valid, true);
 	assert.equal(worker?.metrics.history_projection_reserve_only_growth_observed, true);
 	assert.equal(worker?.metrics.history_projection_reserve_only_growth_stayed_same_topology, true);
+	const reserveCrossingResultBytes = Number(worker?.metrics.reserve_crossing_result_text_bytes);
+	const reserveCrossingActiveBytes = Number(worker?.metrics.maximum_history_projection_active_tool_text_bytes);
+	assert.ok(reserveCrossingResultBytes > 0 && reserveCrossingResultBytes < 12_288);
 	assert.equal(
-		worker?.metrics.maximum_history_projection_active_tool_text_bytes,
-		5 * 12_288,
-		"the deterministic worker must expose the 60 KiB under-hard active tail that crossed only the 48 KiB selection reserve",
+		reserveCrossingActiveBytes,
+		WORKER_TURN_MAX_BYTES + reserveCrossingResultBytes,
+		"the deterministic smaller page must grow the same active topology strictly beyond the 48 KiB selection reserve",
 	);
+	assert.equal(worker?.metrics.reserve_crossing_expected_active_tool_text_bytes, reserveCrossingActiveBytes);
+	assert.ok(reserveCrossingActiveBytes > WORKER_TURN_MAX_BYTES, "reserve-only crossing must stay strict");
+	assert.ok(reserveCrossingActiveBytes < OUTPUT_HARD_CAPS.worker.historyMaxBytes, "reserve-only growth must remain below the true hard cap");
 	assert.ok(Number(worker?.metrics.maximum_history_projection_state_bytes) <= 32 * 1_024);
 	assert.equal(
 		worker?.metrics.minimum_worker_anchor_reserve_bytes,

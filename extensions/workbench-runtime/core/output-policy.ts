@@ -21,9 +21,10 @@ export const COMPARE_RESULT_MAX_LINES = 400 as const;
 export const ERROR_RESULT_MAX_BYTES = 8_192 as const;
 
 export const COMMANDER_TURN_MAX_BYTES = 65_536 as const;
-export const COMMANDER_HISTORY_MAX_BYTES = 98_304 as const;
+export const COMMANDER_HISTORY_MAX_BYTES = 196_608 as const;
 export const WORKER_TURN_MAX_BYTES = 49_152 as const;
-export const WORKER_HISTORY_MAX_BYTES = 65_536 as const;
+export const WORKER_HISTORY_MAX_BYTES = 131_072 as const;
+export const OTHER_HISTORY_MAX_BYTES = 65_536 as const;
 export const DETAILS_MAX_BYTES = 8_192 as const;
 export const STREAM_UPDATE_MAX_BYTES = 4_096 as const;
 export const MAX_TOOL_CALLS_PER_TURN = 16 as const;
@@ -42,6 +43,7 @@ export const OUTPUT_HARD_CAPS = Object.freeze({
 	errorResult: Object.freeze({ maxBytes: ERROR_RESULT_MAX_BYTES }),
 	commander: Object.freeze({ turnMaxBytes: COMMANDER_TURN_MAX_BYTES, historyMaxBytes: COMMANDER_HISTORY_MAX_BYTES }),
 	worker: Object.freeze({ turnMaxBytes: WORKER_TURN_MAX_BYTES, historyMaxBytes: WORKER_HISTORY_MAX_BYTES }),
+	other: Object.freeze({ turnMaxBytes: WORKER_TURN_MAX_BYTES, historyMaxBytes: OTHER_HISTORY_MAX_BYTES }),
 	detailsMaxBytes: DETAILS_MAX_BYTES,
 	streamUpdateMaxBytes: STREAM_UPDATE_MAX_BYTES,
 	maxToolCallsPerTurn: MAX_TOOL_CALLS_PER_TURN,

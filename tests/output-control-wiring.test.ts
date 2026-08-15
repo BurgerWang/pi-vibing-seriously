@@ -378,7 +378,7 @@ test("runtime registers one fail-closed context projector before provider teleme
 			timestamp: 2,
 		} as unknown as AgentMessage,
 	];
-	const input = makeHistory("role-cap", "x".repeat(80 * 1_024));
+	const input = makeHistory("role-cap", "x".repeat(160 * 1_024));
 	const run = async (role: "commander" | "worker" | "other") => {
 		const stub = makeRoleRuntime(role);
 		const ctx = trustedCtx(process.cwd(), `history-${role}`) as ExtensionContext;
@@ -398,7 +398,7 @@ test("runtime registers one fail-closed context projector before provider teleme
 	const commander = await run("commander");
 	const worker = await run("worker");
 	const other = await run("other");
-	assert.equal(historyToolTextBytes(commander), 80 * 1_024);
+	assert.equal(historyToolTextBytes(commander), 160 * 1_024);
 	assert.ok(historyToolTextBytes(commander) <= COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES);
 	assert.ok(historyToolTextBytes(worker) <= WORKER_HISTORY_TOOL_TEXT_MAX_BYTES);
 	assert.ok(historyToolTextBytes(other) <= OTHER_HISTORY_TOOL_TEXT_MAX_BYTES);
@@ -534,7 +534,7 @@ test("worker runtime projects the real outgoing context and round-trips strict v
 				role: "toolResult",
 				toolCallId: id,
 				toolName: "read",
-				content: [{ type: "text", text: String(index).repeat(20 * 1_024) }],
+				content: [{ type: "text", text: String(index).repeat(30 * 1_024) }],
 				isError: false,
 				timestamp: index * 2 + 2,
 			} as unknown as AgentMessage,
@@ -549,7 +549,7 @@ test("worker runtime projects the real outgoing context and round-trips strict v
 		(message as { role?: unknown }).role === "toolResult"
 		&& (message as { toolCallId?: unknown }).toolCallId === "worker-history-4"
 	)) as unknown as { content: Array<Record<string, unknown>> };
-	assert.equal(textOf(latest.content), "4".repeat(20 * 1_024), "latest complete worker bundle stays raw");
+	assert.equal(textOf(latest.content), "4".repeat(30 * 1_024), "latest complete worker bundle stays raw");
 
 	await emitEvent(stub, "turn_end", { type: "turn_end", turnIndex: 61, message: {}, toolResults: [] }, ctx);
 	const persisted = [...stub.appendedEntries].reverse().find((entry) => entry.customType === HISTORY_PROJECTION_ENTRY_TYPE);

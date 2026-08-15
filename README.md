@@ -173,12 +173,12 @@ history.
 | Run-log page; diff review; comparison | 32,768 bytes and 400 lines |
 | Gate read | 24 KiB and 320 lines |
 | One turn's tool-result batch | Commander 64 KiB; worker 48 KiB; at most 16 calls |
-| Active tool-result history | Commander 96 KiB; worker 64 KiB |
+| Active tool-result history | Commander 192 KiB; worker 128 KiB; other 64 KiB |
 | Active-history bundles | 128 complete assistant/tool-result bundles |
 | Details value / streaming update | 8 KiB / 4 KiB |
 
-The P0–P2 refinements below are **Unreleased working-tree behavior**; this page
-does not claim that they are committed, installed, or deployed.
+The P0–P2 refinements below are **Unreleased source behavior**. No deployment,
+tag, package publication, `/reload`, or live qualification is claimed.
 
 Trusted tool-result ingress now applies to exactly six finalized durable
 sources: recipe summaries, executed gate records, immutable comparisons,
@@ -202,17 +202,20 @@ metadata and prefers the durable source path over a receipt-summary fallback.
 
 Projection-state v3 uses one role turn and 16 one-bundle segment slots to size
 the fixed anchor. Its anchor byte cap is
-`max(0, hard tool text - role turn - 16 * 384)`: **26 KiB for Commander**
-(`96 KiB - 64 KiB - 6 KiB`) and **10 KiB for worker/other**
+`max(0, hard tool text - role turn - 16 * 384)`: **122 KiB for Commander**
+(`192 KiB - 64 KiB - 6 KiB`), **74 KiB for worker**
+(`128 KiB - 48 KiB - 6 KiB`), and **10 KiB for other**
 (`64 KiB - 48 KiB - 6 KiB`). The anchor holds at most 96 bundles; the active
 suffix target is at most 16 bundles once a hard-limit projection is required.
 Up to 16 immutable segments may follow the anchor, each projecting no more
-than 384 UTF-8 tool-text bytes and one complete bundle.
+than 384 UTF-8 tool-text bytes and one complete bundle. The v3 state and
+telemetry schema 1.3 do not change; a restored state created under an earlier
+role cap produces one deterministic `policy_changed` transition.
 
 Normal requests replay the exact anchor, ordered segments, and raw active
 suffix. Crossing only the turn or 16-bundle reserve does **not** seal or rewrite
 an under-cap request. The controller acts only when the complete reconstructed
-history crosses the unchanged 96/64 KiB or 128-bundle hard ceiling; at that
+history crosses the role's 192/128/64 KiB or 128-bundle hard ceiling; at that
 decision it keeps the largest complete raw suffix that fits the reserve and
 seals aged material once. Seals 1–16 append a new immutable segment, keep the
 epoch and every older boundary byte-identical, and are an expected tail
@@ -270,12 +273,25 @@ surface; both shares are then `null`, never saturated into a ratio. Cache
 doctor treats Proxy/accessor/symbol/exotic telemetry as uninspectable partial
 evidence without invoking application code.
 
-Warm-prefix auxiliary compaction is intentionally not implemented and is
-recorded as `BLOCKED_BY_PI_0_83_PUBLIC_API`: Pi 0.83 exposes pre-compaction
-cancel/replace-summary control but no post-summary payload transform or
-same-cache-domain guarantee. The workbench does not reimplement private
-authentication, headers, streaming, or retries. Pi's built-in/native
-compaction behavior remains unchanged.
+Commander compaction now has a content-free summary-capacity preflight over
+Pi's actual prepared history and optional split-turn request. It conservatively
+estimates each request envelope: estimates below the warning threshold continue,
+near-capacity estimates warn and continue, and an estimate at or above the model
+window blocks before any summary provider call. A block writes neither
+compaction telemetry nor the workbench supplement and directs the operator to
+`/q-milestone-handoff <next step>`; workers still cancel compaction before
+reading its preparation. Unknown/malformed inputs preserve Pi's prior path.
+
+Warm-prefix auxiliary compaction remains intentionally unimplemented and is
+recorded as `BLOCKED_BY_PI_0_84_2_PUBLIC_API`. The public surface was rechecked
+against [Pi v0.84.2](https://github.com/earendil-works/pi/releases/tag/v0.84.2)
+at [commit `914cf1472e715297caa30db4b9535d534a9eb718`](https://github.com/earendil-works/pi/commit/914cf1472e715297caa30db4b9535d534a9eb718): it exposes pre-compaction
+cancel/replacement control but no post-summary payload transform or
+same-cache-domain guarantee; its native summary call is standalone with cache
+retention disabled and a fresh session id. The workbench does not reimplement
+private authentication, headers, streaming, or retries. Allowed/warned
+requests still use Pi's native summarizer; the preflight never supplies a
+replacement.
 
 The formal stress recipe writes fake-provider telemetry only to its temporary
 project and verifies repository telemetry hashes are unchanged.
@@ -438,12 +454,15 @@ scoped to mid/low-frequency research only.
 
 ## Compatibility
 
-Tested environments (only claims backed by actual runs — see
+Released v0.10.0 tested environments (only claims backed by actual runs — see
 [docs/compatibility.md](docs/compatibility.md) and
 [compatibility/pi.json](compatibility/pi.json)): Pi **0.83.0** (TUI, print,
 json modes), pi-tui 0.83.0, Node **v24.13.0**, npm **11.18.0**, CachyOS
-Linux, typebox 1.3.7, yaml 2.9.x. Other versions are untested — no
-compatibility is claimed for them.
+Linux, typebox 1.3.7, yaml 2.9.x. The Unreleased source targets Pi **0.84.2**
+and the repository dependency tree now resolves Pi/pi-tui 0.84.2. Its public
+compaction surface has been source-audited, but deployment and updated
+live/provider qualification still require the final declared gates, `/reload`,
+and fresh Commander/worker canaries.
 
 ## Development
 
