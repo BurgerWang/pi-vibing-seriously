@@ -105,7 +105,7 @@ test("banner.svg exists, is referenced by the README, and is renderer-safe", asy
 	assert.ok(svg.includes(`v${pkg.version}`), `banner carries the package version v${pkg.version}`);
 });
 
-test("refreshed banner design: mode chips, title cursor, tagline and version chip", async () => {
+test("product banner design: Pi tile, development-first title, delivery line and status chips", async () => {
 	const svg = await readFile(join(ROOT, "assets", "banner.svg"), "utf8");
 	const pkg = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8")) as { version: string };
 
@@ -113,22 +113,17 @@ test("refreshed banner design: mode chips, title cursor, tagline and version chi
 	const ariaMatch = svg.match(/aria-label="([^"]*)"/);
 	assert.ok(ariaMatch, "aria-label present");
 	const ariaLabel = ariaMatch[1] ?? "";
-	assert.ok(ariaLabel.includes("AUDIT / DEV / VERIFY"), "aria-label names the three modes");
-	assert.ok(ariaLabel.includes("recipes, gates and evidence"), "aria-label names recipes/gates/evidence");
+	assert.ok(ariaLabel.includes("development-first Pi workbench"), "aria-label states the product position");
+	assert.ok(ariaLabel.includes("Sol and Luna"), "aria-label names the collaboration model");
+	assert.ok(ariaLabel.includes("evidence-backed delivery"), "aria-label names the product outcome");
 	assert.ok(ariaLabel.includes(`v${pkg.version}`), "aria-label carries the package version");
 
-	// Three mode chips, each stroked in its own mode color.
-	for (const color of ["#7d93b5", "#e8b64c", "#8abeb7"]) {
-		assert.ok(svg.includes(`stroke="${color}"`), `mode chip stroke ${color} present`);
-	}
-
-	// Terminal cursor block (amber, title-scale 18x63) after the WORKBENCH title.
-	assert.ok(/width="18" height="63" fill="#e8b64c"/.test(svg), "title cursor block present");
-
-	// Bottom row: slate tagline, teal checkmark, amber version chip.
-	assert.ok(svg.includes('fill="#7d93b5"'), "tagline/AUDIT glyph color present");
-	assert.ok(svg.includes('fill="#8abeb7"'), "accent (title/bars/checkmark) color present");
-	assert.ok(svg.includes('fill="#e8b64c"'), "cursor/DEV/version glyph color present");
+	assert.ok(/x="32" y="32" width="146" height="150" fill="#121c33"/.test(svg), "Pi product tile present");
+	assert.ok(/x="606" y="67" width="14" height="49" fill="#e8b64c"/.test(svg), "terminal cursor present");
+	assert.equal((svg.match(/y="190"/g) ?? []).length, 4, "four compact status chips present");
+	assert.ok(svg.includes('stroke="#7d93b5"'), "AUDIT/DEV/VERIFY pipeline stroke present");
+	assert.ok(svg.includes('stroke="#8abeb7"'), "Pi/Sol/Luna/PASS stroke present");
+	assert.ok(svg.includes('stroke="#e8b64c"'), "version stroke present");
 });
 
 test("README banner reference matches the generated banner (alt text and width)", async () => {
