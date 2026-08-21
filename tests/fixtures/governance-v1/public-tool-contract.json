@@ -1,0 +1,51 @@
+{
+  "snapshot_schema": 1,
+  "catalog_hash": "a3183c62cc79b297c50b12c66077af3813e8c3923db1861a6ad08931f364229c",
+  "tools": [
+    { "name": "workbench_project_inspect", "parameters_hash": "efddc7bd8bbcef73a14eb1ace1ffdaec81e518ef1e13c1e9271d0b8acb694a49", "metadata_hash": "3849508e21627b1bb637083cea7148fdc9adacbdfd4e55bad6ea25de345dea5a" },
+    { "name": "workbench_run_recipe", "parameters_hash": "ad3e543bae82b5779fc7f52977dc37b18c0c550424fa4c1708dfcf1acce04a31", "metadata_hash": "2a9e270e1a43945841e4f09627609a11a7aa216765f3a4a01302a169e8177f92" },
+    { "name": "workbench_read_run", "parameters_hash": "0419efe41e174ff1bd9eac585c1d24af9aca9bb21e59aeefe417bbd66a54f2bb", "metadata_hash": "334add83f2352f9c47f610671d15e24564de2d7782e66d8cb3ed71be05c3f176" },
+    { "name": "workbench_run_gate", "parameters_hash": "a24ce8da8f45fde2602bfbba61b1cdc422ae664c25a01eaa2bb54d083b13f288", "metadata_hash": "059a120edd56937a22d8876d3affcab9dfdecbfa349010749a3491d8dfa41444" },
+    { "name": "workbench_read_gate", "parameters_hash": "6ae5e058bd9fa84c193f33eb3611d3f4e4b6728c7f283472f2ad406b1343a3ed", "metadata_hash": "6f184568f1ac94c348b6287db0ff419b89a0bf0028a31653d271ea83394332fc" },
+    { "name": "workbench_list_gates", "parameters_hash": "efddc7bd8bbcef73a14eb1ace1ffdaec81e518ef1e13c1e9271d0b8acb694a49", "metadata_hash": "acd55e08cba3b0bb0050a98a62230327f544d05816407debb36b309deaf6adc4" },
+    { "name": "workbench_compare_runs", "parameters_hash": "8a71ac95b86c0b7ba372a86ae7586382bbcfe308f44300d034649f2fce08b81a", "metadata_hash": "8d306c5197cc7d25da5251b1c8cfab3c7dd7ace71cb76624be5831c004b0cc37" },
+    { "name": "workbench_delegate_worker", "parameters_hash": "dc1db21e3590c7f57cfa88f042052964a92d495116966747918d72f2018176a7", "metadata_hash": "17ee3ae2c832a78fa1823a21f022646386966882b86c62b85cc1d1d7f4150187" },
+    { "name": "workbench_review_worker_diff", "parameters_hash": "63c7a5543e256e9641364d845a78327828c354c59e71aaab8184d4aed05cde6a", "metadata_hash": "9ffb6de2d119b8ca69613cfa787873051cebb75664f143e40ce78cd41e387ba1" },
+    { "name": "workbench_delegation_status", "parameters_hash": "efddc7bd8bbcef73a14eb1ace1ffdaec81e518ef1e13c1e9271d0b8acb694a49", "metadata_hash": "e58330534db5b82b65178dd7060915e67c2ddfc93c22f2cb62db4d228b1e342f" },
+    { "name": "workbench_recover_tool_result", "parameters_hash": "008208084aa537a0ac2d1d48d5f6cc43346c952e6f4b69be587a2dd73a8af4c0", "metadata_hash": "61b85a311542bdd84f1f717e58f6a9d3c7ca412aad87fda18bdd021389d99b80" }
+  ],
+  "observable_result_semantics": [
+    { "name": "workbench_project_inspect", "envelope": "text-content+bounded-details", "category": "read-only project snapshot", "source_symbols": ["InspectToolDetails", "renderInspectLines"] },
+    { "name": "workbench_run_recipe", "envelope": "text-content+bounded-details", "category": "declared recipe execution with persisted run authority", "source_symbols": ["RecipeToolDetails", "runRecipe", "buildRecipeParentSummary"] },
+    { "name": "workbench_read_run", "envelope": "text-content+bounded-details", "category": "read-only bounded run view and reuse observation", "source_symbols": ["ReadRunToolDetails", "readManifest", "renderRunResult"] },
+    { "name": "workbench_run_gate", "envelope": "text-content+bounded-details", "category": "formal persisted gate execution or explicit read-only preflight", "source_symbols": ["GateToolDetails", "GatePreflightToolDetails", "runGates", "preflightGateManualEvidence"] },
+    { "name": "workbench_read_gate", "envelope": "text-content+bounded-details", "category": "read-only bounded gate run or definition view", "source_symbols": ["readGateRunPage", "renderGateDefinitionPage"] },
+    { "name": "workbench_list_gates", "envelope": "text-content+bounded-details", "category": "read-only gate catalog and latest-status view", "source_symbols": ["renderGateListPresentation", "latestGateStatuses"] },
+    { "name": "workbench_compare_runs", "envelope": "text-content+bounded-details", "category": "read-only descriptive run comparison", "source_symbols": ["CompareToolDetails", "compareRuns", "renderCompareLines"] },
+    { "name": "workbench_delegate_worker", "envelope": "text-content+bounded-details", "category": "bounded worker launch with delegation ledger persistence", "source_symbols": ["createDelegationLedger", "finishDelegationLedger", "buildDelegateWorkerResult"] },
+    { "name": "workbench_review_worker_diff", "envelope": "text-content+bounded-details", "category": "actual-diff review with review authority update", "source_symbols": ["reviewDelegation", "markReviewed", "demoteReviewedToPending"] },
+    { "name": "workbench_delegation_status", "envelope": "text-content+bounded-details", "category": "delegation authority observation with real-diff refresh", "source_symbols": ["delegationStatusLines", "delegationContextRiskLine"] },
+    { "name": "workbench_recover_tool_result", "envelope": "text-content+bounded-details", "category": "read-only receipt recovery; presentation never acceptance evidence", "source_symbols": ["recoverReceipt", "renderReceiptRecovery", "recoverFailureText"] }
+  ],
+  "error_semantics": {
+    "begin_block_reason_hashes": {
+      "completed_replay": "3418aa4e4e0942034649c753359497a7d3df58351e5530f4be306efe86edc73c",
+      "incomplete_replay": "ec702ebe095e06aa8d9fc5a257b32d6f1c509301a500e480a0fbb82e1706df05",
+      "corrupt_receipt": "e5883b139556aaeb1b5db4751dc7b90903c540f750a9e80c1e5cde8290bd1ec6",
+      "identity_conflict": "2a91c2fc4becc007dd57be9f5693e8dcc4b3e789b40c4abcbb76513184626676",
+      "invalid_identity": "7a064263293a25c762b7b9ea6ce7c31c9f053711edc33fa50d26b6e64c5bdc9c",
+      "storage_error": "6e0f7982218d128aaad2f057185a0ad15f18b691f7878b64054ebcdd6e905676"
+    },
+    "finalize_unavailable_codes": ["invalid_handle", "missing_started", "corrupt_started", "identity_conflict", "already_finalized", "write_error"],
+    "recover_codes": ["invalid", "missing", "incomplete", "corrupt", "conflict", "storage_error"],
+    "recover_failure_hashes": {
+      "invalid": "1183095e57d38a9e528961ba2876a0cc923fb3de1bd84d5fdd5512372a2ab2da",
+      "missing": "2d70cc9c31f159f576eb0a239c94ec16c002a812855434627b5d5f033ef36d1f",
+      "incomplete": "0aec8252dc9eba6c3b49e842ae8c86a44251f9102aca47ead842644837db6595",
+      "corrupt": "25cff06e3272f3b9584d8839e4b492048a84d2c15dc584b93d0e35f4c2e8a9c0",
+      "conflict": "a7f84b77cb344b819eb479336a800f36944debd838bfd12d71c94b8456f4ffa5",
+      "storage_error": "42ffdcf8121861828e35fa960380cb0c63518cba2d104050cbfa1cb365c7d80f"
+    },
+    "validation_refusal_reasons": ["missing-binding", "legacy-binding", "corrupt-binding", "unavailable-binding", "unsuccessful-source", "incomplete-source", "non-sol-source", "commit-mismatch", "diff-mismatch", "dependencies-mismatch", "config-mismatch", "gate-state-mismatch", "profile-mismatch", "mode-mismatch", "target-mismatch", "collection-failure"]
+  }
+}

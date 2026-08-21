@@ -18,7 +18,14 @@ export const WORKER_ROLE_ENV = "WORKBENCH_AGENT_ROLE";
 export const WORKER_ALLOWED_PATHS_ENV = "WORKBENCH_WORKER_ALLOWED_PATHS";
 export const WORKER_PROJECT_ROOT_ENV = "WORKBENCH_WORKER_PROJECT_ROOT";
 export const WORKER_DEPTH_ENV = "WORKBENCH_WORKER_DEPTH";
+export const WORKER_TASK_KIND_ENV = "WORKBENCH_WORKER_TASK_KIND";
+export const WORKER_DELEGATION_ID_ENV = "WORKBENCH_WORKER_DELEGATION_ID";
+export const WORKER_CONTRACT_HASH_ENV = "WORKBENCH_WORKER_CONTRACT_HASH";
 export const WORKER_ROLE = "worker";
+
+export type WorkerTaskKind = "implementation" | "diagnosis";
+export type WorkerRuntimeTaskKind = WorkerTaskKind | "invalid";
+export const WORKER_TASK_KIND_DEFAULT: WorkerTaskKind = "implementation";
 
 export const COMMANDER_MODEL_ID = "gpt-5.6-sol";
 export const COMMANDER_PROVIDERS: readonly string[] = ["openai", "openai-codex"];
@@ -30,8 +37,11 @@ export const WORKER_HIDDEN_TOOLS: ReadonlySet<string> = new Set([
 	"workbench_run_gate",
 	WORKER_TOOL_NAME,
 ]);
+const WORKER_READ_ONLY_HIDDEN_TOOLS: ReadonlySet<string> = new Set(["edit", "write"]);
 
 export interface WorkerTaskContract {
+	/** Omitted is the governance-v1-compatible implementation default. */
+	taskKind?: WorkerTaskKind;
 	task: string;
 	allowedPaths: readonly string[];
 	acceptanceCriteria: readonly string[];
@@ -64,6 +74,29 @@ export interface WorkerRoleContext {
 	role?: string;
 	projectRoot?: string;
 	allowedPaths?: readonly string[];
+	/** `invalid` is the fail-closed child-env parse result. */
+	taskKind?: WorkerRuntimeTaskKind;
+}
+
+export type ResolveWorkerTaskKindResult =
+	| { ok: true; taskKind: WorkerTaskKind }
+	| { ok: false; error: string };
+
+/** Strict public/contract parser: omission alone resolves to implementation. */
+export function resolveWorkerTaskKind(raw: unknown): ResolveWorkerTaskKindResult {
+	if (raw === undefined) return { ok: true, taskKind: WORKER_TASK_KIND_DEFAULT };
+	if (raw === "implementation" || raw === "diagnosis") return { ok: true, taskKind: raw };
+	return { ok: false, error: 'task_kind must be one of "implementation" | "diagnosis"' };
+}
+
+/** Strict child-env parser. Missing keeps v1 compatibility; malformed is least privilege. */
+export function parseWorkerTaskKindEnvironment(raw: string | undefined): WorkerRuntimeTaskKind {
+	const resolved = resolveWorkerTaskKind(raw);
+	return resolved.ok ? resolved.taskKind : "invalid";
+}
+
+function effectiveWorkerTaskKind(taskKind: WorkerRuntimeTaskKind | undefined): WorkerRuntimeTaskKind {
+	return taskKind ?? WORKER_TASK_KIND_DEFAULT;
 }
 
 /** Only GPT-5.6 Sol on an approved first-party provider may command workers. */
@@ -125,9 +158,14 @@ export function isWorkerPathAllowed(projectRoot: string, candidatePath: string, 
 }
 
 /** Fixed worker-role tool matrix: hide denied tools while preserving order. */
-export function computeRoleActiveTools(tools: readonly string[], role: string | undefined): string[] {
+export function computeRoleActiveTools(
+	tools: readonly string[],
+	role: string | undefined,
+	taskKind?: WorkerRuntimeTaskKind,
+): string[] {
 	if (role !== WORKER_ROLE) return [...tools];
-	return tools.filter((tool) => !WORKER_HIDDEN_TOOLS.has(tool));
+	const readOnly = effectiveWorkerTaskKind(taskKind) !== "implementation";
+	return tools.filter((tool) => !WORKER_HIDDEN_TOOLS.has(tool) && !(readOnly && WORKER_READ_ONLY_HIDDEN_TOOLS.has(tool)));
 }
 
 /**
@@ -147,6 +185,12 @@ export function workerRoleToolCallBlockReason(
 	if (toolName === "workbench_run_gate") return "Delegated workers cannot run final validation gates; the Sol commander owns verification";
 	if (toolName === "bash") return "Delegated workers cannot use free-form bash; use declared workbench recipes for project commands";
 	if (toolName !== "edit" && toolName !== "write") return undefined;
+	const taskKind = effectiveWorkerTaskKind(context.taskKind);
+	if (taskKind !== "implementation") {
+		return taskKind === "diagnosis"
+			? `Diagnosis workers are read-only and cannot use ${toolName}`
+			: `Delegated worker has an invalid task-kind contract and cannot use ${toolName}`;
+	}
 
 	const path =
 		typeof input === "object" && input !== null && "path" in input
@@ -330,9 +374,12 @@ export function recipeMutationBlockReason(
  * and authority are unchanged.
  */
 export function formatWorkerTask(contract: WorkerTaskContract): string {
+	const resolvedTaskKind = resolveWorkerTaskKind(contract.taskKind);
+	if (!resolvedTaskKind.ok) throw new Error(resolvedTaskKind.error);
+	const diagnosis = resolvedTaskKind.taskKind === "diagnosis";
 	const profile = contract.budgetProfile ?? WORKER_SPEND_DEFAULT_PROFILE;
 	const lines = [
-		"Delegated implementation task:",
+		diagnosis ? "Delegated diagnosis task (strictly read-only):" : "Delegated implementation task:",
 		contract.task.trim(),
 		"",
 	];
@@ -342,10 +389,12 @@ export function formatWorkerTask(contract: WorkerTaskContract): string {
 	lines.push(
 		`Worker spend-budget profile: ${profile} — bounds cumulative spend only; never expands parent-approved path/scope authority.`,
 		"",
-		"Parent-approved paths (exact path, or subtree ending in / or /**):",
+		diagnosis
+			? "Parent-approved inspection paths (inspection scope only; never write authority):"
+			: "Parent-approved paths (exact path, or subtree ending in / or /**):",
 		...contract.allowedPaths.map((path) => `- ${path}`),
 		"",
-		"Acceptance criteria:",
+		diagnosis ? "Diagnostic objectives (evidence for Sol; never acceptance):" : "Acceptance criteria:",
 		...contract.acceptanceCriteria.map((criterion) => `- ${criterion}`),
 	);
 	if (contract.verification.length > 0) {

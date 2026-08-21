@@ -39,6 +39,8 @@ import { runRecipe } from "../extensions/workbench-runtime/core/recipe-runner.ts
 import { readManifest, type RunRecord } from "../extensions/workbench-runtime/core/runs.ts";
 import { loadProjectConfig, type ExecFn } from "../extensions/workbench-runtime/core/config.ts";
 import { assessRunValidation, type RunValidationAssessment } from "../extensions/workbench-runtime/core/validation-assessment.ts";
+import { ARTIFACT_MANIFEST_FILE } from "../extensions/workbench-runtime/core/artifact-contract.ts";
+import { RUN_COMMIT_FILE } from "../extensions/workbench-runtime/core/run-transaction.ts";
 import {
 	gateStateHash,
 	unavailableEvidenceBlock,
@@ -171,10 +173,10 @@ test("raw manifest argv mutation alone does not matter", async () => {
 		const argvSecret = "argv-secret-token-xyz";
 		const originalRaw = JSON.parse(await readFile(manifestPath(dir, runId), "utf8")) as Record<string, unknown>;
 
-		const mutated = await persistManifest(dir, runId, {
+		const mutated = {
 			...JSON.parse(JSON.stringify(originalRaw)) as Record<string, unknown>,
 			argv: ["node", "-e", "process.exit(0)", argvSecret],
-		});
+		} as unknown as RunRecord;
 		const verdict = await assess(dir, mutated);
 		assert.deepEqual(verdict, REUSABLE, "argv is never read — only the argv_hash identity binds");
 		assert.ok(!JSON.stringify(verdict).includes(argvSecret), "raw argv must never surface in assessment output");
@@ -188,6 +190,12 @@ test("argv_hash identity: missing/malformed/mismatched refuse with corrupt-bindi
 		const { runId } = await runRecipeRun(dir, "hello");
 		const originalRaw = JSON.parse(await readFile(manifestPath(dir, runId), "utf8")) as Record<string, unknown>;
 		assert.match(String(originalRaw.argv_hash), /^[0-9a-f]{64}$/);
+		await rm(join(dir, CONFIG_DIR_NAME, "workbench", "runs", runId, RUN_COMMIT_FILE));
+		await rm(join(dir, CONFIG_DIR_NAME, "workbench", "runs", runId, ARTIFACT_MANIFEST_FILE));
+		delete originalRaw.run_transaction_schema_version;
+		delete originalRaw.run_outcome;
+		delete originalRaw.artifact_manifest_path;
+		originalRaw.schema_version = 1;
 
 		const cases: Array<{ label: string; mutate: (raw: Record<string, unknown>) => void }> = [
 			{ label: "missing", mutate: (raw) => { delete raw.argv_hash; } },
@@ -235,6 +243,12 @@ test("missing, legacy, corrupt and unavailable blocks refuse with the fixed code
 		await setupGitProject(dir);
 		const { runId } = await runRecipeRun(dir, "hello");
 		const originalRaw = JSON.parse(await readFile(manifestPath(dir, runId), "utf8")) as Record<string, unknown>;
+		await rm(join(dir, CONFIG_DIR_NAME, "workbench", "runs", runId, RUN_COMMIT_FILE));
+		await rm(join(dir, CONFIG_DIR_NAME, "workbench", "runs", runId, ARTIFACT_MANIFEST_FILE));
+		delete originalRaw.run_transaction_schema_version;
+		delete originalRaw.run_outcome;
+		delete originalRaw.artifact_manifest_path;
+		originalRaw.schema_version = 1;
 
 		const cases: Array<{ label: string; block: unknown; expect: ValidationRefusalReason[] }> = [
 			{ label: "missing", block: undefined, expect: ["missing-binding"] },
@@ -441,7 +455,7 @@ test("strict gate artifacts: manual tamper, foreign schema and missing evidence 
 		const tampered = JSON.parse(await readFile(evidencePath, "utf8")) as { schema_version: number; checks: Record<string, { evidence: Array<{ detail: string }> }> };
 		tampered.checks["g1.1"]!.evidence[0]!.detail = "TAMPERED-NOTE";
 		await writeFile(evidencePath, JSON.stringify(tampered, null, 2), "utf8");
-		assert.deepEqual(await assess(dir, manifest), rerun(["gate-state-mismatch"]), "manual artifact tamper");
+		assert.deepEqual(await assess(dir, manifest), rerun(["collection-failure"]), "manual artifact tamper invalidates the committed transaction");
 
 		// Foreign evidence schema version: contradictory source evidence.
 		tampered.schema_version = 99;

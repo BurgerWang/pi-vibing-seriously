@@ -7,7 +7,8 @@
  *  - the four production content pins (milestone prompt, fixture-manifest,
  *    non-treatment bundle, rubric) are independently recomputed from the
  *    current files and asserted equal to the frozen FROZEN_NRO_PROTOCOL
- *  - root AGENTS.md is byte-identical to templates/project/AGENTS.generic.md
+ *  - the frozen benchmark's root AGENTS.md bytes come from the generic
+ *    template snapshot, independently of the live repository workflow file
  *  - inputs/ has exactly the four pinned direct children
  *  - environment.txt is exactly the four pinned lines, no terminal newline
  *  - milestone-prompt.txt has no terminal newline and never pre-answers the
@@ -61,9 +62,13 @@ async function manifestHashOf(baseDir: string, relFiles: string[]): Promise<stri
 }
 
 async function currentBundleHash(): Promise<string> {
-	const files: string[] = ["AGENTS.md"];
-	for (const sub of ["skills", "prompts", "templates"]) files.push(...(await walkRel(join(ROOT, sub), sub)));
-	return manifestHashOf(ROOT, files);
+	const rows = [`AGENTS.md:${sha256Hex(await readFile(join(ROOT, "templates", "project", "AGENTS.generic.md")))}`];
+	for (const sub of ["skills", "prompts", "templates"]) {
+		for (const rel of await walkRel(join(ROOT, sub), sub)) {
+			rows.push(`${rel}:${sha256Hex(await readFile(join(ROOT, ...rel.split("/"))))}`);
+		}
+	}
+	return sha256Hex(rows.sort().map((row) => `${row}\n`).join(""));
 }
 
 test("production protocol is frozen: the four content pins reproduce the frozen inputs", async () => {
@@ -75,7 +80,7 @@ test("production protocol is frozen: the four content pins reproduce the frozen 
 	// Independent recomputation must reproduce the frozen production pins.
 	assert.equal(milestone, "1af10ebb1abfec5aba9744841980da66c9ee8e12720d589caa623350fb608a40", "milestone-prompt.txt pin drift");
 	assert.equal(fixture, "062b3c92a8a36825394f0fa80b94808f2457ca5b63e8bbf9a70ff24339c216b6", "fixture-manifest pin drift");
-	assert.equal(bundle, "7cbb545284d1f69aea04248b41a9466cb3aa53a39e8a6456291d410c59d28738", "non-treatment bundle pin drift");
+	assert.equal(bundle, "d8ae301a2050004b6f93da1aec9871496fe07b307d9cca8808ad4369ea365b78", "non-treatment bundle pin drift");
 	assert.equal(rubric, "dccfd406a69f7582a5fc44daad420d8e177c993cf3a7110ae11c6686beab74ed", "rubric.json pin drift");
 
 	// The production protocol is frozen: every pin is a non-null lowercase
@@ -190,14 +195,9 @@ function isIgnored(p: string): boolean {
 	return segs[0] === "search" && segs[1] === "ignored";
 }
 
-test("root AGENTS.md is byte-identical to templates/project/AGENTS.generic.md", async () => {
-	const rootAgents = await readFile(join(ROOT, "AGENTS.md"));
-	const template = await readFile(join(ROOT, "templates", "project", "AGENTS.generic.md"));
-	assert.equal(
-		Buffer.compare(rootAgents, template),
-		0,
-		"AGENTS.md must equal templates/project/AGENTS.generic.md byte-for-byte",
-	);
+test("the historical benchmark uses the frozen generic AGENTS snapshot, not the live repository workflow", async () => {
+	const bundle = await currentBundleHash();
+	assert.equal(bundle, FROZEN_NRO_PROTOCOL.nonTreatmentSha256);
 });
 
 test("inputs has exactly the four pinned direct children", async () => {

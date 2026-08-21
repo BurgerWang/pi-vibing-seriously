@@ -17,8 +17,9 @@ Task: $ARGUMENTS
    handlers pretending to be features.
 4. **Test** — add/update tests for the changed behavior and run them. A
    change without a test that exercises it is incomplete.
-5. **Verify** — run typecheck and the full test suite (declared recipes
-   preferred); record exact commands and outputs.
+5. **Verify** — use focused checks while developing. Once the candidate is
+   stable, run one final typecheck/test/build or gate set proportionate to
+   the risk; record exact commands and outputs.
 6. **Report** — changed files, commands run, results, and remaining risks.
 
 ## Constraints
@@ -28,34 +29,21 @@ Task: $ARGUMENTS
   never claim a check passed that did not run.
 - If the requirement is ambiguous, state the assumption you implemented.
 
-## Worker-first workflow contract
+## Development-first execution
 
-This project operates under the worker-first write authority. The rules
-apply to every build task:
+- Ordinary source, test, and documentation edits are direct in DEV after
+  scope is understood. Delegation is optional; it is not required for a
+  write or a defect repair, which may stay in the same coherent change.
+- When delegation is useful, one bounded call is the normal path: a complete
+  result is reviewed and closed automatically. Use explicit review/status
+  only for incomplete coverage, conflict, or recovery. A worker report is
+  never acceptance.
+- High-risk dependency, security, policy, deployment, migration, and Pi
+  control paths require an explicit user-issued temporary write lease.
+- Keep development feedback to focused tests. Run final gates once on the
+  stable candidate when task or release risk requires them.
 
-1. **Sol owns the decision.** Sol owns requirements,
-   cross-cutting architecture, scope, and acceptance criteria.
-2. **Routine writes are worker-owned by default.** Concrete source, tests,
-   docs, and config writes are routine worker slices: a fresh bounded worker
-   implements them inside the approved contract; the worker owns routine
-   local implementation decisions.
-3. **High-risk decisions remain Sol-owned; the concrete writes are bounded
-   worker slices.** Sol keeps the decision itself and delegates only bounded
-   implementation scopes after the architecture is fixed.
-4. **Defects go to a fresh worker.** A partial or defective slice is
-   repaired by a new bounded delegation to a fresh worker, not by Sol
-   directly repairing the files.
-5. **The only exception is a user-issued temporary write lease.** Only an
-   active human-issued lease (user-only slash commands) lets Sol write
-   directly; it is bounded in calls, time, and project-relative paths.
-6. **Worker reports are never acceptance.** A report records commands and
-   observed results; it can never mark an acceptance criterion satisfied —
-   only Sol maps evidence to criteria.
-7. **Sol reviews the actual diff and runs the final gates.** Sol inspects
-   the real diff (`workbench_review_worker_diff`) and runs the final
-   verification recipes and gates before any verdict.
-
-## Process
+## Related workflow
 
 - Follow the skill:implementation-workflow end to end.
 - Report verification verdicts in the skill:validation-ladder format.

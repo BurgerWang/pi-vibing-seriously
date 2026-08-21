@@ -17,6 +17,11 @@ import type { WorkbenchMode } from "./mode-policy.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
 
 import { DEFAULT_CACHE_POLICY, parseCachePolicy, type RecipeCachePolicy } from "../cache/action-types.ts";
+import {
+	artifactPatterns,
+	parseRecipeArtifactContracts,
+	type RecipeArtifactContract,
+} from "./artifact-contract.ts";
 
 export const RECIPE_SCHEMA_VERSION = 1;
 
@@ -84,6 +89,8 @@ export interface Recipe {
 	mutation: RecipeMutation;
 	/** Result-file globs (relative to project root) — containment-checked. */
 	artifacts: string[];
+	/** Strict normalized contracts. String globs above become legacy optional entries. */
+	artifact_contracts: RecipeArtifactContract[];
 	/** Env var names the process may inherit. Nothing else is passed. */
 	environment: string[];
 	/**
@@ -123,6 +130,7 @@ export const DEFAULT_RECIPE: Omit<Recipe, "name" | "command"> = {
 	writes: [],
 	mutation: "none",
 	artifacts: [],
+	artifact_contracts: [],
 	environment: [],
 	validation_components: [],
 	output_strategy: "tail",
@@ -175,7 +183,7 @@ export function parseRecipe(raw: unknown, index: number): RecipeParseResult {
 		return { recipes: [], errors: [`recipe #${index + 1} must be a mapping`], warnings };
 	}
 	for (const key of Object.keys(raw)) {
-		if (!(key in DEFAULT_RECIPE) && key !== "name" && key !== "command") {
+		if (key === "artifact_contracts" || (!(key in DEFAULT_RECIPE) && key !== "name" && key !== "command")) {
 			errors.push(`recipe #${index + 1} (${typeof raw.name === "string" ? `"${raw.name}"` : "unnamed"}): unknown field "${key}"`);
 		}
 	}
@@ -292,7 +300,8 @@ export function parseRecipe(raw: unknown, index: number): RecipeParseResult {
 	const maxLines = asPositiveInt(raw.max_lines, `recipe "${recipe}": "max_lines"`, DEFAULT_MAX_LINES, errors);
 	const maxBytes = asPositiveInt(raw.max_bytes, `recipe "${recipe}": "max_bytes"`, DEFAULT_MAX_BYTES, errors);
 	const writes = asStringArray(raw.writes, `recipe "${recipe}": "writes"`, errors);
-	const artifacts = asStringArray(raw.artifacts, `recipe "${recipe}": "artifacts"`, errors);
+	const artifactContracts = parseRecipeArtifactContracts(raw.artifacts, `recipe "${recipe}"`, errors);
+	const artifacts = artifactPatterns(artifactContracts);
 
 	// Phase 2A: closed validation-components set (typecheck | unit-test |
 	// whitespace). Default []; a non-array, a non-string entry, an unknown
@@ -358,6 +367,7 @@ export function parseRecipe(raw: unknown, index: number): RecipeParseResult {
 				expected_exit_codes,
 				writes,
 				artifacts,
+				artifact_contracts: artifactContracts,
 				environment,
 				validation_components,
 				output_strategy: outputStrategyRaw as OutputStrategy,

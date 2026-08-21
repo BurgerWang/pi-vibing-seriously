@@ -38,9 +38,11 @@ export function runStatusLabel(record: {
 	timed_out: boolean;
 	cancelled: boolean;
 	expected_exit_codes: readonly number[];
+	run_outcome?: "SUCCESS" | "PROCESS_FAILED" | "ARTIFACT_FAILED";
 }): string {
 	if (record.timed_out) return "TIMED OUT";
 	if (record.cancelled) return "CANCELLED";
+	if (record.run_outcome === "ARTIFACT_FAILED" || record.run_outcome === "PROCESS_FAILED") return "FAILED";
 	if (record.exit_code === null) return "KILLED";
 	return record.expected_exit_codes.includes(record.exit_code) ? "OK" : "FAILED";
 }

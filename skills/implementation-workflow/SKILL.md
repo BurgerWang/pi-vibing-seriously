@@ -13,8 +13,9 @@ description: End-to-end implementation workflow — requirement contract, impact
 3. **Implement** — real code only. No stubs, no TODO shells, no empty
    handlers pretending to be features.
 4. **Test** — add or update tests for the changed behavior; run them.
-5. **Verify** — run typecheck and the full test suite; record exact commands
-   and outputs.
+5. **Verify** — use focused checks while the candidate changes. Once stable,
+   run one final typecheck/test/build or gate set proportionate to risk;
+   record exact commands and outputs.
 6. **Evidence** — report changed files, commands run, and results.
 7. **Risk** — list remaining risks; never claim completion of checks that did
    not run.
@@ -23,38 +24,25 @@ description: End-to-end implementation workflow — requirement contract, impact
 
 - A task is not done until its tests pass and the verification evidence is
   written down.
-- Prefer the project's declared recipes (`.pi/workbench/recipes.yaml`) for
-  build/test/verify commands.
+- Use the project's declared recipes (`.pi/workbench/recipes.yaml`) for
+  project commands when the active Pi mode requires them.
 - If a requirement turns out to be ambiguous, state the assumption you
   implemented.
 - Do not commit, push, or publish unless explicitly asked.
 
-## Worker-first write authority
+## Development-first execution
 
-Implementation work in this project follows the worker-first workflow
-contract:
-
-1. **Sol owns the decision.** Sol owns requirements,
-   cross-cutting architecture, scope, and acceptance criteria.
-2. **Routine writes are worker-owned by default.** Concrete source, tests,
-   docs, and config writes are routine worker slices: a fresh bounded worker
-   implements them inside the approved contract; the worker owns routine
-   local implementation decisions.
-3. **High-risk decisions remain Sol-owned; the concrete writes are bounded
-   worker slices.** Sol keeps the decision itself and delegates only bounded
-   implementation scopes after the architecture is fixed.
-4. **Defects go to a fresh worker.** A partial or defective slice is
-   repaired by a new bounded delegation to a fresh worker, not by Sol
-   directly repairing the files.
-5. **The only exception is a user-issued temporary write lease.** Only an
-   active human-issued lease (user-only slash commands) lets Sol write
-   directly; it is bounded in calls, time, and project-relative paths.
-6. **Worker reports are never acceptance.** A report records commands and
-   observed results; it can never mark an acceptance criterion satisfied —
-   only Sol maps evidence to criteria.
-7. **Sol reviews the actual diff and runs the final gates.** Sol inspects
-   the real diff (`workbench_review_worker_diff`) and runs the final
-   verification recipes and gates before any verdict.
+- Ordinary source, test, and documentation edits are direct in DEV after
+  scope is understood. Delegation is optional; it is not required for a
+  write or a defect repair.
+- When delegation is useful, use one bounded call. Complete delivery is
+  reviewed and closed automatically; explicit review/status is only for
+  incomplete coverage, conflict, or recovery. A worker report is never
+  acceptance.
+- High-risk dependency, security, policy, deployment, migration, and Pi
+  control paths require an explicit user-issued temporary write lease.
+- Use focused tests during development. Run final gates once on a stable
+  candidate when task or release risk requires them.
 
 ## Details
 

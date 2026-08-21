@@ -152,6 +152,17 @@ export const STRICT_SOL_DEV_ALLOWLIST: readonly string[] = [
 	"workbench_recover_tool_result",
 ];
 
+/**
+ * Current development-first DEV surface. The historical strict allowlist is
+ * retained for compatibility, while ordinary edit/write are advertised to
+ * the commander and the second-layer risk gate below remains authoritative.
+ */
+export const DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST: readonly string[] = [
+	...STRICT_SOL_DEV_ALLOWLIST,
+	"edit",
+	"write",
+];
+
 export const STRICT_ALLOWLIST_SET: ReadonlySet<string> = new Set(STRICT_SOL_DEV_ALLOWLIST);
 
 export function isInStrictAllowlist(toolName: string): boolean {
@@ -274,6 +285,49 @@ function normalizeProjectRelative(raw: string): string | undefined {
 		if (segment === "..") return undefined;
 	}
 	return segments.join("/");
+}
+
+const DIRECT_WRITE_HIGH_RISK_BASENAMES = new Set([
+	"agents.md",
+	"package.json", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock", "bun.lockb", "deno.lock",
+	"pyproject.toml", "poetry.lock", "uv.lock", "pipfile", "pipfile.lock", "requirements.txt",
+	"cargo.toml", "cargo.lock", "go.mod", "go.sum", "composer.json", "composer.lock", "gemfile", "gemfile.lock",
+	"dockerfile", "compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml",
+]);
+const DIRECT_WRITE_HIGH_RISK_SEGMENTS = new Set([
+	".pi", ".github", ".gitlab", "deploy", "deployment", "infra", "k8s", "kubernetes", "migrations", "terraform",
+]);
+const DIRECT_WRITE_HIGH_RISK_NAME = /(?:auth|security|permission|policy|credential|secret|crypto|lease|release|migration)/iu;
+
+/**
+ * Fixed, prompt-independent high-risk boundary for direct commander writes.
+ * Ordinary source/tests/docs paths return undefined and need no lease. Paths
+ * that can change dependencies, permissions, security, deployment, migration,
+ * Pi policy, or release authority retain the explicit user-issued lease.
+ */
+export function directDevelopmentWriteBlockReason(path: string, input?: unknown): string | undefined {
+	const normalized = normalizeProjectRelative(path);
+	if (normalized === undefined || path !== path.trim() || path.includes("\\") || normalized !== path) {
+		return "Direct development write requires a canonical project-relative path";
+	}
+	if (typeof input === "object" && input !== null) {
+		for (const key of ["content", "oldText", "newText"] as const) {
+			const value = (input as Record<string, unknown>)[key];
+			if (typeof value === "string" && value.includes("\0")) {
+				return "Direct development write refuses binary/NUL content";
+			}
+		}
+	}
+	const segments = normalized.toLowerCase().split("/");
+	const basename = segments.at(-1) ?? "";
+	if (
+		DIRECT_WRITE_HIGH_RISK_BASENAMES.has(basename)
+		|| segments.some((segment) => DIRECT_WRITE_HIGH_RISK_SEGMENTS.has(segment))
+		|| segments.some((segment) => DIRECT_WRITE_HIGH_RISK_NAME.test(segment))
+	) {
+		return `Direct development write on high-risk path "${normalized}" requires an explicit user-issued write lease`;
+	}
+	return undefined;
 }
 
 /**
@@ -705,15 +759,15 @@ function extractPath(input: unknown): string | undefined {
 /**
  * Pure second-layer commander decision (wired into the Pi runtime's
  * `tool_call` guard). The guard applies ONLY to the
- * approved Sol commander under the single worker-first-strict policy:
+ * approved Sol commander under the development-first policy (whose
+ * serialized compatibility id is worker-first-strict):
  * delegated workers and other controllers are OUTSIDE it — the existing
  * worker guards (worker-policy.ts) remain authoritative for workers, and
  * other controllers are not newly denied by this module. Semantics for
  * Sol:
  *   - bash is always blocked;
- *   - edit/write are blocked unless a valid (active, confirmed, unexpired,
- *     unexhausted) user-issued lease authorizes the project-relative path
- *     and the remaining call;
+ *   - ordinary canonical project-relative edit/write are allowed directly;
+ *   - high-risk edit/write require a valid user-issued lease;
  *   - every other tool outside the strict allowlist is blocked;
  *   - reasons direct Sol to workbench_delegate_worker or an explicit
  *     temporary commander write lease.
@@ -723,23 +777,26 @@ export function commanderToolCallBlockReason(facts: CommanderToolCallFacts): str
 	const { toolName } = facts;
 	const now = facts.now ?? new Date().toISOString();
 	if (toolName === "bash") {
-		return "Worker-first write authority blocks free-form bash for commanders: use declared workbench recipes, workbench_delegate_worker, or an explicit temporary commander write lease";
+		return "Development safety blocks free-form bash for commanders: use declared workbench recipes; workbench_delegate_worker is optional, and a temporary lease authorizes only high-risk edit/write paths";
 	}
 	if (toolName === "edit" || toolName === "write") {
+		const path = extractPath(facts.input);
+		if (!path) {
+			return `Commander ${toolName} requires a non-empty canonical project-relative path`;
+		}
+		const riskReason = directDevelopmentWriteBlockReason(path, facts.input);
+		if (riskReason === undefined) return undefined;
+		if (!riskReason.includes("high-risk path")) return riskReason;
 		const lease = facts.lease;
 		if (!lease || leaseStatus(lease, now) !== "active") {
 			const status = lease ? leaseStatus(lease, now) : "locked";
-			return `Worker-first write authority: commander ${toolName} is blocked (lease ${status}); delegate implementation to workbench_delegate_worker or obtain an explicit user-issued temporary commander write lease`;
-		}
-		const path = extractPath(facts.input);
-		if (!path) {
-			return `Commander ${toolName} requires a non-empty project-relative path; a write lease authorizes edit/write only with a valid path`;
+			return `${riskReason} (lease ${status})`;
 		}
 		if (!isLeasePathAuthorized(lease, path)) {
-			return `Commander ${toolName} on "${path}" is outside the active write lease; delegate to workbench_delegate_worker or request a lease covering this project-relative path`;
+			return `Commander ${toolName} on high-risk path "${path}" is outside the active write lease`;
 		}
 		if (!leaseCoversTool(lease, toolName)) {
-			return `The active write lease authorizes only ${lease.tools.join(", ")}; use workbench_delegate_worker for other write tools`;
+			return `The active write lease authorizes only ${lease.tools.join(", ")}`;
 		}
 		return undefined;
 	}

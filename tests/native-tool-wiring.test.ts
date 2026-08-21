@@ -691,14 +691,17 @@ test("find limit cap: the override and the oracle each satisfy the strict capped
 });
 
 test("find source wiring: the registered override is the literal built-in delegation — same five execute arguments, no transform/branch/N3 mode", async () => {
-	const index = await (await import("node:fs/promises")).readFile(new URL("../extensions/workbench-runtime/index.ts", import.meta.url), "utf8");
+	const index = await (await import("node:fs/promises")).readFile(
+		new URL("../extensions/workbench-runtime/core/native-tool-overrides-controller.ts", import.meta.url),
+		"utf8",
+	);
 	const findMarker = "NATIVE_OVERRIDE_METADATA.find";
 	const findStart = index.indexOf(findMarker);
 	assert.ok(findStart !== -1, "find override registration present in the runtime source");
 	// the find override is its own registerTool block: from its opening
 	// pi.registerTool({ up to (excluding) the next one (the custom tools)
-	const findOpen = index.lastIndexOf("pi.registerTool({", findStart);
-	const findClose = index.indexOf("pi.registerTool({", findStart + findMarker.length);
+	const findOpen = index.lastIndexOf("controller.pi.registerTool({", findStart);
+	const findClose = index.indexOf("\n}", findStart + findMarker.length);
 	assert.ok(findOpen !== -1 && findClose !== -1 && findClose > findOpen, "find override is a self-contained registerTool block");
 	const findBlock = index.slice(findOpen, findClose);
 	// the execute body must be exactly ONE literal delegation statement: the
@@ -742,8 +745,11 @@ test("the exact-name mode/path guard still fires for read (protected paths block
 	assert.equal(checkToolCall("VERIFY", "grep", { pattern: "x", path: ".env" }).allowed, false, "grep protected path blocked in VERIFY");
 	assert.equal(checkToolCall("VERIFY", "find", { pattern: "*", path: ".env" }).allowed, false, "find protected path blocked in VERIFY");
 	// the override performs no writes: its execute paths only ever read
-	const index = await (await import("node:fs/promises")).readFile(new URL("../extensions/workbench-runtime/index.ts", import.meta.url), "utf8");
-	const overrideBlocks = index.split("pi.registerTool({").slice(1, 4).join("\n");
+	const index = await (await import("node:fs/promises")).readFile(
+		new URL("../extensions/workbench-runtime/core/native-tool-overrides-controller.ts", import.meta.url),
+		"utf8",
+	);
+	const overrideBlocks = index.split("controller.pi.registerTool({").slice(1, 4).join("\n");
 	// write CALL SITES only — comments may legitimately name the prohibited
 	// operations ("no pi.exec, no writes")
 	assert.ok(!/(?:^|[^A-Za-z])(?:writeFile|writeFileSync|mkdir|mkdirSync|appendFile|appendFileSync|rm|rmSync|unlink|unlinkSync|rename|renameSync)\s*\(/.test(overrideBlocks), "override registration contains no write call sites");

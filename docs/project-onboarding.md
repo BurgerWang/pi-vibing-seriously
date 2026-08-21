@@ -87,10 +87,41 @@ recipes:
     allowed_modes: [DEV, VERIFY]
     expected_exit_codes: [0]
     writes: ["data/", "results/"]
-    artifacts: ["results/**/*.json"]
+    artifacts:
+      - path: "results/**/*.json"
+        required: true
+        min_count: 1
+        min_bytes: 1
+        freshness: immutable-snapshot
+        snapshot: true
     params:
       - { name: symbol, type: string, required: true }
 ```
+
+Object entries are the v2 authority form. A successful process is still a
+failed recipe when a required artifact is absent, outside its count/byte/hash
+bounds, or cannot be identified safely. `freshness: current` rehashes the
+project file whenever a gate consumes it; `immutable-snapshot` stores and
+verifies a content-addressed copy in the committed run. Historical string
+globs remain runnable as legacy optional output discovery, but cannot satisfy
+an artifact gate.
+
+External artifacts require both an explicit recipe contract and an explicit
+trusted-project mapping:
+
+```yaml
+# .pi/workbench/project.yaml
+artifact_external_roots:
+  warehouse: /absolute/authorized/export/root
+
+# one recipe artifact entry
+artifacts:
+  - { path: "exports/*.json", root: authorized-external, external_root: warehouse, required: true, freshness: current }
+```
+
+The runner resolves the configured root without symlinks and performs an
+independent child-process identity probe before publishing the run. Gate
+consumption repeats the current-state probe.
 
 ## 4. Run the validation ladder
 
@@ -126,13 +157,16 @@ verification.
 | Mode | Tools | Blocked |
 | ---- | ----- | ------- |
 | AUDIT | read, grep, find, ls + read-only workbench tools | bash, edit, write, workbench_run_recipe, workbench_run_gate |
-| DEV | strict commander: fixed 15-tool allowlist; an active user-issued lease may add only edit/write. Workers: bounded tools on parent-approved paths | commander bash/foreign tools/direct writes without a lease; worker free bash, recursive delegation, out-of-scope writes, final gates |
+| DEV | ordinary edit/write plus workbench tools; high-risk paths use a user-issued lease. Workers: bounded tools on parent-approved paths | commander bash/foreign tools/high-risk writes without a lease; worker free bash, recursive delegation, out-of-scope writes, final gates |
 | VERIFY | read, grep, find, ls + all workbench tools | bash, edit, write (recipes only) |
 
-In DEV, the GPT-5.6 Sol commander delegates routine writes and runs project
-commands through declared recipes. A temporary commander lease is bounded by
-calls, time, and project-relative paths and never enables bash; worker
-edit/write calls remain limited to the parent-approved path contract.
+In DEV, the GPT-5.6 Sol commander edits ordinary project files directly and
+runs project commands through declared recipes. Delegation is optional: a
+successful bounded implementation is reviewed and closed in the same call,
+while explicit review/status is only a recovery path. A temporary commander
+lease is bounded by calls, time, and project-relative paths and protects only
+high-risk paths; it never enables bash. Worker edit/write calls remain limited
+to the parent-approved path contract.
 
 The mode is stored in a Pi custom session entry and restored on every
 session start — including `/resume`, `/fork`, `/clone`, `/reload`, and

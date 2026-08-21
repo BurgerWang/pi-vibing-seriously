@@ -68,6 +68,7 @@ import {
 	WORKBENCH_TOOL_METADATA,
 	WORKBENCH_TOOL_NAMES,
 	WORKBENCH_TOOL_PARAMETERS,
+	WORKBENCH_DELEGATE_WORKER_V1_PARAMETERS,
 	workbenchToolMetadataOrdered,
 } from "../extensions/workbench-runtime/core/tool-catalog.ts";
 import {
@@ -185,7 +186,7 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 
 test("v0.10.0 public tool surface has the intentional canonical transition hash", () => {
 	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
-	const currentHash = "b5938d64d2730119daa0f1b1c833aac09ff4923b52124a833bc2f1e0d5294b11";
+	const currentHash = "5f0f609c6e2bbd401c65e3ae4663cdba4e77659e4bc78a8325b73b1c739a7788";
 	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
 	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the documented 0.10.0 hash");
 });
@@ -365,7 +366,7 @@ test("tool metadata audit flags dynamic values and passes static catalog metadat
 	}
 });
 
-test("workbench_delegate_worker metadata is static and carries the responsibility contract", () => {
+test("workbench_delegate_worker metadata is static and defaults to one-call delivery", () => {
 	const meta = WORKBENCH_TOOL_METADATA.workbench_delegate_worker;
 	// Every metadata field stays free of dynamic values (no dates, times,
 	// hashes, absolute paths, or concrete run/gate/task ids).
@@ -373,37 +374,19 @@ test("workbench_delegate_worker metadata is static and carries the responsibilit
 		assert.deepEqual(findDynamicValueMarkers(field), [], `delegate metadata must be static: ${field.slice(0, 80)}`);
 	}
 	const text = [meta.description, meta.promptSnippet, ...meta.promptGuidelines].join("\n");
-	// Worker-owned routine local implementation decisions inside the contract.
-	assert.match(text, /routine local implementation decisions inside the approved contract/);
-	// Sol-owned authority: requirements, cross-cutting architecture, scope,
-	// actual-diff review, final verification/gates, verdict.
-	assert.match(text, /Sol owns requirements, cross-cutting architecture, scope, actual-diff review, final verification\/gates, and the verdict/);
-	// DEV default: coherent source+tests+docs vertical slices, bounded
-	// low/medium-risk, observable acceptance criteria, no worker-prose acceptance.
-	assert.match(text, /source\+tests\+docs vertical slices/);
-	assert.match(text, /bounded low\/medium-risk implementation/);
+	assert.match(text, /normal implementation path/);
+	assert.match(text, /closes the session as REVIEWED in this same call/);
+	assert.match(text, /continue directly to the next development step without calling review or status/);
+	assert.match(text, /smallest useful allowed_paths set/);
 	assert.match(text, /observable acceptance criteria/);
-	assert.match(text, /Worker prose is never acceptance evidence/);
-	// The registration-order/schema contract is untouched: same name, same
-	// position (the first P7 tool, after the seven existing tools; P8b
-	// appends the recovery tool LAST), same parameter schema hash — pinned
-	// to the final Phase 4A optional repair_of schema baseline
-	// (a self-comparison would prove nothing). The hash changed exactly
-	// TWICE, both intentionally, in the worker repair rollout: in Phase 3
-	// of the worker token-budget repair (see docs/compatibility.md for the
-	// documented fingerprint transition) the additive optional
-	// `budget_profile` parameter (with the nested JSON Schema
-	// `default: "standard"` annotation) landed in one rollout transition
-	// directly from the pre-repair baseline
-	// 2cf1f563f78ffe2c85d142c1f40deea7bc658365345554db11c80b8af6b521d9 to
-	// the historical final Phase 3 value
-	// 71707090d2da085b036c5879dd2fcb72558175ead8e596bf55406b65732b0c83;
-	// then Phase 4A (public schema shape only) added the optional
-	// `repair_of` pointer below, and a focused machine run (commander
-	// no-cache run 20260808-114550-j4gd) derived the new canonical hash
-	// pinned below: the final Phase 4A optional repair_of schema baseline.
-	// Phase 5 (task-contract wording / granularity) deliberately leaves the
-	// parameter schema byte-for-byte unchanged.
+	assert.match(text, /committed delegation-v2 transaction/);
+	assert.match(text, /Diagnosis is strictly read-only/);
+	assert.match(text, /zero successful or denied writes/);
+	assert.match(text, /explicit permission, destructive-action confirmation, or final verification gates/);
+	assert.match(text, /Historical v1 ledgers remain read-only/);
+	// Registration name/order stay stable. The current schema/hash intentionally
+	// advances for the additive optional task_kind field, while the separately
+	// retained governance-v1 schema remains pinned to its repair_of baseline.
 	assert.equal(meta.name, "workbench_delegate_worker");
 	assert.equal(WORKBENCH_TOOL_NAMES.indexOf("workbench_delegate_worker"), WORKBENCH_TOOL_NAMES.length - 4, "delegate tool keeps its registration position (seven existing → delegate → review → status → recovery)");
 	// The canonical schema object itself (not only its hash): budget_profile
@@ -447,10 +430,24 @@ test("workbench_delegate_worker metadata is static and carries the responsibilit
 		"strict prior delegation-id provenance for a known-root-cause repair; parent task must include bounded root cause/failure evidence; pointer adds no path/scope/authority and never resumes/imports old report",
 		"repair_of description preserves the fresh-worker/no-authority semantics",
 	);
+	const taskKindSchema = delegateParameters.properties.task_kind;
+	assert.ok(taskKindSchema, "task_kind is present in the current serialized parameter schema");
+	assert.ok(!(delegateParameters.required ?? []).includes("task_kind"), "task_kind stays optional for governance-v1 callers");
+	assert.equal(taskKindSchema.default, "implementation", "task_kind omission is documented as the implementation default");
+	assert.deepEqual(
+		(taskKindSchema.anyOf ?? []).map((alternative) => alternative.const),
+		["implementation", "diagnosis"],
+		"task_kind is the exact closed implementation|diagnosis union; mechanical is not public",
+	);
+	assert.equal(
+		canonicalHash(WORKBENCH_DELEGATE_WORKER_V1_PARAMETERS),
+		"dc1db21e3590c7f57cfa88f042052964a92d495116966747918d72f2018176a7",
+		"the independently retained governance-v1 delegate schema stays machine-pinned",
+	);
 	assert.equal(
 		canonicalHash(WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker),
-		"dc1db21e3590c7f57cfa88f042052964a92d495116966747918d72f2018176a7",
-		"delegate parameter schema hash literal is the final Phase 4A optional repair_of schema baseline — machine-derived (commander no-cache run 20260808-114550-j4gd), superseding the historical final Phase 3 value 71707090d2da085b036c5879dd2fcb72558175ead8e596bf55406b65732b0c83",
+		"48c449d844991149e2b43b0e484a2b4dd90a6b3995fb68751d0f11ed4d88473c",
+		"current delegate parameter schema hash is machine-pinned after the additive optional task_kind transition",
 	);
 });
 
@@ -619,6 +616,71 @@ test("P7 tools keep the fixed seven→delegate→review→status order with stat
 	}
 });
 
+test("delegation status metadata distinguishes new-v2 relevance from legacy full-diff freshness", () => {
+	const meta = WORKBENCH_TOOL_METADATA.workbench_delegation_status;
+	assert.equal(
+		meta.promptSnippet,
+		"Show write-authority and delegation review status (actor, lease, review, hashes, blocked writes)",
+		"the established status prompt snippet stays byte-identical",
+	);
+	assert.deepEqual(meta.promptGuidelines, [
+		"Routine successful delivery closes as REVIEWED in the delegate call; use status only for diagnostics or recovery.",
+		"In the TUI, WF:DIRECT means ordinary edits are available, WF:LEASE means a high-risk scope is authorized, and WF:REVIEW means recovery review is outstanding.",
+	], "current status guidelines keep routine work out of the recovery chain");
+	assert.match(meta.description, /existing hash field names are retained for compatibility/);
+	assert.match(meta.description, /W \(the attributed worker delta\), D \(the explicit dependency closure\), and S \(relevant controls\)/);
+	assert.match(meta.description, /baseline unrelated dirty paths and recognized workbench artifacts do not stale it/);
+	assert.match(meta.description, /Git HEAD, W\/D\/S drift, or a new unknown-origin path fails closed/);
+	assert.match(meta.description, /Historical untagged v2 and v1 authority retain the complete full-diff binding/);
+	assert.doesNotMatch(meta.description, /real git diff \(any change after REVIEWED turns it STALE\)/);
+	assert.equal(
+		canonicalHash(meta),
+		"7443cebe63a46e48fe4fed9604f268eaeae98ad10063fb5e07e8402c5db1f74f",
+		"current status metadata hash is machine-pinned after the relevance-contract correction",
+	);
+	assert.equal(
+		canonicalHash(WORKBENCH_TOOL_PARAMETERS.workbench_delegation_status),
+		"efddc7bd8bbcef73a14eb1ace1ffdaec81e518ef1e13c1e9271d0b8acb694a49",
+		"status input schema stays byte-identical",
+	);
+	assert.equal(
+		canonicalHash(workbenchToolMetadataOrdered()),
+		"3c234c3dd8eae8e466a7920cfc8b7e9e3d6f98f9ca9cf746d3e8ac090da91b44",
+		"current public catalog hash is machine-pinned after the one-call delivery transition",
+	);
+});
+
+test("delegation review metadata is a recovery path and still binds the complete worker delta", () => {
+	const meta = WORKBENCH_TOOL_METADATA.workbench_review_worker_diff;
+	assert.equal(
+		meta.promptSnippet,
+		"Recover an incomplete, pending, stale, or conflicted delegation review",
+		"the current prompt presents review as recovery, not routine chaining",
+	);
+	assert.deepEqual(meta.promptGuidelines, [
+		"Do not call this after an ordinary successful REVIEWED delegation; the default delivery already completed the actual-diff review.",
+		"Use it only when delegation output reports explicit review required, incomplete coverage, or status shows PENDING_REVIEW/STALE.",
+		"The review always checks the entire worker delta against allowed_paths; include_paths narrows only the bounded patch presentation.",
+		"Repeat segmented review only for remaining paths until PASS and complete coverage close the session.",
+	], "review guidance avoids the routine delegate-review-status chain");
+	assert.match(meta.description, /Recovery review/);
+	assert.match(meta.description, /checks the entire attributed worker delta W against allowed_paths/);
+	assert.match(meta.description, /full streaming identities for W, the explicit dependency closure D, and relevant controls S/);
+	assert.match(meta.description, /Baseline unrelated dirty paths and recognized workbench artifacts do not stale new tagged v2/);
+	assert.match(meta.description, /Git HEAD, W\/D\/S drift, or a new unknown-origin path fails closed/);
+	assert.match(meta.description, /Historical untagged v2\/v1 retain full-diff binding/);
+	assert.equal(
+		canonicalHash(meta),
+		"a5b530e55a8ea0a3bf7d7813d81ba07f453e57fb0ce3a7ee174e4463a78ec672",
+		"current review metadata hash is machine-pinned after recovery-only guidance",
+	);
+	assert.equal(
+		canonicalHash(WORKBENCH_TOOL_PARAMETERS.workbench_review_worker_diff),
+		"63c7a5543e256e9641364d845a78327828c354c59e71aaab8184d4aed05cde6a",
+		"review input schema stays byte-identical",
+	);
+});
+
 test("workbench tool catalog: registration order, static metadata, stable schema hashes", () => {
 	// WORKBENCH_TOOLS (mode matrix) == WORKBENCH_TOOL_NAMES (registration order)
 	assert.deepEqual([...WORKBENCH_TOOLS], [...WORKBENCH_TOOL_NAMES]);
@@ -703,12 +765,30 @@ test("the independent read-only allowlist is the exact approved set and never in
 
 test("v0.10.0 runtime removes only the temporary sequential read-only modes", async () => {
 	const index = await readFile(new URL("index.ts", EXTENSION_DIR), "utf8");
+	const recipeController = await readFile(new URL("core/recipe-tools-controller.ts", EXTENSION_DIR), "utf8");
+	const gateController = await readFile(new URL("core/gate-tools-controller.ts", EXTENSION_DIR), "utf8");
+	const compareController = await readFile(new URL("core/compare-tool-controller.ts", EXTENSION_DIR), "utf8");
+	const delegationStatusController = await readFile(new URL("core/delegation-status-tool-controller.ts", EXTENSION_DIR), "utf8");
+	const reviewController = await readFile(new URL("core/review-tool-controller.ts", EXTENSION_DIR), "utf8");
+	const delegateController = await readFile(new URL("core/delegate-tool-controller.ts", EXTENSION_DIR), "utf8");
+	const recoveryController = await readFile(new URL("core/recovery-tool-controller.ts", EXTENSION_DIR), "utf8");
 	const registration = (name: string): string => {
+		const source = name === "workbench_read_run"
+			? recipeController
+			: new Set(["workbench_read_gate", "workbench_list_gates"]).has(name)
+				? gateController
+				: name === "workbench_compare_runs"
+					? compareController
+					: name === "workbench_review_worker_diff"
+						? reviewController
+						: name === "workbench_delegate_worker"
+							? delegateController
+							: index;
 		const marker = `...WORKBENCH_TOOL_METADATA.${name},`;
-		const start = index.indexOf(marker);
+		const start = source.indexOf(marker);
 		assert.ok(start >= 0, `${name} registration exists`);
-		const next = index.indexOf("pi.registerTool({", start + marker.length);
-		return index.slice(start, next < 0 ? index.length : next);
+		const next = source.indexOf("registerTool({", start + marker.length);
+		return source.slice(start, next < 0 ? source.length : next);
 	};
 	for (const name of ["workbench_read_run", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs"]) {
 		assert.doesNotMatch(registration(name), /executionMode:\s*"sequential"/, `${name} now uses runtime turn-budget authorization`);
@@ -1116,12 +1196,31 @@ async function extensionSources(): Promise<Record<string, string>> {
 
 test("no dynamic tool loader: tools are registered statically — the three fixed native overrides first, then WORKBENCH_TOOL_NAMES order", async () => {
 	const index = await readFile(new URL("index.ts", EXTENSION_DIR), "utf8");
+	const nativeController = await readFile(new URL("core/native-tool-overrides-controller.ts", EXTENSION_DIR), "utf8");
+	const recipeController = await readFile(new URL("core/recipe-tools-controller.ts", EXTENSION_DIR), "utf8");
+	const gateController = await readFile(new URL("core/gate-tools-controller.ts", EXTENSION_DIR), "utf8");
+	const compareController = await readFile(new URL("core/compare-tool-controller.ts", EXTENSION_DIR), "utf8");
+	const delegationStatusController = await readFile(new URL("core/delegation-status-tool-controller.ts", EXTENSION_DIR), "utf8");
+	const reviewController = await readFile(new URL("core/review-tool-controller.ts", EXTENSION_DIR), "utf8");
+	const delegateController = await readFile(new URL("core/delegate-tool-controller.ts", EXTENSION_DIR), "utf8");
+	const recoveryController = await readFile(new URL("core/recovery-tool-controller.ts", EXTENSION_DIR), "utf8");
 	// exactly one setActiveTools call site (applyModeTools) — the tool set is
 	// swapped only on mode switches / session_start, never per turn
 	assert.equal(index.split("setActiveTools(").length - 1, 1, "setActiveTools called from exactly one place");
 	// exactly the three fixed native overrides + the 11 workbench catalog
 	// tools are registered (14 total), in the fixed order
-	const registrations = index.split("pi.registerTool({").slice(1);
+	const indexRegistrations = index.split("pi.registerTool({").slice(1);
+	const registrations = [
+		...nativeController.split("controller.pi.registerTool({").slice(1),
+		...recipeController.split("controller.pi.registerTool({").slice(1),
+		...gateController.split("controller.pi.registerTool({").slice(1),
+		...compareController.split("controller.pi.registerTool({").slice(1),
+		...delegateController.split("controller.pi.registerTool({").slice(1),
+		...reviewController.split("controller.pi.registerTool({").slice(1),
+		...delegationStatusController.split("controller.pi.registerTool({").slice(1),
+		...recoveryController.split("controller.pi.registerTool({").slice(1),
+		...indexRegistrations,
+	];
 	assert.equal(
 		registrations.length,
 		NATIVE_OVERRIDE_NAMES.length + WORKBENCH_TOOL_NAMES.length,
@@ -1148,7 +1247,7 @@ test("no dynamic tool loader: tools are registered statically — the three fixe
 		"registration order == NATIVE_OVERRIDE_NAMES + WORKBENCH_TOOL_NAMES (WORKBENCH_TOOL_NAMES itself unchanged)",
 	);
 	// no registerTool inside any loop construct (static registration only)
-	for (const line of index.split("\n")) {
+	for (const line of `${nativeController}\n${recipeController}\n${gateController}\n${compareController}\n${delegateController}\n${reviewController}\n${delegationStatusController}\n${recoveryController}\n${index}`.split("\n")) {
 		if (line.includes("registerTool")) {
 			assert.ok(!/(for|while|forEach|\.map)\(/.test(line), `registerTool must not appear in a loop: ${line.trim()}`);
 		}
@@ -1164,12 +1263,25 @@ test("no supportsToolSearch / supportsToolReferences / search_tools claims", asy
 	}
 });
 
-test("slash commands are not registered as model-callable tools", async () => {
+test("child runtime threads the strict task-kind env through advertised tools and the call guard", async () => {
 	const index = await readFile(new URL("index.ts", EXTENSION_DIR), "utf8");
+	const guard = await readFile(new URL("core/tool-call-guard-controller.ts", EXTENSION_DIR), "utf8");
+	assert.ok(index.includes("taskKind: parseWorkerTaskKindEnvironment(process.env[WORKER_TASK_KIND_ENV])"));
+	const activeToolsCall = /computeRoleActiveTools\([\s\S]*?workerRoleContext\.role,[\s\S]*?workerRoleContext\.taskKind,[\s\S]*?\)/.exec(index);
+	assert.ok(activeToolsCall, "active-tool filtering receives the strict child task kind");
+	assert.ok(
+		guard.includes("workerRoleToolCallBlockReason(workerRoleContext, event.toolName, event.input)"),
+		"the second-layer call guard receives the same worker role context",
+	);
+});
+
+test("slash commands are not registered as model-callable tools", async () => {
+	const sources = await extensionSources();
+	const registrations = Object.values(sources).join("\n");
 	// every registerCommand name starts with "q-" and none of the workbench
 	// tool names appear as a command
-	const commandNames = index
-		.split("pi.registerCommand(")
+	const commandNames = registrations
+		.split("registerCommand(")
 		.slice(1)
 		.map((block) => /"([^"]+)"/.exec(block)?.[1])
 		.filter((n): n is string => Boolean(n));
@@ -1178,58 +1290,36 @@ test("slash commands are not registered as model-callable tools", async () => {
 	for (const tool of WORKBENCH_TOOL_NAMES) assert.ok(!commandNames.includes(tool), tool);
 });
 
-test("delegate wiring: strict repair resolver and finished-ledger guard precede ledger create / worker run; the repair pointer spreads exactly twice and reads only id/status/after facts (Phase 4D)", async () => {
-	const index = await readFile(new URL("index.ts", EXTENSION_DIR), "utf8");
-	const blockStart = index.indexOf("...WORKBENCH_TOOL_METADATA.workbench_delegate_worker,");
-	const blockEnd = index.indexOf("...WORKBENCH_TOOL_METADATA.workbench_review_worker_diff,");
-	assert.ok(blockStart !== -1 && blockEnd !== -1 && blockEnd > blockStart, "delegate registerTool block is delimited by the catalog spreads");
-	const block = index.slice(blockStart, blockEnd);
-	// 1. The strict repair resolver runs BEFORE projectRoot resolution and
-	// before any new ledger is created (malformed pointers fail closed
-	// before any write or child launch).
-	const resolver = "const repairOf = resolveWorkerRepairOf(params.repair_of);";
-	const projectRootLine = "const projectRoot = await projectRootFor(ctx);";
-	const createLedger = "createDelegationLedger(";
-	assert.ok(block.includes(resolver), "strict repair resolver is present");
-	assert.ok(block.includes(projectRootLine), "projectRoot resolution is present");
-	assert.ok(block.indexOf(resolver) < block.indexOf(projectRootLine), "strict resolver precedes projectRoot resolution");
-	assert.ok(block.indexOf(resolver) < block.indexOf(createLedger), "strict resolver precedes any new ledger creation");
-	// 2. The finished-ledger check (manifest status finished + non-null
-	// after record) happens BEFORE any new ledger is created and before any
-	// worker is launched.
-	const finishedCheck = 'prior.manifest.status !== "finished" || prior.after === null';
-	const runWorker = "runDeepseekWorker({";
-	assert.ok(block.includes("readDelegationLedger(projectRoot, repairOf.repairOf)"), "the prior ledger is read for the finished check");
-	assert.ok(block.includes(finishedCheck), "the finished-ledger guard checks manifest status and the after record");
-	assert.ok(block.indexOf(finishedCheck) < block.indexOf(createLedger), "finished-ledger guard precedes any new ledger creation");
-	assert.ok(block.indexOf(finishedCheck) < block.indexOf(runWorker), "finished-ledger guard precedes any worker launch");
-	// 3. The SAME conditional repairOf spread appears exactly twice — the
-	// ledger contract and the worker contract — and the omitted path
-	// carries no key.
-	const spread = "...(repairOf.repairOf !== undefined ? { repairOf: repairOf.repairOf } : {})";
-	assert.equal(block.split(spread).length - 1, 2, "the conditional repairOf spread appears exactly twice (ledger contract + worker contract)");
-	// 4. The delegate block reads ONLY the prior id/status/after facts: it
-	// never accesses prior.before, prior.workerSummary, the prior
-	// worker-report artifact, or any prior contract field (no prose/scope
-	// inheritance, no authority expansion).
-	const priorAccesses = [...block.matchAll(/prior\.\w+/g)].map((m) => m[0]);
-	assert.deepEqual([...new Set(priorAccesses)], ["prior.manifest", "prior.after"], "only the prior manifest status and after record are inspected");
-	assert.ok(!block.includes("prior.before"), "the delegate block never accesses prior.before");
-	assert.ok(!block.includes("prior.workerSummary"), "the delegate block never accesses prior.workerSummary");
-	assert.ok(!block.includes("prior.contract"), "the delegate block never accesses prior contract fields");
-	// The prior delegation's report artifact (worker-report.md) is never
-	// read: the block resolves no delegation directory itself, never uses
-	// the report constant, and its only worker-report mention is the
-	// finish-step comment about the CURRENT delegation's OWN artifact —
-	// never on a line touching the prior id or the repair pointer.
-	assert.ok(!block.includes("delegationDirFor("), "the delegate block never resolves a delegation directory itself");
-	assert.ok(!block.includes("WORKER_REPORT_FILE_NAME"), "the delegate block never reads the report artifact constant");
-	assert.ok(block.split("worker-report").length - 1 >= 1, "the finish-step comment names the current delegation's own worker-report.md");
-	for (const line of block.split("\n")) {
-		if (line.includes("worker-report")) {
-			assert.ok(!line.includes("prior") && !line.includes("repairOf"), `worker-report mention must never touch the prior delegation: ${line.trim()}`);
-		}
+test("delegate wiring uses one v2 execution path and v2-authoritative repair fallback", async () => {
+	const [block, adapters] = await Promise.all([
+		readFile(new URL("core/delegate-tool-controller.ts", EXTENSION_DIR), "utf8"),
+		readFile(new URL("core/runtime-controller-services.ts", EXTENSION_DIR), "utf8"),
+	]);
+	assert.match(block, /\.\.\.WORKBENCH_TOOL_METADATA\.workbench_delegate_worker,/);
+	const taskKind = "const taskKind = resolveWorkerTaskKind(params.task_kind);";
+	const normalize = "normalizeDelegationBoundedTaskContractV2({";
+	const projectRootLine = "const projectRoot = await controller.projectRootFor(ctx);";
+	const v2Read = "controller.services.readCommittedGeneration(projectRoot, repairId)";
+	const v1Fallback = "controller.services.readLegacyLedger(projectRoot, repairId)";
+	const execute = "controller.services.executeDelegation({";
+	const complete = "controller.services.completeDefaultDelivery({";
+	for (const expected of [taskKind, normalize, projectRootLine, v2Read, v1Fallback, execute, complete]) assert.ok(block.includes(expected), expected);
+	assert.ok(block.indexOf(taskKind) < block.indexOf(normalize));
+	assert.ok(block.indexOf(normalize) < block.indexOf(projectRootLine));
+	assert.ok(block.indexOf(v2Read) < block.indexOf(v1Fallback));
+	assert.ok(block.indexOf(v1Fallback) < block.indexOf(execute));
+	assert.ok(block.includes('priorV2.error.code === "not_found"'), "only v2 not_found permits legacy fallback");
+	assert.ok(block.includes('["FAILED", "FINISHED", "REVIEWED"]'), "only approved committed v2 terminals are repairable");
+	for (const forbidden of ["createDelegationLedger", "finishDelegationLedger", "runDeepseekWorker("]) {
+		assert.equal(block.includes(forbidden), false, `${forbidden} is absent from the public v2 handler`);
 	}
+	assert.equal(block.split("controller.services.executeDelegation({").length - 1, 1, "one injected execution service owns the lifecycle");
+	assert.equal(block.split("controller.services.completeDefaultDelivery({").length - 1, 1, "one injected delivery service owns ordinary review close");
+	assert.ok(block.indexOf(execute) < block.indexOf(complete), "delivery review follows successful execution");
+	assert.match(adapters, /readCommittedGeneration: readDelegationCommittedGenerationV2/);
+	assert.match(adapters, /readLegacyLedger: readDelegationLedger/);
+	assert.match(adapters, /executeDelegation: executeDelegationV2/);
+	assert.match(adapters, /completeDefaultDelivery: completeDefaultDelegationDeliveryV2/);
 });
 
 // ---------------------------------------------------------------------------

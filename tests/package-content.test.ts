@@ -209,9 +209,19 @@ test("prompt filenames do not collide with each other or with extension commands
 	const names = entries.filter((f) => f.endsWith(".md")).map((f) => f.replace(/\.md$/, ""));
 	assert.equal(new Set(names).size, names.length, "duplicate prompt basenames");
 
-	const indexSource = await readFile(join(ROOT, "extensions", "workbench-runtime", "index.ts"), "utf8");
+	const runtimeRoot = join(ROOT, "extensions", "workbench-runtime");
+	const coreRoot = join(runtimeRoot, "core");
+	const runtimeSource = [
+		await readFile(join(runtimeRoot, "index.ts"), "utf8"),
+		...await Promise.all(
+			(await readdir(coreRoot))
+				.filter((name) => name.endsWith(".ts"))
+				.sort()
+				.map((name) => readFile(join(coreRoot, name), "utf8")),
+		),
+	].join("\n");
 	const commands = new Set<string>();
-	for (const m of indexSource.matchAll(/registerCommand\(\s*"([^"]+)"/g)) {
+	for (const m of runtimeSource.matchAll(/registerCommand\(\s*"([^"]+)"/g)) {
 		commands.add(m[1] ?? "");
 	}
 	assert.ok(commands.size > 0, "extension commands must be discoverable for the collision check");
@@ -388,14 +398,14 @@ test("quant-research-design states the research scope boundary", async () => {
 	assert.ok(/out of scope/i.test(text), "quant-research-design must state its scope boundary");
 });
 
-// ------------------------------------------------------- worker-first contract
+// ----------------------------------------------- development-first contract
 
 /**
- * P7 worker-first workflow contract sources: the build prompt, the
- * implementation-workflow skill, and both project AGENTS templates must
- * encode the contract so that removing any rule breaks the suite.
+ * The build prompt, implementation skill, and generated AGENTS templates
+ * keep the default path short. Legacy serialized names remain runtime
+ * compatibility details, never a mandatory user workflow.
  */
-const WORKER_FIRST_SOURCES: ReadonlyArray<readonly [string, string]> = [
+const DEVELOPMENT_FIRST_SOURCES: ReadonlyArray<readonly [string, string]> = [
 	["prompts/q-build.md", "q-build prompt"],
 	["skills/implementation-workflow/SKILL.md", "implementation-workflow skill"],
 	["templates/project/AGENTS.generic.md", "AGENTS.generic template"],
@@ -407,57 +417,60 @@ function normalizeSpace(text: string): string {
 	return text.replace(/\s+/g, " ").trim();
 }
 
-async function workerFirstText(relPath: string): Promise<string> {
+async function developmentFirstText(relPath: string): Promise<string> {
 	return normalizeSpace(await readFile(join(ROOT, relPath), "utf8"));
 }
 
-test("worker-first contract: q-build, the implementation skill, and both AGENTS templates state Sol ownership and worker-owned routine writes", async () => {
+test("development-first contract: ordinary edits are direct and delegation is optional in all four sources", async () => {
 	const phrases = [
-		"Sol owns requirements",
-		"cross-cutting architecture",
-		"worker owns routine local implementation decisions",
-		"bounded worker slices",
+		"edits are direct in DEV",
+		"Delegation is optional",
+		"not required for a write or a defect repair",
 	] as const;
-	for (const [relPath, label] of WORKER_FIRST_SOURCES) {
-		const text = await workerFirstText(relPath);
+	for (const [relPath, label] of DEVELOPMENT_FIRST_SOURCES) {
+		const text = await developmentFirstText(relPath);
 		for (const phrase of phrases) {
 			assert.ok(text.includes(phrase), `${label} (${relPath}) must state \"${phrase}\"`);
 		}
 	}
 });
 
-test("worker-first contract: delegation and fresh-worker repair are required in all four sources", async () => {
-	const phrases = ["bounded delegation", "fresh worker"] as const;
-	for (const [relPath, label] of WORKER_FIRST_SOURCES) {
-		const text = await workerFirstText(relPath);
+test("development-first contract: delegation auto-closes and explicit review is recovery-only", async () => {
+	const phrases = ["reviewed and closed automatically", "explicit review/status", "recovery", "never acceptance"] as const;
+	for (const [relPath, label] of DEVELOPMENT_FIRST_SOURCES) {
+		const text = await developmentFirstText(relPath);
 		for (const phrase of phrases) {
 			assert.ok(text.includes(phrase), `${label} (${relPath}) must state \"${phrase}\"`);
 		}
 	}
 });
 
-test("worker-first contract: only a user-issued temporary write lease is an exception in all four sources", async () => {
-	const phrase = "user-issued temporary write lease";
-	for (const [relPath, label] of WORKER_FIRST_SOURCES) {
-		const text = await workerFirstText(relPath);
+test("development-first contract: only high-risk paths require a temporary lease", async () => {
+	const phrase = "High-risk dependency, security, policy, deployment, migration, and Pi control paths require an explicit user-issued temporary write lease";
+	for (const [relPath, label] of DEVELOPMENT_FIRST_SOURCES) {
+		const text = await developmentFirstText(relPath);
 		assert.ok(text.includes(phrase), `${label} (${relPath}) must state \"${phrase}\"`);
 	}
 });
 
-test("worker-first contract: worker reports are never acceptance in all four sources", async () => {
-	const phrase = "never acceptance";
-	for (const [relPath, label] of WORKER_FIRST_SOURCES) {
-		const text = await workerFirstText(relPath);
-		assert.ok(text.includes(phrase), `${label} (${relPath}) must state \"${phrase}\"`);
-	}
-});
-
-test("worker-first contract: Sol reviews the actual diff and runs the final gates in all four sources", async () => {
-	const phrases = ["actual diff", "final gates"] as const;
-	for (const [relPath, label] of WORKER_FIRST_SOURCES) {
-		const text = await workerFirstText(relPath);
+test("development-first contract: focused feedback and one stable-candidate gate pass replace micro-step full verification", async () => {
+	const phrases = ["focused tests", "stable candidate", "final gates once"] as const;
+	for (const [relPath, label] of DEVELOPMENT_FIRST_SOURCES) {
+		const text = await developmentFirstText(relPath);
 		for (const phrase of phrases) {
 			assert.ok(text.includes(phrase), `${label} (${relPath}) must state \"${phrase}\"`);
 		}
+		assert.ok(!text.includes("Routine writes are worker-owned by default"), `${label} must not restore mandatory worker writes`);
+		assert.ok(!text.includes("Defects go to a fresh worker"), `${label} must not restore mandatory fresh-worker repair`);
 	}
+});
+
+test("human documentation cannot become progress or execution authority", async () => {
+	const readme = normalizeSpace(await readFile(join(ROOT, "README.md"), "utf8"));
+	const delegationDoc = normalizeSpace(await readFile(join(ROOT, "docs/worker-delegation.md"), "utf8"));
+	assert.ok(readme.includes("The current runtime and its committed transaction/run records are the product authority"));
+	assert.ok(readme.includes("Historical plans, handoffs, benchmark narratives, and compatibility notes"));
+	assert.ok(readme.includes("never override current code or create a required development step"));
+	assert.ok(delegationDoc.includes("not a progress mirror and records no run ids or verification status"));
+	assert.ok(delegationDoc.includes("Current committed transaction/run records and current test output determine observed state"));
 });

@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "delegation_id": "20260817-010000-a001",
+  "recorded_at": "2026-08-17T01:00:00.000Z",
+  "contract": {
+    "task": "fixture task",
+    "allowed_paths": ["src/**"],
+    "acceptance_criteria": ["fixture criterion"],
+    "verification": ["npm test"],
+    "timeout_seconds": 1800,
+    "budget_profile": "standard"
+  },
+  "git_head": "afca84f4f6d3cc810b953b16625a1756a7dbc850",
+  "git_dirty": false,
+  "diff_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "changed_paths": [],
+  "path_statuses": {},
+  "path_digests": {}
+}

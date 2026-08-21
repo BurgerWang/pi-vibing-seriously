@@ -1,0 +1,68 @@
+{
+  "fixture_schema": 1,
+  "authority_types": {
+    "delegation": {
+      "schema_version": 1,
+      "reader": "readDelegationLedger",
+      "scenarios": [
+        { "case": "valid", "base": "delegation/valid", "expected_id": "20260817-010000-a001", "read": "accepted", "recover": "not-supported", "gate_eligible": false },
+        { "case": "missing-field", "base": "delegation/valid", "overlay": "delegation/missing-field", "expected_id": "20260817-010000-a001", "read": "accepted-defect", "recover": "not-supported", "gate_eligible": false },
+        { "case": "corrupt-truncated", "base": "delegation/valid", "overlay": "delegation/corrupt-truncated", "expected_id": "20260817-010000-a001", "read": "refused", "recover": "not-supported", "gate_eligible": false },
+        { "case": "partial-write", "base": "delegation/partial-write", "expected_id": "20260817-010003-a004", "read": "accepted-running", "recover": "not-supported", "gate_eligible": false },
+        { "case": "identity-conflict", "base": "delegation/valid", "overlay": "delegation/identity-conflict", "expected_id": "20260817-010000-a001", "read": "refused", "recover": "not-supported", "gate_eligible": false },
+        { "case": "unknown-schema", "base": "delegation/valid", "overlay": "delegation/unknown-schema", "expected_id": "20260817-010000-a001", "read": "accepted-defect", "recover": "not-supported", "gate_eligible": false }
+      ]
+    },
+    "run": {
+      "schema_version": 1,
+      "reader": "readManifest",
+      "scenarios": [
+        { "case": "valid", "path": "run/valid/manifest.json", "directory_id": "20260817-020000-b001", "read": "accepted", "recover": "not-supported", "gate_eligible": "conditional" },
+        { "case": "missing-field", "path": "run/missing-field/manifest.json", "directory_id": "20260817-020001-b002", "read": "refused", "recover": "not-supported", "gate_eligible": false },
+        { "case": "corrupt-truncated", "path": "run/corrupt-truncated/manifest.json", "directory_id": "20260817-020002-b003", "read": "refused", "recover": "not-supported", "gate_eligible": false },
+        { "case": "partial-write", "path": "run/partial-write/summary.json", "directory_id": "20260817-020003-b004", "read": "refused", "recover": "not-supported", "gate_eligible": false },
+        { "case": "identity-conflict", "path": "run/identity-conflict/manifest.json", "directory_id": "20260817-020004-b005", "read": "accepted-defect", "recover": "not-supported", "gate_eligible": false },
+        { "case": "unknown-schema", "path": "run/unknown-schema/manifest.json", "directory_id": "20260817-020005-b006", "read": "refused", "recover": "not-supported", "gate_eligible": false }
+      ]
+    },
+    "gate": {
+      "schema_version": 1,
+      "reader": "readPersistedGateRunFacts",
+      "scenarios": [
+        { "case": "valid", "base": "gate/valid", "run_id": "20260817-030000-c001", "read": "accepted", "recover": "facts", "gate_eligible": "conditional" },
+        { "case": "missing-field", "base": "gate/valid", "overlay": "gate/missing-field", "run_id": "20260817-030000-c001", "read": "refused", "recover": "refused", "gate_eligible": false },
+        { "case": "corrupt-truncated", "base": "gate/valid", "overlay": "gate/corrupt-truncated", "run_id": "20260817-030000-c001", "read": "refused", "recover": "refused", "gate_eligible": false },
+        { "case": "partial-write", "base": "gate/partial-write", "run_id": "20260817-030003-c004", "read": "refused", "recover": "refused", "gate_eligible": false },
+        { "case": "identity-conflict", "base": "gate/valid", "overlay": "gate/identity-conflict", "run_id": "20260817-030000-c001", "read": "refused", "recover": "refused", "gate_eligible": false },
+        { "case": "unknown-schema", "base": "gate/valid", "overlay": "gate/unknown-schema", "run_id": "20260817-030000-c001", "read": "refused", "recover": "refused", "gate_eligible": false }
+      ]
+    },
+    "receipt": {
+      "schema": "wtr1",
+      "schema_version": 1,
+      "reader": "parseStartedArtifact/parseFinalizedArtifact/recoverReceipt",
+      "result_id": "wtr1-1111111111111111111111111111111111111111111111111111111111111111",
+      "scenarios": [
+        { "case": "valid", "directory": "receipt/valid", "read": "accepted", "recover": "completed", "gate_eligible": false },
+        { "case": "missing-field", "directory": "receipt/missing-field", "read": "refused", "recover": "corrupt", "gate_eligible": false },
+        { "case": "corrupt-truncated", "directory": "receipt/corrupt-truncated", "read": "refused", "recover": "corrupt", "gate_eligible": false },
+        { "case": "partial-write", "directory": "receipt/partial-write", "read": "accepted-started", "recover": "incomplete", "gate_eligible": false },
+        { "case": "identity-conflict", "directory": "receipt/identity-conflict", "read": "accepted-phases", "recover": "conflict", "gate_eligible": false },
+        { "case": "unknown-schema", "directory": "receipt/unknown-schema", "read": "refused", "recover": "corrupt", "gate_eligible": false }
+      ]
+    },
+    "validation-evidence": {
+      "schema_version": 1,
+      "binding_schema_version": 1,
+      "reader": "parseValidationEvidenceBlock/evaluateValidationReuse",
+      "scenarios": [
+        { "case": "valid", "path": "validation-evidence/valid.json", "read": "accepted", "recover": "reusable-current-state", "gate_eligible": "conditional" },
+        { "case": "missing-field", "path": "validation-evidence/missing-field.json", "read": "refused", "recover": "corrupt-binding", "gate_eligible": false },
+        { "case": "corrupt-truncated", "path": "validation-evidence/corrupt-truncated.json", "read": "refused", "recover": "corrupt-binding", "gate_eligible": false },
+        { "case": "partial-write", "path": "validation-evidence/partial-write.json", "read": "refused", "recover": "corrupt-binding", "gate_eligible": false },
+        { "case": "identity-conflict", "path": "validation-evidence/identity-conflict.json", "read": "accepted", "recover": "target-mismatch", "gate_eligible": false },
+        { "case": "unknown-schema", "path": "validation-evidence/unknown-schema.json", "read": "refused", "recover": "legacy-binding", "gate_eligible": false }
+      ]
+    }
+  }
+}

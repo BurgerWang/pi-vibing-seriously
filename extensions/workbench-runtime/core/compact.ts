@@ -238,11 +238,11 @@ export function buildCompactNote(state: CompactState): string {
 	];
 	lines.push(...line("task", state.task));
 	lines.push(...line("phase", state.phase));
-	// P7 worker-first facts: strict policy active, denied commander direct
-	// writes, pending/reviewed delegation state, and the next action. These
+	// Compatibility facts: development-first direct writes, high-risk lease
+	// boundary, delegation state, and the next action. These
 	// are pointers/statuses only — the hard guards never read this text.
-	if (state.writePolicy === "worker-first-strict") lines.push("worker-first: strict active");
-	if (state.commanderWritesDenied === true) lines.push("commander writes: denied");
+	if (state.writePolicy === "worker-first-strict") lines.push("development writes: direct (high-risk paths require lease)");
+	if (state.commanderWritesDenied === true) lines.push("high-risk writes: lease required");
 	if (state.lastDelegationId) {
 		const reviewState =
 			state.pendingDelegationReview === true

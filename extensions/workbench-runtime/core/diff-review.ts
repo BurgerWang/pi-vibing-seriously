@@ -3,21 +3,26 @@
  * Pure logic with injected exec (git calls are argv-only, shell=false),
  * no Pi imports.
  *
- * The review reads REAL git state and the delegation ledger, then:
+ * The review reads the CURRENT workspace authority and the delegation
+ * ledger, then:
  *   - derives the worker's TRUE changed paths relative to the before
  *     snapshot (new / deleted / digest-moved, including previously-dirty
  *     paths);
- *   - checks EVERY worker path against the parent-approved allowed_paths
+ *   - checks EVERY worker-delta path W against the parent-approved
+ *     allowed_paths
  *     (the exact worker-policy scope semantics) with a realpath-safe
  *     check — symlink escapes count as violations, and `include_paths`
  *     only narrows the patch output and can never hide a violation;
  *     unsafe or non-worker include_paths entries are REFUSED;
- *   - computes the current diff hash and compares it with the recorded
- *     after hash (mismatch/drift are recorded as warnings — the review
- *     binds the CURRENT hash, and any later change turns the bound state
- *     STALE via core/delegation-state.ts); drift compares the recorded
- *     after snapshot against the current tree, so same-path later edits
- *     are detected while untouched preexisting dirty paths are ignored;
+ *   - computes the generation-specific current authority binding and
+ *     compares it with the recorded after binding (mismatch/drift are
+ *     recorded as warnings): new tagged v2 binds the W/D/S relevance
+ *     projection, while historical untagged v2/v1 binds the complete full
+ *     diff. Relevant later change turns the new-v2 bound state STALE;
+ *     any later full-diff change does so for legacy. Drift compares the
+ *     recorded after snapshot against the current authority, so same-path
+ *     later edits are detected while baseline unrelated dirty paths remain
+ *     outside new-v2 relevance;
  *   - warns when the worker report's bounded ## Files Changed section is
  *     missing or does not match the actual diff (reported_paths is parsed
  *     into the ledger at finish);
@@ -29,8 +34,9 @@
  *     explicit segmented include_paths review instruction are returned
  *     when content is truncated or omitted — ANY per-path truncated entry
  *     also sets patch_truncated, even when every entry fits the global
- *     envelope. Scope checks and the bound hash always cover the complete
- *     actual worker diff.
+ *     envelope. Scope checks always cover the complete actual worker delta
+ *     W; the bound authority covers W/D/S relevance for new tagged v2 or
+ *     the complete full diff for historical untagged v2/v1.
  *   - tracks displayed-path COVERAGE (Slice B2): a path is displayed
  *     only when it appears in an actually rendered patch entry (a
  *     globally omitted path never counts; a bounded/per-path-truncated
@@ -49,9 +55,10 @@
  *     path, and the render shows deterministic counts, a bounded next
  *     include_paths guidance (max 50 paths AND a fixed UTF-8 byte cap,
  *     complete paths only, exact omitted count) and the review-complete
- *     fact. Every review segment still scope-checks EVERY worker path and
- *     binds the COMPLETE current diff hash — include_paths narrows only
- *     the rendered patch.
+ *     fact. Every review segment still scope-checks EVERY W path. New
+ *     tagged v2 binds the current W/D/S relevance projection; historical
+ *     untagged v2/v1 binds the complete current full-diff hash.
+ *     `include_paths` narrows only the rendered patch.
  *   - Phase 5 (Execution Efficiency Optimization): CURRENT REGULAR
  *     `.svg`/`.json` worker paths LARGER than the default global review
  *     byte cap (COMPACT_MIN_BYTES = DEFAULT_REVIEW_MAX_BYTES = 32 KiB)
@@ -68,8 +75,9 @@
  *     preview capture — the existing bounded content digest is preserved
  *     (it may read the complete file through MAX_DIGEST_BYTES = 4 MiB and
  *     uses prefix+size beyond); ordinary source/small/
- *     deleted/unreadable paths keep the existing behavior; scope/hash/
- *     include_paths/coverage/STALE invariants are unchanged.
+ *     deleted/unreadable paths keep the existing behavior; scope/
+ *     authority-binding/include_paths/coverage/STALE invariants are
+ *     unchanged.
  *   - Phase 5 hardening: a worker path the authoritative scope/realpath
  *     check finds outside the parent-approved scope is WITHHELD — the
  *     review's per-path content pipeline (git diff capture, bounded file
@@ -78,14 +86,13 @@
  *     path still counts as an actually displayed entry and the verdict
  *     stays FAIL. Compact reads re-verify project-root realpath
  *     containment immediately before opening, so no compact read can
- *     follow an escaping symlink; the whole-diff hash binding
- *     (collectGitFacts) is unchanged and still covers the complete
- *     actual diff.
+ *     follow an escaping symlink. Legacy v1/historical-v2 keep the complete
+ *     collectGitFacts binding; new v2 instead binds W/D/S relevance.
  *   - writes ONLY review.json in the delegation directory and returns the
  *     verdict; the runtime wiring (index.ts) is the only component that
  *     touches the delegation state entry.
  *
- * Verdicts: PASS when no worker path is outside the approved scope;
+ * Verdicts: PASS when no worker-delta path W is outside the approved scope;
  * FAIL when any violation exists (the runtime then refuses to mark the
  * delegation REVIEWED, and a scope FAIL invalidates a prior same-hash
  * REVIEWED state fail-closed via core/delegation-state.ts). The review
@@ -119,6 +126,11 @@ import { redactText } from "./redact.ts";
 import { isWorkerPathAllowedRealpath } from "../worker/path-scope.ts";
 import { readJsonFileBounded, type BoundedFileIoHooks } from "./bounded-file-io.ts";
 import type { ExecFn } from "./config.ts";
+import {
+	REVIEW_RELEVANCE_KIND_V2,
+	type ReviewRelevanceBindingV2,
+	type ReviewRelevanceProjectionV2,
+} from "./review-relevance-v2.ts";
 
 export const REVIEW_SCHEMA_VERSION = 1;
 export const DEFAULT_REVIEW_MAX_LINES = 400;
@@ -146,7 +158,7 @@ export const REVIEW_PATH_STATS_MAX_LINES = 60;
  * complete facts either fit the fixed reader cap byte-for-byte (including
  * the trailing newline) or persistence fails closed.
  */
-function compileReviewRecordPayload(record: ReviewRecord): string | undefined {
+export function compileReviewRecordPayload(record: ReviewRecord): string | undefined {
 	try {
 		const payload = `${JSON.stringify(record, null, 2)}\n`;
 		return Buffer.byteLength(payload, "utf8") <= REVIEW_RECORD_MAX_BYTES ? payload : undefined;
@@ -333,13 +345,13 @@ export interface ReviewRecord {
 	delegation_id: string;
 	reviewed_at: string;
 	verdict: ReviewVerdict;
-	/** The CURRENT diff hash (what the review actually inspected and binds). */
+	/** The CURRENT generation-specific authority hash: new-v2 W/D/S relevance or legacy full diff. */
 	bound_diff_hash: string;
-	/** The diff hash the worker's after record reported. */
+	/** The worker's recorded after authority hash (compatibility field name retained). */
 	recorded_after_hash: string;
-	/** True when the current diff hash differs from the recorded after hash. */
+	/** True when the current generation-specific authority hash differs from the recorded after hash. */
 	mismatch: boolean;
-	/** Current changed paths that appeared after the worker finished. */
+	/** Relevant new-v2 or complete legacy paths that changed after the worker finished. */
 	drift_paths: string[];
 	/** Worker paths outside the parent-approved scope (verdict FAIL when non-empty). */
 	violations: ReviewViolation[];
@@ -376,6 +388,10 @@ export interface ReviewRecord {
 	coverage_complete: boolean;
 	/** Durable project-relative review.json path (reviewRecordRelPath). */
 	review_path: string;
+	/** New-v2 only. Legacy v1 and old-v2 schema1 records omit these fields. */
+	diff_identity_kind?: typeof REVIEW_RELEVANCE_KIND_V2;
+	relevance_binding?: ReviewRelevanceBindingV2;
+	relevance_projection?: ReviewRelevanceProjectionV2;
 }
 
 export interface ReviewResult {
@@ -402,6 +418,33 @@ export interface ReviewInput {
 	/** Secret values to scrub from the patch (collectSecretValues(process.env)). */
 	secrets?: readonly string[];
 	now?: string;
+}
+
+/**
+ * Strict callers may supply already-authorized delegation facts.  This is
+ * the common review-computation seam used by v1 and v2: scope checking,
+ * current git collection, drift/diff hashing, bounded patch rendering and
+ * segmented coverage remain implemented exactly once below.
+ */
+export interface ReviewAuthorityFacts {
+	delegation_id: string;
+	allowed_paths: readonly string[];
+	worker_paths: readonly string[];
+	recorded_after_hash: string;
+	after: GitFacts;
+	reported_paths: readonly string[];
+	/** New-v2 guard-native review seam; presence suppresses legacy Git collection. */
+	current?: GitFacts;
+	current_diff_hash?: string;
+	drift_paths?: readonly string[];
+	relevance_binding?: ReviewRelevanceBindingV2;
+	relevance_projection?: ReviewRelevanceProjectionV2;
+}
+
+export interface ReviewFromAuthorityInput extends ReviewInput {
+	authority: ReviewAuthorityFacts;
+	priorReview: ReviewRecord | null;
+	reviewPath: string;
 }
 
 /**
@@ -949,8 +992,8 @@ export interface ReviewCoverage {
  * displayed_paths field infer their prior coverage ONLY from their
  * persisted patch entries; malformed persisted coverage arrays are never
  * trusted over recomputation from the prior record's valid checked worker
- * paths and its actually rendered patch entries. Output lists are sorted
- * deterministically.
+ * paths and its actually rendered patch entries. Output lists preserve the
+ * trusted worker-path order (legacy order for v1, UTF-8 byte order for v2).
  */
 export function mergeReviewCoverage(
 	workerPaths: readonly string[],
@@ -991,7 +1034,7 @@ export function mergeReviewCoverage(
 			if (typeof path === "string" && priorCheckedSet.has(path) && workerSet.has(path)) displayed.add(path);
 		}
 	}
-	const displayedPaths = [...displayed].sort();
+	const displayedPaths = workerPaths.filter((path) => displayed.has(path));
 	const remainingPaths = workerPaths.filter((path) => !displayed.has(path));
 	return {
 		displayed_paths: displayedPaths,
@@ -1005,7 +1048,10 @@ export function mergeReviewCoverage(
  * (atomic) and returns the verdict + bounded redacted patch. Never touches
  * the delegation state entry — the runtime does that.
  */
-async function reviewDelegationInner(input: ReviewInput): Promise<ReviewResult> {
+async function reviewDelegationInner(
+	input: ReviewInput,
+	override?: Pick<ReviewFromAuthorityInput, "authority" | "priorReview" | "reviewPath">,
+): Promise<ReviewResult> {
 	const projectRoot = input.projectRoot;
 	const delegationId = typeof input.delegationId === "string" ? input.delegationId.trim() : "";
 	const now = input.now ?? new Date().toISOString();
@@ -1016,24 +1062,43 @@ async function reviewDelegationInner(input: ReviewInput): Promise<ReviewResult> 
 	if (!isValidDelegationId(delegationId)) {
 		return reviewFailure("invalid_delegation");
 	}
-	const ledger = await readDelegationLedger(projectRoot, delegationId);
-	if (!ledger) {
-		return reviewFailure("delegation_not_found");
+	let authority: ReviewAuthorityFacts;
+	let priorReview: ReviewRecord | null;
+	let reviewPath: string;
+	if (override === undefined) {
+		const ledger = await readDelegationLedger(projectRoot, delegationId);
+		if (!ledger) return reviewFailure("delegation_not_found");
+		if (!ledger.after) return reviewFailure("delegation_incomplete");
+		authority = {
+			delegation_id: delegationId,
+			allowed_paths: [...ledger.before.contract.allowed_paths],
+			worker_paths: [...ledger.after.changed_since_before],
+			recorded_after_hash: ledger.after.diff_hash,
+			after: {
+				gitHead: ledger.after.git_head,
+				gitDirty: ledger.after.git_dirty,
+				changedPaths: [...ledger.after.changed_paths],
+				pathStatuses: { ...ledger.after.path_statuses },
+				pathDigests: { ...ledger.after.path_digests },
+			},
+			reported_paths: [...ledger.after.reported_paths],
+		};
+		// Slice B2: read the PRIOR persisted review record BEFORE this call
+		// overwrites it — same-hash segments merge displayed coverage.
+		priorReview = await readReviewRecord(projectRoot, delegationId);
+		reviewPath = reviewRecordRelPath(delegationId);
+	} else {
+		authority = override.authority;
+		priorReview = override.priorReview;
+		reviewPath = override.reviewPath;
 	}
-	if (!ledger.after) {
-		return reviewFailure("delegation_incomplete");
-	}
+	if (authority.delegation_id !== delegationId) return reviewFailure("delegation_incomplete");
 
-	// Slice B2: read the PRIOR persisted review record BEFORE this call
-	// overwrites it — same-hash segments merge displayed coverage; a hash
-	// change resets it. The finish-time PENDING_REVIEW placeholder and
-	// corrupt/foreign records read as null (no prior coverage).
-	const priorReview = await readReviewRecord(projectRoot, delegationId);
-
-	// Worker paths = TRUE paths changed between before and after (the ledger
-	// derived them digest-based; previously-dirty paths are included).
-	const workerPaths = [...ledger.after.changed_since_before].sort();
-	const allowedPaths = ledger.before.contract.allowed_paths;
+	// Worker paths are the authority-specific review scope: v1 supplies its
+	// legacy changed-since-before order, while v2 supplies the byte-canonical
+	// ChangeSet-attributed worker delta after strict generation validation.
+	const workerPaths = [...authority.worker_paths];
+	const allowedPaths = [...authority.allowed_paths];
 
 	// Scope check over ALL worker paths — include_paths can never hide a
 	// violation. The check is realpath-safe: a symlink inside an approved
@@ -1057,16 +1122,35 @@ async function reviewDelegationInner(input: ReviewInput): Promise<ReviewResult> 
 	// ledger's claims. Fail closed: an unavailable `git status` (thrown exec
 	// error or non-zero exit) returns a structured failure and writes NO
 	// review record — a fabricated clean tree could never be reviewed as
-	// PASS. The whole-diff hash binding (collectGitFacts) is unchanged and
-	// always covers the complete actual diff, violating paths included.
+	// PASS. New-v2 receives a pre-collected W/D/S relevance binding; legacy
+	// v1 and historical v2 retain collectGitFacts over the complete diff.
 	let current: GitFacts;
-	try {
-		current = await collectGitFacts(projectRoot, input.exec);
-	} catch {
-		return reviewFailure("git_state_unavailable");
+	let boundDiffHash: string;
+	const relevanceSupplied = authority.relevance_binding !== undefined || authority.relevance_projection !== undefined ||
+		authority.current !== undefined || authority.current_diff_hash !== undefined || authority.drift_paths !== undefined;
+	if (relevanceSupplied) {
+		if (authority.relevance_binding === undefined || authority.relevance_projection === undefined || authority.current === undefined ||
+			authority.current_diff_hash === undefined || authority.drift_paths === undefined ||
+			authority.relevance_binding.diff_identity_kind !== REVIEW_RELEVANCE_KIND_V2 ||
+			authority.relevance_projection.diff_identity_kind !== REVIEW_RELEVANCE_KIND_V2 ||
+			authority.relevance_binding.projection_hash !== authority.current_diff_hash) return reviewFailure("git_state_unavailable");
+		current = {
+			gitHead: authority.current.gitHead,
+			gitDirty: authority.current.gitDirty,
+			changedPaths: [...authority.current.changedPaths],
+			pathStatuses: { ...authority.current.pathStatuses },
+			pathDigests: { ...authority.current.pathDigests },
+		};
+		boundDiffHash = authority.current_diff_hash;
+	} else {
+		try {
+			current = await collectGitFacts(projectRoot, input.exec);
+		} catch {
+			return reviewFailure("git_state_unavailable");
+		}
+		boundDiffHash = computeDiffHash(current.changedPaths, current.pathDigests, current.pathStatuses);
 	}
-	const boundDiffHash = computeDiffHash(current.changedPaths, current.pathDigests, current.pathStatuses);
-	const recordedAfterHash = ledger.after.diff_hash;
+	const recordedAfterHash = authority.recorded_after_hash;
 	const mismatch = boundDiffHash !== recordedAfterHash;
 
 	// Include paths narrow only the patch and may name ONLY worker-diff
@@ -1091,21 +1175,22 @@ async function reviewDelegationInner(input: ReviewInput): Promise<ReviewResult> 
 
 	// Drift: paths whose state differs from the recorded-after snapshot
 	// (new paths, same-path later edits via digest/status comparison,
-	// deletions) — recorded as warnings; the bound hash covers them.
+	// deletions) — recorded as warnings; the generation-specific authority
+	// hash covers them.
 	// Untouched preexisting dirty paths (already dirty before the
 	// delegation and still identical) are NOT drift.
 	const afterFacts: GitFacts = {
-		gitHead: ledger.after.git_head,
-		gitDirty: ledger.after.git_dirty,
-		changedPaths: [...ledger.after.changed_paths],
-		pathStatuses: { ...ledger.after.path_statuses },
-		pathDigests: { ...ledger.after.path_digests },
+		gitHead: authority.after.gitHead,
+		gitDirty: authority.after.gitDirty,
+		changedPaths: [...authority.after.changedPaths],
+		pathStatuses: { ...authority.after.pathStatuses },
+		pathDigests: { ...authority.after.pathDigests },
 	};
-	const driftPaths = changedSinceBefore(afterFacts, current);
+	const driftPaths = relevanceSupplied ? [...authority.drift_paths!] : changedSinceBefore(afterFacts, current);
 
 	const notes: string[] = [];
 	if (mismatch) {
-		notes.push(`current diff hash differs from the worker's recorded after hash (${boundDiffHash.slice(0, 12)} vs ${recordedAfterHash.slice(0, 12)}) — the review binds the CURRENT hash; any further change turns the delegation STALE`);
+		notes.push(`current authority binding differs from the worker's recorded binding (${boundDiffHash.slice(0, 12)} vs ${recordedAfterHash.slice(0, 12)}) — later relevant new-v2 drift, or any legacy full-diff change, turns the delegation STALE`);
 	}
 	if (driftPaths.length > 0) {
 		notes.push(boundedPathList(`${driftPaths.length} path(s) changed after the worker finished: `, driftPaths, 10));
@@ -1114,7 +1199,7 @@ async function reviewDelegationInner(input: ReviewInput): Promise<ReviewResult> 
 	// worker listed in its bounded ## Files Changed section. A missing
 	// section or a mismatch with the actual diff is a warning — the verdict
 	// stays driven by the REAL diff, never the report.
-	const reportedPaths = [...ledger.after.reported_paths];
+	const reportedPaths = [...authority.reported_paths];
 	if (reportedPaths.length === 0) {
 		notes.push("worker report has no parseable ## Files Changed section — reported/actual path comparison unavailable");
 	} else {
@@ -1133,8 +1218,8 @@ async function reviewDelegationInner(input: ReviewInput): Promise<ReviewResult> 
 	// Patch: include_paths narrows the OUTPUT only (entries were validated
 	// above against the worker diff). Per-path reads are bounded; the GLOBAL
 	// line AND byte caps are enforced over the whole rendered patch content
-	// (never independently per path). Scope checks and the bound hash always
-	// cover the complete actual diff — truncation affects only the display.
+	// (never independently per path). Scope checks cover every W path; the
+	// bound hash covers new-v2 W/D/S relevance or the complete legacy diff.
 	// Fail closed: a violating path is withheld BEFORE any content open/
 	// read/digest/display — its entry is the deterministic bounded marker,
 	// never a git diff, file read, digest or rendered content.
@@ -1151,7 +1236,7 @@ async function reviewDelegationInner(input: ReviewInput): Promise<ReviewResult> 
 			rawEntries.push({ path, source: "withheld", text: WITHHELD_MARKER, perPathTruncated: false });
 			continue;
 		}
-		const entry = await patchEntryFor(projectRoot, path, input.exec, secrets, Math.min(maxBytes, REVIEW_PATCH_MAX_BYTES), ledger.after.path_digests, current.pathStatuses[path] ?? "");
+		const entry = await patchEntryFor(projectRoot, path, input.exec, secrets, Math.min(maxBytes, REVIEW_PATCH_MAX_BYTES), authority.after.pathDigests, current.pathStatuses[path] ?? "");
 		rawEntries.push(entry);
 	}
 	const bounded = boundPatchEntries(
@@ -1163,7 +1248,7 @@ async function reviewDelegationInner(input: ReviewInput): Promise<ReviewResult> 
 	const verdict: ReviewVerdict = violations.length > 0 ? "FAIL" : "PASS";
 	const priorCoverage = mergeReviewCoverage(workerPaths, [], priorReview, boundDiffHash);
 	const provisionalRecord: ReviewRecord = {
-		schema_version: REVIEW_SCHEMA_VERSION,
+		schema_version: relevanceSupplied ? 2 : REVIEW_SCHEMA_VERSION,
 		delegation_id: delegationId,
 		reviewed_at: now,
 		verdict,
@@ -1182,7 +1267,12 @@ async function reviewDelegationInner(input: ReviewInput): Promise<ReviewResult> 
 		displayed_paths: priorCoverage.displayed_paths,
 		remaining_paths: priorCoverage.remaining_paths,
 		coverage_complete: priorCoverage.coverage_complete,
-		review_path: reviewRecordRelPath(delegationId),
+		review_path: reviewPath,
+		...(relevanceSupplied ? {
+			diff_identity_kind: REVIEW_RELEVANCE_KIND_V2,
+			relevance_binding: structuredClone(authority.relevance_binding!),
+			relevance_projection: structuredClone(authority.relevance_projection!),
+		} : {}),
 	};
 
 	// Presentation is part of review authority: determine which candidate
@@ -1225,10 +1315,12 @@ async function reviewDelegationInner(input: ReviewInput): Promise<ReviewResult> 
 
 	const reviewPayload = compileReviewRecordPayload(record);
 	if (reviewPayload === undefined) return reviewFailure("review_persist_failed");
-	try {
-		await writeTextAtomic(delegationDirFor(projectRoot, delegationId), "review.json", reviewPayload);
-	} catch {
-		return reviewFailure("review_persist_failed");
+	if (override === undefined) {
+		try {
+			await writeTextAtomic(delegationDirFor(projectRoot, delegationId), "review.json", reviewPayload);
+		} catch {
+			return reviewFailure("review_persist_failed");
+		}
 	}
 
 	return { ok: true, record, lines: presentation.lines };
@@ -1240,6 +1332,33 @@ export async function reviewDelegation(input: ReviewInput): Promise<ReviewResult
 		return await reviewDelegationInner(input);
 	} catch {
 		return reviewFailure("runtime_failure");
+	}
+}
+
+/**
+ * Compute a review from caller-supplied strict authority facts without
+ * writing an artifact.  Persistence and lifecycle publication remain the
+ * responsibility of the authority-specific adapter.
+ */
+export async function reviewDelegationFromAuthority(input: ReviewFromAuthorityInput): Promise<ReviewResult> {
+	try {
+		return await reviewDelegationInner(input, {
+			authority: input.authority,
+			priorReview: input.priorReview,
+			reviewPath: input.reviewPath,
+		});
+	} catch {
+		return reviewFailure("runtime_failure");
+	}
+}
+
+/** Shared current-tree binding used for immutable finalized-review replay. */
+export async function collectReviewBoundDiffHash(projectRoot: string, exec: ExecFn): Promise<string | null> {
+	try {
+		const current = await collectGitFacts(projectRoot, exec);
+		return computeDiffHash(current.changedPaths, current.pathDigests, current.pathStatuses);
+	} catch {
+		return null;
 	}
 }
 
@@ -1279,7 +1398,7 @@ export function normalizeReviewCoverage(record: ReviewRecord): ReviewCoverage {
 		for (const path of rawDisplayed) {
 			if (typeof path === "string" && checkedSet.has(path)) displayedSet.add(path);
 		}
-		const displayedPaths = [...displayedSet].sort();
+		const displayedPaths = checked.filter((path) => displayedSet.has(path));
 		const remainingPaths = checked.filter((path) => !displayedSet.has(path));
 		return {
 			displayed_paths: displayedPaths,
@@ -1292,10 +1411,10 @@ export function normalizeReviewCoverage(record: ReviewRecord): ReviewCoverage {
 	const hasDisplayed = Array.isArray(record.displayed_paths);
 	const hasRemaining = Array.isArray(record.remaining_paths);
 	const displayedPaths = hasDisplayed
-		? record.displayed_paths.filter((p): p is string => typeof p === "string").sort()
+		? record.displayed_paths.filter((p): p is string => typeof p === "string")
 		: [];
 	const remainingPaths = hasRemaining
-		? record.remaining_paths.filter((p): p is string => typeof p === "string").sort()
+		? record.remaining_paths.filter((p): p is string => typeof p === "string")
 		: [];
 	return {
 		displayed_paths: displayedPaths,

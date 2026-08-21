@@ -561,7 +561,10 @@ test("production run-log reader contains no whole-log readFile path", async () =
 	const source = await readFile(join(process.cwd(), "extensions/workbench-runtime/core/runs.ts"), "utf8");
 	assert.doesNotMatch(source, /readFile\s*\(\s*path/);
 	assert.doesNotMatch(source, /truncateTail/);
-	const runtime = await readFile(join(process.cwd(), "extensions/workbench-runtime/index.ts"), "utf8");
+	const runtime = await readFile(
+		join(process.cwd(), "extensions/workbench-runtime/core/recipe-tools-controller.ts"),
+		"utf8",
+	);
 	const executeStart = runtime.indexOf('peekOutputAuthorization(toolCallId, "workbench_read_run")');
 	const pageStart = runtime.indexOf("await readRunLogPage(projectRoot, params.run_id", executeStart);
 	const renderStart = runtime.indexOf("const rendered = renderRunLogPage({", pageStart);

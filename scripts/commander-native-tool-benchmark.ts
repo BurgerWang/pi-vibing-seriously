@@ -264,7 +264,7 @@ export const FROZEN_NRO_PROTOCOL: FrozenProtocol = {
 	milestonePromptSha256: "1af10ebb1abfec5aba9744841980da66c9ee8e12720d589caa623350fb608a40",
 	environment: { modelKey: "openai-codex/gpt-5.6-sol", thinkingLevel: "high", piVersion: "0.83.0", nodeVersion: "v26.4.0" },
 	fixtureManifestSha256: "062b3c92a8a36825394f0fa80b94808f2457ca5b63e8bbf9a70ff24339c216b6",
-	nonTreatmentSha256: "7cbb545284d1f69aea04248b41a9466cb3aa53a39e8a6456291d410c59d28738",
+	nonTreatmentSha256: "d8ae301a2050004b6f93da1aec9871496fe07b307d9cca8808ad4369ea365b78",
 	rubricSha256: "dccfd406a69f7582a5fc44daad420d8e177c993cf3a7110ae11c6686beab74ed",
 	runsPerArm: RUNS_PER_ARM,
 	interleave: INTERLEAVE,

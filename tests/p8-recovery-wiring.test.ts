@@ -45,7 +45,11 @@ import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionCommandContext, type 
 
 import workbenchRuntime from "../extensions/workbench-runtime/index.ts";
 import { DEFAULT_RESULT_MAX_BYTES, DEFAULT_RESULT_MAX_LINES, DETAILS_MAX_BYTES, MAX_TOOL_CALLS_PER_TURN } from "../extensions/workbench-runtime/core/output-policy.ts";
-import { RECOVERY_TOOL_NAME } from "../extensions/workbench-runtime/core/tool-catalog.ts";
+import {
+	RECOVERY_TOOL_NAME,
+	WORKBENCH_RECEIPT_FREE_TOOL_NAMES,
+	workbenchToolRequiresReceipt,
+} from "../extensions/workbench-runtime/core/tool-catalog.ts";
 import { TURN_CALL_LIMIT_CONTROL_TEXT } from "../extensions/workbench-runtime/core/turn-output-budget.ts";
 import {
 	deriveResultId,
@@ -368,7 +372,7 @@ test("recovered output is persisted, bounded and truncated (caps + omission mark
 		const guard = await emitToolCall(stub, ctx, {
 			type: "tool_call",
 			toolCallId: callId,
-			toolName: "workbench_project_inspect",
+			toolName: "workbench_run_recipe",
 			input: {},
 		});
 		assert.equal(guard.block, undefined);
@@ -377,7 +381,7 @@ test("recovered output is persisted, bounded and truncated (caps + omission mark
 		// A deliberately HUGE tool result (5000 lines) — the finalize must
 		// extract text blocks only, redact, and cap to the summary bounds.
 		const huge = Array.from({ length: 5000 }, (_, i) => `line-${i}-${"x".repeat(80)}`).join("\n");
-		const merged = await emitToolResult(stub, resultEvent(callId, "workbench_project_inspect", huge, { ok: true }));
+		const merged = await emitToolResult(stub, resultEvent(callId, "workbench_run_recipe", huge, { ok: true }));
 		assert.ok(merged?.details, "details merged");
 		const boundedText = (merged?.content ?? []).filter((block) => block.type === "text").map((block) => block.text ?? "").join("");
 		assert.ok(utf8Bytes(boundedText) <= DEFAULT_RESULT_MAX_BYTES, "receipt input is the final per-tool bounded content");
@@ -433,7 +437,7 @@ test("recovery fail-closed codes: missing, incomplete, malformed/corrupt, confli
 
 		// incomplete — a started receipt that was never finalized.
 		const callInc = "call-incomplete-1";
-		await emitToolCall(stub, ctx, { type: "tool_call", toolCallId: callInc, toolName: "workbench_project_inspect", input: {} });
+		await emitToolCall(stub, ctx, { type: "tool_call", toolCallId: callInc, toolName: "workbench_run_recipe", input: {} });
 		const idInc = deriveResultId(SESSION, callInc);
 		const incomplete = await recoverTool.execute("call-m3", { result_id: idInc }, undefined, undefined, ctx as never);
 		assert.equal((incomplete.details as Record<string, unknown>).code, "incomplete");
@@ -441,7 +445,7 @@ test("recovery fail-closed codes: missing, incomplete, malformed/corrupt, confli
 
 		// malformed artifact → corrupt.
 		const callBad = "call-malformed-1";
-		await emitToolCall(stub, ctx, { type: "tool_call", toolCallId: callBad, toolName: "workbench_project_inspect", input: {} });
+		await emitToolCall(stub, ctx, { type: "tool_call", toolCallId: callBad, toolName: "workbench_run_recipe", input: {} });
 		const idBad = deriveResultId(SESSION, callBad);
 		await writeFile(join(receiptsDir(root), `${idBad}.started`), "not-json{", "utf8");
 		const corrupt = await recoverTool.execute("call-m4", { result_id: idBad }, undefined, undefined, ctx as never);
@@ -449,7 +453,7 @@ test("recovery fail-closed codes: missing, incomplete, malformed/corrupt, confli
 
 		// conflict — both phases parse but disagree (cross-phase mismatch).
 		const callC = "call-conflict-1";
-		await emitToolCall(stub, ctx, { type: "tool_call", toolCallId: callC, toolName: "workbench_project_inspect", input: {} });
+		await emitToolCall(stub, ctx, { type: "tool_call", toolCallId: callC, toolName: "workbench_run_recipe", input: {} });
 		const idC = deriveResultId(SESSION, callC);
 		const startedRaw = JSON.parse(await readFile(join(receiptsDir(root), `${idC}.started`), "utf8")) as Record<string, unknown>;
 		const conflicting = {
@@ -488,7 +492,7 @@ test("begin storage failure blocks the tool call BEFORE execute (fail closed)", 
 		const guard = await emitToolCall(stub, ctx, {
 			type: "tool_call",
 			toolCallId: "call-storage-1",
-			toolName: "workbench_project_inspect",
+			toolName: "workbench_run_recipe",
 			input: {},
 		});
 		assert.equal(guard.block, true, "storage failure blocks before execute");
@@ -511,13 +515,13 @@ test("finalization failure: unavailable metadata merged, started receipt left in
 		workbenchRuntime(stub);
 		const ctx = trustedCtx(root, SESSION);
 		const callId = "call-finalize-fail-1";
-		await emitToolCall(stub, ctx, { type: "tool_call", toolCallId: callId, toolName: "workbench_project_inspect", input: {} });
+		await emitToolCall(stub, ctx, { type: "tool_call", toolCallId: callId, toolName: "workbench_run_recipe", input: {} });
 		const id = deriveResultId(SESSION, callId);
 
 		// Corrupt the started phase after begin — finalize must fail closed
 		// and the started artifact must stay in place (incomplete).
 		await writeFile(join(receiptsDir(root), `${id}.started`), "{broken", "utf8");
-		const merged = await emitToolResult(stub, resultEvent(callId, "workbench_project_inspect", "ok", { ok: true }));
+		const merged = await emitToolResult(stub, resultEvent(callId, "workbench_run_recipe", "ok", { ok: true }));
 		const projectedDetails = merged?.details as Record<string, unknown>;
 		const receiptMeta = projectedDetails.receipt as Record<string, unknown>;
 		assert.equal(receiptMeta.available, false, "failure never claims availability");
@@ -525,9 +529,9 @@ test("finalization failure: unavailable metadata merged, started receipt left in
 		assert.equal(receiptMeta.result_id, id);
 		assert.deepEqual((await receiptFiles(root, id)).sort(), [`${id}.started`], "started receipt left incomplete (never deleted, never finalized)");
 		// R6 projects registered tools through their explicit DTO whitelist.
-		// `ok` is not a project-inspect DTO field, while trusted control-plane
-		// facts survive and the complete persisted details object stays bounded.
-		assert.equal(Object.hasOwn(projectedDetails, "ok"), false, "unlisted domain field removed by per-tool DTO");
+		// `ok` is a run-recipe DTO field, while trusted control-plane facts also
+		// survive and the complete persisted details object stays bounded.
+		assert.equal(projectedDetails.ok, true, "listed run-recipe domain field survives per-tool DTO");
 		assert.equal(Object.hasOwn(projectedDetails, "output_envelope"), true, "trusted envelope preserved");
 		assert.equal((projectedDetails.output_envelope as Record<string, unknown>).schema, "workbench-output-v1");
 		assert.ok(Buffer.byteLength(JSON.stringify(projectedDetails), "utf8") <= DETAILS_MAX_BYTES, "projected details stay within the session cap");
@@ -552,11 +556,11 @@ test("distinct parallel tool calls each get their own receipt lifecycle", async 
 
 		const calls = ["call-para-a", "call-para-b", "call-para-c"];
 		for (const callId of calls) {
-			const guard = await emitToolCall(stub, ctx, { type: "tool_call", toolCallId: callId, toolName: "workbench_project_inspect", input: {} });
+			const guard = await emitToolCall(stub, ctx, { type: "tool_call", toolCallId: callId, toolName: "workbench_run_recipe", input: {} });
 			assert.equal(guard.block, undefined, callId);
 		}
 		for (const callId of calls) {
-			const merged = await emitToolResult(stub, resultEvent(callId, "workbench_project_inspect", `result of ${callId}`, { ok: true }));
+			const merged = await emitToolResult(stub, resultEvent(callId, "workbench_run_recipe", `result of ${callId}`, { ok: true }));
 			assert.ok(merged, `tool_result middleware merged details for ${callId}`);
 			assert.ok(merged.details, `details present for ${callId}`);
 			const receiptMeta = (merged.details as Record<string, unknown>).receipt as Record<string, unknown>;
@@ -573,7 +577,41 @@ test("distinct parallel tool calls each get their own receipt lifecycle", async 
 });
 
 // --------------------------------------------------------------------------
-// 7. Recovery tool itself is never receipted; exact-one params
+// 7. Replay-safe reads are never receipted
+// --------------------------------------------------------------------------
+
+test("inspect/read/list/status/compare/recover are zero-receipt while side-effecting tools remain protected", async () => {
+	await withTempDir(async (root) => {
+		await setupProject(root);
+		const stub = makeStub();
+		workbenchRuntime(stub);
+		const ctx = trustedCtx(root, SESSION);
+
+		for (const [index, toolName] of WORKBENCH_RECEIPT_FREE_TOOL_NAMES.entries()) {
+			assert.equal(workbenchToolRequiresReceipt(toolName), false, toolName);
+			const toolCallId = `call-read-free-${index}`;
+			const guard = await emitToolCall(stub, ctx, {
+				type: "tool_call", toolCallId, toolName, input: {},
+			});
+			assert.equal(guard.block, undefined, toolName);
+			assert.deepEqual(await receiptFiles(root, deriveResultId(SESSION, toolCallId)), [], toolName);
+			const merged = await emitToolResult(stub, resultEvent(toolCallId, toolName, "bounded read result", { ok: true }));
+			assert.equal(Object.hasOwn((merged?.details ?? {}) as Record<string, unknown>, "receipt"), false, toolName);
+		}
+
+		for (const toolName of [
+			"workbench_run_recipe",
+			"workbench_run_gate",
+			"workbench_delegate_worker",
+			"workbench_review_worker_diff",
+		]) {
+			assert.equal(workbenchToolRequiresReceipt(toolName), true, toolName);
+		}
+	});
+});
+
+// --------------------------------------------------------------------------
+// 8. Recovery tool itself is never receipted; exact-one params
 // --------------------------------------------------------------------------
 
 test("recovery tool is never receipted and enforces EXACTLY ONE id source", async () => {
@@ -608,7 +646,7 @@ test("recovery tool is never receipted and enforces EXACTLY ONE id source", asyn
 });
 
 // --------------------------------------------------------------------------
-// 8. Receipts never alter run/cache/gate/delegation artifacts or counts
+// 9. Receipts never alter run/cache/gate/delegation artifacts or counts
 // --------------------------------------------------------------------------
 
 test("receipt lifecycle alters no run/cache/gate/delegation artifacts and no execution counts", async () => {
@@ -668,7 +706,7 @@ test("legacy no-receipt sessions (absent native session identity) fail closed", 
 		const guard = await emitToolCall(stub, legacyCtx, {
 			type: "tool_call",
 			toolCallId: "call-legacy-1",
-			toolName: "workbench_project_inspect",
+			toolName: "workbench_run_recipe",
 			input: {},
 		});
 		assert.equal(guard.block, true, "legacy session blocks before execute");
@@ -738,7 +776,7 @@ test("tool_result tool-name mismatch never finalizes: started stays incomplete, 
 		const guard = await emitToolCall(stub, ctx, {
 			type: "tool_call",
 			toolCallId: callId,
-			toolName: "workbench_project_inspect",
+			toolName: "workbench_run_recipe",
 			input: {},
 		});
 		assert.equal(guard.block, undefined, "call begins normally");
@@ -747,20 +785,21 @@ test("tool_result tool-name mismatch never finalizes: started stays incomplete, 
 
 		// A tool_result for a DIFFERENT tool name with the SAME toolCallId
 		// never finalizes: only the bounded mismatch fact is merged.
-		const mismatched = await emitToolResult(stub, resultEvent(callId, "workbench_run_recipe", "wrong-tool result text", { ok: true }));
+		const mismatched = await emitToolResult(stub, resultEvent(callId, "workbench_project_inspect", "wrong-tool result text", { ok: true }));
 		assert.ok(mismatched?.details, "details merged for the mismatch");
 		const receiptMeta = (mismatched.details as Record<string, unknown>).receipt as Record<string, unknown>;
 		assert.equal(receiptMeta.available, false, "mismatch never claims availability");
 		assert.equal(receiptMeta.code, "tool_name_mismatch", "bounded mismatch code");
 		assert.equal(receiptMeta.result_id, id);
-		assert.equal(receiptMeta.tool, "workbench_project_inspect", "mismatch fact names the begun tool");
+		assert.equal(receiptMeta.tool, "workbench_run_recipe", "mismatch fact names the begun tool");
 		assert.deepEqual(await receiptFiles(root, id), [`${id}.started`], "no finalized JSON — started stays incomplete");
-		assert.equal((mismatched.details as Record<string, unknown>).ok, true, "original domain details preserved");
+		assert.equal(Object.hasOwn(mismatched.details as Record<string, unknown>, "ok"), false,
+			"mismatched project-inspect projection does not invent run-recipe domain details");
 
 		// The in-memory handle was consumed: a later tool_result with the
 		// CORRECT name finds no pending handle and finalizes nothing. The
 		// global envelope/details handlers still run for every result.
-		const later = await emitToolResult(stub, resultEvent(callId, "workbench_project_inspect", "real result text", { ok: true }));
+		const later = await emitToolResult(stub, resultEvent(callId, "workbench_run_recipe", "real result text", { ok: true }));
 		assert.ok(later?.details, "global output-control middleware still projects details");
 		assert.equal(Object.hasOwn(later.details as Record<string, unknown>, "receipt"), false, "consumed handle produces no new receipt metadata");
 		assert.equal(((later.details as Record<string, unknown>).output_envelope as Record<string, unknown>).schema, "workbench-output-v1");
@@ -801,7 +840,7 @@ test("capacity: the 16-call turn limit prevents an unreachable full map and neve
 			const guard = await emitToolCall(stub, ctx, {
 				type: "tool_call",
 				toolCallId: callId,
-				toolName: "workbench_project_inspect",
+				toolName: "workbench_run_recipe",
 				input: {},
 			});
 			assert.equal(guard.block, undefined, callId);
@@ -827,7 +866,7 @@ test("capacity: the 16-call turn limit prevents an unreachable full map and neve
 		// Capacity was not used as an eviction mechanism: every admitted handle
 		// is retained and can still finalize successfully.
 		for (const callId of fillIds) {
-			const merged = await emitToolResult(stub, resultEvent(callId, "workbench_project_inspect", `result of ${callId}`, { ok: true }));
+			const merged = await emitToolResult(stub, resultEvent(callId, "workbench_run_recipe", `result of ${callId}`, { ok: true }));
 			assert.ok(merged, `details merged for ${callId}`);
 			assert.ok(merged.details, `details present for ${callId}`);
 			const receiptMeta = (merged.details as Record<string, unknown>).receipt as Record<string, unknown>;

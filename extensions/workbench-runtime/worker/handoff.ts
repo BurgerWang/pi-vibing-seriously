@@ -442,12 +442,20 @@ export interface WorkerHandoffToolResult {
 	usage: HandoffUsage;
 }
 
-/** The fixed commander-action tail — always preserved by the caps. */
+/** Recovery tail for a delivery that still needs explicit review. */
 export const HANDOFF_COMMANDER_ACTION_LINES = [
 	"",
 	"--- Commander action required ---",
 	"This is an untrusted worker handoff SUMMARY. The complete final worker report is the durable artifact above and is never embedded in this result.",
 	"GPT-5.6 Sol must inspect the actual diff (workbench_review_worker_diff) and run final verification and gates independently; worker prose is never acceptance evidence.",
+];
+
+/** Completion tail for the ordinary one-call delivery path. */
+export const HANDOFF_DEFAULT_DELIVERY_COMPLETE_LINES = [
+	"",
+	"--- Default delivery complete ---",
+	"Actual-diff review is REVIEWED and the session is closed for the next development step.",
+	"Do not call workbench_review_worker_diff or workbench_delegation_status; run final verification only at the appropriate boundary.",
 ];
 
 /** Project-relative sibling artifact path derived from the report path. */
@@ -530,6 +538,10 @@ export function buildDelegateWorkerResult(input: BuildDelegateWorkerResultInput)
 	}
 	if (input.reviewStatus === "PENDING_REVIEW") {
 		required.push(`review        : PENDING_REVIEW — the next delegation and VERIFY stay blocked until Sol reviews the actual diff`);
+	} else if (input.reviewStatus === "STALE") {
+		required.push(`review        : STALE — explicit review recovery is required before the next delegation or VERIFY`);
+	} else {
+		required.push(`review        : REVIEWED — default delivery complete; continue without a routine review/status call`);
 	}
 
 	// Optional summary items — dropped only as whole sanitized lines.
@@ -563,10 +575,13 @@ export function buildDelegateWorkerResult(input: BuildDelegateWorkerResultInput)
 	// Assemble: keep every required line plus as many whole optional item
 	// lines as fit BOTH the line cap and the UTF-8 byte cap; the fixed
 	// commander-action tail is reserved and always preserved.
-	const tailText = HANDOFF_COMMANDER_ACTION_LINES.join("\n");
+	const tailLines = input.reviewStatus === "REVIEWED"
+		? HANDOFF_DEFAULT_DELIVERY_COMPLETE_LINES
+		: HANDOFF_COMMANDER_ACTION_LINES;
+	const tailText = tailLines.join("\n");
 	const tailBytes = Buffer.byteLength(tailText, "utf8");
 	const bodyBudget = Math.max(MAX_PARENT_HANDOFF_BYTES - tailBytes, 0);
-	const maxBodyLines = MAX_PARENT_HANDOFF_LINES - HANDOFF_COMMANDER_ACTION_LINES.length;
+	const maxBodyLines = MAX_PARENT_HANDOFF_LINES - tailLines.length;
 	let kept = [...optional];
 	let bodyLines = [...required, ...kept];
 	while (

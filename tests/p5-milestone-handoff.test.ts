@@ -679,7 +679,7 @@ test("the hidden note is deterministic, bounded, redacted and pointers-only", ()
 	assert.ok(note.includes("mode: AUDIT"));
 	assert.ok(note.includes("delegation: 20260801-120000-abcd PENDING_REVIEW"));
 	assert.ok(note.includes("last run: 20260801-120000-abcd (unit-test)"));
-	assert.ok(note.includes("commander writes: denied in target (write lease never carried)"));
+	assert.ok(note.includes("development writes: ordinary paths direct; high-risk lease never carried"));
 	assert.ok(!note.includes("stdout") && !note.includes("stderr"), "no log content");
 	assert.ok(!note.includes("[truncated]"), "small note is never truncated");
 	// Hard caps: the note never exceeds the line/char/byte bounds, even when
@@ -899,7 +899,7 @@ test("successful handoff: idle wait, prepared record, parent link, setup entries
 	assert.ok(!note.includes("/tmp/workbench-project/session.jsonl"), "hidden note excludes the absolute source session path");
 	assert.ok(note.includes("next step: run the q3 verification and write the report"));
 	assert.ok(note.includes("mode: AUDIT"));
-	assert.ok(note.includes("commander writes: denied in target (write lease never carried)"));
+	assert.ok(note.includes("development writes: ordinary paths direct; high-risk lease never carried"));
 	assert.ok(!note.includes("stdout") && !note.includes("stderr"), "note never carries logs");
 	assert.ok(utf8ByteLength(note) <= MAX_HANDOFF_NOTE_BYTES);
 	assert.ok(note.length <= MAX_HANDOFF_NOTE_CHARS);
@@ -925,7 +925,7 @@ test("successful handoff: idle wait, prepared record, parent link, setup entries
 	const announce = harness.replacementNotifyLines.join("\n");
 	assert.ok(announce.includes(`milestone ${prepared.milestone_id} handed off`));
 	assert.ok(announce.includes("run the q3 verification and write the report"));
-	assert.ok(announce.includes("NOT carried") && announce.includes("locked"));
+	assert.ok(announce.includes("NOT carried") && announce.includes("high-risk"));
 	assert.ok(announce.includes("delegation  : DELEGATION 20260801-120000-abcd REVIEWED"));
 	assert.equal(harness.reloadCalls, 1, "reload restores setup entries before continuation");
 	assert.equal(harness.orderEvents[harness.orderEvents.length - 1], "reload", "announce happens before reload");
@@ -933,20 +933,17 @@ test("successful handoff: idle wait, prepared record, parent link, setup entries
 	assert.equal(harness.oldNotifyLines.length, 0, "the old ctx is never used after the successful replacement");
 
 	// Target-runtime restore proof: after reload semantics, the copied
-	// mode/compact/delegation are ACTIVE and commander writes stay locked.
+	// mode/compact/delegation are active; AUDIT still blocks mutation.
 	assert.ok(stub.activeTools.includes("read"), "restored AUDIT mode active");
 	assert.ok(!stub.activeTools.includes("bash") && !stub.activeTools.includes("edit") && !stub.activeTools.includes("write"), "AUDIT tool set");
-	// Commander writes locked: the strict-Sol guard blocks edit with no lease.
+	// AUDIT mode blocks edit independently of the DEV direct-write policy.
 	const blockedEdit = await guardCall(stub, "edit", { path: "src/main.ts" });
 	assert.ok(blockedEdit && blockedEdit.block === true);
-	assert.match(String(blockedEdit.reason), /lease locked/);
-	// Delegation restored: the blocked edit increments the RESTORED audit
-	// counter (2 → 3) on the copied delegation (latestId intact).
+	assert.match(String(blockedEdit.reason), /AUDIT mode blocks/);
+	// The AUDIT denial does not masquerade as a blocked high-risk write
+	// attempt, so it creates no new delegation-state append.
 	const delegationAppends = stub.appendEntryCalls.filter((c) => c.customType === DELEGATION_STATE_ENTRY_TYPE);
-	const lastDelegation = delegationAppends[delegationAppends.length - 1];
-	assert.ok(lastDelegation && typeof lastDelegation.data === "object" && lastDelegation.data !== null);
-	assert.equal((lastDelegation.data as { latestId?: string }).latestId, "20260801-120000-abcd", "delegation state restored");
-	assert.equal((lastDelegation.data as { blockedWriteAttempts?: number }).blockedWriteAttempts, 3, "restored audit counter incremented");
+	assert.equal(delegationAppends.length, 0);
 	// Compact restored: the copied task surfaces through the compaction
 	// supplement (nothing re-seeded it via before_agent_start).
 	const compact = stub.events.get("session_before_compact")![0]!;
@@ -1001,16 +998,18 @@ test("the source lease never transfers: DEV source with an ACTIVE lease yields a
 	assert.ok(harness.setupRan && harness.withSessionRan);
 	assert.ok(!harness.targetEntries.some((e) => e.customType === LEASE_STATE_ENTRY_TYPE), "no lease entry in the target");
 	assert.equal(harness.reloadCalls, 1);
-	// Restored target: exact canonical 15 (DEV + Sol, NO lease tools).
-	assert.deepEqual(stub.activeTools, [...STRICT_SOL_DEV_ALLOWLIST], "exactly the locked canonical 15 after reload");
-	assert.equal(stub.activeTools.length, 15);
-	const blocked = await guardCall(stub, "edit", { path: "src/main.ts" });
-	assert.ok(blocked && blocked.block === true, "commander writes stay locked in the target");
+	// Restored target: ordinary development writes remain direct; only the
+	// source session's high-risk lease is intentionally absent.
+	assert.deepEqual(stub.activeTools, [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
+	assert.equal(stub.activeTools.length, 17);
+	assert.equal(await guardCall(stub, "edit", { path: "src/main.ts" }), undefined);
+	const blocked = await guardCall(stub, "edit", { path: "package.json" });
+	assert.ok(blocked && blocked.block === true, "high-risk path requires fresh authorization");
 	assert.match(String(blocked.reason), /lease locked/);
-	// The milestone note itself states the target-lock fact.
+	// The milestone note states the development-first target fact.
 	const noteEntry = harness.targetEntries.find((e) => e.customType === MILESTONE_HANDOFF_NOTE_ENTRY_TYPE);
 	assert.ok(noteEntry && noteEntry.type === "custom_message");
-	assert.ok(String(noteEntry.content).includes("commander writes: denied in target (write lease never carried)"));
+	assert.ok(String(noteEntry.content).includes("development writes: ordinary paths direct; high-risk lease never carried"));
 });
 
 test("a cancelled replacement records an additive cancelled record in the source and reports", async () => {

@@ -33,7 +33,10 @@ import type { ValidationComponent } from "./recipe-schema.ts";
 import type { ValidationEvidenceBlock } from "./validation-evidence.ts";
 import type { CacheRequestMode } from "../cache/action-types.ts";
 
+/** Frozen legacy manifest version. Existing v1 records remain read-only. */
 export const RUN_SCHEMA_VERSION = 1;
+/** Current manifest version. Old v1 readers must reject newly published runs. */
+export const RUN_MANIFEST_SCHEMA_VERSION_V2 = 2;
 /** Run JSON is metadata, never an unbounded model-input channel. */
 export const RUN_JSON_INPUT_MAX_BYTES = 1_048_576 as const;
 
@@ -130,6 +133,11 @@ export interface RunRecord {
 	 * non-reusable.
 	 */
 	validation_evidence?: ValidationEvidenceBlock;
+	/** Present on runs published through the atomic v2 run transaction. */
+	run_transaction_schema_version?: 2;
+	/** Bounded machine outcome; process success alone is never sufficient. */
+	run_outcome?: "SUCCESS" | "PROCESS_FAILED" | "ARTIFACT_FAILED";
+	artifact_manifest_path?: "artifact-manifest.json";
 }
 
 export async function readManifest(projectRoot: string, runId: string): Promise<RunRecord | null> {
@@ -138,10 +146,40 @@ export async function readManifest(projectRoot: string, runId: string): Promise<
 		const read = await readJsonFileBounded<RunRecord>(join(dir, "manifest.json"), RUN_JSON_INPUT_MAX_BYTES);
 		if (!read.ok) return null;
 		const parsed = read.value.value;
-		return parsed.schema_version === RUN_SCHEMA_VERSION ? parsed : null;
+		if (parsed.schema_version === RUN_SCHEMA_VERSION) {
+			return parsed.run_transaction_schema_version === undefined ? parsed : null;
+		}
+		if (parsed.schema_version === RUN_MANIFEST_SCHEMA_VERSION_V2) {
+			return parsed.run_transaction_schema_version === 2 ? parsed : null;
+		}
+		return null;
 	} catch {
 		return null;
 	}
+}
+
+function minimallyValidRunRecord(value: RunRecord, runId: string): boolean {
+	return value.schema_version === RUN_MANIFEST_SCHEMA_VERSION_V2 &&
+		value.run_id === runId &&
+		typeof value.recipe === "string" && value.recipe.length > 0 &&
+		typeof value.started_at === "string" && Number.isFinite(Date.parse(value.started_at)) &&
+		typeof value.finished_at === "string" && Number.isFinite(Date.parse(value.finished_at)) &&
+		typeof value.duration_ms === "number" && Number.isFinite(value.duration_ms) && value.duration_ms >= 0 &&
+		(value.exit_code === null || (typeof value.exit_code === "number" && Number.isInteger(value.exit_code))) &&
+		typeof value.timed_out === "boolean" &&
+		typeof value.cancelled === "boolean" &&
+		Array.isArray(value.artifact_paths) && value.artifact_paths.every((path) => typeof path === "string");
+}
+
+/** Strict authority read: requires an atomically committed v2 run directory. */
+export async function readCommittedManifest(projectRoot: string, runId: string): Promise<RunRecord | null> {
+	const { readCommittedRunTransaction } = await import("./run-transaction.ts");
+	const transaction = await readCommittedRunTransaction(projectRoot, runId);
+	if (!transaction.ok) return null;
+	const manifest = await readManifest(projectRoot, runId);
+	if (!manifest || !minimallyValidRunRecord(manifest, runId) || manifest.run_transaction_schema_version !== 2) return null;
+	if (manifest.run_outcome !== "SUCCESS" && manifest.run_outcome !== "PROCESS_FAILED" && manifest.run_outcome !== "ARTIFACT_FAILED") return null;
+	return manifest;
 }
 
 export interface RunSummaryRecord {
@@ -177,8 +215,12 @@ export async function readSummary(projectRoot: string, runId: string): Promise<R
 	}
 }
 
-/** List runs newest-first, optionally capped. */
-export async function listRuns(projectRoot: string, limit = 10): Promise<RunRecord[]> {
+/**
+ * Diagnostic inventory of readable run attempts, newest first. This may
+ * include an uncommitted v2 manifest so callers can explain a failed attempt;
+ * it must never be used as success authority.
+ */
+export async function listRunAttempts(projectRoot: string, limit = 10): Promise<RunRecord[]> {
 	let entries: Dirent[];
 	try {
 		entries = await readdir(runsDir(projectRoot), { withFileTypes: true });
@@ -189,9 +231,47 @@ export async function listRuns(projectRoot: string, limit = 10): Promise<RunReco
 	for (const entry of entries) {
 		if (!entry.isDirectory() || !isValidRunId(entry.name)) continue;
 		const manifest = await readManifest(projectRoot, entry.name);
+		if (manifest?.run_id === entry.name) records.push(manifest);
+	}
+	records.sort((a, b) => (a.started_at < b.started_at ? 1 : a.started_at > b.started_at ? -1 : a.run_id < b.run_id ? 1 : -1));
+	return records.slice(0, limit);
+}
+
+/**
+ * Consumable run listing. Legacy v1 manifests remain visible for read-only
+ * compatibility; every manifest that advertises the v2 transaction contract
+ * is listed only after its complete directory identity verifies.
+ */
+export async function listRuns(projectRoot: string, limit = 10): Promise<RunRecord[]> {
+	const attempts = await listRunAttempts(projectRoot, Number.MAX_SAFE_INTEGER);
+	const records: RunRecord[] = [];
+	for (const attempt of attempts) {
+		if (attempt.run_transaction_schema_version === 2) {
+			const committed = await readCommittedManifest(projectRoot, attempt.run_id);
+			if (committed) records.push(committed);
+		} else {
+			records.push(attempt);
+		}
+		if (records.length >= limit) break;
+	}
+	return records;
+}
+
+/** List only atomically committed v2 runs. Partial and legacy runs are excluded. */
+export async function listCommittedRuns(projectRoot: string, limit = 10): Promise<RunRecord[]> {
+	let entries: Dirent[];
+	try {
+		entries = await readdir(runsDir(projectRoot), { withFileTypes: true });
+	} catch {
+		return [];
+	}
+	const records: RunRecord[] = [];
+	for (const entry of entries) {
+		if (!entry.isDirectory() || !isValidRunId(entry.name)) continue;
+		const manifest = await readCommittedManifest(projectRoot, entry.name);
 		if (manifest) records.push(manifest);
 	}
-	records.sort((a, b) => (a.started_at < b.started_at ? 1 : a.started_at > b.started_at ? -1 : 0));
+	records.sort((a, b) => (a.started_at < b.started_at ? 1 : a.started_at > b.started_at ? -1 : a.run_id < b.run_id ? 1 : -1));
 	return records.slice(0, limit);
 }
 

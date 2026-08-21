@@ -59,6 +59,8 @@ import {
 	MAX_REVIEW_DRIFT_PATHS,
 	REVIEW_ERROR_MAX_BYTES,
 	REVIEW_RECORD_MAX_BYTES,
+	mergeReviewCoverage,
+	normalizeReviewCoverage,
 	readReviewRecord,
 	renderReviewLines,
 	reviewDelegation,
@@ -317,7 +319,7 @@ test("later diff changes are detected as mismatch + drift (the state layer turns
 		assert.equal(record.mismatch, true, "current hash differs from the recorded after hash");
 		assert.notEqual(record.bound_diff_hash, afterHash);
 		assert.deepEqual(record.drift_paths, ["drift.txt"]);
-		assert.ok(record.notes.some((n) => n.includes("diff hash differs")), "mismatch is recorded as a warning");
+		assert.ok(record.notes.some((n) => n.includes("authority binding differs")), "mismatch is recorded as a warning");
 		assert.ok(record.notes.some((n) => n.includes("changed after the worker finished")), "drift is recorded as a warning");
 		// In-scope worker paths still PASS — mismatch warns, it does not fail.
 		assert.equal(record.verdict, "PASS");
@@ -894,6 +896,27 @@ test("review error paths are fixed, bounded, and never expose hostile messages, 
 // ---------------------------------------------------------------------------
 // Slice B2 — displayed-path coverage (segmented actual-diff review)
 // ---------------------------------------------------------------------------
+
+test("Slice B2: displayed and remaining coverage preserve trusted Unicode worker order", () => {
+	const byteFirst = "src/\uE000.ts";
+	const byteSecond = "src/😀.ts";
+	const workerPaths = [byteFirst, byteSecond];
+	assert.ok(Buffer.from(byteFirst).compare(Buffer.from(byteSecond)) < 0, "fixture is UTF-8 byte canonical");
+	assert.ok(byteFirst > byteSecond, "fixture differs from default JavaScript UTF-16 ordering");
+
+	const merged = mergeReviewCoverage(workerPaths, [byteSecond, byteFirst], null, "a".repeat(64));
+	assert.deepEqual(merged.displayed_paths, workerPaths, "render order cannot replace worker authority order");
+	assert.deepEqual(merged.remaining_paths, []);
+
+	const normalized = normalizeReviewCoverage({
+		checked_paths: workerPaths,
+		displayed_paths: [byteSecond, byteFirst],
+		remaining_paths: [],
+		patch: [],
+	} as unknown as ReviewRecord);
+	assert.deepEqual(normalized.displayed_paths, workerPaths, "render normalization projects coverage through checked order");
+	assert.deepEqual(normalized.remaining_paths, []);
+});
 
 test("Slice B2: globally omitted paths stay remaining; include_paths segments merge displayed coverage; bounded truncated entries count; complete only when every worker path rendered", async () => {
 	await withTempDir(async (dir) => {

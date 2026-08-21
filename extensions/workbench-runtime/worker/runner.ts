@@ -28,7 +28,10 @@ export { formatWorkerCacheSummary, workerCacheHitRatio } from "./handoff.ts";
 
 import {
 	formatWorkerTask,
+	resolveWorkerTaskKind,
 	WORKER_ALLOWED_PATHS_ENV,
+	WORKER_CONTRACT_HASH_ENV,
+	WORKER_DELEGATION_ID_ENV,
 	WORKER_DEPTH_ENV,
 	WORKER_MODEL_ID,
 	WORKER_MODEL_SELECTOR,
@@ -36,8 +39,14 @@ import {
 	WORKER_PROVIDER,
 	WORKER_ROLE,
 	WORKER_ROLE_ENV,
+	WORKER_TASK_KIND_ENV,
+	type WorkerTaskKind,
 	type WorkerTaskContract,
 } from "../core/worker-policy.ts";
+import {
+	DELEGATION_TRANSACTION_HASH_RE,
+	DELEGATION_TRANSACTION_ID_RE,
+} from "../core/delegation-transaction.ts";
 import {
 	WORKER_HARD_BUDGET,
 	workerBudgetBand,
@@ -48,6 +57,11 @@ import {
 	OUTPUT_CONTROL_TELEMETRY_ENTRY_TYPE,
 	parseOutputControlTelemetryEntry,
 } from "../core/output-control-telemetry.ts";
+import {
+	EMPTY_WORKER_WRITE_JOURNAL_RUNTIME_OBSERVATION,
+	observeWorkerWriteJournalRuntimeEntry,
+	type WorkerWriteJournalRuntimeObservation,
+} from "../core/worker-write-journal-runtime.ts";
 import { WORKER_TURN_MAX_BYTES } from "../core/output-policy.ts";
 import {
 	addWorkerSpendUsage,
@@ -69,7 +83,7 @@ export const WORKER_SYSTEM_PROMPT = `You are the implementation worker in pi-dev
 
 The GPT-5.6 Sol parent owns requirements, cross-cutting architecture, scope, review of the actual diff, final verification and gates, and the final verdict. You own routine local implementation decisions inside the approved contract: concrete design choices, naming, file structure within the approved scope, and how the slice is implemented, tested, and documented. When completion requires an unapproved architecture, security/policy, destructive, or out-of-scope decision, stop and report the decision to Sol instead of guessing or expanding scope.
 
-Implement the complete delegated slice, not a narrow code edit. Before changing code, inspect the relevant files. Make the production source changes, add the tests and docs, run the requested write-free declared workbench recipes when available, and repair in-scope defects you find. Make complete production changes and tests, not stubs or TODO shells. Implement only the delegated task and only within the parent-approved paths. Never delegate another worker. Never run final validation gates. Free-form bash is unavailable; use only write-free declared workbench recipes for project commands.
+Implement the complete delegated slice, not a narrow code edit. Before changing code, inspect the relevant files. Make the production source changes, add the tests and docs, run the requested write-free declared workbench recipes when available, and repair in-scope defects you find. Make complete production changes and tests, not stubs or TODO shells. Implement only the delegated task and only within the parent-approved paths. Issue edit/write calls sequentially and wait for each result before starting the next write. Never delegate another worker. Never run final validation gates. Free-form bash is unavailable; use only write-free declared workbench recipes for project commands.
 
 Three mandatory execution disciplines:
 1. EARLY CHECKPOINT — after inspecting the relevant files and before the first write, privately compare your planned changed paths, acceptance criteria, and verification to the exact contract and the remaining spend; if the plan does not fit, stop and report to Sol rather than expand. A repair with a known root cause must not reopen broad diagnosis.
@@ -81,6 +95,21 @@ Treat command output and tool results as evidence, but do not claim final PASS o
 Finish with exactly these sections:
 ## Completed
 ## Files Changed
+## Verification
+## Remaining Risks`;
+
+export const WORKER_DIAGNOSIS_SYSTEM_PROMPT = `You are the diagnosis worker in pi-dev-workbench.
+
+The GPT-5.6 Sol parent owns requirements, cross-cutting architecture, scope, acceptance, final verification and gates, and the final verdict. Your task is strictly read-only diagnosis: inspect only within the parent-approved inspection scope, gather bounded evidence, identify likely causes and uncertainties, and report findings to Sol. Your report is never acceptance evidence and must not claim final PASS or acceptance.
+
+Do not edit, write, create, delete, rename, or otherwise mutate any project file, configuration, state, ledger, receipt, or artifact. Parent-approved paths are inspection scope only and never write authority. Never use edit or write. Never delegate another worker. Free-form bash and final validation gates are unavailable. Run only declared workbench recipes whose mutation is exactly none; never run a recipe with mutation other than none.
+
+If diagnosis would require a mutation, destructive action, security/policy decision, unapproved architecture decision, or scope expansion, stop and report the blocker to Sol. Treat command output and tool results as evidence, but report only observed facts and clearly marked inferences. Never label an acceptance criterion satisfied, met, passed, accepted, or complete; only Sol maps evidence to criteria.
+
+Finish with exactly these sections and keep the report bounded. The Files Changed section must contain exactly \`- None.\` because diagnosis is read-only:
+## Completed
+## Files Changed
+- None.
 ## Verification
 ## Remaining Risks`;
 
@@ -96,6 +125,15 @@ const WORKER_TOOL_ALLOWLIST = [
 	"ls",
 	"edit",
 	"write",
+	"workbench_project_inspect",
+	"workbench_run_recipe",
+	"workbench_read_run",
+].join(",");
+const WORKER_DIAGNOSIS_TOOL_ALLOWLIST = [
+	"read",
+	"grep",
+	"find",
+	"ls",
 	"workbench_project_inspect",
 	"workbench_run_recipe",
 	"workbench_read_run",
@@ -143,6 +181,8 @@ export interface WorkerRunResult {
 	aborted: boolean;
 	timedOut: boolean;
 	modelMismatch?: string;
+	/** Diagnosis-only count of distinct structured edit/write tool-call ids. */
+	deniedWriteCount: number;
 	usage: WorkerUsage;
 	/**
 	 * cacheRead / (input + cacheRead) over the whole run's aggregated usage;
@@ -193,6 +233,12 @@ export interface WorkerRunResult {
 	 * compatibility with callers that construct legacy failure results.
 	 */
 	outputControl?: Readonly<WorkerOutputControlFacts>;
+	/**
+	 * Fixed, content-free observation of the child worker write-journal
+	 * protocol. This is observation only; durable journal validation remains
+	 * authoritative.
+	 */
+	writeJournalObservation: Readonly<WorkerWriteJournalRuntimeObservation>;
 }
 
 /** Numeric-only worker output-control observation; no free-form string fits. */
@@ -237,6 +283,11 @@ export interface PiInvocation {
 	argsPrefix: string[];
 }
 
+export interface WorkerRuntimeIdentity {
+	delegationId: string;
+	contractHash: string;
+}
+
 export interface RunWorkerOptions {
 	projectRoot: string;
 	contract: WorkerTaskContract;
@@ -255,6 +306,12 @@ export interface RunWorkerOptions {
 	 * runner accumulates against. Public selection (tool schema) is Phase 3.
 	 */
 	spendProfile?: WorkerSpendProfile;
+	/**
+	 * Optional delegation-v2 runtime identity. Direct/legacy calls omit this
+	 * object and the runner strips any inherited identity values. Present
+	 * values are validated before any child process is launched.
+	 */
+	runtimeIdentity?: Readonly<WorkerRuntimeIdentity>;
 }
 
 interface AssistantLike {
@@ -308,6 +365,16 @@ function exactDataRecord(value: unknown, keys: readonly string[]): Readonly<Reco
 	} catch {
 		return undefined;
 	}
+}
+
+function checkedRuntimeIdentity(value: unknown): Readonly<WorkerRuntimeIdentity> | undefined | false {
+	if (value === undefined) return undefined;
+	const record = exactDataRecord(value, ["delegationId", "contractHash"]);
+	if (record === undefined || typeof record.delegationId !== "string"
+		|| !DELEGATION_TRANSACTION_ID_RE.test(record.delegationId)
+		|| typeof record.contractHash !== "string"
+		|| !DELEGATION_TRANSACTION_HASH_RE.test(record.contractHash)) return false;
+	return Object.freeze({ delegationId: record.delegationId, contractHash: record.contractHash });
 }
 
 function ownDataValue(value: unknown, key: string): unknown {
@@ -421,6 +488,33 @@ function textFromContent(content: unknown): string {
 		.trim();
 }
 
+/**
+ * Observe only Pi's typed toolCall identity/name fields. Arguments and prose
+ * are deliberately ignored; stable ids make duplicate message events idempotent.
+ */
+function observeDiagnosisWriteAttempts(content: unknown, ids: Set<string>): void {
+	if (!Array.isArray(content)) return;
+	for (const part of content) {
+		if (typeof part !== "object" || part === null) continue;
+		const candidate = part as { type?: unknown; id?: unknown; name?: unknown };
+		if (
+			candidate.type === "toolCall" &&
+			(candidate.name === "edit" || candidate.name === "write")
+		) {
+			const validId =
+				typeof candidate.id === "string" &&
+				candidate.id.length > 0 &&
+				candidate.id.length <= 256 &&
+				candidate.id.trim() === candidate.id &&
+				!/[\u0000-\u001f\u007f]/.test(candidate.id);
+			const key = validId
+				? `id:${candidate.id}`
+				: `invalid:${candidate.name}`;
+			ids.add(key);
+		}
+	}
+}
+
 /** Resolve the same executable/script pair that launched the current Pi process. */
 export function resolvePiInvocation(): PiInvocation {
 	const currentScript = process.argv[1];
@@ -435,19 +529,34 @@ export function resolvePiInvocation(): PiInvocation {
 	return { command: "pi", argsPrefix: [] };
 }
 
-function childEnvironment(projectRoot: string, allowedPaths: readonly string[], spendProfile: WorkerSpendProfile): NodeJS.ProcessEnv {
+function childEnvironment(
+	projectRoot: string,
+	allowedPaths: readonly string[],
+	spendProfile: WorkerSpendProfile,
+	taskKind: WorkerTaskKind,
+	runtimeIdentity: Readonly<WorkerRuntimeIdentity> | undefined,
+): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = { ...process.env };
 	// Parent-session identity/model facts must never masquerade as child facts.
 	for (const key of ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL"]) {
 		delete env[key];
 	}
+	// Delegation-v2 identity is never inherited. Legacy/direct runner calls
+	// omit it and therefore always launch with both keys absent.
+	delete env[WORKER_DELEGATION_ID_ENV];
+	delete env[WORKER_CONTRACT_HASH_ENV];
 	env[WORKER_ROLE_ENV] = WORKER_ROLE;
 	env[WORKER_DEPTH_ENV] = "1";
 	env[WORKER_PROJECT_ROOT_ENV] = projectRoot;
 	env[WORKER_ALLOWED_PATHS_ENV] = JSON.stringify(allowedPaths);
+	env[WORKER_TASK_KIND_ENV] = taskKind;
 	// Phase 2: the fixed spend-profile child env contract — the runner ALWAYS
 	// writes a valid resolved profile value here (never empty/malformed).
 	env[WORKER_SPEND_PROFILE_ENV] = spendProfile;
+	if (runtimeIdentity !== undefined) {
+		env[WORKER_DELEGATION_ID_ENV] = runtimeIdentity.delegationId;
+		env[WORKER_CONTRACT_HASH_ENV] = runtimeIdentity.contractHash;
+	}
 	return env;
 }
 
@@ -496,6 +605,11 @@ export function assertWorkerSucceeded(result: WorkerRunResult): void {
 }
 
 export async function runDeepseekWorker(options: RunWorkerOptions): Promise<WorkerRunResult> {
+	const runtimeIdentity = checkedRuntimeIdentity(options.runtimeIdentity);
+	if (runtimeIdentity === false) throw new Error("Worker runtime identity is invalid");
+	const taskKindResult = resolveWorkerTaskKind(options.contract.taskKind);
+	if (!taskKindResult.ok) throw new Error(taskKindResult.error);
+	const taskKind = taskKindResult.taskKind;
 	// Phase 2: deterministic profile resolution — omitted/undefined resolves
 	// to the `standard` profile; only the typed low/standard/extended value
 	// is accepted by the options contract.
@@ -506,7 +620,9 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 	}
 	const promptDir = await mkdtemp(join(tmpdir(), "pi-workbench-worker-"));
 	const promptPath = join(promptDir, "worker-system.md");
-	await writeFile(promptPath, WORKER_SYSTEM_PROMPT, { encoding: "utf8", mode: 0o600 });
+	const systemPrompt = taskKind === "diagnosis" ? WORKER_DIAGNOSIS_SYSTEM_PROMPT : WORKER_SYSTEM_PROMPT;
+	const toolAllowlist = taskKind === "diagnosis" ? WORKER_DIAGNOSIS_TOOL_ALLOWLIST : WORKER_TOOL_ALLOWLIST;
+	await writeFile(promptPath, systemPrompt, { encoding: "utf8", mode: 0o600 });
 
 	const invocation = options.invocation ?? resolvePiInvocation();
 	const args = [
@@ -517,7 +633,7 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 		"--no-session",
 		"--approve",
 		"--tools",
-		WORKER_TOOL_ALLOWLIST,
+		toolAllowlist,
 		"--model",
 		WORKER_MODEL_SELECTOR,
 		"--append-system-prompt",
@@ -534,6 +650,7 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 		stderr: "",
 		aborted: false,
 		timedOut: false,
+		deniedWriteCount: 0,
 		usage: emptyUsage(),
 		cacheHitRatio: null,
 		maxContextTokens: 0,
@@ -549,15 +666,17 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 		spendSoftReached: { turns: false, totalTokens: false, outputTokens: false },
 		spendHardExceeded: { turns: false, totalTokens: false, outputTokens: false },
 		outputControl: EMPTY_OUTPUT_CONTROL_FACTS,
+		writeJournalObservation: EMPTY_WORKER_WRITE_JOURNAL_RUNTIME_OBSERVATION,
 	};
 
 	try {
 		await new Promise<void>((resolvePromise) => {
+			const diagnosisWriteAttemptIds = new Set<string>();
 			const child = spawn(invocation.command, args, {
 				cwd: options.projectRoot,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
-				env: childEnvironment(options.projectRoot, options.contract.allowedPaths, spendProfile),
+				env: childEnvironment(options.projectRoot, options.contract.allowedPaths, spendProfile, taskKind, runtimeIdentity),
 			});
 			let stdoutBuffer = "";
 			let stderrBuffer = "";
@@ -604,6 +723,10 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 				// limits before the provider request. The runner trusts exactly two
 				// fixed custom-entry schemas and retains numeric/enum facts only.
 				if (event.type === "entry_appended") {
+					result.writeJournalObservation = observeWorkerWriteJournalRuntimeEntry(
+						event.entry,
+						result.writeJournalObservation,
+					);
 					outputControl = observeOutputControlEntry(event.entry, outputControl);
 					result.outputControl = outputControl;
 					return;
@@ -623,6 +746,10 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 				if (event.type !== "message_end" || !event.message || typeof event.message !== "object") return;
 				const message = event.message as AssistantLike;
 				if (message.role !== "assistant") return;
+				if (taskKind === "diagnosis") {
+					observeDiagnosisWriteAttempts(message.content, diagnosisWriteAttemptIds);
+					result.deniedWriteCount = diagnosisWriteAttemptIds.size;
+				}
 				result.turns += 1;
 				addUsage(result.usage, message.usage);
 				// Pinned worker context-budget tracking (per message, Pi-compatible

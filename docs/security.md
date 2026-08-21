@@ -96,21 +96,22 @@ Defense-in-depth controls:
 - the tool executes sequentially, propagates abort, enforces a timeout, and
   bounds stdout/stderr processing.
 
-### Worker-first write authority (P7)
+### Development-first write authority (current; legacy id P7)
 
-Approved GPT-5.6 Sol in DEV resolves to the fixed `worker-first-strict`
-policy: the active tool set is exactly the canonical 15-tool allowlist
-(`read`, `grep`, `find`, `ls` plus all eleven `workbench_*` tools) — no
-`bash`/`edit`/`write`, no foreign tools — and no persisted/prompt/config
-value can weaken or opt out of it. Actor identity comes only from the
+Approved GPT-5.6 Sol in DEV receives the historical 15-tool read/workbench
+surface plus ordinary `edit` and `write`; `bash` and foreign tools stay
+unavailable. The serialized `worker-first-strict` policy id remains for
+compatibility only. It does not force routine development through worker
+delegation. Actor identity comes only from the
 `WORKBENCH_AGENT_ROLE=worker` env contract and the provider/model pair;
 project config can never self-label a controller as Sol or as a worker.
 Workers and other controllers are outside the policy (the existing worker
 guards remain authoritative; other controllers are not newly denied).
 
-Second-layer `tool_call` guard for strict Sol: `bash` is always blocked;
-`edit`/`write` require an ACTIVE user-issued temporary write lease
-authorizing the project-relative path and the remaining call; every tool
+Second-layer `tool_call` guard for Sol: `bash` is always blocked; ordinary
+canonical project-relative `edit`/`write` is direct after project realpath
+containment. Dependency, security/auth/policy, deployment/migration and Pi
+control paths require an ACTIVE user-issued temporary write lease; every tool
 outside the allowlist is blocked despite any re-enable. Leases are user-only
 (`/q-commander-write-unlock`, `/q-commander-write-lock`, `/q-write-policy
 status` — commands, never model tools), with fixed reasons
@@ -125,11 +126,11 @@ lease whose two bounded distinct token parts are displayed exactly once and
 must both be confirmed by a second invocation — both parts are consumed on
 success and a confirmed lease can never be re-confirmed. Token parts never
 appear in status/compact summaries or persisted summaries (`/q-write-policy
-status` and the footer show only `WF:LEASE used/max` / `WF:LOCKED` facts).
+status` and the footer show only `WF:LEASE used/max` / `WF:DIRECT` facts).
 Leases are revoked on leaving DEV, commander model/provider change, session
 end, explicit lock, and they expire (30 min) or exhaust (10 calls) —
-restoring the exact canonical 15 tools; restore is fail-closed (invalid
-records restore to locked).
+removing only the high-risk exception; ordinary direct edit/write remains
+available. Invalid lease records fail closed for high-risk paths.
 
 ### Delegation ledger and review lifecycle (P7)
 
@@ -144,17 +145,24 @@ transcripts or secrets), and the ledger's own directory is excluded from the
 git facts it records so records never pollute the diff they describe. Git
 facts come from argv-only `exec` calls (shell=false), never shell strings.
 
-`workbench_review_worker_diff` (DEV-only, Sol) re-reads the REAL git state:
-it scope-checks every worker path against the parent-approved `allowed_paths`
-(realpath/symlink-safe; `include_paths` narrows only the patch and can never
-hide a violation), compares the current diff hash with the recorded after
-hash (mismatch/drift are warnings), warns when the worker's `## Files
-Changed` section is missing or inconsistent with the actual diff, and writes
-the completed `review.json` (atomic). The tool is callable repeatedly on
-the latest delegation (PENDING_REVIEW / STALE / REVIEWED) and EVERY call
-re-runs the real git facts, the full scope check over every worker path and
-the complete current diff hash — `include_paths` only narrows the rendered
-patch, so a segment can never skip a scope check or a hash binding.
+`workbench_review_worker_diff` (DEV-only, Sol) re-evaluates the CURRENT
+workspace authority. Every record generation scope-checks all worker-delta
+paths W against the parent-approved `allowed_paths` (realpath/symlink-safe;
+`include_paths` narrows only the patch and can never hide a violation). For
+new tagged v2, the current authority binding is the W/D/S relevance
+projection: W is the attributed worker delta, D is the explicit dependency
+closure, and S is the closed relevant control set. Baseline unrelated dirty
+paths and recognized workbench artifacts are excluded, while Git HEAD,
+W/D/S drift, or a new unknown-origin path fails closed. Historical untagged
+v2/v1 instead re-reads the real Git facts and binds the complete current
+full-diff hash. The review compares that generation-specific current binding
+with the recorded after binding (mismatch/drift are warnings), warns when the
+worker's `## Files Changed` section is missing or inconsistent with W, and
+writes the completed `review.json` atomically. The tool is callable
+repeatedly on the latest delegation (PENDING_REVIEW / STALE / REVIEWED), and
+EVERY call refreshes the appropriate generation-specific authority and the
+full scope check over all W. `include_paths` only narrows the rendered patch,
+so a segment can never skip a scope check or its authority binding.
 
 Displayed-path coverage (Commander Slice B2) is machine-derived from the
 actually rendered patch entries: a path counts as displayed only when it
@@ -171,24 +179,28 @@ records stay readable and infer prior coverage ONLY from their persisted
 patch entries, and absent or malformed persisted coverage arrays or a
 persisted `coverage_complete` flag never render a false COMPLETE. Verdict
 `PASS` combined with COMPLETE displayed-path coverage marks the delegation
-REVIEWED bound to the CURRENT hash; `FAIL` keeps it PENDING_REVIEW, and
-ANY re-review of the SAME current diff that is not PASS with complete
-coverage (a scope FAIL or an incomplete PASS, e.g. a legacy partial
+REVIEWED bound to the CURRENT authority binding; `FAIL` keeps it
+PENDING_REVIEW, and ANY re-review of the SAME current authority binding that
+is not PASS with complete coverage (a scope FAIL or an incomplete PASS,
+e.g. a legacy partial
 review record) invalidates a prior REVIEWED state fail-closed (demoted to
 PENDING_REVIEW with the reviewed hash cleared — pending/stale stay safely
 blocking). A pending or stale review blocks the next delegation
-AND VERIFY (mode entry and gate runs in VERIFY are refused); any diff
-change after REVIEWED turns the delegation STALE (a diff returning to
-exactly the reviewed hash re-validates). Blocked commander write attempts
-are counted while a review is outstanding. The review lifecycle and the
-lease persist as custom
+AND VERIFY (mode entry and gate runs in VERIFY are refused). New tagged v2
+uses a W/D/S relevance binding: baseline unrelated dirty paths and recognized
+workbench artifacts do not stale it, while Git HEAD, W/D/S, or a new
+unknown-origin path fails closed. Historical untagged v2/v1 retains the
+complete full-diff binding, where any diff change after REVIEWED turns the
+delegation STALE. A binding returning to exactly the reviewed hash
+re-validates. Blocked commander write attempts are counted while a review is
+outstanding. The review lifecycle and the lease persist as custom
 entries (`workbench-delegation-state`, `workbench-write-lease`) — durable
 across compaction and session replacement — and restore fail-closed on
 `session_start`.
 
-B6 (Worker-First Compliance, P7) is a machine-backed universal base gate:
-the runtime injects bounded worker-first facts into every gate run —
-strict policy active, zero unauthorized commander writes (or hard denial
+B6 (Development Safety; legacy P7 machine kind `worker-first`) is a
+machine-backed universal base gate: the runtime injects bounded safety facts
+into every gate run — development policy active, zero unauthorized high-risk writes (or hard denial
 active), no pending/stale worker review, reviewed hash matches the current
 diff, worker paths within the approved contracts, no active unexplained
 write lease, and final verification initiated by the Sol commander. Missing
@@ -292,6 +304,32 @@ code as well). See
 Run records (`manifest.json`, `command.json`, `environment.json`,
 `summary.json`, `stdout.log`, `stderr.log`) are redacted:
 
+- new recipe and gate runs are assembled in a hidden staging directory and
+  become visible only after all required payload files and their full-byte
+  identities have been strictly read back; one directory rename publishes the
+  run and `run-commit.json` binds the complete file inventory;
+- newly published run manifests use top-level `schema_version: 2` as well as
+  the v2 transaction marker. Historical schema-v1 manifests remain read-only;
+  mixed v1/v2 and unknown versions fail closed. This prevents v1-only code
+  from accepting a current run as v1 SUCCESS;
+- a visible directory without a valid v2 commit record is diagnostic/partial,
+  never gate authority; the newest same-recipe partial, failed, or corrupt run
+  blocks rather than causing fallback to an older success;
+- artifact gates accept only a committed successful run with a valid v2
+  artifact manifest. Current files are rehashed at consumption time;
+  immutable snapshots are content-addressed and verified inside the committed
+  run;
+- external artifact roots are disabled unless a trusted project explicitly
+  maps a bounded name to an absolute directory. Collection and current-state
+  gate validation both use a separate process probe; symlink escapes,
+  unavailable roots, identity races, and root remapping fail closed.
+
+Before any rollback to v1-only code, the read-only
+`npm run governance:rollback-check` inventory must report safe. Any v2,
+partial, corrupt, mixed, unknown, unavailable, or over-limit authority blocks
+that rollback; no record is migrated, quarantined, rewritten, or deleted. See
+[governance-recovery.md](governance-recovery.md).
+
 - env vars whose names look like secrets (`*API_KEY*`, `*TOKEN*`,
   `*SECRET*`, `*PASSWORD*`, `*AUTH*`, `*CREDENTIAL*`, `*PRIVATE_KEY*`,
   ...) are stored as `[REDACTED]` in `environment.json`;
@@ -372,6 +410,11 @@ logs. Records on disk are never rewritten.
 `core/tool-result-recovery.ts` persists two-phase tool-result receipts
 (`.pi/workbench/tool-results/<id>.started` + `<id>.json`, schema `wtr1`),
 wired into the Pi tool lifecycle in P8b. What it protects:
+
+- **Receipts protect side effects, not reads.** Recipe/gate execution,
+  delegation and review keep the two-phase replay guard. Project inspect,
+  run/gate reads and lists, comparison, delegation status and receipt recovery
+  are safely replayable and create no result receipt.
 
 - **Raw input never persists.** Only the exact tool name and a canonical
   SHA-256 hash of the raw input are persisted; raw arguments, the native Pi

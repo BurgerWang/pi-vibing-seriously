@@ -108,7 +108,7 @@ const B5_CHECKS = [
 ];
 
 // ---------------------------------------------------------------------------
-// B6 Worker-First Compliance (P7 slice 3) — machine-backed only.
+// B6 Development Safety (legacy machine kind `worker-first`) — machine-backed only.
 //
 // The eight checks evaluate the bounded WorkerFirstGateFacts object that the
 // runtime injects into EVERY gate run (slash command AND model tool). No
@@ -124,10 +124,10 @@ const B5_CHECKS = [
 const B6_CHECKS = [
 	check(
 		"b6.1",
-		"Worker-first strict policy active",
+		"Development-first policy active",
 		"worker-first",
 		{ worker_first: "strict-policy-active" },
-		"the session resolves to the fixed worker-first-strict write policy (approved GPT-5.6 Sol)",
+		"the session resolves to the development-first policy (legacy compatibility id worker-first-strict)",
 	),
 	check(
 		"b6.2",
@@ -138,14 +138,14 @@ const B6_CHECKS = [
 	),
 	check(
 		"b6.3",
-		"No pending worker review",
+		"No pending recovery review",
 		"worker-first",
 		{ worker_first: "no-pending-review" },
 		"the latest delegation is not PENDING_REVIEW (review before the next delegation / VERIFY)",
 	),
 	check(
 		"b6.4",
-		"No stale worker review",
+		"No stale recovery review",
 		"worker-first",
 		{ worker_first: "no-stale-review" },
 		"the latest delegation is not STALE (no diff change since the reviewed hash)",
@@ -314,11 +314,11 @@ export const BASE_GATES: readonly Gate[] = [
 	),
 	gate(
 		"b6",
-		"Worker-First Compliance",
-		"Machine-backed worker-first compliance: strict policy active, zero unauthorized commander writes / hard denial active, no pending or stale worker review, reviewed hash matches the current diff, all worker paths within the approved contracts, no active unexplained write lease, and final verification initiated by the Sol commander. Facts are injected by the runtime — model prose can never satisfy these checks.",
+		"Development Safety",
+		"Machine-backed development safety: direct development policy active, high-risk writes remain authorized, no pending or stale recovery review, reviewed binding is current, delegated paths stay within contract, no unexplained high-risk lease is active, and final verification is commander-initiated. Facts are injected by the runtime; the legacy worker-first check kind remains only for record compatibility, and model prose can never satisfy these checks.",
 		[],
 		B6_CHECKS,
-		"Worker-first compliance holds: strict policy active, hard denial of unauthorized commander writes, clean delegation review state (no pending/stale review, reviewed hash matches), all worker paths within contracts, no unexplained active lease, and Sol-initiated final verification.",
+		"Development safety holds: ordinary writes remain direct, high-risk writes are authorized, delegation recovery state is clean, reviewed binding is current, delegated paths stay within contracts, no unexplained active lease exists, and final verification is Sol-initiated.",
 	),
 ];
 

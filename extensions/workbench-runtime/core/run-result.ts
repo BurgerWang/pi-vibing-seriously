@@ -352,6 +352,7 @@ class LineBudget {
 function statusOf(m: RunRecord): string {
 	if (m.timed_out === true) return "TIMED OUT";
 	if (m.cancelled === true) return "CANCELLED";
+	if (m.run_outcome === "ARTIFACT_FAILED" || m.run_outcome === "PROCESS_FAILED") return "FAILED";
 	const code = typeof m.exit_code === "number" && Number.isFinite(m.exit_code) ? m.exit_code : null;
 	if (code === null) return "KILLED";
 	const expected = Array.isArray(m.expected_exit_codes) ? m.expected_exit_codes : [];

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "delegation_id": "20260817-010003-a004",
+  "created_at": "2026-08-17T01:03:00.000Z",
+  "finished_at": null,
+  "status": "running",
+  "review_status": "PENDING_REVIEW",
+  "git_head_before": "afca84f4f6d3cc810b953b16625a1756a7dbc850",
+  "git_dirty_before": false,
+  "diff_hash_before": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "diff_hash_after": null,
+  "changed_path_count_before": 0,
+  "changed_path_count_after": null,
+  "changed_since_before_count": null
+}

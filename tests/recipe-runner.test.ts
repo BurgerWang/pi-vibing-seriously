@@ -193,16 +193,16 @@ test("cache request mode is recorded exactly for default, no-cache and refresh-c
 	});
 });
 
-test("all six run artifacts are written to the run directory", async () => {
+test("a complete recipe run publishes its payload and atomic commit record", async () => {
 	await withTempDir(async (dir) => {
 		await setupProject(dir);
 		const result = await runRecipe({ projectRoot: dir, recipeName: "hello", mode: "DEV", exec: spawnExec, params: { msg: "world" } });
 		assert.equal(result.ok, true);
 		const files = (await readdir(result.runDir as string)).sort();
-		assert.deepEqual(files, ["command.json", "environment.json", "manifest.json", "stderr.log", "stdout.log", "summary.json"]);
+		assert.deepEqual(files, ["artifact-manifest.json", "command.json", "environment.json", "manifest.json", "run-commit.json", "stderr.log", "stdout.log", "summary.json"]);
 
 		const manifest = JSON.parse(await readFile(join(result.runDir as string, "manifest.json"), "utf8"));
-		assert.equal(manifest.schema_version, 1);
+		assert.equal(manifest.schema_version, 2);
 		assert.equal(manifest.recipe, "hello");
 		assert.equal(manifest.profile, "generic");
 		assert.equal(manifest.exit_code, 0);
@@ -216,6 +216,8 @@ test("all six run artifacts are written to the run directory", async () => {
 		assert.ok(manifest.cwd);
 		assert.ok(manifest.stdout_truncated === false);
 		assert.ok(manifest.stderr_truncated === false);
+		assert.equal(manifest.run_transaction_schema_version, 2);
+		assert.equal(manifest.run_outcome, "SUCCESS");
 	});
 });
 

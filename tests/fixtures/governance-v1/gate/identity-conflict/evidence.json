@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "run_id": "20260817-039999-z999",
+  "requested": ["b0"],
+  "profile": "generic",
+  "mode": "DEV",
+  "checks": {
+    "b0.fixture": {
+      "check_id": "b0.fixture",
+      "evidence": [{ "type": "manual", "check_id": "b0.fixture", "detail": "foreign evidence" }]
+    }
+  }
+}

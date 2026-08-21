@@ -27,6 +27,7 @@ import {
 	buildDelegateWorkerResult,
 	changedPathsLine,
 	HANDOFF_COMMANDER_ACTION_LINES,
+	HANDOFF_DEFAULT_DELIVERY_COMPLETE_LINES,
 	isVerificationCommand,
 	MAX_PARENT_HANDOFF_BYTES,
 	MAX_PARENT_HANDOFF_LINES,
@@ -650,6 +651,18 @@ test("the fixed commander-action tail is exactly the documented four lines", () 
 	assert.equal(HANDOFF_COMMANDER_ACTION_LINES.length, 4);
 	assert.equal(HANDOFF_COMMANDER_ACTION_LINES[1], "--- Commander action required ---");
 	assert.ok(HANDOFF_COMMANDER_ACTION_LINES[3]?.includes("workbench_review_worker_diff"));
+});
+
+test("REVIEWED handoff says delivery is complete and forbids the redundant review/status chain", () => {
+	const result = buildDelegateWorkerResult(handoffInput({ reviewStatus: "REVIEWED" }));
+	const text = result.content[0]?.text ?? "";
+	assert.match(text, /review\s+: REVIEWED — default delivery complete/);
+	assert.match(text, /--- Default delivery complete ---/);
+	assert.match(text, /Do not call workbench_review_worker_diff or workbench_delegation_status/);
+	assert.doesNotMatch(text, /--- Commander action required ---/);
+	assert.equal(HANDOFF_DEFAULT_DELIVERY_COMPLETE_LINES.length, 4);
+	assert.ok(Buffer.byteLength(text, "utf8") <= MAX_PARENT_HANDOFF_BYTES);
+	assert.ok(text.split("\n").length <= MAX_PARENT_HANDOFF_LINES);
 });
 
 // ---------------------------------------------------------------------------

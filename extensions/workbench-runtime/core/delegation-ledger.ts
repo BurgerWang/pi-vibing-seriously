@@ -55,6 +55,7 @@
 import { randomBytes } from "node:crypto";
 import { open, mkdir, rename, writeFile } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
+import { TextDecoder } from "node:util";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
@@ -492,34 +493,112 @@ export function normalizeStatusPath(raw: string): string | undefined {
 	return path;
 }
 
-/** Minimal C-style unquote for quoted porcelain paths (core.quotePath). */
-function unquotePorcelainPath(raw: string): string {
-	if (!raw.startsWith('"') || !raw.endsWith('"') || raw.length < 2) return raw;
-	let out = "";
-	for (let i = 1; i < raw.length - 1; i += 1) {
+/**
+ * Decode one Git `core.quotePath` C-quoted path. Git emits non-ASCII path
+ * bytes as three-digit octal escapes, so decoding escapes directly into a
+ * JavaScript string would corrupt multi-byte UTF-8 names. Build the original
+ * bytes first, then perform one fatal UTF-8 decode. Unknown/incomplete
+ * escapes, impossible bytes and NUL are rejected rather than fabricated.
+ */
+function unquotePorcelainPath(raw: string): string | undefined {
+	if (!raw.startsWith('"')) return raw;
+	if (!raw.endsWith('"') || raw.length < 2) return undefined;
+
+	const bytes: number[] = [];
+	const end = raw.length - 1;
+	let i = 1;
+	while (i < end) {
 		const ch = raw[i]!;
-		if (ch === "\\" && i + 1 < raw.length - 1) {
-			const next = raw[i + 1]!;
-			if (next === '"' || next === "\\") {
-				out += next;
-				i += 1;
+		if (ch === '"') return undefined;
+		if (ch !== "\\") {
+			const codePoint = raw.codePointAt(i);
+			if (codePoint === undefined) return undefined;
+			const literal = String.fromCodePoint(codePoint);
+			bytes.push(...Buffer.from(literal, "utf8"));
+			i += literal.length;
+			continue;
+		}
+
+		const next = raw[i + 1];
+		if (next === undefined || i + 1 >= end) return undefined;
+		const safeEscapeBytes: Readonly<Record<string, number>> = {
+			a: 0x07,
+			b: 0x08,
+			t: 0x09,
+			n: 0x0a,
+			v: 0x0b,
+			f: 0x0c,
+			r: 0x0d,
+			"\\": 0x5c,
+			'"': 0x22,
+		};
+		const safeByte = safeEscapeBytes[next];
+		if (safeByte !== undefined) {
+			bytes.push(safeByte);
+			i += 2;
+			continue;
+		}
+
+		if (next < "0" || next > "7" || i + 3 >= end) return undefined;
+		const octal = raw.slice(i + 1, i + 4);
+		if (!/^[0-7]{3}$/.test(octal)) return undefined;
+		const byte = Number.parseInt(octal, 8);
+		if (byte > 0xff) return undefined;
+		bytes.push(byte);
+		i += 4;
+	}
+
+	try {
+		const decoded = new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(bytes));
+		return decoded.includes("\0") ? undefined : decoded;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Find the rename/copy separator outside C-quoted path atoms. */
+function porcelainRenameArrow(raw: string): number {
+	let quoted = false;
+	let escaped = false;
+	for (let i = 0; i <= raw.length - 4; i += 1) {
+		const ch = raw[i]!;
+		if (quoted) {
+			if (escaped) {
+				escaped = false;
 				continue;
 			}
+			if (ch === "\\") {
+				escaped = true;
+				continue;
+			}
+			if (ch === '"') quoted = false;
+			continue;
 		}
-		out += ch;
+		if (ch === '"') {
+			quoted = true;
+			continue;
+		}
+		if (raw.startsWith(" -> ", i)) return i;
 	}
-	return out;
+	return -1;
 }
 
 /** Extract the destination path from one `git status --porcelain` line. */
 export function parsePorcelainPath(line: string): string | undefined {
 	if (line.length < 4) return undefined;
 	let rest = line.slice(3).trim();
-	if (rest.startsWith('"')) rest = unquotePorcelainPath(rest);
-	// Renames/copies render as "XY <source> -> <dest>": the changed path is the destination.
-	const arrow = rest.indexOf(" -> ");
-	if (arrow >= 0) rest = rest.slice(arrow + 4).trim();
-	return rest || undefined;
+	// Renames/copies render as "XY <source> -> <dest>": only R/C status
+	// lines give the arrow structural meaning. An ordinary filename may
+	// legitimately contain the same text and must remain whole.
+	if (/[RC]/.test(line.slice(0, 2))) {
+		const arrow = porcelainRenameArrow(rest);
+		if (arrow < 0) return undefined;
+		const source = unquotePorcelainPath(rest.slice(0, arrow).trim());
+		if (!source) return undefined;
+		rest = rest.slice(arrow + 4).trim();
+	}
+	const decoded = unquotePorcelainPath(rest);
+	return decoded || undefined;
 }
 
 const REPORTED_SECTION_HEADING = /^##\s*files changed\s*$/i;
@@ -688,7 +767,7 @@ export async function collectGitFacts(projectRoot: string, exec: ExecFn): Promis
 	const seen = new Set<string>();
 	for (const line of lines) {
 		const raw = parsePorcelainPath(line);
-		if (!raw) continue;
+		if (!raw) throw new Error("git status --porcelain returned an invalid or undecodable path");
 		const normalized = normalizeStatusPath(raw);
 		if (!normalized || seen.has(normalized)) continue;
 		// The workbench's own delegation records are never part of the diff

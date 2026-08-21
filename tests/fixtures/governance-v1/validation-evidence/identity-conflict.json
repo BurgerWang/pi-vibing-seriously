@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "binding": {
+    "schema_version": 1,
+    "kind": "recipe",
+    "commit": "afca84f4f6d3cc810b953b16625a1756a7dbc850",
+    "diff_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "lockfiles": {
+      "package-lock.json": "missing",
+      "npm-shrinkwrap.json": "missing",
+      "yarn.lock": "missing",
+      "pnpm-lock.yaml": "missing",
+      "bun.lockb": "missing",
+      "uv.lock": "missing",
+      "poetry.lock": "missing",
+      "Pipfile.lock": "missing",
+      "Cargo.lock": "missing",
+      "go.sum": "missing",
+      "Gemfile.lock": "missing",
+      "composer.lock": "missing",
+      "requirements.lock": "missing"
+    },
+    "config_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "gate_state_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "profile": "generic",
+    "mode": "DEV",
+    "owner": "sol",
+    "target": {
+      "kind": "recipe",
+      "name": "foreign-recipe",
+      "definition_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "invocation_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "cwd": "."
+    },
+    "outcome": { "successful": true, "complete": true, "source": "exec" }
+  },
+  "unavailable_reason": null
+}

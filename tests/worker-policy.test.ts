@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promis
 import { join } from "node:path";
 import { test } from "node:test";
 
-import { WORKBENCH_TOOL_METADATA } from "../extensions/workbench-runtime/core/tool-catalog.ts";
+import { WORKBENCH_TOOL_METADATA, WORKBENCH_TOOL_PARAMETERS } from "../extensions/workbench-runtime/core/tool-catalog.ts";
 import { STRICT_SOL_DEV_ALLOWLIST } from "../extensions/workbench-runtime/core/write-authority.ts";
 import {
 	commanderBlockReason,
@@ -11,9 +11,11 @@ import {
 	formatWorkerTask,
 	isWorkerPathAllowed,
 	parseWorkerAllowedPaths,
+	parseWorkerTaskKindEnvironment,
 	recipeMutationBlockReason,
 	resolveWorkerBudgetProfile,
 	resolveWorkerRepairOf,
+	resolveWorkerTaskKind,
 	workerRecipeBlockReason,
 	workerRoleToolCallBlockReason,
 	WORKER_ROLE,
@@ -71,6 +73,27 @@ test("worker role uses a stable reduced tool matrix while commander tools are un
 	assert.deepEqual(computeRoleActiveTools(tools, undefined), tools);
 });
 
+test("task-kind parsing is closed, omission-compatible, and malformed env is least privilege", () => {
+	assert.deepEqual(resolveWorkerTaskKind(undefined), { ok: true, taskKind: "implementation" });
+	assert.deepEqual(resolveWorkerTaskKind("implementation"), { ok: true, taskKind: "implementation" });
+	assert.deepEqual(resolveWorkerTaskKind("diagnosis"), { ok: true, taskKind: "diagnosis" });
+	for (const bad of ["mechanical", "", "Diagnosis", null, 1, {}, []]) {
+		const resolved = resolveWorkerTaskKind(bad);
+		assert.equal(resolved.ok, false, `${JSON.stringify(bad)} must fail closed`);
+	}
+	assert.equal(parseWorkerTaskKindEnvironment(undefined), "implementation");
+	assert.equal(parseWorkerTaskKindEnvironment("diagnosis"), "diagnosis");
+	assert.equal(parseWorkerTaskKindEnvironment("mechanical"), "invalid");
+});
+
+test("diagnosis and invalid workers have a read-only advertised matrix", () => {
+	const tools = ["read", "grep", "edit", "write", "workbench_run_recipe", "workbench_delegate_worker"];
+	assert.deepEqual(computeRoleActiveTools(tools, WORKER_ROLE, "implementation"), ["read", "grep", "edit", "write", "workbench_run_recipe"]);
+	assert.deepEqual(computeRoleActiveTools(tools, WORKER_ROLE, "diagnosis"), ["read", "grep", "workbench_run_recipe"]);
+	assert.deepEqual(computeRoleActiveTools(tools, WORKER_ROLE, "invalid"), ["read", "grep", "workbench_run_recipe"]);
+	assert.deepEqual(computeRoleActiveTools(tools, undefined, "diagnosis"), tools, "commander tools are unaffected");
+});
+
 test("worker-role filtering still hides recursion/final-gate tools from the strict Sol DEV allowlist (P7)", () => {
 	const workerTools = computeRoleActiveTools(STRICT_SOL_DEV_ALLOWLIST, WORKER_ROLE);
 	assert.ok(!workerTools.includes("workbench_delegate_worker"), "workers can never recursively delegate");
@@ -90,6 +113,15 @@ test("worker role blocks recursion, free bash, final gates, and out-of-scope wri
 	assert.match(workerRoleToolCallBlockReason(context, "write", {}) ?? "", /non-empty path/);
 	assert.equal(workerRoleToolCallBlockReason(context, "workbench_run_recipe", { recipe: "unit-test" }), undefined);
 	assert.equal(workerRoleToolCallBlockReason({ role: undefined }, "bash", {}), undefined, "commander process is unaffected");
+});
+
+test("diagnosis and malformed task kinds block edit/write before path evaluation", () => {
+	for (const taskKind of ["diagnosis", "invalid"] as const) {
+		const context = { role: WORKER_ROLE, taskKind, projectRoot: "/repo", allowedPaths: ["src/**"] };
+		assert.match(workerRoleToolCallBlockReason(context, "edit", { path: "src/main.ts" }) ?? "", /read-only|invalid task-kind/);
+		assert.match(workerRoleToolCallBlockReason(context, "write", { path: "src/new.ts" }) ?? "", /read-only|invalid task-kind/);
+		assert.equal(workerRoleToolCallBlockReason(context, "read", { path: "src/main.ts" }), undefined);
+	}
 });
 
 test("worker recipes are read-only by declaration", () => {
@@ -157,6 +189,29 @@ test("formatted worker task carries the complete bounded contract in the user me
 	assert.match(text, /- Reject invalid input/);
 	assert.match(text, /Requested verification:/);
 	assert.ok(!text.includes("final PASS"));
+});
+
+test("formatted diagnosis task makes inspection-only authority explicit", () => {
+	const text = formatWorkerTask({
+		taskKind: "diagnosis",
+		task: "Identify the parser failure cause",
+		allowedPaths: ["src/**", "tests/parser.test.ts"],
+		acceptanceCriteria: ["Report evidence and uncertainty"],
+		verification: ["Run the read-only unit-test recipe"],
+	});
+	assert.match(text, /Delegated diagnosis task \(strictly read-only\)/);
+	assert.match(text, /inspection scope only; never write authority/);
+	assert.match(text, /Diagnostic objectives \(evidence for Sol; never acceptance\)/);
+	assert.throws(
+		() => formatWorkerTask({
+			taskKind: "mechanical" as never,
+			task: "bad",
+			allowedPaths: ["src/**"],
+			acceptanceCriteria: ["bad"],
+			verification: [],
+		}),
+		/task_kind must be one of/,
+	);
 });
 
 // ---------------------------------------------------------------------------
@@ -238,115 +293,152 @@ test("the complete-slice task contract travels fully and stays acceptance-free",
 	assert.ok(!text.includes("final PASS"), "the task text never grants a final verdict");
 });
 
-test("delegate-tool metadata codifies the Sol/worker responsibility split and the vertical-slice default", () => {
+test("delegate-tool metadata codifies direct one-call development delivery", () => {
 	const meta = WORKBENCH_TOOL_METADATA.workbench_delegate_worker;
 	const text = [meta.description, meta.promptSnippet, ...meta.promptGuidelines].join("\n");
-	// Worker-owned: routine local implementation decisions inside the contract.
-	assert.match(text, /routine local implementation decisions inside the approved contract/);
-	// Sol-owned: requirements, cross-cutting architecture, scope, actual-diff
-	// review, final verification/gates, and verdict.
-	assert.match(text, /Sol owns requirements, cross-cutting architecture, scope, actual-diff review, final verification\/gates, and the verdict/);
-	// DEV default: coherent source+tests+docs vertical slices for bounded
-	// low/medium-risk implementation, with explicit paths and observable criteria.
-	assert.match(text, /source\+tests\+docs vertical slices/);
-	assert.match(text, /bounded low\/medium-risk implementation/);
+	assert.match(text, /normal implementation path/);
+	assert.match(text, /closes the session as REVIEWED in this same call/);
+	assert.match(text, /continue directly to the next development step without calling review or status/);
+	assert.match(text, /concrete task/);
+	assert.match(text, /smallest useful allowed_paths set/);
 	assert.match(text, /observable acceptance criteria/);
-	assert.match(text, /minimum repository orientation/);
-	assert.match(text, /avoid duplicating the worker's routine investigation/);
-	// Worker prose is never acceptance; Sol independently inspects the diff.
-	assert.match(text, /Worker prose is never acceptance evidence/);
-	assert.match(text, /untrusted implementation report/);
-	assert.match(text, /independently inspect the actual diff/);
+	assert.match(text, /High-risk permission and final verification remain explicit boundaries/);
+	assert.doesNotMatch(text, /minimum repository orientation/);
+	assert.doesNotMatch(text, /source\+tests\+docs vertical slices/);
 });
 
-test("delegate-tool metadata codifies profile choice and bounded-slicing granularity (Phase 5)", () => {
+test("delegate-tool metadata keeps explicit review out of the ordinary path", () => {
 	const meta = WORKBENCH_TOOL_METADATA.workbench_delegate_worker;
 	const text = [meta.description, meta.promptSnippet, ...meta.promptGuidelines].join("\n");
-	// Profile choice: standard is the deterministic default; low is an
-	// explicit tighter opt-in; extended is explicit Sol-approved only and
-	// is never inferred or auto-promoted.
-	assert.match(text, /standard is the deterministic default/);
-	assert.match(text, /low is an explicit tighter opt-in/);
-	assert.match(text, /extended is explicit Sol-approved only/);
-	assert.match(text, /never inferred or auto-promoted/);
-	// Granularity: one coherent source+tests+docs vertical slice with ample
-	// headroom BELOW its soft thresholds; soft is a handoff reserve and
-	// hard is failure — neither is a planning target.
-	assert.match(text, /ample headroom BELOW/);
-	assert.match(text, /soft is a handoff reserve/);
-	assert.match(text, /hard is failure/);
-	assert.match(text, /neither is a planning target/);
-	// Unknown root cause: bounded diagnosis → Sol architecture/scope
-	// decision → bounded implementation — never one open-ended worker task.
-	assert.match(text, /bounded diagnosis/);
-	assert.match(text, /Sol architecture\/scope decision/);
-	assert.match(text, /bounded implementation/);
-	assert.match(text, /never one open-ended worker task/);
+	assert.match(text, /automatic diff review and session close/);
+	assert.match(text, /Call workbench_review_worker_diff only when/);
+	assert.match(text, /explicit review required, incomplete coverage, a conflict, or a pending\/stale recovery state/);
+	assert.doesNotMatch(text, /after a worker returns: review the actual diff/);
 });
 
-test("delegate-tool metadata codifies the bounded repair_of provenance contract (Phase 4D)", () => {
+test("delegate-tool metadata leaves detailed repair provenance in the parameter contract", () => {
 	const meta = WORKBENCH_TOOL_METADATA.workbench_delegate_worker;
 	const text = [meta.description, meta.promptSnippet, ...meta.promptGuidelines].join("\n");
-	// The optional repair_of pointer is named as strict prior delegation-id
-	// provenance for repairs of a KNOWN root cause only.
-	assert.match(text, /repair_of/);
-	assert.match(text, /known-root-cause repair/);
-	assert.match(text, /after Sol has fixed the root cause and decided the scope/);
-	// The parent task itself must carry the bounded failure evidence; the
-	// pointer adds none of its own.
-	assert.match(text, /bounded failure evidence/);
-	// The runtime requires a FINISHED prior delegation ledger before any new
-	// ledger is created or any worker is launched.
-	assert.match(text, /FINISHED prior delegation ledger/);
-	assert.match(text, /before any new ledger is created or any worker is launched/);
-	// Fresh worker, nothing inherited: the pointer never resumes the prior
-	// worker and the fresh worker inherits no prior report, session, scope,
-	// or contract.
-	assert.match(text, /never resumes the prior worker/);
-	assert.match(text, /inherits no prior report, session, scope, or contract/);
-	// No authority expansion: the pointer adds no path/scope/authority and
-	// never expands paths, scope, or authority.
-	assert.match(text, /adds no path\/scope\/authority/);
-	assert.match(text, /never expands paths, scope, or authority/);
-	// Unknown root causes still use bounded diagnosis then a Sol decision —
-	// repair_of never replaces that path.
-	assert.match(text, /unknown root cause still requires bounded diagnosis/);
-	assert.match(text, /Sol architecture\/scope decision/);
+	assert.doesNotMatch(text, /known-root-cause repair/);
+	assert.doesNotMatch(text, /fresh worker inherits/);
+	const schema = WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker as unknown as {
+		properties: Record<string, { description?: string }>;
+	};
+	assert.match(schema.properties.repair_of?.description ?? "", /strict prior delegation-id provenance/);
+	assert.match(schema.properties.repair_of?.description ?? "", /adds no path\/scope\/authority/);
 });
 
-test("worker-delegation documentation defines the risk rubric, worker-first high-risk delegation, fresh continuation, one writing worker, and the P7 ledger/review lifecycle", async () => {
+test("worker-delegation documentation defines development-first boundaries and strict public v2 delegation authority", async () => {
 	const doc = await readFile(new URL("../docs/worker-delegation.md", import.meta.url), "utf8");
 	// Risk rubric with low/medium/high tiers.
 	assert.match(doc, /## Risk rubric/);
 	assert.match(doc, /\| Low \|/);
 	assert.match(doc, /\| Medium \|/);
 	assert.match(doc, /\| High \|/);
-	// High-risk decisions are Commander-led: Sol owns the decision and never
-	// delegates it; implementation/repair writes go to a fresh bounded worker
-	// by default; only explicitly designed bounded support/implementation
-	// scopes are delegated after the architecture is fixed; a temporary
-	// commander direct write requires an explicit user-issued write lease.
-	assert.match(doc, /Commander-led: Sol owns the decision and never delegates the decision itself/);
-	assert.match(doc, /implementation\/repair writes go to a fresh bounded worker/);
-	assert.match(doc, /explicitly designed bounded support\/implementation scopes are delegated after the architecture is fixed/);
-	assert.match(doc, /Temporary commander direct writes require an explicit user-issued write lease/);
-	assert.match(doc, /never the DEV default/);
-	// Commander-led responsibilities are spelled out.
+	// Development is direct by default; only a concrete high-risk boundary
+	// activates the lease, and delegation is an optional execution tool.
+	assert.match(doc, /Low \| One contained change with a clear contract \| Direct edit\/write plus focused tests/);
+	assert.match(doc, /optionally delegate one bounded task when it materially reduces work/);
+	assert.match(doc, /Ordinary work does not become high risk merely because it changes source/);
+	assert.match(doc, /A partial result may be repaired directly in the same coherent change/);
+	assert.match(doc, /High-risk classification must name the concrete permission/);
+	assert.doesNotMatch(doc, /implementation\/repair writes go to a fresh bounded worker/);
+	assert.doesNotMatch(doc, /Sol does \*\*not\*\* directly write by default/);
+	// Caller/worker responsibilities are spelled out.
 	assert.match(doc, /### Responsibility split/);
-	assert.match(doc, /\| Owned by Sol \(never delegated\) \| Owned by the Worker \(inside the approved contract\) \|/);
-	// Fresh continuation and one writing worker per worktree.
-	assert.match(doc, /## Fresh-worker continuation/);
-	assert.match(doc, /brand-new `--no-session` worker/);
+	assert.match(doc, /\| Owned by the caller \| Owned by an optional Worker \(inside the approved contract\) \|/);
+	// Optional continuation and one writing worker per worktree.
+	assert.match(doc, /## Optional worker continuation/);
+	assert.match(doc, /brand-new `--no-session` worker and cannot recurse/);
+	assert.match(doc, /direct repair is the shorter default/);
 	assert.match(doc, /## One writing worker per worktree/);
 	assert.match(doc, /at most one worker writes to a worktree at any time/);
-	// P7 worker-first write authority and the delegation ledger/review
-	// lifecycle: every delegation is recorded and reviewed, and a pending or
-	// stale review blocks both the next delegation and VERIFY.
-	assert.match(doc, /## Worker-first write authority \(P7\)/);
-	assert.match(doc, /## Delegation ledger and review lifecycle \(P7\)/);
-	assert.match(doc, /PENDING_REVIEW → REVIEWED → \(current diff hash changes\) → STALE/);
+	// Current development-first write authority and the single public v2 transaction.
+	assert.match(doc, /## Development-first write authority \(current; legacy id P7\)/);
+	assert.match(doc, /historical 15 read\/workbench tools plus ordinary `edit` and `write`/);
+	assert.match(doc, /routine source, test, or documentation edits require delegation/);
+	assert.match(doc, /Ordinary canonical project-relative `edit`\/`write` calls are allowed\s+directly/);
+	assert.match(doc, /temporary high-risk write lease/);
+	assert.match(doc, /`WF:DIRECT` otherwise/);
+	assert.match(doc, /## Recommended development workflow/);
+	assert.match(doc, /Implement ordinary source, tests, and documentation directly in DEV/);
+	assert.match(doc, /normal successful implementation auto-reviews and closes/);
+	assert.match(doc, /run one final recipe or\s+gate set proportionate to task or release risk/);
+	assert.match(doc, /## Delegation transaction and review lifecycle \(P7\)/);
+	assert.match(doc, /\.pi\/workbench\/delegations\/<id>\/v2\/transaction\.json/);
+	assert.match(doc, /`PREPARED`[\s\S]*BEFORE the child is[\s\S]*`RUNNING`/);
+	assert.match(doc, /`COMMITTING`/);
+	assert.match(doc, /\.pi\/workbench\/delegations\/<id>\/v2\/generations\/g########\//);
+	assert.match(doc, /exactly eight records/);
+	for (const record of [
+		"after.json",
+		"before.json",
+		"identity.json",
+		"review.json",
+		"scope.json",
+		"usage.json",
+		"worker-report.md",
+		"worker-summary.json",
+	]) {
+		assert.ok(doc.includes("`" + record + "`"), `missing documented v2 generation record ${record}`);
+	}
+	assert.match(doc, /plus `commit-marker\.json`/);
+	assert.match(doc, /full-byte content-hash\/marker proof/);
+	assert.match(doc, /implementation: PREPARED → RUNNING → COMMITTING → PENDING_REVIEW → REVIEWED/);
+	assert.match(doc, /diagnosis:\s+PREPARED → RUNNING → COMMITTING → FINISHED/);
+	// Stage-1 task-kind compatibility and the task-specific postconditions are
+	// explicit; superficial child success or prose cannot bypass them.
+	assert.match(doc, /omission preserves compatibility by resolving to\s+`implementation`/);
+	assert.match(doc, /Stage 1 enables only `implementation` and `diagnosis`/);
+	assert.match(doc, /`mechanical` \(or any unknown value\) fails closed/);
+	assert.match(doc, /implementation can reach `PENDING_REVIEW` only with a nonempty actual\s+delta, complete scope facts with no out-of-scope changes/);
+	assert.match(doc, /diagnosis can reach\s+`FINISHED` only with zero actual delta, zero successful\s+write attempts, zero denied write attempts, and a complete report/);
+	assert.match(doc, /Both\s+successful paths also require provider success, exit code 0, a complete\s+report, complete terminal facts, and the exact pinned\/observed worker\s+identity/);
+	assert.match(doc, /Provider success, exit code 0, or reassuring worker prose cannot\s+bypass any other postcondition/);
+	assert.match(doc, /failure\s+becomes `FAILED`; incomplete terminal or generation facts become\s+`RECOVERY_REQUIRED`/);
+	// V2 review authority is separate, coverage-gated, immutable after final
+	// PASS, and cannot unlock through a failed session-mirror append.
+	assert.match(doc, /\.pi\/workbench\/delegations\/<id>\/v2\/review\.json/);
+	assert.match(doc, /segmented provisional PASS, incomplete coverage, or any\s+FAIL[\s\S]*never grants authority/);
+	assert.match(doc, /Only a complete `PASS` with complete path\s+coverage atomically publishes[\s\S]*`REVIEWED`/);
+	assert.match(doc, /PENDING_REVIEW → REVIEWED → \(versioned binding conflicts\) → STALE/);
+	assert.match(doc, /`changeset-relevance-v2` projection over the closed relevance set/);
+	assert.match(doc, /W is the\s+attributed worker delta, D is the explicit dependency closure/);
+	assert.match(doc, /S is the relevant control set \(fixed workbench configuration,\s+applicable `AGENTS\.md`, and managed policy\/schema paths\)/);
+	assert.match(doc, /Baseline unrelated dirty paths \(B\) and\s+recognized workbench artifacts are deliberately excluded/);
+	assert.match(doc, /Git HEAD change,\s+W\/D\/S drift, or a new unknown-origin dirty path \(U\) fails closed/);
+	assert.match(doc, /Historical\s+untagged v2 and v1 reviews retain their complete full-diff binding/);
+	assert.match(doc, /compatibility field names remain[\s\S]*new tagged v2 refreshes the W\/D\/S relevance binding/);
+	assert.match(doc, /Historical untagged v2\/v1 refreshes the complete full-diff\s+binding/);
+	assert.doesNotMatch(doc, /refreshes against the real git diff, so\s+any change after REVIEWED turns the delegation STALE/);
+	assert.match(doc, /An append failure never\s+unlocks memory or the compact mirror/);
+	assert.match(doc, /immutable final artifact/);
+	// Strict repair provenance and legacy compatibility allow a v1 read only
+	// for a true v2 not-found result; invalid v2 authority remains blocking.
+	assert.match(doc, /Only terminal v2 states `FAILED`,\s+`FINISHED`, or `REVIEWED` are referenceable/);
+	assert.match(doc, /Only a strict v2 `not_found` result permits the historical\s+read-only fallback/);
+	assert.match(doc, /pending, corrupt, unknown-[\s\S]*version[\s\S]*fails closed and never falls\s+back to v1/);
+	assert.match(doc, /v1 `manifest\.json`\/ledger\/review readers remain historical read-only\s+compatibility/);
+	assert.match(doc, /New public delegations never write v1/);
+	assert.match(doc, /Rollback may stop using v2 but must not delete or rewrite v2\s+authority/);
+	assert.match(doc, /unknown higher schema version always fails closed/);
+	// Human documentation is not a progress mirror or execution authority.
+	assert.match(doc, /not a progress\s+mirror and records no run ids or verification status/);
+	assert.match(doc, /Current committed\s+transaction\/run records and current test output determine observed state/);
+	assert.match(doc, /worker report remains bounded presentation, never acceptance authority/);
+	assert.doesNotMatch(doc, /remain `NOT_RUN` until Sol runs and records them/);
+	// Existing hard blocking language remains stable.
 	assert.match(doc, /a pending or stale review blocks BOTH the next delegation/);
 	assert.match(doc, /and VERIFY \(`\/q-mode-verify`\s+refuses/);
+});
+
+test("security documentation distinguishes new-v2 relevance from legacy full-diff review gating", async () => {
+	const doc = await readFile(new URL("../docs/security.md", import.meta.url), "utf8");
+	assert.match(doc, /New tagged v2\s+uses a W\/D\/S relevance binding/);
+	assert.match(doc, /baseline unrelated dirty paths and recognized\s+workbench artifacts do not stale it/);
+	assert.match(doc, /Git HEAD, W\/D\/S, or a new\s+unknown-origin path fails closed/);
+	assert.match(doc, /Historical untagged v2\/v1 retains the\s+complete full-diff binding/);
+	assert.doesNotMatch(doc, /any diff\s+change after REVIEWED turns the delegation STALE \(a diff returning/);
 });
 
 // ---------------------------------------------------------------------------

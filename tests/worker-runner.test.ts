@@ -10,15 +10,26 @@ import {
 	formatWorkerCacheSummary,
 	runDeepseekWorker,
 	workerCacheHitRatio,
+	WORKER_DIAGNOSIS_SYSTEM_PROMPT,
 	WORKER_SYSTEM_PROMPT,
 	type PiInvocation,
 	type WorkerRunResult,
 } from "../extensions/workbench-runtime/worker/runner.ts";
-import type { WorkerTaskContract } from "../extensions/workbench-runtime/core/worker-policy.ts";
+import {
+	WORKER_CONTRACT_HASH_ENV,
+	WORKER_DELEGATION_ID_ENV,
+	WORKER_TASK_KIND_ENV,
+	type WorkerTaskContract,
+} from "../extensions/workbench-runtime/core/worker-policy.ts";
 import {
 	WORKER_SPEND_DEFAULT_PROFILE,
 	WORKER_SPEND_PROFILE_ENV,
 } from "../extensions/workbench-runtime/core/worker-spend.ts";
+import {
+	EMPTY_WORKER_WRITE_JOURNAL_RUNTIME_OBSERVATION,
+	WORKER_WRITE_JOURNAL_RUNTIME_TELEMETRY_ENTRY_TYPE,
+	WORKER_WRITE_JOURNAL_RUNTIME_TELEMETRY_SCHEMA,
+} from "../extensions/workbench-runtime/core/worker-write-journal-runtime.ts";
 
 const CONTRACT: WorkerTaskContract = {
 	task: "Implement one bounded change",
@@ -60,6 +71,17 @@ function assistantEvent(overrides: Record<string, unknown> = {}): string {
 	});
 }
 
+function journalTelemetryEvent(data: Readonly<Record<string, unknown>>): string {
+	return JSON.stringify({
+		type: "entry_appended",
+		entry: {
+			type: "custom",
+			customType: WORKER_WRITE_JOURNAL_RUNTIME_TELEMETRY_ENTRY_TYPE,
+			data,
+		},
+	});
+}
+
 test("runner consumes JSON events, pins model identity, and aggregates usage", async () => {
 	const first = assistantEvent({ content: [{ type: "text", text: "working" }], stopReason: "toolUse" });
 	const final = assistantEvent();
@@ -91,6 +113,86 @@ test("runner consumes JSON events, pins model identity, and aggregates usage", a
 		assert.deepEqual(result.spendReasons, []);
 		assert.deepEqual(result.spendSoftReached, { turns: false, totalTokens: false, outputTokens: false });
 		assert.deepEqual(result.spendHardExceeded, { turns: false, totalTokens: false, outputTokens: false });
+		assert.strictEqual(result.writeJournalObservation, EMPTY_WORKER_WRITE_JOURNAL_RUNTIME_OBSERVATION);
+	});
+});
+
+test("runner observes exact worker journal begin and complete entries without retaining identifiers or content", async () => {
+	const begin = journalTelemetryEvent({
+		schema: WORKER_WRITE_JOURNAL_RUNTIME_TELEMETRY_SCHEMA,
+		phase: "begin",
+		tool: "edit",
+		outcome: "none",
+		code: "none",
+		revision: 1,
+		poisoned: 0,
+	});
+	const complete = journalTelemetryEvent({
+		schema: WORKER_WRITE_JOURNAL_RUNTIME_TELEMETRY_SCHEMA,
+		phase: "complete",
+		tool: "edit",
+		outcome: "succeeded",
+		code: "none",
+		revision: 2,
+		poisoned: 0,
+	});
+	const final = assistantEvent();
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${begin}\n${complete}\n${final}\n`)});`, async (invocation, dir) => {
+		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		assertWorkerSucceeded(result);
+		assert.deepEqual(result.writeJournalObservation, {
+			state: "complete", tool: "edit", outcome: "succeeded", code: "none", revision: 2,
+		});
+		assert.deepEqual(Object.keys(result.writeJournalObservation).sort(), ["code", "outcome", "revision", "state", "tool"]);
+		assert.equal(Object.isFrozen(result.writeJournalObservation), true);
+	});
+});
+
+test("runner makes explicit journal failures and malformed matching entries sticky failed observations", async () => {
+	const failure = journalTelemetryEvent({
+		schema: WORKER_WRITE_JOURNAL_RUNTIME_TELEMETRY_SCHEMA,
+		phase: "failure",
+		tool: "write",
+		outcome: "none",
+		code: "journal_read_failed",
+		revision: 0,
+		poisoned: 1,
+	});
+	const laterValid = journalTelemetryEvent({
+		schema: WORKER_WRITE_JOURNAL_RUNTIME_TELEMETRY_SCHEMA,
+		phase: "begin",
+		tool: "write",
+		outcome: "none",
+		code: "none",
+		revision: 1,
+		poisoned: 0,
+	});
+	const final = assistantEvent();
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${failure}\n${laterValid}\n${final}\n`)});`, async (invocation, dir) => {
+		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		assertWorkerSucceeded(result);
+		assert.deepEqual(result.writeJournalObservation, {
+			state: "failed", tool: "write", outcome: "none", code: "journal_read_failed", revision: 0,
+		});
+	});
+
+	const malformed = journalTelemetryEvent({
+		schema: WORKER_WRITE_JOURNAL_RUNTIME_TELEMETRY_SCHEMA,
+		phase: "begin",
+		tool: "edit",
+		outcome: "none",
+		code: "none",
+		revision: 1,
+		poisoned: 0,
+		privatePath: "PRIVATE_WORKER_PATH",
+	});
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${malformed}\n${final}\n`)});`, async (invocation, dir) => {
+		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		assertWorkerSucceeded(result);
+		assert.deepEqual(result.writeJournalObservation, {
+			state: "failed", tool: "none", outcome: "none", code: "invalid", revision: 0,
+		});
+		assert.equal(JSON.stringify(result.writeJournalObservation).includes("PRIVATE"), false);
 	});
 });
 
@@ -132,6 +234,18 @@ test("worker system prompt grants local implementation ownership inside the appr
 	assert.match(WORKER_SYSTEM_PROMPT, /unapproved architecture, security\/policy, destructive, or out-of-scope decision/);
 	assert.match(WORKER_SYSTEM_PROMPT, /stop and report/);
 	assert.match(WORKER_SYSTEM_PROMPT, /instead of guessing or expanding scope/);
+});
+
+test("diagnosis system prompt is read-only and keeps acceptance with Sol", () => {
+	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /strictly read-only diagnosis/);
+	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /Do not edit, write, create, delete, rename/);
+	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /configuration, state, ledger, receipt, or artifact/);
+	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /inspection scope only and never write authority/);
+	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /mutation is exactly none/);
+	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /never run a recipe with mutation other than none/);
+	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /must not claim final PASS or acceptance/);
+	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /only Sol maps evidence to criteria/);
+	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /## Files Changed\n- None\./);
 });
 
 test("worker system prompt pins the three mandatory execution disciplines (early checkpoint, stopping hygiene, short report)", () => {
@@ -202,13 +316,13 @@ test("worker system prompt pins the three mandatory execution disciplines (early
 
 test("runner pins max model selector and passes a non-recursive worker role contract", async () => {
 	const script = `
-const facts = JSON.stringify({ argv: process.argv.slice(2), role: process.env.WORKBENCH_AGENT_ROLE, depth: process.env.WORKBENCH_WORKER_DEPTH, paths: JSON.parse(process.env.WORKBENCH_WORKER_ALLOWED_PATHS || "[]"), inheritedModel: process.env.PI_MODEL || null, spendProfile: process.env.${WORKER_SPEND_PROFILE_ENV} || null });
+const facts = JSON.stringify({ argv: process.argv.slice(2), role: process.env.WORKBENCH_AGENT_ROLE, depth: process.env.WORKBENCH_WORKER_DEPTH, paths: JSON.parse(process.env.WORKBENCH_WORKER_ALLOWED_PATHS || "[]"), taskKind: process.env.${WORKER_TASK_KIND_ENV} || null, inheritedModel: process.env.PI_MODEL || null, spendProfile: process.env.${WORKER_SPEND_PROFILE_ENV} || null });
 console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "deepseek", model: "deepseek-v4-flash", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
 `;
 	await withFakeWorker(script, async (invocation, dir) => {
 		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assertWorkerSucceeded(result);
-		const facts = JSON.parse(result.output) as { argv: string[]; role: string; depth: string; paths: string[]; inheritedModel: string | null; spendProfile: string | null };
+		const facts = JSON.parse(result.output) as { argv: string[]; role: string; depth: string; paths: string[]; taskKind: string | null; inheritedModel: string | null; spendProfile: string | null };
 		const modelFlag = facts.argv.indexOf("--model");
 		assert.ok(modelFlag >= 0);
 		assert.equal(facts.argv[modelFlag + 1], "deepseek/deepseek-v4-flash:max");
@@ -216,10 +330,153 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 		assert.equal(facts.role, "worker");
 		assert.equal(facts.depth, "1");
 		assert.deepEqual(facts.paths, CONTRACT.allowedPaths);
+		assert.equal(facts.taskKind, "implementation", "omitted task kind is explicitly carried as the compatibility default");
+		const toolsFlag = facts.argv.indexOf("--tools");
+		assert.ok(facts.argv[toolsFlag + 1]?.split(",").includes("edit"));
+		assert.ok(facts.argv[toolsFlag + 1]?.split(",").includes("write"));
 		assert.equal(facts.inheritedModel, null, "parent PI_MODEL must not masquerade as the child model");
 		assert.equal(facts.spendProfile, "standard", "the runner always writes a valid spend profile into the fixed child env contract");
 		assert.equal(result.spendProfile, "standard");
 	});
+});
+
+test("runner passes an exact validated delegation-v2 runtime identity to the child", async () => {
+	const delegationId = "20260820-150000-r1T2";
+	const contractHash = "a".repeat(64);
+	const script = `
+const facts = JSON.stringify({ delegationId: process.env.${WORKER_DELEGATION_ID_ENV} || null, contractHash: process.env.${WORKER_CONTRACT_HASH_ENV} || null });
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "deepseek", model: "deepseek-v4-flash", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
+`;
+	await withFakeWorker(script, async (invocation, dir) => {
+		const result = await runDeepseekWorker({
+			projectRoot: dir,
+			contract: CONTRACT,
+			timeoutMs: 2_000,
+			invocation,
+			runtimeIdentity: { delegationId, contractHash },
+		});
+		assertWorkerSucceeded(result);
+		assert.deepEqual(JSON.parse(result.output), { delegationId, contractHash });
+	});
+});
+
+test("legacy runner calls strip hostile inherited runtime identity values", async () => {
+	const previousDelegation = process.env[WORKER_DELEGATION_ID_ENV];
+	const previousContract = process.env[WORKER_CONTRACT_HASH_ENV];
+	process.env[WORKER_DELEGATION_ID_ENV] = "HOSTILE_INHERITED_DELEGATION";
+	process.env[WORKER_CONTRACT_HASH_ENV] = "HOSTILE_INHERITED_CONTRACT";
+	try {
+		const script = `
+const facts = JSON.stringify({ delegationId: process.env.${WORKER_DELEGATION_ID_ENV} || null, contractHash: process.env.${WORKER_CONTRACT_HASH_ENV} || null });
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "deepseek", model: "deepseek-v4-flash", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
+`;
+		await withFakeWorker(script, async (invocation, dir) => {
+			const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+			assertWorkerSucceeded(result);
+			assert.deepEqual(JSON.parse(result.output), { delegationId: null, contractHash: null });
+		});
+	} finally {
+		if (previousDelegation === undefined) delete process.env[WORKER_DELEGATION_ID_ENV];
+		else process.env[WORKER_DELEGATION_ID_ENV] = previousDelegation;
+		if (previousContract === undefined) delete process.env[WORKER_CONTRACT_HASH_ENV];
+		else process.env[WORKER_CONTRACT_HASH_ENV] = previousContract;
+	}
+});
+
+test("malformed runtime identity is rejected before child spawn without echoing raw values", async () => {
+	const secret = "PRIVATE_RUNTIME_IDENTITY_MUST_NOT_LEAK";
+	const cases = [
+		{ delegationId: secret, contractHash: "a".repeat(64) },
+		{ delegationId: "20260820-150000-r1T2", contractHash: secret },
+		{ delegationId: "20260820-150000-r1T2", contractHash: "a".repeat(64), extra: secret },
+	];
+	for (const runtimeIdentity of cases) {
+		await assert.rejects(
+			runDeepseekWorker({
+				projectRoot: "/tmp",
+				contract: CONTRACT,
+				timeoutMs: 2_000,
+				invocation: { command: "must-not-spawn", argsPrefix: [] },
+				runtimeIdentity: runtimeIdentity as never,
+			}),
+			(error: Error) => error.message === "Worker runtime identity is invalid" && !error.message.includes(secret),
+		);
+	}
+});
+
+test("diagnosis runner selects the read-only prompt, argv tool matrix, and child env", async () => {
+	const script = `
+import { readFileSync } from "node:fs";
+const argv = process.argv.slice(2);
+const promptFlag = argv.indexOf("--append-system-prompt");
+const facts = JSON.stringify({ argv, taskKind: process.env.${WORKER_TASK_KIND_ENV} || null, prompt: readFileSync(argv[promptFlag + 1], "utf8") });
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "deepseek", model: "deepseek-v4-flash", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
+`;
+	await withFakeWorker(script, async (invocation, dir) => {
+		const result = await runDeepseekWorker({
+			projectRoot: dir,
+			contract: { ...CONTRACT, taskKind: "diagnosis" },
+			timeoutMs: 2_000,
+			invocation,
+		});
+		assertWorkerSucceeded(result);
+		const facts = JSON.parse(result.output) as { argv: string[]; taskKind: string | null; prompt: string };
+		assert.equal(facts.taskKind, "diagnosis");
+		const toolsFlag = facts.argv.indexOf("--tools");
+		const tools = facts.argv[toolsFlag + 1]?.split(",") ?? [];
+		assert.ok(tools.includes("read"));
+		assert.ok(tools.includes("workbench_run_recipe"));
+		assert.ok(!tools.includes("edit"));
+		assert.ok(!tools.includes("write"));
+		assert.equal(facts.prompt, WORKER_DIAGNOSIS_SYSTEM_PROMPT);
+	});
+});
+
+test("diagnosis counts structured edit/write attempts by stable id and fails malformed ids closed", async () => {
+	const first = assistantEvent({
+		content: [
+			{ type: "toolCall", id: "call-edit", name: "edit", arguments: { secret: "never inspect" } },
+			{ type: "toolCall", id: "call-write", name: "write", arguments: {} },
+			{ type: "toolCall", id: "call-read", name: "read", arguments: {} },
+			{ type: "toolCall", name: "edit", arguments: {} },
+			{ type: "toolCall", id: " whitespace ", name: "edit", arguments: {} },
+			{ type: "text", text: "edit write in prose must not count" },
+		],
+		stopReason: "toolUse",
+	});
+	const second = assistantEvent({
+		content: [
+			{ type: "toolCall", id: "call-edit", name: "edit", arguments: {} },
+			{ type: "toolCall", id: "", name: "write", arguments: {} },
+			{ type: "toolCall", id: 7, name: "write", arguments: {} },
+			{ type: "text", text: "## Completed\nDiagnosis reported." },
+		],
+	});
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${first}\n${second}\n`)});`, async (invocation, dir) => {
+		const diagnosis = await runDeepseekWorker({
+			projectRoot: dir,
+			contract: { ...CONTRACT, taskKind: "diagnosis" },
+			timeoutMs: 2_000,
+			invocation,
+		});
+		assert.equal(diagnosis.deniedWriteCount, 4, "two valid ids plus fixed malformed edit/write sentinels");
+	});
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${first}\n${second}\n`)});`, async (invocation, dir) => {
+		const implementation = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		assert.equal(implementation.deniedWriteCount, 0, "implementation does not classify its allowed write calls as denied");
+	});
+});
+
+test("runner rejects malformed task kinds before spawning", async () => {
+	await assert.rejects(
+		runDeepseekWorker({
+			projectRoot: "/tmp",
+			contract: { ...CONTRACT, taskKind: "mechanical" as never },
+			timeoutMs: 2_000,
+			invocation: { command: "must-not-spawn", argsPrefix: [] },
+		}),
+		/task_kind must be one of/,
+	);
 });
 
 test("runner passes an explicit spend profile to the child env and records it on the result", async () => {
@@ -387,7 +644,9 @@ function workerResult(overrides: Partial<WorkerRunResult> = {}): WorkerRunResult
 		spendReasons: [],
 		spendSoftReached: { turns: false, totalTokens: false, outputTokens: false },
 		spendHardExceeded: { turns: false, totalTokens: false, outputTokens: false },
+		writeJournalObservation: EMPTY_WORKER_WRITE_JOURNAL_RUNTIME_OBSERVATION,
 		...overrides,
+		deniedWriteCount: overrides.deniedWriteCount ?? 0,
 	};
 }
 

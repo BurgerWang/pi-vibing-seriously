@@ -1,6 +1,6 @@
 # Controlled Worker Delegation
 
-pi-dev-workbench can delegate one bounded implementation task from a
+pi-dev-workbench can delegate one bounded implementation or diagnosis task from a
 GPT-5.6 Sol commander to a pinned DeepSeek worker without introducing a
 standalone agent framework, daemon, queue, or background service.
 
@@ -8,23 +8,23 @@ standalone agent framework, daemon, queue, or background service.
 
 | Role | Model | Authority |
 | --- | --- | --- |
-| Commander | `openai-codex/gpt-5.6-sol` or `openai/gpt-5.6-sol` | Requirements, cross-cutting architecture, scope, plan, delegate, review the real diff, run gates, make the final judgment |
+| Commander | `openai-codex/gpt-5.6-sol` or `openai/gpt-5.6-sol` | Direct ordinary development, requirements, cross-cutting architecture, optional delegation, high-risk decisions, final verification |
 | Worker | `deepseek/deepseek-v4-flash:max` | Routine local implementation decisions inside the approved contract: concrete design, naming, file structure within scope, production source changes, tests, docs, write-free recipe checks, in-scope repair |
 
 The worker report is never acceptance evidence. Its Verification section
 records only commands and observed results; it must not label an acceptance
-criterion satisfied, met, passed, accepted, or complete. Only the commander
-maps evidence to criteria, runs final gates, and reports the final
-PASS/FAIL/BLOCKED/NOT_RUN verdict.
+criterion satisfied, met, passed, accepted, or complete. The caller maps
+evidence to criteria and runs final verification when task or release risk
+requires it.
 
 ### Responsibility split
 
-| Owned by Sol (never delegated) | Owned by the Worker (inside the approved contract) |
+| Owned by the caller | Owned by an optional Worker (inside the approved contract) |
 | --- | --- |
 | Requirements and acceptance criteria | Concrete design and naming choices |
 | Cross-cutting architecture and scope | File structure within the approved paths |
-| Plan, delegation, and the actual-diff review | Production source changes, tests, and docs |
-| Final verification, recipes/gates, and the verdict | Investigation, write-free recipe checks, in-scope repair |
+| Direct ordinary edits, delegation choice, and high-risk decisions | Production source changes, tests, and docs in a bounded task |
+| Risk-proportionate final verification and the verdict | Investigation, write-free recipe checks, in-scope repair |
 
 The worker is expected to implement the complete delegated slice — relevant
 investigation, production source changes, tests, docs, requested write-free
@@ -36,42 +36,24 @@ approved contract, and every final judgment, belongs to Sol.
 
 | Risk | Shape | Delegation |
 | --- | --- | --- |
-| Low | One contained change with a clear contract (for example a pure helper plus its unit test and a doc line) | Default: delegate as a coherent source+tests+docs vertical slice after minimum repository orientation |
-| Medium | Touches several files or modules, but the contract is unambiguous and the paths can be enumerated | Delegate after Sol approves the plan and supplies explicit source/tests/docs paths and observable acceptance criteria |
-| High | Requirements are ambiguous or contested, cross-cutting architecture is at stake, policy/security/budget/model/path behavior changes, or the change defines the delegation mechanism itself | Commander-led: Sol owns the decision and never delegates the decision itself; implementation/repair writes go to a fresh bounded worker, and only explicitly designed bounded support/implementation scopes are delegated after the architecture is fixed. Temporary commander direct writes require an explicit user-issued write lease |
+| Low | One contained change with a clear contract | Direct edit/write plus focused tests |
+| Medium | Touches several files or modules, but the contract is unambiguous | Direct coherent implementation; optionally delegate one bounded task when it materially reduces work |
+| High | Dependency, security/policy, deployment/migration, Pi control paths, destructive action, or release authority | Caller owns the decision; protected paths require an explicit user-issued temporary write lease, and delegation never expands authority |
 
-High-risk work is Commander-led, not categorically impossible to delegate:
-Sol owns requirements, cross-cutting architecture, and core safety decisions,
-and never transfers the decision itself. Under worker-first write authority
-Sol does **not** directly write by default — implementation and repair writes
-go to a fresh bounded worker, and Sol may delegate an explicitly designed
-bounded support/implementation scope of high-risk work (for example helper
-code, tests, or docs whose shape Sol has already decided) after the
-architecture is fixed; that is never the DEV default and never transfers the
-decision. When a worker returns a partial or defective slice, Sol reviews the
-actual diff and either issues another bounded delegation to a fresh worker or
-— only with an explicit human-issued temporary write lease — repairs defects
-directly; the verdict is always Sol's.
+Ordinary work does not become high risk merely because it changes source,
+tests, documentation, or repairs a defect. Delegation is an optional execution
+tool. A partial result may be repaired directly in the same coherent change;
+a second worker, manual status call, or separate review step is not a
+prerequisite. High-risk classification must name the concrete permission,
+security, migration, destructive, or release concern.
 
-## Fresh-worker continuation
+## Optional worker continuation
 
-Every delegation is a brand-new `--no-session` worker: no worker session is
-ever resumed and no worker has memory of any earlier worker's turns. A
-worker cannot delegate, so continuation is always a Sol decision. To
-continue work after a handoff or a partial slice, Sol:
-
-1. inspects the actual diff and the worker report;
-2. writes a new bounded contract whose task text states the current state of
-   the worktree and the remaining work;
-3. supplies fresh allowed paths, acceptance criteria, and requested
-   verification;
-4. delegates the next slice to a fresh worker (worker-first: Sol does not
-   directly write by default; a temporary commander direct repair requires an
-   explicit human-issued write lease — see Worker-first write authority
-   below).
-
-The durable state between delegations is the project diff plus recipe/gate
-run records — never worker memory and never worker prose.
+Every delegation is a brand-new `--no-session` worker and cannot recurse. If
+another delegation is genuinely useful, the caller supplies a new bounded
+contract and the current worktree is the source of truth. This is an optional
+continuation; direct repair is the shorter default. Worker prose is never
+durable authority.
 
 ## Worker execution discipline (prompt contract)
 
@@ -133,22 +115,21 @@ is used when nothing changed. `Verification` reports only the command and
 its observed outcome — never logs; the task and acceptance criteria are
 never repeated. The exemption preserves path auditability in the report
 while the actual diff remains authoritative: mechanical scope enforcement,
-the real-diff review (`workbench_review_worker_diff`), and final
-verification never depend on the prompt's format rules. These are
+the automatic real-diff review in the normal delegation call (with
+`workbench_review_worker_diff` retained for incomplete/conflict recovery),
+and final verification never depend on the prompt's format rules. These are
 worker-side format rules; the mechanical report caps (≤ 8 parsed items per
 section, ≤ 500 characters per item, byte-bounded rendering) still apply on
 top.
 
-### Fresh repair semantics
+### Repair semantics
 
-A partial or defective slice is repaired by a fresh bounded delegation, not
-by Sol writing directly (worker-first write authority) and not by the same
-worker continuing (workers are `--no-session`, never resumed). When Sol
-delegates a repair whose root cause is already known, the contract states
-the known root cause and the decided fix; the fresh worker implements that
-fix directly — the EARLY CHECKPOINT discipline forbids reopening broad
-diagnosis. Prompt discipline improves efficiency, but mechanical scope
-checks, diff review, and final gates remain authoritative either way.
+A partial or defective delivery may be repaired directly in the same coherent
+change. If delegation is still useful, it creates a fresh bounded
+`--no-session` worker because worker sessions are intentionally not resumed.
+The optional `repair_of` pointer records provenance for that delegated case;
+it never makes delegation mandatory or expands scope. Mechanical scope checks
+and risk-proportionate final verification remain authoritative either way.
 
 ### Repair provenance pointer (`repair_of`, Phase 4A)
 
@@ -159,14 +140,18 @@ provenance only, never a resume:
 - **Public shape:** exactly 20 characters — `^\d{8}-\d{6}-[A-Za-z0-9]{4}$`
   — a prior delegation id such as `20260101-120000-abcd`. Omitted for
   ordinary delegations; any malformed value fails closed with a bounded
-  error before any ledger is created or any worker is launched.
+  error before any v2 transaction is prepared or any worker is launched.
 - **Use:** only after Sol has fixed the known root cause and decided the
   scope. The parent task itself must carry the bounded root-cause/failure
   evidence; the pointer adds none.
-- **Finished-ledger requirement:** the runtime verifies that the referenced
-  prior delegation's ledger is finished (manifest status `finished` with a
-  non-null `after` record) BEFORE any new ledger is created or any worker
-  is launched; only those id/status/after facts are inspected.
+- **Strict v2-first authority:** the runtime first strict-reads the prior
+  delegation's committed v2 authority. Only terminal v2 states `FAILED`,
+  `FINISHED`, or `REVIEWED` are referenceable. A pending, corrupt, unknown-
+  version, or otherwise invalid v2 authority fails closed and never falls
+  back to v1. Only a strict v2 `not_found` result permits the historical
+  read-only fallback, which accepts a finished v1 manifest with its `after`
+  record. This check finishes BEFORE any new v2 transaction is prepared or
+  any worker is launched.
 - **What is not inherited:** the fresh worker inherits no prior report
   (`worker-report.md`), no prior summary, no prior session, no prior
   allowed paths/scope, and no prior contract fields. `repair_of` never
@@ -191,28 +176,44 @@ part of the deterministic DEV tool matrix and absent from AUDIT and VERIFY.
 One invocation:
 
 1. checks project trust and the active commander provider/model;
-2. validates the structured task contract;
-3. refreshes the delegation review state against the real git diff and
-   refuses to start while a review is pending or stale;
-4. records the bounded delegation ledger (`manifest.json`, `before.json`)
-   BEFORE the worker starts;
-5. starts one short-lived `pi --mode json -p --no-session` child process;
-6. pins `--model deepseek/deepseek-v4-flash:max`;
-7. streams bounded progress from Pi JSON events;
-8. verifies every assistant event reports `deepseek/deepseek-v4-flash`;
-9. tracks per-message context tokens against the pinned budget (soft
+2. validates the structured task contract and resolves the public
+   `task_kind`: omission preserves compatibility by resolving to
+   `implementation`; Stage 1 enables only `implementation` and `diagnosis`,
+   while `mechanical` (or any unknown value) fails closed;
+3. refreshes the delegation review state against its versioned binding and
+   refuses to start while a review is pending or stale: a new tagged v2
+   generation uses the ChangeSet relevance binding described below, while
+   historical untagged v2/v1 authority retains the complete full-diff
+   binding;
+4. writes `PREPARED` to the single v2 transaction authority at
+   `.pi/workbench/delegations/<id>/v2/transaction.json` BEFORE the child is
+   launched, then advances it to `RUNNING` using revision-checked state
+   transitions;
+5. starts one short-lived `pi --mode json -p --no-session` child process and
+   pins `--model deepseek/deepseek-v4-flash:max`;
+6. streams bounded progress from Pi JSON events and verifies every assistant
+   event reports the exact pinned `deepseek/deepseek-v4-flash` identity;
+7. tracks per-message context tokens against the pinned budget (soft
    handoff / hard stop, see below) and rejects any `compaction_start` event;
-10. accumulates the cumulative delegation-spend state after every assistant
+8. accumulates the cumulative delegation-spend state after every assistant
     message (pure `core/worker-spend.ts` policy — turns / total tokens /
     output tokens per the active profile) and terminates the child
     fail-closed when any hard spend dimension is reached (see below);
-11. terminates the child on completion, timeout, parent abort, hard-budget
+9. terminates the child on completion, timeout, parent abort, hard-budget
     stop (context or spend), or a compaction attempt;
-12. finishes the ledger on EVERY outcome (success and failure —
-    `after.json`, `worker-summary.json`, `review.json` placeholder, the
-    bounded `worker-report.md` and `usage.json`, review_status
-    PENDING_REVIEW);
-13. returns a STRICTLY bounded structured summary to the parent session
+10. advances to `COMMITTING`, evaluates fixed machine postconditions, and
+    stages one immutable generation at
+    `.pi/workbench/delegations/<id>/v2/generations/g########/` containing
+    exactly eight records — `after.json`, `before.json`, `identity.json`,
+    `review.json`, `scope.json`, `usage.json`, `worker-report.md`, and
+    `worker-summary.json` — plus `commit-marker.json`; publication requires
+    the exact record inventory and a full-byte content-hash/marker proof;
+11. publishes a complete successful generation as `PENDING_REVIEW` for an
+    implementation or `FINISHED` for a diagnosis. A fully evidenced worker
+    or postcondition failure publishes `FAILED`; missing terminal,
+    persistence, identity, or generation facts require
+    `RECOVERY_REQUIRED`, never a business-success state;
+12. returns a STRICTLY bounded structured summary to the parent session
     (delegation id, provider/model, status, actual changed paths, bounded
     parsed section items, usage/cache/budget facts, durable report path,
     parse/review warnings) — never the worker's report text, patch, or
@@ -221,13 +222,14 @@ One invocation:
 There is no persistent worker process. The child inherits the user's OS
 permissions and provider authentication, just like any other Pi process.
 
-## Worker-first write authority (P7)
+## Development-first write authority (current; legacy id P7)
 
-Approved GPT-5.6 Sol resolves to the fixed `worker-first-strict` write policy
-in DEV: the active tool set is exactly the canonical 15-tool allowlist
-(`read`, `grep`, `find`, `ls` plus all eleven `workbench_*` tools) — no
-`bash`/`edit`/`write`, no foreign tools — and no persisted/prompt/config value
-can weaken or opt out of it. Actor identity comes only from the existing
+Approved GPT-5.6 Sol in DEV receives the fixed development surface: the
+historical 15 read/workbench tools plus ordinary `edit` and `write`. `bash`
+and foreign tools remain unavailable. The persisted policy id
+`worker-first-strict` is retained only for record compatibility; it no longer
+means that routine source, test, or documentation edits require delegation.
+Actor identity comes only from the existing
 `WORKBENCH_AGENT_ROLE=worker` env contract and the provider/model pair;
 project config can never self-label a controller as Sol or as a worker.
 Delegated workers and other controllers are outside the policy: the existing
@@ -238,9 +240,10 @@ Consequences for the commander workflow:
 
 - `bash` is always blocked for strict Sol — project commands run through
   declared workbench recipes only.
-- `edit`/`write` are blocked by default. Implementation and repair writes go
-  to a fresh bounded worker via `workbench_delegate_worker`.
-- The only exception is a **temporary commander write lease**, issued by the
+- Ordinary canonical project-relative `edit`/`write` calls are allowed
+  directly after lexical and realpath/symlink containment checks.
+- Dependency manifests, security/auth/policy files, deployment/migration
+  paths, and Pi control paths require a **temporary high-risk write lease**, issued by the
   human through user-only slash commands (never by prompts or config):
   `/q-commander-write-unlock <reason> --paths <comma-list> --calls <N>
   --minutes <N>`, with fixed reasons `bootstrap-policy`,
@@ -258,9 +261,10 @@ Consequences for the commander workflow:
   required and both are consumed on success. Token parts never appear in
   status or compact summaries.
 - Expiry (30 min), exhaustion (10 calls) and revocation (leaving DEV, model/
-  provider change, session end, or `/q-commander-write-lock`) restore the
-  exact canonical 15 tools. The footer shows `WF:LEASE <used>/<max>` while an
-  active confirmed lease exists and `WF:LOCKED` otherwise; `WF:REVIEW` is
+  provider change, session end, or `/q-commander-write-lock`) remove only the
+  high-risk exception; ordinary direct edits remain available. The footer
+  shows `WF:LEASE <used>/<max>` while an active confirmed lease exists and
+  `WF:DIRECT` otherwise; `WF:REVIEW` is
   appended independently while a delegation review is pending or stale.
   `/q-write-policy status` (which accepts exactly the trimmed `status`
   subcommand) prints the actor, the fixed policy, the lock/lease status and a
@@ -272,67 +276,153 @@ Consequences for the commander workflow:
   maps non-empty declared `writes` to `source`; other controllers are
   unaffected).
 
-## Delegation ledger and review lifecycle (P7)
+## Delegation transaction and review lifecycle (P7)
 
-Every delegation — success **and** failure — is recorded in a bounded ledger
-at `<project-root>/<CONFIG_DIR_NAME>/workbench/delegations/<id>/` before the
-worker starts (`manifest.json`, `before.json`), finished when the worker
-returns (`after.json`, `worker-summary.json`, a `review.json`
-PENDING_REVIEW placeholder, plus the bounded handoff artifacts
-`worker-report.md` and `usage.json` — see Bounded worker handoff), and
-reviewed later. Records are atomic, bounded, redacted, and never contain
-full worker transcripts or secrets; the ledger's own directory is excluded
-from the git facts it records. The before snapshot carries the bounded
-contract, git HEAD/dirty, a deterministic diff hash and per-path porcelain
-status codes + bounded content digests; the after record carries the TRUE
-changed paths since before (digest-based, including previously-dirty
-paths), the after diff hash, pinned identity, outcome, usage/budget facts,
-a bounded redacted report summary, and the safe `reported_paths` parsed
-from the worker's bounded `## Files Changed` section.
+New public delegations have one write authority: delegation transaction v2.
+The mutable CAS state is
+`.pi/workbench/delegations/<id>/v2/transaction.json`; its successful terminal
+facts bind exactly one immutable
+`.pi/workbench/delegations/<id>/v2/generations/g########/` directory. That
+generation is not authority unless all eight required records and its
+`commit-marker.json` pass the strict full-byte inventory, content-hash,
+delegation/task/generation/revision, contract, and pinned-identity proof.
+Partial, foreign, or ambiguous generations never publish success.
 
-Review lifecycle (single latest-delegation slot, persisted as the
+The normal transaction paths are:
+
+```
+implementation: PREPARED → RUNNING → COMMITTING → PENDING_REVIEW → REVIEWED
+diagnosis:      PREPARED → RUNNING → COMMITTING → FINISHED
+```
+
+An implementation can reach `PENDING_REVIEW` only with a nonempty actual
+delta, complete scope facts with no out-of-scope changes, and a delta hash. A
+diagnosis can reach `FINISHED` only with zero actual delta, zero successful
+write attempts, zero denied write attempts, and a complete report. Both
+successful paths also require provider success, exit code 0, a complete
+report, complete terminal facts, and the exact pinned/observed worker
+identity. Provider success, exit code 0, or reassuring worker prose cannot
+bypass any other postcondition. A fully recorded worker/postcondition failure
+becomes `FAILED`; incomplete terminal or generation facts become
+`RECOVERY_REQUIRED`.
+
+Records are atomic, bounded, redacted, and never contain full worker
+transcripts or secrets; the delegation directory is excluded from workspace
+facts. New tagged v2 `before.json`/`after.json` records identify their
+workspace binding as `workspace_guard_v2`: their compatibility-named
+`diff_hash` fields bind the corresponding metadata-only workspace guards,
+while full streaming identities already captured by the write journal and
+ChangeSet finalizer bind the attributed worker delta. `after.json` carries
+the attributed worker paths, the wider changed-since-before union (worker
+delta, workspace drift, and conflicts), the split `worker_delta_hash` and
+`workspace_guard_hash`, pinned identity, outcome, usage/budget facts, a
+bounded redacted report summary, and the safe `reported_paths` parsed from
+the worker's bounded `## Files Changed` section.
+
+Implementation review authority is written only to
+`.pi/workbench/delegations/<id>/v2/review.json`. Review is strict v2-first:
+the immutable committed generation is validated before the mutable review
+artifact is read. A segmented provisional PASS, incomplete coverage, or any
+FAIL may persist bounded evidence but never grants authority and never moves
+the transaction to `REVIEWED`. Only a complete `PASS` with complete path
+coverage atomically publishes the final review and the `REVIEWED` transaction
+state. For new tagged v2, the immutable review binds a schema-v2
+`changeset-relevance-v2` projection over the closed relevance set: W is the
+attributed worker delta, D is the explicit dependency closure (empty by
+default), and S is the relevant control set (fixed workbench configuration,
+applicable `AGENTS.md`, and managed policy/schema paths). Every W/D/S entry
+uses a full streaming identity. Baseline unrelated dirty paths (B) and
+recognized workbench artifacts are deliberately excluded; a Git HEAD change,
+W/D/S drift, or a new unknown-origin dirty path (U) fails closed. Historical
+untagged v2 and v1 reviews retain their complete full-diff binding.
+
+Strict replay accepts a finalized artifact only while its versioned binding
+still matches: its W/D/S relevance projection for new tagged v2, or the full
+current diff for historical untagged v2/v1. A relevant/unknown-origin conflict
+or a legacy full-diff change projects the session mirror to blocking `STALE`
+without changing the immutable final artifact.
+
+Session lifecycle (single latest-delegation mirror, persisted as the
 `workbench-delegation-state` custom entry):
 
 ```
-PENDING_REVIEW → REVIEWED → (current diff hash changes) → STALE
-      ^                                            |
-      +──────────────── re-review (workbench_review_worker_diff) ──┘
+PENDING_REVIEW → REVIEWED → (versioned binding conflicts) → STALE
 ```
 
-- **`workbench_review_worker_diff`** (DEV-only, Sol): reads the real git
-  state and the ledger, scope-checks EVERY worker path against the
-  parent-approved `allowed_paths` with a realpath/symlink-safe check
+- **Default implementation delivery:** after a successful worker result, the
+  same `workbench_delegate_worker` call reads the current workspace guard,
+  performs the bounded review below over every attributed worker path, and
+  publishes a complete PASS as `REVIEWED`. Ordinary development therefore
+  continues without a manual `review` or `status` call.
+- **`workbench_review_worker_diff`** (DEV-only recovery path): reads the current
+  workspace guard and strict v2 authority, scope-checks EVERY worker path
+  against the parent-approved `allowed_paths` with a realpath/symlink-safe check
   (`include_paths` narrows only the patch output and can never hide a
-  violation; unsafe or non-worker entries are refused), compares the current
-  diff hash with the recorded after hash (mismatch/drift are warnings), warns
-  when the worker report's `## Files Changed` section is missing or does not
-  match the actual diff, and returns a globally bounded redacted patch
+  violation; unsafe or non-worker entries are refused), constructs the
+  new-v2 W/D/S relevance projection (or the historical complete full-diff
+  binding for untagged v2/v1), warns when the worker report's `## Files
+  Changed` section is missing or does not match the attributed worker delta,
+  and returns a globally bounded redacted patch
   (default 400 lines / 32 KiB over the whole rendered patch; per-path stats
   plus a segmented `include_paths` review instruction when truncated or
-  omitted — the bound hash and scope checks always cover the complete actual
-  diff). Verdict `PASS` marks the delegation REVIEWED; `FAIL` (any
-  out-of-scope path) keeps it PENDING_REVIEW. The review record
-  (`review.json`) binds the CURRENT diff hash.
+  omitted — scope checks always cover the complete worker delta, while the
+  bound hash covers W/D/S relevance for new tagged v2 or the complete diff
+  for legacy authority). Verdict `PASS` marks the delegation REVIEWED;
+  `FAIL` (any out-of-scope path) keeps it PENDING_REVIEW. Large or incomplete
+  coverage also stays pending and is the reason to call this recovery tool.
+  The v2 review artifact binds
+  the versioned current binding. The session mirror is prospective:
+  `REVIEWED` unlocks only after its append succeeds. An append failure never
+  unlocks memory or the compact mirror and is returned as a persistence
+  failure; retry may replay the immutable final artifact. A failed blocking
+  `STALE` append remains a hard in-memory/compact block and is never reported
+  as durably persisted.
 - **`workbench_delegation_status`** (and `/q-delegation-status`): actor,
   fixed policy, lease status (bounded summary — never token parts), latest
   delegation, review status, current/reviewed diff hashes, blocked write
-  attempts, latest review verdict; refreshes against the real git diff, so
-  any change after REVIEWED turns the delegation STALE.
+  attempts, latest review verdict. The compatibility field names remain, but
+  new tagged v2 refreshes the W/D/S relevance binding: B and recognized
+  workbench artifacts do not stale it, while Git HEAD, W/D/S, or U conflicts
+  fail closed. Historical untagged v2/v1 refreshes the complete full-diff
+  binding, so any diff change there turns a reviewed delegation STALE.
 - **Blocking:** a pending or stale review blocks BOTH the next delegation
   (`workbench_delegate_worker` refuses to start) and VERIFY (`/q-mode-verify`
   refuses, and `/q-gate`/`workbench_run_gate` are refused in VERIFY) until
-  the current diff is reviewed. REVIEWED binds `reviewedDiffHash ===
-  currentDiffHash`; a diff that returns to exactly the reviewed hash
-  re-validates (back to REVIEWED). Blocked commander write attempts are
-  counted while a review is outstanding.
-- **B6 Worker-First Compliance (P7):** a machine-backed universal base gate —
-  the runtime injects bounded worker-first facts into every gate run
-  (strict policy active, zero unauthorized commander writes, no
-  pending/stale review, reviewed hash matches the current diff, worker
-  paths within the approved contracts, no active unexplained lease,
+  the versioned binding is reviewed. `reviewedDiffHash === currentDiffHash`
+  remains the compact compatibility invariant: those fields hold the W/D/S
+  projection hash for new tagged v2 and the complete diff hash for historical
+  authority. A binding that returns to exactly the reviewed hash re-validates
+  (back to REVIEWED). Blocked commander write attempts are counted while a
+  review is outstanding.
+- **B6 Development Safety (legacy P7 machine kind `worker-first`):** a
+  machine-backed universal base gate. The runtime injects bounded safety facts
+  into every gate run (development policy active, zero unauthorized high-risk writes, no
+  pending/stale review, reviewed hash matches the applicable versioned
+  binding, worker paths within the approved contracts, no active unexplained lease,
   Sol-initiated final verification). Missing facts are NOT_RUN (a required
   NOT_RUN never PASSes), a pending/stale review BLOCKs B6, and model prose
   can never satisfy B6.1-B6.8.
+
+### Legacy read-only compatibility and rollback
+
+The v1 `manifest.json`/ledger/review readers remain historical read-only
+compatibility. New public delegations never write v1: they write only the v2
+transaction, immutable generation, and v2 review paths above. Public reads,
+status, gates, review, and `repair_of` resolve strict v2 authority first; only
+a strict v2 `not_found` result may use the applicable finished v1 fallback.
+Corrupt, pending, unsupported, storage-failed, or otherwise invalid v2 never
+falls back. Rollback may stop using v2 but must not delete or rewrite v2
+authority, and an unknown higher schema version always fails closed.
+
+This document specifies the current runtime contract; it is not a progress
+mirror and records no run ids or verification status. Current committed
+transaction/run records and current test output determine observed state. A
+worker report remains bounded presentation, never acceptance authority.
+
+Operational diagnosis, explicit project-authority reconciliation, v1-only
+rollback blocking, and stop conditions are documented in
+[governance-recovery.md](governance-recovery.md). The rollback inventory is a
+read-only pre-deploy check, not a required step in ordinary development.
 
 ## Bounded worker handoff (P7)
 
@@ -352,17 +442,18 @@ code-point safe (never a lone surrogate, never a replacement character).
 Configured secret values are redacted BEFORE any truncation: the runner
 retains the COMPLETE final assistant text in process memory (bounded only
 by the 2 MiB JSON-event input — never pre-truncated to the report bound),
-and the ledger writes the ≤ 512 KiB `worker-report.md` with the explicit
+and the v2 generation writes the ≤ 512 KiB `worker-report.md` with the explicit
 marker only when the REDACTED report still exceeds the bound — post-secret
 tail content survives when redaction makes the report fit.
 
-Every finished delegation — success **and** failure — atomically writes,
-alongside the existing `manifest.json` / `before.json` / `after.json` /
-`review.json` records:
+Every fully evidenced terminal delegation — success **or** complete failure —
+publishes the bounded handoff records inside the same immutable v2 generation.
+They form part of the exact eight-record inventory described above, rather
+than a second permissive v1 ledger writer:
 
 - `worker-report.md` — the redacted complete final worker text (the runner
   retains the COMPLETE final assistant text in process memory, bounded by
-  the 2 MiB JSON-event input; the ledger redacts FIRST, then caps to the
+  the 2 MiB JSON-event input; generation construction redacts FIRST, then caps to the
   512 KiB bound with the marker only when the redacted report still
   exceeds it); persisted only, never included in any parent tool result or
   details;
@@ -385,12 +476,13 @@ repair) is `{ profile, turns, totalTokens, outputTokens, band,
 softReached: {turns, totalTokens, outputTokens}, hardExceeded: {turns,
 totalTokens, outputTokens}, reasons }` — `reasons` entries are exactly
 `"turns" | "total_tokens" | "output_tokens"` in the fixed order. It is
-persisted additively on `schema_version: 1` records (old records without
-it — and without the before contract's `budget_profile` — parse
-unchanged, no migration, no rewrite), deliberately NOT duplicated into
-`after.json` (usage.json / worker-summary.json are its records), and the
-parent handoff renders the deterministic spend summary line and nested
-spend details from the SAME persisted worker-summary spend object.
+persisted on the v2 generation's `schema_version: 2` `usage.json` and
+`worker-summary.json` records. Historical v1 records without it — and
+without the before contract's `budget_profile` — remain read-only and parse
+unchanged, with no migration or rewrite. The object is deliberately NOT
+duplicated into `after.json`, and the parent handoff renders the deterministic
+spend summary line and nested spend details from the SAME persisted
+worker-summary spend object.
 
 The report parser scans the whole bounded report text for exactly the four
 required final headings (`## Completed`, `## Files Changed`,
@@ -635,7 +727,7 @@ token-budget repair (`docs/plans/worker-token-budget-repair.md`) adds a
 `extensions/workbench-runtime/core/worker-spend.ts` — pure logic, no Pi
 imports, reusing `workerContextTokens` from `core/worker-budget.ts` for the
 per-message total semantics. **Phases 2–4 status: runtime wiring, public profile selection,
-ledger persistence, handoff rendering and numeric-only progress
+v2 generation persistence, handoff rendering and numeric-only progress
 landed; Phase 5 (task-contract profile wording and delegation-granularity
 guidance) landed.** The runner accumulates the cumulative
 spend state after every assistant message (same pure policy), records the
@@ -648,11 +740,11 @@ spend profile from the fixed child env contract
 to `standard` defensively), accumulates its own independent spend state
 on assistant `message_end` events, and sends exactly one hidden cumulative
 soft steer when the band first becomes soft or hard. **Phase 3 status:
-public selection, contract validation, ledger persistence and handoff
+public selection, contract validation, v2 generation persistence and handoff
 rendering landed.** The optional `budget_profile` tool parameter (closed
 literal union `low | standard | extended`, default `standard`, `extended`
 never inferred) is resolved by the strict contract validation in
-`core/worker-policy.ts` BEFORE any ledger creation or child launch, the
+`core/worker-policy.ts` BEFORE any v2 transaction preparation or child launch, the
 resolved profile is recorded in the before contract
 (`before.json` → `contract.budget_profile`) and passed to the runner (the
 same profile reaches the child env and every outcome's spend facts —
@@ -698,9 +790,10 @@ Per-message context safety (above) is unchanged.
   terminates the child and the invocation fails closed
   (`assertWorkerSucceeded`), naming the winning dimension(s) and
   current/limit values via the deterministic hard-stop formatter; the
-  ledger is finished on every outcome (the spend facts enter the
-  ledger/handoff as of Phase 3). The 60-minute timeout remains an
-  independent failure path.
+  outcome is committed as `FAILED` when its terminal facts and immutable
+  generation are complete; incomplete persistence requires
+  `RECOVERY_REQUIRED`. The 60-minute timeout remains an independent failure
+  path.
 - **Profiles:** `standard` is the deterministic default for every
   delegation without an explicit request; `low` is an explicit tighter
   opt-in; `extended` is explicit Sol-approved only and is never inferred
@@ -709,7 +802,7 @@ Per-message context safety (above) is unchanged.
   `standard`) is validated by the pure contract check in
   `core/worker-policy.ts` — omitted resolves to `standard`; unknown,
   empty, wrong-type and case-variant values fail closed with a bounded
-  error before the ledger is created or the child starts. The pure
+  error before the v2 transaction is prepared or the child starts. The pure
   resolver defaults to `standard` only where a default is explicitly
   requested, while strict validation rejects unknown values.
 - **Child env contract (wired):** the runner passes the resolved profile to
@@ -717,11 +810,11 @@ Per-message context safety (above) is unchanged.
   variable; the worker-role lifecycle strictly validates it and falls back
   to `standard` on malformed/missing values (defensive — the runner always
   writes a valid value).
-- **Deterministic summary** (rendered into the parent handoff and ledger):
+- **Deterministic summary** (rendered into the parent handoff and immutable generation):
   `spend budget : turns N/M | total X/Y | output A/B | profile P` with the
   profile's hard limits as denominators; the handoff derives the line and
   the nested `spend` details from the SAME canonical spend object the
-  ledger persisted in worker-summary.json (never recomputed from runner
+  v2 generation persisted in worker-summary.json (never recomputed from runner
   internals or worker prose).
 
 ## Review patch bounds (P7)
@@ -731,8 +824,9 @@ at 400 lines / 32 KiB, enforced GLOBALLY over the rendered patch content
 (never independently per path). ANY per-path truncated entry also sets
 `patch_truncated` — even when the (redaction-shrunk) entry fits the global
 envelope — so the segmented-review instruction always renders when any
-content was cut. Scope checks and the bound diff hash always use the
-COMPLETE actual worker diff — truncation affects only the displayed
+content was cut. Scope checks always use the COMPLETE attributed worker
+delta. The bound hash uses W/D/S relevance for new tagged v2 and the complete
+full diff for historical untagged v2/v1; truncation affects only the displayed
 patch. Every patch path carries bounded path/stat information (source,
 bytes, truncated/omitted), and when patch content is truncated or omitted
 the review returns an explicit segmented-review instruction: drive
@@ -742,6 +836,7 @@ path-by-path `include_paths` re-reviews (max 50 paths per call).
 
 ```json
 {
+  "task_kind": "implementation",
   "task": "Implement the already-approved parser change",
   "allowed_paths": ["src/parser/**", "tests/parser.test.ts"],
   "acceptance_criteria": [
@@ -754,6 +849,10 @@ path-by-path `include_paths` re-reviews (max 50 paths per call).
   "timeout_seconds": 1800
 }
 ```
+
+`task_kind` is optional only for public compatibility: omission resolves to
+`implementation`. Stage 1 accepts exactly `implementation | diagnosis`;
+`mechanical`, case variants, unknown strings, and wrong types fail closed.
 
 `budget_profile` is optional and selects the cumulative delegation-spend
 profile (`low | standard | extended`; omitted resolves to `standard`). The
@@ -770,11 +869,13 @@ pointer for a known-root-cause repair (see Repair provenance pointer
 above): exactly the 20-character `^\d{8}-\d{6}-[A-Za-z0-9]{4}$` delegation
 id shape, used only after Sol has fixed the known root cause and decided
 the scope, with the bounded failure evidence carried in the task itself;
-the runtime requires the referenced prior delegation ledger to be finished
-before any new ledger is created or any worker is launched, and the fresh
-worker inherits no prior report/session/scope/contract — the pointer adds
-no path/scope/authority. Ordinary delegations omit it entirely; unknown
-root causes still use bounded diagnosis, then a Sol decision.
+the runtime strict-reads v2 first and accepts only a referenced terminal
+`FAILED`, `FINISHED`, or `REVIEWED` v2 authority. Only v2 `not_found` permits
+the finished-v1 read-only fallback; corrupt, pending, or unknown v2 authority
+never falls back. This check precedes any new v2 transaction or child launch,
+and the fresh worker inherits no prior report/session/scope/contract — the
+pointer adds no path/scope/authority. Ordinary delegations omit it entirely;
+unknown root causes still use bounded diagnosis, then a Sol decision.
 
 Path rules are deliberately simple:
 
@@ -810,53 +911,35 @@ command can still write despite an empty declaration.
    execution mode; parallel writes to one worktree are not supported.
 7. **Existing command/path guards:** the normal workbench P5 protections
    still apply inside the child.
-8. **Worker-first write authority:** approved Sol in DEV gets exactly the
-   canonical 15-tool allowlist (no bash/edit/write, no foreign tools); the
-   second-layer `tool_call` guard blocks bash for Sol always, blocks
-   edit/write without an active human-issued lease (and outside its paths),
-   and blocks every tool outside the allowlist despite any re-enable.
+8. **Development-first write authority:** approved Sol in DEV receives
+   ordinary edit/write directly. The second-layer `tool_call` guard still
+   blocks bash and foreign tools, and high-risk paths require an active
+   human-issued lease within its exact scope.
 9. **Review gating:** a pending or stale delegation review blocks the next
-   delegation and VERIFY; the review binds the current diff hash and any
-   later diff change turns the delegation STALE.
+   delegation and VERIFY. New tagged v2 binds W/D/S relevance, so baseline
+   unrelated dirty paths and recognized workbench artifacts do not stale it;
+   Git HEAD, W/D/S, or new unknown-origin drift fails closed. Historical
+   untagged v2/v1 binds the complete full diff, where any later diff change
+   turns the delegation STALE.
 
 These are guardrails, not an OS security boundary. Use a container or VM for
 untrusted repositories or unattended automation.
 
-## Required commander workflow
+## Recommended development workflow
 
-1. Orient in the repository (minimum orientation — enough to define the
-   slice) and inspect the current git state.
-2. Define observable acceptance criteria and explicit allowed paths for the
-   source, tests, and docs of one coherent vertical slice.
-3. Size every delegation as ONE coherent source+tests+docs vertical slice
-   with ample headroom BELOW its soft thresholds — soft is a handoff
-   reserve and hard is failure; neither is a planning target. Never plan a
-   delegation that expects to consume its budget, and never batch
-   unrelated work into one task to amortize delegation overhead.
-4. Choose the spend profile explicitly: `standard` is the deterministic
-   default (omit `budget_profile`); pass `low` only when the slice is
-   deliberately tighter; pass `extended` only with explicit Sol approval
-   for an approved larger slice — it is never inferred or auto-promoted.
-5. When the root cause of a problem is unknown, never delegate one
-   open-ended "investigate and fix" task. Split the work into (a) a
-   bounded diagnosis delegation, (b) a Sol architecture/scope decision
-   from the diagnosis, and (c) a bounded implementation delegation for the
-   decided slice.
-6. Delegate bounded low/medium-risk vertical slices while in DEV; high-risk
-   decisions remain Commander-led — Sol never delegates the decision itself,
-   and only explicitly designed bounded support/implementation scopes are
-   delegated after the architecture is fixed. Sol does not directly write by
-   default: implementation and repair writes go to a fresh bounded worker;
-   a temporary commander direct write requires an explicit human-issued
-   write lease (`/q-commander-write-unlock`).
-7. Avoid duplicating the worker's routine investigation, but read the actual
-   files and diff after the worker returns — the report is never acceptance.
-8. Correct defects by issuing another bounded delegation to a fresh worker,
-   or — only with an explicit human-issued temporary write lease — repair
-   directly (see Worker-first write authority).
-9. Switch to VERIFY.
-10. Run declared recipes and the project validation gates.
-11. Make the final verdict from persisted evidence, not worker prose.
+1. Orient only enough to define the current task, its acceptance criteria,
+   affected files, and concrete risk.
+2. Implement ordinary source, tests, and documentation directly in DEV. Use
+   focused recipes while the candidate is changing.
+3. Optionally use one bounded delegation when it materially reduces work. A
+   normal successful implementation auto-reviews and closes; call explicit
+   review/status only when the result says recovery is required.
+4. Escalate only named high-risk paths or actions to the temporary lease or
+   human confirmation flow. Do not classify ordinary development as high
+   risk merely because it is a write.
+5. Once the candidate is stable, switch to VERIFY and run one final recipe or
+   gate set proportionate to task or release risk. Base the verdict on current
+   records and code, never worker prose or a historical handoff document.
 
 ## Stable-prefix and cache behavior
 

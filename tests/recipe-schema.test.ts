@@ -68,6 +68,44 @@ test("minimal recipes get safe defaults", () => {
 	assert.equal(recipe.max_bytes, 51200);
 	assert.deepEqual(recipe.writes, []);
 	assert.deepEqual(recipe.environment, []);
+	assert.deepEqual(recipe.artifact_contracts, []);
+});
+
+test("artifact objects become strict v2 contracts while string globs stay legacy optional", () => {
+	const result = parseRecipe({
+		name: "artifacts",
+		command: ["true"],
+		artifacts: [
+			"legacy/*.json",
+			{ path: "out/*.bin", required: true, min_count: 1, max_count: 2, type: "file", min_bytes: 4, max_bytes: 64, freshness: "immutable-snapshot", snapshot: true, root: "project" },
+			{ path: "exports/*.json", root: "authorized-external", external_root: "warehouse", required: true },
+		],
+	}, 0);
+	assert.deepEqual(result.errors, []);
+	const recipe = result.recipes[0]!;
+	assert.deepEqual(recipe.artifacts, ["legacy/*.json", "out/*.bin", "exports/*.json"]);
+	assert.equal(recipe.artifact_contracts[0]!.legacy_optional, true);
+	assert.equal(recipe.artifact_contracts[0]!.required, false);
+	assert.equal(recipe.artifact_contracts[1]!.legacy_optional, false);
+	assert.equal(recipe.artifact_contracts[1]!.freshness, "immutable-snapshot");
+	assert.equal(recipe.artifact_contracts[1]!.max_count, 2);
+	assert.equal(recipe.artifact_contracts[2]!.external_root, "warehouse");
+});
+
+test("artifact v2 contracts reject unknown fields, invalid bounds, hashes and snapshot policy", () => {
+	for (const artifact of [
+		{ path: "out/*", surprise: true },
+		{ path: "out/*", min_count: 2, max_count: 1 },
+		{ path: "out/*", sha256: "not-a-hash" },
+		{ path: "out/*", freshness: "immutable-snapshot", snapshot: false },
+		{ path: "out/*", root: "anywhere" },
+		{ path: "out/*", root: "authorized-external" },
+		{ path: "out/*", root: "project", external_root: "warehouse" },
+	]) {
+		const result = parseRecipe({ name: "bad", command: ["true"], artifacts: [artifact] }, 0);
+		assert.equal(result.recipes.length, 0);
+		assert.ok(result.errors.length > 0);
+	}
 });
 
 test("command must be an argv array, never a shell string", () => {

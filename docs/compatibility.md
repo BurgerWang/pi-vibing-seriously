@@ -423,8 +423,9 @@ additive and backward compatible:
   execution counts.
 - **P8b additive tool transition (recovery appended LAST).** P8b wires the
   reviewed P8a core into the runtime: BEGIN at the END of the `tool_call`
-  guard (after every policy check, before execution) for every registered
-  workbench tool except the public recovery tool; exact toolCallId +
+  guard (after every policy check, before execution) for side-effecting
+  recipe/gate/delegation/review tools; replay-safe inspect/read/list/status/
+  compare/recovery tools bypass receipts; exact toolCallId +
   tool-name dual-match FINALIZE in the `tool_result` handler; capacity
   pre-block at `MAX_IN_FLIGHT_RECEIPTS` (256) with no eviction; and the new
   public read-only `workbench_recover_tool_result`. The inventory becomes

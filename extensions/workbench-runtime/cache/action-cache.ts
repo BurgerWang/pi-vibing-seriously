@@ -21,7 +21,7 @@
  * the task.
  */
 
-import { mkdir, writeFile } from "node:fs/promises";
+import { writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
@@ -29,7 +29,7 @@ import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import type { WorkbenchMode } from "../core/mode-policy.ts";
 import type { ExecFn } from "../core/config.ts";
 import type { Recipe } from "../core/recipe-schema.ts";
-import { makeRunId, RUN_SCHEMA_VERSION, type RunRecord, type RunSummaryRecord } from "../core/runs.ts";
+import { makeRunId, RUN_MANIFEST_SCHEMA_VERSION_V2, type RunRecord, type RunSummaryRecord } from "../core/runs.ts";
 import { sha256Hex } from "./canonical-hash.ts";
 import type { ActionCacheStore } from "./action-store.ts";
 import {
@@ -46,6 +46,8 @@ import {
 } from "./action-types.ts";
 import { computeActionKey, declaredEnvironmentHash, type ComputedActionKey } from "./action-key.ts";
 import { resolveQuantContract, verifyBacktestResultArtifact } from "./quant-files.ts";
+import { beginRunTransaction } from "../core/run-transaction.ts";
+import { collectRecipeArtifactsV2, writeArtifactManifestV2 } from "../core/artifact-contract.ts";
 
 // Re-exported to preserve the existing `action-cache.ts` import API
 // (index.ts and recipe-runner.ts import CacheRequestMode from here); the
@@ -97,6 +99,7 @@ export interface ExecutedRunFacts {
 export interface MaterializedRun {
 	runId: string;
 	runDir: string;
+	stagingDir: string;
 	record: RunRecord;
 	summary: RunSummaryRecord;
 }
@@ -348,6 +351,8 @@ export interface MaterializeInput {
 	mode: WorkbenchMode;
 	git: { commit: string | null; dirty: boolean };
 	now?: () => Date;
+	authorizedExternalRoots?: Readonly<Record<string, string>>;
+	exec: ExecFn;
 }
 
 /**
@@ -361,12 +366,16 @@ export async function materializeCachedRun(input: MaterializeInput): Promise<Mat
 	const now = input.now ?? (() => new Date());
 	const validatedAt = now();
 	const runId = makeRunId(validatedAt);
-	const runDir = join(projectRoot, CONFIG_DIR_NAME, "workbench", "runs", runId);
+	const transaction = await beginRunTransaction(projectRoot, runId);
+	const runDir = transaction.finalDir;
+	const stagingDir = transaction.stagingDir;
 	const cwdAbs = resolve(projectRoot, recipe.cwd);
 	const evidencePaths = [`${CONFIG_DIR_NAME}/workbench/runs/${runId}`];
+	const artifactCollection = await collectRecipeArtifactsV2({ projectRoot, runId, stagingRunDir: stagingDir, contracts: recipe.artifact_contracts, authorizedExternalRoots: input.authorizedExternalRoots, exec: input.exec });
+	if (!artifactCollection.ok) throw new Error(`cached run artifact validation failed: ${artifactCollection.code}`);
 
 	const manifest: RunRecord = {
-		schema_version: RUN_SCHEMA_VERSION,
+		schema_version: RUN_MANIFEST_SCHEMA_VERSION_V2,
 		run_id: runId,
 		recipe: recipe.name,
 		profile,
@@ -380,7 +389,7 @@ export async function materializeCachedRun(input: MaterializeInput): Promise<Mat
 		cancelled: false,
 		git_commit: git.commit,
 		git_dirty: git.dirty,
-		artifact_paths: record.summary.artifactPaths,
+		artifact_paths: artifactCollection.artifactPaths,
 		stdout_truncated: record.summary.stdoutTruncated,
 		stderr_truncated: record.summary.stderrTruncated,
 		mode,
@@ -415,6 +424,9 @@ export async function materializeCachedRun(input: MaterializeInput): Promise<Mat
 				}
 			: undefined,
 		evidence_paths: evidencePaths,
+		run_transaction_schema_version: 2,
+		run_outcome: record.success ? "SUCCESS" : "PROCESS_FAILED",
+		artifact_manifest_path: "artifact-manifest.json",
 	};
 
 	const summary: RunSummaryRecord = {
@@ -431,7 +443,7 @@ export async function materializeCachedRun(input: MaterializeInput): Promise<Mat
 		cancelled: false,
 		git_commit: git.commit,
 		git_dirty: git.dirty,
-		artifact_paths: record.summary.artifactPaths,
+		artifact_paths: artifactCollection.artifactPaths,
 		stdout_truncated: record.summary.stdoutTruncated,
 		stderr_truncated: record.summary.stderrTruncated,
 		stdout: record.summary.stdout,
@@ -440,10 +452,10 @@ export async function materializeCachedRun(input: MaterializeInput): Promise<Mat
 		stderr_log: join(runDir, "stderr.log"),
 	};
 
-	await mkdir(runDir, { recursive: true });
-	await writeFile(join(runDir, "manifest.json"), JSON.stringify(manifest, null, 2), "utf8");
+	await writeArtifactManifestV2(stagingDir, artifactCollection.manifest);
+	await writeFile(join(stagingDir, "manifest.json"), JSON.stringify(manifest, null, 2), "utf8");
 	await writeFile(
-		join(runDir, "command.json"),
+		join(stagingDir, "command.json"),
 		JSON.stringify(
 			{
 				recipe: recipe.name,
@@ -464,7 +476,7 @@ export async function materializeCachedRun(input: MaterializeInput): Promise<Mat
 		"utf8",
 	);
 	await writeFile(
-		join(runDir, "environment.json"),
+		join(stagingDir, "environment.json"),
 		JSON.stringify(
 			{
 				environment: {},
@@ -476,12 +488,12 @@ export async function materializeCachedRun(input: MaterializeInput): Promise<Mat
 		),
 		"utf8",
 	);
-	await writeFile(join(runDir, "stdout.log"), record.summary.stdout, "utf8");
-	await writeFile(join(runDir, "stderr.log"), record.summary.stderr, "utf8");
-	await writeFile(join(runDir, "summary.json"), JSON.stringify(summary, null, 2), "utf8");
+	await writeFile(join(stagingDir, "stdout.log"), record.summary.stdout, "utf8");
+	await writeFile(join(stagingDir, "stderr.log"), record.summary.stderr, "utf8");
+	await writeFile(join(stagingDir, "summary.json"), JSON.stringify(summary, null, 2), "utf8");
 	// Cache-source evidence: an explicit marker in the run directory.
 	await writeFile(
-		join(runDir, "execution.json"),
+		join(stagingDir, "execution.json"),
 		JSON.stringify(
 			{
 				schema_version: 1,
@@ -498,5 +510,5 @@ export async function materializeCachedRun(input: MaterializeInput): Promise<Mat
 		"utf8",
 	);
 
-	return { runId, runDir, record: manifest, summary };
+	return { runId, runDir, stagingDir, record: manifest, summary };
 }

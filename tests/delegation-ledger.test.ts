@@ -38,6 +38,7 @@ import {
 	isValidDelegationId,
 	makeDelegationId,
 	normalizeStatusPath,
+	parsePorcelainPath,
 	parseReportedPaths,
 	readDelegationLedger,
 	MAX_CHANGED_PATHS,
@@ -133,6 +134,20 @@ test("normalizeStatusPath refuses absolute, drive and escaping paths", () => {
 	assert.equal(normalizeStatusPath(""), undefined);
 });
 
+test("parsePorcelainPath decodes Git C-quoted UTF-8 bytes and rejects malformed encodings", () => {
+	assert.equal(parsePorcelainPath('?? "\\344\\270\\255\\346\\226\\207.txt"'), "中文.txt");
+	assert.equal(parsePorcelainPath('?? "tab\\tbackslash\\\\quote\\\".txt"'), 'tab\tbackslash\\quote".txt');
+	assert.equal(parsePorcelainPath('R  "old\\342\\230\\203.txt" -> "new\\344\\270\\255.txt"'), "new中.txt");
+	assert.equal(parsePorcelainPath("R  old.ts -> new.ts"), "new.ts", "ASCII rename behavior is preserved");
+	assert.equal(parsePorcelainPath('?? "ordinary -> name.txt"'), "ordinary -> name.txt", "an ordinary path arrow is not a rename separator");
+
+	assert.equal(parsePorcelainPath('?? "bad\\q.txt"'), undefined, "unknown escapes are rejected");
+	assert.equal(parsePorcelainPath('?? "bad\\37.txt"'), undefined, "incomplete octal escapes are rejected");
+	assert.equal(parsePorcelainPath('?? "\\777.txt"'), undefined, "octal values beyond one byte are rejected");
+	assert.equal(parsePorcelainPath('?? "\\377.txt"'), undefined, "invalid UTF-8 bytes are rejected");
+	assert.equal(parsePorcelainPath('R  "bad\\q.txt" -> good.txt'), undefined, "a malformed rename source rejects the whole record");
+});
+
 test("the ledger's own directory is recognized and never a project change", async () => {
 	await withTempDir(async (dir) => {
 		assert.equal(isDelegationRecordPath(dir, `${CONFIG_DIR_NAME}/workbench/delegations/x/manifest.json`), true);
@@ -174,6 +189,47 @@ test("collectGitFacts records HEAD, dirty state and per-path digests (tracked + 
 		assert.deepEqual(dirty.changedPaths, ["README.md", "src/nested/new.ts"]);
 		assert.match(dirty.pathDigests["README.md"] ?? "", /^[0-9a-f]{64}$/);
 		assert.match(dirty.pathDigests["src/nested/new.ts"] ?? "", /^[0-9a-f]{64}$/);
+	});
+});
+
+test("collectGitFacts decodes and sorts real Git C-quoted Unicode paths without escaped literal leakage", async () => {
+	await withTempDir(async (dir) => {
+		await cleanRepo(dir);
+		const names = ["文档.txt", "中文.txt", "éclair.txt"];
+		for (const name of names) await writeFile(join(dir, name), `${name}\n`, "utf8");
+
+		const rawStatus = await spawnExec("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: dir });
+		assert.equal(rawStatus.code, 0);
+		assert.match(rawStatus.stdout, /\\[0-7]{3}/, "fixture exercises Git's actual octal C quoting");
+
+		const facts = await collectGitFacts(dir, spawnExec);
+		assert.deepEqual(facts.changedPaths, [...names].sort(), "decoded Unicode paths retain deterministic path ordering");
+		assert.deepEqual(Object.keys(facts.pathStatuses).sort(), [...names].sort());
+		assert.ok(facts.changedPaths.every((path) => !path.includes("\\")), "no octal escape literal leaks into changed paths");
+		assert.ok(Object.keys(facts.pathDigests).every((path) => names.includes(path)), "digests are keyed by decoded filesystem paths");
+		for (const name of names) {
+			assert.equal(facts.pathStatuses[name], "??");
+			assert.match(facts.pathDigests[name] ?? "", /^[0-9a-f]{64}$/);
+		}
+	});
+});
+
+test("collectGitFacts rejects an undecodable quoted status path instead of omitting it", async () => {
+	await withTempDir(async (dir) => {
+		const invalidStatusExec: ExecFn = async (command, args) => {
+			if (command === "git" && args[0] === "rev-parse") {
+				return { stdout: "a".repeat(40), stderr: "", code: 0, killed: false };
+			}
+			if (command === "git" && args[0] === "status") {
+				return { stdout: '?? "\\377.txt"\n', stderr: "", code: 0, killed: false };
+			}
+			return { stdout: "", stderr: "", code: 0, killed: false };
+		};
+
+		await assert.rejects(
+			collectGitFacts(dir, invalidStatusExec),
+			/git status --porcelain returned an invalid or undecodable path/,
+		);
 	});
 });
 

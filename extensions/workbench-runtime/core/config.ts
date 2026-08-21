@@ -70,6 +70,8 @@ export interface ProjectConfig {
 	cacheTelemetry: boolean;
 	/** P6-C: action-cache capacity limit (project.yaml cache.actionCache.maxBytes). */
 	actionCacheMaxBytes: number;
+	/** Explicitly authorized, realpath-resolved roots for v2 recipe artifacts. */
+	artifactExternalRoots: Readonly<Record<string, string>>;
 	/**
 	 * P7 (commander-token-optimization plan §6): observation-only commander
 	 * advisory thresholds (project.yaml commander.advisory.soft/high). Always
@@ -263,6 +265,27 @@ export async function loadProjectConfig(projectRoot: string, options: LoadProjec
 		issues.push({ file: "project.yaml", message: effective.issue });
 	}
 
+	const artifactExternalRoots: Record<string, string> = {};
+	const externalRootsDoc = projectDoc?.artifact_external_roots;
+	if (externalRootsDoc !== undefined && (typeof externalRootsDoc !== "object" || externalRootsDoc === null || Array.isArray(externalRootsDoc))) {
+		issues.push({ file: "project.yaml", message: '"artifact_external_roots" must be a mapping of name to absolute directory' });
+	} else if (externalRootsDoc !== undefined) {
+		for (const [name, value] of Object.entries(externalRootsDoc as Record<string, unknown>)) {
+			if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(name) || typeof value !== "string" || !isAbsoluteStyleProjectDir(value)) {
+				issues.push({ file: "project.yaml", message: `artifact external root "${name}" must name an absolute directory` });
+				continue;
+			}
+			try {
+				const resolvedRoot = await realpath(value);
+				const rootStats = await stat(resolvedRoot);
+				if (!rootStats.isDirectory()) throw new Error("not a directory");
+				artifactExternalRoots[name] = resolvedRoot;
+			} catch {
+				issues.push({ file: "project.yaml", message: `artifact external root "${name}" is unavailable or not a directory` });
+			}
+		}
+	}
+
 	// P6-A: telemetry opt-out. project.yaml: cache: { telemetry: false }.
 	let cacheTelemetry = true;
 	// P6-C: action-cache capacity. project.yaml: cache: { actionCache: { maxBytes: N } }.
@@ -353,6 +376,7 @@ export async function loadProjectConfig(projectRoot: string, options: LoadProjec
 		issues,
 		cacheTelemetry,
 		actionCacheMaxBytes,
+		artifactExternalRoots,
 		commanderAdvisory: parsedAdvisory.config,
 	};
 }

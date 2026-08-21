@@ -73,9 +73,9 @@ extensions/workbench-runtime/
     │                        #   selection and ledger/handoff persistence: Phase 3;
     │                        #   numeric-only progress counters/band: Phase 4;
     │                        #   task-contract profile wording + granularity guidance: Phase 5)
-    ├── write-authority.ts   # P7 worker-first-strict policy: actor identity, exact
-    │                        #   15-tool Sol DEV allowlist, commander guard, temporary
-    │                        #   write lease (pure state, no Pi imports)
+    ├── write-authority.ts   # development-first policy: actor identity, direct
+    │                        #   ordinary writes, high-risk path guard, temporary
+    │                        #   lease (legacy policy id retained for compatibility)
     ├── lease-command.ts     # P7 user-only lease slash commands: argument parsing,
     │                        #   bounded id/token generation, TUI/non-TUI renderers,
     │                        #   WF footer segment (pure)
@@ -204,8 +204,8 @@ GPT-5.6 Sol parent in DEV
   → P7: ledger finished on EVERY outcome (success and failure) — after.json,
        worker-summary.json, review.json placeholder; review_status
        PENDING_REVIEW (never falls back)
-  → Sol reviews the ACTUAL diff (workbench_review_worker_diff, callable
-       repeatedly on the latest delegation): whole-worker-diff scope check
+  → the same delegation call automatically reviews the ACTUAL diff and
+       closes ordinary complete PASS deliveries as REVIEWED: whole-worker-diff scope check
        vs allowed_paths, current diff hash bound to the reviewed hash,
        mismatch/drift warnings, bounded redacted patch with displayed-path
        coverage facts — a path counts as displayed only when it appears in
@@ -215,6 +215,8 @@ GPT-5.6 Sol parent in DEV
        prior-hash coverage is dropped — this call's rendered paths stay
        displayed), and every segment re-runs the full scope check and the
        complete diff hash (include_paths narrows only the patch)
+  → workbench_review_worker_diff is used only as the recovery path for a
+       large/incomplete, pending, stale, or conflicted review
   → REVIEWED requires scope PASS AND complete displayed-path coverage
        (any later diff change → STALE); FAIL stays PENDING_REVIEW and ANY
        re-review of the same current diff that is not PASS with complete
@@ -225,24 +227,17 @@ GPT-5.6 Sol parent in DEV
   → Sol runs final VERIFY recipes/gates → final judgment
 ```
 
-Responsibility split: Sol owns requirements, cross-cutting architecture,
-scope, actual-diff review, final recipes/gates, and the verdict; the worker
-owns routine local implementation decisions inside the approved contract and
-delivers a complete source+tests+docs vertical slice (investigation,
-production changes, tests, docs, write-free recipe checks, in-scope repair).
-The DEV default is **worker-first write authority**: approved GPT-5.6 Sol
-resolves to the fixed `worker-first-strict` policy — exactly the canonical
-15-tool allowlist (read, grep, find, ls + all 11 `workbench_*` tools; an
-ACTIVE user-issued lease adds exactly its edit/write tools → 17 active; no
-bash/edit/write, no foreign tools) — so implementation
-and repair writes go to a fresh bounded worker; high-risk decisions remain
-Commander-led (Sol keeps the decision, delegates only bounded
-support/implementation scopes after the architecture is fixed, and never
-delegates the decision itself), and a temporary commander direct write
-requires an explicit human-issued write lease (`/q-commander-write-unlock`,
-user-only). See [worker-delegation.md](worker-delegation.md) for the risk
-rubric, the lease commands, fresh-worker continuation, and the
-one-writing-worker-per-worktree rule.
+Responsibility split is development-first. Sol may make ordinary source,
+test, and documentation edits directly in DEV; delegation is optional for a
+useful bounded task, not a write or defect-repair prerequisite. A successful
+delegation owns its local implementation decisions, then the same public call
+scope-checks, reviews, and closes the delivery. Explicit review/status is a
+recovery surface only. The serialized `worker-first-strict` policy name and
+the gate check kind remain compatibility identifiers; they no longer describe
+the user workflow. High-risk dependency, security/policy,
+deployment/migration, and Pi control paths still require a user-issued
+temporary lease. See [worker-delegation.md](worker-delegation.md) for the
+transaction, risk, and recovery contracts.
 
 The delegate tool is static in the DEV prefix and absent from AUDIT/VERIFY.
 No worker process survives its tool call. The pinned budget policy lives in
@@ -324,9 +319,9 @@ workbench_run_recipe / /q-run
   → gates.json + summary.json per run; exit 0 iff PASS
 ```
 
-B6 (Worker-First Compliance, P7) is machine-backed: the runtime injects a
-bounded worker-first facts object into every gate run (slash command AND
-model tool). Its `worker-first` checks only PASS from those facts — missing
+B6 (Development Safety; legacy P7 machine kind `worker-first`) is
+machine-backed: the runtime injects a bounded safety facts object into every
+gate run (slash command AND model tool). Its compatibility-kind checks only PASS from those facts — missing
 facts are NOT_RUN (a required NOT_RUN never PASSes), a pending/stale review
 BLOCKs B6, negative compliance facts FAIL it, and model prose can never
 satisfy B6.1-B6.8.
@@ -1238,8 +1233,9 @@ run/cache/gate/delegation artifacts or execution counts.
 
 - **BEGIN (pre-execute, policy-gated).** At the END of the `tool_call`
   guard — after every worker/commander/mode/path/lease check has allowed —
-  every registered workbench tool EXCEPT the public recovery tool begins an
-  exclusive started receipt (native Pi session id + `event.toolCallId` +
+  each side-effecting workbench tool (recipe/gate execution, delegation and
+  review) begins an exclusive started receipt (native Pi session id +
+  `event.toolCallId` +
   exact tool name + canonical input hash; the effective project root is
   resolved like each tool's own execute). BEGIN completes BEFORE the tool
   executes. A matching `completed_replay` and every incomplete/corrupt/
@@ -1247,6 +1243,10 @@ run/cache/gate/delegation artifacts or execution counts.
   reason (carrying the durable result id and a recover instruction) and the
   tool never executes — exact same-toolCallId identity only; P4 validation
   evidence is never consulted.
+- **Replay-safe reads bypass receipts.** Project inspect, run/gate read/list,
+  run comparison, delegation status and receipt recovery execute without a
+  started/finalized receipt, so current-state reads remain current and add no
+  per-call receipt files.
 - **Capacity blocks, never evicts.** When the in-memory handle map is
   already at `MAX_IN_FLIGHT_RECEIPTS` (256), a new registered workbench
   call is blocked BEFORE begin/execution with a fixed bounded reason;
@@ -1463,33 +1463,14 @@ run/cache/gate/delegation artifacts or execution counts.
   compaction cancellation in the worker-role lifecycle only, runner
   budget/compaction tracking with fail-closed hard stop and compaction
   rejection, budget/compaction facts in the worker report
-- P7 (this release): worker-first write authority — approved GPT-5.6 Sol
-  resolves to the fixed `worker-first-strict` policy in DEV (at the P7
-  milestone / before P8b: exact canonical 14-tool allowlist, no
-  bash/edit/write or foreign tools; identity from the
-  worker env contract + provider/model only); user-only temporary commander
-  write leases (`/q-write-policy status`, `/q-commander-write-unlock`,
-  `/q-commander-write-lock` — TUI explicit confirmation vs non-TUI two-part
-  token confirmation, fixed reasons, project-relative exact/subtree scope,
-  edit/write only, max 10 calls / 30 minutes, expiry/exhaustion/revocation,
-  `WF:LEASE`/`WF:LOCKED`/`WF:REVIEW` footer segments, tokens never
-  summarized); bounded delegation ledger
-  (`core/delegation-ledger.ts` — before/after/worker-summary/review records
-  under `<CONFIG_DIR_NAME>/workbench/delegations/<id>/`, atomic, redacted,
-  every success/failure PENDING_REVIEW); review lifecycle
-  (`core/delegation-state.ts` PENDING_REVIEW → REVIEWED → STALE with hash
-  binding, `core/diff-review.ts` whole-worker-diff scope check, bound vs
-  recorded hash, drift, bounded patch; PENDING_REVIEW/STALE blocks the next
-  delegation and VERIFY); `workbench_review_worker_diff` /
-  `workbench_delegation_status` tools, `/q-delegation-status`; command
-  inventory 24 → 28, tool inventory 8 → 10 (the three P7 delegation tools
-  have no compact TUI renderers — the P4 five remain the only ones);
-  machine-backed B6 Worker-First Compliance gate (runtime-injected facts,
-  NOT_RUN/BLOCKED semantics, never satisfiable by model prose); recipe
-  mutation policy (`none | artifacts | source` — strict Sol: none/artifacts
-  only, workers: none only); worker-first workflow contract in q-build, the
-  implementation-workflow skill, and both project AGENTS templates plus
-  focused package-content tests.
+- Historical P7 introduced the serialized `worker-first-strict` policy id,
+  bounded leases, delegation records, review state, and the B6 machine check
+  kind. Current DEV behavior is development-first: ordinary edit/write is
+  direct, high-risk paths retain the bounded lease, a successful v2
+  delegation auto-reviews and closes, and B6 is presented as Development
+  Safety. The legacy ids remain readable for compatibility but are not a
+  required workflow in q-build, the implementation skill, or generated
+  project AGENTS files.
 - P8 (this release): safe nested project support — optional `project.yaml`
   `project_dir` (default `.`) resolved after config load into the safe
   effective project root (`core/config.ts`: absolute-path, `..`-escape and

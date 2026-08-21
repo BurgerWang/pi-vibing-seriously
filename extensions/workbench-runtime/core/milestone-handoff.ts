@@ -421,7 +421,7 @@ export function buildMilestoneHandoffNote(record: MilestoneHandoffRecord): strin
 	// (never tokens). The target lock is a FIXED handoff invariant — the
 	// target never carries a lease, so the fact is always rendered.
 	if (state?.activeWriteLease) lines.push(`source write lease: ${state.activeWriteLease}`);
-	lines.push("commander writes: denied in target (write lease never carried)");
+	lines.push("development writes: ordinary paths direct; high-risk lease never carried");
 	if (state?.lastRunId) lines.push(`last run: ${state.lastRunId}${state.lastRecipe ? ` (${state.lastRecipe})` : ""}`);
 	if (state && state.passedGates.length > 0) lines.push(`gates passed: ${state.passedGates.join(", ")}`);
 	if (state && state.failedGates.length > 0) lines.push(`gates failed: ${state.failedGates.join(", ")}`);

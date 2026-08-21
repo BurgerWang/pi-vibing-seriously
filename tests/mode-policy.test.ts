@@ -28,7 +28,10 @@ import {
 	MODE_ENTRY_TYPE,
 	statusText,
 } from "../extensions/workbench-runtime/core/state.ts";
-import { STRICT_SOL_DEV_ALLOWLIST } from "../extensions/workbench-runtime/core/write-authority.ts";
+import {
+	DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST,
+	STRICT_SOL_DEV_ALLOWLIST,
+} from "../extensions/workbench-runtime/core/write-authority.ts";
 
 // ---------------------------------------------------------------------------
 // Tool sets per mode (P1: VERIFY has no free bash; workbench tools are part
@@ -266,19 +269,19 @@ const FULL_DEV_ACTIVE = [
 	"a_foreign",
 ];
 
-test("strict Sol DEV: computeActiveTools returns exactly the fixed 15-tool allowlist, no bash/edit/write/foreign", () => {
+test("development-first Sol DEV exposes the canonical direct edit/write surface without bash or foreign tools", () => {
 	const tools = computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS);
-	assert.deepEqual(tools, [...STRICT_SOL_DEV_ALLOWLIST], "exact canonical allowlist order");
-	assert.equal(tools.length, 15);
+	assert.deepEqual(tools, [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST], "exact canonical allowlist order");
+	assert.equal(tools.length, 17);
 	assert.ok(!tools.includes("bash"));
-	assert.ok(!tools.includes("edit"));
-	assert.ok(!tools.includes("write"));
+	assert.ok(tools.includes("edit"));
+	assert.ok(tools.includes("write"));
 	assert.ok(!tools.includes("web_search"));
 	assert.ok(!tools.includes("a_foreign"));
 	// Re-enabled tools are dropped by construction, never ordered by Pi/another extension.
-	assert.deepEqual(computeActiveTools("DEV", [...FULL_DEV_ACTIVE].reverse(), SOL_FACTS), [...STRICT_SOL_DEV_ALLOWLIST]);
+	assert.deepEqual(computeActiveTools("DEV", [...FULL_DEV_ACTIVE].reverse(), SOL_FACTS), [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST]);
 	// openai provider is equally strict.
-	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, { provider: "openai", model: "gpt-5.6-sol" }), [...STRICT_SOL_DEV_ALLOWLIST]);
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, { provider: "openai", model: "gpt-5.6-sol" }), [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST]);
 	// AUDIT/VERIFY stay strict for Sol too (facts never widen them).
 	assert.deepEqual(computeActiveTools("AUDIT", FULL_DEV_ACTIVE, SOL_FACTS), AUDIT_TOOLS);
 	assert.deepEqual(computeActiveTools("VERIFY", FULL_DEV_ACTIVE, SOL_FACTS), VERIFY_TOOLS);
@@ -304,28 +307,22 @@ test("strict Sol allowlist applies only to the approved Sol identity; workers an
 // P7 slice 3: lease-aware active tool set (active lease enables edit/write)
 // ---------------------------------------------------------------------------
 
-test("strict Sol DEV with an ACTIVE confirmed lease enables exactly its edit/write tools after the canonical 15", () => {
+test("lease inputs do not change the development-first Sol tool surface", () => {
 	const tools = computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["edit", "write"]);
-	assert.deepEqual(tools, [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
+	assert.deepEqual(tools, [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST]);
 	assert.equal(tools.length, 17);
-	// A write-only lease enables only write.
-	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["write"]), [...STRICT_SOL_DEV_ALLOWLIST, "write"]);
-	// Lease-added tools are CANONICAL and deduplicated: always `edit` then
-	// `write` (never the input order), even when the input carries
-	// duplicates or foreign values — bash can never enter through the
-	// lease channel.
-	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["write", "edit"]), [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
-	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["edit", "edit", "write", "write"]), [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
-	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["write", "bash", "edit", "web_search", "write"]), [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["write"]), [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST]);
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["write", "edit"]), [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST]);
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["edit", "edit", "write", "write"]), [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST]);
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["write", "bash", "edit", "web_search", "write"]), [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST]);
 });
 
-test("no lease / empty lease / pending / expired / exhausted / revoked lease returns to exactly the canonical 15", () => {
-	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS), [...STRICT_SOL_DEV_ALLOWLIST], "no lease");
-	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, []), [...STRICT_SOL_DEV_ALLOWLIST], "empty lease tools");
-	assert.equal(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, []).length, 15);
-	// bash can never be enabled through the lease channel (second layer stays authoritative).
-	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["bash", "edit", "write"]), [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
-	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["bash"]), [...STRICT_SOL_DEV_ALLOWLIST]);
+test("no lease or malformed lease tools retain direct edit/write while bash stays unavailable", () => {
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS), [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST], "no lease");
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, []), [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST], "empty lease tools");
+	assert.equal(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, []).length, 17);
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["bash", "edit", "write"]), [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST]);
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["bash"]), [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST]);
 });
 
 test("lease tools never widen non-Sol DEV, AUDIT or VERIFY tool sets", () => {

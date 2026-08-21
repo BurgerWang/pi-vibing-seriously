@@ -250,6 +250,12 @@ test("recipeDefinitionHash: ONLY validation_components differ -> different hash"
 	assert.notEqual(recipeDefinitionHash(different), recipeDefinitionHash(base), "changing only validation_components must change the definition hash");
 });
 
+test("recipeDefinitionHash binds the full artifact contract, not only its glob", () => {
+	const legacy = { ...DEFAULT_RECIPE, name: "r", command: ["true"], artifacts: ["out/*.json"], artifact_contracts: [{ path: "out/*.json", required: false, min_count: 0, max_count: null, type: "file" as const, min_bytes: 0, max_bytes: 268435456, sha256: null, freshness: "current" as const, snapshot: false, root: "project" as const, external_root: null, legacy_optional: true }] };
+	const required = { ...legacy, artifact_contracts: [{ ...legacy.artifact_contracts[0]!, required: true, min_count: 1, legacy_optional: false }] };
+	assert.notEqual(recipeDefinitionHash(required), recipeDefinitionHash(legacy));
+});
+
 test("lifecycle: argv change -> miss", async () => {
 	await withTempDir(async (root) => {
 		await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"]), params: [{ name: "p", type: "string", required: true }], command: ["hello-cli", "{{p}}"] });

@@ -1,0 +1,14 @@
+{
+  "delegation_id": "20260817-010000-a001",
+  "created_at": "2026-08-17T01:00:00.000Z",
+  "finished_at": "2026-08-17T01:01:00.000Z",
+  "status": "finished",
+  "review_status": "PENDING_REVIEW",
+  "git_head_before": "afca84f4f6d3cc810b953b16625a1756a7dbc850",
+  "git_dirty_before": false,
+  "diff_hash_before": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "diff_hash_after": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "changed_path_count_before": 0,
+  "changed_path_count_after": 1,
+  "changed_since_before_count": 1
+}

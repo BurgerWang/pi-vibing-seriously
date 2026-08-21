@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { types as utilTypes } from "node:util";
 
+import { DELEGATION_TRANSACTION_ID_RE } from "./delegation-transaction.ts";
+
 /**
  * The provider-visible projection budget is deliberately invariant. A trusted
  * executor must opt into this exact version and budget; callers cannot enlarge
@@ -300,12 +302,25 @@ function sourcePathMatchesKind(sourceKind: TrustedRecoverySourceKind, sourcePath
 			&& parts[4] === "comparison.json";
 	}
 	if (sourceKind === "completed_worker_report") {
-		return parts.length === 5
+		const legacyV1 = parts.length === 5
 			&& parts[0] === ".pi"
 			&& parts[1] === "workbench"
 			&& parts[2] === "delegations"
 			&& hasSafeRecordId(parts[3] ?? "")
 			&& parts[4] === "worker-report.md";
+		if (legacyV1) return true;
+		if (parts.length !== 8
+			|| parts[0] !== ".pi"
+			|| parts[1] !== "workbench"
+			|| parts[2] !== "delegations"
+			|| !DELEGATION_TRANSACTION_ID_RE.test(parts[3] ?? "")
+			|| parts[4] !== "v2"
+			|| parts[5] !== "generations"
+			|| parts[7] !== "worker-report.md") return false;
+		const generation = parts[6] ?? "";
+		if (!/^g\d{8}$/.test(generation)) return false;
+		const generationNumber = Number(generation.slice(1));
+		return Number.isSafeInteger(generationNumber) && generationNumber > 0 && generationNumber <= 99_999_999;
 	}
 	if (parts.length !== 5
 		|| parts[0] !== ".pi"

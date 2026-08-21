@@ -7,10 +7,15 @@
 **pi-dev-workbench** is a [Pi Package](https://pi.dev) that makes software and
 quantitative-research work reviewable from plan to verdict. It combines an
 enforced **AUDIT / DEV / VERIFY** workflow, declared recipes, durable run
-evidence, machine-backed gates, bounded worker delegation, and strict context
+evidence, machine-backed gates, optional bounded worker delegation, and strict context
 output control — all through Pi's native extension, tool, command, skill,
 prompt, and TUI surfaces. **It is not a standalone agent framework, daemon,
 background service, or sandbox.**
+
+The current runtime and its committed transaction/run records are the product
+authority. Historical plans, handoffs, benchmark narratives, and compatibility
+notes explain decisions but never override current code or create a required
+development step.
 
 **Navigate:** [Quick start](#quick-start) · [Core concepts](#core-concepts) ·
 [Modes](#mode-policy) · [Recipes](#recipes-and-run-records) ·
@@ -44,15 +49,16 @@ background service, or sandbox.**
    approve project trust again. Workbench configuration and recipes are read
    only for trusted projects.
 
-4. **Follow the mode → recipe → gate loop:**
+4. **Develop first; verify once the candidate is stable:**
 
    ```text
    /q-status              # mode, cwd, project trust, active tools
    /q-mode-audit          # inspect without writes
-   /q-mode-dev            # implement through bounded worker slices
-   /q-run typecheck       # run a declared recipe; use the names in recipes.yaml
-   /q-mode-verify         # declared recipes and gates only
-   /q-gate base           # run the base validation ladder
+   /q-mode-dev            # ordinary edit/write is direct
+   /q-run typecheck       # focused feedback through a declared recipe
+   workbench_delegate_worker  # optional: one bounded task, auto-reviewed on success
+   /q-mode-verify         # switch only when the candidate is stable
+   /q-gate base           # one final validation pass when risk requires it
    ```
 
 For onboarding details, nested projects, and recipe examples, see
@@ -65,7 +71,7 @@ For onboarding details, nested projects, and recipe examples, see
 | **Modes define authority** | AUDIT inspects, DEV implements, and VERIFY re-runs declared evidence; active-tool sets and a hard `tool_call` guard enforce the boundary |
 | **Recipes produce evidence** | Named, schema-parameterized argv commands run without shell strings; path-contained, redacted run records keep the full evidence on disk |
 | **Gates decide readiness** | b0–b6 base and q0–q5 quant gates return exactly PASS / FAIL / BLOCKED / NOT_RUN; model prose never substitutes for machine or recorded manual evidence |
-| **Workers own routine writes** | Bounded workers implement parent-approved slices; the commander owns architecture, reviews the actual git diff, and runs final gates |
+| **Development stays direct** | Ordinary source/test/docs edits run directly in DEV; bounded delegation is optional and auto-closes successful delivery |
 | **Output stays bounded** | Result envelopes, turn/history budgets, stale-safe cursors, bounded DTOs, numeric telemetry, and a legacy-session sanitizer control model-visible context |
 | **Prompt prefixes stay cooperative** | Active-history projection freezes a bounded anchor plus immutable segments; ordinary turns append to a raw active tail, while seals and checkpoints are explicit |
 | **Caching is explicit** | Opt-in, success-only recipe result caching uses declared content inputs; it never caches LLM answers or arbitrary bash |
@@ -87,7 +93,7 @@ per arm). See
 | Mode | Purpose | Model tools |
 | --- | --- | --- |
 | AUDIT | Read-only inspection | read, grep, find, ls + read-only workbench tools — never `bash`/`edit`/`write`, never `workbench_run_recipe` |
-| DEV | Implementing features | strict commander: fixed 15-tool allowlist, no `bash`/`edit`/`write` (a user-issued lease may add exactly those two); workers: bounded parent-approved paths |
+| DEV | Implementing features | ordinary `edit`/`write` plus workbench tools; high-risk paths require a user-issued lease; delegated workers stay within parent-approved paths |
 | VERIFY | Re-verifying completed work | declared recipes and gates only — no free `bash`, no `edit`/`write`, no delegation |
 
 - `/q-mode-audit`, `/q-mode-dev`, `/q-mode-verify` switch modes; `/q-status`
@@ -101,36 +107,24 @@ per arm). See
   re-enables them. This is a **discipline boundary, not a sandbox** (see
   [Security model](#security-model)).
 
-## Worker-first workflow
+## Development-first delivery
 
-Approved GPT-5.6 Sol (the commander) owns requirements, architecture, scope,
-actual-diff review, final gates, and the verdict — but does **not** write
-directly by default:
-
-- **Strict Sol DEV allowlist.** Sol always resolves to the fixed
-  `worker-first-strict` policy: exactly the canonical 15-tool allowlist
-  (read, grep, find, ls + the 11 `workbench_*` tools) — no `bash`/`edit`/
-  `write`, no foreign tools. AUDIT/VERIFY are strict for every actor.
-- **Bounded workers.** `workbench_delegate_worker` spawns one short-lived,
-  pinned, non-recursive worker for a bounded implementation task: coherent
-  source + tests + docs slices inside parent-approved paths, a per-message
-  context budget (1M window, 80% soft steer / 90% fail-closed) and a
-  cumulative spend budget (`low` / `standard` / `extended` profiles).
-  Workers own routine local implementation decisions; they can never use
-  free bash, recurse, or run final gates.
-- **Actual-diff review.** Every delegation — success **and** failure — is
-  recorded in a bounded ledger (`.pi/workbench/delegations/<id>/`) and
-  starts `PENDING_REVIEW`. `workbench_review_worker_diff` checks the real
-  git diff against the recorded before-snapshot, scope-checks every changed
-  path, and binds the reviewed diff hash; a pending or stale review
-  **blocks the next delegation and VERIFY** until the commander reviews the
-  actual diff. Worker reports are never acceptance evidence.
-- **Temporary commander write lease (user-only).** The explicit exception
-  is a human-issued lease through the user-only slash commands
-  (`/q-commander-write-unlock`, `/q-commander-write-lock`,
-  `/q-write-policy`): bounded calls (≤ 10), time (≤ 30 min) and
-  project-relative paths; `edit`/`write` only, never `bash`; revoked on
-  expiry, exhaustion, leaving DEV, model/provider change, or session end.
+- **Ordinary work is direct.** In DEV, canonical project-relative source,
+  test, and documentation edits use `edit`/`write` directly. A delegation is
+  optional, not a prerequisite for writes or defect repair.
+- **One-call delegation.** `workbench_delegate_worker` remains available for
+  a useful bounded task. A normal successful implementation is scope-checked,
+  reviewed, and closed as `REVIEWED` in that same call. The explicit review
+  and status tools are recovery surfaces for incomplete coverage, conflict,
+  or persistence failure—not a routine chain after every delegation.
+- **Risk still escalates.** Dependency manifests, security/policy,
+  deployment/migration, and Pi control paths require a user-issued temporary
+  lease. Destructive actions, permissions, release authority, and final
+  verification remain explicit.
+- **Verification is concentrated.** Use focused recipes while the candidate
+  changes; run final gates once on the stable candidate when task or release
+  risk requires them. Worker reports remain bounded observations, never
+  acceptance evidence.
 
 Details: [docs/worker-delegation.md](docs/worker-delegation.md).
 
@@ -144,7 +138,7 @@ Recipes are fully declarative in `.pi/workbench/recipes.yaml`:
   symlink-aware realpath); `../`, absolute paths and symlink escapes are
   rejected.
 - Every recipe declares `mutation` (`none` | `artifacts` | `source`);
-  strict Sol runs only `none`/`artifacts` recipes, workers only `none`
+  the development commander runs `none`/`artifacts` recipes, workers only `none`
   (write-free) recipes.
 - Each run persists a manifest, bounded logs, redacted environment facts,
   and artifact snapshots under `.pi/workbench/runs/<run-id>/` — never API
@@ -313,7 +307,7 @@ cursor semantics, durable evidence, compatibility, and release recipes.
 A gate is a named validation stage with checks and optional prerequisites.
 The built-in catalog provides base gates **b0–b6** (project readiness,
 static quality, unit correctness, integration correctness, output contract,
-reproducibility/handoff, worker-first compliance) and quant gates **q0–q5**
+reproducibility/handoff, development safety) and quant gates **q0–q5**
 (research contract, market-data integrity, backtest semantics, experiment
 integrity, out-of-sample robustness, strategy reporting). Key rules:
 
@@ -322,9 +316,10 @@ integrity, out-of-sample robustness, strategy reporting). Key rules:
 - Checks verify configs, recipe runs, artifacts, files, JSON fields,
   numeric ranges, and schema conformance — or record explicit `manual`
   evidence. Model prose can never masquerade as machine verification.
-- **b6 is machine-backed**: the runtime injects worker-first facts (strict
-  policy active, zero unauthorized commander writes, no pending/stale
-  review, reviewed diff hash matches the current diff) into every gate run.
+- **b6 is machine-backed**: Development Safety checks the direct-development
+  policy, high-risk write authorization, delegation scope/recovery state,
+  current reviewed binding, and commander-initiated final verification. Its
+  internal `worker-first` kind is retained only for record compatibility.
 - Gate runs persist `gates.json` + `evidence.json` artifacts per run.
 
 Commands: `/q-gate <id|base|quant|all>`, `/q-gates`, `/q-gate-show`,
@@ -446,6 +441,7 @@ scoped to mid/low-frequency research only.
 | [context-output-control-plane.md](docs/context-output-control-plane.md) | Hard output limits, cursors, history projection, session sanitization and release evidence |
 | [worker-delegation.md](docs/worker-delegation.md) | Worker contract, budgets, review lifecycle |
 | [security.md](docs/security.md) | Full protection matrix and boundaries |
+| [governance-recovery.md](docs/governance-recovery.md) | Read-only diagnosis, explicit reconcile, rollback blocking and stop conditions |
 | [quant-research-profile.md](docs/quant-research-profile.md) | Quant scope, contracts, Q0–Q5 |
 | [compatibility.md](docs/compatibility.md) | Tested environment matrix |
 | [cache/](docs/cache/) | Telemetry, stable-prefix, action cache, quant contracts, benchmark |

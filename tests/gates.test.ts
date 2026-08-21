@@ -504,7 +504,7 @@ test("artifact checks use persisted run records, never model claims", async () =
 				'  - name: producer',
 				'    command: ["node", "-e", "require(\\"fs\\").mkdirSync(\\"out\\", { recursive: true }); require(\\"fs\\").writeFileSync(\\"out/result.json\\", \\"{}\\")"]',
 				'    writes: ["out/"]',
-				'    artifacts: ["out/*.json"]',
+				'    artifacts: [{ path: "out/*.json", required: true, min_bytes: 1, freshness: current }]',
 				"",
 			].join("\n"),
 			gatesYaml: gatesYaml(
@@ -831,7 +831,7 @@ test("gate results persist the full run record layout", async () => {
 		assert.ok(files);
 		const entries = (await import("node:fs/promises")).readdir;
 		const names = (await entries(result.runDir)).sort();
-		assert.deepEqual(names, ["artifacts", "evidence.json", "gates.json", "manifest.json", "stderr.log", "stdout.log", "summary.json"]);
+		assert.deepEqual(names, ["artifacts", "command.json", "environment.json", "evidence.json", "gates.json", "manifest.json", "run-commit.json", "stderr.log", "stdout.log", "summary.json"]);
 
 		const manifest = (await readRunFile(result.runDir, "manifest.json")) as Record<string, unknown>;
 		assert.equal(manifest.run_id, result.runId);
@@ -1024,13 +1024,16 @@ function cleanWorkerFirstFacts(overrides: Partial<WorkerFirstGateFacts> = {}): W
 	};
 }
 
-test("B6 is a built-in universal base gate with exactly eight worker-first checks", async () => {
+test("B6 is the development-safety base gate with eight legacy-compatible machine checks", async () => {
 	await withTempDir(async (dir) => {
 		await setupProject(dir, { profile: "generic" });
 		const gates = await loadGates(dir);
 		const b6 = gates.find((g) => g.id === "b6");
 		assert.ok(b6, "b6 loads for generic profiles (universal base gate)");
 		assert.equal(b6!.source, "catalog");
+		assert.equal(b6!.title, "Development Safety");
+		assert.match(b6!.description, /direct development policy active/);
+		assert.match(b6!.description, /legacy worker-first check kind remains only for record compatibility/);
 		assert.equal(b6!.prerequisites.length, 0, "B6 is independent of B0-B5 (no manual-evidence prerequisites)");
 		assert.equal(b6!.required, true);
 		assert.equal(b6!.blocking, true);
@@ -1414,7 +1417,7 @@ test("recipe execution and artifact checks stay repository-root based with proje
 				"recipes:",
 				'  - name: producer',
 				'    command: ["node", "-e", "process.stdout.write(process.cwd()); require(\\"fs\\").mkdirSync(\\"out\\", { recursive: true }); require(\\"fs\\").writeFileSync(\\"out/result.json\\", \\"{}\\")"]',
-				'    artifacts: ["out/*.json"]',
+				'    artifacts: [{ path: "out/*.json", required: true, min_bytes: 1, freshness: current }]',
 				"",
 			].join("\n"),
 		);
@@ -1736,17 +1739,17 @@ test("P4a: collection unavailable leaves the gate status/result unchanged and pe
 	});
 });
 
-test("P4a: legacy manifests without validation_evidence stay readable (additive optional field)", async () => {
+test("P4a: current manifests without validation_evidence stay readable (additive optional field)", async () => {
 	await withTempDir(async (dir) => {
 		await setupProject(dir, { gatesYaml: gatesYaml(`  - id: g1\n    title: G1\n    checks:\n${CONFIG_CHECK}`) });
 		const result = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
-		// Strip the P4a field → the pre-P4a v1 shape.
+		// Strip only the additive P4a field; the current v2 identity remains.
 		const manifestPath = join(result.runDir, "manifest.json");
 		const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
 		delete manifest.validation_evidence;
 		await writeFile(manifestPath, JSON.stringify(manifest), "utf8");
 		const read = await readManifest(dir, result.runId);
-		assert.equal(read?.schema_version, 1, "schema v1 is unchanged");
+		assert.equal(read?.schema_version, 2, "the current run manifest stays schema v2");
 		assert.equal(read?.run_id, result.runId);
 		assert.equal(read.validation_evidence, undefined, "the field is optional — legacy records parse");
 

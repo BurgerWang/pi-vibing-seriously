@@ -60,7 +60,7 @@ export function recipeDefinitionHash(recipe: Recipe): string {
 		allowed_modes: recipe.allowed_modes,
 		expected_exit_codes: recipe.expected_exit_codes,
 		writes: recipe.writes,
-		artifacts: recipe.artifacts,
+		artifacts: recipe.artifact_contracts,
 		environment: recipe.environment,
 		validation_components: recipe.validation_components,
 		output_strategy: recipe.output_strategy,

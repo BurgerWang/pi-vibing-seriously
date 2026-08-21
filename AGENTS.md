@@ -1,68 +1,40 @@
-# AGENTS — pi-dev-workbench generic profile
+# AGENTS — pi-dev-workbench repository workflow
 
-Guidance for AI agents working in this repository.
+Guidance for Codex and other development agents working in this repository.
 
-## Mode discipline
+## Hard product/development boundary
 
-- The project runs under the workbench mode policy: AUDIT (read-only),
-  DEV (implement), VERIFY (re-verify only).
-- Project commands run through declared workbench recipes
-  (`.pi/workbench/recipes.yaml`) — never improvise shell commands in VERIFY.
+- `.pi/workbench` modes, recipes, delegation, ledgers, gates, receipts, and
+  state files are Pi runtime/product behavior under test. They do not
+  orchestrate Codex's own repository-development workflow.
+- Do not use Pi workbench modes, recipes, delegation tools, ledgers, review
+  state, or gates to manage Codex development unless the user explicitly
+  requests a real Pi product feature or end-to-end test.
+- Codex may inspect and edit in-scope repository files directly, using
+  `apply_patch` for edits, and may run normal focused package/test commands.
+- Subagents are optional. No write or defect requires a fresh worker,
+  temporary write lease, workbench delegation, or workbench diff review.
 
-## Working style
+## Normal development workflow
 
-1. **Orient first.** Before touching code, map the repository: entry points,
-   dependencies, test runner, configuration, and git state. Record file paths
-   as evidence.
-2. **Contract before code.** Restate the task as acceptance criteria and list
-   the files you will change before editing.
-3. **Real implementation.** No stubs, no TODO shells, no placeholder commits.
-   A change is not done until its tests pass.
-4. **Tests travel with code.** Add or update tests for every behavior change
-   and run them.
-5. **Verify, then report.** Run the project's declared verification recipes
-   (typecheck, tests, build). Report exact commands, results, and remaining
-   risks. Never claim a check passed that did not run.
-6. **Evidence over assertion.** Cite file paths, line numbers, and command
-   output. If you cannot verify something, say so.
+1. **Orient first.** Inspect relevant entry points, dependencies, tests,
+   configuration, git state, and any applicable repository instructions.
+2. **Set the contract.** State the intended behavior, acceptance conditions,
+   and expected file scope before editing when the task is non-trivial.
+3. **Implement completely.** Make the smallest coherent change that solves
+   the task. Do not leave stubs, TODO shells, or placeholder implementations.
+4. **Keep tests with behavior.** Add or update tests for behavior changes and
+   run the affected focused checks during development.
+5. **Verify proportionately.** Once the candidate is stable, run the relevant
+   final typecheck, tests, build, or `check` command in proportion to risk.
+   Report exactly what ran; never claim an unrun check passed.
+6. **Use evidence honestly.** Review the actual diff and command output.
+   Distinguish development feedback from formal Pi product-test authority.
 
-## Worker-first write authority
+## Repository safety and handoff
 
-This project operates under the worker-first workflow contract:
-
-1. **Sol owns the decision.** Sol owns requirements,
-   cross-cutting architecture, scope, and acceptance criteria.
-2. **Routine writes are worker-owned by default.** Concrete source, tests,
-   docs, and config writes are routine worker slices: a fresh bounded worker
-   implements them inside the approved contract; the worker owns routine
-   local implementation decisions.
-3. **High-risk decisions remain Sol-owned; the concrete writes are bounded
-   worker slices.** Sol keeps the decision itself and delegates only bounded
-   implementation scopes after the architecture is fixed.
-4. **Defects go to a fresh worker.** A partial or defective slice is
-   repaired by a new bounded delegation to a fresh worker, not by Sol
-   directly repairing the files.
-5. **The only exception is a user-issued temporary write lease.** Only an
-   active human-issued lease (user-only slash commands) lets Sol write
-   directly; it is bounded in calls, time, and project-relative paths.
-6. **Worker reports are never acceptance.** A report records commands and
-   observed results; it can never mark an acceptance criterion satisfied —
-   only Sol maps evidence to criteria.
-7. **Sol reviews the actual diff and runs the final gates.** Sol inspects
-   the real diff (`workbench_review_worker_diff`) and runs the final
-   verification recipes and gates before any verdict.
-
-## Skills
-
-- `skill:repository-orientation` — start of work in an unexplored repository
-- `skill:implementation-workflow` — any implementation task
-- `skill:debugging-workflow` — any failure or unexpected behavior
-- `skill:validation-ladder` — any verification or review verdict
-- `skill:repository-audit` — systematic read-only review of code or repository
-- `skill:cli-product-development` — command-line tools and scripts
-- `skill:handoff-and-release` — handoff notes, changelog, release prep
-
-## Handoff
-
-Before handing off work: summarize what changed, how to verify it, what was
-deliberately not done, and known limitations.
+- Preserve unrelated dirty-worktree changes and avoid broad staging or
+  cleanup that could overwrite user work.
+- Do not commit, push, publish, release, or create a PR unless the user asks.
+- Before handoff, summarize what changed, how it was verified, what was not
+  done, and any remaining risk or limitation.

@@ -20,7 +20,7 @@
 import { createHash } from "node:crypto";
 import { copyFile, lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { globSync } from "node:fs";
-import { basename, join, relative } from "node:path";
+import { basename, join, matchesGlob, relative } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
@@ -48,7 +48,7 @@ import { realpathContained } from "./path-guard.ts";
 import { runRecipe } from "./recipe-runner.ts";
 import type { Recipe } from "./recipe-schema.ts";
 import { recipeMutationBlockReason, type RecipeMutationFacts } from "./worker-policy.ts";
-import { listRuns, makeRunId, readManifest, RUN_SCHEMA_VERSION, type RunRecord } from "./runs.ts";
+import { listRunAttempts, makeRunId, readCommittedManifest, RUN_MANIFEST_SCHEMA_VERSION_V2, type RunRecord } from "./runs.ts";
 import type { WorkbenchMode } from "./mode-policy.ts";
 import { truncateTail } from "@earendil-works/pi-coding-agent";
 import {
@@ -57,6 +57,8 @@ import {
 	type TrustedWorkbenchConfigFileDigest,
 } from "./validation-evidence.ts";
 import { readJsonFileBounded, readUtf8FileBounded, type BoundedFileIoHooks } from "./bounded-file-io.ts";
+import { validateCommittedArtifactsV2 } from "./artifact-contract.ts";
+import { beginRunTransaction, commitRunTransaction } from "./run-transaction.ts";
 
 export const GATE_SCHEMA_VERSION = 1;
 /** Persisted gate/evidence records are authority inputs, never unbounded JSON channels. */
@@ -661,7 +663,7 @@ interface PersistedGateStatusRecord {
 }
 
 async function readGatesFile(projectRoot: string, runId: string, hooks?: BoundedFileIoHooks): Promise<PersistedGateStatusRecord | null> {
-	const manifest = await readManifest(projectRoot, runId);
+	const manifest = await readCommittedManifest(projectRoot, runId);
 	if (!manifest || manifest.recipe !== "gate") return null;
 	try {
 		const read = await readJsonFileBounded(join(runsDir(projectRoot), runId, "gates.json"), GATE_AUTHORITY_RECORD_MAX_BYTES, hooks);
@@ -682,10 +684,13 @@ async function readGatesFile(projectRoot: string, runId: string, hooks?: Bounded
 
 /** Most recent persisted status of a gate, if any. */
 export async function latestGateStatus(projectRoot: string, gateId: string, hooks?: BoundedFileIoHooks): Promise<{ status: GateStatus; run_id: string } | null> {
-	const runs = await listRuns(projectRoot, 50);
+	const runs = await listRunAttempts(projectRoot, 50);
 	for (const run of runs) {
+		if (run.recipe !== "gate") continue;
 		const record = await readGatesFile(projectRoot, run.run_id, hooks);
-		if (!record) continue;
+		// A newer gate run that advertises itself through a readable manifest
+		// but is partial/corrupt must not make us fall back to older optimism.
+		if (!record) return null;
 		const gate = record.gates.find((g) => g.id === gateId);
 		if (gate) return { status: gate.status, run_id: run.run_id };
 	}
@@ -722,6 +727,7 @@ export interface CheckContext {
 	workerFirstFacts?: WorkerFirstGateFacts;
 	/** P7: actor facts for the shared recipe mutation decision in recipe checks. */
 	actorFacts?: RecipeMutationFacts;
+	artifactExternalRoots: Readonly<Record<string, string>>;
 	/** Test-only allocation observation; cannot raise the fixed JSON artifact cap. */
 	jsonFileReadHooks?: BoundedFileIoHooks;
 	log: (line: string) => void;
@@ -839,7 +845,7 @@ export function evaluateWorkerFirstAssertion(
 ): { status: "PASS" | "FAIL" | "NOT_RUN"; detail: string } {
 	switch (name) {
 		case "strict-policy-active": {
-			if (facts.writePolicy === "worker-first-strict") return { status: "PASS", detail: "worker-first-strict policy is active" };
+			if (facts.writePolicy === "worker-first-strict") return { status: "PASS", detail: "development-first direct-write policy is active (legacy compatibility id worker-first-strict)" };
 			// The runtime always resolves the policy for the current actor
 			// (worker-first-strict for approved Sol, null otherwise) — null is
 			// a negative compliance fact, not a missing one.
@@ -847,7 +853,7 @@ export function evaluateWorkerFirstAssertion(
 		}
 		case "no-unauthorized-commander-writes": {
 			if (facts.commanderWritesDenied === true) {
-				return { status: "PASS", detail: "commander edit/write is hard-denied — no unauthorized write can get through" };
+				return { status: "PASS", detail: "high-risk commander writes require an explicit lease; ordinary project writes remain direct" };
 			}
 			if (facts.blockedCommanderWriteAttempts !== null && facts.blockedCommanderWriteAttempts === 0) {
 				return { status: "PASS", detail: "zero unauthorized commander write attempts" };
@@ -1030,7 +1036,11 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 
 			case "artifact": {
 				const recipeName = check.artifact_recipe as string;
-				const runs = await listRuns(ctx.projectRoot, 50);
+				// Select from diagnostic manifests first. The newest same-recipe
+				// attempt owns the decision even when its transaction is partial or
+				// corrupt; strict verification below then fails it closed instead of
+				// silently falling back to an older success.
+				const runs = await listRunAttempts(ctx.projectRoot, 50);
 				const run = runs.find((r) => r.recipe === recipeName);
 				if (!run) {
 					fail(`no run of recipe "${recipeName}" found`, [
@@ -1038,9 +1048,30 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 					]);
 					break;
 				}
+				const strictRun = await readCommittedManifest(ctx.projectRoot, run.run_id);
+				if (!strictRun) {
+					fail(`run ${run.run_id} of "${recipeName}" failed committed identity verification`, [
+						{ type: "artifact", run_id: run.run_id, recipe: recipeName, paths: run.artifact_paths, detail: "run transaction identity failed" },
+					]);
+					break;
+				}
+				if (strictRun.run_outcome !== "SUCCESS" || strictRun.exit_code === null || !strictRun.expected_exit_codes.includes(strictRun.exit_code) || strictRun.timed_out || strictRun.cancelled) {
+					fail(`latest run ${strictRun.run_id} of "${recipeName}" is not a successful committed run`, [
+						{ type: "artifact", run_id: strictRun.run_id, recipe: recipeName, paths: strictRun.artifact_paths, detail: `run outcome ${strictRun.run_outcome ?? "legacy"}` },
+					]);
+					break;
+				}
+				const currentArtifacts = await validateCommittedArtifactsV2(ctx.projectRoot, join(runsDir(ctx.projectRoot), run.run_id), run.run_id, { authorizedExternalRoots: ctx.artifactExternalRoots, exec: ctx.exec });
+				if (!currentArtifacts.ok) {
+					fail(`run ${run.run_id} of "${recipeName}" has invalid artifact authority (${currentArtifacts.code})`, [
+						{ type: "artifact", run_id: run.run_id, recipe: recipeName, paths: run.artifact_paths, detail: currentArtifacts.code },
+					]);
+					break;
+				}
+				const authorityPaths = currentArtifacts.manifest.artifacts.map((artifact) => artifact.root === "project" ? artifact.path : `external:${artifact.external_root}/${artifact.path}`);
 				const matched = check.artifact_glob
-					? run.artifact_paths.filter((p) => globSync(check.artifact_glob as string, { cwd: ctx.projectRoot }).includes(p))
-					: run.artifact_paths;
+					? authorityPaths.filter((path) => matchesGlob(path, check.artifact_glob as string))
+					: authorityPaths;
 				if (matched.length === 0) {
 					fail(`run ${run.run_id} of "${recipeName}" produced no matching artifacts${check.artifact_glob ? ` (glob: ${check.artifact_glob})` : ""}`, [
 						{ type: "artifact", run_id: run.run_id, recipe: recipeName, paths: run.artifact_paths, detail: "no matching artifacts" },
@@ -1208,7 +1239,7 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 					// Required facts were not injected: NOT_RUN — never PASS.
 					entry.status = "NOT_RUN";
 					entry.failure_reason = null;
-					ctx.log(`    ${check.id} NOT_RUN — worker-first compliance facts were not injected (runtime-only machine check)`);
+					ctx.log(`    ${check.id} NOT_RUN — development-safety facts were not injected (legacy worker-first machine check)`);
 					break;
 				}
 				if (facts.blockedReason) {
@@ -1482,8 +1513,10 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 	const { config, gates, trustedConfigFileDigest, requestedIds, ordered } = await selectGates(projectRoot, selector, input.gateConfigReadHooks);
 
 	const runId = makeRunId(startedAt);
-	const runDir = join(runsDir(projectRoot), runId);
-	await mkdir(join(runDir, "artifacts"), { recursive: true });
+	const transaction = await beginRunTransaction(projectRoot, runId);
+	const runDir = transaction.finalDir;
+	const writeDir = transaction.stagingDir;
+	await mkdir(join(writeDir, "artifacts"), { recursive: true });
 
 	const git = await gitState(projectRoot, exec);
 
@@ -1507,7 +1540,7 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 	const ctx: CheckContext = {
 		projectRoot,
 		effectiveProjectRoot: config.effectiveProjectRoot,
-		runDir,
+		runDir: writeDir,
 		configIssues: config.issues,
 		recipes: config.recipes,
 		profile: config.profile,
@@ -1518,6 +1551,7 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 		manualEvidence: trimmedManual,
 		workerFirstFacts: input.workerFirstFacts,
 		actorFacts: input.actorFacts,
+		artifactExternalRoots: config.artifactExternalRoots,
 		jsonFileReadHooks: input.jsonFileReadHooks,
 		log,
 	};
@@ -1611,7 +1645,7 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 	});
 
 	const manifest = {
-		schema_version: RUN_SCHEMA_VERSION,
+		schema_version: RUN_MANIFEST_SCHEMA_VERSION_V2,
 		run_id: runId,
 		recipe: "gate",
 		profile: config.profile,
@@ -1632,7 +1666,11 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 		expected_exit_codes: [0],
 		declared_writes: [],
 		environment_names: [],
+		validation_components: [],
+		cache_request_mode: "no-cache",
 		validation_evidence: gateEvidence.ok ? gateEvidence.block : unavailableEvidenceBlock(gateEvidence.reason),
+		run_transaction_schema_version: 2,
+		run_outcome: ok ? "SUCCESS" : "PROCESS_FAILED",
 	};
 
 	const gateSummary: Record<string, GateStatus> = {};
@@ -1670,12 +1708,19 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 		},
 	};
 
-	await writeFile(join(runDir, "manifest.json"), JSON.stringify(manifest, null, 2), "utf8");
-	await writeFile(join(runDir, "gates.json"), gatesAuthorityJson, "utf8");
-	await writeFile(join(runDir, "evidence.json"), evidenceAuthorityJson, "utf8");
-	await writeFile(join(runDir, "summary.json"), JSON.stringify(summary, null, 2), "utf8");
-	await writeFile(join(runDir, "stdout.log"), stdoutFull, "utf8");
-	await writeFile(join(runDir, "stderr.log"), "", "utf8");
+	await writeFile(join(writeDir, "manifest.json"), JSON.stringify(manifest, null, 2), "utf8");
+	await writeFile(join(writeDir, "command.json"), JSON.stringify({ recipe: "gate", argv: manifest.argv, cwd: projectRoot }, null, 2), "utf8");
+	await writeFile(join(writeDir, "environment.json"), JSON.stringify({ environment: {} }, null, 2), "utf8");
+	await writeFile(join(writeDir, "gates.json"), gatesAuthorityJson, "utf8");
+	await writeFile(join(writeDir, "evidence.json"), evidenceAuthorityJson, "utf8");
+	await writeFile(join(writeDir, "summary.json"), JSON.stringify(summary, null, 2), "utf8");
+	await writeFile(join(writeDir, "stdout.log"), stdoutFull, "utf8");
+	await writeFile(join(writeDir, "stderr.log"), "", "utf8");
+	try {
+		await commitRunTransaction(transaction, finishedAt);
+	} catch {
+		throw new GateSetupError("RUN_RECORD_COMMIT_FAILED");
+	}
 
 	return { ok, status: overall, runId, runDir, gates: gateEntries, requested: requestedIds, profile: config.profile };
 }

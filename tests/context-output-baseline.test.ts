@@ -529,10 +529,14 @@ function registeredExecuteCalls(source: string, metadataName: string): Set<strin
 }
 
 test("R0 wires whole-result clamps at read-run and diff-review final text boundaries", async () => {
-	const source = await readFile(new URL("../extensions/workbench-runtime/index.ts", import.meta.url), "utf8");
+	const sources = await Promise.all([
+		readFile(new URL("../extensions/workbench-runtime/index.ts", import.meta.url), "utf8"),
+		readFile(new URL("../extensions/workbench-runtime/core/recipe-tools-controller.ts", import.meta.url), "utf8"),
+		readFile(new URL("../extensions/workbench-runtime/core/review-tool-controller.ts", import.meta.url), "utf8"),
+	]);
 	for (const metadataName of ["workbench_read_run", "workbench_review_worker_diff"]) {
 		assert.ok(
-			registeredExecuteCalls(source, metadataName).has("clampWholeResultText"),
+			sources.some((source) => registeredExecuteCalls(source, metadataName).has("clampWholeResultText")),
 			`${metadataName} execute must call clampWholeResultText`,
 		);
 	}

@@ -66,8 +66,9 @@ const CONTEXT_OUTPUT_STRESS_SCRIPT = "tsx --test tests/context-output-stress.tes
 const READ_V3_SCRIPT = "tsx --test tests/native-tool-policy.test.ts tests/native-tool-wiring.test.ts tests/read-v3.test.ts";
 const CONTEXT_OUTPUT_BENCHMARK_SCRIPT = "tsx scripts/context-output-benchmark.ts";
 const SESSION_SANITIZE_SCRIPT = "tsx scripts/workbench-session-sanitize.ts";
+const GOVERNANCE_ROLLBACK_CHECK_SCRIPT = "tsx scripts/governance-rollback-check.ts";
 
-test("package.json: exact script inventory includes v2 and final v0.10 context-output scripts", async () => {
+test("package.json: exact script inventory includes v2, context-output and rollback-check scripts", async () => {
 	const pkg = JSON.parse(await readFile(join(process.cwd(), "package.json"), "utf8")) as { version?: string; scripts?: Record<string, string> };
 
 	// Exactly the three v2 scripts, with the exact frozen intent.
@@ -78,13 +79,14 @@ test("package.json: exact script inventory includes v2 and final v0.10 context-o
 	assert.equal(pkg.scripts?.["test:read-v3"], READ_V3_SCRIPT);
 	assert.equal(pkg.scripts?.["benchmark:context-output"], CONTEXT_OUTPUT_BENCHMARK_SCRIPT);
 	assert.equal(pkg.scripts?.["session:sanitize"], SESSION_SANITIZE_SCRIPT);
+	assert.equal(pkg.scripts?.["governance:rollback-check"], GOVERNANCE_ROLLBACK_CHECK_SCRIPT);
 
 	// The complete scripts map is exactly the pre-existing scripts plus the
 	// three v2 scripts and the additive test:release-assets,
 	// test:runtime-core, test:gate-preflight, test:worker-efficiency and
 	// test:diff-review-efficiency scripts, plus the two approved R0
-	// context-output baseline, core, and benchmark scripts — nothing changed,
-	// nothing removed.
+	// context-output baseline, core, and benchmark scripts, plus the read-only
+	// governance rollback check — nothing removed.
 	assert.deepEqual(pkg.scripts, {
 		typecheck: "tsc --noEmit",
 		test: "tsx --test tests/*.test.ts",
@@ -113,6 +115,7 @@ test("package.json: exact script inventory includes v2 and final v0.10 context-o
 		"cache:doctor": "tsx scripts/cache-benchmark.ts doctor",
 		"benchmark:context-output": CONTEXT_OUTPUT_BENCHMARK_SCRIPT,
 		"session:sanitize": SESSION_SANITIZE_SCRIPT,
+		"governance:rollback-check": GOVERNANCE_ROLLBACK_CHECK_SCRIPT,
 	});
 	// No version metadata drift.
 	assert.equal(pkg.version, "0.10.0");

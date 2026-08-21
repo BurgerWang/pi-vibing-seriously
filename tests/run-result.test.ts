@@ -238,6 +238,9 @@ test("status mapping: failed / killed / timed out / cancelled manifests", () => 
 	assert.ok(timed.text.includes("timed out  : yes"), timed.text);
 	const cancelled = renderRunResult(renderInput({ manifest: makeManifest({ cancelled: true }) }));
 	assert.ok(cancelled.text.includes("status     : CANCELLED"), cancelled.text);
+	const artifactFailed = renderRunResult(renderInput({ manifest: makeManifest({ exit_code: 0, run_outcome: "ARTIFACT_FAILED" }) }));
+	assert.ok(artifactFailed.text.includes("status     : FAILED"), artifactFailed.text);
+	assert.ok(artifactFailed.text.includes("exit code  : 0"), "the process exit remains truthful even when artifact validation failed");
 });
 
 // --------------------------------------------------------------------------

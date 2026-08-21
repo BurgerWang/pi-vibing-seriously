@@ -1129,16 +1129,66 @@ test("every registered tool uses the execute callback boundary; a real run_recip
 	});
 
 	const source = await readFile(join(process.cwd(), "extensions/workbench-runtime/index.ts"), "utf8");
+	const nativeController = await readFile(
+		join(process.cwd(), "extensions/workbench-runtime/core/native-tool-overrides-controller.ts"),
+		"utf8",
+	);
+	const recipeController = await readFile(
+		join(process.cwd(), "extensions/workbench-runtime/core/recipe-tools-controller.ts"),
+		"utf8",
+	);
+	const gateController = await readFile(
+		join(process.cwd(), "extensions/workbench-runtime/core/gate-tools-controller.ts"),
+		"utf8",
+	);
+	const compareController = await readFile(
+		join(process.cwd(), "extensions/workbench-runtime/core/compare-tool-controller.ts"),
+		"utf8",
+	);
+	const delegationStatusController = await readFile(
+		join(process.cwd(), "extensions/workbench-runtime/core/delegation-status-tool-controller.ts"),
+		"utf8",
+	);
+	const reviewController = await readFile(
+		join(process.cwd(), "extensions/workbench-runtime/core/review-tool-controller.ts"),
+		"utf8",
+	);
+	const delegateController = await readFile(
+		join(process.cwd(), "extensions/workbench-runtime/core/delegate-tool-controller.ts"),
+		"utf8",
+	);
+	const recoveryController = await readFile(
+		join(process.cwd(), "extensions/workbench-runtime/core/recovery-tool-controller.ts"),
+		"utf8",
+	);
+	const outputController = await readFile(
+		join(process.cwd(), "extensions/workbench-runtime/core/runtime-output-controller.ts"),
+		"utf8",
+	);
 	assert.match(source, /export default function workbenchRuntime\(runtimePi: ExtensionAPI\): void \{\s*const streamingControl = streamingControlledApi\(runtimePi\);\s*const pi = streamingControl\.api;/);
-	assert.equal((source.match(/\bpi\.registerTool\(\{/g) ?? []).length, 14, "all static native/catalog registrations use the controlled API");
-	const boundaryStart = source.indexOf("function boundedStreamingUpdate");
-	const boundaryEnd = source.indexOf("function wrapStreamingToolDefinition", boundaryStart);
-	const boundary = source.slice(boundaryStart, boundaryEnd);
+	assert.equal(
+		(source.match(/\bpi\.registerTool\(\{/g) ?? []).length
+			+ (nativeController.match(/\bcontroller\.pi\.registerTool\(\{/g) ?? []).length
+			+ (recipeController.match(/\bcontroller\.pi\.registerTool\(\{/g) ?? []).length
+			+ (gateController.match(/\bcontroller\.pi\.registerTool\(\{/g) ?? []).length
+			+ (compareController.match(/\bcontroller\.pi\.registerTool\(\{/g) ?? []).length
+			+ (delegationStatusController.match(/\bcontroller\.pi\.registerTool\(\{/g) ?? []).length
+			+ (reviewController.match(/\bcontroller\.pi\.registerTool\(\{/g) ?? []).length
+			+ (delegateController.match(/\bcontroller\.pi\.registerTool\(\{/g) ?? []).length
+			+ (recoveryController.match(/\bcontroller\.pi\.registerTool\(\{/g) ?? []).length,
+		14,
+		"all static native/catalog registrations use the injected controlled API",
+	);
+	const boundaryStart = outputController.indexOf("function boundedStreamingUpdate");
+	const boundaryEnd = outputController.indexOf("function wrapStreamingToolDefinition", boundaryStart);
+	const boundary = outputController.slice(boundaryStart, boundaryEnd);
 	assert.match(boundary, /enforceStreamingUpdate\(\{ toolName, content \}\)/);
 	assert.match(boundary, /projectToolResultDetails\(/);
 	assert.doesNotMatch(boundary, /turnOutputBudget|authorizeOutput|takeOutputAuthorization|finalizeReceipt/);
-	assert.match(source, /runtimePi\.on\("tool_execution_update"/);
-	assert.match(source, /boundGlobalStreamingUpdate\(event\)/);
+	assert.match(outputController, /runtimePi\.on\("tool_execution_update"/);
+	assert.match(outputController, /const locallyBoundedStreamingUpdates = new WeakSet<object>\(\);/);
+	assert.match(outputController, /boundGlobalStreamingUpdate\(event, locallyBoundedStreamingUpdates\)/);
+	assert.doesNotMatch(outputController, /^const locallyBoundedStreamingUpdates/m, "streaming update identity is isolated per runtime instance");
 });
 
 test("an active foreign tool with a frozen oversized update is blocked before execute, callback, or publish", async () => {
@@ -1755,10 +1805,10 @@ test("receipt finalization consumes bounded content and projection metadata reac
 		await writeConfigFile(root, "project.yaml", "name: output-control-wiring\nprofile: generic\n");
 		const stub = makeStub(); workbenchRuntime(stub); const ctx = trustedCtx(root);
 		const callId = "receipt-huge-1";
-		const guard = await emitToolCall(stub, ctx as ExtensionContext, { type: "tool_call", toolCallId: callId, toolName: "workbench_project_inspect", input: {} });
+		const guard = await emitToolCall(stub, ctx as ExtensionContext, { type: "tool_call", toolCallId: callId, toolName: "workbench_run_recipe", input: { recipe: "receipt-e2e" } });
 		assert.equal(guard.block, undefined);
 		const raw = `${"receipt-line\n".repeat(200_000)}RECEIPT-RAW-TAIL`;
-		const result = await emitToolResult(stub, { type: "tool_result", toolCallId: callId, toolName: "workbench_project_inspect", input: {}, content: [{ type: "text", text: raw }], isError: false, details: { ok: true } });
+		const result = await emitToolResult(stub, { type: "tool_result", toolCallId: callId, toolName: "workbench_run_recipe", input: { recipe: "receipt-e2e" }, content: [{ type: "text", text: raw }], isError: false, details: { ok: true } });
 		const shown = textOf(result.content);
 		assert.ok(bytes(shown) <= DEFAULT_RESULT_MAX_BYTES);
 		assert.ok(!shown.includes("RECEIPT-RAW-TAIL"));
@@ -1770,7 +1820,7 @@ test("receipt finalization consumes bounded content and projection metadata reac
 		assert.ok(stored.summary.length <= shown.length, "receipt scans only the already-bounded result");
 		let observed: unknown;
 		stub.events.get("tool_execution_end")?.push((event) => { observed = (event as { result?: { details?: unknown } }).result?.details; });
-		for (const handler of stub.events.get("tool_execution_end") ?? []) await handler({ type: "tool_execution_end", toolCallId: callId, toolName: "workbench_project_inspect", result: { content: result.content, details: result.details }, isError: false }, ctx);
+		for (const handler of stub.events.get("tool_execution_end") ?? []) await handler({ type: "tool_execution_end", toolCallId: callId, toolName: "workbench_run_recipe", result: { content: result.content, details: result.details }, isError: false }, ctx);
 		assert.equal(((observed as Record<string, unknown>).output_envelope as Record<string, unknown>).schema, "workbench-output-v1");
 	});
 });
@@ -1977,8 +2027,7 @@ test("footer adds CTX:SOFT/HIGH from numeric observations without becoming an en
 	await emitEvent(stub, "session_start", { type: "session_start", reason: "resume" }, ctx);
 	await emitMessageEnd(stub, assistantBatch([]), ctx);
 	assert.match(footer, /(?:^| \| )CTX:SOFT(?: \| |$)/);
-	const source = await readFile(join(process.cwd(), "extensions/workbench-runtime/index.ts"), "utf8");
-	const guard = source.slice(source.lastIndexOf('pi.on("tool_call"'));
+	const guard = await readFile(join(process.cwd(), "extensions/workbench-runtime/core/tool-call-guard-controller.ts"), "utf8");
 	assert.doesNotMatch(guard, /outputControlTelemetry|CTX:|outputTruncatedResults|outputHistoryCollapsedBundles/);
 });
 
@@ -2213,12 +2262,12 @@ test("receipt BEGIN failure releases its authorization and the immediate fallbac
 			...base,
 			sessionManager: { ...base.sessionManager, getSessionId: () => "" },
 		} as ExtensionContext;
-		await startBudgetTurn(stub, ctx, "other", 0, [{ id: "receipt-fail", name: "workbench_project_inspect", arguments: {} }]);
-		const guard = await emitToolCall(stub, ctx, { type: "tool_call", toolCallId: "receipt-fail", toolName: "workbench_project_inspect", input: {} });
+		await startBudgetTurn(stub, ctx, "other", 0, [{ id: "receipt-fail", name: "workbench_run_recipe", arguments: { recipe: "receipt-fail" } }]);
+		const guard = await emitToolCall(stub, ctx, { type: "tool_call", toolCallId: "receipt-fail", toolName: "workbench_run_recipe", input: { recipe: "receipt-fail" } });
 		assert.equal(guard.block, true);
 		assert.ok(bytes(guard.reason ?? "") <= 511);
 		const result = await emitMessageEnd(stub, {
-			role: "toolResult", toolCallId: "receipt-fail", toolName: "workbench_project_inspect",
+			role: "toolResult", toolCallId: "receipt-fail", toolName: "workbench_run_recipe",
 			content: [{ type: "text", text: "must-not-survive" }], details: {}, isError: true, timestamp: 1,
 		}, ctx);
 		assert.deepEqual(result.content, []);
@@ -2244,15 +2293,14 @@ test("blocked reservations with zero control allocation persist an empty result"
 });
 
 test("tool_call guard source order pins budget before receipt and bookkeeping", async () => {
-	const source = await readFile(join(process.cwd(), "extensions/workbench-runtime/index.ts"), "utf8");
-	const guard = source.slice(source.lastIndexOf('pi.on("tool_call"'));
+	const guard = await readFile(join(process.cwd(), "extensions/workbench-runtime/core/tool-call-guard-controller.ts"), "utf8");
 	const markers = [
-		"streamingControl.toolCallBlockReason(",
+		"controller.toolCallBlockReason(",
 		"workerRoleToolCallBlockReason(",
 		"isWorkerPathAllowedRealpath(",
 		"commanderToolCallBlockReason({",
 		"checkToolCall(mode",
-		"authorizeOutput(event.toolCallId",
+		"controller.authorizeOutput(event.toolCallId",
 		"beginReceipt({",
 		"consumeLeaseCall(",
 	];
@@ -2264,18 +2312,30 @@ test("tool_call guard source order pins budget before receipt and bookkeeping", 
 
 test("native read peeks the exact pending FIFO allocation before cursor rendering without consuming it", async () => {
 	const source = await readFile(join(process.cwd(), "extensions/workbench-runtime/index.ts"), "utf8");
-	const peekStart = source.indexOf("function peekOutputAuthorization(");
-	const peekEnd = source.indexOf("\n\tfunction rememberTrustedReadContinuation(", peekStart);
+	const transientState = await readFile(
+		join(process.cwd(), "extensions/workbench-runtime/core/runtime-transient-state.ts"),
+		"utf8",
+	);
+	const resultMiddleware = await readFile(
+		join(process.cwd(), "extensions/workbench-runtime/core/tool-result-middleware-controller.ts"),
+		"utf8",
+	);
+	const nativeController = await readFile(
+		join(process.cwd(), "extensions/workbench-runtime/core/native-tool-overrides-controller.ts"),
+		"utf8",
+	);
+	const peekStart = transientState.indexOf("peekOutputAuthorization(toolCallId, toolName) {");
+	const peekEnd = transientState.indexOf("\n\t\trememberTrustedReadContinuation:", peekStart);
 	assert.ok(peekStart >= 0 && peekEnd > peekStart);
-	const peek = source.slice(peekStart, peekEnd);
+	const peek = transientState.slice(peekStart, peekEnd);
 	assert.match(peek, /exactCallKey\(toolCallId, toolName\)/);
-	assert.match(peek, /pendingOutputAuthorizations\.get\(key\)\?\.\[0\]/);
+	assert.match(peek, /outputAuthorizations\.get\(key\)\?\.\[0\]/);
 	assert.doesNotMatch(peek, /shift\(|delete\(/, "execute-side peek must not consume the tool_result FIFO slot");
 
-	const readStart = source.indexOf("...NATIVE_OVERRIDE_METADATA.read");
-	const readEnd = source.indexOf("...NATIVE_OVERRIDE_METADATA.grep", readStart);
+	const readStart = nativeController.indexOf("...NATIVE_OVERRIDE_METADATA.read");
+	const readEnd = nativeController.indexOf("...NATIVE_OVERRIDE_METADATA.grep", readStart);
 	assert.ok(readStart >= 0 && readEnd > readStart);
-	const read = source.slice(readStart, readEnd);
+	const read = nativeController.slice(readStart, readEnd);
 	const markers = [
 		'peekOutputAuthorization(toolCallId, "read")',
 		"const maxOutputBytes =",
@@ -2285,9 +2345,9 @@ test("native read peeks the exact pending FIFO allocation before cursor renderin
 	const positions = markers.map((marker) => read.indexOf(marker));
 	assert.ok(positions.every((position) => position >= 0), JSON.stringify(positions));
 	assert.deepEqual([...positions].sort((a, b) => a - b), positions);
-	assert.match(source, /const trustedContinuation = takeTrustedReadContinuation\(event\.toolCallId, event\.toolName\)/);
+	assert.match(source, /transientState\.takeTrustedReadContinuation\(toolCallId, toolName\)/);
 	assert.doesNotMatch(
-		source.slice(source.indexOf('/** tool_result #1'), source.indexOf('/**\n\t * tool_result #2')),
+		resultMiddleware,
 		/details\?\.next_cursor|details\.next_cursor/,
 		"tool_result continuation must never be derived from caller-controlled details",
 	);
@@ -3107,6 +3167,84 @@ describe("trusted recovery authority and runtime ingress wiring", () => {
 		});
 	});
 
+	test("completed worker authority accepts strict legacy and immutable v2 report paths only", async () => {
+		await withTempDir(async (projectRoot) => {
+			const delegationId = "20260817-020000-v2ok";
+			const legacyPath = `.pi/workbench/delegations/${delegationId}/worker-report.md`;
+			const v2Path = `.pi/workbench/delegations/${delegationId}/v2/generations/g00000001/worker-report.md`;
+			for (const sourcePath of [legacyPath, v2Path]) {
+				await mkdir(dirname(join(projectRoot, sourcePath)), { recursive: true });
+				await writeFile(join(projectRoot, sourcePath), "bounded worker report\n", "utf8");
+				const authority = await buildTrustedRecoveryAuthority({
+					projectRoot,
+					sourceKind: "completed_worker_report",
+					toolCallId: `authority-${sourcePath.includes("/v2/") ? "v2" : "v1"}`,
+					toolName: "workbench_delegate_worker",
+					sourcePath,
+					requiredFacts: authorityFacts.completed_worker_report,
+				});
+				assert.ok(authority, sourcePath);
+				assert.equal(authority.sourcePath, sourcePath);
+			}
+
+			const invalidPaths = [
+				`.pi/workbench/delegations/delegation-01/v2/generations/g00000001/worker-report.md`,
+				`.pi/workbench/delegations/${delegationId}/v3/generations/g00000001/worker-report.md`,
+				`.pi/workbench/delegations/${delegationId}/v2/generations/.g00000001.attempt-deadbeef.staging/worker-report.md`,
+				`.pi/workbench/delegations/${delegationId}/v2/generations/g00000000/worker-report.md`,
+				`.pi/workbench/delegations/${delegationId}/v2/generations/g0000001/worker-report.md`,
+				`.pi/workbench/delegations/${delegationId}/v2/generations/g100000000/worker-report.md`,
+				`.pi/workbench/delegations/${delegationId}/v2/generations/g0000000x/worker-report.md`,
+				`.pi/workbench/delegations/${delegationId}/v2/generations/g00000001/extra/worker-report.md`,
+				`.pi/workbench/delegations/${delegationId}/v2/generations/../g00000001/worker-report.md`,
+			] as const;
+			for (const sourcePath of invalidPaths) {
+				const absolute = join(projectRoot, sourcePath);
+				await mkdir(dirname(absolute), { recursive: true });
+				await writeFile(absolute, "must never mint authority\n", "utf8");
+				assert.equal(await buildTrustedRecoveryAuthority({
+					projectRoot,
+					sourceKind: "completed_worker_report",
+					toolCallId: "authority-invalid-v2",
+					toolName: "workbench_delegate_worker",
+					sourcePath,
+					requiredFacts: authorityFacts.completed_worker_report,
+				}), undefined, sourcePath);
+			}
+
+			const authority = await buildTrustedRecoveryAuthority({
+				projectRoot,
+				sourceKind: "completed_worker_report",
+				toolCallId: "authority-v2-projection",
+				toolName: "workbench_delegate_worker",
+				sourcePath: v2Path,
+				requiredFacts: authorityFacts.completed_worker_report,
+			});
+			assert.ok(authority);
+			const projected = projectToolResultIngress({
+				toolCallId: "authority-v2-projection",
+				toolName: "workbench_delegate_worker",
+				content: [{ type: "text", text: "bounded handoff" }],
+				isError: false,
+				authority,
+			});
+			assert.equal(projected.status, "projected");
+			if (projected.status !== "projected") assert.fail("strict v2 worker source must project");
+			assert.equal(projected.metadata.sourcePath, v2Path);
+			for (const sourcePath of invalidPaths) {
+				const refused = projectToolResultIngress({
+					toolCallId: "authority-v2-projection",
+					toolName: "workbench_delegate_worker",
+					content: [{ type: "text", text: "bounded handoff" }],
+					isError: false,
+					authority: { ...authority, sourcePath },
+				});
+				assert.equal(refused.status, "unchanged", `projection must reject ${sourcePath}`);
+				if (refused.status === "unchanged") assert.equal(refused.reason, "invalid_authority");
+			}
+		});
+	});
+
 	test("authority fails closed on same-size sub-millisecond mutation and oversized durable sources", async () => {
 		await withTempDir(async (outer) => {
 			const projectRoot = join(outer, "project");
@@ -3357,6 +3495,7 @@ describe("trusted recovery authority and runtime ingress wiring", () => {
 			try {
 				process.argv[1] = fakeWorker;
 				raw = await tool.execute("ingress-worker-report", {
+					task_kind: "diagnosis",
 					task: "Return the fixed bounded report without changing files.",
 					allowed_paths: ["extensions/workbench-runtime/index.ts"],
 					acceptance_criteria: ["A durable worker report is recorded."],
@@ -3480,12 +3619,7 @@ describe("trusted recovery authority and runtime ingress wiring", () => {
 				content: raw.content, details: raw.details, isError: false,
 			});
 			assertIngressResult(result, "finalized_run_page", "/stdout.log");
-			const receiptFacts = (result.details as Record<string, unknown>).receipt as Record<string, unknown>;
-			assert.equal(receiptFacts.available, true);
-			const receiptPath = String(receiptFacts.path);
-			const receipt = JSON.parse(await readFile(join(root, receiptPath), "utf8")) as { summary: string };
-			assert.match(receipt.summary, /^\[workbench-tool-result-ingress v1\]\n/);
-			assert.ok(bytes(receipt.summary) <= TOOL_RESULT_INGRESS_BUDGET_BYTES);
+			assert.equal(Object.hasOwn(result.details as Record<string, unknown>, "receipt"), false, "replay-safe workbench_read_run creates zero receipt");
 		});
 	});
 
@@ -3586,16 +3720,7 @@ describe("trusted recovery authority and runtime ingress wiring", () => {
 			assert.equal(envelope.shownTextBytes, bytes(shown));
 			assert.equal(Object.hasOwn(details, "ingress_projection"), false, "post-envelope content cannot retain the pre-envelope projection hash or byte facts");
 
-			const receiptFacts = details.receipt as Record<string, unknown>;
-			assert.equal(receiptFacts.available, true);
-			const receipt = JSON.parse(await readFile(join(root, String(receiptFacts.path)), "utf8")) as {
-				summary: string;
-				summary_omitted_bytes: number;
-			};
-			assert.doesNotMatch(receipt.summary, /\[workbench-tool-result-ingress|\[workbench-recovery|projection_hash=/, "the receipt scans only the final generic envelope");
-			assert.ok(bytes(receipt.summary) <= DEFENSIVE_DYNAMIC_RESERVATION_BYTES);
-			assert.equal(shown.startsWith(receipt.summary.slice(0, 256)), true);
-			assert.ok(receipt.summary_omitted_bytes >= 0);
+			assert.equal(Object.hasOwn(details, "receipt"), false, "replay-safe comparison creates zero receipt");
 
 			await emitEvent(stub, "turn_end", { type: "turn_end", turnIndex: 93, message: {}, toolResults: [] }, ctx);
 			const telemetryEntries = stub.appendedEntries.filter((entry) => entry.customType === "workbench-output-turn-telemetry-v1");

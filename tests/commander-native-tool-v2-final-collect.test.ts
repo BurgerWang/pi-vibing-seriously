@@ -1773,9 +1773,9 @@ test("preflight: privacy — errors carry fixed child basenames only, never root
 /** Repository root — read-only real-tree references only (frozen bundle copy, package.json pin). */
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
-/** Byte-copy the real frozen bundle (AGENTS.md + skills/ + prompts/ + templates/) into a temp project root. */
+/** Byte-copy the frozen bundle; the root AGENTS bytes come from the historical generic template, never the live repository policy. */
 async function makeBundleCopy(projectRoot: string): Promise<void> {
-	await cp(join(REPO_ROOT, "AGENTS.md"), join(projectRoot, "AGENTS.md"));
+	await cp(join(REPO_ROOT, "templates", "project", "AGENTS.generic.md"), join(projectRoot, "AGENTS.md"));
 	for (const dir of ["skills", "prompts", "templates"] as const) {
 		await cp(join(REPO_ROOT, dir), join(projectRoot, dir), { recursive: true });
 	}
@@ -1832,19 +1832,23 @@ test("preflightSystemForCollectorV2: success reproduces every frozen pin and ret
 	});
 });
 
-test("preflightSystemForCollectorV2: the current Pi 0.84.2 repository fails closed against the historical Pi 0.83.0 collector (read-only)", async () => {
+test("preflightSystemForCollectorV2: the current Pi 0.84.2 package pin fails closed against the historical Pi 0.83.0 collector", async () => {
 	const raw = await readFile(join(REPO_ROOT, PACKAGE_JSON_RELATIVE_V2), "utf8");
 	const root = JSON.parse(raw) as Record<string, unknown>;
 	const devDeps = root.devDependencies;
 	assert.ok(typeof devDeps === "object" && devDeps !== null && !Array.isArray(devDeps), "real package.json must carry devDependencies");
 	assert.equal((devDeps as Record<string, unknown>)["@earendil-works/pi-coding-agent"], "0.84.2", "the real repository must carry the currently qualified Pi pin");
 	assert.equal(FROZEN_ENVIRONMENT.piVersion, "0.83.0", "the historical paid benchmark authority must retain its frozen Pi pin");
-	await expectSystemError(
-		REPO_ROOT,
-		{ nodeVersion: FROZEN_ENVIRONMENT.nodeVersion },
-		"PACKAGE_PIN_MISMATCH",
-		`devDependencies["@earendil-works/pi-coding-agent"] must be pinned exactly to the frozen Pi version (${FROZEN_ENVIRONMENT.piVersion})`,
-	);
+	await withTempDir(async (projectRoot) => {
+		await makeSystemRoot(projectRoot);
+		await writeFile(join(projectRoot, PACKAGE_JSON_RELATIVE_V2), JSON.stringify({ devDependencies: { "@earendil-works/pi-coding-agent": "0.84.2" } }), "utf8");
+		await expectSystemError(
+			projectRoot,
+			{ nodeVersion: FROZEN_ENVIRONMENT.nodeVersion },
+			"PACKAGE_PIN_MISMATCH",
+			`devDependencies["@earendil-works/pi-coding-agent"] must be pinned exactly to the frozen Pi version (${FROZEN_ENVIRONMENT.piVersion})`,
+		);
+	});
 });
 
 test("preflightSystemForCollectorV2: every protocol pin and environment drift fails closed BEFORE any filesystem access", async () => {

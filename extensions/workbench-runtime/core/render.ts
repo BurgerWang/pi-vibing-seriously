@@ -30,6 +30,8 @@ import {
 
 export interface RecipeToolDetails {
 	ok: boolean;
+	/** Fixed machine failure code for a committed diagnostic run. */
+	error?: string;
 	run_id: string;
 	recipe: string;
 	status: string;

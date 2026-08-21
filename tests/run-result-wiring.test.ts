@@ -212,6 +212,18 @@ const FAIL_JS = ['console.error("TypeError: boom at fail.js:1");', "process.exit
 
 const FAIL_RECIPES = 'recipes:\n  - name: fail\n    command: ["node", "fail.js"]\n';
 
+const ARTIFACT_FAIL_RECIPES = [
+	"recipes:",
+	"  - name: artifact-fail",
+	'    command: ["node", "artifact-ok.js"]',
+	"    artifacts:",
+	'      - path: "missing/*.json"',
+	"        required: true",
+	"        min_count: 1",
+	"        freshness: current",
+	"",
+].join("\n");
+
 /** The run records directory of a temp project. */
 function runsDir(root: string): string {
 	return join(root, CONFIG_DIR_NAME, "workbench", "runs");
@@ -356,7 +368,7 @@ test("workbench_read_run include=logs: shared quoted reverse page with bounded p
 		assertWithinCaps(text, 20_480, 200);
 		assert.ok(text.includes("[workbench-run-log-page v1]"), text);
 		assert.ok(text.includes(`.pi/workbench/runs/${runId}/stdout.log`), text);
-		assert.ok(text.includes("noise-line-250"), "tail keeps the LAST log lines");
+		assert.ok(text.includes("noise-line-250"), `tail keeps the LAST log lines:\n${text}`);
 		assert.ok(!text.split("\n").includes("| noise-line-1"), "oldest line is outside the reverse page");
 		assert.ok(!text.split("\n").includes("| RAW-SUCCESS-MARKER-42"), "the first line is outside the reverse page");
 		assert.ok(text.includes("--- BEGIN QUOTED STDERR CONTENT ---"), text);
@@ -417,6 +429,51 @@ test("workbench_read_run default on a failing run: status FAILED, exit 1, within
 		assert.ok(!text.includes("TypeError: boom at fail.js:1"), text);
 		assert.ok(!/^argv\s*:/m.test(text), text);
 		await assertDiskUnchanged(runDir, diskBefore);
+	});
+});
+
+test("workbench_run_recipe reports committed artifact failure without converting exit 0 to success", async () => {
+	await withTempDir(async (root) => {
+		await setupProject(root, ARTIFACT_FAIL_RECIPES);
+		await writeFile(join(root, "artifact-ok.js"), 'console.log("process completed");\n', "utf8");
+		const stub = makeStub();
+		workbenchRuntime(stub);
+		const recipeTool = stub.tools.get("workbench_run_recipe") as unknown as RecipeTool;
+		assert.ok(recipeTool, "workbench_run_recipe registered");
+
+		const result = await recipeTool.execute(
+			"call-artifact-fail",
+			{ recipe: "artifact-fail", cache: "no-cache" },
+			undefined,
+			undefined,
+			trustedCtx(root) as never,
+		);
+		const text = toolText(result);
+		assert.ok(text.includes("error      : REQUIRED_ARTIFACT_MISSING"), text);
+		assert.ok(text.includes("status     : FAILED"), text);
+		assert.ok(text.includes("exit code  : 0"), text);
+		assert.equal(result.details.ok, false);
+		assert.equal(result.details.error, "REQUIRED_ARTIFACT_MISSING");
+		assert.equal(result.details.status, "FAILED");
+		assert.equal(result.details.exit_code, 0);
+
+		const runDir = await singleRunDir(root);
+		const manifest = JSON.parse(await readFile(join(runDir, "manifest.json"), "utf8")) as {
+			run_id?: string;
+			run_outcome?: string;
+			exit_code?: number | null;
+			artifact_manifest_path?: string;
+		};
+		assert.equal(manifest.run_id, basename(runDir));
+		assert.equal(manifest.run_outcome, "ARTIFACT_FAILED");
+		assert.equal(manifest.exit_code, 0);
+		assert.equal(manifest.artifact_manifest_path, "artifact-manifest.json");
+		const commit = JSON.parse(await readFile(join(runDir, "run-commit.json"), "utf8")) as {
+			schema_version?: number;
+			run_id?: string;
+		};
+		assert.equal(commit.schema_version, 2);
+		assert.equal(commit.run_id, basename(runDir));
 	});
 });
 

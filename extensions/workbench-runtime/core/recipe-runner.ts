@@ -27,20 +27,18 @@
  *     never blocks the task and never bypasses gates
  */
 
-import { mkdir, writeFile } from "node:fs/promises";
-import { copyFile } from "node:fs/promises";
-import { join, relative, basename } from "node:path";
-import { globSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
+import { join, relative } from "node:path";
 
 import { truncateHead, truncateTail } from "@earendil-works/pi-coding-agent";
 
-import { loadProjectConfig, runsDir, type ExecFn } from "./config.ts";
+import { loadProjectConfig, type ExecFn } from "./config.ts";
 import type { WorkbenchMode } from "./mode-policy.ts";
 import { realpathContained, lexicalContain } from "./path-guard.ts";
 import { buildArgv, RecipeParamError, type Recipe } from "./recipe-schema.ts";
 import { recipeMutationBlockReason, type RecipeMutationFacts } from "./worker-policy.ts";
 import { collectSecretValues, redactArgvEntry, redactEnvValue, redactText } from "./redact.ts";
-import { makeRunId, RUN_SCHEMA_VERSION, type RunRecord, type RunSummaryRecord } from "./runs.ts";
+import { makeRunId, RUN_MANIFEST_SCHEMA_VERSION_V2, type RunRecord, type RunSummaryRecord } from "./runs.ts";
 import { EXTENSION_VERSION } from "../cache/cache-types.ts";
 import { ActionCacheStore, type LockHandle } from "../cache/action-store.ts";
 import { ARTIFACT_RESTORE_ENABLED } from "../cache/action-types.ts";
@@ -57,6 +55,11 @@ import {
 } from "../cache/action-cache.ts";
 import type { ActionKey, ActionRecord } from "../cache/action-types.ts";
 import { captureRecipeValidationEvidence, executedArgvHash, unavailableEvidenceBlock, type ValidationEvidenceBlock } from "./validation-evidence.ts";
+import {
+	collectRecipeArtifactsV2,
+	writeArtifactManifestV2,
+} from "./artifact-contract.ts";
+import { beginRunTransaction, commitRunTransaction } from "./run-transaction.ts";
 
 export interface RunRecipeInput {
 	projectRoot: string;
@@ -129,24 +132,6 @@ async function gitState(projectRoot: string, exec: ExecFn): Promise<{ commit: st
 	}
 }
 
-/** Collect artifact files matching declared globs (project-relative paths). */
-async function collectArtifacts(projectRoot: string, globs: readonly string[]): Promise<string[]> {
-	const paths = new Set<string>();
-	for (const pattern of globs) {
-		if (lexicalContain(projectRoot, pattern) === undefined) continue; // validated earlier; skip defensively
-		for (const match of globSync(pattern, { cwd: projectRoot })) {
-			// glob may return directories for patterns like "dist/**"; keep files only.
-			try {
-				const { stat } = await import("node:fs/promises");
-				if ((await stat(join(projectRoot, match))).isFile()) paths.add(match);
-			} catch {
-				// vanished between glob and stat
-			}
-		}
-	}
-	return [...paths].sort();
-}
-
 /**
  * Validate every declared path of the recipe against the project root.
  * Throws RecipeSetupError on the first violation.
@@ -166,39 +151,6 @@ export async function validateRecipePaths(projectRoot: string, recipe: Recipe): 
 	for (const artifact of recipe.artifacts) {
 		if (lexicalContain(projectRoot, artifact) === undefined) {
 			throw new RecipeSetupError(`recipe "${recipe.name}" artifacts pattern escapes the project root: ${artifact}`);
-		}
-	}
-}
-
-/**
- * Snapshot declared JSON artifacts into the run directory (P4).
- *
- * Run records must be self-contained evidence: the comparator and quant
- * report only ever read facts that are attributed to a run. Small JSON
- * artifacts (<= 1MB) are copied to `<run-dir>/artifacts/<basename>` so later
- * runs overwriting the same project file can never corrupt earlier records.
- */
-const SNAPSHOT_MAX_BYTES = 1024 * 1024;
-
-async function snapshotJsonArtifacts(projectRoot: string, runDir: string, artifactPaths: readonly string[]): Promise<void> {
-	const targets: string[] = [];
-	const { stat } = await import("node:fs/promises");
-	for (const rel of artifactPaths) {
-		if (!rel.endsWith(".json")) continue;
-		try {
-			const info = await stat(join(projectRoot, rel));
-			if (info.isFile() && info.size <= SNAPSHOT_MAX_BYTES) targets.push(rel);
-		} catch {
-			// vanished between collection and snapshot — skip
-		}
-	}
-	if (targets.length === 0) return;
-	await mkdir(join(runDir, "artifacts"), { recursive: true });
-	for (const rel of targets) {
-		try {
-			await copyFile(join(projectRoot, rel), join(runDir, "artifacts", basename(rel)));
-		} catch {
-			// unreadable source — record without a snapshot
 		}
 	}
 }
@@ -329,18 +281,26 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		const outcome = await lookupValidated(cacheCtx, key);
 		if (outcome.status !== "hit" || !outcome.record) return null;
 		const git = await gitState(projectRoot, exec);
-		const materialized = await materializeCachedRun({
-			projectRoot,
-			recipe,
-			policy: recipe.cache,
-			profile: config.profile,
-			key,
-			record: outcome.record,
-			mode,
-			git,
-			now,
-		});
-		return { materialized, record: outcome.record };
+		try {
+			const materialized = await materializeCachedRun({
+				projectRoot,
+				recipe,
+				policy: recipe.cache,
+				profile: config.profile,
+				key,
+				record: outcome.record,
+				mode,
+				git,
+				now,
+				authorizedExternalRoots: config.artifactExternalRoots,
+				exec,
+			});
+			return { materialized, record: outcome.record };
+		} catch {
+			// A cache hit that cannot produce a complete v2 run transaction is
+			// not a hit. Execute normally; partial staging is never consumable.
+			return null;
+		}
 	};
 
 	// P4a: patch the materialized cache-hit run with its validation binding
@@ -350,7 +310,7 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 	const hitResult = async (hit: NonNullable<Awaited<ReturnType<typeof tryHit>>>, actionKey: string, reason: string): Promise<RunRecipeResult> => {
 		const patched = await captureAndPatchRunManifest({
 			projectRoot,
-			runDir: hit.materialized.runDir,
+			runDir: hit.materialized.stagingDir,
 			record: hit.materialized.record,
 			profile: config.profile,
 			mode,
@@ -364,6 +324,14 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 			complete: true,
 			source: "cache",
 		});
+		try {
+			await commitRunTransaction(
+				{ runId: hit.materialized.runId, stagingDir: hit.materialized.stagingDir, finalDir: hit.materialized.runDir },
+				new Date(hit.materialized.record.finished_at),
+			);
+		} catch {
+			return { ok: false, error: "RUN_RECORD_COMMIT_FAILED" };
+		}
 		return {
 			ok: hit.record.success,
 			record: patched,
@@ -406,7 +374,15 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 
 	// ------------------------------------------------------------------ exec
 	const runId = makeRunId(startedAt);
-	const runDir = join(runsDir(projectRoot), runId);
+	let transaction;
+	try {
+		transaction = await beginRunTransaction(projectRoot, runId);
+	} catch (error) {
+		if (lock) await lock.release().catch(() => {});
+		return { ok: false, error: `RUN_RECORD_COMMIT_FAILED: ${(error as Error).message}` };
+	}
+	const runDir = transaction.finalDir;
+	const writeDir = transaction.stagingDir;
 	const env = buildEnvironment(recipe);
 	const secrets = collectSecretValues(env);
 
@@ -418,8 +394,6 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 	const cwd = (await realpathContained(projectRoot, recipe.cwd)) as string;
 
 	const git = await gitState(projectRoot, exec);
-
-	await mkdir(runDir, { recursive: true });
 
 	let result: { stdout: string; stderr: string; code: number; killed: boolean };
 	try {
@@ -435,7 +409,7 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		const failedAt = now();
 		const redactedArgv = redactText(argv.join("\u0000"), secrets).split("\u0000").map(redactArgvEntry);
 		const record: RunRecord = {
-			schema_version: RUN_SCHEMA_VERSION,
+			schema_version: RUN_MANIFEST_SCHEMA_VERSION_V2,
 			run_id: runId,
 			recipe: recipe.name,
 			profile: config.profile,
@@ -459,17 +433,22 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 			validation_components: recipe.validation_components,
 			cache_request_mode: cacheMode,
 			argv_hash: executedArgvHashValue,
+			run_transaction_schema_version: 2,
+			run_outcome: "PROCESS_FAILED",
+			artifact_manifest_path: "artifact-manifest.json",
 		};
 		const environmentRecord: Record<string, string> = {};
 		for (const [name, value] of Object.entries(env)) {
 			environmentRecord[name] = redactEnvValue(name, value);
 		}
-		await writeFile(join(runDir, "manifest.json"), JSON.stringify(record, null, 2), "utf8");
-		await writeFile(join(runDir, "command.json"), JSON.stringify({ recipe: recipe.name, argv: redactedArgv, cwd, error: (error as Error).message }, null, 2), "utf8");
-		await writeFile(join(runDir, "environment.json"), JSON.stringify({ environment: environmentRecord }, null, 2), "utf8");
-		await writeFile(join(runDir, "stdout.log"), "", "utf8");
-		await writeFile(join(runDir, "stderr.log"), "", "utf8");
-		await writeFile(join(runDir, "summary.json"), JSON.stringify({ run_id: runId, recipe: recipe.name, error: (error as Error).message }, null, 2), "utf8");
+		const artifactCollection = await collectRecipeArtifactsV2({ projectRoot, runId, stagingRunDir: writeDir, contracts: recipe.artifact_contracts, authorizedExternalRoots: config.artifactExternalRoots, exec });
+		await writeArtifactManifestV2(writeDir, artifactCollection.manifest);
+		await writeFile(join(writeDir, "manifest.json"), JSON.stringify(record, null, 2), "utf8");
+		await writeFile(join(writeDir, "command.json"), JSON.stringify({ recipe: recipe.name, argv: redactedArgv, cwd, error: (error as Error).message }, null, 2), "utf8");
+		await writeFile(join(writeDir, "environment.json"), JSON.stringify({ environment: environmentRecord }, null, 2), "utf8");
+		await writeFile(join(writeDir, "stdout.log"), "", "utf8");
+		await writeFile(join(writeDir, "stderr.log"), "", "utf8");
+		await writeFile(join(writeDir, "summary.json"), JSON.stringify({ run_id: runId, recipe: recipe.name, error: "PROCESS_FAILED" }, null, 2), "utf8");
 		// P4a: capture the validation binding for the spawn-failure terminal
 		// path too (outcome: unsuccessful + incomplete). A capture failure
 		// persists bounded unavailable state; the original spawn error always
@@ -477,7 +456,7 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		try {
 			await captureAndPatchRunManifest({
 				projectRoot,
-				runDir,
+				runDir: writeDir,
 				record,
 				profile: config.profile,
 				mode,
@@ -494,6 +473,11 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		} catch {
 			// never mask the spawn failure with a manifest-patch error
 		}
+		try {
+			await commitRunTransaction(transaction, failedAt);
+		} catch {
+			throw new Error(`recipe "${recipeName}" failed to spawn and RUN_RECORD_COMMIT_FAILED`);
+		}
 		throw new Error(`recipe "${recipeName}" failed to spawn: ${(error as Error).message}`);
 	}
 
@@ -509,11 +493,19 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 	const stdoutView = truncate(stdoutFull, truncationOptions);
 	const stderrView = truncate(stderrFull, truncationOptions);
 
-	const artifactPaths = await collectArtifacts(projectRoot, recipe.artifacts);
-	await snapshotJsonArtifacts(projectRoot, runDir, artifactPaths);
+	const artifactCollection = await collectRecipeArtifactsV2({
+		projectRoot,
+		runId,
+		stagingRunDir: writeDir,
+		contracts: recipe.artifact_contracts,
+		authorizedExternalRoots: config.artifactExternalRoots,
+		exec,
+	});
+	const artifactPaths = artifactCollection.artifactPaths;
+	const runOk = exitOk && artifactCollection.ok;
 
 	const record: RunRecord = {
-		schema_version: RUN_SCHEMA_VERSION,
+		schema_version: RUN_MANIFEST_SCHEMA_VERSION_V2,
 		run_id: runId,
 		recipe: recipe.name,
 		profile: config.profile,
@@ -538,6 +530,9 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		cache_request_mode: cacheMode,
 		execution_source: "exec",
 		argv_hash: executedArgvHashValue,
+		run_transaction_schema_version: 2,
+		run_outcome: !exitOk ? "PROCESS_FAILED" : artifactCollection.ok ? "SUCCESS" : "ARTIFACT_FAILED",
+		artifact_manifest_path: "artifact-manifest.json",
 	};
 
 	const summary: RunSummaryRecord = {
@@ -568,9 +563,10 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		environmentRecord[name] = redactEnvValue(name, value);
 	}
 
-	await writeFile(join(runDir, "manifest.json"), JSON.stringify(record, null, 2), "utf8");
+	await writeArtifactManifestV2(writeDir, artifactCollection.manifest);
+	await writeFile(join(writeDir, "manifest.json"), JSON.stringify(record, null, 2), "utf8");
 	await writeFile(
-		join(runDir, "command.json"),
+		join(writeDir, "command.json"),
 		JSON.stringify(
 			{
 				recipe: recipe.name,
@@ -587,10 +583,10 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		),
 		"utf8",
 	);
-	await writeFile(join(runDir, "environment.json"), JSON.stringify({ environment: environmentRecord }, null, 2), "utf8");
-	await writeFile(join(runDir, "stdout.log"), stdoutFull, "utf8");
-	await writeFile(join(runDir, "stderr.log"), stderrFull, "utf8");
-	await writeFile(join(runDir, "summary.json"), JSON.stringify(summary, null, 2), "utf8");
+	await writeFile(join(writeDir, "environment.json"), JSON.stringify({ environment: environmentRecord }, null, 2), "utf8");
+	await writeFile(join(writeDir, "stdout.log"), stdoutFull, "utf8");
+	await writeFile(join(writeDir, "stderr.log"), stderrFull, "utf8");
+	await writeFile(join(writeDir, "summary.json"), JSON.stringify(summary, null, 2), "utf8");
 
 	// ---------------------------------------------------------- cache write
 	let cacheStatus: RunRecipeResult["cache"] = {
@@ -625,7 +621,7 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 			gitCommit: git.commit,
 			gitDirty: git.dirty,
 		};
-		if (shouldCacheRun(recipe.cache, facts)) {
+		if (artifactCollection.ok && shouldCacheRun(recipe.cache, facts)) {
 			// P6-D: the quant contract is re-validated AT WRITE TIME — a schema
 			// that became invalid (or a logical reference that can no longer
 			// resolve) between key computation and write REFUSES the cache.
@@ -658,7 +654,7 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 	// patch the persisted + returned manifest (never alters the outcome).
 	const patched = await captureAndPatchRunManifest({
 		projectRoot,
-		runDir,
+		runDir: writeDir,
 		record,
 		profile: config.profile,
 		mode,
@@ -668,12 +664,24 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		argvHash: executedArgvHashValue,
 		projectGates: config.gates,
 		actorFacts: input.actorFacts,
-		successful: exitOk,
+		successful: runOk,
 		complete: !result.killed,
 		source: "exec",
 	});
+	try {
+		await commitRunTransaction(transaction, finishedAt);
+	} catch {
+		return { ok: false, error: "RUN_RECORD_COMMIT_FAILED", record: patched, summary, cache: cacheStatus };
+	}
 
-	return { ok: exitOk, record: patched, summary, runDir, cache: cacheStatus };
+	return {
+		ok: runOk,
+		error: artifactCollection.ok ? undefined : artifactCollection.code,
+		record: patched,
+		summary,
+		runDir,
+		cache: cacheStatus,
+	};
 }
 
 /** Project-relative form of a path for display (keeps messages portable). */

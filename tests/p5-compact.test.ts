@@ -219,7 +219,7 @@ test("buildCompactNote is bounded, ASCII, and contains pointers only", () => {
 	assert.ok(!/[\u{1F300}-\u{1FAFF}\u{2190}-\u{21FF}]/u.test(note), "no emoji/symbols");
 });
 
-test("buildCompactNote names worker-first strict active, denied commander writes, pending/reviewed delegation state and the next action", () => {
+test("buildCompactNote names development-first direct writes, the high-risk lease boundary, and delegation state", () => {
 	const s = state({
 		writePolicy: "worker-first-strict",
 		commanderWritesDenied: true,
@@ -230,8 +230,8 @@ test("buildCompactNote names worker-first strict active, denied commander writes
 		nextDelegationAction: "review delegation 20260801-120000-abcd (PENDING_REVIEW) before the next delegation or VERIFY",
 	});
 	const note = buildCompactNote(s);
-	assert.ok(note.includes("worker-first: strict active"), note);
-	assert.ok(note.includes("commander writes: denied"), note);
+	assert.ok(note.includes("development writes: direct (high-risk paths require lease)"), note);
+	assert.ok(note.includes("high-risk writes: lease required"), note);
 	assert.ok(note.includes("delegation: 20260801-120000-abcd PENDING_REVIEW"), note);
 	assert.ok(note.includes("blocked commander writes: 4"), note);
 	assert.ok(note.includes("next delegation action: review delegation 20260801-120000-abcd"), note);

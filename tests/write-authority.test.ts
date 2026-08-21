@@ -2,10 +2,11 @@
  * P7 tests for the pure write-authority foundations (core/write-authority.ts).
  *
  * Focus: actor detection (env worker identity, Sol identity, no config
- * self-labeling), the single worker-first-strict policy (approved Sol
- * always, non-Sol not applicable), the exact fixed-order strict Sol DEV
- * allowlist, the foreign-tool removal helper, the second-layer commander
- * decision (Sol-only guard: bash always blocked, edit/write lease-gated,
+ * self-labeling), the legacy-compatible policy identity (approved Sol
+ * always, non-Sol not applicable), the fixed development-first Sol DEV
+ * surface, the foreign-tool removal helper, the second-layer commander
+ * decision (Sol-only guard: bash blocked, ordinary edit/write direct,
+ * high-risk edit/write lease-gated,
  * non-allowlist tools blocked; workers and other controllers outside the
  * guard), temporary commander write leases (reason / path / calls /
  * duration / two-part confirmation tokens / timeout / exhaustion /
@@ -23,8 +24,10 @@ import {
 	commanderToolCallBlockReason,
 	confirmLease,
 	consumeLeaseCall,
+	DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST,
 	defaultWritePolicy,
 	detectActorRole,
+	directDevelopmentWriteBlockReason,
 	foreignTools,
 	isInStrictAllowlist,
 	isLeasePathAuthorized,
@@ -277,6 +280,7 @@ test("commander guard blocks bash always for Sol, even with an active lease and 
 	const reason = guard("bash", { command: "npm test" });
 	assert.ok(reason);
 	assert.match(reason, /workbench_delegate_worker/);
+	assert.match(reason, /optional/);
 	assert.match(reason, /lease/);
 	// An active lease never authorizes bash.
 	const lease = activeLease();
@@ -285,50 +289,54 @@ test("commander guard blocks bash always for Sol, even with an active lease and 
 	assert.ok(guard("bash", { command: "npm test" }));
 });
 
-test("commander edit/write requires an active lease authorizing the path and the remaining call", () => {
+test("commander edit/write is direct for ordinary paths and lease-gated for high-risk paths", () => {
 	const lease = activeLease();
 	assert.equal(guard("edit", { path: "src/main.ts" }, { lease }), undefined);
 	assert.equal(guard("write", { path: "README.md" }, { lease }), undefined);
-	// Subtree coverage: nested paths under src/ are authorized.
+	assert.equal(guard("edit", { path: "src/main.ts" }), undefined);
+	assert.equal(guard("write", { path: "README.md" }), undefined);
 	assert.equal(guard("write", { path: "src/nested/deep/file.ts" }, { lease }), undefined);
-	// No lease at all: locked.
-	const locked = guard("edit", { path: "src/main.ts" });
+
+	const locked = guard("edit", { path: "package.json" });
 	assert.ok(locked);
 	assert.match(locked, /lease locked/);
-	assert.match(locked, /workbench_delegate_worker/);
+	assert.match(locked, /high-risk path/);
+	const highRiskLease = activeLease({ paths: ["package.json", "src/security/**"] });
+	assert.equal(guard("edit", { path: "package.json" }, { lease: highRiskLease }), undefined);
+	assert.equal(guard("write", { path: "src/security/auth.ts" }, { lease: highRiskLease }), undefined);
 	// Lease still pending confirmation.
-	const pending = issueOk();
-	const pendingReason = guard("edit", { path: "src/main.ts" }, { lease: pending });
+	const pending = issueOk({ paths: ["package.json"] });
+	const pendingReason = guard("edit", { path: "package.json" }, { lease: pending });
 	assert.ok(pendingReason);
 	assert.match(pendingReason, /lease pending/);
 	// Wrong confirmation parts never activate the lease.
 	const badConfirm = confirmLease(pending, "WRONG", TOKEN_B, NOW);
 	assert.equal(badConfirm.ok, false);
 	// Exhausted lease (no remaining call).
-	const exhausted = { ...activeLease({ maxCalls: 1 }), callsUsed: 1 };
-	const exhaustedReason = guard("write", { path: "src/main.ts" }, { lease: exhausted });
+	const exhausted = { ...activeLease({ maxCalls: 1, paths: ["package.json"] }), callsUsed: 1 };
+	const exhaustedReason = guard("write", { path: "package.json" }, { lease: exhausted });
 	assert.ok(exhaustedReason);
 	assert.match(exhaustedReason, /lease exhausted/);
 	// Expired lease.
-	const expired = activeLease();
-	const expiredReason = guard("write", { path: "src/main.ts" }, { lease: expired, now: AFTER_EXPIRY });
+	const expired = activeLease({ paths: ["package.json"] });
+	const expiredReason = guard("write", { path: "package.json" }, { lease: expired, now: AFTER_EXPIRY });
 	assert.ok(expiredReason);
 	assert.match(expiredReason, /lease expired/);
 	// Revoked lease.
-	const revoked = revokeLease(activeLease(), "model change", NOW);
-	const revokedReason = guard("write", { path: "src/main.ts" }, { lease: revoked });
+	const revoked = revokeLease(activeLease({ paths: ["package.json"] }), "model change", NOW);
+	const revokedReason = guard("write", { path: "package.json" }, { lease: revoked });
 	assert.ok(revokedReason);
 	assert.match(revokedReason, /lease revoked/);
 });
 
-test("commander edit/write is refused when the lease does not authorize the path, tool, or input shape", () => {
-	const lease = activeLease();
+test("high-risk writes require matching lease scope/tool while malformed direct writes fail closed", () => {
+	const lease = activeLease({ paths: [".github/workflows/ci.yml"] });
 	// Exact-path rules do not cover descendants.
-	const exactReason = guard("edit", { path: "README.md/sub" }, { lease });
+	const exactReason = guard("edit", { path: ".github/workflows/ci.yml/sub" }, { lease });
 	assert.ok(exactReason);
 	assert.match(exactReason, /outside the active write lease/);
 	// Uncovered path.
-	const pathReason = guard("edit", { path: "tests/uncovered.ts" }, { lease });
+	const pathReason = guard("edit", { path: ".github/workflows/release.yml" }, { lease });
 	assert.ok(pathReason);
 	assert.match(pathReason, /outside the active write lease/);
 	// Absolute and escaping candidates are never authorized.
@@ -336,17 +344,20 @@ test("commander edit/write is refused when the lease does not authorize the path
 	assert.equal(isLeasePathAuthorized(lease, "src/../../etc/passwd"), false);
 	assert.ok(guard("edit", { path: "/repo/src/main.ts" }, { lease }));
 	assert.ok(guard("write", { path: "../outside.ts" }, { lease }));
+	assert.ok(guard("write", { path: "src\\main.ts" }, { lease }));
+	assert.ok(guard("write", { path: " src/main.ts" }, { lease }));
+	assert.match(guard("write", { path: "src/main.ts", content: "ok\0bad" }, { lease }) ?? "", /NUL/);
 	// Missing path is refused even with an active lease.
 	const missingReason = guard("edit", { path: "" }, { lease });
 	assert.ok(missingReason);
-	assert.match(missingReason, /non-empty project-relative path/);
+	assert.match(missingReason, /non-empty canonical project-relative path/);
 	assert.ok(guard("write", {}, { lease }));
 	// A lease scoped to write only never authorizes edit.
-	const writeOnly = activeLease({ tools: ["write"] });
-	const toolReason = guard("edit", { path: "src/main.ts" }, { lease: writeOnly });
+	const writeOnly = activeLease({ tools: ["write"], paths: ["package.json"] });
+	const toolReason = guard("edit", { path: "package.json" }, { lease: writeOnly });
 	assert.ok(toolReason);
 	assert.match(toolReason, /authorizes only write/);
-	assert.equal(guard("write", { path: "src/main.ts" }, { lease: writeOnly }), undefined);
+	assert.equal(guard("write", { path: "package.json" }, { lease: writeOnly }), undefined);
 });
 
 test("commander guard blocks every tool outside the allowlist even when re-enabled", () => {
@@ -367,16 +378,16 @@ test("allowlist tools pass the commander guard for commanders", () => {
 	}
 });
 
-test("Sol guard blocks with the worker-first reason; the policy is fixed", () => {
-	const blocked = guard("edit", { path: "src/main.ts" });
+test("development-first surface exposes direct ordinary writes while retaining a fixed high-risk gate", () => {
+	assert.deepEqual(DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST, [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
+	assert.equal(guard("edit", { path: "src/main.ts" }), undefined);
+	assert.equal(guard("write", { path: "docs/guide.md" }), undefined);
+	const blocked = guard("edit", { path: ".github/workflows/ci.yml" });
 	assert.ok(blocked);
-	assert.match(blocked, /Worker-first write authority/);
-	assert.match(blocked, /workbench_delegate_worker/);
-	assert.match(blocked, /lease/);
-	// With a valid lease, edit/write pass for Sol.
-	const lease = activeLease();
-	assert.equal(guard("edit", { path: "src/main.ts" }, { lease }), undefined);
-	assert.equal(guard("write", { path: "README.md" }, { lease }), undefined);
+	assert.match(blocked, /high-risk path/);
+	assert.match(blocked, /lease locked/);
+	assert.equal(directDevelopmentWriteBlockReason("src/main.ts"), undefined);
+	assert.match(directDevelopmentWriteBlockReason("src/security/auth.ts") ?? "", /high-risk/);
 });
 
 // ---------------------------------------------------------------------------
@@ -801,10 +812,10 @@ test("parseWritePolicyArgs accepts exactly the trimmed `status` subcommand", () 
 });
 
 // ---------------------------------------------------------------------------
-// compact footer segment (WF:LEASE / WF:LOCKED)
+// compact footer segment (WF:LEASE / WF:DIRECT)
 // ---------------------------------------------------------------------------
 
-test("writeAuthorityFooterSegment renders WF:LEASE used/max only for an ACTIVE strict-Sol lease, WF:LOCKED otherwise", () => {
+test("writeAuthorityFooterSegment renders an active high-risk lease or the direct-development default", () => {
 	const sol = { actor: "sol-commander" as const, policy: "worker-first-strict" as const };
 	// Active lease: the required compact segment with the exact call usage.
 	const active = activeLease({ maxCalls: 3 });
@@ -812,19 +823,19 @@ test("writeAuthorityFooterSegment renders WF:LEASE used/max only for an ACTIVE s
 	const consumed = consumeLeaseCall(active, "edit", "src/main.ts", NOW);
 	assert.ok(consumed.ok);
 	assert.equal(writeAuthorityFooterSegment({ ...sol, lease: consumed.lease, now: NOW }), "WF:LEASE 1/3");
-	// Every non-active state renders WF:LOCKED: locked, pending, expired,
-	// exhausted, revoked.
-	assert.equal(writeAuthorityFooterSegment({ ...sol, lease: undefined, now: NOW }), "WF:LOCKED", "locked");
-	assert.equal(writeAuthorityFooterSegment({ ...sol, lease: issueOk(), now: NOW }), "WF:LOCKED", "pending");
-	assert.equal(writeAuthorityFooterSegment({ ...sol, lease: activeLease(), now: AFTER_EXPIRY }), "WF:LOCKED", "expired");
+	// Every non-active state renders WF:DIRECT: ordinary writes stay usable;
+	// only high-risk paths remain lease-gated.
+	assert.equal(writeAuthorityFooterSegment({ ...sol, lease: undefined, now: NOW }), "WF:DIRECT", "locked");
+	assert.equal(writeAuthorityFooterSegment({ ...sol, lease: issueOk(), now: NOW }), "WF:DIRECT", "pending");
+	assert.equal(writeAuthorityFooterSegment({ ...sol, lease: activeLease(), now: AFTER_EXPIRY }), "WF:DIRECT", "expired");
 	assert.equal(
 		writeAuthorityFooterSegment({ ...sol, lease: { ...activeLease({ maxCalls: 1 }), callsUsed: 1 }, now: NOW }),
-		"WF:LOCKED",
+		"WF:DIRECT",
 		"exhausted",
 	);
 	assert.equal(
 		writeAuthorityFooterSegment({ ...sol, lease: revokeLease(activeLease(), "user-directed lock", NOW), now: NOW }),
-		"WF:LOCKED",
+		"WF:DIRECT",
 		"revoked",
 	);
 	// Non-strict actors render no segment at all.
@@ -840,17 +851,17 @@ test("renderWritePolicyStatus reports actor/policy/lock status and never leaks t
 	// Locked strict Sol.
 	const locked = renderWritePolicyStatus({ actor: "sol-commander", provider: "openai-codex", model: "gpt-5.6-sol", policy: "worker-first-strict", lease: undefined, now: NOW });
 	assert.ok(locked.some((l) => l.includes("sol-commander")));
-	assert.ok(locked.some((l) => l.includes("worker-first-strict") && l.includes("fixed")));
-	assert.ok(locked.some((l) => l.includes("denied") && l.includes("locked")));
+	assert.ok(locked.some((l) => l.includes("development-first") && l.includes("worker-first-strict")));
+	assert.ok(locked.some((l) => l.includes("ordinary paths direct") && l.includes("high-risk")));
 	assert.ok(locked.some((l) => l === "lease        : WRITE-LEASE locked"));
 	// Active lease: allowed, with the bounded compact summary.
 	const active = renderWritePolicyStatus({ actor: "sol-commander", policy: "worker-first-strict", lease: activeLease(), now: NOW });
-	assert.ok(active.some((l) => l.includes("allowed via lease lease-1")));
+	assert.ok(active.some((l) => l.includes("high-risk paths allowed via lease lease-1")));
 	assert.ok(active.some((l) => l.includes("WRITE-LEASE active lease-1")));
 	assert.ok(active.every((l) => !l.includes(TOKEN_A) && !l.includes(TOKEN_B)), "no token parts in active status");
 	// Pending lease: denied with a confirm hint — but never the actual parts.
 	const pending = renderWritePolicyStatus({ actor: "sol-commander", policy: "worker-first-strict", lease: issueOk(), now: NOW });
-	assert.ok(pending.some((l) => l.includes("pending confirmation")));
+	assert.ok(pending.some((l) => l.includes("high-risk lease pending confirmation")));
 	assert.ok(pending.some((l) => l.includes("confirm <partA> <partB>")));
 	assert.ok(pending.every((l) => !l.includes(TOKEN_A) && !l.includes(TOKEN_B)), "no token parts in pending status");
 	// Non-applicable policy (non-Sol actors): existing guards govern.

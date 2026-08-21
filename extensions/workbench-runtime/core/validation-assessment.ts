@@ -56,13 +56,18 @@
  * and full worker-first facts never leave this module.
  */
 
+import { lstat } from "node:fs/promises";
+import { join } from "node:path";
+
 import { loadProjectConfig, type ExecFn } from "./config.ts";
 import { latestGateStatus, loadGates, readPersistedGateRunFacts } from "./gate-engine.ts";
 import { orderGates, resolveSelector } from "./gate-schema.ts";
 import type { WorkerFirstGateFacts } from "./gate-schema.ts";
 import type { WorkbenchMode } from "./mode-policy.ts";
 import type { Recipe } from "./recipe-schema.ts";
-import type { RunRecord } from "./runs.ts";
+import { readCommittedManifest, runDirFor, type RunRecord } from "./runs.ts";
+import { ARTIFACT_MANIFEST_FILE } from "./artifact-contract.ts";
+import { RUN_COMMIT_FILE } from "./run-transaction.ts";
 import {
 	buildGateValidationTarget,
 	buildRecipeValidationTarget,
@@ -219,13 +224,33 @@ export async function assessRunValidation(input: AssessRunValidationInput): Prom
 }
 
 async function assessRunValidationInner(input: AssessRunValidationInput): Promise<RunValidationAssessment> {
-	const parsed = parseBlockFailClosed(input.manifest.validation_evidence);
+	let manifest = input.manifest;
+	const runDir = runDirFor(input.projectRoot, input.manifest.run_id);
+	let hasV2DiskMarker = input.manifest.run_transaction_schema_version === 2;
+	if (!hasV2DiskMarker) {
+		for (const marker of [RUN_COMMIT_FILE, ARTIFACT_MANIFEST_FILE]) {
+			try {
+				await lstat(join(runDir, marker));
+				hasV2DiskMarker = true;
+				break;
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") return rerun(["collection-failure"]);
+			}
+		}
+	}
+	if (hasV2DiskMarker) {
+		const committed = await readCommittedManifest(input.projectRoot, input.manifest.run_id);
+		if (!committed) return rerun(["collection-failure"]);
+		manifest = committed;
+	}
+
+	const parsed = parseBlockFailClosed(manifest.validation_evidence);
 	if (!parsed.ok) return rerun(parsed.reasons);
 	const binding = parsed.block.binding!;
 
 	// The manifest kind and the binding kind must agree — a contradiction
 	// is corrupt evidence, never reusable.
-	const isGateRun = input.manifest.recipe === "gate";
+	const isGateRun = manifest.recipe === "gate";
 	if (isGateRun !== (binding.kind === "gate")) return rerun(["corrupt-binding"]);
 
 	// Current trusted config: profile, declared recipes, raw project gates.
@@ -247,7 +272,7 @@ async function assessRunValidationInner(input: AssessRunValidationInput): Promis
 		// gates/evidence/manifest identity facts (run id, requested set,
 		// profile/mode, gate/check shapes) or a record that contradicts the
 		// binding's own requested/effective gates fail closed.
-		const sourceFacts = await readPersistedGateRunFacts(input.projectRoot, input.manifest.run_id, input.manifest);
+		const sourceFacts = await readPersistedGateRunFacts(input.projectRoot, manifest.run_id, manifest);
 		if (!sourceFacts) return rerun(["collection-failure"]);
 		if (
 			[...new Set(sourceFacts.requested)].sort().join("\u0000") !== [...sourceTarget.requested_gates].sort().join("\u0000") ||
@@ -274,7 +299,7 @@ async function assessRunValidationInner(input: AssessRunValidationInput): Promis
 		// faithfully reconstructed. Missing/malformed/mismatched identities
 		// are corrupt evidence and refuse reuse deterministically. Raw argv
 		// is never read, re-derived, or rendered.
-		const manifestArgvHash = input.manifest.argv_hash;
+		const manifestArgvHash = manifest.argv_hash;
 		if (typeof manifestArgvHash !== "string" || !SHA256_RE.test(manifestArgvHash)) {
 			return rerun(["corrupt-binding"]);
 		}
@@ -300,7 +325,7 @@ async function assessRunValidationInner(input: AssessRunValidationInput): Promis
 		gateState,
 	});
 
-	const verdict = evaluateValidationReuse(input.manifest.validation_evidence, current);
+	const verdict = evaluateValidationReuse(manifest.validation_evidence, current);
 	return {
 		status: verdict.reusable ? "REUSABLE" : "RERUN_REQUIRED",
 		reasons: verdict.reasons,
