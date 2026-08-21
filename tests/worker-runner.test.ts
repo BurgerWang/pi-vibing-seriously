@@ -502,17 +502,14 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 	});
 });
 
-test("the contract budget profile and the runner spendProfile option are one resolved low profile — env, result, and task text all agree", async () => {
+test("retired low is defensively resolved to standard across task text, child env, and result", async () => {
 	const script = `
 const facts = JSON.stringify({ spendProfile: process.env.${WORKER_SPEND_PROFILE_ENV} || null, argv: process.argv.slice(2) });
 console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "openai-codex", model: "gpt-5.6-luna", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
 `;
 	await withFakeWorker(script, async (invocation, dir) => {
-		// Production invariant: the index handler resolves the budget profile
-		// ONCE and passes that same value into both the contract (ledger and
-		// task-text source) and the runner option (enforcement source) — the
-		// two can never disagree. This test pins that consistency on an
-		// explicit `low` profile.
+		// Direct/internal callers may still carry the retired literal. The
+		// runner must never execute it as low.
 		const result = await runPinnedWorker({
 			projectRoot: dir,
 			contract: { ...CONTRACT, budgetProfile: "low" },
@@ -528,8 +525,8 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 		// path/scope authority — enforcement stays in the runner and the
 		// fixed child env contract.
 		const taskText = facts.argv[facts.argv.length - 1] ?? "";
-		const taskProfile = /Worker spend-budget profile: (low|standard|extended)/.exec(taskText)?.[1];
-		assert.equal(taskProfile, "low", "task text names the resolved low profile");
+		const taskProfile = /Worker spend-budget profile: (standard|extended)/.exec(taskText)?.[1];
+		assert.equal(taskProfile, "standard", "task text names the defensive standard profile");
 		assert.match(taskText, /bounds cumulative spend only/, "profile wording bounds cumulative spend only");
 		assert.match(taskText, /never expands parent-approved path\/scope authority/, "profile wording never expands parent-approved path/scope authority");
 		assert.equal(facts.spendProfile, taskProfile, "child env profile equals the task-text profile");
@@ -1012,31 +1009,14 @@ test("runner spend: hard stop fails closed even when the child would exit 0", as
 	});
 });
 
-test("runner spend: low and extended profiles enforce their exact limits", async () => {
-	// low hard turns = 16: the 16th turn terminates the child fail-closed.
-	const lowTurns = Array.from({ length: 16 }, () => assistantEvent()).join("\n");
-	await withFakeWorker(
-		`process.stdout.write(${JSON.stringify(`${lowTurns}\n`)}); setInterval(() => {}, 1000);`,
-		async (invocation, dir) => {
-			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "low" });
-			assert.equal(result.spendProfile, "low");
-			assert.equal(result.spendBand, "hard");
-			assert.deepEqual(result.spendReasons, ["turns"]);
-			assert.match(result.errorMessage ?? "", /profile low.*turns 16\/16/);
-			assert.throws(() => assertWorkerSucceeded(result), /profile low.*turns 16\/16/);
-		},
-	);
-	// low hard total = 1,632,000 exactly (8 x 200,000 + 32,000).
-	const lowTotal = [...Array.from({ length: 8 }, () => 200_000), 32_000].map((t) => assistantEvent({ usage: usageWith(t) })).join("\n");
-	await withFakeWorker(
-		`process.stdout.write(${JSON.stringify(`${lowTotal}\n`)}); setInterval(() => {}, 1000);`,
-		async (invocation, dir) => {
-			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "low" });
-			assert.equal(result.spendBand, "hard");
-			assert.deepEqual(result.spendReasons, ["total_tokens"]);
-			assert.match(result.errorMessage ?? "", /total_tokens 1632000\/1632000/);
-		},
-	);
+test("runner spend: retired low resolves to standard while extended keeps its exact limit", async () => {
+	const oneTurn = assistantEvent();
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${oneTurn}\n`)});`, async (invocation, dir) => {
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "low" });
+		assert.equal(result.spendProfile, "standard");
+		assert.equal(result.spendBand, "ok");
+		assert.equal(result.spendHardExceeded.turns, false);
+	});
 	// extended hard turns = 96: the 96th turn terminates the child fail-closed.
 	const extTurns = Array.from({ length: 96 }, () => assistantEvent()).join("\n");
 	await withFakeWorker(

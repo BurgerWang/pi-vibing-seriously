@@ -72,7 +72,10 @@ import {
 const ACCEPTANCE_ITEM_MAX_CHARS = 1_000;
 const VERIFICATION_ITEM_MAX_CHARS = 500;
 const REPORT_WARNING_MAX_CHARS = 500;
-const SPEND_PROFILES: readonly WorkerSpendProfile[] = ["low", "standard", "extended"];
+/** Persisted v2 records may contain the retired low profile and remain readable. */
+const HISTORICAL_SPEND_PROFILES: readonly WorkerSpendProfile[] = ["low", "standard", "extended"];
+/** New public contracts and committed generations may use only active profiles. */
+const CURRENT_SPEND_PROFILES: readonly WorkerSpendProfile[] = ["standard", "extended"];
 const TASK_CONTRACT_FIELDS = [
 	"task_kind",
 	"task",
@@ -232,7 +235,7 @@ function parseContractPayload(raw: unknown): DelegationArtifactResult<Delegation
 	if (!Number.isSafeInteger(raw.timeout_seconds) || (raw.timeout_seconds as number) < 60 || (raw.timeout_seconds as number) > 3_600) {
 		return fail("invalid_contract", "delegation v2 timeout is outside the fixed bound");
 	}
-	if (!SPEND_PROFILES.includes(raw.budget_profile as WorkerSpendProfile)) {
+	if (!HISTORICAL_SPEND_PROFILES.includes(raw.budget_profile as WorkerSpendProfile)) {
 		return fail("invalid_contract", "delegation v2 budget profile is invalid");
 	}
 	if (Object.prototype.hasOwnProperty.call(raw, "repair_of") &&
@@ -312,7 +315,7 @@ export function normalizeDelegationBoundedTaskContractV2(
 		return fail("invalid_contract", "delegation v2 public timeout is outside the fixed bound");
 	}
 	const budget_profile = raw.budget_profile === undefined ? "standard" : raw.budget_profile;
-	if (!SPEND_PROFILES.includes(budget_profile as WorkerSpendProfile)) {
+	if (!CURRENT_SPEND_PROFILES.includes(budget_profile as WorkerSpendProfile)) {
 		return fail("invalid_contract", "delegation v2 public budget profile is invalid");
 	}
 	if (raw.repair_of !== undefined && (typeof raw.repair_of !== "string" || !DELEGATION_TRANSACTION_ID_RE.test(raw.repair_of))) {
@@ -388,7 +391,7 @@ function validateWorkerFacts(worker: LedgerWorkerFacts): boolean {
 	if (!budgetValues.every(finiteNonNegative) || typeof worker.budget.softBudgetReached !== "boolean" ||
 		typeof worker.budget.hardBudgetExceeded !== "boolean" || !Array.isArray(worker.budget.compactionReasons) ||
 		!worker.budget.compactionReasons.every((reason) => typeof reason === "string" && reason.length <= 500)) return false;
-	if (spendProfile === undefined || !SPEND_PROFILES.includes(spendProfile) || !isRecord(worker.spendState) ||
+	if (spendProfile === undefined || !HISTORICAL_SPEND_PROFILES.includes(spendProfile) || !isRecord(worker.spendState) ||
 		!finiteNonNegative(worker.spendState.turns) || !finiteNonNegative(worker.spendState.totalTokens) ||
 		!finiteNonNegative(worker.spendState.outputTokens) || !["ok", "soft", "hard"].includes(String(worker.spendBand)) ||
 		!Array.isArray(worker.spendReasons) || !worker.spendReasons.every((reason) => ["turns", "total_tokens", "output_tokens"].includes(reason)) ||
@@ -613,6 +616,12 @@ function buildDelegationCommittedArtifactsUnchecked(
 	const contractResult = parseContractBinding(input.contract);
 	if (!contractResult.ok) return contractResult;
 	const contract = contractResult.value;
+	// The strict binder remains able to reproduce historical low contract
+	// hashes for read/review compatibility. Artifact construction is the
+	// current write boundary and must never publish a new low generation.
+	if (!CURRENT_SPEND_PROFILES.includes(contract.budget_profile)) {
+		return fail("invalid_contract", "delegation v2 low budget profile is historical-read-only");
+	}
 	if (contract.contract_hash !== transaction.contract_hash || contract.task_kind !== transaction.task_kind ||
 		!sameStrings(contract.allowed_paths, transaction.allowed_paths)) {
 		return fail("binding_conflict", "delegation task contract conflicts with the COMMITTING transaction");

@@ -46,6 +46,7 @@ interface RuntimeStub {
 	events: Map<string, Array<(event: unknown, ctx: unknown) => unknown>>;
 	tools: Map<string, unknown>;
 	appendedEntries: Array<{ customType: string; data: unknown }>;
+	sentMessages: Array<{ message: unknown; options: unknown }>;
 }
 
 function makeStub(): RuntimeStub & ExtensionAPI {
@@ -53,6 +54,7 @@ function makeStub(): RuntimeStub & ExtensionAPI {
 		events: new Map(),
 		tools: new Map(),
 		appendedEntries: [],
+		sentMessages: [],
 		registerCommand: () => {},
 		registerTool: (definition: { name: string }) => { stub.tools.set(definition.name, definition); },
 		on: (event: string, handler: (event: unknown, ctx: unknown) => unknown) => {
@@ -61,7 +63,7 @@ function makeStub(): RuntimeStub & ExtensionAPI {
 			stub.events.set(event, handlers);
 		},
 		appendEntry: (customType: string, data?: unknown) => { stub.appendedEntries.push({ customType, data }); },
-		sendMessage: () => {},
+		sendMessage: (message: unknown, options: unknown) => { stub.sentMessages.push({ message, options }); },
 		sendUserMessage: () => {},
 		setActiveTools: () => {},
 		getActiveTools: () => [],
@@ -72,14 +74,15 @@ function makeStub(): RuntimeStub & ExtensionAPI {
 	return stub;
 }
 
-function workerRuntime(): RuntimeStub & ExtensionAPI {
+function workerRuntime(spendProfile?: string): RuntimeStub & ExtensionAPI {
 	const names = [WORKER_ROLE_ENV, WORKER_PROJECT_ROOT_ENV, WORKER_ALLOWED_PATHS_ENV, WORKER_SPEND_PROFILE_ENV] as const;
 	const previous = new Map(names.map((name) => [name, process.env[name]]));
 	try {
 		process.env[WORKER_ROLE_ENV] = "worker";
 		delete process.env[WORKER_PROJECT_ROOT_ENV];
 		delete process.env[WORKER_ALLOWED_PATHS_ENV];
-		delete process.env[WORKER_SPEND_PROFILE_ENV];
+		if (spendProfile === undefined) delete process.env[WORKER_SPEND_PROFILE_ENV];
+		else process.env[WORKER_SPEND_PROFILE_ENV] = spendProfile;
 		const stub = makeStub();
 		workbenchRuntime(stub);
 		return stub;
@@ -91,6 +94,29 @@ function workerRuntime(): RuntimeStub & ExtensionAPI {
 		}
 	}
 }
+
+test("worker child env retires low by enforcing the standard soft-turn boundary", async () => {
+	const stub = workerRuntime("low");
+	const ctx = context([]);
+	const event = {
+		type: "message_end",
+		message: {
+			role: "assistant",
+			provider: "openai-codex",
+			model: "gpt-5.6-luna",
+			content: [],
+			stopReason: "toolUse",
+			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { total: 0 } },
+		},
+	};
+	for (let turn = 0; turn < 31; turn += 1) await emitRuntimeEvent(stub, "message_end", event, ctx);
+	assert.equal(stub.sentMessages.length, 0, "retired low does not steer at its historical 8-turn threshold");
+	await emitRuntimeEvent(stub, "message_end", event, ctx);
+	assert.equal(stub.sentMessages.length, 1, "standard soft threshold steers at turn 32");
+	const message = stub.sentMessages[0]!.message as { content?: unknown; details?: Record<string, unknown> };
+	assert.match(String(message.content), /profile standard/);
+	assert.equal(message.details?.profile, "standard");
+});
 
 function context(entries: readonly unknown[]): ExtensionContext {
 	return {

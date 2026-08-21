@@ -63,7 +63,7 @@ extensions/workbench-runtime/
     │                        #   handoff / 90% hard stop, Pi-compatible context tokens
     ├── worker-spend.ts      # pinned worker cumulative delegation-spend policy (worker
     │                        #   token-budget repair; pure, no Pi imports): fixed
-    │                        #   low/standard/extended profiles, per-message total reuse of
+    │                        #   standard/extended active profiles, historical low read compatibility
     │                        #   workerContextTokens, immutable cumulative turns/total/output
     │                        #   accumulation, ok|soft|hard band + fixed reason ordering,
     │                        #   deterministic steer/hard-stop/summary formatters — wired
@@ -248,7 +248,7 @@ Commander/project compaction reserve. See
 
 The cumulative delegation-spend policy (approved worker token-budget
 repair) lives in `core/worker-spend.ts` (pure, no Pi imports):
-fixed `low`/`standard`/`extended` profiles with exact soft/hard limits,
+fixed active `standard`/`extended` profiles with exact soft/hard limits,
 per-message total normalization reusing `workerContextTokens` (positive
 `totalTokens` authoritative, else the non-negative
 `input + output + cacheRead + cacheWrite` sum; `cacheRead` counts),
@@ -262,11 +262,11 @@ every assistant message, terminates the child fail-closed on any hard
 spend dimension with the deterministic hard-stop message, and records the
 final profile/state/band/reasons facts on every run result; the
 worker-role lifecycle reads the profile from the fixed
-`WORKBENCH_WORKER_SPEND_PROFILE` child env contract (malformed/missing
-falls back to `standard` defensively) and sends exactly one hidden
+`WORKBENCH_WORKER_SPEND_PROFILE` child env contract (retired `low` and
+malformed/missing values fall back to `standard` defensively) and sends exactly one hidden
 cumulative soft steer when the band first becomes soft/hard. Phase 3 adds
 the public profile surface: the optional `budget_profile` tool parameter
-(closed literal union `low | standard | extended`, default `standard`,
+(closed literal union `standard | extended`, default `standard`,
 `extended` never inferred) is resolved fail-closed by the pure contract
 check in `core/worker-policy.ts` before ledger creation/child launch, the
 resolved profile travels into the before contract
@@ -276,7 +276,14 @@ result facts, exception fallbacks included), and the canonical cumulative
 `worker-summary.json` (schema_version stays 1; pre-repair records read
 without migration) and rendered into the bounded parent handoff (the
 deterministic `spend budget : …` line plus nested spend details, both
-derived from the SAME persisted worker-summary spend object). Phase 4 adds
+derived from the SAME persisted worker-summary spend object).
+
+The retired `low` literal is historical-read-only: frozen v1 metadata and
+already committed v1/v2 records remain readable and hash-verifiable, while
+new public contracts and committed generations reject it. Direct/internal
+runner input and child env `low` resolve to `standard`.
+
+Phase 4 adds
 the numeric-only progress surface: `WorkerProgress` exposes the cumulative
 turns/total/output counters and the fixed `ok | soft | hard` band after
 every processed assistant message (evaluated from the same cumulative

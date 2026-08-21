@@ -741,15 +741,15 @@ final profile/state/band/reasons facts on every run result, and terminates
 the child fail-closed whenever any hard dimension is reached (`>=`,
 deterministic hard-stop message). The worker-role lifecycle reads the
 spend profile from the fixed child env contract
-(`WORKBENCH_WORKER_SPEND_PROFILE` — the runner always writes a valid
-`low`/`standard`/`extended` value; malformed/missing child env falls back
-to `standard` defensively), accumulates its own independent spend state
+(`WORKBENCH_WORKER_SPEND_PROFILE` — the runner writes `standard` or
+`extended`; retired `low` and malformed/missing child env fall back to
+`standard` defensively), accumulates its own independent spend state
 on assistant `message_end` events, and sends exactly one hidden cumulative
 soft steer when the band first becomes soft or hard. **Phase 3 status:
 public selection, contract validation, v2 generation persistence and handoff
 rendering landed.** The optional `budget_profile` tool parameter (closed
-literal union `low | standard | extended`, default `standard`, `extended`
-never inferred) is resolved by the strict contract validation in
+literal union `standard | extended`, default `standard`, `extended` never
+inferred) is resolved by the strict contract validation in
 `core/worker-policy.ts` BEFORE any v2 transaction preparation or child launch, the
 resolved profile is recorded in the before contract
 (`before.json` → `contract.budget_profile`) and passed to the runner (the
@@ -761,13 +761,12 @@ Per-message context safety (above) is unchanged.
 
 | Profile | Soft turns | Soft total | Soft output | Hard turns | Hard total | Hard output |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `low` | 8 | 816,000 | 50,000 | 16 | 1,632,000 | 100,000 |
 | `standard` (default) | 32 | 5,440,000 | 160,000 | 64 | 10,880,000 | 320,000 |
 | `extended` (explicit) | 64 | 10,880,000 | 320,000 | 96 | 17,408,000 | 512,000 |
 
 These are the current `gpt-5.6-luna-xhigh-continuation-v1` limits. Total-token
 thresholds are fixed multiples of Luna's Pi-advertised 272,000-token context
-window: low 3×/6×, standard 20×/40×, extended 40×/64× (soft/hard).
+window: standard 20×/40×, extended 40×/64× (soft/hard).
 The interval between soft and hard is an intentional continuation reserve:
 soft does not terminate the worker and must not direct the user to open a new
 Sol session. It asks the worker to finish the coherent change and hand back
@@ -810,16 +809,20 @@ Hard remains a fail-closed runaway ceiling.
   `RECOVERY_REQUIRED`. The 60-minute timeout remains an independent failure
   path.
 - **Profiles:** `standard` is the deterministic default for every
-  delegation without an explicit request; `low` is an explicit tighter
-  opt-in; `extended` is explicit Sol-approved only and is never inferred
-  or auto-promoted. The public `budget_profile` tool parameter
-  (optional, closed literal union `low | standard | extended`, default
+  delegation without an explicit request; `extended` is explicit
+  Sol-approved only and is never inferred or auto-promoted. The public
+  `budget_profile` tool parameter (optional, closed literal union
+  `standard | extended`, default
   `standard`) is validated by the pure contract check in
   `core/worker-policy.ts` — omitted resolves to `standard`; unknown,
   empty, wrong-type and case-variant values fail closed with a bounded
   error before the v2 transaction is prepared or the child starts. The pure
   resolver defaults to `standard` only where a default is explicitly
   requested, while strict validation rejects unknown values.
+- **Historical compatibility:** committed v1/v2 records carrying `low`
+  remain strictly readable and hash-verifiable, but `low` is rejected for
+  every new public contract and committed artifact. Direct/internal runner
+  input and child env `low` resolve defensively to `standard`.
 - **Child env contract (wired):** the runner passes the resolved profile to
   the worker child through the fixed `WORKBENCH_WORKER_SPEND_PROFILE` env
   variable; the worker-role lifecycle strictly validates it and falls back
@@ -870,10 +873,9 @@ path-by-path `include_paths` re-reviews (max 50 paths per call).
 `mechanical`, case variants, unknown strings, and wrong types fail closed.
 
 `budget_profile` is optional and selects the cumulative delegation-spend
-profile (`low | standard | extended`; omitted resolves to `standard`). The
-profile bounds cumulative spend only — it never expands the approved paths
-or scope. `standard` is the deterministic default; `low` is an explicit
-tighter opt-in for deliberately small slices; `extended` is explicit
+profile (`standard | extended`; omitted resolves to `standard`). The profile
+bounds cumulative spend only — it never expands the approved paths or scope.
+`standard` is the deterministic default; `extended` is explicit
 Sol-approved only for an approved larger slice and is never inferred or
 auto-promoted. The worker task text carries the resolved profile as one
 informational line; enforcement is the runner's fixed child-env contract,
@@ -1061,7 +1063,7 @@ The tool fails rather than silently falling back when:
 - an assistant event reaches the 244,800-token (90%) hard context budget;
 - any cumulative spend dimension reaches its hard limit (turns / total
   tokens / output tokens per the active profile — `standard` by default,
-  `low`/`extended` explicit opt-ins via the optional `budget_profile`
+  `extended` as the only explicit opt-in via the optional `budget_profile`
   parameter);
 - the child emits any `compaction_start` event (a compaction attempt);
 - the child exits non-zero, times out, or is aborted;

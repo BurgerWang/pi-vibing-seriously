@@ -552,7 +552,7 @@ test("the before contract records the explicit budget profile and rejects invali
 
 		// Unknown/empty/wrong-type profiles fail closed BEFORE any ledger
 		// record exists (boundLedgerContract refuses without writing).
-		for (const bad of ["", "LOW", "Standard", "ultra", null, 42, true, {}] as unknown[]) {
+		for (const bad of ["", "low", "LOW", "Standard", "ultra", null, 42, true, {}] as unknown[]) {
 			const refused = await createDelegationLedger(
 				dir,
 				makeDelegationId(new Date()),
@@ -561,7 +561,7 @@ test("the before contract records the explicit budget profile and rejects invali
 				NOW,
 			);
 			assert.equal(refused.ok, false, `${JSON.stringify(bad)} must fail closed before ledger creation`);
-			if (!refused.ok) assert.match(refused.error, /budget_profile must be one of "low" \| "standard" \| "extended"/);
+			if (!refused.ok) assert.match(refused.error, /budget_profile must be one of "standard" \| "extended"/);
 		}
 	});
 });
@@ -716,6 +716,30 @@ test("synthetic pre-repair schema_version 1 records without budget_profile/spend
 		const beforeRaw = await readFile(join(dirPath, "before.json"), "utf8");
 		assert.ok(!beforeRaw.includes("budget_profile"), "the pre-repair before.json is not rewritten");
 		assert.ok(!beforeRaw.includes("repair_of"), "the pre-repair before.json is never rewritten with repair_of");
+	});
+});
+
+test("historical schema_version 1 low records remain read-only compatible", async () => {
+	await withTempDir(async (dir) => {
+		await cleanRepo(dir);
+		const before = await collectGitFacts(dir, spawnExec);
+		const id = makeDelegationId(new Date());
+		const created = await createDelegationLedger(
+			dir,
+			id,
+			{ task: "historical", allowedPaths: ["src/**"], acceptanceCriteria: [], verification: [], timeoutSeconds: 1800 },
+			before,
+			NOW,
+		);
+		assert.ok(created.ok);
+		const beforePath = join(delegationDirFor(dir, id), "before.json");
+		const record = JSON.parse(await readFile(beforePath, "utf8")) as { contract: { budget_profile: string } };
+		record.contract.budget_profile = "low";
+		const historicalBytes = `${JSON.stringify(record, null, 2)}\n`;
+		await writeFile(beforePath, historicalBytes, "utf8");
+		const ledger = await readDelegationLedger(dir, id);
+		assert.equal(ledger?.before.contract.budget_profile, "low");
+		assert.equal(await readFile(beforePath, "utf8"), historicalBytes, "historical low is read without migration");
 	});
 });
 

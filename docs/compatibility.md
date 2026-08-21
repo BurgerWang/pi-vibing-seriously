@@ -184,7 +184,7 @@ other than the matrix below is newly claimed by this release.
 
 ## Tool-schema fingerprint transition (Phase 3, worker token-budget repair)
 
-`workbench_delegate_worker` gained exactly ONE additive parameter in Phase 3
+`workbench_delegate_worker` historically gained exactly ONE additive parameter in Phase 3
 of the worker token-budget repair
 (`docs/plans/worker-token-budget-repair.md`): the optional `budget_profile`
 closed literal union `low | standard | extended` (default `standard`). The
@@ -212,6 +212,16 @@ canonical `spend` object in `usage.json` / `worker-summary.json` are
 additive fields on the unchanged `schema_version: 1` records; pre-repair
 records without them parse unchanged and are never rewritten (no
 migration).
+
+The current surface retires `low`: public JSON Schema exposes only
+`standard | extended`, omission still defaults to `standard`, and explicit
+`low` fails closed before transaction persistence or worker launch. Runner
+and child-env compatibility maps old/internal `low` input to `standard`.
+Frozen governance-v1 catalog/schema/hash evidence is unchanged, and already
+committed v1/v2 `low` records remain strict read/hash compatibility data;
+new committed artifacts cannot carry `low`. This intentional current-schema
+change produces a new static DEV fingerprint without rewriting historical
+fingerprint records.
 
 ## Tool-schema fingerprint transition (Phase 4A, worker repair contract — `repair_of` pointer)
 

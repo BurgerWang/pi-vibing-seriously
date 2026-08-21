@@ -299,8 +299,8 @@ export interface RunWorkerOptions {
 	/**
 	 * Internal cumulative spend profile for this delegation run (worker
 	 * token-budget repair, Phase 2). Optional and deterministic: omitted
-	 * values resolve to the `standard` profile. Only the typed
-	 * low/standard/extended profile is accepted. The resolved profile is
+	 * values, including the retired historical `low` literal, resolve to the
+	 * `standard` profile. `extended` is the only non-default active profile. The resolved profile is
 	 * passed to the child through the fixed WORKER_SPEND_PROFILE_ENV env
 	 * contract, so the worker-role lifecycle enforces the SAME profile the
 	 * runner accumulates against. Public selection (tool schema) is Phase 3.
@@ -610,11 +610,14 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 	const taskKindResult = resolveWorkerTaskKind(options.contract.taskKind);
 	if (!taskKindResult.ok) throw new Error(taskKindResult.error);
 	const taskKind = taskKindResult.taskKind;
-	// Phase 2: deterministic profile resolution — omitted/undefined resolves
-	// to the `standard` profile; only the typed low/standard/extended value
-	// is accepted by the options contract.
+	// Deterministic active-profile resolution: omitted, malformed, and the
+	// retired historical `low` value all resolve to `standard`; only explicit
+	// `extended` selects a larger profile.
 	const spendProfile = resolveWorkerSpendProfile(options.spendProfile);
-	const taskText = formatWorkerTask(options.contract);
+	// Render the same active profile used by the runner and child env. This
+	// prevents an old/internal `low` contract from advertising a retired
+	// budget while actually running under the defensive standard fallback.
+	const taskText = formatWorkerTask({ ...options.contract, budgetProfile: spendProfile });
 	if (Buffer.byteLength(taskText, "utf8") > MAX_TASK_ARGUMENT_BYTES) {
 		throw new Error(`Worker task contract exceeds ${MAX_TASK_ARGUMENT_BYTES} bytes`);
 	}

@@ -50,7 +50,8 @@ export interface WorkerTaskContract {
 	/**
 	 * Phase 3 (worker token-budget repair): the resolved cumulative
 	 * spend-budget profile (additive, optional). Omitted resolves to
-	 * `standard`; `low`/`extended` are explicit opt-ins. The profile is
+	 * `standard`; `extended` is the only explicit opt-in. Historical `low`
+	 * values are never accepted for a new contract. The profile is
 	 * carried on the contract for ledger/record consistency — the runner
 	 * enforces it through the fixed WORKER_SPEND_PROFILE_ENV child env
 	 * contract, never through task prose (Phase 5 adds only a
@@ -224,7 +225,7 @@ export function workerRecipeBlockReason(role: string | undefined, recipeName: st
  * delegation task contract (Phase 3 of the worker token-budget repair):
  *
  *   - omitted/undefined → `standard` (the only default path);
- *   - exactly `low` | `standard` | `extended` accepted;
+ *   - exactly `standard` | `extended` accepted;
  *   - everything else (unknown strings, empty strings, case variants,
  *     null, numbers, objects, arrays) FAILS CLOSED with a bounded useful
  *     error — before any ledger creation or child launch. `extended` is
@@ -237,13 +238,13 @@ export function workerRecipeBlockReason(role: string | undefined, recipeName: st
  */
 export function resolveWorkerBudgetProfile(value: unknown): { ok: true; profile: WorkerSpendProfile } | { ok: false; error: string } {
 	if (value === undefined) return { ok: true, profile: WORKER_SPEND_DEFAULT_PROFILE };
-	if (value === "low" || value === "standard" || value === "extended") return { ok: true, profile: value };
+	if (value === "standard" || value === "extended") return { ok: true, profile: value };
 	if (typeof value === "string") {
 		const preview = value.length > 60 ? `${value.slice(0, 60)}…` : value;
-		return { ok: false, error: `budget_profile must be one of "low" | "standard" | "extended" (received string ${JSON.stringify(preview)})` };
+		return { ok: false, error: `budget_profile must be one of "standard" | "extended" (received string ${JSON.stringify(preview)})` };
 	}
 	const kind = value === null ? "null" : typeof value;
-	return { ok: false, error: `budget_profile must be one of "low" | "standard" | "extended" (received ${kind})` };
+	return { ok: false, error: `budget_profile must be one of "standard" | "extended" (received ${kind})` };
 }
 
 // ---------------------------------------------------------------------------
@@ -363,8 +364,8 @@ export function recipeMutationBlockReason(
 /**
  * Stable task text: fixed instructions plus dynamic contract in the user
  * message. Phase 5: the text includes one short deterministic
- * spend-profile line naming the resolved `budgetProfile` (omitted →
- * `standard`; explicit `low`/`extended` named when supplied) and stating
+ * spend-profile line naming the resolved active `budgetProfile` (omitted or
+ * retired `low` → `standard`; explicit `extended` named when supplied) and stating
  * that the profile bounds cumulative spend only — it never expands the
  * parent-approved path/scope authority. Phase 4A: when and only when
  * `repairOf` is present, a deterministic `Repair provenance:` line
@@ -378,7 +379,7 @@ export function formatWorkerTask(contract: WorkerTaskContract): string {
 	const resolvedTaskKind = resolveWorkerTaskKind(contract.taskKind);
 	if (!resolvedTaskKind.ok) throw new Error(resolvedTaskKind.error);
 	const diagnosis = resolvedTaskKind.taskKind === "diagnosis";
-	const profile = contract.budgetProfile ?? WORKER_SPEND_DEFAULT_PROFILE;
+	const profile = contract.budgetProfile === "extended" ? "extended" : WORKER_SPEND_DEFAULT_PROFILE;
 	const lines = [
 		diagnosis ? "Delegated diagnosis task (strictly read-only):" : "Delegated implementation task:",
 		contract.task.trim(),

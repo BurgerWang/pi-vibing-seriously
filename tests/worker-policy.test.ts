@@ -258,25 +258,27 @@ test("formatted diagnosis task makes inspection-only authority explicit", () => 
 // Phase 3: budget-profile contract validation (worker token-budget repair)
 // ---------------------------------------------------------------------------
 
-test("budget-profile validation resolves omitted to standard and accepts exactly the three literals", () => {
+test("budget-profile validation resolves omitted to standard and accepts only active profiles", () => {
 	assert.deepEqual(resolveWorkerBudgetProfile(undefined), { ok: true, profile: "standard" });
-	assert.deepEqual(resolveWorkerBudgetProfile("low"), { ok: true, profile: "low" });
 	assert.deepEqual(resolveWorkerBudgetProfile("standard"), { ok: true, profile: "standard" });
 	assert.deepEqual(resolveWorkerBudgetProfile("extended"), { ok: true, profile: "extended" });
+	const retired = resolveWorkerBudgetProfile("low");
+	assert.equal(retired.ok, false, "retired low fails closed at the public contract boundary");
+	if (!retired.ok) assert.match(retired.error, /"standard" \| "extended"/);
 });
 
 test("budget-profile validation fails closed on unknown, empty, wrong types and case variants", () => {
 	// Unknown/empty/case-variant strings fail closed with the bounded error.
-	for (const bad of ["", "LOW", "Standard", "EXTENDED", "ultra", " low", "standard ", "low\n", "low\u0000"]) {
+	for (const bad of ["", "low", "LOW", "Standard", "EXTENDED", "ultra", " low", "standard ", "low\n", "low\u0000"]) {
 		const r = resolveWorkerBudgetProfile(bad);
 		assert.equal(r.ok, false, `string ${JSON.stringify(bad)} must fail closed`);
-		if (!r.ok) assert.match(r.error, /budget_profile must be one of "low" \| "standard" \| "extended"/);
+		if (!r.ok) assert.match(r.error, /budget_profile must be one of "standard" \| "extended"/);
 	}
 	// Wrong types fail closed: null, numbers, booleans, objects, arrays.
 	for (const bad of [null, 0, 1, 3.5, true, false, {}, { profile: "low" }, [], ["low"]]) {
 		const r = resolveWorkerBudgetProfile(bad);
 		assert.equal(r.ok, false, `${JSON.stringify(bad)} must fail closed`);
-		if (!r.ok) assert.match(r.error, /budget_profile must be one of "low" \| "standard" \| "extended"/);
+		if (!r.ok) assert.match(r.error, /budget_profile must be one of "standard" \| "extended"/);
 	}
 	// The error stays bounded even for pathological values (never the full
 	// value embedded, never an unbounded message).
@@ -298,8 +300,8 @@ test("formatted worker task names the resolved spend profile deterministically (
 	// Omitted budgetProfile resolves deterministically to standard.
 	const standardText = formatWorkerTask(base);
 	assert.match(standardText, /Worker spend-budget profile: standard/);
-	// Explicit low / extended profiles are named exactly when supplied.
-	assert.match(formatWorkerTask({ ...base, budgetProfile: "low" }), /Worker spend-budget profile: low/);
+	// Retired low is defensively rendered as standard; extended remains explicit.
+	assert.match(formatWorkerTask({ ...base, budgetProfile: "low" }), /Worker spend-budget profile: standard/);
 	const extendedText = formatWorkerTask({ ...base, budgetProfile: "extended" });
 	assert.match(extendedText, /Worker spend-budget profile: extended/);
 	// The profile line states the profile bounds spend only — it never
@@ -575,6 +577,6 @@ test("formatted worker task carries the repair provenance pointer line only when
 	// Combined with an explicit budget profile, both lines coexist with the
 	// provenance pointer first and the profile rendering unchanged.
 	const combined = formatWorkerTask({ ...base, repairOf: VALID_REPAIR_ID, budgetProfile: "low" });
-	assert.ok(combined.indexOf("Repair provenance:") < combined.indexOf("Worker spend-budget profile: low"));
-	assert.match(combined, /Worker spend-budget profile: low — bounds cumulative spend only/);
+	assert.ok(combined.indexOf("Repair provenance:") < combined.indexOf("Worker spend-budget profile: standard"));
+	assert.match(combined, /Worker spend-budget profile: standard — bounds cumulative spend only/);
 });

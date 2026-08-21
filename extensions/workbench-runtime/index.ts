@@ -42,8 +42,7 @@ import {
 	createWorkerWriteJournalRuntime,
 } from "./core/worker-write-journal-runtime.ts";
 import {
-	isWorkerSpendProfile,
-	WORKER_SPEND_DEFAULT_PROFILE,
+	resolveWorkerSpendProfile,
 	WORKER_SPEND_PROFILE_ENV,
 } from "./core/worker-spend.ts";
 import {
@@ -268,12 +267,10 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		allowedPaths: parseWorkerAllowedPaths(process.env[WORKER_ALLOWED_PATHS_ENV]),
 		taskKind: parseWorkerTaskKindEnvironment(process.env[WORKER_TASK_KIND_ENV]),
 		// Phase 2 (worker token-budget repair): the delegation spend profile
-		// from the fixed child env contract. The runner ALWAYS writes a valid
-		// low/standard/extended value; malformed/missing child env falls back
-		// to `standard` defensively (strict validation, never guessed).
-		spendProfile: isWorkerSpendProfile(process.env[WORKER_SPEND_PROFILE_ENV])
-			? process.env[WORKER_SPEND_PROFILE_ENV]
-			: WORKER_SPEND_DEFAULT_PROFILE,
+		// from the fixed child env contract. Current runners write only
+		// standard/extended; retired `low` and malformed/missing child env
+		// resolve defensively to `standard`.
+		spendProfile: resolveWorkerSpendProfile(process.env[WORKER_SPEND_PROFILE_ENV]),
 	};
 	const workerWriteJournalRuntime = createWorkerWriteJournalRuntime({
 		role: workerRoleContext.role,

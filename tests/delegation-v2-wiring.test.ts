@@ -447,6 +447,24 @@ async function emitToolResult(stub: StubAPI, result: RuntimeResult, toolCallId: 
 	return event;
 }
 
+test("public delegate rejects retired low before transaction persistence or child launch", async () => {
+	await withTempDir(async (root) => {
+		await initializeProject(root);
+		const stub = commanderRuntime();
+		await assert.rejects(
+			delegateTool(stub).execute(
+				"retired-low",
+				delegateParams({ budget_profile: "low" }),
+				undefined,
+				undefined,
+				commanderContext(root, "retired-low"),
+			),
+			/invalid_contract/,
+		);
+		assert.deepEqual(await delegationDirectories(root), [], "low is rejected before any transaction directory exists");
+	});
+});
+
 test("diagnosis zero-diff commits v2 FINISHED, unblocks the mirror, and trusts only the immutable generation report", async () => {
 	await withTempDir(async (root) => {
 		await initializeProject(root);

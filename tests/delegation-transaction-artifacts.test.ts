@@ -210,12 +210,13 @@ function committing(
 	kind: DelegationTaskKind,
 	reportComplete: boolean,
 	afterFacts = after(kind),
+	budgetProfile: DelegationBoundedTaskContractPayloadV2["budget_profile"] = "standard",
 ): {
 	state: DelegationTransactionRecord;
 	contract: ReturnType<typeof bindDelegationBoundedTaskContractV2> & { ok: true };
 	changeSetLifecycle: Readonly<FinalizedDelegationChangeSetLifecycleV2>;
 } {
-	const contract = bindDelegationBoundedTaskContractV2(payload(kind));
+	const contract = bindDelegationBoundedTaskContractV2({ ...payload(kind), budget_profile: budgetProfile });
 	if (!contract.ok) throw new Error(contract.error.message);
 	assert.equal(contract.ok, true);
 	const prepared = createPreparedDelegationTransaction({
@@ -381,6 +382,34 @@ test("artifact v2: canonical contract hashing preserves array order and omits ab
 	assert.equal(bindDelegationBoundedTaskContractV2({ ...payload(), task_kind: "mechanical" }).ok, false);
 	assert.equal(bindDelegationBoundedTaskContractV2({ ...payload(), allowed_paths: ["z/**", "a/**"] }).ok, false);
 	assert.equal(bindDelegationBoundedTaskContractV2({ ...payload(), allowed_paths: ["src/**", "src/**"] }).ok, false);
+});
+
+test("artifact v2: historical low contract hashes remain reproducible but cannot create a new committed artifact", () => {
+	const historical = bindDelegationBoundedTaskContractV2({ ...payload(), budget_profile: "low" });
+	assert.equal(historical.ok, true, "strict historical read binding preserves low contract hash compatibility");
+	if (!historical.ok) return;
+	assert.equal(historical.value.budget_profile, "low");
+	assert.deepEqual(bindDelegationBoundedTaskContractV2(structuredClone(historical.value)), {
+		ok: false,
+		error: { code: "invalid_contract", message: "delegation v2 task contract must have the exact normalized field set" },
+	}, "a binding with contract_hash is not accepted as an unbound payload");
+
+	const facts = after("implementation");
+	const current = committing("implementation", true, facts, "low");
+	const lowContract = current.contract.value;
+	const built = buildDelegationCommittedArtifactsV2({
+		transaction: current.state,
+		contract: lowContract,
+		...artifactWorkspaceFacts(current.changeSetLifecycle),
+		changeSetLifecycle: current.changeSetLifecycle,
+		worker: { ...worker(), spendProfile: "low" },
+		reportText: completeReport(),
+	});
+	assert.equal(built.ok, false, "current artifact construction never publishes low");
+	if (!built.ok) {
+		assert.equal(built.error.code, "invalid_contract");
+		assert.match(built.error.message, /historical-read-only/);
+	}
 });
 
 test("artifact v2: public contract normalizer trims and defaults before strict binding without mutating input", () => {

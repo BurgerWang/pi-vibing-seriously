@@ -235,8 +235,8 @@ test("governance v1 freezes schema constants, public tool input/output categorie
 	assert.notEqual(canonicalHash(currentBudgetProfile), canonicalHash(v1BudgetProfile), "current budget description may identify the Luna policy without rewriting the frozen v1 catalog");
 	assert.deepEqual(
 		(currentBudgetProfile as { anyOf?: Array<{ const?: unknown }> }).anyOf?.map((entry) => entry.const),
-		["low", "standard", "extended"],
-		"current budget keeps the exact closed profile enum",
+		["standard", "extended"],
+		"current budget exposes only the active profile enum",
 	);
 	assert.equal((currentBudgetProfile as { default?: unknown }).default, "standard");
 	const currentMetadata = WORKBENCH_TOOL_METADATA.workbench_delegate_worker;

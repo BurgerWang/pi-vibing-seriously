@@ -186,7 +186,7 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 
 test("v0.10.0 public tool surface has the intentional canonical transition hash", () => {
 	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
-	const currentHash = "1a993956f8d9e12a392b6f8745baed3ef7a29cdfc0e63564b70845050ca5173c";
+	const currentHash = "a8bc925d4e0d698699077a7b222ca640a3de4e9748ebbb623468130bce1e5aad";
 	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
 	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the documented 0.10.0 hash");
 });
@@ -384,6 +384,7 @@ test("workbench_delegate_worker metadata is static and defaults to one-call deli
 	assert.match(text, /zero successful or denied writes/);
 	assert.match(text, /explicit permission, destructive-action confirmation, or final verification gates/);
 	assert.match(text, /Historical v1 ledgers remain read-only/);
+	assert.doesNotMatch(text, /deepseek/i, "current delegate metadata contains no retired provider wording");
 	// Registration name/order stay stable. The current schema/hash intentionally
 	// advances for the additive optional task_kind field, while the separately
 	// retained governance-v1 schema remains pinned to its repair_of baseline.
@@ -392,7 +393,7 @@ test("workbench_delegate_worker metadata is static and defaults to one-call deli
 	// The canonical schema object itself (not only its hash): budget_profile
 	// stays OPTIONAL — absent from `required` — and its nested union carries
 	// the JSON Schema `default: "standard"` annotation plus the exact
-	// closed alternatives in the fixed low|standard|extended order. This
+	// closed alternatives in the fixed standard|extended order. This
 	// inspects the real serialized shape so the pin below can never pass on
 	// a self-comparison or a drifted-but-self-consistent schema.
 	const delegateParameters = WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker as unknown as {
@@ -407,9 +408,11 @@ test("workbench_delegate_worker metadata is static and defaults to one-call deli
 	assert.equal(budgetProfileSchema.default, "standard", "the nested budget_profile schema carries the JSON Schema default annotation standard");
 	assert.deepEqual(
 		(budgetProfileSchema.anyOf ?? []).map((alternative) => alternative.const),
-		["low", "standard", "extended"],
-		"the exact closed alternatives in the fixed low|standard|extended order",
+		["standard", "extended"],
+		"the exact closed active alternatives in the fixed standard|extended order",
 	);
+	assert.doesNotMatch(budgetProfileSchema.description ?? "", /low =/);
+	assert.match(budgetProfileSchema.description ?? "", /retired low literal is rejected/);
 	assert.match(budgetProfileSchema.description ?? "", /Luna xhigh cumulative spend profile/);
 	assert.match(budgetProfileSchema.description ?? "", /standard = 32\/5,440,000\/160,000 soft, 64\/10,880,000\/320,000 hard/);
 	assert.match(budgetProfileSchema.description ?? "", /current Sol session/);
@@ -449,8 +452,8 @@ test("workbench_delegate_worker metadata is static and defaults to one-call deli
 	);
 	assert.equal(
 		canonicalHash(WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker),
-		"08d65265ec611faa6e4ec1beeb40e2b3a11ec7b26d157b182730ecbec8598a8f",
-		"current delegate parameter schema hash is machine-pinned after the Luna budget-description transition",
+		"788c73e103fa79b1bf78c44b44040463e4c8ca11ffd9e9dd4be0784ce5283adc",
+		"current delegate parameter schema hash is machine-pinned after low retirement",
 	);
 });
 
@@ -648,8 +651,8 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.equal(
 		canonicalHash(workbenchToolMetadataOrdered()),
-		"c01b382bbb185da8c8d3c039fed0b2b8ec7d056ac59c246fd5d79c2dfe73eace",
-		"current public catalog hash is machine-pinned after the Luna identity and budget-description transition",
+		"b904a9a21904b9ae6b786ebd5699098df426cb7e8030fe5783dc1b602ac8f4fb",
+		"current public catalog hash is machine-pinned after low retirement",
 	);
 });
 

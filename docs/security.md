@@ -231,7 +231,7 @@ wording and granularity guidance since Phase 5):
 - operates independently of the per-message context budget above (which is
   unchanged) and accumulates turns, total tokens and output tokens over
   all assistant messages of a delegation run;
-- three fixed profiles — `low`, `standard` (the default), `extended`
+- two active profiles — `standard` (the default), `extended`
   (explicit opt-in only, never inferred) — with exact soft/hard turns,
   total-token and output-token limits; "reached" means at or above (`>=`);
 - per-message totals reuse the context-budget semantics (positive
@@ -250,9 +250,9 @@ wording and granularity guidance since Phase 5):
   independent of the context steer, send failures swallowed);
 - the spend profile reaches the child through the fixed
   `WORKBENCH_WORKER_SPEND_PROFILE` env contract (the runner always writes
-  a valid value; malformed/missing child env falls back to `standard`
+  a valid active value; retired `low` and malformed/missing child env fall back to `standard`
   defensively); public profile selection is an optional `budget_profile`
-  tool parameter (closed literal union `low | standard | extended`,
+  tool parameter (closed literal union `standard | extended`,
   default `standard`, `extended` never inferred) validated fail-closed by
   the pure contract check in `core/worker-policy.ts` BEFORE any ledger
   creation or child launch; the resolved profile is recorded in the before
@@ -272,6 +272,11 @@ wording and granularity guidance since Phase 5):
   `Pinned worker: N turn(s), model provider/model` text prefix and adds
   only deterministic counters/band;
 - the 60-minute timeout remains an independent failure path.
+
+Historical committed v1/v2 records with `low` remain read-only compatible.
+The public contract and new committed-artifact boundary reject `low` before
+persistence or launch; runtime/internal `low` inputs never execute below the
+`standard` limits.
 
 Only recipes with an empty declared `writes` list are available to a worker.
 Recipe mutation policy (P7): every recipe declares

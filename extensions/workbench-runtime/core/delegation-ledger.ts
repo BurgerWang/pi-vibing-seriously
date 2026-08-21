@@ -935,8 +935,8 @@ export function boundLedgerContract(raw: LedgerContract): { ok: true; contract: 
 		.slice(0, MAX_VERIFICATION_STEPS);
 	const timeoutSeconds = Number.isInteger(raw.timeoutSeconds) && raw.timeoutSeconds >= 60 && raw.timeoutSeconds <= 3600 ? raw.timeoutSeconds : 1800;
 	// Phase 3: resolve the spend-budget profile deterministically — omitted
-	// resolves to `standard`; any other value must be exactly one of the
-	// three literals or the contract FAILS CLOSED (an unknown/empty/wrong-
+	// resolves to `standard`; any other value must be exactly one of the two
+	// active literals or the contract FAILS CLOSED (retired low/unknown/empty/wrong-
 	// typed profile must never reach a ledger record or a child launch).
 	const profile = resolveWorkerBudgetProfile(raw.budgetProfile);
 	if (!profile.ok) return profile;

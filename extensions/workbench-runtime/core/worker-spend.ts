@@ -34,9 +34,10 @@
  *     directly (non-negative finite; malformed → 0), independent of which
  *     path the per-message total took; a provider that omits `output`
  *     undercounts the dimension (accepted, documented heuristic guard).
- *   - Three fixed profiles (`low`, `standard` — the default, `extended` —
- *     explicit only), with exact soft/hard limits; "reached" means at or
- *     above (`>=`), mirroring the `workerBudgetBand` convention.
+ *   - Two active profiles (`standard` — the default, `extended` — explicit
+ *     only), with exact soft/hard limits. The retired `low` limits remain in
+ *     this module solely to validate already-committed historical records;
+ *     runtime selection always maps `low` to `standard`.
  *   - Band evaluation on every processed message: any hard dimension →
  *     `hard` (hard wins over soft, always); else any soft dimension →
  *     `soft`; else `ok`. The triggered-reasons list is the subset of
@@ -55,8 +56,10 @@
 
 import { workerContextTokens } from "./worker-budget.ts";
 
-/** Closed set of delegation spend profiles; `standard` is the default. */
+/** Persisted profile set; `low` is historical-read-only. */
 export type WorkerSpendProfile = "low" | "standard" | "extended";
+/** Profiles that may be selected for a current delegation. */
+export type ActiveWorkerSpendProfile = Exclude<WorkerSpendProfile, "low">;
 /** Cumulative spend band for one delegation run. */
 export type WorkerSpendBand = "ok" | "soft" | "hard";
 /**
@@ -103,9 +106,9 @@ export const WORKER_SPEND_POLICY_ID = "gpt-5.6-luna-xhigh-continuation-v1" as co
  * Fixed child env contract (Phase 2 wiring): the runner passes the resolved
  * spend profile to the worker child through this env var, so the worker-role
  * lifecycle enforces the SAME profile the runner accumulates against. The
- * runner always writes a valid `low` | `standard` | `extended` value;
- * worker-role readers strictly validate it and fall back to `standard` on
- * malformed/missing values (defensive mirror of `resolveWorkerSpendProfile`).
+ * runner always writes a valid active `standard` | `extended` value;
+ * worker-role readers map retired `low` and malformed/missing values to
+ * `standard` (defensive mirror of `resolveWorkerSpendProfile`).
  */
 export const WORKER_SPEND_PROFILE_ENV = "WORKBENCH_WORKER_SPEND_PROFILE";
 
@@ -113,7 +116,8 @@ export const WORKER_SPEND_PROFILE_ENV = "WORKBENCH_WORKER_SPEND_PROFILE";
 export const WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE = "workbench-worker-spend-soft-steer";
 
 /**
- * Exact immutable profile limits (plan §4.3). Every object is frozen at
+ * Exact immutable profile limits (plan §4.3). `low` is retained only for
+ * strict historical-record validation. Every object is frozen at
  * runtime; all six numbers per profile are fixed constants and "reached"
  * means at or above the limit (`>=`).
  */
@@ -185,13 +189,13 @@ function limitsFor(profile: WorkerSpendProfile): WorkerSpendLimits {
 }
 
 /**
- * Strict profile validation: accepts exactly `low` | `standard` |
- * `extended`; rejects everything else (unknown, empty, wrong type,
+ * Strict active-profile validation: accepts exactly `standard` |
+ * `extended`; rejects retired `low` and everything else (unknown, empty, wrong type,
  * case variants). Callers that must fail closed use this check; callers
  * that explicitly request a default use `resolveWorkerSpendProfile`.
  */
-export function isWorkerSpendProfile(value: unknown): value is WorkerSpendProfile {
-	return value === "low" || value === "standard" || value === "extended";
+export function isWorkerSpendProfile(value: unknown): value is ActiveWorkerSpendProfile {
+	return value === "standard" || value === "extended";
 }
 
 /**
@@ -200,7 +204,7 @@ export function isWorkerSpendProfile(value: unknown): value is WorkerSpendProfil
  * exists only here, where a default is explicitly requested; strict
  * validation (`isWorkerSpendProfile`) still rejects unknown values.
  */
-export function resolveWorkerSpendProfile(value: unknown): WorkerSpendProfile {
+export function resolveWorkerSpendProfile(value: unknown): ActiveWorkerSpendProfile {
 	return isWorkerSpendProfile(value) ? value : WORKER_SPEND_DEFAULT_PROFILE;
 }
 
@@ -308,9 +312,9 @@ export function workerSpendReasons(state: unknown, profile: WorkerSpendProfile):
 export function formatWorkerSpendSteerText(state: unknown, profile: WorkerSpendProfile): string {
 	const s = normalizeWorkerSpendState(state);
 	const profileName = resolveWorkerSpendProfile(profile);
-	const limits = limitsFor(profile);
+	const limits = limitsFor(profileName);
 	const softReasons = WORKER_SPEND_REASON_ORDER.filter(
-		(reason) => workerSpendDimensionFlags(s, profile).soft[dimensionKey(reason)],
+		(reason) => workerSpendDimensionFlags(s, profileName).soft[dimensionKey(reason)],
 	);
 	const facts =
 		softReasons.length > 0
@@ -338,8 +342,8 @@ export function formatWorkerSpendSteerText(state: unknown, profile: WorkerSpendP
 export function formatWorkerSpendHardStop(state: unknown, profile: WorkerSpendProfile): string {
 	const s = normalizeWorkerSpendState(state);
 	const profileName = resolveWorkerSpendProfile(profile);
-	const limits = limitsFor(profile);
-	const flags = workerSpendDimensionFlags(s, profile);
+	const limits = limitsFor(profileName);
+	const flags = workerSpendDimensionFlags(s, profileName);
 	const reasons = WORKER_SPEND_REASON_ORDER.filter((reason) => flags.hard[dimensionKey(reason)]);
 	const facts =
 		reasons.length > 0
@@ -358,6 +362,7 @@ export function formatWorkerSpendHardStop(state: unknown, profile: WorkerSpendPr
  */
 export function formatWorkerSpendSummary(state: unknown, profile: WorkerSpendProfile): string {
 	const s = normalizeWorkerSpendState(state);
-	const limits = limitsFor(profile);
-	return `spend budget : turns ${s.turns}/${limits.hard.turns} | total ${s.totalTokens}/${limits.hard.totalTokens} | output ${s.outputTokens}/${limits.hard.outputTokens} | profile ${resolveWorkerSpendProfile(profile)}`;
+	const profileName = resolveWorkerSpendProfile(profile);
+	const limits = limitsFor(profileName);
+	return `spend budget : turns ${s.turns}/${limits.hard.turns} | total ${s.totalTokens}/${limits.hard.totalTokens} | output ${s.outputTokens}/${limits.hard.outputTokens} | profile ${profileName}`;
 }

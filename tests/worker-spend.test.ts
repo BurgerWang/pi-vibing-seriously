@@ -90,8 +90,8 @@ test("spend profile constants: all 18 numbers exact, immutable, ordered", () => 
 	assert.ok(Object.isFrozen(EMPTY_WORKER_SPEND_STATE));
 });
 
-test("profile selection: strict validation rejects unknown, resolve defaults to standard", () => {
-	assert.equal(isWorkerSpendProfile("low"), true);
+test("active profile selection rejects retired low and resolves it to standard", () => {
+	assert.equal(isWorkerSpendProfile("low"), false);
 	assert.equal(isWorkerSpendProfile("standard"), true);
 	assert.equal(isWorkerSpendProfile("extended"), true);
 	assert.equal(isWorkerSpendProfile(undefined), false);
@@ -103,7 +103,7 @@ test("profile selection: strict validation rejects unknown, resolve defaults to 
 	assert.equal(isWorkerSpendProfile(42), false);
 	assert.equal(isWorkerSpendProfile({}), false);
 
-	assert.equal(resolveWorkerSpendProfile("low"), "low");
+	assert.equal(resolveWorkerSpendProfile("low"), "standard");
 	assert.equal(resolveWorkerSpendProfile("standard"), "standard");
 	assert.equal(resolveWorkerSpendProfile("extended"), "extended");
 	assert.equal(resolveWorkerSpendProfile(undefined), "standard");
@@ -333,10 +333,10 @@ test("soft steer text is deterministic and names profile, reasons, and current/s
 	const steerAll = formatWorkerSpendSteerText({ turns: 32, totalTokens: 5_440_000, outputTokens: 160_000 }, "standard");
 	assert.ok(steerAll.includes("turns 32/32, total_tokens 5440000/5440000, output_tokens 160000/160000"));
 
-	// Profile is named per profile; low-profile boundaries render correctly.
-	const steerLow = formatWorkerSpendSteerText({ turns: 8, totalTokens: 0, outputTokens: 0 }, "low");
-	assert.match(steerLow, /profile low/);
-	assert.ok(steerLow.includes("turns 8/8"));
+	// Retired low is defensively presented under the standard profile.
+	const steerLow = formatWorkerSpendSteerText({ turns: 32, totalTokens: 0, outputTokens: 0 }, "low");
+	assert.match(steerLow, /profile standard/);
+	assert.ok(steerLow.includes("turns 32/32"));
 	const steerExtended = formatWorkerSpendSteerText({ turns: 64, totalTokens: 0, outputTokens: 0 }, "extended");
 	assert.match(steerExtended, /profile extended/);
 	assert.ok(steerExtended.includes("turns 64/64"));
@@ -360,8 +360,8 @@ test("hard-stop text is deterministic and names winning dimensions with current/
 		`Worker cumulative spend hard budget reached (profile standard): turns 70/64, output_tokens 330000/320000.${action}`,
 	);
 	assert.equal(
-		formatWorkerSpendHardStop({ turns: 10, totalTokens: 1_700_000, outputTokens: 0 }, "low"),
-		`Worker cumulative spend hard budget reached (profile low): total_tokens 1700000/1632000.${action}`,
+		formatWorkerSpendHardStop({ turns: 64, totalTokens: 0, outputTokens: 0 }, "low"),
+		`Worker cumulative spend hard budget reached (profile standard): turns 64/64.${action}`,
 	);
 	assert.equal(
 		formatWorkerSpendHardStop({ turns: 96, totalTokens: 17_408_000, outputTokens: 512_000 }, "extended"),
@@ -406,7 +406,7 @@ test("hard-stop text derives reasons strictly from hard flags; soft-only states 
 	);
 	assert.equal(
 		formatWorkerSpendHardStop({ turns: 10, totalTokens: 0, outputTokens: 0 }, "low"),
-		`Worker cumulative spend hard budget reached (profile low): no dimension at its hard limit.${action}`,
+		`Worker cumulative spend hard budget reached (profile standard): no dimension at its hard limit.${action}`,
 	);
 	assert.equal(
 		formatWorkerSpendHardStop({ turns: 80, totalTokens: 0, outputTokens: 0 }, "extended"),
@@ -439,7 +439,7 @@ test("spend summary formatter is deterministic with hard-limit denominators", ()
 	);
 	assert.equal(
 		formatWorkerSpendSummary({ turns: 5, totalTokens: 400_000, outputTokens: 20_000 }, "low"),
-		"spend budget : turns 5/16 | total 400000/1632000 | output 20000/100000 | profile low",
+		"spend budget : turns 5/64 | total 400000/10880000 | output 20000/320000 | profile standard",
 	);
 	assert.equal(
 		formatWorkerSpendSummary({ turns: 50, totalTokens: 9_000_000, outputTokens: 250_000 }, "extended"),
@@ -456,7 +456,7 @@ test("spend summary formatter is deterministic with hard-limit denominators", ()
 	);
 	assert.equal(
 		formatWorkerSpendSummary(null, "low"),
-		"spend budget : turns 0/16 | total 0/1632000 | output 0/100000 | profile low",
+		"spend budget : turns 0/64 | total 0/10880000 | output 0/320000 | profile standard",
 	);
 });
 
