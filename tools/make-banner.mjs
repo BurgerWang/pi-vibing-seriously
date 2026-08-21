@@ -7,11 +7,12 @@
  * identically everywhere (GitHub included). The version chip is read from
  * package.json, so the banner can never drift from the package version.
  *
- * Design (product refresh): a compact Pi product card beside a development-
- * first terminal. The visual hierarchy is product name first, outcome second,
- * with the AUDIT → DEV → VERIFY pipeline and Sol → Luna collaboration kept as
- * small status chips. No scripts, external references, foreignObject, event
- * handlers, gradients, or fonts — only deterministic <rect> pixels.
+ * Design (product refresh): a compact Pi product card beside a fixed
+ * Sol-to-Luna delivery terminal. The visual hierarchy is product name first,
+ * outcome second, with the AUDIT → DEV → VERIFY pipeline and Sol → Luna
+ * collaboration kept as small status chips. No scripts, external references,
+ * foreignObject, event handlers, gradients, or fonts — only deterministic
+ * <rect> pixels.
  *
  * Usage:
  *   node tools/make-banner.mjs            # write assets/banner.svg
@@ -126,7 +127,7 @@ export function buildBanner(version) {
 	putText(rects, ">", 3, 187, 92, COLORS.cursor);
 
 	// Product hierarchy: positioning statement, name, then outcome.
-	putText(rects, "DEVELOPMENT FIRST", 3, 218, 28, COLORS.cursor);
+	putText(rects, "SOL PLANS LUNA BUILDS", 3, 218, 28, COLORS.cursor);
 	putText(rects, "WORKBENCH", 7, 218, 67, COLORS.accent);
 	rects.push(`<rect x="606" y="67" width="14" height="49" fill="${COLORS.cursor}"/>`);
 	putText(rects, "SHIP FAST · VERIFY ONCE", 3, 218, 137, COLORS.tag);
@@ -144,7 +145,7 @@ export function buildBanner(version) {
 
 	const viewBox = `0 0 ${width} ${height}`;
 	const body = rects.join("\n");
-	const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" width="${width}" height="${height}" shape-rendering="crispEdges" role="img" aria-label="pi-dev-workbench v${version} — development-first Pi workbench with Sol and Luna, evidence-backed delivery">\n${body}\n</svg>\n`;
+	const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}" width="${width}" height="${height}" shape-rendering="crispEdges" role="img" aria-label="pi-dev-workbench v${version} — fixed Sol and Luna collaboration with evidence-backed delivery">\n${body}\n</svg>\n`;
 	return { svg, width, height, version };
 }
 
@@ -171,7 +172,7 @@ function putText(rects, text, scale, x0, y0, color) {
 function asciiPreview(version) {
 	const px = GLYPH_W + 1;
 	const lines = [
-		"PI  DEVELOPMENT FIRST",
+		"PI  SOL PLANS LUNA BUILDS",
 		"WORKBENCH",
 		"SHIP FAST · VERIFY ONCE",
 		`V${version}  AUDIT > DEV > VERIFY  SOL > LUNA  ✓ PASS`,

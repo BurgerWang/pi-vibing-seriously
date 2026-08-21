@@ -613,7 +613,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		);
 	}
 
-	/** Reapply the tool surface when a high-risk lease is no longer active. */
+	/** Reapply the locked 15-tool surface when a temporary lease is no longer active. */
 	function syncLeaseLock(now?: string): void {
 		if (writeLease && leaseStatus(writeLease, now ?? new Date().toISOString()) !== "active") {
 			applyModeTools();

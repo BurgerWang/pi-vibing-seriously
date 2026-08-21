@@ -99,7 +99,7 @@ an unfrozen protocol.
 | `milestone_prompt_sha256` | SHA-256 of the raw bytes of the frozen `milestone-prompt.txt` (no trailing newline) | `1af10ebb1abfec5aba9744841980da66c9ee8e12720d589caa623350fb608a40` |
 | `fixture_manifest_sha256` | Deterministic fixture-manifest hash over the frozen fixture tree (§5.2) | `062b3c92a8a36825394f0fa80b94808f2457ca5b63e8bbf9a70ff24339c216b6` |
 | `rubric_sha256` | SHA-256 of the raw bytes of the frozen `rubric.json` | `dccfd406a69f7582a5fc44daad420d8e177c993cf3a7110ae11c6686beab74ed` |
-| `non_treatment_sha256` | Deterministic content-manifest hash over the frozen non-treatment bundle: `AGENTS.md` + everything under `skills/` + `prompts/` + `templates/` (same hash function as §5.2; captured at freeze time and re-captured in every collection record, §4.5) | `d8ae301a2050004b6f93da1aec9871496fe07b307d9cca8808ad4369ea365b78` |
+| `non_treatment_sha256` | Deterministic content-manifest hash over the frozen non-treatment bundle: `AGENTS.md` + everything under `skills/` + `prompts/` + `templates/` (same hash function as §5.2; captured at freeze time and re-captured in every collection record, §4.5) | `b7cc04cc44345f448105ab4272a9e80d795f79e663041f7b7f2276132448a2bd` |
 
 ### 3.3 Pin resolution discipline
 
@@ -419,7 +419,7 @@ directory).
     "path": "commander-native-tool-benchmark/fixture",
     "manifest_sha256": "062b3c92a8a36825394f0fa80b94808f2457ca5b63e8bbf9a70ff24339c216b6"
   },
-  "non_treatment_sha256": "d8ae301a2050004b6f93da1aec9871496fe07b307d9cca8808ad4369ea365b78",
+  "non_treatment_sha256": "b7cc04cc44345f448105ab4272a9e80d795f79e663041f7b7f2276132448a2bd",
   "rubric": {
     "sha256": "dccfd406a69f7582a5fc44daad420d8e177c993cf3a7110ae11c6686beab74ed",
     "checks": [ { "id": "fact-1", "pattern": "<regex>" } ]

@@ -34,7 +34,6 @@ import {
 import { WORKBENCH_TOOL_NAMES } from "./tool-catalog.ts";
 import { WORKER_TOOL_NAME } from "./worker-policy.ts";
 import {
-	DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST,
 	defaultWritePolicy,
 	detectActorRole,
 	LEASE_TOOLS,
@@ -161,11 +160,11 @@ export function isToolHardDenied(mode: WorkbenchMode, toolName: string): boolean
 /**
  * Active-tool set to configure for a mode, based on the currently active set.
  *
- * Development-first Sol DEV: the approved GPT-5.6 Sol identity retains the
- * serialized worker-first-strict compatibility id, but DEV advertises the
- * canonical workbench surface plus ordinary edit/write. Bash and foreign
- * tools remain excluded. The second-layer write-authority guard—not active
- * tool presence—requires a lease for high-risk paths. Delegated workers and
+ * Worker-first Sol DEV: the approved GPT-5.6 Sol identity receives the
+ * canonical 15-tool read/control/delegation surface. Bash and foreign tools
+ * remain excluded. An ACTIVE human-issued lease adds only its exact
+ * edit/write subset, and the second-layer guard still checks path/tool scope.
+ * Delegated workers and
  * other controllers remain outside this policy and keep the role-specific
  * behavior below. AUDIT and VERIFY remain strict for every actor.
  *
@@ -178,21 +177,23 @@ export function computeActiveTools(
 	mode: WorkbenchMode,
 	currentlyActive: readonly string[],
 	facts?: ActorToolFacts,
-	/** Compatibility input; leases affect high-risk authorization, not DEV tool presence. */
+	/** Exact edit/write subset from an ACTIVE user-issued lease. */
 	leaseTools: readonly string[] = [],
 ): string[] {
 	if (mode === "DEV" && facts) {
 		const actor = detectActorRole(facts);
 		const policy = defaultWritePolicy(facts.provider, facts.model);
 		if (actor === "sol-commander" && policy === "worker-first-strict") {
-			// The fixed development-first surface is advertised (every tool is a
+			// The fixed worker-first surface is advertised (every tool is a
 			// Pi builtin or a statically registered workbench tool); foreign
 			// tools are dropped by construction. Intersecting with the current
 			// active set would lose tools when switching back from a stricter
-			// mode, so the canonical list is returned directly. Lease input does
-			// not change this surface; the second layer checks high-risk paths.
-			void leaseTools;
-			return [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST];
+			// mode, so the canonical list is returned directly. Only the fixed
+			// lease-tool order may extend it; malformed/foreign names are ignored.
+			return [
+				...STRICT_SOL_DEV_ALLOWLIST,
+				...LEASE_TOOLS.filter((tool) => leaseTools.includes(tool)),
+			];
 		}
 	}
 	const active = new Set<string>();

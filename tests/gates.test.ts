@@ -1032,8 +1032,8 @@ test("B6 is the development-safety base gate with eight legacy-compatible machin
 		assert.ok(b6, "b6 loads for generic profiles (universal base gate)");
 		assert.equal(b6!.source, "catalog");
 		assert.equal(b6!.title, "Development Safety");
-		assert.match(b6!.description, /direct development policy active/);
-		assert.match(b6!.description, /legacy worker-first check kind remains only for record compatibility/);
+		assert.match(b6!.description, /fixed Sol\/Luna policy active/);
+		assert.match(b6!.description, /commander writes locked or explicitly leased/);
 		assert.equal(b6!.prerequisites.length, 0, "B6 is independent of B0-B5 (no manual-evidence prerequisites)");
 		assert.equal(b6!.required, true);
 		assert.equal(b6!.blocking, true);

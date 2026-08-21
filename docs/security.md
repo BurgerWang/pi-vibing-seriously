@@ -96,22 +96,20 @@ Defense-in-depth controls:
 - the tool executes sequentially, propagates abort, enforces a timeout, and
   bounds stdout/stderr processing.
 
-### Development-first write authority (current; legacy id P7)
+### Fixed Sol -> Luna write authority (current; legacy id P7)
 
-Approved GPT-5.6 Sol in DEV receives the historical 15-tool read/workbench
-surface plus ordinary `edit` and `write`; `bash` and foreign tools stay
-unavailable. The serialized `worker-first-strict` policy id remains for
-compatibility only. It does not force routine development through worker
-delegation. Actor identity comes only from the
+Approved GPT-5.6 Sol in DEV receives the fixed 15-tool read/control/delegation
+surface; `bash`, `edit`, `write`, and foreign tools stay unavailable by
+default. The serialized `worker-first-strict` policy id describes the active
+product behavior: routine development is implemented by Luna. Actor identity comes only from the
 `WORKBENCH_AGENT_ROLE=worker` env contract and the provider/model pair;
 project config can never self-label a controller as Sol or as a worker.
 Workers and other controllers are outside the policy (the existing worker
 guards remain authoritative; other controllers are not newly denied).
 
-Second-layer `tool_call` guard for Sol: `bash` is always blocked; ordinary
-canonical project-relative `edit`/`write` is direct after project realpath
-containment. Dependency, security/auth/policy, deployment/migration and Pi
-control paths require an ACTIVE user-issued temporary write lease; every tool
+Second-layer `tool_call` guard for Sol: `bash` is always blocked; any direct
+canonical project-relative `edit`/`write` requires an ACTIVE user-issued
+temporary write lease plus project realpath containment. Every tool
 outside the allowlist is blocked despite any re-enable. Leases are user-only
 (`/q-commander-write-unlock`, `/q-commander-write-lock`, `/q-write-policy
 status` — commands, never model tools), with fixed reasons
@@ -126,11 +124,11 @@ lease whose two bounded distinct token parts are displayed exactly once and
 must both be confirmed by a second invocation — both parts are consumed on
 success and a confirmed lease can never be re-confirmed. Token parts never
 appear in status/compact summaries or persisted summaries (`/q-write-policy
-status` and the footer show only `WF:LEASE used/max` / `WF:DIRECT` facts).
+status` and the footer show only `WF:LEASE used/max` / `WF:LOCKED` facts).
 Leases are revoked on leaving DEV, commander model/provider change, session
 end, explicit lock, and they expire (30 min) or exhaust (10 calls) —
-removing only the high-risk exception; ordinary direct edit/write remains
-available. Invalid lease records fail closed for high-risk paths.
+restoring the locked Sol surface. Invalid lease records fail closed for all
+direct commander edit/write paths.
 
 ### Delegation ledger and review lifecycle (P7)
 

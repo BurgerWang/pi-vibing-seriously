@@ -40,7 +40,7 @@ import {
 	MAX_LEASE_DURATION_MS,
 	revokeLease,
 	serializeLease,
-	DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST as CURRENT_SOL_DEV_ALLOWLIST,
+	STRICT_SOL_DEV_ALLOWLIST as CURRENT_SOL_DEV_ALLOWLIST,
 } from "../extensions/workbench-runtime/core/write-authority.ts";
 import {
 	emptyDelegationState,
@@ -667,7 +667,7 @@ test("P7 tools and commands are registered statically", () => {
 	assert.ok(stub.commands.has("q-delegation-status"), "/q-delegation-status registered");
 });
 
-test("Sol DEV exposes the fixed development-first surface on session_start", async () => {
+test("Sol DEV exposes the fixed worker-first surface on session_start", async () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	const handlers = stub.events.get("session_start");
@@ -677,9 +677,9 @@ test("Sol DEV exposes the fixed development-first surface on session_start", asy
 	});
 	await handlers[0]!({ type: "session_start", reason: "resume" } as never, ctx as never);
 	assert.deepEqual(stub.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST], "exactly the fixed allowlist in canonical order");
-	assert.equal(stub.activeTools.length, 17, "17 tools: ordinary edit/write, no bash/foreign");
-	assert.ok(stub.activeTools.includes("edit"));
-	assert.ok(stub.activeTools.includes("write"));
+	assert.equal(stub.activeTools.length, 15, "15 tools: edit/write/bash/foreign are locked");
+	assert.ok(!stub.activeTools.includes("edit"));
+	assert.ok(!stub.activeTools.includes("write"));
 	for (const tool of ["bash", "web_search"]) {
 		assert.ok(!stub.activeTools.includes(tool), `${tool} must not be active for Sol`);
 	}
@@ -694,7 +694,7 @@ test("non-Sol sessions keep the existing DEV tool set (other controllers unchang
 	assert.ok(stub.activeTools.includes("edit"));
 });
 
-test("the tool_call guard allows ordinary writes but blocks bash, high-risk unleased writes, and foreign tools", async () => {
+test("the tool_call guard blocks bash, every unleased write, and foreign tools", async () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	const sessionStart = stub.events.get("session_start")![0]!;
@@ -705,10 +705,11 @@ test("the tool_call guard allows ordinary writes but blocks bash, high-risk unle
 	type GuardResult = { block?: boolean; reason?: string } | undefined;
 	const bash = (await guardCall(stub, "bash", { command: "ls -la" })) as GuardResult;
 	assert.ok(bash && bash.block === true, "bash blocked for strict Sol");
-	assert.match(String(bash.reason), /Development safety/);
-	assert.match(String(bash.reason), /workbench_delegate_worker is optional/);
+	assert.match(String(bash.reason), /Worker-first development/);
+	assert.match(String(bash.reason), /workbench_delegate_worker/);
 	const edit = (await guardCall(stub, "edit", { path: "src/main.ts" })) as GuardResult;
-	assert.equal(edit, undefined, "ordinary edit is direct");
+	assert.ok(edit && edit.block === true, "ordinary edit belongs to Luna without a lease");
+	assert.match(String(edit.reason), /lease locked/);
 	const highRisk = (await guardCall(stub, "edit", { path: "package.json" })) as GuardResult;
 	assert.ok(highRisk && highRisk.block === true, "high-risk edit requires a lease");
 	assert.match(String(highRisk.reason), /lease locked/);
@@ -719,7 +720,7 @@ test("the tool_call guard allows ordinary writes but blocks bash, high-risk unle
 	assert.equal(read, undefined, "allowlist tools pass the guard");
 });
 
-test("ordinary direct writes fail closed when a project symlink escapes the real project root", async () => {
+test("leased commander writes fail closed when a project symlink escapes the real project root", async () => {
 	await withTempDir(async (root) => {
 		await withTempDir(async (outside) => {
 			await mkdir(join(root, "src"), { recursive: true });
@@ -728,6 +729,7 @@ test("ordinary direct writes fail closed when a project symlink escapes the real
 			const stub = makeStub();
 			workbenchRuntime(stub);
 			await solSession(stub);
+			await issueAndConfirm(stub, "user-directed --paths src/** --calls 1 --minutes 10");
 			const result = await guardCall(
 				stub,
 				"edit",
@@ -806,6 +808,7 @@ test("worker role keeps its edit/write path scope in the P7 tool_call guard", as
 // ---------------------------------------------------------------------------
 
 const UNLOCK_ARGS = "user-directed --paths src/**,README.md --calls 3 --minutes 10";
+const ACTIVE_SOL_DEV_ALLOWLIST = [...CURRENT_SOL_DEV_ALLOWLIST, "edit", "write"];
 
 /** Fire session_start as approved GPT-5.6 Sol (sets the commander identity). */
 async function solSession(stub: StubAPI, entries?: StubAPI["entries"]): Promise<void> {
@@ -937,11 +940,13 @@ test("non-TUI unlock issues a pending lease, emits two distinct bounded token pa
 	const issued = await runCmd(stub, "q-commander-write-unlock", UNLOCK_ARGS);
 	const { partA, partB } = issuedParts(issued.output);
 	assert.ok(issued.output.includes("BLOCKED until confirmed"));
-	// Pending high-risk lease does not alter the direct development surface.
+	// Pending lease does not alter the locked worker-first surface.
 	assert.deepEqual(stub.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST]);
-	assert.equal(stub.activeTools.length, 17);
-	assert.equal(await guardCall(stub, "edit", { path: "src/main.ts" }), undefined);
-	// The guard still blocks high-risk edit while pending.
+	assert.equal(stub.activeTools.length, 15);
+	const pendingOrdinary = await guardCall(stub, "edit", { path: "src/main.ts" });
+	assert.ok(pendingOrdinary && pendingOrdinary.block === true);
+	assert.match(String(pendingOrdinary.reason), /lease pending/);
+	// The guard also blocks high-risk edit while pending.
 	const blocked = await guardCall(stub, "edit", { path: "package.json" });
 	assert.ok(blocked && blocked.block === true);
 	assert.match(String(blocked.reason), /lease pending/);
@@ -970,7 +975,7 @@ test("non-TUI confirmation requires BOTH exact parts on the same command; mismat
 	// Both exact parts activate the lease and enable edit/write.
 	const ok = await runCmd(stub, "q-commander-write-unlock", `confirm ${partA} ${partB}`);
 	assert.ok(ok.output.includes("CONFIRMED and active"));
-	assert.deepEqual(stub.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST]);
+	assert.deepEqual(stub.activeTools, ACTIVE_SOL_DEV_ALLOWLIST);
 	assert.equal(stub.activeTools.length, 17);
 	assert.equal(await guardCall(stub, "edit", { path: "src/main.ts" }), undefined, "authorized edit passes the guard");
 	// The lease-id form confirms too, and a wrong id is refused.
@@ -1010,18 +1015,18 @@ test("TUI unlock requires explicit human confirmation; cancel leaves the lease l
 	assert.ok(body.includes("10 minute(s)"));
 	assert.ok(body.includes("edit, write only"));
 	assert.ok(!body.includes("confirmation part"), "TUI dialog never shows token parts");
-	assert.deepEqual(stub.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST]);
+	assert.deepEqual(stub.activeTools, ACTIVE_SOL_DEV_ALLOWLIST);
 	assert.match(await leaseStatusLine(stub), /WRITE-LEASE active/);
 });
 
-test("high-risk unlock is limited to approved Sol in DEV; everyone else is refused", async () => {
+test("temporary commander unlock is limited to approved Sol in DEV; everyone else is refused", async () => {
 	// Non-Sol actor (no session identity): refused; the lease is not applicable.
 	const stubA = makeStub();
 	workbenchRuntime(stubA);
 	const refusedA = await runCmd(stubA, "q-commander-write-unlock", UNLOCK_ARGS);
 	assert.match(refusedA.output, /refused/);
 	assert.match(refusedA.output, /approved provider/);
-	assert.match(refusedA.output, /high-risk paths/);
+	assert.match(refusedA.output, /temporary write exception/);
 	assert.match(await leaseStatusLine(stubA), /\(not applicable\)/);
 	// Delegated worker (env contract wins even with Sol-looking model facts): refused.
 	// The policy line still resolves by provider/model, but the ACTOR gate refuses.
@@ -1079,7 +1084,7 @@ test("a pending or active lease blocks re-issuance until confirmed or locked", a
 	assert.match(active.output, /already active/);
 });
 
-test("only authorized high-risk edit/write consumes lease calls; ordinary edits remain direct after exhaustion", async () => {
+test("only authorized leased edit/write consumes calls; exhaustion restores the worker-first lock", async () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	await solSession(stub);
@@ -1094,13 +1099,15 @@ test("only authorized high-risk edit/write consumes lease calls; ordinary edits 
 	assert.equal(await guardCall(stub, "edit", { path: "package.json" }), undefined);
 	assert.deepEqual(stub.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST]);
 	assert.match(await leaseStatusLine(stub), /WRITE-LEASE exhausted/);
-	assert.equal(await guardCall(stub, "edit", { path: "src/main.ts" }), undefined);
+	const ordinaryAfterExhaustion = await guardCall(stub, "edit", { path: "src/main.ts" });
+	assert.ok(ordinaryAfterExhaustion && ordinaryAfterExhaustion.block === true);
+	assert.match(String(ordinaryAfterExhaustion.reason), /lease exhausted/);
 	const exhausted = await guardCall(stub, "edit", { path: "package.json" });
 	assert.ok(exhausted && exhausted.block === true);
 	assert.match(String(exhausted.reason), /lease exhausted/);
 });
 
-test("/q-commander-write-lock revokes the high-risk exception without disabling ordinary direct edits", async () => {
+test("/q-commander-write-lock revokes the exception and restores the worker-first lock", async () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	await solSession(stub);
@@ -1110,7 +1117,9 @@ test("/q-commander-write-lock revokes the high-risk exception without disabling 
 	assert.match(locked.output, /revoked/);
 	assert.match(locked.output, /user-directed lock/);
 	assert.deepEqual(stub.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST]);
-	assert.equal(await guardCall(stub, "edit", { path: "src/main.ts" }), undefined);
+	const ordinaryBlocked = await guardCall(stub, "edit", { path: "src/main.ts" });
+	assert.ok(ordinaryBlocked && ordinaryBlocked.block === true);
+	assert.match(String(ordinaryBlocked.reason), /lease revoked/);
 	const blocked = await guardCall(stub, "edit", { path: "package.json" });
 	assert.ok(blocked && blocked.block === true);
 	assert.match(String(blocked.reason), /lease revoked/);
@@ -1125,8 +1134,8 @@ test("/q-commander-write-lock revokes the high-risk exception without disabling 
 	workbenchRuntime(stubB);
 	await solSession(stubB);
 	const noLease = await runCmd(stubB, "q-commander-write-lock", "");
-	assert.match(noLease.output, /no high-risk lease is active/);
-	assert.match(noLease.output, /ordinary direct edits remain available/);
+	assert.match(noLease.output, /no temporary lease is active/);
+	assert.match(noLease.output, /commander writes are locked/);
 });
 
 test("leaving DEV, model change and session end revoke the lease and reapply locked tools", async () => {
@@ -1168,7 +1177,9 @@ test("leaving DEV, model change and session end revoke the lease and reapply loc
 	);
 	assert.match(await leaseStatusLine(stubB), /WRITE-LEASE revoked/);
 	assert.deepEqual(stubB.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST]);
-	assert.equal(await guardCall(stubB, "edit", { path: "src/main.ts" }), undefined);
+	const ordinaryBlocked = await guardCall(stubB, "edit", { path: "src/main.ts" });
+	assert.ok(ordinaryBlocked && ordinaryBlocked.block === true);
+	assert.match(String(ordinaryBlocked.reason), /lease revoked/);
 	const blocked = await guardCall(stubB, "edit", { path: "package.json" });
 	assert.ok(blocked && blocked.block === true);
 	assert.match(String(blocked.reason), /lease revoked/);
@@ -1199,7 +1210,7 @@ test("lease state persists reason/paths/calls/expiry/usage and restores accurate
 	assert.ok(status.output.includes("active"), "restored lease is active");
 	assert.ok(status.output.includes("1/2"), "callsUsed restored exactly");
 	assert.ok(status.output.includes("package.json"), "paths restored");
-	assert.deepEqual(stubB.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST]);
+	assert.deepEqual(stubB.activeTools, ACTIVE_SOL_DEV_ALLOWLIST);
 	assert.equal(await guardCall(stubB, "edit", { path: ".github/workflows/ci.yml" }), undefined, "restored lease still authorizes high-risk writes");
 });
 
@@ -1218,7 +1229,7 @@ test("pending lease restores with its token parts intact and confirms on the sam
 	assert.deepEqual(stubB.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST], "pending lease enables nothing");
 	const ok = await runCmd(stubB, "q-commander-write-unlock", `confirm ${partA} ${partB}`);
 	assert.ok(ok.output.includes("CONFIRMED and active"));
-	assert.deepEqual(stubB.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST]);
+	assert.deepEqual(stubB.activeTools, ACTIVE_SOL_DEV_ALLOWLIST);
 });
 
 test("lease restore is policy-bound and fail-closed: wrong model, corrupt or expired entries never activate", async () => {
@@ -1276,7 +1287,9 @@ test("lease restore is policy-bound and fail-closed: wrong model, corrupt or exp
 		fakeCtx(stubOtherModel.entries, { model: { provider: "openai-codex", id: "gpt-5.6-sol", api: "responses" } as never }) as never,
 	);
 	assert.match(await leaseStatusLine(stubOtherModel), /WRITE-LEASE revoked/);
-	assert.equal(await guardCall(stubOtherModel, "edit", { path: "src/main.ts" }), undefined);
+	const revokedOrdinary = await guardCall(stubOtherModel, "edit", { path: "src/main.ts" });
+	assert.ok(revokedOrdinary && revokedOrdinary.block === true);
+	assert.match(String(revokedOrdinary.reason), /lease revoked/);
 	const blocked = await guardCall(stubOtherModel, "edit", { path: "package.json" });
 	assert.ok(blocked && blocked.block === true);
 	assert.match(String(blocked.reason), /lease revoked/);
@@ -1303,7 +1316,7 @@ test("RPC mode is non-TUI: hasUI never opens the human dialog — the pending tw
 	// The two-step confirmation completes on the same command, in RPC mode.
 	const confirmed = await runCmd(stub, "q-commander-write-unlock", `confirm ${partA} ${partB}`, { mode: "rpc", hasUI: true });
 	assert.ok(confirmed.output.includes("CONFIRMED and active"));
-	assert.deepEqual(stub.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST]);
+	assert.deepEqual(stub.activeTools, ACTIVE_SOL_DEV_ALLOWLIST);
 	// print/json are equally non-TUI (no dialog), even with hasUI true.
 	for (const mode of ["print", "json"] as const) {
 		const stub2 = makeStub();
@@ -1314,7 +1327,7 @@ test("RPC mode is non-TUI: hasUI never opens the human dialog — the pending tw
 		const parts = issuedParts(issued2.output);
 		const confirmed2 = await runCmd(stub2, "q-commander-write-unlock", `confirm ${parts.partA} ${parts.partB}`, { mode, hasUI: true });
 		assert.ok(confirmed2.output.includes("CONFIRMED and active"));
-		assert.deepEqual(stub2.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST]);
+		assert.deepEqual(stub2.activeTools, ACTIVE_SOL_DEV_ALLOWLIST);
 	}
 	// Only a real TUI (mode "tui") asks the human.
 	const stubTui = makeStub();
@@ -1344,7 +1357,7 @@ test("/q-write-policy accepts exactly the trimmed `status` argument; other/missi
 	assert.ok(ok.output.includes("WRITE-LEASE locked"));
 });
 
-test("lazy lease sync expires only the high-risk exception; ordinary direct edits remain available", async () => {
+test("lazy lease sync expires the exception and restores the locked worker-first surface", async () => {
 	// Craft an ACTIVE confirmed lease that expires ~150ms after creation
 	// (structurally valid: 30-minute duration, confirmed, calls remaining).
 	// A fresh entry is made per stub so the near-expiry window is measured
@@ -1367,8 +1380,7 @@ test("lazy lease sync expires only the high-risk exception; ordinary direct edit
 		return [entry(LEASE_STATE_ENTRY_TYPE, serializeLease(confirmed.lease))];
 	};
 
-	// Agent-turn path: after expiry, the development-first surface stays
-	// stable while the high-risk exception is no longer active.
+	// Agent-turn path: after expiry, the locked surface is restored.
 	const stubA = makeStub();
 	workbenchRuntime(stubA);
 	await solSession(stubA, makeLazyEntry());
@@ -1376,15 +1388,17 @@ test("lazy lease sync expires only the high-risk exception; ordinary direct edit
 	await new Promise((resolve) => setTimeout(resolve, 300));
 	const beforeStart = stubA.events.get("before_agent_start")![0]!;
 	await beforeStart!({ type: "before_agent_start", prompt: "continue", systemPrompt: "" } as never, fakeCtx([]) as never);
-	assert.deepEqual(stubA.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST], "ordinary direct tools remain advertised");
+	assert.deepEqual(stubA.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST], "locked tools restored");
 	assert.match(await leaseStatusLine(stubA), /WRITE-LEASE expired/);
-	assert.equal(await guardCall(stubA, "edit", { path: "src/main.ts" }), undefined);
+	const ordinaryBlocked = await guardCall(stubA, "edit", { path: "src/main.ts" });
+	assert.ok(ordinaryBlocked && ordinaryBlocked.block === true);
+	assert.match(String(ordinaryBlocked.reason), /lease expired/);
 	const blocked = await guardCall(stubA, "edit", { path: "package.json" });
 	assert.ok(blocked && blocked.block === true);
 	assert.match(String(blocked.reason), /lease expired/);
 
-	// Guard path: a high-risk edit is blocked immediately after expiry even
-	// without a timer/background job; the ordinary direct surface is stable.
+	// Guard path: any edit is blocked immediately after expiry even without a
+	// timer/background job.
 	const stubB = makeStub();
 	workbenchRuntime(stubB);
 	await solSession(stubB, makeLazyEntry());
@@ -1393,10 +1407,10 @@ test("lazy lease sync expires only the high-risk exception; ordinary direct edit
 	const guardBlocked = await guardCall(stubB, "edit", { path: "package.json" });
 	assert.ok(guardBlocked && guardBlocked.block === true);
 	assert.match(String(guardBlocked.reason), /lease expired/);
-	assert.deepEqual(stubB.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST], "ordinary direct tools remain available");
+	assert.deepEqual(stubB.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST], "locked tools restored");
 });
 
-test("footer renders WF:LEASE for high-risk authorization and WF:DIRECT otherwise; WF:REVIEW stays independent", async () => {
+test("footer renders WF:LEASE for temporary authorization and WF:LOCKED otherwise; WF:REVIEW stays independent", async () => {
 	const solModel = { provider: "openai-codex", id: "gpt-5.6-sol", api: "responses" } as never;
 	/** Run session_start (Sol identity unless `sol` is false) and return the last footer line. */
 	const footerAfterStart = async (stub: StubAPI, leaseEntries: StubAPI["entries"], sol: boolean): Promise<string> => {
@@ -1435,19 +1449,19 @@ test("footer renders WF:LEASE for high-risk authorization and WF:DIRECT otherwis
 	workbenchRuntime(stubActive);
 	const activeLine = await footerAfterStart(stubActive, [entry(LEASE_STATE_ENTRY_TYPE, serializeLease(confirmed.lease))], true);
 	assert.ok(activeLine.includes("WF:LEASE 0/10"), `active footer: ${activeLine}`);
-	assert.ok(!activeLine.includes("WF:DIRECT"), "active high-risk lease has its own segment");
+	assert.ok(!activeLine.includes("WF:LOCKED"), "active lease has its own segment");
 	assert.ok(!activeLine.includes("WF:REVIEW"), "the lease segment never merges the independent WF:REVIEW segment");
-	assert.deepEqual(stubActive.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST]);
+	assert.deepEqual(stubActive.activeTools, ACTIVE_SOL_DEV_ALLOWLIST);
 
-	// No lease: ordinary direct development remains explicit.
+	// No lease: worker-first lock remains explicit.
 	const stubLocked = makeStub();
 	workbenchRuntime(stubLocked);
 	const lockedLine = await footerAfterStart(stubLocked, [], true);
-	assert.ok(lockedLine.includes("WF:DIRECT"), `direct footer: ${lockedLine}`);
+	assert.ok(lockedLine.includes("WF:LOCKED"), `locked footer: ${lockedLine}`);
 	assert.ok(!lockedLine.includes("WF:LEASE"), "no WF:LEASE without an active lease");
 
-	// Pending / exhausted / expired / revoked all render WF:DIRECT and retain
-	// the same development-first surface.
+	// Pending / exhausted / expired / revoked all render WF:LOCKED and retain
+	// the same worker-first surface.
 	const pending = issueLease({
 		id: "wl-p",
 		reason: "user-directed",
@@ -1479,9 +1493,9 @@ test("footer renders WF:LEASE for high-risk authorization and WF:DIRECT otherwis
 		const stub = makeStub();
 		workbenchRuntime(stub);
 		const line = await footerAfterStart(stub, leaseEntries, true);
-		assert.ok(line.includes("WF:DIRECT"), `${label} footer renders WF:DIRECT: ${line}`);
+		assert.ok(line.includes("WF:LOCKED"), `${label} footer renders WF:LOCKED: ${line}`);
 		assert.ok(!line.includes("WF:LEASE"), `${label} never renders WF:LEASE: ${line}`);
-		assert.deepEqual(stub.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST], `${label}: development-first surface`);
+		assert.deepEqual(stub.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST], `${label}: worker-first surface`);
 	}
 
 	// Non-strict actors render no WF segment at all.
@@ -1496,7 +1510,7 @@ test("footer renders WF:LEASE for high-risk authorization and WF:DIRECT otherwis
 // gate facts wiring
 // ---------------------------------------------------------------------------
 
-test("the Sol guard counts blocked high-risk edit/write attempts but not ordinary direct writes", async () => {
+test("the Sol guard counts every blocked edit/write attempt", async () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	await solSession(stub);
@@ -1520,7 +1534,7 @@ test("the Sol guard counts blocked high-risk edit/write attempts but not ordinar
 	assert.equal((after2[after2.length - 1]!.data as { blockedWriteAttempts?: number }).blockedWriteAttempts, 3);
 });
 
-test("session_start derives development-first facts and the compaction note names them", async () => {
+test("session_start derives worker-first facts and the compaction note names them", async () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	const recorded = recordDelegation(emptyDelegationState(), {
@@ -1537,8 +1551,8 @@ test("session_start derives development-first facts and the compaction note name
 	await compact!({ type: "session_before_compact", preparation: {}, branchEntries: [], reason: "manual", willRetry: false, signal: new AbortController().signal } as never, fakeCtx(entries) as never);
 	assert.ok(stub.messages.length > 0, "supplement note sent");
 	const note = stub.messages[0]?.content ?? "";
-	assert.ok(note.includes("development writes: direct (high-risk paths require lease)"), note);
-	assert.ok(note.includes("high-risk writes: lease required"), note);
+	assert.ok(note.includes("development writes: Sol plans, Luna implements"), note);
+	assert.ok(note.includes("commander writes: locked (temporary lease required)"), note);
 	assert.ok(note.includes("delegation: 20260801-120000-abcd PENDING_REVIEW"), note);
 	assert.ok(note.includes("next delegation action: review delegation 20260801-120000-abcd"), note);
 });

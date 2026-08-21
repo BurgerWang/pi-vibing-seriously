@@ -38,15 +38,14 @@ export interface MilestoneHandoffCommandController {
 /**
  * Register the complete milestone handoff lifecycle behind one thin runtime
  * adapter. The controller deliberately carries no write lease into the new
- * session: ordinary development writes remain direct, while high-risk writes
- * require fresh user authorization.
+ * session: Sol edit/write returns to locked and routine work stays with Luna.
  */
 export function registerMilestoneHandoffCommand(controller: MilestoneHandoffCommandController): void {
 	const now = controller.now ?? (() => new Date());
 
 	controller.pi.registerCommand("q-milestone-handoff", {
 		description:
-			"USER-ONLY milestone handoff: /q-milestone-handoff <next step> — starts a fresh parent-linked session; high-risk leases are not carried, while ordinary direct edit/write remains available",
+			"USER-ONLY milestone handoff: /q-milestone-handoff <next step> — starts a fresh parent-linked session; temporary commander write leases are never carried",
 		handler: async (args, ctx) => {
 			// Refuse worker invocation before parsing or mutating session state.
 			if (controller.getRole() === "worker") {
@@ -112,7 +111,7 @@ export function registerMilestoneHandoffCommand(controller: MilestoneHandoffComm
 						`source      : ${record.session}`,
 						`mode        : ${record.state?.mode ?? sourceMode}`,
 						`delegation  : ${sourceDelegationSummary}`,
-						"write lease : NOT carried — high-risk paths require fresh authorization; ordinary direct edits remain available",
+						"write lease : NOT carried — commander edit/write is locked; routine implementation belongs to Luna",
 						"hidden milestone note injected (pointers/status only); reloading to restore copied state…",
 					]);
 					await replacementCtx.reload();

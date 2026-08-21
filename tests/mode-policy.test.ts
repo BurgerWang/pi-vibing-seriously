@@ -28,10 +28,7 @@ import {
 	MODE_ENTRY_TYPE,
 	statusText,
 } from "../extensions/workbench-runtime/core/state.ts";
-import {
-	DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST,
-	STRICT_SOL_DEV_ALLOWLIST,
-} from "../extensions/workbench-runtime/core/write-authority.ts";
+import { STRICT_SOL_DEV_ALLOWLIST } from "../extensions/workbench-runtime/core/write-authority.ts";
 
 // ---------------------------------------------------------------------------
 // Tool sets per mode (P1: VERIFY has no free bash; workbench tools are part
@@ -269,19 +266,19 @@ const FULL_DEV_ACTIVE = [
 	"a_foreign",
 ];
 
-test("development-first Sol DEV exposes the canonical direct edit/write surface without bash or foreign tools", () => {
+test("worker-first Sol DEV exposes the locked 15-tool surface without bash/edit/write or foreign tools", () => {
 	const tools = computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS);
-	assert.deepEqual(tools, [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST], "exact canonical allowlist order");
-	assert.equal(tools.length, 17);
+	assert.deepEqual(tools, [...STRICT_SOL_DEV_ALLOWLIST], "exact canonical allowlist order");
+	assert.equal(tools.length, 15);
 	assert.ok(!tools.includes("bash"));
-	assert.ok(tools.includes("edit"));
-	assert.ok(tools.includes("write"));
+	assert.ok(!tools.includes("edit"));
+	assert.ok(!tools.includes("write"));
 	assert.ok(!tools.includes("web_search"));
 	assert.ok(!tools.includes("a_foreign"));
 	// Re-enabled tools are dropped by construction, never ordered by Pi/another extension.
-	assert.deepEqual(computeActiveTools("DEV", [...FULL_DEV_ACTIVE].reverse(), SOL_FACTS), [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST]);
+	assert.deepEqual(computeActiveTools("DEV", [...FULL_DEV_ACTIVE].reverse(), SOL_FACTS), [...STRICT_SOL_DEV_ALLOWLIST]);
 	// openai provider is equally strict.
-	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, { provider: "openai", model: "gpt-5.6-sol" }), [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST]);
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, { provider: "openai", model: "gpt-5.6-sol" }), [...STRICT_SOL_DEV_ALLOWLIST]);
 	// AUDIT/VERIFY stay strict for Sol too (facts never widen them).
 	assert.deepEqual(computeActiveTools("AUDIT", FULL_DEV_ACTIVE, SOL_FACTS), AUDIT_TOOLS);
 	assert.deepEqual(computeActiveTools("VERIFY", FULL_DEV_ACTIVE, SOL_FACTS), VERIFY_TOOLS);
@@ -307,22 +304,22 @@ test("strict Sol allowlist applies only to the approved Sol identity; workers an
 // P7 slice 3: lease-aware active tool set (active lease enables edit/write)
 // ---------------------------------------------------------------------------
 
-test("lease inputs do not change the development-first Sol tool surface", () => {
+test("active lease inputs add only the exact canonical edit/write subset", () => {
 	const tools = computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["edit", "write"]);
-	assert.deepEqual(tools, [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST]);
+	assert.deepEqual(tools, [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
 	assert.equal(tools.length, 17);
-	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["write"]), [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST]);
-	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["write", "edit"]), [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST]);
-	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["edit", "edit", "write", "write"]), [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST]);
-	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["write", "bash", "edit", "web_search", "write"]), [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST]);
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["write"]), [...STRICT_SOL_DEV_ALLOWLIST, "write"]);
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["write", "edit"]), [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["edit", "edit", "write", "write"]), [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["write", "bash", "edit", "web_search", "write"]), [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
 });
 
-test("no lease or malformed lease tools retain direct edit/write while bash stays unavailable", () => {
-	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS), [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST], "no lease");
-	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, []), [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST], "empty lease tools");
-	assert.equal(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, []).length, 17);
-	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["bash", "edit", "write"]), [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST]);
-	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["bash"]), [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST]);
+test("no lease or malformed lease tools retain the locked surface", () => {
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS), [...STRICT_SOL_DEV_ALLOWLIST], "no lease");
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, []), [...STRICT_SOL_DEV_ALLOWLIST], "empty lease tools");
+	assert.equal(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, []).length, 15);
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["bash", "edit", "write"]), [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
+	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["bash"]), [...STRICT_SOL_DEV_ALLOWLIST]);
 });
 
 test("lease tools never widen non-Sol DEV, AUDIT or VERIFY tool sets", () => {

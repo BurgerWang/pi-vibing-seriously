@@ -14,6 +14,11 @@ Guidance for Codex and other development agents working in this repository.
   `apply_patch` for edits, and may run normal focused package/test commands.
 - Subagents are optional. No write or defect requires a fresh worker,
   temporary write lease, workbench delegation, or workbench diff review.
+- This exemption applies only to external repository-maintenance agents such
+  as Codex. When this checkout is loaded as the Pi product, its generated
+  project AGENTS files and runtime enforce the fixed Sol commander -> Luna
+  worker delivery model; do not reinterpret that product behavior as
+  optional because repository maintenance is direct.
 
 ## Normal development workflow
 

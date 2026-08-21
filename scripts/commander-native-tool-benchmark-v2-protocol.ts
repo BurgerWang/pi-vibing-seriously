@@ -134,7 +134,7 @@ export const FROZEN_NRO_V2_PROTOCOL: FrozenProtocol = {
 	milestonePromptSha256: "1af10ebb1abfec5aba9744841980da66c9ee8e12720d589caa623350fb608a40",
 	environment: FROZEN_ENVIRONMENT,
 	fixtureManifestSha256: "062b3c92a8a36825394f0fa80b94808f2457ca5b63e8bbf9a70ff24339c216b6",
-	nonTreatmentSha256: "d8ae301a2050004b6f93da1aec9871496fe07b307d9cca8808ad4369ea365b78",
+	nonTreatmentSha256: "b7cc04cc44345f448105ab4272a9e80d795f79e663041f7b7f2276132448a2bd",
 	rubricSha256: "6c223da4c117f4af857be20f1dab43b495f62eced638bfd4a9a2db80e0026046",
 	runsPerArm: RUNS_PER_ARM,
 	interleave: INTERLEAVE,

@@ -11,10 +11,10 @@
  *   - the non-TUI issuance/confirmation result renderers — the ONLY
  *     renderers that ever display the two confirmation token parts
  *   - `/q-write-policy` argument parsing (accepts EXACTLY the trimmed
- *     `status` subcommand) and rendering (actor, development-first direct
- *     writes, bounded high-risk lease summary — NEVER any token part)
+ *     `status` subcommand) and rendering (actor, fixed worker-first policy,
+ *     bounded temporary lease summary — NEVER any token part)
  *   - the compact footer segment: `WF:LEASE <used>/<max>` for an ACTIVE
- *     high-risk lease, `WF:DIRECT` otherwise (the WF:REVIEW
+ *     temporary lease, `WF:LOCKED` otherwise (the WF:REVIEW
  *     segment is appended independently by the caller, never merged here)
  *
  * Bounded-output discipline: every renderer is line-bounded and no renderer
@@ -295,15 +295,15 @@ export function renderLeaseConfirmed(lease: WriteLease, _now: string): string[] 
 		`tools    : ${lease.tools.join(", ")} only — bash is never authorized`,
 		`calls    : ${lease.callsUsed}/${lease.maxCalls} used (one per authorized edit/write)`,
 		`expires  : ${lease.expiresAt}`,
-		`edit/write are active in strict Sol DEV (canonical 14-tool allowlist + lease tools); lock, expiry or exhaustion revokes them`,
+		`edit/write are active in strict Sol DEV (canonical 15-tool allowlist + lease tools); lock, expiry or exhaustion revokes them`,
 	];
 }
 
 /**
- * Compact footer segment for the development-first Sol write authority. An ACTIVE
+ * Compact footer segment for worker-first Sol write authority. An ACTIVE
  * confirmed lease renders the required compact `WF:LEASE <callsUsed>/<maxCalls>`;
- * every other state renders `WF:DIRECT`: ordinary edit/write remain directly
- * available while high-risk paths still require a lease. Other actors
+ * every other state renders `WF:LOCKED`: commander edit/write are absent and
+ * routine implementation belongs to Luna. Other actors
  * render no segment at all. The WF:REVIEW segment is appended by the
  * caller independently and is never merged into this segment.
  */
@@ -318,7 +318,7 @@ export function writeAuthorityFooterSegment(facts: {
 	if (status === "active" && facts.lease) {
 		return `WF:LEASE ${facts.lease.callsUsed}/${facts.lease.maxCalls}`;
 	}
-	return "WF:DIRECT";
+	return "WF:LOCKED";
 }
 
 export interface WritePolicyStatusFacts {
@@ -338,16 +338,16 @@ export interface WritePolicyStatusFacts {
 export function renderWritePolicyStatus(facts: WritePolicyStatusFacts): string[] {
 	const lines = [`actor        : ${facts.actor} (${facts.provider ?? "(none)"}/${facts.model ?? "(none)"})`];
 	if (facts.policy === "worker-first-strict") {
-		lines.push("policy       : development-first direct editing (compatibility id: worker-first-strict)");
+		lines.push("policy       : fixed Sol -> Luna worker-first delivery (worker-first-strict)");
 		const status = facts.lease ? leaseStatus(facts.lease, facts.now) : "locked";
 		if (status === "active") {
-			lines.push(`direct write : ordinary paths direct; high-risk paths allowed via lease ${facts.lease!.id} within its scope`);
+			lines.push(`direct write : temporary exception active via lease ${facts.lease!.id} within its exact scope`);
 		} else if (status === "pending") {
 			lines.push(
-				"direct write : ordinary paths direct; high-risk lease pending confirmation (run /q-commander-write-unlock confirm <partA> <partB> with the issued parts)",
+				"direct write : locked; temporary lease pending confirmation (run /q-commander-write-unlock confirm <partA> <partB> with the issued parts)",
 			);
 		} else {
-			lines.push(`direct write : ordinary paths direct; high-risk paths require a lease (lease ${status})`);
+			lines.push(`direct write : locked; routine writes belong to Luna (lease ${status})`);
 		}
 		lines.push(`lease        : ${leaseCompactSummary(facts.lease, facts.now)}`);
 	} else {

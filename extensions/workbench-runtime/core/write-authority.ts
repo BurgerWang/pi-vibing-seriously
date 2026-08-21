@@ -1,7 +1,7 @@
 /**
  * P7 write authority — pure decision logic, no Pi imports.
  *
- * Development-first Sol/worker authority (wired into the Pi runtime — the
+ * Worker-first Sol/worker authority (wired into the Pi runtime — the
  * `tool_call` guard, the session-scoped lease state, the user-only slash
  * commands in core/lease-command.ts and the compact footer; this module
  * stays import-free and unit-testable):
@@ -12,19 +12,21 @@
  *     can self-label any controller as Sol or as a worker.
  *   - the serialized compatibility policy id remains exactly
  *     `worker-first-strict` and applies ONLY to the approved Sol commander;
- *     current DEV behavior is development-first: ordinary canonical
- *     project-relative edit/write are direct, while high-risk paths retain
- *     the explicit user-issued lease boundary. No persisted/prompt/config
+ *     current DEV behavior is fixed Sol -> Luna delivery: routine writes
+ *     belong to a bounded worker delegation, while direct commander
+ *     edit/write exists only as an explicit user-issued temporary lease
+ *     exception. No persisted/prompt/config
  *     value can weaken or opt out of those boundaries.
  *     Delegated workers and other controllers are OUTSIDE this policy
  *     (policy non-applicability): the existing worker guards remain
  *     authoritative for workers, and other controllers are not newly
  *     denied by this module.
- *   - the current Sol DEV surface is the fixed historical read/control
- *     allowlist plus edit/write; bash and foreign tools remain absent.
+ *   - the default Sol DEV surface is the fixed read/control/delegation
+ *     allowlist; bash/edit/write and foreign tools are absent. An ACTIVE
+ *     lease adds only its exact edit/write tool subset.
  *   - the second-layer commander decision (Sol only): bash is always
- *     blocked; ordinary edit/write are direct; high-risk edit/write require
- *     a valid user-issued temporary lease; every other tool outside the
+ *     blocked; every edit/write requires a valid user-issued temporary
+ *     lease; every other tool outside the
  *     allowlist is blocked.
  *   - temporary commander write leases: default locked, allowed reasons,
  *     project-relative exact/subtree paths (absolute POSIX, Windows drive
@@ -153,17 +155,6 @@ export const STRICT_SOL_DEV_ALLOWLIST: readonly string[] = [
 	// the same order as WORKBENCH_TOOL_NAMES / MODE_TOOLS (stable-prefix
 	// discipline: never reorder, never add tools implicitly).
 	"workbench_recover_tool_result",
-];
-
-/**
- * Current development-first DEV surface. The historical strict allowlist is
- * retained for compatibility, while ordinary edit/write are advertised to
- * the commander and the second-layer risk gate below remains authoritative.
- */
-export const DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST: readonly string[] = [
-	...STRICT_SOL_DEV_ALLOWLIST,
-	"edit",
-	"write",
 ];
 
 export const STRICT_ALLOWLIST_SET: ReadonlySet<string> = new Set(STRICT_SOL_DEV_ALLOWLIST);
@@ -303,10 +294,10 @@ const DIRECT_WRITE_HIGH_RISK_SEGMENTS = new Set([
 const DIRECT_WRITE_HIGH_RISK_NAME = /(?:auth|security|permission|policy|credential|secret|crypto|lease|release|migration)/iu;
 
 /**
- * Fixed, prompt-independent high-risk boundary for direct commander writes.
- * Ordinary source/tests/docs paths return undefined and need no lease. Paths
- * that can change dependencies, permissions, security, deployment, migration,
- * Pi policy, or release authority retain the explicit user-issued lease.
+ * Fixed, prompt-independent validation and risk classifier for the temporary
+ * commander-write exception. Every direct write needs a lease; the returned
+ * high-risk reason remains useful for diagnostics and never grants ordinary
+ * paths direct authority.
  */
 export function directDevelopmentWriteBlockReason(path: string, input?: unknown): string | undefined {
 	const normalized = normalizeProjectRelative(path);
@@ -762,15 +753,15 @@ function extractPath(input: unknown): string | undefined {
 /**
  * Pure second-layer commander decision (wired into the Pi runtime's
  * `tool_call` guard). The guard applies ONLY to the
- * approved Sol commander under the development-first policy (whose
+ * approved Sol commander under the worker-first policy (whose
  * serialized compatibility id is worker-first-strict):
  * delegated workers and other controllers are OUTSIDE it — the existing
  * worker guards (worker-policy.ts) remain authoritative for workers, and
  * other controllers are not newly denied by this module. Semantics for
  * Sol:
  *   - bash is always blocked;
- *   - ordinary canonical project-relative edit/write are allowed directly;
- *   - high-risk edit/write require a valid user-issued lease;
+ *   - every canonical project-relative edit/write requires a valid,
+ *     user-issued lease covering the exact tool and path;
  *   - every other tool outside the strict allowlist is blocked;
  *   - reasons direct Sol to workbench_delegate_worker or an explicit
  *     temporary commander write lease.
@@ -780,23 +771,22 @@ export function commanderToolCallBlockReason(facts: CommanderToolCallFacts): str
 	const { toolName } = facts;
 	const now = facts.now ?? new Date().toISOString();
 	if (toolName === "bash") {
-		return "Development safety blocks free-form bash for commanders: use declared workbench recipes; workbench_delegate_worker is optional, and a temporary lease authorizes only high-risk edit/write paths";
+		return "Worker-first development blocks free-form bash for commanders: use declared workbench recipes and workbench_delegate_worker; a temporary lease authorizes only bounded edit/write calls";
 	}
 	if (toolName === "edit" || toolName === "write") {
 		const path = extractPath(facts.input);
 		if (!path) {
 			return `Commander ${toolName} requires a non-empty canonical project-relative path`;
 		}
-		const riskReason = directDevelopmentWriteBlockReason(path, facts.input);
-		if (riskReason === undefined) return undefined;
-		if (!riskReason.includes("high-risk path")) return riskReason;
+		const validationReason = directDevelopmentWriteBlockReason(path, facts.input);
+		if (validationReason !== undefined && !validationReason.includes("high-risk path")) return validationReason;
 		const lease = facts.lease;
 		if (!lease || leaseStatus(lease, now) !== "active") {
 			const status = lease ? leaseStatus(lease, now) : "locked";
-			return `${riskReason} (lease ${status})`;
+			return `Worker-first policy blocks direct commander ${toolName} on "${path}": routine implementation belongs to workbench_delegate_worker; an explicit user-issued temporary write lease is required (lease ${status})`;
 		}
 		if (!isLeasePathAuthorized(lease, path)) {
-			return `Commander ${toolName} on high-risk path "${path}" is outside the active write lease`;
+			return `Commander ${toolName} path "${path}" is outside the active write lease`;
 		}
 		if (!leaseCoversTool(lease, toolName)) {
 			return `The active write lease authorizes only ${lease.tools.join(", ")}`;

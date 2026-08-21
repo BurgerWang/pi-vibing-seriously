@@ -80,7 +80,7 @@ test("production protocol is frozen: the four content pins reproduce the frozen 
 	// Independent recomputation must reproduce the frozen production pins.
 	assert.equal(milestone, "1af10ebb1abfec5aba9744841980da66c9ee8e12720d589caa623350fb608a40", "milestone-prompt.txt pin drift");
 	assert.equal(fixture, "062b3c92a8a36825394f0fa80b94808f2457ca5b63e8bbf9a70ff24339c216b6", "fixture-manifest pin drift");
-	assert.equal(bundle, "d8ae301a2050004b6f93da1aec9871496fe07b307d9cca8808ad4369ea365b78", "non-treatment bundle pin drift");
+	assert.equal(bundle, "b7cc04cc44345f448105ab4272a9e80d795f79e663041f7b7f2276132448a2bd", "non-treatment bundle pin drift");
 	assert.equal(rubric, "dccfd406a69f7582a5fc44daad420d8e177c993cf3a7110ae11c6686beab74ed", "rubric.json pin drift");
 
 	// The production protocol is frozen: every pin is a non-null lowercase

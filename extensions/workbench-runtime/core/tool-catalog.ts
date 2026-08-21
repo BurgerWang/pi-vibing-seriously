@@ -416,7 +416,7 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 			"Show the write-authority and delegation-review state: actor, write policy, lease status, latest delegation, review status (PENDING_REVIEW/REVIEWED/STALE), current and actual diff hashes, reviewed hash, blocked write attempts, and the latest review verdict. The existing hash field names are retained for compatibility: a new tagged v2 delegation refreshes a ChangeSet relevance binding over W (the attributed worker delta), D (the explicit dependency closure), and S (relevant controls); baseline unrelated dirty paths and recognized workbench artifacts do not stale it, while Git HEAD, W/D/S drift, or a new unknown-origin path fails closed and makes a reviewed delegation STALE. Historical untagged v2 and v1 authority retain the complete full-diff binding, where any diff change makes a reviewed delegation STALE. Emits an explicit CONTEXT RISK line when the latest delegation handoff is detected too large for safe context compaction.",
 		promptGuidelines: [
 			"Routine successful delivery closes as REVIEWED in the delegate call; use status only for diagnostics or recovery.",
-			"In the TUI, WF:DIRECT means ordinary edits are available, WF:LEASE means a high-risk scope is authorized, and WF:REVIEW means recovery review is outstanding.",
+			"In the TUI, WF:LOCKED means routine writes belong to Luna, WF:LEASE means a bounded temporary Sol write exception is active, and WF:REVIEW means recovery review is outstanding.",
 		],
 	},
 	workbench_recover_tool_result: {

@@ -186,7 +186,7 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 
 test("v0.10.0 public tool surface has the intentional canonical transition hash", () => {
 	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
-	const currentHash = "bc868199ba7482fc0ed9d7009f47df05fc577196c8968e887d9e55e544cf3929";
+	const currentHash = "1a993956f8d9e12a392b6f8745baed3ef7a29cdfc0e63564b70845050ca5173c";
 	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
 	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the documented 0.10.0 hash");
 });
@@ -628,7 +628,7 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.deepEqual(meta.promptGuidelines, [
 		"Routine successful delivery closes as REVIEWED in the delegate call; use status only for diagnostics or recovery.",
-		"In the TUI, WF:DIRECT means ordinary edits are available, WF:LEASE means a high-risk scope is authorized, and WF:REVIEW means recovery review is outstanding.",
+		"In the TUI, WF:LOCKED means routine writes belong to Luna, WF:LEASE means a bounded temporary Sol write exception is active, and WF:REVIEW means recovery review is outstanding.",
 	], "current status guidelines keep routine work out of the recovery chain");
 	assert.match(meta.description, /existing hash field names are retained for compatibility/);
 	assert.match(meta.description, /W \(the attributed worker delta\), D \(the explicit dependency closure\), and S \(relevant controls\)/);
@@ -638,7 +638,7 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	assert.doesNotMatch(meta.description, /real git diff \(any change after REVIEWED turns it STALE\)/);
 	assert.equal(
 		canonicalHash(meta),
-		"7443cebe63a46e48fe4fed9604f268eaeae98ad10063fb5e07e8402c5db1f74f",
+		"57129d1a8eac087ecb498f4f7a9117476858723c7cd94cd69a2121cca6abe224",
 		"current status metadata hash is machine-pinned after the relevance-contract correction",
 	);
 	assert.equal(
@@ -648,7 +648,7 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.equal(
 		canonicalHash(workbenchToolMetadataOrdered()),
-		"a82aea8825dd4e72deba118b76ee45b0f3f222a0ea5cfc41d7e25c079d650231",
+		"c01b382bbb185da8c8d3c039fed0b2b8ec7d056ac59c246fd5d79c2dfe73eace",
 		"current public catalog hash is machine-pinned after the Luna identity and budget-description transition",
 	);
 });

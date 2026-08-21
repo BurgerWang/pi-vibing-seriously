@@ -398,14 +398,14 @@ test("quant-research-design states the research scope boundary", async () => {
 	assert.ok(/out of scope/i.test(text), "quant-research-design must state its scope boundary");
 });
 
-// ----------------------------------------------- development-first contract
+// ----------------------------------------------- fixed Sol -> Luna contract
 
 /**
  * The build prompt, implementation skill, and generated AGENTS templates
  * keep the default path short. Legacy serialized names remain runtime
  * compatibility details, never a mandatory user workflow.
  */
-const DEVELOPMENT_FIRST_SOURCES: ReadonlyArray<readonly [string, string]> = [
+const FIXED_SOL_LUNA_SOURCES: ReadonlyArray<readonly [string, string]> = [
 	["prompts/q-build.md", "q-build prompt"],
 	["skills/implementation-workflow/SKILL.md", "implementation-workflow skill"],
 	["templates/project/AGENTS.generic.md", "AGENTS.generic template"],
@@ -417,51 +417,51 @@ function normalizeSpace(text: string): string {
 	return text.replace(/\s+/g, " ").trim();
 }
 
-async function developmentFirstText(relPath: string): Promise<string> {
+async function fixedSolLunaText(relPath: string): Promise<string> {
 	return normalizeSpace(await readFile(join(ROOT, relPath), "utf8"));
 }
 
-test("development-first contract: ordinary edits are direct and delegation is optional in all four sources", async () => {
+test("fixed collaboration contract: routine writes belong to one bounded Luna delegation in all four sources", async () => {
 	const phrases = [
-		"edits are direct in DEV",
-		"Delegation is optional",
-		"not required for a write or a defect repair",
+		"Sol owns requirements",
+		"Routine source, test, and documentation writes in DEV belong to one bounded Luna delegation",
+		"Use one bounded delegation call",
 	] as const;
-	for (const [relPath, label] of DEVELOPMENT_FIRST_SOURCES) {
-		const text = await developmentFirstText(relPath);
+	for (const [relPath, label] of FIXED_SOL_LUNA_SOURCES) {
+		const text = await fixedSolLunaText(relPath);
 		for (const phrase of phrases) {
 			assert.ok(text.includes(phrase), `${label} (${relPath}) must state \"${phrase}\"`);
 		}
 	}
 });
 
-test("development-first contract: delegation auto-closes and explicit review is recovery-only", async () => {
+test("fixed collaboration contract: delegation auto-closes and explicit review is recovery-only", async () => {
 	const phrases = ["reviewed and closed automatically", "explicit review/status", "recovery", "never acceptance"] as const;
-	for (const [relPath, label] of DEVELOPMENT_FIRST_SOURCES) {
-		const text = await developmentFirstText(relPath);
+	for (const [relPath, label] of FIXED_SOL_LUNA_SOURCES) {
+		const text = await fixedSolLunaText(relPath);
 		for (const phrase of phrases) {
 			assert.ok(text.includes(phrase), `${label} (${relPath}) must state \"${phrase}\"`);
 		}
 	}
 });
 
-test("development-first contract: only high-risk paths require a temporary lease", async () => {
-	const phrase = "High-risk dependency, security, policy, deployment, migration, and Pi control paths require an explicit user-issued temporary write lease";
-	for (const [relPath, label] of DEVELOPMENT_FIRST_SOURCES) {
-		const text = await developmentFirstText(relPath);
+test("fixed collaboration contract: direct Sol writes require an explicit bounded temporary lease", async () => {
+	const phrase = "Sol may edit/write directly only through an active user-issued temporary lease";
+	for (const [relPath, label] of FIXED_SOL_LUNA_SOURCES) {
+		const text = await fixedSolLunaText(relPath);
 		assert.ok(text.includes(phrase), `${label} (${relPath}) must state \"${phrase}\"`);
 	}
 });
 
-test("development-first contract: focused feedback and one stable-candidate gate pass replace micro-step full verification", async () => {
+test("fixed collaboration contract: focused feedback and one stable-candidate gate pass replace micro-step full verification", async () => {
 	const phrases = ["focused tests", "stable candidate", "final gates once"] as const;
-	for (const [relPath, label] of DEVELOPMENT_FIRST_SOURCES) {
-		const text = await developmentFirstText(relPath);
+	for (const [relPath, label] of FIXED_SOL_LUNA_SOURCES) {
+		const text = await fixedSolLunaText(relPath);
 		for (const phrase of phrases) {
 			assert.ok(text.includes(phrase), `${label} (${relPath}) must state \"${phrase}\"`);
 		}
-		assert.ok(!text.includes("Routine writes are worker-owned by default"), `${label} must not restore mandatory worker writes`);
-		assert.ok(!text.includes("Defects go to a fresh worker"), `${label} must not restore mandatory fresh-worker repair`);
+		assert.ok(!text.includes("Delegation is optional"), `${label} must not make routine delegation optional`);
+		assert.ok(!text.includes("Ordinary source, test, and documentation edits are direct"), `${label} must not restore direct routine writes`);
 	}
 });
 

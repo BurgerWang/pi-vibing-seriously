@@ -138,7 +138,7 @@ test("protocol-v2: exact frozen environment and the four content pins", () => {
 	);
 	assert.equal(
 		FROZEN_NRO_V2_PROTOCOL.nonTreatmentSha256,
-		"d8ae301a2050004b6f93da1aec9871496fe07b307d9cca8808ad4369ea365b78",
+		"b7cc04cc44345f448105ab4272a9e80d795f79e663041f7b7f2276132448a2bd",
 		"non-treatment bundle pin drift",
 	);
 	assert.equal(

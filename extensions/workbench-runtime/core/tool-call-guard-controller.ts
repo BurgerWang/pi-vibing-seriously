@@ -24,7 +24,6 @@ import {
 	commanderToolCallBlockReason,
 	consumeLeaseCall,
 	detectActorRole,
-	directDevelopmentWriteBlockReason,
 	leaseStatus,
 	type WriteLease,
 } from "./write-authority.ts";
@@ -76,6 +75,9 @@ export function registerToolCallGuard(controller: ToolCallGuardController): void
 		const actor = detectActorRole({ roleEnv: workerRoleContext.role, provider: identity.provider, model: identity.model });
 		const now = new Date().toISOString();
 		controller.syncLease(now);
+		const mode = controller.getMode();
+		const check = checkToolCall(mode, event.toolName, event.input);
+		if (!check.allowed) return { block: true, reason: boundedGuardReason(check.reason ?? `Blocked by workbench ${mode} mode`) };
 		if (actor === "sol-commander") {
 			const commanderReason = commanderToolCallBlockReason({
 				actor,
@@ -98,17 +100,13 @@ export function registerToolCallGuard(controller: ToolCallGuardController): void
 				try {
 					const projectRoot = await controller.projectRootFor(ctx);
 					if (!(await isWorkerPathAllowedRealpath(projectRoot, path, [path]))) {
-						return { block: true, reason: boundedGuardReason("Direct development write failed project realpath/symlink containment") };
+						return { block: true, reason: boundedGuardReason("Commander leased write failed project realpath/symlink containment") };
 					}
 				} catch {
-					return { block: true, reason: boundedGuardReason("Direct development write could not verify project containment") };
+					return { block: true, reason: boundedGuardReason("Commander leased write could not verify project containment") };
 				}
 			}
 		}
-
-		const mode = controller.getMode();
-		const check = checkToolCall(mode, event.toolName, event.input);
-		if (!check.allowed) return { block: true, reason: boundedGuardReason(check.reason ?? `Blocked by workbench ${mode} mode`) };
 
 		const authorization = controller.authorizeOutput(event.toolCallId, event.toolName, event.input);
 		controller.rememberOutputAuthorization(authorization);
@@ -164,9 +162,8 @@ export function registerToolCallGuard(controller: ToolCallGuardController): void
 			const path = event.input && typeof event.input === "object" && typeof (event.input as { path?: unknown }).path === "string"
 				? (event.input as { path: string }).path
 				: "";
-			const highRisk = directDevelopmentWriteBlockReason(path, event.input)?.includes("high-risk path") === true;
 			const lease = controller.getLease();
-			if (highRisk && lease && leaseStatus(lease, now) === "active") {
+			if (lease && leaseStatus(lease, now) === "active") {
 				const consumed = consumeLeaseCall(lease, event.toolName, path, now);
 				if (consumed.ok) {
 					controller.setLease(consumed.lease);

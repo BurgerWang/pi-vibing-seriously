@@ -238,11 +238,11 @@ export function buildCompactNote(state: CompactState): string {
 	];
 	lines.push(...line("task", state.task));
 	lines.push(...line("phase", state.phase));
-	// Compatibility facts: development-first direct writes, high-risk lease
-	// boundary, delegation state, and the next action. These
+	// Compatibility facts: fixed Sol/Luna authority, temporary lease
+	// exception, delegation state, and the next action. These
 	// are pointers/statuses only — the hard guards never read this text.
-	if (state.writePolicy === "worker-first-strict") lines.push("development writes: direct (high-risk paths require lease)");
-	if (state.commanderWritesDenied === true) lines.push("high-risk writes: lease required");
+	if (state.writePolicy === "worker-first-strict") lines.push("development writes: Sol plans, Luna implements");
+	if (state.commanderWritesDenied === true) lines.push("commander writes: locked (temporary lease required)");
 	if (state.lastDelegationId) {
 		const reviewState =
 			state.pendingDelegationReview === true

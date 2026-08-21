@@ -1,5 +1,5 @@
 /**
- * Development-first default delivery for successful implementation workers.
+ * Fixed Sol -> Luna default delivery for successful implementation workers.
  *
  * The public runtime delegates execution once, then this boundary performs the
  * ordinary actual-diff review and closes the session mirror when that review is

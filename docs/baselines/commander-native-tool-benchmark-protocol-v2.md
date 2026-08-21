@@ -120,7 +120,7 @@ committed or analyzed against an unfrozen protocol.
 | `milestone_prompt_sha256` | SHA-256 of the raw bytes of the frozen `milestone-prompt.txt` (no trailing newline) | `1af10ebb1abfec5aba9744841980da66c9ee8e12720d589caa623350fb608a40` |
 | `fixture_manifest_sha256` | Deterministic fixture-manifest hash over the frozen v2 fixture tree (same function as v1 §5.2) | `062b3c92a8a36825394f0fa80b94808f2457ca5b63e8bbf9a70ff24339c216b6` |
 | `rubric_sha256` | SHA-256 of the raw bytes of the frozen schema-2 `rubric.json` | `6c223da4c117f4af857be20f1dab43b495f62eced638bfd4a9a2db80e0026046` |
-| `non_treatment_sha256` | Deterministic content-manifest hash over the frozen non-treatment bundle: `AGENTS.md` + everything under `skills/` + `prompts/` + `templates/` | `d8ae301a2050004b6f93da1aec9871496fe07b307d9cca8808ad4369ea365b78` |
+| `non_treatment_sha256` | Deterministic content-manifest hash over the frozen non-treatment bundle: `AGENTS.md` + everything under `skills/` + `prompts/` + `templates/` | `b7cc04cc44345f448105ab4272a9e80d795f79e663041f7b7f2276132448a2bd` |
 
 The v2 milestone prompt and the v2 fixture tree are **byte-copies of
 the v1 inputs**, so their pins reproduce the v1 pins exactly; the v2
@@ -309,7 +309,7 @@ Manifest shape (frozen):
     "path": "commander-native-tool-benchmark-v2/fixture",
     "manifest_sha256": "062b3c92a8a36825394f0fa80b94808f2457ca5b63e8bbf9a70ff24339c216b6"
   },
-  "non_treatment_sha256": "d8ae301a2050004b6f93da1aec9871496fe07b307d9cca8808ad4369ea365b78",
+  "non_treatment_sha256": "b7cc04cc44345f448105ab4272a9e80d795f79e663041f7b7f2276132448a2bd",
   "rubric": {
     "sha256": "6c223da4c117f4af857be20f1dab43b495f62eced638bfd4a9a2db80e0026046",
     "checks": [ { "id": "build", "pattern": "build:\\s*alpha-42\\b" } ]

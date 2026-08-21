@@ -26,17 +26,19 @@ Guidance for AI agents working in this repository.
 6. **Evidence over assertion.** Cite file paths, line numbers, and command
    output. If you cannot verify something, say so.
 
-## Development-first execution
+## Fixed Sol -> Luna execution
 
-- Ordinary source, test, and documentation edits are direct in DEV after
-  scope is understood. Delegation is optional; it is not required for a
-  write or a defect repair.
-- When delegation is useful, use one bounded call. Complete delivery is
-  reviewed and closed automatically; explicit review/status is only for
-  incomplete coverage, conflict, or recovery. A worker report is never
-  acceptance.
-- High-risk dependency, security, policy, deployment, migration, and Pi
-  control paths require an explicit user-issued temporary write lease.
+- Sol owns requirements, acceptance criteria, cross-cutting architecture,
+  approved paths, review, and the final verdict. Routine source, test, and
+  documentation writes in DEV belong to one bounded Luna delegation.
+- Use one bounded delegation call for a coherent implementation slice.
+  Complete delivery is reviewed and closed automatically; explicit
+  review/status is only for incomplete coverage, conflict, or recovery. A
+  worker report is never acceptance.
+- Sol may edit/write directly only through an active user-issued temporary
+  lease bounded by paths, tools, calls, and time. This is an explicit
+  exception for bootstrap, worker unavailability, security emergencies, or
+  user direction; it is never the routine path and never authorizes bash.
 - Use focused tests during development. Run final gates once on a stable
   candidate when task or release risk requires them.
 

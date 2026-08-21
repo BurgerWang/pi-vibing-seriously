@@ -124,10 +124,10 @@ const B5_CHECKS = [
 const B6_CHECKS = [
 	check(
 		"b6.1",
-		"Development-first policy active",
+		"Worker-first Sol/Luna policy active",
 		"worker-first",
 		{ worker_first: "strict-policy-active" },
-		"the session resolves to the development-first policy (legacy compatibility id worker-first-strict)",
+		"the session resolves to the fixed Sol/Luna worker-first-strict policy",
 	),
 	check(
 		"b6.2",
@@ -315,10 +315,10 @@ export const BASE_GATES: readonly Gate[] = [
 	gate(
 		"b6",
 		"Development Safety",
-		"Machine-backed development safety: direct development policy active, high-risk writes remain authorized, no pending or stale recovery review, reviewed binding is current, delegated paths stay within contract, no unexplained high-risk lease is active, and final verification is commander-initiated. Facts are injected by the runtime; the legacy worker-first check kind remains only for record compatibility, and model prose can never satisfy these checks.",
+		"Machine-backed development safety: fixed Sol/Luna policy active, commander writes locked or explicitly leased, no pending or stale recovery review, reviewed binding is current, delegated paths stay within contract, no unexplained temporary lease is active, and final verification is commander-initiated. Facts are injected by the runtime; model prose can never satisfy these checks.",
 		[],
 		B6_CHECKS,
-		"Development safety holds: ordinary writes remain direct, high-risk writes are authorized, delegation recovery state is clean, reviewed binding is current, delegated paths stay within contracts, no unexplained active lease exists, and final verification is Sol-initiated.",
+		"Development safety holds: routine writes are worker-owned, any commander write is explicitly leased, delegation recovery state is clean, reviewed binding is current, delegated paths stay within contracts, no unexplained active lease exists, and final verification is Sol-initiated.",
 	),
 ];
 
