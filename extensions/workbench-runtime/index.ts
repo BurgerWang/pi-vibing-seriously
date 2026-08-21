@@ -898,6 +898,9 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 						);
 					} else if (authority.transactionVerdict !== null) {
 						lines.push(`completion v2: ${authority.transactionVerdict} (strict terminal machine facts; no review artifact)`);
+						if (authority.transactionStatus === "FAILED") {
+							lines.push(`next action  : call workbench_delegate_worker with repair_of=${delegationState.latestId}; do not retry review`);
+						}
 					} else {
 						lines.push(`review v2    : NOT_RUN`);
 					}

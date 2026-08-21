@@ -771,6 +771,51 @@ test("diagnosis denied structured write or real delta durably FAILS", async () =
 	}
 });
 
+test("an explicit repair_of supersedes the exact latest committed FAILED delegation with a real delta", async () => {
+	await withTempDir(async (root) => {
+		await initializeProject(root);
+		const failedScript = await writeFakeWorker(root, { changedPath: "src/failed-worker-delta.txt" });
+		const repairScript = await writeFakeWorker(root, {});
+		const stub = commanderRuntime();
+		const ctx = commanderContext(root, "committed-failed-repair");
+		await assert.rejects(
+			withFakeWorker(failedScript, () => delegateTool(stub).execute(
+				"committed-failed-source", delegateParams({ task_kind: "diagnosis" }), undefined, undefined, ctx,
+			)),
+			/DIAGNOSIS_DELTA_FORBIDDEN/,
+		);
+		const failedId = latestSessionState(stub).latestId!;
+		assert.equal(latestSessionState(stub).status, "PENDING_REVIEW");
+		const failed = await readDelegationCommittedGenerationV2(root, failedId);
+		assert.equal(failed.ok, true);
+		if (failed.ok) {
+			assert.equal(failed.value.state.status, "FAILED");
+			assert.deepEqual(failed.value.state.terminal_outcome?.changed_paths, ["src/failed-worker-delta.txt"]);
+		}
+		const transactionPath = join(root, CONFIG_DIR_NAME, "workbench", "delegations", failedId, "v2", "transaction.json");
+		const transactionBefore = await readFile(transactionPath, "utf8");
+		const status = await delegationStatusTool(stub).execute("committed-failed-status", {}, undefined, undefined, ctx);
+		assert.match(resultText(status), /completion v2:\s+FAIL/);
+		assert.match(resultText(status), new RegExp(`repair_of=${failedId}`));
+		const refusedReview = await reviewTool(stub).execute(
+			"committed-failed-review", { delegation_id: failedId }, undefined, undefined, ctx,
+		);
+		assert.equal(refusedReview.details.error, "repair_required");
+		assert.equal(refusedReview.details.repair_of, failedId);
+		assert.match(resultText(refusedReview), /do not retry review/);
+		assert.equal(await readFile(transactionPath, "utf8"), transactionBefore, "status and review guidance preserve committed FAILED evidence");
+
+		const repaired = await withFakeWorker(repairScript, () => delegateTool(stub).execute(
+			"committed-failed-repair", delegateParams({ task_kind: "diagnosis", repair_of: failedId }), undefined, undefined, ctx,
+		));
+		const repairId = delegationId(repaired);
+		assert.notEqual(repairId, failedId);
+		assert.equal(latestSessionState(stub).latestId, repairId);
+		assert.equal(latestSessionState(stub).status, "REVIEWED");
+		assert.equal(await readFile(transactionPath, "utf8"), transactionBefore, "the committed FAILED authority remains immutable");
+	});
+});
+
 async function installLegacyFinishedFixture(root: string, id: string): Promise<void> {
 	const source = join(process.cwd(), "tests", "fixtures", "governance-v1", "delegation", "valid");
 	const destination = join(root, CONFIG_DIR_NAME, "workbench", "delegations", id);

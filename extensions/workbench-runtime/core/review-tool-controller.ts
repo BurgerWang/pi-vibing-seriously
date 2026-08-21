@@ -80,6 +80,21 @@ export function registerReviewTool(controller: ReviewToolController): void {
 				maxBytes: renderMaxBytes,
 				maxLines: renderMaxLines,
 			}).text;
+			const repairRequired = (delegationId: string) => ({
+				content: [{
+					type: "text" as const,
+					text: reviewText(
+						`workbench_review_worker_diff: repair_required; delegation ${delegationId} cannot be completed by review; call workbench_delegate_worker with repair_of=${delegationId} to start a fresh bounded repair; do not retry review`,
+					),
+				}],
+				details: {
+					ok: false,
+					error: "repair_required",
+					authority_version: 2,
+					repair_of: delegationId,
+					next_action: "workbench_delegate_worker",
+				},
+			});
 			if (renderMaxBytes <= 0) return { content: [], details: { ok: false, error: "output_allocation_unavailable" } };
 			const trustError = controller.trustedOrError(ctx);
 			if (trustError) {
@@ -113,6 +128,7 @@ export function registerReviewTool(controller: ReviewToolController): void {
 			let finalized = false;
 			let reviewRecordPath: string | undefined;
 			if (v2Preflight.ok) {
+				if (v2Preflight.value.state.status === "FAILED") return repairRequired(delegationId);
 				authorityVersion = 2;
 				const v2Result = await controller.services.reviewV2({
 					projectRoot,
@@ -223,23 +239,7 @@ export function registerReviewTool(controller: ReviewToolController): void {
 			} else {
 				if (v2Preflight.error.code === "invalid_record") {
 					const recoverable = await controller.services.readRecoverableUnpublished(projectRoot, delegationId);
-					if (recoverable.ok) {
-						return {
-							content: [{
-								type: "text",
-								text: reviewText(
-									`workbench_review_worker_diff: repair_required; delegation ${delegationId} has no committed review authority; call workbench_delegate_worker with repair_of=${delegationId} to start a fresh bounded repair; do not retry review`,
-								),
-							}],
-							details: {
-								ok: false,
-								error: "repair_required",
-								authority_version: 2,
-								repair_of: delegationId,
-								next_action: "workbench_delegate_worker",
-							},
-						};
-					}
+					if (recoverable.ok) return repairRequired(delegationId);
 				}
 				return {
 					content: [{ type: "text", text: reviewText(`workbench_review_worker_diff: v2 authority ${v2Preflight.error.code}; legacy fallback refused`) }],
