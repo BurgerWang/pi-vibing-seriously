@@ -241,6 +241,26 @@ export interface WorkerRunResult {
 	writeJournalObservation: Readonly<WorkerWriteJournalRuntimeObservation>;
 }
 
+/** Closed, content-free failure categories safe to surface at the public edge. */
+export type WorkerRunFailureCode =
+	| "COMPACTION_REJECTED"
+	| "CONTEXT_HARD_LIMIT"
+	| "SPEND_TOTAL_TOKEN_LIMIT"
+	| "SPEND_OUTPUT_TOKEN_LIMIT"
+	| "SPEND_TURN_LIMIT_LEGACY"
+	| "MODEL_IDENTITY_MISMATCH"
+	| "ABORTED"
+	| "TIMED_OUT"
+	| "EXIT_CODE_NONZERO"
+	| "STOP_REASON_FAILURE"
+	| "PROVIDER_RESPONSE_UNVERIFIED"
+	| "FINAL_OUTPUT_MISSING";
+
+export interface WorkerRunFailure {
+	readonly code: WorkerRunFailureCode;
+	readonly message: string;
+}
+
 /** Numeric-only worker output-control observation; no free-form string fits. */
 export interface WorkerOutputControlFacts {
 	currentToolTextBytes: number;
@@ -560,48 +580,73 @@ function childEnvironment(
 	return env;
 }
 
-function workerFailureReason(result: WorkerRunResult): string | undefined {
+export function workerRunFailure(result: WorkerRunResult): WorkerRunFailure | undefined {
 	// Any compaction attempt or hard-budget stop fails closed, regardless of
 	// the child's eventual exit code: a worker must never silently continue
 	// through lossy compaction or past the pinned 90% hard budget.
 	if (result.compactionCount > 0) {
-		return `Pinned worker attempted context compaction (${result.compactionReasons.join(", ") || "unknown reason"}) — fail closed`;
+		return {
+			code: "COMPACTION_REJECTED",
+			message: `Pinned worker attempted context compaction (${result.compactionReasons.join(", ") || "unknown reason"}) — fail closed`,
+		};
 	}
 	if (result.hardBudgetExceeded) {
-		return `Pinned worker exceeded the ${WORKER_HARD_BUDGET}-token hard context budget — fail closed`;
+		return {
+			code: "CONTEXT_HARD_LIMIT",
+			message: `Pinned worker exceeded the ${WORKER_HARD_BUDGET}-token hard context budget — fail closed`,
+		};
 	}
-	// Phase 2 cumulative spend hard stop: any hard spend dimension reached
-	// fails closed regardless of the child's eventual exit code, and the
-	// deterministic hard-stop formatter outranks the ordinary exit/timeout
-	// text. This check sits parallel to the existing 900k hard-context path
-	// (compaction and hard-context keep their existing precedence above it;
-	// model-drift/abort/timeout keep their existing relative order below it).
+	// Cumulative total/output tokens remain true hard resource ceilings.
+	// Turn thresholds are retained in persisted telemetry for historical
+	// compatibility, but a tool-heavy run is no longer killed solely because
+	// it processed many small assistant messages.
+	if (result.spendHardExceeded.totalTokens || result.spendHardExceeded.outputTokens) {
+		return {
+			code: result.spendHardExceeded.totalTokens ? "SPEND_TOTAL_TOKEN_LIMIT" : "SPEND_OUTPUT_TOKEN_LIMIT",
+			message: formatWorkerSpendHardStop(result.spendState, result.spendProfile),
+		};
+	}
+	// Old runtimes terminated on the turn marker. Recognize their bounded,
+	// deterministic signature so a reloaded controller can diagnose the
+	// historical result accurately instead of blaming the provider.
 	if (
-		result.spendHardExceeded.turns ||
-		result.spendHardExceeded.totalTokens ||
-		result.spendHardExceeded.outputTokens
+		result.spendHardExceeded.turns &&
+		result.exitCode !== 0 &&
+		result.errorMessage?.startsWith("Worker cumulative spend hard budget reached")
 	) {
-		return formatWorkerSpendHardStop(result.spendState, result.spendProfile);
+		return {
+			code: "SPEND_TURN_LIMIT_LEGACY",
+			message: result.errorMessage,
+		};
 	}
-	if (result.modelMismatch) return result.modelMismatch;
-	if (result.aborted) return "Pinned worker was aborted";
-	if (result.timedOut) return "Pinned worker timed out";
+	if (result.modelMismatch) return { code: "MODEL_IDENTITY_MISMATCH", message: result.modelMismatch };
+	if (result.aborted) return { code: "ABORTED", message: "Pinned worker was aborted" };
+	if (result.timedOut) return { code: "TIMED_OUT", message: "Pinned worker timed out" };
 	if (result.exitCode !== 0) {
-		return result.errorMessage ?? `Pinned worker exited with code ${result.exitCode}${result.stderr ? `: ${result.stderr}` : ""}`;
+		return {
+			code: "EXIT_CODE_NONZERO",
+			message: result.errorMessage ?? `Pinned worker exited with code ${result.exitCode}${result.stderr ? `: ${result.stderr}` : ""}`,
+		};
 	}
 	if (result.stopReason === "error" || result.stopReason === "aborted") {
-		return result.errorMessage ?? `Pinned worker stopped with ${result.stopReason}`;
+		return {
+			code: "STOP_REASON_FAILURE",
+			message: result.errorMessage ?? `Pinned worker stopped with ${result.stopReason}`,
+		};
 	}
 	if (result.provider !== WORKER_PROVIDER || result.model !== WORKER_MODEL_ID) {
-		return `Pinned worker produced no verified ${WORKER_PROVIDER}/${WORKER_MODEL_ID} assistant response`;
+		return {
+			code: "PROVIDER_RESPONSE_UNVERIFIED",
+			message: `Pinned worker produced no verified ${WORKER_PROVIDER}/${WORKER_MODEL_ID} assistant response`,
+		};
 	}
-	if (!result.output) return "Pinned worker produced no final text output";
+	if (!result.output) return { code: "FINAL_OUTPUT_MISSING", message: "Pinned worker produced no final text output" };
 	return undefined;
 }
 
 export function assertWorkerSucceeded(result: WorkerRunResult): void {
-	const reason = workerFailureReason(result);
-	if (reason) throw new Error(reason);
+	const failure = workerRunFailure(result);
+	if (failure) throw new Error(failure.message);
 }
 
 export async function runPinnedWorker(options: RunWorkerOptions): Promise<WorkerRunResult> {
@@ -776,11 +821,13 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 				// normalized total/output added (positive totalTokens authoritative,
 				// else the non-negative component sum; cacheRead counts; malformed
 				// usage contributes zero but still counts the turn — never NaN). Any
-				// hard dimension reached (`>=`) terminates the child fail-closed with
-				// the deterministic hard-stop message; soft alone never fails.
+				// cumulative total/output hard dimension reached (`>=`) terminates the
+				// child fail-closed with the deterministic hard-stop message. Turns
+				// remain an advisory/telemetry marker: tool-heavy development must not
+				// be killed solely for crossing an arbitrary message count.
 				result.spendState = addWorkerSpendUsage(result.spendState, message.usage);
 				const spendFlags = workerSpendDimensionFlags(result.spendState, spendProfile);
-				if (spendFlags.hard.turns || spendFlags.hard.totalTokens || spendFlags.hard.outputTokens) {
+				if (spendFlags.hard.totalTokens || spendFlags.hard.outputTokens) {
 					result.errorMessage = formatWorkerSpendHardStop(result.spendState, spendProfile);
 					terminate("error");
 				}

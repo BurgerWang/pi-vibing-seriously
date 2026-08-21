@@ -86,7 +86,7 @@ write; locking, expiry, or exhaustion restores the fixed worker-first surface.
 Worker cumulative limits provide a continuation reserve rather than an early
 dead end:
 
-| Profile | Soft → hard turns | Soft → hard total tokens | Soft → hard output tokens |
+| Profile | Soft → advisory turn marker | Soft → hard total tokens | Soft → hard output tokens |
 | --- | ---: | ---: | ---: |
 | `standard` | 32 → 64 | 5,440,000 → 10,880,000 | 160,000 → 320,000 |
 | `extended` | 64 → 96 | 10,880,000 → 17,408,000 | 320,000 → 512,000 |
@@ -95,9 +95,11 @@ dead end:
 explicitly only for a clearly small, bounded slice.
 
 Soft limits request a coherent handoff and allow a bounded follow-up in the
-same Sol session. Hard limits remain fail-closed runaway protection. Every
-profile also keeps the per-message 272,000-token context guard: 217,600 soft,
-244,800 hard.
+same Sol session. A turn marker remains visible but never kills healthy,
+tool-heavy work by itself. Cumulative total/output limits remain fail-closed
+runaway protection. Every profile also keeps the per-message 272,000-token
+context guard: 217,600 soft, 244,800 hard; timeout, compaction rejection, and
+model-identity checks are unchanged.
 
 The retired `low` profile remains readable only in historical delegation
 records. New requests reject it before persistence or worker launch; old or

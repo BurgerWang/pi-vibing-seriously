@@ -898,7 +898,7 @@ test("runner spend: exact soft boundaries never fail (turns/total/output)", asyn
 	});
 });
 
-test("runner spend: Luna continuation reserve runs from soft 32 through hard 64", async () => {
+test("runner spend: turn markers remain observable without killing tool-heavy work", async () => {
 	const sixtyThree = Array.from({ length: 63 }, () => assistantEvent()).join("\n");
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${sixtyThree}\n`)});`, async (invocation, dir) => {
 		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "standard" });
@@ -908,16 +908,15 @@ test("runner spend: Luna continuation reserve runs from soft 32 through hard 64"
 	});
 	const sixtyFour = Array.from({ length: 64 }, () => assistantEvent()).join("\n");
 	await withFakeWorker(
-		`process.stdout.write(${JSON.stringify(`${sixtyFour}\n`)}); setInterval(() => {}, 1000);`,
+		`process.stdout.write(${JSON.stringify(`${sixtyFour}\n`)});`,
 		async (invocation, dir) => {
 			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "standard" });
-			assert.equal(result.exitCode, 1, "child terminated by the runner at the exact hard turns boundary");
+			assert.equal(result.exitCode, 0, "turn count alone never terminates a healthy worker");
 			assert.equal(result.spendBand, "hard");
 			assert.deepEqual(result.spendReasons, ["turns"]);
 			assert.equal(result.spendHardExceeded.turns, true);
-			assert.match(result.errorMessage ?? "", /turns 64\/64/);
-			assert.match(result.errorMessage ?? "", /current Sol session/);
-			assert.throws(() => assertWorkerSucceeded(result), /Worker cumulative spend hard budget reached \(profile standard\): turns 64\/64/);
+			assert.equal(result.errorMessage, undefined);
+			assert.doesNotThrow(() => assertWorkerSucceeded(result));
 		},
 	);
 });
@@ -1021,17 +1020,19 @@ test("runner spend: retired low resolves to extended while both active profiles 
 		assert.equal(standard.spendProfile, "standard");
 		assert.equal(standard.spendBand, "ok");
 	});
-	// extended hard turns = 96: the 96th turn terminates the child fail-closed.
+	// Extended turn marker = 96: it remains observable, but true resource
+	// ceilings (tokens/output/context/timeout) own termination.
 	const extTurns = Array.from({ length: 96 }, () => assistantEvent()).join("\n");
 	await withFakeWorker(
-		`process.stdout.write(${JSON.stringify(`${extTurns}\n`)}); setInterval(() => {}, 1000);`,
+		`process.stdout.write(${JSON.stringify(`${extTurns}\n`)});`,
 		async (invocation, dir) => {
 			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "extended" });
 			assert.equal(result.spendProfile, "extended");
 			assert.equal(result.spendBand, "hard");
 			assert.deepEqual(result.spendReasons, ["turns"]);
-			assert.match(result.errorMessage ?? "", /turns 96\/96/);
-			assert.throws(() => assertWorkerSucceeded(result), /profile extended.*turns 96\/96/);
+			assert.equal(result.exitCode, 0);
+			assert.equal(result.errorMessage, undefined);
+			assert.doesNotThrow(() => assertWorkerSucceeded(result));
 		},
 	);
 });
@@ -1240,14 +1241,13 @@ test("progress band transitions ok → soft at the exact soft boundary and match
 	assertNumericOnlyProgress(updates, []);
 });
 
-test("progress at the exact hard boundary matches the final spend facts (fail-closed outcome)", async () => {
-	// Standard hard turns = 64 exactly: the runner terminates fail-closed on
-	// the 64th event, and the LAST progress tuple still reports the exact
-	// cumulative counters and the hard band of the final result.
+test("progress at the exact turn marker matches final facts without forcing failure", async () => {
+	// The 64th standard turn is still visible as the historical hard telemetry
+	// marker, but it is advisory and the healthy child completes normally.
 	const events = Array.from({ length: 64 }, () => assistantEvent()).join("\n");
 	const updates: Array<Record<string, unknown>> = [];
 	await withFakeWorker(
-		`process.stdout.write(${JSON.stringify(`${events}\n`)}); setInterval(() => {}, 1000);`,
+		`process.stdout.write(${JSON.stringify(`${events}\n`)});`,
 		async (invocation, dir) => {
 			const result = await runPinnedWorker({
 				projectRoot: dir,
@@ -1259,7 +1259,8 @@ test("progress at the exact hard boundary matches the final spend facts (fail-cl
 			});
 			assert.equal(result.spendBand, "hard");
 			assert.deepEqual(result.spendReasons, ["turns"]);
-			assert.throws(() => assertWorkerSucceeded(result), /turns 64\/64/);
+			assert.equal(result.exitCode, 0);
+			assert.doesNotThrow(() => assertWorkerSucceeded(result));
 			assert.equal(updates.length, 64);
 			const last = updates[63]!;
 			assert.deepEqual(

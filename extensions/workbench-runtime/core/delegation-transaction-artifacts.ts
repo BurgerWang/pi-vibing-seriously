@@ -661,7 +661,7 @@ function buildDelegationCommittedArtifactsUnchecked(
 		input.worker.provider !== transaction.worker_identity.provider ||
 		input.worker.model !== transaction.worker_identity.model ||
 		input.worker.spendProfile !== contract.budget_profile ||
-		(input.worker.status === "success") !== outcome.provider_success) {
+		(input.worker.turns > 0) !== outcome.provider_success) {
 		return fail("binding_conflict", "worker facts conflict with the pinned transaction outcome");
 	}
 	const reportResult = deriveDelegationPersistedReportV2(input.reportText, input.secrets ?? []);

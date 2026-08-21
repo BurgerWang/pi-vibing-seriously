@@ -203,10 +203,11 @@ One invocation:
    handoff / hard stop, see below) and rejects any `compaction_start` event;
 8. accumulates the cumulative delegation-spend state after every assistant
     message (pure `core/worker-spend.ts` policy — turns / total tokens /
-    output tokens per the active profile) and terminates the child
-    fail-closed when any hard spend dimension is reached (see below);
+    output tokens per the active profile) and terminates the child fail-closed
+    when cumulative total/output reaches a hard limit; turn markers only steer
+    and remain observable (see below);
 9. terminates the child on completion, timeout, parent abort, hard-budget
-    stop (context or spend), or a compaction attempt;
+    stop (context or cumulative total/output spend), or a compaction attempt;
 10. advances to `COMMITTING`, evaluates fixed machine postconditions, and
     stages one immutable generation at
     `.pi/workbench/delegations/<id>/v2/generations/g########/` containing
@@ -741,8 +742,10 @@ landed; Phase 5 (task-contract profile wording and delegation-granularity
 guidance) landed.** The runner accumulates the cumulative
 spend state after every assistant message (same pure policy), records the
 final profile/state/band/reasons facts on every run result, and terminates
-the child fail-closed whenever any hard dimension is reached (`>=`,
-deterministic hard-stop message). The worker-role lifecycle reads the
+the child fail-closed whenever cumulative total/output reaches a hard limit
+(`>=`, deterministic hard-stop message). Turn thresholds remain persisted
+steering/diagnostic markers and never terminate a healthy worker by themselves.
+The worker-role lifecycle reads the
 spend profile from the fixed child env contract
 (`WORKBENCH_WORKER_SPEND_PROFILE` — the runner writes `standard` or
 `extended`; retired `low` and malformed/missing child env fall back to
@@ -762,7 +765,7 @@ is persisted additively in `usage.json` / `worker-summary.json` on every
 finished success and failure and rendered into the bounded parent handoff.
 Per-message context safety (above) is unchanged.
 
-| Profile | Soft turns | Soft total | Soft output | Hard turns | Hard total | Hard output |
+| Profile | Soft turns | Soft total | Soft output | Turn marker | Hard total | Hard output |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `standard` (explicit small slice) | 32 | 5,440,000 | 160,000 | 64 | 10,880,000 | 320,000 |
 | `extended` (safe default) | 64 | 10,880,000 | 320,000 | 96 | 17,408,000 | 512,000 |
@@ -774,7 +777,9 @@ The interval between soft and hard is an intentional continuation reserve:
 soft does not terminate the worker and must not direct the user to open a new
 Sol session. It asks the worker to finish the coherent change and hand back
 remaining work for a bounded follow-up delegation in the current Sol session.
-Hard remains a fail-closed runaway ceiling.
+Hard total/output consumption remains a fail-closed runaway ceiling. The turn
+marker is advisory because tool-heavy development can use many low-cost turns;
+the independent timeout still bounds wall-clock execution.
 
 - **Per-message totals** reuse the context-budget semantics: a positive
   `totalTokens` is authoritative; otherwise the non-negative
@@ -793,7 +798,8 @@ Hard remains a fail-closed runaway ceiling.
 - **Band evaluation** on every processed message: any hard dimension
   reached (`>=`) → `hard` (hard wins over soft, always); else any soft
   dimension reached → `soft`; else `ok`. Triggered reasons are listed in
-  the fixed order `turns`, `total_tokens`, `output_tokens`.
+  the fixed order `turns`, `total_tokens`, `output_tokens`. This persisted
+  telemetry classification does not make the turn marker an enforcement path.
 - **Soft steer (wired):** at most one hidden cumulative soft steer per
   delegation (`WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE =
   "workbench-worker-spend-soft-steer"`, `display: false`,
@@ -803,14 +809,15 @@ Hard remains a fail-closed runaway ceiling.
   dimension(s) in the fixed reason order, and current vs. limit values; a
   send failure is swallowed and never breaks a model request. The steer is
   a request, not an enforcement.
-- **Hard stop (wired):** when any hard dimension is reached the runner
-  terminates the child and the invocation fails closed
+- **Hard stop (wired):** when cumulative total or output reaches a hard limit
+  the runner terminates the child and the invocation fails closed
   (`assertWorkerSucceeded`), naming the winning dimension(s) and
   current/limit values via the deterministic hard-stop formatter; the
   outcome is committed as `FAILED` when its terminal facts and immutable
   generation are complete; incomplete persistence requires
-  `RECOVERY_REQUIRED`. The 60-minute timeout remains an independent failure
-  path.
+  `RECOVERY_REQUIRED`. Crossing only the persisted turn marker does not
+  terminate or fail an otherwise healthy worker. The 60-minute timeout remains
+  an independent failure path.
 - **Profiles:** `extended` is the deterministic safe default for every
   delegation without an explicit request; `standard` is selected explicitly
   only for a clearly small bounded slice. The public

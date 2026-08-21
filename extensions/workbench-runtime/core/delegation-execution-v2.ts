@@ -68,9 +68,10 @@ import type { WorkerSpendProfile } from "./worker-spend.ts";
 import { isStrictStreamingIdentityPath } from "./streaming-identity.ts";
 import { truncateUtf8 } from "../worker/handoff.ts";
 import {
-	assertWorkerSucceeded,
 	runPinnedWorker,
+	workerRunFailure,
 	type RunWorkerOptions,
+	type WorkerRunFailureCode,
 	type WorkerProgress,
 	type WorkerRunResult,
 } from "../worker/runner.ts";
@@ -149,6 +150,8 @@ interface DelegationExecutionV2Common {
 	after?: DelegationWorkspaceAfterFactsV2;
 	result?: DelegationExecutionMachineResultV2;
 	workerSummary?: LedgerWorkerSummaryRecord;
+	/** Closed runner category; never contains provider text, stderr, paths, or raw errors. */
+	worker_failure_code?: WorkerRunFailureCode;
 	/** Bounded builder category; raw builder messages are never exposed. */
 	artifact_error_code?: DelegationArtifactErrorCode | "internal_error";
 }
@@ -281,15 +284,6 @@ function workerTask(contract: DelegationBoundedTaskContractBindingV2): WorkerTas
 
 function fixedWorkerIdentity(result: WorkerRunResult): boolean {
 	return result.provider === WORKER_PROVIDER && result.model === WORKER_MODEL_ID;
-}
-
-function workerSucceeded(result: WorkerRunResult): boolean {
-	try {
-		assertWorkerSucceeded(result);
-		return true;
-	} catch {
-		return false;
-	}
 }
 
 function ledgerWorkerFacts(
@@ -541,7 +535,12 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 		state = await attemptRecovery(checked, state, input.clock, storageOptions, "worker identity was missing or conflicted");
 		return failure("worker_identity_invalid", checked, input, { durable_state: state });
 	}
-	const succeeded = workerSucceeded(worker);
+	const workerFailure = workerRunFailure(worker);
+	const succeeded = workerFailure === undefined;
+	// Provider transport/identity success is independent from the overall
+	// worker outcome. A locally enforced budget/timeout/report failure after
+	// verified Luna assistant messages must never become PROVIDER_NOT_SUCCESS.
+	const providerSucceeded = fixedWorkerIdentity(worker) && worker.turns > 0;
 	let changeSetLifecycle: Readonly<FinalizedDelegationChangeSetLifecycleV2>;
 	try {
 		const finalizedLifecycle = await finalizeDelegationChangeSetLifecycleV2({
@@ -599,7 +598,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 			delegation_id: checked.delegationId,
 			task_kind: checked.contract.task_kind,
 			worker_identity: { ...checked.workerIdentity },
-			provider_success: succeeded,
+			provider_success: providerSucceeded,
 			exit_code: worker.exitCode,
 			report_complete: report.value.report_complete,
 			terminal_facts_complete: true,
@@ -678,6 +677,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 		after: cloneAfter(after),
 		result,
 		workerSummary: structuredClone(artifacts.value.workerSummary),
+		...(workerFailure === undefined ? {} : { worker_failure_code: workerFailure.code }),
 	};
 	const expectedSuccess = checked.contract.task_kind === "implementation" ? "PENDING_REVIEW" : "FINISHED";
 	if (succeeded && state.status === expectedSuccess) {

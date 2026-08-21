@@ -239,7 +239,13 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					const artifactError = execution.artifact_error_code === undefined
 						? ""
 						: `; artifact_error=${execution.artifact_error_code}`;
-					throw new Error(`workbench_delegate_worker: delegation v2 ${execution.code}${artifactError}; durable_status=${status}; postconditions=${reasons}`);
+					const workerFailure = execution.worker_failure_code === undefined
+						? ""
+						: `; worker_failure=${execution.worker_failure_code}`;
+					const workerFacts = execution.result === undefined
+						? ""
+						: `; assistant_turns=${execution.result.turns}; spend_profile=${execution.result.spend.profile}; spend_total_tokens=${execution.result.spend.totalTokens}; spend_output_tokens=${execution.result.spend.outputTokens}; exit_code=${execution.result.exitCode ?? "none"}`;
+					throw new Error(`workbench_delegate_worker: delegation v2 ${execution.code}${artifactError}; durable_status=${status}; postconditions=${reasons}${workerFailure}${workerFacts}`);
 				}
 				const result = execution.result;
 				const handoffSummary = execution.workerSummary;

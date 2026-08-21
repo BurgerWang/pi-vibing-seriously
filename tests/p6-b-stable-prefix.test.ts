@@ -186,7 +186,7 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 
 test("v0.10.0 public tool surface has the intentional canonical transition hash", () => {
 	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
-	const currentHash = "292dfa098c192a3a8443990821ee664875f8ce5e5ec8dda36a96ba30acdcfc45";
+	const currentHash = "7cc79f784d084bf45c16cf4c9d961e7a49ac7f114dec70933c9f3120dc386bb3";
 	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
 	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the documented 0.10.0 hash");
 });
@@ -417,7 +417,9 @@ test("workbench_delegate_worker metadata is static and defaults to one-call deli
 	assert.doesNotMatch(budgetProfileSchema.description ?? "", /low =/);
 	assert.match(budgetProfileSchema.description ?? "", /retired low literal is rejected/);
 	assert.match(budgetProfileSchema.description ?? "", /Luna xhigh cumulative spend profile/);
-	assert.match(budgetProfileSchema.description ?? "", /standard = 32\/5,440,000\/160,000 soft, 64\/10,880,000\/320,000 hard/);
+	assert.match(budgetProfileSchema.description ?? "", /standard: soft at 32 turns \/ 5,440,000 total \/ 160,000 output/);
+	assert.match(budgetProfileSchema.description ?? "", /advisory turn marker 64, hard total 10,880,000, hard output 320,000/);
+	assert.match(budgetProfileSchema.description ?? "", /never kills healthy tool-heavy work by itself/);
 	assert.match(budgetProfileSchema.description ?? "", /current Sol session/);
 	// Phase 4A (public schema shape only): repair_of stays OPTIONAL —
 	// absent from `required` — and is an exactly-20-character string pinned
@@ -455,8 +457,8 @@ test("workbench_delegate_worker metadata is static and defaults to one-call deli
 	);
 	assert.equal(
 		canonicalHash(WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker),
-		"94416c9663e568d453787022249ee9b1aa770d898cef57064843fb4c25becb9c",
-		"current delegate parameter schema hash is machine-pinned after the extended safe-default transition",
+		"df77eaa04f473d50a754a216c8b67d9822ce8a5d084f80dc7ad49d335cdb9302",
+		"current delegate parameter schema hash is machine-pinned after turn-only termination retirement",
 	);
 });
 
@@ -654,8 +656,8 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.equal(
 		canonicalHash(workbenchToolMetadataOrdered()),
-		"daaffea4371c2521e9d87785fafeafaec1b02528e5080eef9c14f144e30617db",
-		"current public catalog hash is machine-pinned after safe-default and segmented-delivery guidance",
+		"bf6d1f0de7b5114c18b7307d3dfafa802b55a00c303cf5a5f28e70a9c42e763a",
+		"current public catalog hash is machine-pinned after safe-default, segmented delivery, and advisory turn-marker guidance",
 	);
 });
 

@@ -6,7 +6,7 @@
  * (`docs/plans/worker-token-budget-repair.md`): this module is the pure
  * policy and is **WIRED into the runtime since Phase 2** — the runner
  * accumulates the cumulative spend state after every assistant message and
- * terminates fail-closed on any hard dimension, and the worker-role
+ * terminates fail-closed on hard total/output consumption, and the worker-role
  * lifecycle sends exactly one hidden soft steer when the band first becomes
  * soft/hard (profile carried through the fixed `WORKER_SPEND_PROFILE_ENV`
  * child env contract). Public profile selection and ledger/handoff
@@ -15,8 +15,9 @@
  * It operates independently of the per-message context safety in
  * `core/worker-budget.ts` (272,000-token window, 217,600 soft handoff /
  * 244,800 hard stop): context safety bounds any single
- * message; this policy bounds cumulative spend across a delegation run —
- * turns, cumulative total tokens, and cumulative output tokens.
+ * message; this policy observes cumulative turns and bounds actual cumulative
+ * total/output consumption across a delegation run. Turn thresholds remain
+ * compatibility telemetry and steering markers, never a stand-alone kill switch.
  *
  * The current limits are Luna-specific and expressed in 272K context-window
  * equivalents. Every profile has a substantial continuation reserve between
@@ -46,7 +47,8 @@
  *   - At most one hidden cumulative soft steer per delegation (delivered
  *     exactly like the existing context steer, `display: false`,
  *     `deliverAs: "steer"`); the steer is a request, not enforcement. Any
- *     hard dimension → runner terminates and the invocation fails closed.
+ *     hard total/output dimension → runner terminates and the invocation
+ *     fails closed. A turn marker alone never terminates healthy work.
  *
  * Malformed counters, malformed usage, and unrecognized profile values
  * never throw and never produce NaN: counters normalize to zero, and limit

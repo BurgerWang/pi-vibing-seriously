@@ -283,6 +283,81 @@ test("delegate controller exposes only the bounded artifact builder category", a
 	);
 });
 
+test("delegate controller distinguishes a local legacy turn stop from provider availability", async () => {
+	const fixed = new Date("2026-08-21T03:05:06.000Z");
+	const controller = {
+		services: {
+			now: () => fixed,
+			makeDelegationId: () => "20260821-030506-W1r2",
+			readCommittedGeneration: async () => ({ ok: false, error: { code: "not_found" } }),
+			readRecoverableUnpublished: async () => ({ ok: false, error: { code: "not_recoverable" } }),
+			readLegacyLedger: async () => null,
+			executeDelegation: async () => ({
+				ok: false,
+				code: "postconditions_failed",
+				worker_failure_code: "SPEND_TURN_LIMIT_LEGACY",
+				durable_state: {
+					status: "FAILED",
+					postcondition_reasons: ["EXIT_CODE_NOT_ZERO", "REPORT_INCOMPLETE", "IMPLEMENTATION_DELTA_REQUIRED"],
+				},
+				result: {
+					provider: "openai-codex",
+					model: "gpt-5.6-luna",
+					status: "failure",
+					turns: 64,
+					exitCode: 143,
+					stopReason: "error",
+					usage: { input: 1, output: 1, cacheRead: 1, cacheWrite: 0, totalTokens: 3, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+					cacheHitRatio: 0.5,
+					budget: { maxContextTokens: 3, maxContextRatio: 0, softBudgetReached: false, hardBudgetExceeded: false, compactionCount: 0, compactionReasons: [] },
+					spend: { profile: "standard", turns: 64, totalTokens: 3, outputTokens: 1, band: "hard", softReached: { turns: true, totalTokens: false, outputTokens: false }, hardExceeded: { turns: true, totalTokens: false, outputTokens: false }, reasons: ["turns"] },
+					deniedWriteCount: 0,
+					reportComplete: false,
+				},
+			}),
+			completeDefaultDelivery: async () => { throw new Error("must not deliver"); },
+			buildTrustedRecoveryAuthority: async () => undefined,
+		},
+		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+		secrets: [],
+		trustedOrError: () => undefined,
+		projectRootFor: async () => "/project",
+		reconcileProjectAuthority: async () => true,
+		getProjectAuthorityBlockReason: () => undefined,
+		collectCurrentDelegationBinding: async () => ({ status: "fresh", hash: "a".repeat(64) }),
+		projectTerminalReviewedBinding: async () => null,
+		getDelegationState: () => emptyDelegationState(),
+		setDelegationState: () => {},
+		persistDelegationState: () => {},
+		persistDelegationStateStrict: () => {},
+		markTerminalMirrorBlocked: () => {},
+		refreshStatus: async () => {},
+		bindTrustedIngressAuthority: () => undefined,
+		rememberTrustedIngressAuthority: () => {},
+	} as unknown as Omit<DelegateToolController<unknown>, "pi">;
+	const tool = captureRegistration(registerDelegateTool, controller);
+
+	await assert.rejects(
+		tool.execute("delegate-turn-stop", {
+			task: "Implement the bounded change.",
+			task_kind: "implementation",
+			allowed_paths: ["src/**"],
+			acceptance_criteria: ["The change is implemented."],
+			verification: [],
+			timeout_seconds: 60,
+			budget_profile: "standard",
+		}, undefined, undefined, context()),
+		(error: unknown) => {
+			const message = String(error);
+			assert.match(message, /postconditions=EXIT_CODE_NOT_ZERO,REPORT_INCOMPLETE,IMPLEMENTATION_DELTA_REQUIRED/);
+			assert.match(message, /worker_failure=SPEND_TURN_LIMIT_LEGACY/);
+			assert.match(message, /assistant_turns=64; spend_profile=standard; spend_total_tokens=3; spend_output_tokens=1; exit_code=143/);
+			assert.doesNotMatch(message, /PROVIDER_NOT_SUCCESS|private|stderr/);
+			return true;
+		},
+	);
+});
+
 test("production controller service bundle is immutable and complete", () => {
 	assert.ok(Object.isFrozen(RUNTIME_CONTROLLER_SERVICES));
 	for (const services of Object.values(RUNTIME_CONTROLLER_SERVICES)) assert.ok(Object.isFrozen(services));

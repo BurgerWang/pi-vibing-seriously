@@ -695,6 +695,44 @@ test("artifact v2: worker identity, profile, counters, and derived spend facts a
 	}
 });
 
+test("artifact v2: verified provider response remains true when the overall worker outcome fails locally", () => {
+	const report = completeReport();
+	const facts = after("implementation");
+	const { state, contract, changeSetLifecycle } = committing("implementation", true, facts);
+	assert.ok(state.terminal_outcome);
+	const failedState: DelegationTransactionRecord = {
+		...state,
+		terminal_outcome: { ...state.terminal_outcome, exit_code: 7, provider_success: true },
+		postcondition_reasons: ["EXIT_CODE_NOT_ZERO"],
+	};
+	const failedWorker = { ...worker(report), status: "failure" as const, exitCode: 7, errorMessage: "bounded local failure" };
+	const result = buildDelegationCommittedArtifactsV2({
+		transaction: failedState,
+		contract: contract.value,
+		...artifactWorkspaceFacts(changeSetLifecycle),
+		changeSetLifecycle,
+		worker: failedWorker,
+		reportText: report,
+	});
+	assert.equal(result.ok, true, result.ok ? "" : result.error.code);
+	if (!result.ok) return;
+	assert.equal(result.value.workerSummary.status, "failure");
+
+	const falseProviderFailure = buildDelegationCommittedArtifactsV2({
+		transaction: {
+			...failedState,
+			terminal_outcome: { ...failedState.terminal_outcome, provider_success: false },
+			postcondition_reasons: ["PROVIDER_NOT_SUCCESS", "EXIT_CODE_NOT_ZERO"],
+		} as DelegationTransactionRecord,
+		contract: contract.value,
+		...artifactWorkspaceFacts(changeSetLifecycle),
+		changeSetLifecycle,
+		worker: failedWorker,
+		reportText: report,
+	});
+	assert.equal(falseProviderFailure.ok, false, "completed verified turns cannot be rebound as provider failure");
+});
+
 test("artifact v2: fallback spend and raw aggregate usage remain distinct persisted facts", () => {
 	const report = completeReport();
 	const facts = after("implementation");

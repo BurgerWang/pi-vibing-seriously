@@ -297,6 +297,35 @@ test("execution v2: implementation commits PENDING_REVIEW and strict reader retu
 	});
 });
 
+test("execution v2: a turn-only marker remains a successful committed delegation", async (t) => {
+	const projectRoot = await root(t);
+	const delegationId = id(46);
+	const report = completeReport(["src/changed.ts"]);
+	const markedWorker = worker(report, {
+		turns: 64,
+		spendState: { turns: 64, totalTokens: 160, outputTokens: 40 },
+		spendBand: "hard",
+		spendReasons: ["turns"],
+		spendSoftReached: { turns: true, totalTokens: false, outputTokens: false },
+		spendHardExceeded: { turns: true, totalTokens: false, outputTokens: false },
+	});
+	const result = await executeDelegationV2(await input(
+		projectRoot,
+		delegationId,
+		"implementation",
+		after(["src/changed.ts"]),
+		markedWorker,
+	));
+	assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result));
+	if (!result.ok) return;
+	assert.equal(result.status, "PENDING_REVIEW");
+	assert.deepEqual(result.durable_state.postcondition_reasons, []);
+	assert.equal(result.durable_state.terminal_outcome?.provider_success, true);
+	assert.equal(result.workerSummary.status, "success");
+	assert.equal(result.workerSummary.spend?.band, "hard");
+	assert.deepEqual(result.workerSummary.spend?.reasons, ["turns"]);
+});
+
 test("execution v2: create then edit the same new file commits with missing pre-worker authority", async (t) => {
 	const projectRoot = await root(t);
 	const delegationId = id(30);
@@ -400,6 +429,8 @@ test("execution v2: complete machine facts commit postcondition failures as fail
 		after: AfterFacts;
 		worker: WorkerRunResult;
 		reason: string;
+		absentReason?: string;
+		workerFailureCode?: string;
 		expectedStatus?: "FAILED" | "RECOVERY_REQUIRED";
 	}> = [
 		{
@@ -435,7 +466,27 @@ test("execution v2: complete machine facts commit postcondition failures as fail
 			kind: "implementation",
 			after: after(["src/changed.ts"]),
 			worker: worker(completeReport(["src/changed.ts"]), { exitCode: 7, errorMessage: "worker failed" }),
-			reason: "PROVIDER_NOT_SUCCESS",
+			reason: "EXIT_CODE_NOT_ZERO",
+			absentReason: "PROVIDER_NOT_SUCCESS",
+			workerFailureCode: "EXIT_CODE_NONZERO",
+		},
+		{
+			name: "legacy local turn stop is not a provider failure",
+			kind: "implementation",
+			after: after(["src/changed.ts"]),
+			worker: worker(completeReport(["src/changed.ts"]), {
+				exitCode: 143,
+				turns: 64,
+				errorMessage: "Worker cumulative spend hard budget reached (profile standard): turns 64/64.",
+				spendState: { turns: 64, totalTokens: 160, outputTokens: 40 },
+				spendBand: "hard",
+				spendReasons: ["turns"],
+				spendSoftReached: { turns: true, totalTokens: false, outputTokens: false },
+				spendHardExceeded: { turns: true, totalTokens: false, outputTokens: false },
+			}),
+			reason: "EXIT_CODE_NOT_ZERO",
+			absentReason: "PROVIDER_NOT_SUCCESS",
+			workerFailureCode: "SPEND_TURN_LIMIT_LEGACY",
 		},
 		{
 			name: "out-of-scope implementation change",
@@ -457,6 +508,10 @@ test("execution v2: complete machine facts commit postcondition failures as fail
 			assert.equal(result.code, "postconditions_failed");
 			assert.equal(result.durable_state?.status, item.expectedStatus ?? "FAILED");
 			assert.equal(result.durable_state?.postcondition_reasons.includes(item.reason as never), true);
+			if (item.absentReason !== undefined) {
+				assert.equal(result.durable_state?.postcondition_reasons.includes(item.absentReason as never), false);
+			}
+			if (item.workerFailureCode !== undefined) assert.equal(result.worker_failure_code, item.workerFailureCode);
 			const committed = await readDelegationCommittedGenerationV2(projectRoot, delegationId);
 			assert.equal(committed.ok, true);
 			assert.equal(committed.ok && committed.value.state.status, item.expectedStatus ?? "FAILED");
