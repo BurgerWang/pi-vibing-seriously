@@ -10,6 +10,7 @@ import {
 	type DelegationState,
 } from "./delegation-state.ts";
 import type { reviewDelegationV2 } from "./delegation-review-v2.ts";
+import type { readRecoverableUnpublishedDelegationV2 } from "./delegation-project-authority.ts";
 import type { readDelegationCommittedGenerationV2 } from "./delegation-transaction-storage.ts";
 import {
 	MAX_REVIEW_GUIDANCE_BYTES,
@@ -55,6 +56,7 @@ export interface ReviewToolController {
 export interface ReviewToolServices {
 	now(): Date;
 	readCommittedGeneration: typeof readDelegationCommittedGenerationV2;
+	readRecoverableUnpublished: typeof readRecoverableUnpublishedDelegationV2;
 	reviewV2: typeof reviewDelegationV2;
 	reviewLegacy: typeof reviewDelegation;
 }
@@ -219,6 +221,26 @@ export function registerReviewTool(controller: ReviewToolController): void {
 				controller.setDelegationState(nextState);
 				controller.persistDelegationState();
 			} else {
+				if (v2Preflight.error.code === "invalid_record") {
+					const recoverable = await controller.services.readRecoverableUnpublished(projectRoot, delegationId);
+					if (recoverable.ok) {
+						return {
+							content: [{
+								type: "text",
+								text: reviewText(
+									`workbench_review_worker_diff: repair_required; delegation ${delegationId} has no committed review authority; call workbench_delegate_worker with repair_of=${delegationId} to start a fresh bounded repair; do not retry review`,
+								),
+							}],
+							details: {
+								ok: false,
+								error: "repair_required",
+								authority_version: 2,
+								repair_of: delegationId,
+								next_action: "workbench_delegate_worker",
+							},
+						};
+					}
+				}
 				return {
 					content: [{ type: "text", text: reviewText(`workbench_review_worker_diff: v2 authority ${v2Preflight.error.code}; legacy fallback refused`) }],
 					details: { ok: false, error: v2Preflight.error.code, authority_version: 2 },

@@ -172,6 +172,12 @@ function delegationStatusTool(stub: StubAPI): RuntimeTool {
 	return tool as RuntimeTool;
 }
 
+function reviewTool(stub: StubAPI): RuntimeTool {
+	const tool = stub.tools.get("workbench_review_worker_diff");
+	assert.ok(tool);
+	return tool as RuntimeTool;
+}
+
 function resultText(result: RuntimeResult): string {
 	return result.content
 		.map((item) => typeof item.text === "string" ? item.text : "")
@@ -920,6 +926,19 @@ test("an explicit repair_of safely supersedes an unpublished artifact failure wi
 		await startSession(stub, ctx);
 		assert.equal(latestSessionState(stub).latestId, brokenId);
 		assert.equal(latestSessionState(stub).status, "PENDING_REVIEW");
+		const status = await delegationStatusTool(stub).execute("artifact-repair-status", {}, undefined, undefined, ctx);
+		assert.match(resultText(status), /RECOVERABLE_UNPUBLISHED/);
+		assert.match(resultText(status), new RegExp(`repair_of=${brokenId}`));
+		assert.doesNotMatch(resultText(status), /authority v2\s+: INVALID/);
+		const refusedReview = await reviewTool(stub).execute(
+			"artifact-repair-review", { delegation_id: brokenId }, undefined, undefined, ctx,
+		);
+		assert.equal(refusedReview.details.error, "repair_required");
+		assert.equal(refusedReview.details.repair_of, brokenId);
+		assert.equal(refusedReview.details.next_action, "workbench_delegate_worker");
+		assert.match(resultText(refusedReview), new RegExp(`repair_of=${brokenId}`));
+		assert.match(resultText(refusedReview), /do not retry review/);
+		assert.equal(await readFile(transactionPath, "utf8"), transactionBefore, "status and review guidance never rewrite recovery evidence");
 
 		const script = await writeFakeWorker(root, {});
 		const repaired = await withFakeWorker(script, () => delegateTool(stub).execute(

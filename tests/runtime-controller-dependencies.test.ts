@@ -128,6 +128,7 @@ test("review controller refuses corrupt v2 authority and never falls back to leg
 				ok: false,
 				error: { code: "invalid_record", message: "private storage detail" },
 			}),
+			readRecoverableUnpublished: async () => ({ ok: false, error: { code: "not_recoverable" } }),
 			reviewV2: async () => { throw new Error("must not review invalid authority"); },
 			reviewLegacy: async () => {
 				legacyCalls += 1;

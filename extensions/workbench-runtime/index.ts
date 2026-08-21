@@ -97,6 +97,7 @@ import {
 } from "./cache/cache-telemetry.ts";
 import { type GitFacts } from "./core/delegation-ledger.ts";
 import {
+	readRecoverableUnpublishedDelegationV2,
 	readDelegationAuthorityObservationV2 as readDelegationAuthorityObservation,
 } from "./core/delegation-project-authority.ts";
 import {
@@ -861,7 +862,17 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			if (block) lines.push(`blocked      : ${block}`);
 			const authority = await readDelegationAuthorityObservation(projectRoot, delegationState.latestId);
 			if (authority.kind === "invalid-v2") {
-				lines.push(`authority v2 : INVALID (${authority.code}) — legacy fallback refused`);
+				const recoverable = authority.code === "invalid_record"
+					? await readRecoverableUnpublishedDelegationV2(projectRoot, delegationState.latestId)
+					: undefined;
+				if (recoverable?.ok) {
+					lines.push(
+						"authority v2 : RECOVERABLE_UNPUBLISHED (RECOVERY_REQUIRED; committed proof absent)",
+						`next action  : call workbench_delegate_worker with repair_of=${delegationState.latestId}; do not retry review`,
+					);
+				} else {
+					lines.push(`authority v2 : INVALID (${authority.code}) — legacy fallback refused`);
+				}
 			} else if (authority.kind === "legacy" && authority.review) {
 				const review = authority.review;
 				lines.push(
@@ -869,17 +880,27 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 					`review bound : ${review.bound_diff_hash}`,
 				);
 			} else if (authority.kind === "v2") {
-				lines.push(`authority v2 : transaction ${authority.transactionStatus}`);
-				if (authority.review) {
+				const recoverable = authority.transactionStatus === "RECOVERY_REQUIRED"
+					? await readRecoverableUnpublishedDelegationV2(projectRoot, delegationState.latestId)
+					: undefined;
+				if (recoverable?.ok) {
 					lines.push(
-						`review v2    : ${authority.review.verdict} at ${authority.review.reviewed_at}${authority.finalized ? " (FINAL)" : " (PROVISIONAL)"}`,
-						`review path  : ${authority.reviewPath ?? "(none)"}`,
-						`review bound : ${authority.review.bound_diff_hash}`,
+						"authority v2 : RECOVERABLE_UNPUBLISHED (RECOVERY_REQUIRED; committed proof absent)",
+						`next action  : call workbench_delegate_worker with repair_of=${delegationState.latestId}; do not retry review`,
 					);
-				} else if (authority.transactionVerdict !== null) {
-					lines.push(`completion v2: ${authority.transactionVerdict} (strict terminal machine facts; no review artifact)`);
 				} else {
-					lines.push(`review v2    : NOT_RUN`);
+					lines.push(`authority v2 : transaction ${authority.transactionStatus}`);
+					if (authority.review) {
+						lines.push(
+							`review v2    : ${authority.review.verdict} at ${authority.review.reviewed_at}${authority.finalized ? " (FINAL)" : " (PROVISIONAL)"}`,
+							`review path  : ${authority.reviewPath ?? "(none)"}`,
+							`review bound : ${authority.review.bound_diff_hash}`,
+						);
+					} else if (authority.transactionVerdict !== null) {
+						lines.push(`completion v2: ${authority.transactionVerdict} (strict terminal machine facts; no review artifact)`);
+					} else {
+						lines.push(`review v2    : NOT_RUN`);
+					}
 				}
 			}
 		} else {

@@ -36,6 +36,7 @@ const delegate = Object.freeze({
 const review = Object.freeze({
 	now,
 	readCommittedGeneration: readDelegationCommittedGenerationV2,
+	readRecoverableUnpublished: readRecoverableUnpublishedDelegationV2,
 	reviewV2: reviewDelegationV2,
 	reviewLegacy: reviewDelegation,
 }) satisfies ReviewToolServices;
