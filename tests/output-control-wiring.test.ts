@@ -3476,7 +3476,7 @@ describe("trusted recovery authority and runtime ingress wiring", () => {
 				"const message = {",
 				"  role: 'assistant',",
 				`  content: [{ type: 'text', text: ${JSON.stringify(report)} }],`,
-				"  provider: 'deepseek', model: 'deepseek-v4-flash', stopReason: 'stop',",
+				"  provider: 'openai-codex', model: 'gpt-5.6-luna', stopReason: 'stop',",
 				"  usage: { input: 8, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 12, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },",
 				"};",
 				"process.stdout.write(JSON.stringify({ type: 'message_end', message }) + '\\n');",

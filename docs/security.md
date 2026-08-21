@@ -85,7 +85,7 @@ and provider authentication. The parent project must already be trusted.
 Defense-in-depth controls:
 
 - only `gpt-5.6-sol` on the `openai-codex` or `openai` provider can invoke it;
-- the child selector is pinned to `deepseek/deepseek-v4-flash:max`, and
+- the child selector is pinned to `openai-codex/gpt-5.6-luna:xhigh`, and
   assistant provider/model drift fails closed;
 - AUDIT and VERIFY hard-deny the delegate tool;
 - the worker role removes recursive delegation, free-form `bash`, and
@@ -210,12 +210,12 @@ BLOCKs B6, and model prose can never satisfy B6.1-B6.8.
 Context-budget protection (model-specific, independent of the
 Commander/project compaction reserve):
 
-- the pinned worker window is 1,000,000 context tokens; per-message tokens
+- the Pi-advertised pinned worker window is 272,000 context tokens; per-message tokens
   use Pi's normalized usage semantics (positive `totalTokens` wins,
   otherwise the non-negative `input + output + cacheRead + cacheWrite` sum);
-- at 800,000 tokens (80%) the worker role sends one hidden steer to stop new
+- at 217,600 tokens (80%) the worker role sends one hidden steer to stop new
   implementation, finish a concise handoff, and list remaining work;
-- at 900,000 tokens (90%) the runner terminates the child and the invocation
+- at 244,800 tokens (90%) the runner terminates the child and the invocation
   fails closed;
 - in the worker role only, `session_before_compact` is cancelled
   (`{ cancel: true }`) so a worker never silently continues through lossy
@@ -271,7 +271,7 @@ wording and granularity guidance since Phase 5):
   pinned provider/model identity — never worker text, reasons, report
   content, tool arguments, patches, logs, or error prose; the starting/
   running onUpdate keeps the exact
-  `DeepSeek worker: N turn(s), model provider/model` text prefix and adds
+  `Pinned worker: N turn(s), model provider/model` text prefix and adds
   only deterministic counters/band;
 - the 60-minute timeout remains an independent failure path.
 

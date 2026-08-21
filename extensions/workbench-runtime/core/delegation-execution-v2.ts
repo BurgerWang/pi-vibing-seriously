@@ -68,7 +68,7 @@ import { isStrictStreamingIdentityPath } from "./streaming-identity.ts";
 import { truncateUtf8 } from "../worker/handoff.ts";
 import {
 	assertWorkerSucceeded,
-	runDeepseekWorker,
+	runPinnedWorker,
 	type RunWorkerOptions,
 	type WorkerProgress,
 	type WorkerRunResult,
@@ -518,7 +518,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 
 	let worker: WorkerRunResult;
 	try {
-		worker = await (input.runWorker ?? runDeepseekWorker)({
+		worker = await (input.runWorker ?? runPinnedWorker)({
 			projectRoot: checked.projectRoot,
 			contract: workerTask(checked.contract),
 			runtimeIdentity: {

@@ -74,8 +74,13 @@ import {
 	computeFileSourceId,
 	type FileSourceSnapshot,
 } from "../extensions/workbench-runtime/core/continuation-cursor.ts";
-import { runDeepseekWorker } from "../extensions/workbench-runtime/worker/runner.ts";
-import type { WorkerTaskContract } from "../extensions/workbench-runtime/core/worker-policy.ts";
+import { runPinnedWorker } from "../extensions/workbench-runtime/worker/runner.ts";
+import {
+	WORKER_MODEL_ID,
+	WORKER_PROVIDER,
+	type WorkerTaskContract,
+} from "../extensions/workbench-runtime/core/worker-policy.ts";
+import { WORKER_MODEL_CONTEXT_TOKENS } from "../extensions/workbench-runtime/core/worker-budget.ts";
 import { sanitizeSession } from "./workbench-session-sanitize.ts";
 
 export const CONTEXT_OUTPUT_SCENARIO_IDS = [
@@ -278,8 +283,8 @@ function isOfflineFakeTelemetryRecord(value: unknown): boolean {
 	const usage = record.usage;
 	if (typeof usage !== "object" || usage === null || Array.isArray(usage)) return false;
 	const totals = usage as Record<string, unknown>;
-	return record.provider === "deepseek"
-		&& record.model === "deepseek-v4-flash"
+	return record.provider === WORKER_PROVIDER
+		&& record.model === WORKER_MODEL_ID
 		&& record.apiKind === "openai-completions"
 		&& totals.input === 100
 		&& totals.output === 10
@@ -287,6 +292,12 @@ function isOfflineFakeTelemetryRecord(value: unknown): boolean {
 		&& totals.cacheWrite === 0
 		&& totals.totalTokens === 110;
 }
+
+// The 500-path review scenario intentionally exercises the immutable
+// governance-v1 reader/writer contract. These values are historical fixture
+// identity, never the current delegated-worker selector.
+const LEGACY_V1_WORKER_PROVIDER = "deepseek";
+const LEGACY_V1_WORKER_MODEL = "deepseek-v4-flash";
 
 async function inspectOfflineTelemetry(projectRoot: string): Promise<OfflineTelemetryFacts> {
 	const content = await readFile(join(projectRoot, OFFLINE_TELEMETRY_RELATIVE_PATH));
@@ -776,8 +787,8 @@ async function diffScenario(root: string, state: MeasurementState): Promise<Scen
 		now: "2026-08-13T00:00:01.000Z",
 		secrets: [],
 		worker: {
-			provider: "deepseek",
-			model: "deepseek-v4-flash",
+			provider: LEGACY_V1_WORKER_PROVIDER,
+			model: LEGACY_V1_WORKER_MODEL,
 			status: "success",
 			exitCode: 0,
 			turns: 1,
@@ -1819,24 +1830,24 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 		};
 
 		const modelRuntime = await ModelRuntime.create({ modelsPath: null, allowModelNetwork: false });
-		modelRuntime.registerProvider("deepseek", {
-			name: "Offline deterministic DeepSeek",
+		modelRuntime.registerProvider(${JSON.stringify(WORKER_PROVIDER)}, {
+			name: "Offline deterministic pinned worker",
 			apiKey: "offline-local-only",
 			api: "openai-completions",
 			baseUrl: "http://offline.invalid",
 			streamSimple: fakeProviderStream,
 			models: [{
-				id: "deepseek-v4-flash",
-				name: "Offline deterministic DeepSeek V4 Flash",
+				id: ${JSON.stringify(WORKER_MODEL_ID)},
+				name: "Offline deterministic GPT-5.6 Luna",
 				api: "openai-completions",
-				reasoning: false,
+				reasoning: true,
 				input: ["text"],
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-				contextWindow: 1_000_000,
-				maxTokens: 4_096,
+				contextWindow: ${WORKER_MODEL_CONTEXT_TOKENS},
+				maxTokens: 131_072,
 			}],
 		});
-		const model = modelRuntime.getModel("deepseek", "deepseek-v4-flash");
+		const model = modelRuntime.getModel(${JSON.stringify(WORKER_PROVIDER)}, ${JSON.stringify(WORKER_MODEL_ID)});
 		if (!model) throw new Error("offline deterministic model registration failed");
 
 		const agentDir = join(projectRoot, ".agent-context-output");
@@ -1862,7 +1873,7 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 			cwd: sessionRoot,
 			agentDir,
 			model,
-			thinkingLevel: "off",
+			thinkingLevel: "xhigh",
 			modelRuntime,
 			resourceLoader,
 			tools: ["read"],
@@ -1920,7 +1931,7 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 	`;
 	await writeFile(scriptPath, fakeChildSource, { encoding: "utf8", mode: 0o600 });
 	const progress: Array<{ currentToolTextBytes: number; collapsedToolResults: number; turnReservedBytes: number }> = [];
-	const result = await runDeepseekWorker({
+	const result = await runPinnedWorker({
 		projectRoot: root,
 		contract: WORKER_CONTRACT,
 		timeoutMs: 120_000,
@@ -1967,8 +1978,8 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 			error_message_sha256: sha256(errorMessage),
 			model_mismatch_bytes: bytes(modelMismatch),
 			model_mismatch_sha256: sha256(modelMismatch),
-			provider_matches: result.provider === "deepseek",
-			model_matches: result.model === "deepseek-v4-flash",
+			provider_matches: result.provider === WORKER_PROVIDER,
+			model_matches: result.model === WORKER_MODEL_ID,
 			stop_reason_matches: stopReason === "stop",
 			stop_reason_bytes: bytes(stopReason),
 			stop_reason_sha256: sha256(stopReason),
@@ -2096,8 +2107,8 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 	const historyBounded = childFacts.maxProjectedHistoryBytes <= WORKER_HISTORY_TOOL_TEXT_MAX_BYTES
 		&& childFacts.historyCap === WORKER_HISTORY_TOOL_TEXT_MAX_BYTES;
 	const success = result.exitCode === 0
-		&& result.provider === "deepseek"
-		&& result.model === "deepseek-v4-flash"
+		&& result.provider === WORKER_PROVIDER
+		&& result.model === WORKER_MODEL_ID
 		&& result.stopReason === "stop"
 		&& result.output.length > 0
 		&& !result.aborted
@@ -2106,7 +2117,7 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 		&& !result.hardBudgetExceeded
 		&& result.compactionCount === 0
 		&& result.turns === 25
-		&& result.spendBand === "soft"
+		&& result.spendBand === "ok"
 		&& childFacts.productionReadToolResults === 24
 		&& childFacts.forwardedRawToolResultEvents === 0
 		&& childFacts.maxPreHistoryToolResultEventBytes <= 2 * MIB
@@ -2213,7 +2224,7 @@ async function workerScenario(root: string, state: MeasurementState): Promise<Sc
 		},
 		[
 			acceptance("worker-provider-responses", result.turns, "=", 25),
-			acceptance("standard-profile-soft-band", result.spendBand, "=", "soft"),
+			acceptance("luna-standard-continuation-reserve-not-entered", result.spendBand, "=", "ok"),
 			acceptance("worker-success", success, "=", true),
 			acceptance("production-read-tool-results", childFacts.productionReadToolResults, "=", 24),
 			acceptance("actual-tool-result-message-events", childFacts.actualToolResultMessageEvents, "=", 24),

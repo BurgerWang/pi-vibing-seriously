@@ -5,6 +5,17 @@ environments that were actually exercised are listed; no untested
 compatibility is claimed. The machine-readable copy lives in
 [`compatibility/pi.json`](../compatibility/pi.json).
 
+## Unreleased pinned-worker qualification
+
+The active delegated-worker selector is
+`openai-codex/gpt-5.6-luna:xhigh`. On 2026-08-21 the installed Pi catalog
+advertised a 272,000-token context window for that route; a real no-tools
+temporary-directory availability smoke verified the provider/model and exit
+status without sending private repository content. Runner argument, identity,
+budget, and lifecycle behavior are covered by the current integration suite.
+DeepSeek rows below are retained only as historical v0.10.0/cache-provider
+compatibility evidence and are not the active worker selector.
+
 ## Unreleased cache-prefix P0–P2 compatibility
 
 These are Unreleased source compatibility statements. No deployment, tag,

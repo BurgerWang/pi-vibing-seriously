@@ -1,5 +1,13 @@
 # Worker Token-Budget Repair — Durable Implementation Plan
 
+> **Historical calibration notice (2026-08-21):** this plan records the
+> original DeepSeek-era diagnosis and implementation. The active worker is
+> now `openai-codex/gpt-5.6-luna:xhigh`; current cumulative limits and
+> continuation-reserve behavior are defined by
+> `core/worker-spend.ts` and `docs/worker-delegation.md`. The historical
+> baseline and old thresholds below are retained as audit evidence, not as
+> current runtime configuration.
+
 | Field | Value |
 | --- | --- |
 | Status | **APPROVED — Phases 1–5 IMPLEMENTED and FINAL-VALIDATED; Phase 6 deferred / NOT_SCHEDULED pending provider capability evidence** |

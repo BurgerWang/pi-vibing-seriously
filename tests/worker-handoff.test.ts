@@ -23,6 +23,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
+import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtime/core/worker-policy.ts";
+
 import {
 	buildDelegateWorkerResult,
 	changedPathsLine,
@@ -262,8 +264,8 @@ const HANDOFF_REPORT = [
 function handoffInput(overrides: Partial<BuildDelegateWorkerResultInput> = {}): BuildDelegateWorkerResultInput {
 	return {
 		delegationId: "20260601-120000-abcd",
-		provider: "deepseek",
-		model: "deepseek-v4-flash",
+		provider: WORKER_PROVIDER,
+		model: WORKER_MODEL_ID,
 		status: "success",
 		turns: 3,
 		exitCode: 0,
@@ -279,7 +281,7 @@ function handoffInput(overrides: Partial<BuildDelegateWorkerResultInput> = {}): 
 		},
 		cacheHitRatio: 2 / 3,
 		budget: {
-			maxContextTokens: 400_000,
+			maxContextTokens: 108_800,
 			maxContextRatio: 0.4,
 			softBudgetReached: false,
 			hardBudgetExceeded: false,
@@ -322,11 +324,11 @@ test("the parent handoff never contains report/patch/test-log content and is bou
 	assert.ok(Buffer.byteLength(text, "utf8") <= MAX_PARENT_HANDOFF_BYTES, "UTF-8 byte cap");
 	// The required bounded facts are present.
 	assert.ok(text.includes("20260601-120000-abcd"), "delegation id");
-	assert.ok(text.includes("deepseek/deepseek-v4-flash"), "provider/model");
+	assert.ok(text.includes("openai-codex/gpt-5.6-luna"), "provider/model");
 	assert.ok(text.includes("SUCCESS"), "status");
 	assert.ok(text.includes("src/main.ts"), "actual changed paths");
 	assert.ok(text.includes("uncached input 10 | cache read 20 | hit ratio 67%"), "usage/cache summary");
-	assert.ok(text.includes("worker budget : max context 400000 / 1000000 (40%)"), "budget summary");
+	assert.ok(text.includes("worker budget : max context 108800 / 272000 (40%)"), "budget summary");
 	assert.ok(text.includes(".pi/workbench/delegations/20260601-120000-abcd/worker-report.md"), "report path");
 	assert.ok(text.includes("worker-summary.json") && text.includes("usage.json"), "artifact pointers");
 	assert.ok(text.includes("workbench_review_worker_diff"), "Sol must inspect the actual diff");
@@ -354,10 +356,10 @@ test("pathological 500×400-char changed paths and CJK items never remove requir
 	// Required pointers/facts survive the pathological inputs.
 	for (const needle of [
 		"20260601-120000-abcd",
-		"deepseek/deepseek-v4-flash",
+		"openai-codex/gpt-5.6-luna",
 		"SUCCESS",
 		"uncached input 10 | cache read 20 | hit ratio 67%",
-		"worker budget : max context 400000 / 1000000 (40%)",
+		"worker budget : max context 108800 / 272000 (40%)",
 		".pi/workbench/delegations/20260601-120000-abcd/worker-report.md",
 		"worker-summary.json",
 		"usage.json",
@@ -445,7 +447,7 @@ test("structured details carry only bounded fields and prohibit output/full_repo
 	assert.equal(details.status, "success");
 	assert.equal(details.turns, 3);
 	assert.equal(details.cache_hit_ratio, 2 / 3);
-	assert.equal(details.max_context_tokens, 400_000);
+	assert.equal(details.max_context_tokens, 108_800);
 	assert.equal(details.review_status, "PENDING_REVIEW");
 	const summary = details.summary as {
 		completed: string[];
@@ -550,7 +552,7 @@ test("the parent handoff renders the deterministic spend summary line and the ne
 	const result = buildDelegateWorkerResult(handoffInput({ spend: SPEND_FACTS }));
 	const text = result.content[0]?.text ?? "";
 	// The exact deterministic line (profile hard limits as denominators).
-	assert.ok(text.includes("spend budget : turns 3/36 | total 35/5000000 | output 5/200000 | profile standard"), "deterministic spend summary line rendered");
+	assert.ok(text.includes("spend budget : turns 3/64 | total 35/10880000 | output 5/320000 | profile standard"), "deterministic spend summary line rendered");
 	// The nested details carry the EXACT canonical spend object (single
 	// derivation — the persisted worker-summary spend object, verbatim).
 	assert.deepEqual(result.details.spend, SPEND_FACTS);
@@ -558,16 +560,16 @@ test("the parent handoff renders the deterministic spend summary line and the ne
 	assert.ok(text.split("\n").length <= MAX_PARENT_HANDOFF_LINES, "line cap");
 	assert.ok(Buffer.byteLength(text, "utf8") <= MAX_PARENT_HANDOFF_BYTES, "UTF-8 byte cap");
 	// The context budget line and the top-level usage stay intact.
-	assert.ok(text.includes("worker budget : max context 400000 / 1000000 (40%)"), "context budget line preserved");
+	assert.ok(text.includes("worker budget : max context 108800 / 272000 (40%)"), "context budget line preserved");
 	assert.equal(result.usage.input, 10, "top-level nested worker usage preserved for cost accounting");
 });
 
 test("a hard-band spend object renders the hard-limit summary line and the dimension-named failure line", () => {
 	const hardSpend: HandoffSpendFacts = {
 		profile: "standard",
-		turns: 36,
-		totalTokens: 5_000_000,
-		outputTokens: 200_000,
+		turns: 64,
+		totalTokens: 10_880_000,
+		outputTokens: 320_000,
 		band: "hard",
 		softReached: { turns: true, totalTokens: true, outputTokens: true },
 		hardExceeded: { turns: true, totalTokens: true, outputTokens: true },
@@ -576,12 +578,13 @@ test("a hard-band spend object renders the hard-limit summary line and the dimen
 	const result = buildDelegateWorkerResult(
 		handoffInput({
 			spend: hardSpend,
-			failureMessage: "Worker cumulative spend hard budget reached (profile standard): turns 36/36, total_tokens 5000000/5000000, output_tokens 200000/200000.",
+			failureMessage: "Worker cumulative spend hard budget reached (profile standard): turns 64/64, total_tokens 10880000/10880000, output_tokens 320000/320000. Continue with a bounded follow-up delegation in the current Sol session after reviewing any partial delta; do not request a new Sol session.",
 		}),
 	);
 	const text = result.content[0]?.text ?? "";
-	assert.ok(text.includes("spend budget : turns 36/36 | total 5000000/5000000 | output 200000/200000 | profile standard"));
+	assert.ok(text.includes("spend budget : turns 64/64 | total 10880000/10880000 | output 320000/320000 | profile standard"));
 	assert.ok(text.includes("failure       : Worker cumulative spend hard budget reached"), "dimension-named failure line rendered");
+	assert.ok(text.includes("current Sol session"), "hard stop carries bounded same-session continuation guidance");
 	assert.deepEqual(result.details.spend, hardSpend);
 	assert.ok(text.split("\n").length <= MAX_PARENT_HANDOFF_LINES);
 	assert.ok(Buffer.byteLength(text, "utf8") <= MAX_PARENT_HANDOFF_BYTES);
@@ -599,7 +602,7 @@ test("the spend summary line is a required fact line that survives byte-cap pres
 	};
 	const result = buildDelegateWorkerResult(handoffInput({ summary, spend: SPEND_FACTS }));
 	const text = result.content[0]?.text ?? "";
-	assert.ok(text.includes("spend budget : turns 3/36 | total 35/5000000 | output 5/200000 | profile standard"), "the spend line is a required fact line and survives the byte-cap pressure");
+	assert.ok(text.includes("spend budget : turns 3/64 | total 35/10880000 | output 5/320000 | profile standard"), "the spend line is a required fact line and survives the byte-cap pressure");
 	assert.ok(text.split("\n").length <= MAX_PARENT_HANDOFF_LINES, "line cap");
 	assert.ok(Buffer.byteLength(text, "utf8") <= MAX_PARENT_HANDOFF_BYTES, "UTF-8 byte cap");
 	assert.equal(Buffer.from(text, "utf8").toString("utf8"), text, "strict round trip — no split multibyte sequence");

@@ -1,5 +1,5 @@
 /**
- * Pinned DeepSeek worker cumulative delegation-spend policy — pure logic,
+ * Pinned GPT-5.6 Luna xhigh cumulative delegation-spend policy — pure logic,
  * no Pi imports.
  *
  * Phases 1–2 of the approved worker token-budget repair
@@ -13,12 +13,16 @@
  * persistence of the spend facts land in Phase 3 of that plan.
  *
  * It operates independently of the per-message context safety in
- * `core/worker-budget.ts` (1,000,000-token window, 800,000 soft handoff /
- * 900,000 hard stop), which is unchanged: context safety bounds any single
+ * `core/worker-budget.ts` (272,000-token window, 217,600 soft handoff /
+ * 244,800 hard stop): context safety bounds any single
  * message; this policy bounds cumulative spend across a delegation run —
  * turns, cumulative total tokens, and cumulative output tokens.
  *
- * Approved semantics (plan §4.2–§4.6):
+ * The current limits are Luna-specific and expressed in 272K context-window
+ * equivalents. Every profile has a substantial continuation reserve between
+ * soft and hard: soft asks the worker to finish the coherent slice and hand
+ * off; hard remains a true runaway ceiling. This replaces the historical
+ * DeepSeek-calibrated thresholds without weakening fail-closed enforcement.
  *
  *   - Per-message total tokens reuse `workerContextTokens` from
  *     `core/worker-budget.ts`: a positive `totalTokens` is authoritative;
@@ -92,6 +96,9 @@ type SpendDimensionKey = "turns" | "totalTokens" | "outputTokens";
 /** Default profile for every delegation that does not explicitly request another. */
 export const WORKER_SPEND_DEFAULT_PROFILE = "standard" as const;
 
+/** Current model-specific spend policy; persisted for diagnostics/tests. */
+export const WORKER_SPEND_POLICY_ID = "gpt-5.6-luna-xhigh-continuation-v1" as const;
+
 /**
  * Fixed child env contract (Phase 2 wiring): the runner passes the resolved
  * spend profile to the worker child through this env var, so the worker-role
@@ -112,16 +119,16 @@ export const WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE = "workbench-worker-spend-soft
  */
 export const WORKER_SPEND_LIMITS: Readonly<Record<WorkerSpendProfile, WorkerSpendLimits>> = Object.freeze({
 	low: Object.freeze({
-		soft: Object.freeze({ turns: 8, totalTokens: 750_000, outputTokens: 40_000 }),
-		hard: Object.freeze({ turns: 12, totalTokens: 1_250_000, outputTokens: 75_000 }),
+		soft: Object.freeze({ turns: 8, totalTokens: 816_000, outputTokens: 50_000 }),
+		hard: Object.freeze({ turns: 16, totalTokens: 1_632_000, outputTokens: 100_000 }),
 	}),
 	standard: Object.freeze({
-		soft: Object.freeze({ turns: 24, totalTokens: 3_000_000, outputTokens: 120_000 }),
-		hard: Object.freeze({ turns: 36, totalTokens: 5_000_000, outputTokens: 200_000 }),
+		soft: Object.freeze({ turns: 32, totalTokens: 5_440_000, outputTokens: 160_000 }),
+		hard: Object.freeze({ turns: 64, totalTokens: 10_880_000, outputTokens: 320_000 }),
 	}),
 	extended: Object.freeze({
-		soft: Object.freeze({ turns: 48, totalTokens: 8_000_000, outputTokens: 200_000 }),
-		hard: Object.freeze({ turns: 64, totalTokens: 12_000_000, outputTokens: 300_000 }),
+		soft: Object.freeze({ turns: 64, totalTokens: 10_880_000, outputTokens: 320_000 }),
+		hard: Object.freeze({ turns: 96, totalTokens: 17_408_000, outputTokens: 512_000 }),
 	}),
 });
 
@@ -311,10 +318,10 @@ export function formatWorkerSpendSteerText(state: unknown, profile: WorkerSpendP
 			: "no dimension at its soft limit";
 	return [
 		`Worker cumulative spend soft budget reached (profile ${profileName}): ${facts}.`,
-		"Stop starting new implementation work now.",
-		"Finish only the change already in flight, then write a concise handoff",
+		"The Luna continuation reserve is active; do not stop solely because the soft threshold was reached.",
+		"Stop starting unrelated work and finish the coherent change already in flight, then write a concise handoff",
 		"(## Completed / ## Files Changed / ## Verification / ## Remaining Risks).",
-		"List the remaining work explicitly for the Sol commander.",
+		"List any remaining work for a bounded follow-up delegation in the current Sol session; never ask the user to open a new Sol session.",
 	].join("\n");
 }
 
@@ -338,7 +345,7 @@ export function formatWorkerSpendHardStop(state: unknown, profile: WorkerSpendPr
 		reasons.length > 0
 			? reasons.map((reason) => `${reason} ${currentValue(s, reason)}/${limitValue(limits.hard, reason)}`).join(", ")
 			: "no dimension at its hard limit";
-	return `Worker cumulative spend hard budget reached (profile ${profileName}): ${facts}.`;
+	return `Worker cumulative spend hard budget reached (profile ${profileName}): ${facts}. Continue with a bounded follow-up delegation in the current Sol session after reviewing any partial delta; do not request a new Sol session.`;
 }
 
 /**

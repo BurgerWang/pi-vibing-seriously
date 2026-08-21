@@ -306,7 +306,7 @@ async function writeFakeWorker(
 		"const message = {",
 		"  role: 'assistant',",
 		`  content: ${content},`,
-		"  provider: 'deepseek', model: 'deepseek-v4-flash', stopReason: 'stop',",
+		"  provider: 'openai-codex', model: 'gpt-5.6-luna', stopReason: 'stop',",
 		"  usage: { input: 8, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 12, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },",
 		"};",
 		"process.stdout.write(JSON.stringify({ type: 'message_end', message }) + '\\n');",
@@ -904,7 +904,7 @@ test("public delegate source has no legacy writer or direct runner wiring", asyn
 		join(process.cwd(), "extensions", "workbench-runtime", "core", "status-commands.ts"),
 		"utf8",
 	);
-	for (const forbidden of ["createDelegationLedger", "finishDelegationLedger", "runDeepseekWorker(", "collectGitFacts(", "collectAfterFacts("]) {
+	for (const forbidden of ["createDelegationLedger", "finishDelegationLedger", "runPinnedWorker(", "collectGitFacts(", "collectAfterFacts("]) {
 		assert.equal(block.includes(forbidden), false, forbidden);
 	}
 	assert.match(block, /resolveWorkerTaskKind\(params\.task_kind\)/);

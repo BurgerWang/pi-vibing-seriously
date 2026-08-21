@@ -38,7 +38,7 @@ extensions/workbench-runtime/
 ├── schemas/quant-result.schema.json   # quant output contract (validated, never computed)
 ├── ui/tool-renderers.ts     # P4 TUI renderers (theme-colored Text components)
 ├── worker/
-│   ├── runner.ts            # short-lived pinned DeepSeek Pi child process + JSON event/usage capture
+│   ├── runner.ts            # short-lived pinned Pi worker child process + JSON event/usage capture
 │   └── path-scope.ts        # realpath/symlink enforcement for parent-approved worker writes
 └── cache/                   # P6-A prompt-cache telemetry (content-free hashes + numbers)
     ├── cache-types.ts       # record schema (1.1), usage semantics (verified api kinds)
@@ -59,7 +59,7 @@ extensions/workbench-runtime/
     ├── mode-policy.ts       # AUDIT/DEV/VERIFY tool sets; combined tool_call check
     ├── worker-policy.ts     # commander/model/role/path contract for controlled delegation;
     │                        #   Phase 3: fail-closed budget_profile validation/resolution
-    ├── worker-budget.ts     # pinned worker context budget: 1,000,000 window, 80% soft
+    ├── worker-budget.ts     # pinned worker context budget: 272,000 window, 80% soft
     │                        #   handoff / 90% hard stop, Pi-compatible context tokens
     ├── worker-spend.ts      # pinned worker cumulative delegation-spend policy (worker
     │                        #   token-budget repair; pure, no Pi imports): fixed
@@ -191,7 +191,7 @@ GPT-5.6 Sol parent in DEV
   → P7: bounded ledger created (.pi/workbench/delegations/<id>/before.json,
        manifest.json — recorded BEFORE the worker starts)
   → short-lived pi --mode json --no-session
-       --model deepseek/deepseek-v4-flash:max
+       --model openai-codex/gpt-5.6-luna:xhigh
   → child role matrix + hard guard: no recursion, no bash, no final gates
   → edit/write limited to parent-approved paths
   → worker-role lifecycle: one hidden soft-budget steer at 80%, cancel
@@ -241,8 +241,8 @@ transaction, risk, and recovery contracts.
 
 The delegate tool is static in the DEV prefix and absent from AUDIT/VERIFY.
 No worker process survives its tool call. The pinned budget policy lives in
-`core/worker-budget.ts` (pure): a 1,000,000-token window, 80% soft handoff
-(800,000), 90% hard stop (900,000) — model-specific, independent of the
+`core/worker-budget.ts` (pure): a 272,000-token window, 80% soft handoff
+(217,600), 90% hard stop (244,800) — model-specific, independent of the
 Commander/project compaction reserve. See
 [worker-delegation.md](worker-delegation.md).
 
@@ -284,7 +284,7 @@ state the final result facts derive from — the last tuple matches the
 final ledger counters, soft and hard outcomes included) plus the pinned
 provider/model identity; progress never carries text, reasons, tool
 arguments, patches, logs, or error prose. The index handler keeps the
-exact `DeepSeek worker: N turn(s), model provider/model` onUpdate prefix
+exact `Pinned worker: N turn(s), model provider/model` onUpdate prefix
 and appends the deterministic spend segment (`| spend total X | output Y |
 band B`); the details add only bounded numeric counters and the fixed band
 next to the existing identity fields. Phase 5 adds the
@@ -1458,7 +1458,7 @@ run/cache/gate/delegation artifacts or execution counts.
   include_paths-as-display-filter, coverage completion and later-change
   STALE semantics are unchanged
 - P7: worker context-budget protection — pure `core/worker-budget.ts`
-  (1,000,000-token pinned window, 80% soft handoff / 90% hard stop,
+  (272,000-token pinned window, 80% soft handoff / 90% hard stop,
   Pi-compatible context tokens), one-shot hidden soft-budget steer and
   compaction cancellation in the worker-role lifecycle only, runner
   budget/compaction tracking with fail-closed hard stop and compaction

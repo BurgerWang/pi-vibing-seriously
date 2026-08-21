@@ -186,7 +186,7 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 
 test("v0.10.0 public tool surface has the intentional canonical transition hash", () => {
 	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
-	const currentHash = "5f0f609c6e2bbd401c65e3ae4663cdba4e77659e4bc78a8325b73b1c739a7788";
+	const currentHash = "bc868199ba7482fc0ed9d7009f47df05fc577196c8968e887d9e55e544cf3929";
 	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
 	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the documented 0.10.0 hash");
 });
@@ -410,6 +410,9 @@ test("workbench_delegate_worker metadata is static and defaults to one-call deli
 		["low", "standard", "extended"],
 		"the exact closed alternatives in the fixed low|standard|extended order",
 	);
+	assert.match(budgetProfileSchema.description ?? "", /Luna xhigh cumulative spend profile/);
+	assert.match(budgetProfileSchema.description ?? "", /standard = 32\/5,440,000\/160,000 soft, 64\/10,880,000\/320,000 hard/);
+	assert.match(budgetProfileSchema.description ?? "", /current Sol session/);
 	// Phase 4A (public schema shape only): repair_of stays OPTIONAL —
 	// absent from `required` — and is an exactly-20-character string pinned
 	// to the strict delegation-id pattern ^\d{8}-\d{6}-[A-Za-z0-9]{4}$.
@@ -446,8 +449,8 @@ test("workbench_delegate_worker metadata is static and defaults to one-call deli
 	);
 	assert.equal(
 		canonicalHash(WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker),
-		"48c449d844991149e2b43b0e484a2b4dd90a6b3995fb68751d0f11ed4d88473c",
-		"current delegate parameter schema hash is machine-pinned after the additive optional task_kind transition",
+		"08d65265ec611faa6e4ec1beeb40e2b3a11ec7b26d157b182730ecbec8598a8f",
+		"current delegate parameter schema hash is machine-pinned after the Luna budget-description transition",
 	);
 });
 
@@ -645,8 +648,8 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.equal(
 		canonicalHash(workbenchToolMetadataOrdered()),
-		"3c234c3dd8eae8e466a7920cfc8b7e9e3d6f98f9ca9cf746d3e8ac090da91b44",
-		"current public catalog hash is machine-pinned after the one-call delivery transition",
+		"a82aea8825dd4e72deba118b76ee45b0f3f222a0ea5cfc41d7e25c079d650231",
+		"current public catalog hash is machine-pinned after the Luna identity and budget-description transition",
 	);
 });
 
@@ -1310,7 +1313,7 @@ test("delegate wiring uses one v2 execution path and v2-authoritative repair fal
 	assert.ok(block.indexOf(v1Fallback) < block.indexOf(execute));
 	assert.ok(block.includes('priorV2.error.code === "not_found"'), "only v2 not_found permits legacy fallback");
 	assert.ok(block.includes('["FAILED", "FINISHED", "REVIEWED"]'), "only approved committed v2 terminals are repairable");
-	for (const forbidden of ["createDelegationLedger", "finishDelegationLedger", "runDeepseekWorker("]) {
+	for (const forbidden of ["createDelegationLedger", "finishDelegationLedger", "runPinnedWorker("]) {
 		assert.equal(block.includes(forbidden), false, `${forbidden} is absent from the public v2 handler`);
 	}
 	assert.equal(block.split("controller.services.executeDelegation({").length - 1, 1, "one injected execution service owns the lifecycle");

@@ -18,7 +18,11 @@ import {
 	resolveWorkerTaskKind,
 	workerRecipeBlockReason,
 	workerRoleToolCallBlockReason,
+	WORKER_MODEL_ID,
+	WORKER_MODEL_SELECTOR,
+	WORKER_PROVIDER,
 	WORKER_ROLE,
+	WORKER_THINKING_LEVEL,
 	type WorkerTaskContract,
 } from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { isWorkerPathAllowedRealpath } from "../extensions/workbench-runtime/worker/path-scope.ts";
@@ -30,6 +34,42 @@ test("only GPT-5.6 Sol on an approved provider may command the worker", () => {
 	assert.match(commanderBlockReason("deepseek", "deepseek-v4-flash") ?? "", /requires commander/);
 	assert.match(commanderBlockReason("openai-codex", "gpt-5.6-terra") ?? "", /active model/);
 	assert.match(commanderBlockReason(undefined, undefined) ?? "", /\(none\)/);
+});
+
+test("worker identity is pinned to GPT-5.6 Luna at xhigh reasoning", () => {
+	assert.equal(WORKER_PROVIDER, "openai-codex");
+	assert.equal(WORKER_MODEL_ID, "gpt-5.6-luna");
+	assert.equal(WORKER_THINKING_LEVEL, "xhigh");
+	assert.equal(WORKER_MODEL_SELECTOR, "openai-codex/gpt-5.6-luna:xhigh");
+});
+
+test("active worker runtime is DeepSeek-free and formal stress isolates only the explicit legacy-v1 fixture", async () => {
+	const root = join(import.meta.dirname, "..");
+	const activeRuntime = [
+		"extensions/workbench-runtime/core/worker-policy.ts",
+		"extensions/workbench-runtime/core/delegation-execution-v2.ts",
+		"extensions/workbench-runtime/core/delegate-tool-controller.ts",
+		"extensions/workbench-runtime/worker/runner.ts",
+		"extensions/workbench-runtime/index.ts",
+	];
+	for (const path of activeRuntime) {
+		const source = await readFile(join(root, path), "utf8");
+		assert.doesNotMatch(source, /deepseek|deepseek-v4|runDeepseekWorker/i, `${path} must use only the current pinned-worker identity`);
+	}
+	const currentDelegateMetadata = [
+		WORKBENCH_TOOL_METADATA.workbench_delegate_worker.description,
+		WORKBENCH_TOOL_METADATA.workbench_delegate_worker.promptSnippet,
+		...WORKBENCH_TOOL_METADATA.workbench_delegate_worker.promptGuidelines,
+	].join("\n");
+	assert.doesNotMatch(currentDelegateMetadata, /deepseek|deepseek-v4/i);
+	assert.match(currentDelegateMetadata, /GPT-5\.6 Luna xhigh/);
+
+	const evidenceSource = await readFile(join(root, "scripts/context-output-evidence.ts"), "utf8");
+	assert.doesNotMatch(evidenceSource, /runDeepseekWorker/i);
+	const legacyMatches = evidenceSource.match(/deepseek(?:-v4-flash)?/gi) ?? [];
+	assert.deepEqual(legacyMatches.map((value) => value.toLowerCase()), ["deepseek", "deepseek-v4-flash"]);
+	assert.match(evidenceSource, /const LEGACY_V1_WORKER_PROVIDER = "deepseek"/);
+	assert.match(evidenceSource, /registerProvider\(\$\{JSON\.stringify\(WORKER_PROVIDER\)\}/);
 });
 
 test("worker allowed-path rules support exact files and explicit subtrees", () => {
@@ -144,7 +184,7 @@ test("strict Sol runs only mutation none/artifacts recipes; mutation source is d
 });
 
 test("delegated workers run only mutation none recipes", () => {
-	const worker = { role: WORKER_ROLE, provider: "deepseek", model: "deepseek-v4-flash" };
+	const worker = { role: WORKER_ROLE, provider: WORKER_PROVIDER, model: WORKER_MODEL_ID };
 	assert.equal(recipeMutationBlockReason(worker, "unit-test", "none"), undefined);
 	assert.match(recipeMutationBlockReason(worker, "build", "artifacts") ?? "", /workers run only mutation: none/);
 	assert.match(recipeMutationBlockReason(worker, "format", "source") ?? "", /workers run only mutation: none/);

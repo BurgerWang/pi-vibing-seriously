@@ -1,8 +1,8 @@
 /**
  * Pinned worker context-budget tests (pure module).
  *
- * Covers the model-specific budget metadata (1,000,000 context tokens, 80%
- * soft handoff at 800,000, 90% hard stop at 900,000 — independent of the
+ * Covers the model-specific budget metadata (272,000 context tokens, 80%
+ * soft handoff at 217,600, 90% hard stop at 244,800 — independent of the
  * Commander/project compaction reserve), the Pi-compatible context-token
  * calculation (positive totalTokens wins, otherwise the non-negative
  * input+output+cacheRead+cacheWrite sum), threshold boundaries, malformed
@@ -24,10 +24,10 @@ import {
 	workerContextTokens,
 } from "../extensions/workbench-runtime/core/worker-budget.ts";
 
-test("pinned worker budget metadata: 1,000,000 context, 80% soft, 90% hard", () => {
-	assert.equal(WORKER_MODEL_CONTEXT_TOKENS, 1_000_000);
-	assert.equal(WORKER_SOFT_BUDGET, 800_000);
-	assert.equal(WORKER_HARD_BUDGET, 900_000);
+test("pinned worker budget metadata: 272,000 context, 80% soft, 90% hard", () => {
+	assert.equal(WORKER_MODEL_CONTEXT_TOKENS, 272_000);
+	assert.equal(WORKER_SOFT_BUDGET, 217_600);
+	assert.equal(WORKER_HARD_BUDGET, 244_800);
 	assert.ok(WORKER_SOFT_BUDGET < WORKER_HARD_BUDGET, "soft below hard");
 	assert.ok(WORKER_HARD_BUDGET < WORKER_MODEL_CONTEXT_TOKENS, "hard below the full window");
 });
@@ -62,12 +62,12 @@ test("malformed usage contributes zero — never NaN, never throws", () => {
 	assert.equal(workerContextTokens({ input: -1, output: -1, cacheRead: -1, cacheWrite: -1 }), 0);
 });
 
-test("workerContextRatio is tokens / 1,000,000 and never NaN", () => {
+test("workerContextRatio is tokens / 272,000 and never NaN", () => {
 	assert.equal(workerContextRatio(0), 0);
 	assert.equal(workerContextRatio(WORKER_SOFT_BUDGET), 0.8);
 	assert.equal(workerContextRatio(WORKER_HARD_BUDGET), 0.9);
-	assert.equal(workerContextRatio(1_000_000), 1);
-	assert.equal(workerContextRatio(1_100_000), 1.1);
+	assert.equal(workerContextRatio(272_000), 1);
+	assert.equal(workerContextRatio(299_200), 1.1);
 	assert.equal(workerContextRatio(-1), 0);
 	assert.equal(workerContextRatio(Number.NaN), 0);
 	assert.equal(workerContextRatio(Infinity), 0);
@@ -75,12 +75,12 @@ test("workerContextRatio is tokens / 1,000,000 and never NaN", () => {
 
 test("workerBudgetBand boundaries: ok below 80%, soft at 80%, hard at 90%", () => {
 	assert.equal(workerBudgetBand(0), "ok");
-	assert.equal(workerBudgetBand(799_999), "ok");
+	assert.equal(workerBudgetBand(217_599), "ok");
 	assert.equal(workerBudgetBand(WORKER_SOFT_BUDGET), "soft");
-	assert.equal(workerBudgetBand(899_999), "soft");
+	assert.equal(workerBudgetBand(244_799), "soft");
 	assert.equal(workerBudgetBand(WORKER_HARD_BUDGET), "hard");
-	assert.equal(workerBudgetBand(900_001), "hard");
-	assert.equal(workerBudgetBand(1_000_000), "hard");
+	assert.equal(workerBudgetBand(244_801), "hard");
+	assert.equal(workerBudgetBand(272_000), "hard");
 	assert.equal(workerBudgetBand(Number.NaN), "ok");
 	assert.equal(workerBudgetBand(-1), "ok");
 });
@@ -97,16 +97,16 @@ test("soft steer message type and text instruct stop/handoff/remaining work", ()
 });
 
 test("budget summary formatter is deterministic", () => {
-	assert.equal(formatWorkerBudgetSummary(800_000, 0.8), "max context 800000 / 1000000 (80%) | soft 800000 | hard 900000");
-	assert.equal(formatWorkerBudgetSummary(0, 0), "max context 0 / 1000000 (0%) | soft 800000 | hard 900000");
-	assert.equal(formatWorkerBudgetSummary(899_999, 0.899999), "max context 899999 / 1000000 (89.9%) | soft 800000 | hard 900000");
-	assert.equal(formatWorkerBudgetSummary(812_345, 0.812345), "max context 812345 / 1000000 (81.2%) | soft 800000 | hard 900000");
-	assert.equal(formatWorkerBudgetSummary(900_000, 0.9), "max context 900000 / 1000000 (90%) | soft 800000 | hard 900000");
-	assert.equal(formatWorkerBudgetSummary(1_000_000, 1), "max context 1000000 / 1000000 (100%) | soft 800000 | hard 900000");
+	assert.equal(formatWorkerBudgetSummary(217_600, 0.8), "max context 217600 / 272000 (80%) | soft 217600 | hard 244800");
+	assert.equal(formatWorkerBudgetSummary(0, 0), "max context 0 / 272000 (0%) | soft 217600 | hard 244800");
+	assert.equal(formatWorkerBudgetSummary(244_799, 0.899996), "max context 244799 / 272000 (89.9%) | soft 217600 | hard 244800");
+	assert.equal(formatWorkerBudgetSummary(220_999, 0.812496), "max context 220999 / 272000 (81.2%) | soft 217600 | hard 244800");
+	assert.equal(formatWorkerBudgetSummary(244_800, 0.9), "max context 244800 / 272000 (90%) | soft 217600 | hard 244800");
+	assert.equal(formatWorkerBudgetSummary(272_000, 1), "max context 272000 / 272000 (100%) | soft 217600 | hard 244800");
 });
 
 test("budget summary formatter defends against malformed inputs", () => {
-	assert.equal(formatWorkerBudgetSummary(Number.NaN, Number.NaN), "max context 0 / 1000000 (0%) | soft 800000 | hard 900000");
-	assert.equal(formatWorkerBudgetSummary(-1, -1), "max context 0 / 1000000 (0%) | soft 800000 | hard 900000");
-	assert.equal(formatWorkerBudgetSummary(850_000, Number.NaN), "max context 850000 / 1000000 (85%) | soft 800000 | hard 900000");
+	assert.equal(formatWorkerBudgetSummary(Number.NaN, Number.NaN), "max context 0 / 272000 (0%) | soft 217600 | hard 244800");
+	assert.equal(formatWorkerBudgetSummary(-1, -1), "max context 0 / 272000 (0%) | soft 217600 | hard 244800");
+	assert.equal(formatWorkerBudgetSummary(231_200, Number.NaN), "max context 231200 / 272000 (85%) | soft 217600 | hard 244800");
 });

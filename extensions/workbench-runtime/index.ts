@@ -1261,7 +1261,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	// Apply exact, core-proven immutable cache boundaries only for the public
 	// OpenAI GPT-5.6 Responses path. The helper is copy-on-write and fails
 	// closed to the original payload for every unsupported/uncertain shape;
-	// Codex stays experimentally disabled and DeepSeek remains identity-exact.
+	// The provider boundary stays identity-exact for every configured worker.
 	// Telemetry records a local, nonfinal observation of the post-breakpoint
 	// payload at this extension boundary, never the pre-transform payload. The
 	// provider/SDK may still transform it; retained facts are structural hashes

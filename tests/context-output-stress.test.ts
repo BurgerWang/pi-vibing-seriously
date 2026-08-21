@@ -19,6 +19,7 @@ import {
 	HISTORY_PROJECTION_SEGMENT_MAX_TOOL_TEXT_BYTES,
 } from "../extensions/workbench-runtime/core/context-history-budget.ts";
 import { OUTPUT_HARD_CAPS, WORKER_TURN_MAX_BYTES } from "../extensions/workbench-runtime/core/output-policy.ts";
+import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtime/core/worker-policy.ts";
 
 export const CONTEXT_OUTPUT_STRESS_ARTIFACT = ".pi/workbench/runs/context-output-stress/context-output-evidence.json";
 const FORMAL_STRESS = process.env.npm_lifecycle_event === "test:context-output-stress";
@@ -55,8 +56,8 @@ async function readTelemetryRecords(projectRoot: string): Promise<Array<Record<s
 
 function isOfflineFakeTelemetryRecord(record: Record<string, unknown>): boolean {
 	const usage = record.usage as Record<string, unknown> | undefined;
-	return record.provider === "deepseek"
-		&& record.model === "deepseek-v4-flash"
+	return record.provider === WORKER_PROVIDER
+		&& record.model === WORKER_MODEL_ID
 		&& record.apiKind === "openai-completions"
 		&& usage?.input === 100
 		&& usage.output === 10

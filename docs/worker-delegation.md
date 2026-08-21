@@ -1,7 +1,7 @@
 # Controlled Worker Delegation
 
 pi-dev-workbench can delegate one bounded implementation or diagnosis task from a
-GPT-5.6 Sol commander to a pinned DeepSeek worker without introducing a
+GPT-5.6 Sol commander to a pinned GPT-5.6 Luna worker without introducing a
 standalone agent framework, daemon, queue, or background service.
 
 ## Roles
@@ -9,7 +9,7 @@ standalone agent framework, daemon, queue, or background service.
 | Role | Model | Authority |
 | --- | --- | --- |
 | Commander | `openai-codex/gpt-5.6-sol` or `openai/gpt-5.6-sol` | Direct ordinary development, requirements, cross-cutting architecture, optional delegation, high-risk decisions, final verification |
-| Worker | `deepseek/deepseek-v4-flash:max` | Routine local implementation decisions inside the approved contract: concrete design, naming, file structure within scope, production source changes, tests, docs, write-free recipe checks, in-scope repair |
+| Worker | `openai-codex/gpt-5.6-luna:xhigh` | Routine local implementation decisions inside the approved contract: concrete design, naming, file structure within scope, production source changes, tests, docs, write-free recipe checks, in-scope repair |
 
 The worker report is never acceptance evidence. Its Verification section
 records only commands and observed results; it must not label an acceptance
@@ -190,9 +190,9 @@ One invocation:
    launched, then advances it to `RUNNING` using revision-checked state
    transitions;
 5. starts one short-lived `pi --mode json -p --no-session` child process and
-   pins `--model deepseek/deepseek-v4-flash:max`;
+   pins `--model openai-codex/gpt-5.6-luna:xhigh`;
 6. streams bounded progress from Pi JSON events and verifies every assistant
-   event reports the exact pinned `deepseek/deepseek-v4-flash` identity;
+   event reports the exact pinned `openai-codex/gpt-5.6-luna` identity;
 7. tracks per-message context tokens against the pinned budget (soft
    handoff / hard stop, see below) and rejects any `compaction_start` event;
 8. accumulates the cumulative delegation-spend state after every assistant
@@ -524,7 +524,7 @@ identity. Progress never carries `lastText`, worker text, reasons, tool
 arguments, patches, logs, or error prose, and the counters are always
 finite normalized numbers (malformed usage contributes zero, never NaN).
 The compact progress text keeps the exact
-`DeepSeek worker: N turn(s), model provider/model` prefix and appends the
+`Pinned worker: N turn(s), model provider/model` prefix and appends the
 deterministic spend segment `| spend total X | output Y | band B`
 (starting state included with zero counters and band `ok`); every progress
 tuple matches the final ledger spend facts at the last event (soft and
@@ -611,8 +611,8 @@ the 131,072-byte policy without repeating the transition. A raw history that
 fits the expanded cap becomes inactive/raw, while a still-oversized history
 uses the existing deterministic checkpoint path.
 
-The 128 KiB cap is qualified only against the pinned worker's 1,000,000-token
-window, not arbitrary 64k/128k models. It is Unreleased source behavior until
+The 128 KiB cap is qualified against the pinned worker's Pi-advertised
+272,000-token window, not arbitrary 64k/128k models. It is Unreleased source behavior until
 the Pi 0.84.2 dependency tree is verified (the current tree resolves it), the
 declared gates pass, and `/reload` activates it. Only a fresh exact-correlated
 live worker cohort can establish a cache-read change.
@@ -640,7 +640,8 @@ but does not install or deploy the companion extension. Projection-state v3
 does not change the nine-field pressure wire contract and requires no companion
 code change.
 
-DeepSeek worker requests receive no OpenAI-specific breakpoint fields. The
+The `openai-codex` Luna worker receives no explicit breakpoint fields because
+Codex experimental breakpoint injection remains disabled. The
 immutable segmented shape can still increase the exact reusable prefix, but
 that is an architectural benefit rather than a measured cache-hit claim. Only
 verified provider `cacheRead` usage can establish reuse; offline fake-provider
@@ -685,14 +686,14 @@ auth/header/stream/retry behavior. Worker compaction cancellation remains
 unchanged; Commander now preflights native summary capacity and otherwise
 keeps Pi's native summarizer.
 
-The pinned worker runs on a 1,000,000-token context window. The workbench
+Pi advertises a 272,000-token context window for the pinned worker. The workbench
 protects that budget with two thresholds that are model-specific and
 independent of the Commander/project compaction reserve:
 
 | Threshold | Tokens | Behavior |
 | --- | --- | --- |
-| Soft handoff | 800,000 (80%) | The worker role sends one hidden active-loop steer (`display: false`, `deliverAs: "steer"`): stop new implementation, finish a concise handoff, list the remaining work. |
-| Hard stop | 900,000 (90%) | The runner terminates the child and the invocation fails closed. |
+| Soft handoff | 217,600 (80%) | The worker role sends one hidden active-loop steer (`display: false`, `deliverAs: "steer"`): stop new implementation, finish a concise handoff, list the remaining work. |
+| Hard stop | 244,800 (90%) | The runner terminates the child and the invocation fails closed. |
 
 Context tokens use Pi's normalized usage semantics: a positive
 `totalTokens` is authoritative; otherwise the sum of the non-negative
@@ -714,7 +715,7 @@ reasons) and any compaction attempt fails the invocation closed — even if
 the child would otherwise exit 0.
 
 The final report exposes the facts: the text appends
-`worker budget : max context N / 1000000 (P%) | soft 800000 | hard 900000`
+`worker budget : max context N / 272000 (P%) | soft 217600 | hard 244800`
 and the structured `details` carry `max_context_tokens`,
 `max_context_ratio`, `soft_budget_reached`, `hard_budget_exceeded`,
 `compaction_count`, and `compaction_reasons`.
@@ -755,9 +756,18 @@ Per-message context safety (above) is unchanged.
 
 | Profile | Soft turns | Soft total | Soft output | Hard turns | Hard total | Hard output |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `low` | 8 | 750,000 | 40,000 | 12 | 1,250,000 | 75,000 |
-| `standard` (default) | 24 | 3,000,000 | 120,000 | 36 | 5,000,000 | 200,000 |
-| `extended` (explicit) | 48 | 8,000,000 | 200,000 | 64 | 12,000,000 | 300,000 |
+| `low` | 8 | 816,000 | 50,000 | 16 | 1,632,000 | 100,000 |
+| `standard` (default) | 32 | 5,440,000 | 160,000 | 64 | 10,880,000 | 320,000 |
+| `extended` (explicit) | 64 | 10,880,000 | 320,000 | 96 | 17,408,000 | 512,000 |
+
+These are the current `gpt-5.6-luna-xhigh-continuation-v1` limits. Total-token
+thresholds are fixed multiples of Luna's Pi-advertised 272,000-token context
+window: low 3×/6×, standard 20×/40×, extended 40×/64× (soft/hard).
+The interval between soft and hard is an intentional continuation reserve:
+soft does not terminate the worker and must not direct the user to open a new
+Sol session. It asks the worker to finish the coherent change and hand back
+remaining work for a bounded follow-up delegation in the current Sol session.
+Hard remains a fail-closed runaway ceiling.
 
 - **Per-message totals** reuse the context-budget semantics: a positive
   `totalTokens` is authoritative; otherwise the non-negative
@@ -1045,7 +1055,7 @@ The tool fails rather than silently falling back when:
 - the child cannot start;
 - the pinned model is unavailable;
 - an assistant event reports another provider/model;
-- an assistant event reaches the 900,000-token (90%) hard context budget;
+- an assistant event reaches the 244,800-token (90%) hard context budget;
 - any cumulative spend dimension reaches its hard limit (turns / total
   tokens / output tokens per the active profile — `standard` by default,
   `low`/`extended` explicit opt-ins via the optional `budget_profile`

@@ -143,13 +143,13 @@ function publish(state: DelegationTransactionRecord): DelegationTransactionRecor
 	return ok(publishDelegationCommit(state, { ...cas(state, T3), proof: committedProof(state) }));
 }
 
-test("PREPARED freezes schema v2, exact contract hash, DeepSeek identity, paths, generation and revision", () => {
+test("PREPARED freezes schema v2, exact contract hash, pinned worker identity, paths, generation and revision", () => {
 	const rawPaths = ["tests/exact.test.ts", "src/**"];
 	const state = prepared("implementation", rawPaths);
 	assert.equal(state.schema_version, 2);
 	assert.equal(state.status, "PREPARED");
 	assert.equal(state.contract_hash, CONTRACT_HASH);
-	assert.deepEqual(state.worker_identity, { provider: "deepseek", model: "deepseek-v4-flash", worker_id: "worker-A" });
+	assert.deepEqual(state.worker_identity, { provider: WORKER_PROVIDER, model: WORKER_MODEL_ID, worker_id: "worker-A" });
 	assert.deepEqual(state.allowed_paths, ["src/**", "tests/exact.test.ts"]);
 	assert.deepEqual(rawPaths, ["tests/exact.test.ts", "src/**"], "prepare does not sort the caller-owned input");
 	assert.equal(state.generation, 1);

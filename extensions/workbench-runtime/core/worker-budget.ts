@@ -1,14 +1,14 @@
 /**
- * Pinned DeepSeek worker context-budget policy — pure logic, no Pi imports.
+ * Pinned GPT-5.6 Luna worker context-budget policy — pure logic, no Pi imports.
  *
- * The pinned worker model (`deepseek/deepseek-v4-flash:max`) runs on a
- * 1,000,000-token context window. The workbench protects that budget with
+ * Pi exposes the pinned worker model (`openai-codex/gpt-5.6-luna:xhigh`) with
+ * a 272,000-token context window. The workbench protects that budget with
  * two thresholds that are model-specific and completely independent of the
  * Commander/project compaction reserve:
  *
- *   - soft handoff: 800,000 tokens (80%) — the worker role sends one hidden
+ *   - soft handoff: 217,600 tokens (80%) — the worker role sends one hidden
  *     steer asking the worker to stop new implementation and hand off;
- *   - hard stop:    900,000 tokens (90%) — the runner terminates the child
+ *   - hard stop:    244,800 tokens (90%) — the runner terminates the child
  *     and any result at/above this budget fails closed.
  *
  * Context tokens follow Pi's normalized usage semantics: a positive
@@ -18,11 +18,11 @@
  */
 
 /** Pinned worker model context window (tokens). */
-export const WORKER_MODEL_CONTEXT_TOKENS = 1_000_000;
+export const WORKER_MODEL_CONTEXT_TOKENS = 272_000;
 /** 80% soft handoff threshold: one hidden steer, no failure. */
-export const WORKER_SOFT_BUDGET = 800_000;
+export const WORKER_SOFT_BUDGET = 217_600;
 /** 90% hard stop threshold: runner terminates, invocation fails closed. */
-export const WORKER_HARD_BUDGET = 900_000;
+export const WORKER_HARD_BUDGET = 244_800;
 /** customType of the hidden worker soft-budget steer message. */
 export const WORKER_SOFT_STEER_MESSAGE_TYPE = "workbench-worker-soft-steer";
 
@@ -51,7 +51,7 @@ export function workerContextTokens(usage: unknown): number {
 	);
 }
 
-/** tokens / 1,000,000 context window; malformed input maps to 0, never NaN. */
+/** tokens / pinned context window; malformed input maps to 0, never NaN. */
 export function workerContextRatio(tokens: number): number {
 	if (typeof tokens !== "number" || !Number.isFinite(tokens) || tokens < 0) return 0;
 	return tokens / WORKER_MODEL_CONTEXT_TOKENS;
@@ -59,9 +59,9 @@ export function workerContextRatio(tokens: number): number {
 
 /**
  * Budget band for a token count:
- *   "ok"   — below 800,000 (80%);
- *   "soft" — at/above 800,000 and below 900,000 (90%);
- *   "hard" — at/above 900,000.
+ *   "ok"   — below 217,600 (80%);
+ *   "soft" — at/above 217,600 and below 244,800 (90%);
+ *   "hard" — at/above 244,800.
  * Malformed input maps to "ok".
  */
 export function workerBudgetBand(tokens: number): WorkerBudgetBand {

@@ -612,8 +612,8 @@ test("hard spend failures are ledgered as failure with the spend hard flags/reas
 			worker: workerFacts({
 				status: "failure",
 				exitCode: 1,
-				errorMessage: "Worker cumulative spend hard budget reached (profile standard): turns 36/36.",
-				spendState: { turns: 36, totalTokens: 4_999_999, outputTokens: 199_999 },
+				errorMessage: "Worker cumulative spend hard budget reached (profile standard): turns 64/64.",
+				spendState: { turns: 64, totalTokens: 10_879_999, outputTokens: 319_999 },
 				spendBand: "hard",
 				spendReasons: ["turns"],
 				spendSoftReached: { turns: true, totalTokens: false, outputTokens: false },
@@ -629,9 +629,9 @@ test("hard spend failures are ledgered as failure with the spend hard flags/reas
 		assert.match(ledger.workerSummary.error_message ?? "", /hard budget reached/);
 		assert.deepEqual(ledger.workerSummary.spend, {
 			profile: "standard",
-			turns: 36,
-			totalTokens: 4_999_999,
-			outputTokens: 199_999,
+			turns: 64,
+			totalTokens: 10_879_999,
+			outputTokens: 319_999,
 			band: "hard",
 			softReached: { turns: true, totalTokens: false, outputTokens: false },
 			hardExceeded: { turns: true, totalTokens: false, outputTokens: false },

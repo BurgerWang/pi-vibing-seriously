@@ -229,8 +229,16 @@ test("governance v1 freezes schema constants, public tool input/output categorie
 		"current delegate input evolves from v1 only by appending task_kind",
 	);
 	assert.deepEqual(currentDelegate.required, v1Delegate.required, "task_kind remains optional and cannot rewrite v1 required fields");
-	const { task_kind: _taskKind, ...currentV1Properties } = currentDelegate.properties;
-	assert.equal(canonicalHash(currentV1Properties), canonicalHash(v1Delegate.properties), "all governance-v1 delegate properties stay exact");
+	const { task_kind: _taskKind, budget_profile: currentBudgetProfile, ...currentStableProperties } = currentDelegate.properties;
+	const { budget_profile: v1BudgetProfile, ...v1StableProperties } = v1Delegate.properties;
+	assert.equal(canonicalHash(currentStableProperties), canonicalHash(v1StableProperties), "non-budget governance-v1 delegate properties stay exact");
+	assert.notEqual(canonicalHash(currentBudgetProfile), canonicalHash(v1BudgetProfile), "current budget description may identify the Luna policy without rewriting the frozen v1 catalog");
+	assert.deepEqual(
+		(currentBudgetProfile as { anyOf?: Array<{ const?: unknown }> }).anyOf?.map((entry) => entry.const),
+		["low", "standard", "extended"],
+		"current budget keeps the exact closed profile enum",
+	);
+	assert.equal((currentBudgetProfile as { default?: unknown }).default, "standard");
 	const currentMetadata = WORKBENCH_TOOL_METADATA.workbench_delegate_worker;
 	const currentMetadataText = [
 		currentMetadata.description,

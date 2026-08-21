@@ -1,7 +1,7 @@
 /**
  * P7 write authority — pure decision logic, no Pi imports.
  *
- * Worker-first write authority (wired into the Pi runtime — the
+ * Development-first Sol/worker authority (wired into the Pi runtime — the
  * `tool_call` guard, the session-scoped lease state, the user-only slash
  * commands in core/lease-command.ts and the compact footer; this module
  * stays import-free and unit-testable):
@@ -10,19 +10,22 @@
  *     A delegated worker is identified ONLY by the existing
  *     WORKBENCH_AGENT_ROLE=worker environment contract; no project config
  *     can self-label any controller as Sol or as a worker.
- *   - the write policy is exactly `worker-first-strict` and applies ONLY
- *     to the approved Sol commander: GPT-5.6 Sol always resolves to it and
- *     no persisted/prompt/config value can weaken or opt out of it.
+ *   - the serialized compatibility policy id remains exactly
+ *     `worker-first-strict` and applies ONLY to the approved Sol commander;
+ *     current DEV behavior is development-first: ordinary canonical
+ *     project-relative edit/write are direct, while high-risk paths retain
+ *     the explicit user-issued lease boundary. No persisted/prompt/config
+ *     value can weaken or opt out of those boundaries.
  *     Delegated workers and other controllers are OUTSIDE this policy
  *     (policy non-applicability): the existing worker guards remain
  *     authoritative for workers, and other controllers are not newly
  *     denied by this module.
- *   - the strict Sol DEV allowlist: the exact fixed-order DEV tool matrix
- *     for commanders (no bash/edit/write, no foreign tools).
+ *   - the current Sol DEV surface is the fixed historical read/control
+ *     allowlist plus edit/write; bash and foreign tools remain absent.
  *   - the second-layer commander decision (Sol only): bash is always
- *     blocked; edit and write require a valid user-issued temporary write
- *     lease authorizing the project-relative path and the remaining call;
- *     every other tool outside the allowlist is blocked.
+ *     blocked; ordinary edit/write are direct; high-risk edit/write require
+ *     a valid user-issued temporary lease; every other tool outside the
+ *     allowlist is blocked.
  *   - temporary commander write leases: default locked, allowed reasons,
  *     project-relative exact/subtree paths (absolute POSIX, Windows drive
  *     and backslash-root paths are categorically rejected BEFORE any

@@ -2,7 +2,7 @@
  * Controlled worker-delegation policy — pure decision logic, no Pi imports.
  *
  * The parent commander must be GPT-5.6 Sol. The only worker is the pinned
- * DeepSeek V4 Flash model at max reasoning. A child worker cannot delegate,
+ * GPT-5.6 Luna model at xhigh reasoning. A child worker cannot delegate,
  * run free-form bash, or execute final validation gates. Structured edit and
  * write calls are limited to paths approved by the parent task contract.
  */
@@ -29,9 +29,10 @@ export const WORKER_TASK_KIND_DEFAULT: WorkerTaskKind = "implementation";
 
 export const COMMANDER_MODEL_ID = "gpt-5.6-sol";
 export const COMMANDER_PROVIDERS: readonly string[] = ["openai", "openai-codex"];
-export const WORKER_PROVIDER = "deepseek";
-export const WORKER_MODEL_ID = "deepseek-v4-flash";
-export const WORKER_MODEL_SELECTOR = `${WORKER_PROVIDER}/${WORKER_MODEL_ID}:max`;
+export const WORKER_PROVIDER = "openai-codex";
+export const WORKER_MODEL_ID = "gpt-5.6-luna";
+export const WORKER_THINKING_LEVEL = "xhigh";
+export const WORKER_MODEL_SELECTOR = `${WORKER_PROVIDER}/${WORKER_MODEL_ID}:${WORKER_THINKING_LEVEL}`;
 export const WORKER_HIDDEN_TOOLS: ReadonlySet<string> = new Set([
 	"bash",
 	"workbench_run_gate",

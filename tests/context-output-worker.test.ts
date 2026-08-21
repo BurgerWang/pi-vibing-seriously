@@ -37,7 +37,7 @@ import {
 import { WORKER_TURN_MAX_BYTES } from "../extensions/workbench-runtime/core/output-policy.ts";
 import {
 	assertWorkerSucceeded,
-	runDeepseekWorker,
+	runPinnedWorker,
 	type PiInvocation,
 } from "../extensions/workbench-runtime/worker/runner.ts";
 import type { WorkerTaskContract } from "../extensions/workbench-runtime/core/worker-policy.ts";
@@ -607,8 +607,8 @@ test("runner observes only fixed numeric child preflight telemetry after consecu
 			type: "message_end",
 			message: {
 				role: "assistant",
-				provider: "deepseek",
-				model: "deepseek-v4-flash",
+				provider: "openai-codex",
+				model: "gpt-5.6-luna",
 				content: [{ type: "text", text: "## Completed\nObserved bounded child preflight facts." }],
 				stopReason: "stop",
 				usage: {
@@ -621,7 +621,7 @@ test("runner observes only fixed numeric child preflight telemetry after consecu
 	const source = `process.stdout.write(${JSON.stringify(`${events.map((event) => JSON.stringify(event)).join("\n")}\n`)});`;
 	await withFakeChild(source, async (invocation, dir) => {
 		const progress: Array<Record<string, unknown>> = [];
-		const worker = await runDeepseekWorker({
+		const worker = await runPinnedWorker({
 			projectRoot: dir,
 			contract: RUNNER_CONTRACT,
 			timeoutMs: 2_000,

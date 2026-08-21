@@ -117,6 +117,21 @@ per arm). See
   reviewed, and closed as `REVIEWED` in that same call. The explicit review
   and status tools are recovery surfaces for incomplete coverage, conflict,
   or persistence failure—not a routine chain after every delegation.
+- **The current worker is Luna xhigh.** GPT-5.6 Sol owns requirements,
+  cross-cutting architecture, scope, acceptance, and final verification; the
+  optional bounded worker is pinned to
+  `openai-codex/gpt-5.6-luna:xhigh` and owns routine implementation decisions
+  only inside the approved contract. Historical DeepSeek records and cache
+  fixtures remain compatibility evidence, not an active worker selector.
+- **Cumulative spend has a continuation reserve.** The Luna-specific
+  low/standard/extended profiles use soft→hard limits of
+  `8→16 / 32→64 / 64→96` turns, `816,000→1,632,000 /
+  5,440,000→10,880,000 / 10,880,000→17,408,000` total tokens, and
+  `50,000→100,000 / 160,000→320,000 / 320,000→512,000` output tokens.
+  Soft asks for a coherent handoff and a bounded follow-up in the current Sol
+  session; hard remains a fail-closed runaway ceiling. Every profile also
+  keeps the per-message 272,000-token context guard (217,600 soft / 244,800
+  hard).
 - **Risk still escalates.** Dependency manifests, security/policy,
   deployment/migration, and Pi control paths require a user-issued temporary
   lease. Destructive actions, permissions, release authority, and final
@@ -455,10 +470,13 @@ Released v0.10.0 tested environments (only claims backed by actual runs — see
 [compatibility/pi.json](compatibility/pi.json)): Pi **0.83.0** (TUI, print,
 json modes), pi-tui 0.83.0, Node **v24.13.0**, npm **11.18.0**, CachyOS
 Linux, typebox 1.3.7, yaml 2.9.x. The Unreleased source targets Pi **0.84.2**
-and the repository dependency tree now resolves Pi/pi-tui 0.84.2. Its public
-compaction surface has been source-audited, but deployment and updated
-live/provider qualification still require the final declared gates, `/reload`,
-and fresh Commander/worker canaries.
+and the repository dependency tree now resolves Pi/pi-tui 0.84.2. The current
+worker qualification pins `openai-codex/gpt-5.6-luna:xhigh`: a private-data-free
+live availability smoke verified the exact provider/model, the formal offline
+context/output stress suite passed all 101 acceptance checks, and the current
+candidate passed 2,398 tests with zero failures (one additional test is an
+intentional skip). Deployment into another installed Pi environment still
+requires `/reload` and an environment-local Commander/worker canary.
 
 ## Development
 

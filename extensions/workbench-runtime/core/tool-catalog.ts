@@ -121,6 +121,15 @@ const WORKBENCH_DELEGATE_WORKER_V1_PROPERTIES = {
 	),
 } as const;
 
+/** Current Luna-xhigh profile description; the frozen v1 schema above stays byte-stable. */
+const WORKBENCH_DELEGATE_WORKER_CURRENT_BUDGET_PROFILE = Type.Optional(
+	Type.Union([Type.Literal("low"), Type.Literal("standard"), Type.Literal("extended")], {
+		description:
+			"Luna xhigh cumulative spend profile with a soft-to-hard continuation reserve (turns / total tokens / output tokens). low = 8/816,000/50,000 soft, 16/1,632,000/100,000 hard; standard = 32/5,440,000/160,000 soft, 64/10,880,000/320,000 hard; extended = 64/10,880,000/320,000 soft, 96/17,408,000/512,000 hard. Soft asks for a coherent handoff in the current Sol session; hard remains fail-closed. extended is explicit and never inferred.",
+		default: "standard",
+	}),
+);
+
 /** Exact governance-v1 delegate input schema retained for characterization. */
 export const WORKBENCH_DELEGATE_WORKER_V1_PARAMETERS = Type.Object(WORKBENCH_DELEGATE_WORKER_V1_PROPERTIES);
 
@@ -235,6 +244,9 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 	}),
 	workbench_delegate_worker: Type.Object({
 		...WORKBENCH_DELEGATE_WORKER_V1_PROPERTIES,
+		// Current schema supersedes only the budget description/limits. The
+		// frozen governance-v1 schema continues to use the original property.
+		budget_profile: WORKBENCH_DELEGATE_WORKER_CURRENT_BUDGET_PROFILE,
 		// S1.1 additive evolution only: governance-v1 task/bounds/budget/repair
 		// fields above remain byte-equivalent through the frozen property set.
 		// task_kind is appended and optional; runtime omission alone resolves
@@ -376,9 +388,9 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 	workbench_delegate_worker: {
 		...WORKBENCH_DELEGATE_WORKER_V1_METADATA,
 		description:
-			"Deliver one bounded development task through the committed delegation-v2 transaction. The normal implementation path executes the worker, checks the immutable ChangeSet and approved scope, performs the bounded actual-diff review, and closes the session as REVIEWED in this same call; the parent should continue development without a routine review/status chain. If the diff is too large for complete coverage, conflicts, or persistence fails, the call stays blocking and directs the parent to the explicit review recovery tool. Diagnosis is strictly read-only and closes only with zero changed paths, zero successful or denied writes, and a complete report. This default path never bypasses explicit permission, destructive-action confirmation, or final verification gates. Historical v1 ledgers remain read-only repair provenance only.",
+			"Deliver one bounded development task to the pinned GPT-5.6 Luna xhigh worker through the committed delegation-v2 transaction. The normal implementation path executes the worker, checks the immutable ChangeSet and approved scope, performs the bounded actual-diff review, and closes the session as REVIEWED in this same call; the parent should continue development without a routine review/status chain. If the diff is too large for complete coverage, conflicts, or persistence fails, the call stays blocking and directs the parent to the explicit review recovery tool. Diagnosis is strictly read-only and closes only with zero changed paths, zero successful or denied writes, and a complete report. This default path never bypasses explicit permission, destructive-action confirmation, or final verification gates. Historical v1 ledgers remain read-only repair provenance only.",
 		promptSnippet:
-			"Deliver a bounded implementation in one call with automatic diff review and session close, or run a read-only diagnosis",
+			"Deliver a bounded implementation to GPT-5.6 Luna xhigh in one call with automatic diff review and session close, or run a read-only diagnosis",
 		promptGuidelines: [
 			"Use one workbench_delegate_worker call for an ordinary bounded implementation; after a successful REVIEWED result, continue directly to the next development step without calling review or status.",
 			"Provide a concrete task, the smallest useful allowed_paths set, and observable acceptance criteria. Omit task_kind for implementation; choose diagnosis explicitly for read-only investigation.",

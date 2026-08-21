@@ -1,9 +1,18 @@
 {
-	"$comment": "Tested-environment matrix for pi-dev-workbench v0.10.0 (Context Output Control Plane). Only environments that were actually exercised are listed \u2014 no untested compatibility claims. See docs/compatibility.md for details.",
+	"$comment": "Historical v0.10.0 tested-environment matrix plus the current unreleased pinned-worker qualification. Historical DeepSeek rows are retained as evidence and are not the active worker selector. See docs/compatibility.md for details.",
 	"schema_version": 1,
 	"package": {
 		"name": "pi-dev-workbench",
 		"version": "0.10.0"
+	},
+	"current_worker": {
+		"provider": "openai-codex",
+		"model": "gpt-5.6-luna",
+		"thinking_level": "xhigh",
+		"selector": "openai-codex/gpt-5.6-luna:xhigh",
+		"pi_catalog_context_window": 272000,
+		"qualified_on": "2026-08-21",
+		"evidence": "real no-tools temporary-directory availability smoke plus runner/model-identity integration tests; no private repository content was sent in the live smoke"
 	},
 	"pi": {
 		"package": "@earendil-works/pi-coding-agent",
@@ -45,9 +54,10 @@
 		"smoke_json_mode": "pi --mode json -a -p",
 		"extension_direct_load": "tests/p5-inventory.test.ts (stub ExtensionAPI)",
 		"cache_benchmark_cli": "npm run cache:report / npm run cache:doctor (scripts/cache-benchmark.ts)",
-		"controlled_worker_smoke": "short-lived pi --mode json --no-session child; deepseek/deepseek-v4-flash:max; 2 read-only turns; verified provider/model; exit 0; git status unchanged"
+		"current_worker_availability_smoke": "pi --mode json --print --no-session --no-extensions --tools '' --model openai-codex/gpt-5.6-luna:xhigh in a temporary directory; exact response marker; verified provider/model; exit 0; no private repository content",
+		"historical_v0_10_controlled_worker_smoke": "short-lived pi --mode json --no-session child; deepseek/deepseek-v4-flash:max; 2 read-only turns; verified provider/model; exit 0; git status unchanged"
 	},
-	"provider_tested": {
+	"historical_provider_tested": {
 		"provider": "deepseek",
 		"model": "deepseek-v4-flash",
 		"api_kind": "openai-completions",

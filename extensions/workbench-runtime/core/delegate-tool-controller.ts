@@ -146,7 +146,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 						controller.persistDelegationStateStrict(recorded.state);
 						void controller.refreshStatus(ctx);
 						onUpdate?.({
-							content: [{ type: "text", text: `DeepSeek worker: 0 turn(s), model ${WORKER_MODEL_SELECTOR} | spend total 0 | output 0 | band ok` }],
+							content: [{ type: "text", text: `Pinned worker: 0 turn(s), model ${WORKER_MODEL_SELECTOR} | spend total 0 | output 0 | band ok` }],
 							details: {
 								phase: "starting",
 								delegation_id: delegationId,
@@ -161,7 +161,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					},
 					onProgress: (progress) => {
 						onUpdate?.({
-							content: [{ type: "text", text: `DeepSeek worker: ${progress.turns} turn(s), model ${progress.provider ?? WORKER_PROVIDER}/${progress.model ?? WORKER_MODEL_ID} | spend total ${progress.totalTokens} | output ${progress.outputTokens} | band ${progress.spendBand}` }],
+							content: [{ type: "text", text: `Pinned worker: ${progress.turns} turn(s), model ${progress.provider ?? WORKER_PROVIDER}/${progress.model ?? WORKER_MODEL_ID} | spend total ${progress.totalTokens} | output ${progress.outputTokens} | band ${progress.spendBand}` }],
 							details: {
 								phase: "running",
 								turns: progress.turns,

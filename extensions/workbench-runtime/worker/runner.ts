@@ -1,5 +1,5 @@
 /**
- * Short-lived DeepSeek worker process runner.
+ * Short-lived pinned worker process runner.
  *
  * This is not a daemon or a second framework: one tool invocation spawns one
  * isolated `pi --mode json --no-session` process, consumes its structured
@@ -194,11 +194,11 @@ export interface WorkerRunResult {
 	 * calculation — see core/worker-budget.ts); 0 when no assistant usage.
 	 */
 	maxContextTokens: number;
-	/** maxContextTokens / 1,000,000 (the pinned worker context window). */
+	/** maxContextTokens / 272,000 (the Pi-advertised pinned worker context window). */
 	maxContextRatio: number;
-	/** True when any message reached the 800k (80%) soft handoff threshold. */
+	/** True when any message reached the 217,600 (80%) soft handoff threshold. */
 	softBudgetReached: boolean;
-	/** True when any message reached the 900k (90%) hard stop threshold. */
+	/** True when any message reached the 244,800 (90%) hard stop threshold. */
 	hardBudgetExceeded: boolean;
 	/** Number of compaction_start events observed from the child. */
 	compactionCount: number;
@@ -565,10 +565,10 @@ function workerFailureReason(result: WorkerRunResult): string | undefined {
 	// the child's eventual exit code: a worker must never silently continue
 	// through lossy compaction or past the pinned 90% hard budget.
 	if (result.compactionCount > 0) {
-		return `DeepSeek worker attempted context compaction (${result.compactionReasons.join(", ") || "unknown reason"}) — fail closed`;
+		return `Pinned worker attempted context compaction (${result.compactionReasons.join(", ") || "unknown reason"}) — fail closed`;
 	}
 	if (result.hardBudgetExceeded) {
-		return `DeepSeek worker exceeded the ${WORKER_HARD_BUDGET}-token hard context budget — fail closed`;
+		return `Pinned worker exceeded the ${WORKER_HARD_BUDGET}-token hard context budget — fail closed`;
 	}
 	// Phase 2 cumulative spend hard stop: any hard spend dimension reached
 	// fails closed regardless of the child's eventual exit code, and the
@@ -584,18 +584,18 @@ function workerFailureReason(result: WorkerRunResult): string | undefined {
 		return formatWorkerSpendHardStop(result.spendState, result.spendProfile);
 	}
 	if (result.modelMismatch) return result.modelMismatch;
-	if (result.aborted) return "DeepSeek worker was aborted";
-	if (result.timedOut) return "DeepSeek worker timed out";
+	if (result.aborted) return "Pinned worker was aborted";
+	if (result.timedOut) return "Pinned worker timed out";
 	if (result.exitCode !== 0) {
-		return result.errorMessage ?? `DeepSeek worker exited with code ${result.exitCode}${result.stderr ? `: ${result.stderr}` : ""}`;
+		return result.errorMessage ?? `Pinned worker exited with code ${result.exitCode}${result.stderr ? `: ${result.stderr}` : ""}`;
 	}
 	if (result.stopReason === "error" || result.stopReason === "aborted") {
-		return result.errorMessage ?? `DeepSeek worker stopped with ${result.stopReason}`;
+		return result.errorMessage ?? `Pinned worker stopped with ${result.stopReason}`;
 	}
 	if (result.provider !== WORKER_PROVIDER || result.model !== WORKER_MODEL_ID) {
-		return `DeepSeek worker produced no verified ${WORKER_PROVIDER}/${WORKER_MODEL_ID} assistant response`;
+		return `Pinned worker produced no verified ${WORKER_PROVIDER}/${WORKER_MODEL_ID} assistant response`;
 	}
-	if (!result.output) return "DeepSeek worker produced no final text output";
+	if (!result.output) return "Pinned worker produced no final text output";
 	return undefined;
 }
 
@@ -604,7 +604,7 @@ export function assertWorkerSucceeded(result: WorkerRunResult): void {
 	if (reason) throw new Error(reason);
 }
 
-export async function runDeepseekWorker(options: RunWorkerOptions): Promise<WorkerRunResult> {
+export async function runPinnedWorker(options: RunWorkerOptions): Promise<WorkerRunResult> {
 	const runtimeIdentity = checkedRuntimeIdentity(options.runtimeIdentity);
 	if (runtimeIdentity === false) throw new Error("Worker runtime identity is invalid");
 	const taskKindResult = resolveWorkerTaskKind(options.contract.taskKind);
@@ -739,7 +739,7 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 					const reason = event.reason === "manual" || event.reason === "threshold" || event.reason === "overflow" ? event.reason : "unknown";
 					result.compactionCount += 1;
 					if (!result.compactionReasons.includes(reason)) result.compactionReasons.push(reason);
-					result.errorMessage = `DeepSeek worker attempted context compaction (${reason}) — fail closed`;
+					result.errorMessage = `Pinned worker attempted context compaction (${reason}) — fail closed`;
 					terminate("error");
 					return;
 				}
@@ -764,7 +764,7 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 				if (budgetBand !== "ok") result.softBudgetReached = true;
 				if (budgetBand === "hard") {
 					result.hardBudgetExceeded = true;
-					result.errorMessage = `DeepSeek worker exceeded the ${WORKER_HARD_BUDGET}-token hard context budget — fail closed`;
+					result.errorMessage = `Pinned worker exceeded the ${WORKER_HARD_BUDGET}-token hard context budget — fail closed`;
 					terminate("error");
 				}
 				// Phase 2 cumulative spend accounting (independent of the per-message
@@ -845,7 +845,7 @@ export async function runDeepseekWorker(options: RunWorkerOptions): Promise<Work
 				}
 			});
 			child.on("error", (error) => {
-				result.errorMessage = `Failed to spawn DeepSeek worker: ${error.message}`;
+				result.errorMessage = `Failed to spawn pinned worker: ${error.message}`;
 				result.exitCode = 1;
 				finish();
 			});

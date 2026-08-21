@@ -8,7 +8,7 @@ import { buildDelegateWorkerResult, MAX_WORKER_REPORT_BYTES, parsedReportToHando
 import {
 	assertWorkerSucceeded,
 	formatWorkerCacheSummary,
-	runDeepseekWorker,
+	runPinnedWorker,
 	workerCacheHitRatio,
 	WORKER_DIAGNOSIS_SYSTEM_PROMPT,
 	WORKER_SYSTEM_PROMPT,
@@ -18,6 +18,9 @@ import {
 import {
 	WORKER_CONTRACT_HASH_ENV,
 	WORKER_DELEGATION_ID_ENV,
+	WORKER_MODEL_ID,
+	WORKER_MODEL_SELECTOR,
+	WORKER_PROVIDER,
 	WORKER_TASK_KIND_ENV,
 	type WorkerTaskContract,
 } from "../extensions/workbench-runtime/core/worker-policy.ts";
@@ -54,8 +57,8 @@ function assistantEvent(overrides: Record<string, unknown> = {}): string {
 		type: "message_end",
 		message: {
 			role: "assistant",
-			provider: "deepseek",
-			model: "deepseek-v4-flash",
+			provider: WORKER_PROVIDER,
+			model: WORKER_MODEL_ID,
 			content: [{ type: "text", text: "## Completed\nImplemented." }],
 			stopReason: "stop",
 			usage: {
@@ -87,7 +90,7 @@ test("runner consumes JSON events, pins model identity, and aggregates usage", a
 	const final = assistantEvent();
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${first}\nnot-json\n${final}\n`)});`, async (invocation, dir) => {
 		const progress: number[] = [];
-		const result = await runDeepseekWorker({
+		const result = await runPinnedWorker({
 			projectRoot: dir,
 			contract: CONTRACT,
 			timeoutMs: 2_000,
@@ -96,8 +99,8 @@ test("runner consumes JSON events, pins model identity, and aggregates usage", a
 		});
 		assertWorkerSucceeded(result);
 		assert.equal(result.exitCode, 0);
-		assert.equal(result.provider, "deepseek");
-		assert.equal(result.model, "deepseek-v4-flash");
+		assert.equal(result.provider, WORKER_PROVIDER);
+		assert.equal(result.model, WORKER_MODEL_ID);
 		assert.equal(result.turns, 2);
 		assert.match(result.output, /Implemented/);
 		assert.equal(result.usage.input, 20);
@@ -138,7 +141,7 @@ test("runner observes exact worker journal begin and complete entries without re
 	});
 	const final = assistantEvent();
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${begin}\n${complete}\n${final}\n`)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assertWorkerSucceeded(result);
 		assert.deepEqual(result.writeJournalObservation, {
 			state: "complete", tool: "edit", outcome: "succeeded", code: "none", revision: 2,
@@ -169,7 +172,7 @@ test("runner makes explicit journal failures and malformed matching entries stic
 	});
 	const final = assistantEvent();
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${failure}\n${laterValid}\n${final}\n`)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assertWorkerSucceeded(result);
 		assert.deepEqual(result.writeJournalObservation, {
 			state: "failed", tool: "write", outcome: "none", code: "journal_read_failed", revision: 0,
@@ -187,7 +190,7 @@ test("runner makes explicit journal failures and malformed matching entries stic
 		privatePath: "PRIVATE_WORKER_PATH",
 	});
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${malformed}\n${final}\n`)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assertWorkerSucceeded(result);
 		assert.deepEqual(result.writeJournalObservation, {
 			state: "failed", tool: "none", outcome: "none", code: "invalid", revision: 0,
@@ -314,18 +317,18 @@ test("worker system prompt pins the three mandatory execution disciplines (early
 	assert.match(WORKER_SYSTEM_PROMPT, /## Completed\n## Files Changed\n## Verification\n## Remaining Risks/);
 });
 
-test("runner pins max model selector and passes a non-recursive worker role contract", async () => {
+test("runner pins xhigh model selector and passes a non-recursive worker role contract", async () => {
 	const script = `
 const facts = JSON.stringify({ argv: process.argv.slice(2), role: process.env.WORKBENCH_AGENT_ROLE, depth: process.env.WORKBENCH_WORKER_DEPTH, paths: JSON.parse(process.env.WORKBENCH_WORKER_ALLOWED_PATHS || "[]"), taskKind: process.env.${WORKER_TASK_KIND_ENV} || null, inheritedModel: process.env.PI_MODEL || null, spendProfile: process.env.${WORKER_SPEND_PROFILE_ENV} || null });
-console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "deepseek", model: "deepseek-v4-flash", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "openai-codex", model: "gpt-5.6-luna", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
 `;
 	await withFakeWorker(script, async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assertWorkerSucceeded(result);
 		const facts = JSON.parse(result.output) as { argv: string[]; role: string; depth: string; paths: string[]; taskKind: string | null; inheritedModel: string | null; spendProfile: string | null };
 		const modelFlag = facts.argv.indexOf("--model");
 		assert.ok(modelFlag >= 0);
-		assert.equal(facts.argv[modelFlag + 1], "deepseek/deepseek-v4-flash:max");
+		assert.equal(facts.argv[modelFlag + 1], WORKER_MODEL_SELECTOR);
 		assert.ok(facts.argv.includes("--no-session"), "every worker invocation is ephemeral and cannot resume prior context");
 		assert.equal(facts.role, "worker");
 		assert.equal(facts.depth, "1");
@@ -345,10 +348,10 @@ test("runner passes an exact validated delegation-v2 runtime identity to the chi
 	const contractHash = "a".repeat(64);
 	const script = `
 const facts = JSON.stringify({ delegationId: process.env.${WORKER_DELEGATION_ID_ENV} || null, contractHash: process.env.${WORKER_CONTRACT_HASH_ENV} || null });
-console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "deepseek", model: "deepseek-v4-flash", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "openai-codex", model: "gpt-5.6-luna", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
 `;
 	await withFakeWorker(script, async (invocation, dir) => {
-		const result = await runDeepseekWorker({
+		const result = await runPinnedWorker({
 			projectRoot: dir,
 			contract: CONTRACT,
 			timeoutMs: 2_000,
@@ -368,10 +371,10 @@ test("legacy runner calls strip hostile inherited runtime identity values", asyn
 	try {
 		const script = `
 const facts = JSON.stringify({ delegationId: process.env.${WORKER_DELEGATION_ID_ENV} || null, contractHash: process.env.${WORKER_CONTRACT_HASH_ENV} || null });
-console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "deepseek", model: "deepseek-v4-flash", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "openai-codex", model: "gpt-5.6-luna", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
 `;
 		await withFakeWorker(script, async (invocation, dir) => {
-			const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 			assertWorkerSucceeded(result);
 			assert.deepEqual(JSON.parse(result.output), { delegationId: null, contractHash: null });
 		});
@@ -392,7 +395,7 @@ test("malformed runtime identity is rejected before child spawn without echoing 
 	];
 	for (const runtimeIdentity of cases) {
 		await assert.rejects(
-			runDeepseekWorker({
+			runPinnedWorker({
 				projectRoot: "/tmp",
 				contract: CONTRACT,
 				timeoutMs: 2_000,
@@ -410,10 +413,10 @@ import { readFileSync } from "node:fs";
 const argv = process.argv.slice(2);
 const promptFlag = argv.indexOf("--append-system-prompt");
 const facts = JSON.stringify({ argv, taskKind: process.env.${WORKER_TASK_KIND_ENV} || null, prompt: readFileSync(argv[promptFlag + 1], "utf8") });
-console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "deepseek", model: "deepseek-v4-flash", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "openai-codex", model: "gpt-5.6-luna", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
 `;
 	await withFakeWorker(script, async (invocation, dir) => {
-		const result = await runDeepseekWorker({
+		const result = await runPinnedWorker({
 			projectRoot: dir,
 			contract: { ...CONTRACT, taskKind: "diagnosis" },
 			timeoutMs: 2_000,
@@ -453,7 +456,7 @@ test("diagnosis counts structured edit/write attempts by stable id and fails mal
 		],
 	});
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${first}\n${second}\n`)});`, async (invocation, dir) => {
-		const diagnosis = await runDeepseekWorker({
+		const diagnosis = await runPinnedWorker({
 			projectRoot: dir,
 			contract: { ...CONTRACT, taskKind: "diagnosis" },
 			timeoutMs: 2_000,
@@ -462,14 +465,14 @@ test("diagnosis counts structured edit/write attempts by stable id and fails mal
 		assert.equal(diagnosis.deniedWriteCount, 4, "two valid ids plus fixed malformed edit/write sentinels");
 	});
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${first}\n${second}\n`)});`, async (invocation, dir) => {
-		const implementation = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const implementation = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assert.equal(implementation.deniedWriteCount, 0, "implementation does not classify its allowed write calls as denied");
 	});
 });
 
 test("runner rejects malformed task kinds before spawning", async () => {
 	await assert.rejects(
-		runDeepseekWorker({
+		runPinnedWorker({
 			projectRoot: "/tmp",
 			contract: { ...CONTRACT, taskKind: "mechanical" as never },
 			timeoutMs: 2_000,
@@ -482,10 +485,10 @@ test("runner rejects malformed task kinds before spawning", async () => {
 test("runner passes an explicit spend profile to the child env and records it on the result", async () => {
 	const script = `
 const facts = JSON.stringify({ spendProfile: process.env.${WORKER_SPEND_PROFILE_ENV} || null });
-console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "deepseek", model: "deepseek-v4-flash", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "openai-codex", model: "gpt-5.6-luna", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
 `;
 	await withFakeWorker(script, async (invocation, dir) => {
-		const result = await runDeepseekWorker({
+		const result = await runPinnedWorker({
 			projectRoot: dir,
 			contract: CONTRACT,
 			timeoutMs: 2_000,
@@ -502,7 +505,7 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 test("the contract budget profile and the runner spendProfile option are one resolved low profile — env, result, and task text all agree", async () => {
 	const script = `
 const facts = JSON.stringify({ spendProfile: process.env.${WORKER_SPEND_PROFILE_ENV} || null, argv: process.argv.slice(2) });
-console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "deepseek", model: "deepseek-v4-flash", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "openai-codex", model: "gpt-5.6-luna", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
 `;
 	await withFakeWorker(script, async (invocation, dir) => {
 		// Production invariant: the index handler resolves the budget profile
@@ -510,7 +513,7 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 		// task-text source) and the runner option (enforcement source) — the
 		// two can never disagree. This test pins that consistency on an
 		// explicit `low` profile.
-		const result = await runDeepseekWorker({
+		const result = await runPinnedWorker({
 			projectRoot: dir,
 			contract: { ...CONTRACT, budgetProfile: "low" },
 			timeoutMs: 2_000,
@@ -536,7 +539,7 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 
 test("runner rejects an oversized task contract before spawning", async () => {
 	await assert.rejects(
-		runDeepseekWorker({
+		runPinnedWorker({
 			projectRoot: process.cwd(),
 			contract: { ...CONTRACT, task: "x".repeat(70 * 1024) },
 			timeoutMs: 2_000,
@@ -549,15 +552,15 @@ test("runner rejects an oversized task contract before spawning", async () => {
 test("runner fails closed on model drift", async () => {
 	const drift = assistantEvent({ provider: "openai-codex", model: "gpt-5.6-sol" });
 	await withFakeWorker(`console.log(${JSON.stringify(drift)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
-		assert.match(result.modelMismatch ?? "", /expected deepseek\/deepseek-v4-flash/);
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		assert.match(result.modelMismatch ?? "", /expected openai-codex\/gpt-5\.6-luna/);
 		assert.throws(() => assertWorkerSucceeded(result), /Worker model drift/);
 	});
 });
 
 test("runner preserves bounded stderr and non-zero exit failures", async () => {
 	await withFakeWorker('process.stderr.write("provider unavailable\\n"); process.exit(7);', async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assert.equal(result.exitCode, 7);
 		assert.match(result.stderr, /provider unavailable/);
 		assert.throws(() => assertWorkerSucceeded(result), /exited with code 7/);
@@ -579,7 +582,7 @@ test("runner reports null cacheHitRatio when the worker reports no input at all"
 		usage: { input: 0, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 5, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 	});
 	await withFakeWorker(`console.log(${JSON.stringify(zero)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assertWorkerSucceeded(result);
 		assert.equal(result.cacheHitRatio, null);
 		assert.equal(formatWorkerCacheSummary(result.usage), "uncached input 0 | cache read 0 | hit ratio N/A");
@@ -588,7 +591,7 @@ test("runner reports null cacheHitRatio when the worker reports no input at all"
 
 test("runner timeout terminates the child and reports timeout honestly", async () => {
 	await withFakeWorker("setInterval(() => {}, 1000);", async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 50, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 50, invocation });
 		assert.equal(result.timedOut, true);
 		assert.throws(() => assertWorkerSucceeded(result), /timed out/);
 	});
@@ -598,7 +601,7 @@ test("runner propagates AbortSignal to the child", async () => {
 	await withFakeWorker("setInterval(() => {}, 1000);", async (invocation, dir) => {
 		const controller = new AbortController();
 		setTimeout(() => controller.abort(), 50);
-		const result = await runDeepseekWorker({
+		const result = await runPinnedWorker({
 			projectRoot: dir,
 			contract: CONTRACT,
 			timeoutMs: 2_000,
@@ -613,8 +616,8 @@ test("runner propagates AbortSignal to the child", async () => {
 function workerResult(overrides: Partial<WorkerRunResult> = {}): WorkerRunResult {
 	return {
 		exitCode: 0,
-		provider: "deepseek",
-		model: "deepseek-v4-flash",
+		provider: WORKER_PROVIDER,
+		model: WORKER_MODEL_ID,
 		turns: 1,
 		stopReason: "stop",
 		output: "## Completed\nImplemented.",
@@ -683,8 +686,8 @@ const HANDOFF_REPORT = [
 function handoffInput(overrides: Partial<BuildDelegateWorkerResultInput> = {}): BuildDelegateWorkerResultInput {
 	return {
 		delegationId: "20260601-120000-abcd",
-		provider: "deepseek",
-		model: "deepseek-v4-flash",
+		provider: WORKER_PROVIDER,
+		model: WORKER_MODEL_ID,
 		status: "success",
 		turns: 1,
 		exitCode: 0,
@@ -751,12 +754,12 @@ test("delegated worker zero-denominator usage renders N/A and null", () => {
 // ---------------------------------------------------------------------------
 
 test("runner tracks max per-message context tokens/ratio and soft-budget reach", async () => {
-	const first = assistantEvent({ usage: usageWith(400_000) });
-	const soft = assistantEvent({ usage: usageWith(810_000) });
+	const first = assistantEvent({ usage: usageWith(100_000) });
+	const soft = assistantEvent({ usage: usageWith(220_320) });
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${first}\n${soft}\n`)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assertWorkerSucceeded(result); // soft budget is a steer, not a failure
-		assert.equal(result.maxContextTokens, 810_000, "max over per-message tokens");
+		assert.equal(result.maxContextTokens, 220_320, "max over per-message tokens");
 		assert.equal(result.maxContextRatio, 0.81);
 		assert.equal(result.softBudgetReached, true);
 		assert.equal(result.hardBudgetExceeded, false);
@@ -765,35 +768,35 @@ test("runner tracks max per-message context tokens/ratio and soft-budget reach",
 	});
 });
 
-test("runner boundary: 799,999 stays under the soft budget, 899,999 is soft only", async () => {
-	const under = assistantEvent({ usage: usageWith(799_999) });
+test("runner boundary: 217,599 stays under the soft budget, 244,799 is soft only", async () => {
+	const under = assistantEvent({ usage: usageWith(217_599) });
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${under}\n`)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assertWorkerSucceeded(result);
 		assert.equal(result.softBudgetReached, false);
 		assert.equal(result.hardBudgetExceeded, false);
 	});
-	const near = assistantEvent({ usage: usageWith(899_999) });
+	const near = assistantEvent({ usage: usageWith(244_799) });
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${near}\n`)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assertWorkerSucceeded(result);
 		assert.equal(result.softBudgetReached, true);
 		assert.equal(result.hardBudgetExceeded, false);
-		assert.equal(result.maxContextTokens, 899_999);
-		assert.equal(result.maxContextRatio, 0.899999);
+		assert.equal(result.maxContextTokens, 244_799);
+		assert.equal(result.maxContextRatio, 244_799 / 272_000);
 	});
 });
 
-test("runner terminates fail-closed at the 900,000-token hard budget", async () => {
-	const hard = assistantEvent({ usage: usageWith(900_000) });
+test("runner terminates fail-closed at the 244,800-token hard budget", async () => {
+	const hard = assistantEvent({ usage: usageWith(244_800) });
 	// Stay alive after emitting the event so the runner's termination is what
 	// tears the child down (deterministic close with a non-zero exit).
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${hard}\n`)}); setInterval(() => {}, 1000);`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assert.equal(result.hardBudgetExceeded, true);
 		assert.equal(result.softBudgetReached, true, "passing the hard stop implies the soft threshold was reached");
 		assert.equal(result.exitCode, 1, "child terminated by the runner");
-		assert.match(result.errorMessage ?? "", /900000-token hard context budget/);
+		assert.match(result.errorMessage ?? "", /244800-token hard context budget/);
 		assert.throws(() => assertWorkerSucceeded(result), /hard context budget/);
 	});
 });
@@ -805,7 +808,7 @@ test("runner rejects any result with a compaction attempt and counts reasons", a
 	await withFakeWorker(
 		`process.stdout.write(${JSON.stringify(`${threshold}\n${overflow}\n${threshold}\n${final}\n`)});`,
 		async (invocation, dir) => {
-			const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 			assert.equal(result.compactionCount, 3);
 			assert.deepEqual(result.compactionReasons, ["threshold", "overflow"], "distinct reasons in arrival order");
 			assert.match(result.errorMessage ?? "", /attempted context compaction/);
@@ -818,7 +821,7 @@ test("runner fails closed on a compaction attempt even when the child exits 0", 
 	const threshold = JSON.stringify({ type: "compaction_start", reason: "threshold" });
 	const final = assistantEvent();
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${threshold}\n${final}\n`)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assert.equal(result.compactionCount, 1);
 		assert.equal(result.hardBudgetExceeded, false);
 		assert.throws(() => assertWorkerSucceeded(result), /attempted context compaction \(threshold\)/);
@@ -830,10 +833,10 @@ test("runner budget tracking ignores malformed usage defensively", async () => {
 		usage: { input: -1, output: "x", cacheRead: Infinity, cacheWrite: 5, totalTokens: -3, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 	});
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${bad}\n`)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assertWorkerSucceeded(result);
 		assert.equal(result.maxContextTokens, 5, "fallback sums only the non-negative components");
-		assert.equal(result.maxContextRatio, 0.000005);
+		assert.equal(result.maxContextRatio, 5 / 272_000);
 		assert.equal(result.softBudgetReached, false);
 		assert.equal(result.hardBudgetExceeded, false);
 		// Phase 2: malformed usage contributes zero tokens to the cumulative
@@ -852,7 +855,7 @@ test("runner spend: cacheRead counts through the spend policy when totalTokens i
 		usage: { input: 10, output: 5, cacheRead: 20, cacheWrite: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 	});
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${noTotal}\n`)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assertWorkerSucceeded(result);
 		assert.deepEqual(result.spendState, { turns: 1, totalTokens: 35, outputTokens: 5 }, "cacheRead counts in the fallback sum");
 	});
@@ -864,30 +867,32 @@ test("runner spend: cacheRead counts through the spend policy when totalTokens i
 // ---------------------------------------------------------------------------
 
 test("runner spend: exact soft boundaries never fail (turns/total/output)", async () => {
-	// Standard soft turns = 24 exactly: band soft, still succeeds.
-	const turnsSoft = Array.from({ length: 24 }, () => assistantEvent()).join("\n");
+	// Luna standard soft turns = 32 exactly: band soft, still succeeds.
+	const turnsSoft = Array.from({ length: 32 }, () => assistantEvent()).join("\n");
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${turnsSoft}\n`)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assertWorkerSucceeded(result);
 		assert.equal(result.spendBand, "soft");
 		assert.deepEqual(result.spendReasons, ["turns"]);
 		assert.deepEqual(result.spendSoftReached, { turns: true, totalTokens: false, outputTokens: false });
 		assert.deepEqual(result.spendHardExceeded, { turns: false, totalTokens: false, outputTokens: false });
 	});
-	// Standard soft total = 3,000,000 exactly (5 x 600,000, per-message below
-	// the 800k context soft threshold so context safety stays quiet).
-	const totalSoft = Array.from({ length: 5 }, () => assistantEvent({ usage: usageWith(600_000) })).join("\n");
+	// Standard soft total = 5,440,000 exactly while turns remain below their
+	// independent soft boundary: 30 x 180,000 + 40,000 = 5,440,000.
+	const totalSoft = [...Array.from({ length: 30 }, () => 180_000), 40_000]
+		.map((tokens) => assistantEvent({ usage: usageWith(tokens) }))
+		.join("\n");
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${totalSoft}\n`)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assertWorkerSucceeded(result);
 		assert.equal(result.spendBand, "soft");
 		assert.deepEqual(result.spendReasons, ["total_tokens"]);
 		assert.equal(result.spendHardExceeded.totalTokens, false);
 	});
-	// Standard soft output = 120,000 exactly (4 x 30,000 output).
-	const outputSoft = Array.from({ length: 4 }, () => assistantEvent({ usage: usageWith(30_030, { output: 30_000 }) })).join("\n");
+	// Standard soft output = 160,000 exactly (4 x 40,000 output).
+	const outputSoft = Array.from({ length: 4 }, () => assistantEvent({ usage: usageWith(40_030, { output: 40_000 }) })).join("\n");
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${outputSoft}\n`)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assertWorkerSucceeded(result);
 		assert.equal(result.spendBand, "soft");
 		assert.deepEqual(result.spendReasons, ["output_tokens"]);
@@ -895,160 +900,154 @@ test("runner spend: exact soft boundaries never fail (turns/total/output)", asyn
 	});
 });
 
-test("runner spend: hard turns boundary at exactly 36 terminates fail-closed; 35 stays soft", async () => {
-	const thirtyFive = Array.from({ length: 35 }, () => assistantEvent()).join("\n");
-	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${thirtyFive}\n`)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+test("runner spend: Luna continuation reserve runs from soft 32 through hard 64", async () => {
+	const sixtyThree = Array.from({ length: 63 }, () => assistantEvent()).join("\n");
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${sixtyThree}\n`)});`, async (invocation, dir) => {
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assertWorkerSucceeded(result);
 		assert.equal(result.spendBand, "soft");
 		assert.deepEqual(result.spendReasons, ["turns"]);
 	});
-	const thirtySix = Array.from({ length: 36 }, () => assistantEvent()).join("\n");
+	const sixtyFour = Array.from({ length: 64 }, () => assistantEvent()).join("\n");
 	await withFakeWorker(
-		`process.stdout.write(${JSON.stringify(`${thirtySix}\n`)}); setInterval(() => {}, 1000);`,
+		`process.stdout.write(${JSON.stringify(`${sixtyFour}\n`)}); setInterval(() => {}, 1000);`,
 		async (invocation, dir) => {
-			const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 			assert.equal(result.exitCode, 1, "child terminated by the runner at the exact hard turns boundary");
 			assert.equal(result.spendBand, "hard");
 			assert.deepEqual(result.spendReasons, ["turns"]);
 			assert.equal(result.spendHardExceeded.turns, true);
-			assert.match(result.errorMessage ?? "", /turns 36\/36/);
-			assert.throws(() => assertWorkerSucceeded(result), /Worker cumulative spend hard budget reached \(profile standard\): turns 36\/36/);
+			assert.match(result.errorMessage ?? "", /turns 64\/64/);
+			assert.match(result.errorMessage ?? "", /current Sol session/);
+			assert.throws(() => assertWorkerSucceeded(result), /Worker cumulative spend hard budget reached \(profile standard\): turns 64\/64/);
 		},
 	);
 });
 
-test("runner spend: hard total boundary at exactly 5,000,000; one below stays soft", async () => {
-	// 9 x 500,000 + 499,999 = 4,999,999: at/above the soft total (3,000,000),
+test("runner spend: hard total boundary at exactly 10,880,000; one below stays soft", async () => {
+	// 54 x 200,000 + 79,999 = 10,879,999: at/above soft total,
 	// one below the hard total — soft, no failure.
-	const below = [...Array.from({ length: 9 }, () => 500_000), 499_999].map((t) => assistantEvent({ usage: usageWith(t) })).join("\n");
+	const below = [...Array.from({ length: 54 }, () => 200_000), 79_999].map((t) => assistantEvent({ usage: usageWith(t) })).join("\n");
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${below}\n`)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assertWorkerSucceeded(result);
 		assert.equal(result.spendBand, "soft");
-		assert.deepEqual(result.spendReasons, ["total_tokens"]);
+		assert.deepEqual(result.spendReasons, ["turns", "total_tokens"]);
 		assert.equal(result.spendHardExceeded.totalTokens, false);
 	});
-	// 10 x 500,000 = 5,000,000 exactly: hard total reached (`>=` semantics).
-	const exact = Array.from({ length: 10 }, () => assistantEvent({ usage: usageWith(500_000) })).join("\n");
+	// 54 x 200,000 + 80,000 = 10,880,000 exactly: hard total reached.
+	const exact = [...Array.from({ length: 54 }, () => 200_000), 80_000].map((t) => assistantEvent({ usage: usageWith(t) })).join("\n");
 	await withFakeWorker(
 		`process.stdout.write(${JSON.stringify(`${exact}\n`)}); setInterval(() => {}, 1000);`,
 		async (invocation, dir) => {
-			const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 			assert.equal(result.exitCode, 1, "child terminated by the runner at the exact hard total boundary");
 			assert.equal(result.spendBand, "hard");
 			assert.deepEqual(result.spendReasons, ["total_tokens"]);
 			assert.equal(result.spendHardExceeded.totalTokens, true);
-			assert.match(result.errorMessage ?? "", /total_tokens 5000000\/5000000/);
-			assert.throws(() => assertWorkerSucceeded(result), /total_tokens 5000000\/5000000/);
+			assert.match(result.errorMessage ?? "", /total_tokens 10880000\/10880000/);
+			assert.throws(() => assertWorkerSucceeded(result), /total_tokens 10880000\/10880000/);
 		},
 	);
 });
 
-test("runner spend: hard output boundary at exactly 200,000; one below stays soft", async () => {
-	// 2 x 99,999 output = 199,998: at/above soft output (120,000), one below
-	// the hard output (200,000) — soft, no failure.
-	const below = [99_999, 99_999].map((o) => assistantEvent({ usage: usageWith(100_030, { output: o }) })).join("\n");
+test("runner spend: hard output boundary at exactly 320,000; one below stays soft", async () => {
+	const below = [80_000, 80_000, 80_000, 79_999].map((o) => assistantEvent({ usage: usageWith(80_030, { output: o }) })).join("\n");
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${below}\n`)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assertWorkerSucceeded(result);
 		assert.equal(result.spendBand, "soft");
 		assert.deepEqual(result.spendReasons, ["output_tokens"]);
 		assert.equal(result.spendHardExceeded.outputTokens, false);
 	});
-	// 2 x 100,000 output = 200,000 exactly: hard output reached.
-	const exact = [100_000, 100_000].map((o) => assistantEvent({ usage: usageWith(100_030, { output: o }) })).join("\n");
+	const exact = [80_000, 80_000, 80_000, 80_000].map((o) => assistantEvent({ usage: usageWith(80_030, { output: o }) })).join("\n");
 	await withFakeWorker(
 		`process.stdout.write(${JSON.stringify(`${exact}\n`)}); setInterval(() => {}, 1000);`,
 		async (invocation, dir) => {
-			const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 			assert.equal(result.exitCode, 1, "child terminated by the runner at the exact hard output boundary");
 			assert.equal(result.spendBand, "hard");
 			assert.deepEqual(result.spendReasons, ["output_tokens"]);
 			assert.equal(result.spendHardExceeded.outputTokens, true);
-			assert.match(result.errorMessage ?? "", /output_tokens 200000\/200000/);
-			assert.throws(() => assertWorkerSucceeded(result), /output_tokens 200000\/200000/);
+			assert.match(result.errorMessage ?? "", /output_tokens 320000\/320000/);
+			assert.throws(() => assertWorkerSucceeded(result), /output_tokens 320000\/320000/);
 		},
 	);
 });
 
 test("runner spend: multi-dimension hard stop lists reasons in the fixed order", async () => {
-	// 35 turns of 138,889 tokens each, then one final message that pushes
-	// turns to 36, cumulative total to exactly 5,000,000 and cumulative
-	// output to 200,175 — all three dimensions hard at the same message.
-	// Every per-message total stays below 800,000 so context safety stays
-	// quiet (per-message context never reaches the 80%/90% thresholds).
-	const small = Array.from({ length: 35 }, () => assistantEvent({ usage: usageWith(138_889) })).join("\n");
-	const final = assistantEvent({ usage: usageWith(138_885, { output: 200_000 }) });
+	// 64 equal turns reach all Luna standard hard dimensions at once while
+	// every individual 170K context stays below the 217.6K context soft cap.
+	const allHard = Array.from({ length: 64 }, () => assistantEvent({ usage: usageWith(170_000, { output: 5_000 }) })).join("\n");
 	await withFakeWorker(
-		`process.stdout.write(${JSON.stringify(`${small}\n${final}\n`)}); setInterval(() => {}, 1000);`,
+		`process.stdout.write(${JSON.stringify(`${allHard}\n`)}); setInterval(() => {}, 1000);`,
 		async (invocation, dir) => {
-			const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 			assert.equal(result.spendBand, "hard");
 			assert.deepEqual(result.spendReasons, ["turns", "total_tokens", "output_tokens"], "fixed reason order — never alphabetical");
 			assert.deepEqual(result.spendHardExceeded, { turns: true, totalTokens: true, outputTokens: true });
 			assert.match(
 				result.errorMessage ?? "",
-				/turns 36\/36, total_tokens 5000000\/5000000, output_tokens 200175\/200000/,
+				/turns 64\/64, total_tokens 10880000\/10880000, output_tokens 320000\/320000/,
 			);
-			assert.throws(() => assertWorkerSucceeded(result), /turns 36\/36, total_tokens 5000000\/5000000, output_tokens 200175\/200000/);
+			assert.throws(() => assertWorkerSucceeded(result), /turns 64\/64, total_tokens 10880000\/10880000, output_tokens 320000\/320000/);
 		},
 	);
 });
 
 test("runner spend: hard stop fails closed even when the child would exit 0", async () => {
-	// The child emits 10 x 500,000 = exactly the hard total (5,000,000) and
+	// The child emits 54 x 200,000 + 80,000 = exactly the hard total and
 	// exits 0 on its own (natural completion). Per-message totals stay below
-	// 800,000 so the hard CONTEXT budget never fires. The runner may tear the
+	// 217,600 so the hard CONTEXT budget never fires. The runner may tear the
 	// child down first or observe the natural exit — either way the recorded
 	// spend facts are hard and assertWorkerSucceeded fails closed with the
 	// deterministic hard-stop message, outranking the ordinary exit text.
-	const hard = Array.from({ length: 10 }, () => assistantEvent({ usage: usageWith(500_000) })).join("\n");
+	const hard = [...Array.from({ length: 54 }, () => 200_000), 80_000].map((total) => assistantEvent({ usage: usageWith(total) })).join("\n");
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${hard}\n`)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assert.equal(result.spendBand, "hard");
 		assert.deepEqual(result.spendReasons, ["total_tokens"]);
 		assert.equal(result.spendHardExceeded.totalTokens, true);
-		assert.throws(() => assertWorkerSucceeded(result), /total_tokens 5000000\/5000000/);
+		assert.throws(() => assertWorkerSucceeded(result), /total_tokens 10880000\/10880000/);
 	});
 });
 
 test("runner spend: low and extended profiles enforce their exact limits", async () => {
-	// low hard turns = 12: the 12th turn terminates the child fail-closed.
-	const lowTurns = Array.from({ length: 12 }, () => assistantEvent()).join("\n");
+	// low hard turns = 16: the 16th turn terminates the child fail-closed.
+	const lowTurns = Array.from({ length: 16 }, () => assistantEvent()).join("\n");
 	await withFakeWorker(
 		`process.stdout.write(${JSON.stringify(`${lowTurns}\n`)}); setInterval(() => {}, 1000);`,
 		async (invocation, dir) => {
-			const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "low" });
+			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "low" });
 			assert.equal(result.spendProfile, "low");
 			assert.equal(result.spendBand, "hard");
 			assert.deepEqual(result.spendReasons, ["turns"]);
-			assert.match(result.errorMessage ?? "", /profile low.*turns 12\/12/);
-			assert.throws(() => assertWorkerSucceeded(result), /profile low.*turns 12\/12/);
+			assert.match(result.errorMessage ?? "", /profile low.*turns 16\/16/);
+			assert.throws(() => assertWorkerSucceeded(result), /profile low.*turns 16\/16/);
 		},
 	);
-	// low hard total = 1,250,000 exactly (2 x 625,000).
-	const lowTotal = [625_000, 625_000].map((t) => assistantEvent({ usage: usageWith(t) })).join("\n");
+	// low hard total = 1,632,000 exactly (8 x 200,000 + 32,000).
+	const lowTotal = [...Array.from({ length: 8 }, () => 200_000), 32_000].map((t) => assistantEvent({ usage: usageWith(t) })).join("\n");
 	await withFakeWorker(
 		`process.stdout.write(${JSON.stringify(`${lowTotal}\n`)}); setInterval(() => {}, 1000);`,
 		async (invocation, dir) => {
-			const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "low" });
+			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "low" });
 			assert.equal(result.spendBand, "hard");
 			assert.deepEqual(result.spendReasons, ["total_tokens"]);
-			assert.match(result.errorMessage ?? "", /total_tokens 1250000\/1250000/);
+			assert.match(result.errorMessage ?? "", /total_tokens 1632000\/1632000/);
 		},
 	);
-	// extended hard turns = 64: the 64th turn terminates the child fail-closed.
-	const extTurns = Array.from({ length: 64 }, () => assistantEvent()).join("\n");
+	// extended hard turns = 96: the 96th turn terminates the child fail-closed.
+	const extTurns = Array.from({ length: 96 }, () => assistantEvent()).join("\n");
 	await withFakeWorker(
 		`process.stdout.write(${JSON.stringify(`${extTurns}\n`)}); setInterval(() => {}, 1000);`,
 		async (invocation, dir) => {
-			const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "extended" });
+			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "extended" });
 			assert.equal(result.spendProfile, "extended");
 			assert.equal(result.spendBand, "hard");
 			assert.deepEqual(result.spendReasons, ["turns"]);
-			assert.match(result.errorMessage ?? "", /turns 64\/64/);
-			assert.throws(() => assertWorkerSucceeded(result), /profile extended.*turns 64\/64/);
+			assert.match(result.errorMessage ?? "", /turns 96\/96/);
+			assert.throws(() => assertWorkerSucceeded(result), /profile extended.*turns 96\/96/);
 		},
 	);
 });
@@ -1056,9 +1055,9 @@ test("runner spend: low and extended profiles enforce their exact limits", async
 test("delegated worker presentation exposes budget and compaction facts", () => {
 	const built = buildDelegateWorkerResult(
 		handoffInput({
-			budget: {
-				maxContextTokens: 812_345,
-				maxContextRatio: 0.812345,
+		budget: {
+				maxContextTokens: 220_320,
+				maxContextRatio: 0.81,
 				softBudgetReached: true,
 				hardBudgetExceeded: false,
 				compactionCount: 0,
@@ -1067,9 +1066,9 @@ test("delegated worker presentation exposes budget and compaction facts", () => 
 		}),
 	);
 	const text = built.content[0]?.text ?? "";
-	assert.match(text, /worker budget : max context 812345 \/ 1000000 \(81\.2%\)/);
-	assert.equal(built.details.max_context_tokens, 812_345);
-	assert.equal(built.details.max_context_ratio, 0.812345);
+	assert.match(text, /worker budget : max context 220320 \/ 272000 \(81%\)/);
+	assert.equal(built.details.max_context_tokens, 220_320);
+	assert.equal(built.details.max_context_ratio, 0.81);
 	assert.equal(built.details.soft_budget_reached, true);
 	assert.equal(built.details.hard_budget_exceeded, false);
 	assert.equal(built.details.compaction_count, 0);
@@ -1079,8 +1078,8 @@ test("delegated worker presentation exposes budget and compaction facts", () => 
 test("delegated worker presentation reports a hard-budget stop factually", () => {
 	const built = buildDelegateWorkerResult(
 		handoffInput({
-			budget: {
-				maxContextTokens: 900_000,
+		budget: {
+				maxContextTokens: 244_800,
 				maxContextRatio: 0.9,
 				softBudgetReached: true,
 				hardBudgetExceeded: true,
@@ -1089,7 +1088,7 @@ test("delegated worker presentation reports a hard-budget stop factually", () =>
 			},
 		}),
 	);
-	assert.match(built.content[0]?.text ?? "", /worker budget : max context 900000 \/ 1000000 \(90%\)/);
+	assert.match(built.content[0]?.text ?? "", /worker budget : max context 244800 \/ 272000 \(90%\)/);
 	assert.equal(built.details.hard_budget_exceeded, true);
 	assert.equal(built.details.compaction_count, 0);
 });
@@ -1126,7 +1125,7 @@ test("progress callbacks expose spend and output-control numeric facts plus prov
 	const final = assistantEvent({ content: [{ type: "text", text: "## Completed\nfinal report body" }] });
 	const updates: Array<Record<string, unknown>> = [];
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${first}\n${final}\n`)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({
+		const result = await runPinnedWorker({
 			projectRoot: dir,
 			contract: CONTRACT,
 			timeoutMs: 2_000,
@@ -1162,8 +1161,8 @@ test("progress callbacks expose spend and output-control numeric facts plus prov
 		currentToolTextBytes: 0,
 		collapsedToolResults: 0,
 		turnReservedBytes: 0,
-		provider: "deepseek",
-		model: "deepseek-v4-flash",
+		provider: WORKER_PROVIDER,
+		model: WORKER_MODEL_ID,
 	});
 	assert.deepEqual(updates[1], {
 		turns: 2,
@@ -1173,8 +1172,8 @@ test("progress callbacks expose spend and output-control numeric facts plus prov
 		currentToolTextBytes: 0,
 		collapsedToolResults: 0,
 		turnReservedBytes: 0,
-		provider: "deepseek",
-		model: "deepseek-v4-flash",
+		provider: WORKER_PROVIDER,
+		model: WORKER_MODEL_ID,
 	});
 	assertNumericOnlyProgress(updates, ["working", "final report body"]);
 });
@@ -1192,7 +1191,7 @@ test("progress counters stay finite and normalized under cacheRead fallback and 
 	});
 	const updates: Array<Record<string, unknown>> = [];
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${cacheFallback}\n${malformed}\n`)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({
+		const result = await runPinnedWorker({
 			projectRoot: dir,
 			contract: CONTRACT,
 			timeoutMs: 2_000,
@@ -1211,8 +1210,8 @@ test("progress counters stay finite and normalized under cacheRead fallback and 
 		currentToolTextBytes: 0,
 		collapsedToolResults: 0,
 		turnReservedBytes: 0,
-		provider: "deepseek",
-		model: "deepseek-v4-flash",
+		provider: WORKER_PROVIDER,
+		model: WORKER_MODEL_ID,
 	});
 	assert.deepEqual(updates[1], {
 		turns: 2,
@@ -1222,19 +1221,19 @@ test("progress counters stay finite and normalized under cacheRead fallback and 
 		currentToolTextBytes: 0,
 		collapsedToolResults: 0,
 		turnReservedBytes: 0,
-		provider: "deepseek",
-		model: "deepseek-v4-flash",
+		provider: WORKER_PROVIDER,
+		model: WORKER_MODEL_ID,
 	});
 	assertNumericOnlyProgress(updates, []);
 });
 
 test("progress band transitions ok → soft at the exact soft boundary and matches the final spend facts", async () => {
-	// Standard soft turns = 24 exactly: the 24th event's progress tuple is
+	// Standard soft turns = 32 exactly: the 32nd event's progress tuple is
 	// the first with band soft; every tuple before it is ok.
-	const events = Array.from({ length: 24 }, () => assistantEvent()).join("\n");
+	const events = Array.from({ length: 32 }, () => assistantEvent()).join("\n");
 	const updates: Array<Record<string, unknown>> = [];
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${events}\n`)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({
+		const result = await runPinnedWorker({
 			projectRoot: dir,
 			contract: CONTRACT,
 			timeoutMs: 2_000,
@@ -1243,10 +1242,10 @@ test("progress band transitions ok → soft at the exact soft boundary and match
 		});
 		assertWorkerSucceeded(result); // soft is a steer, not a failure
 		assert.equal(result.spendBand, "soft");
-		assert.equal(updates.length, 24);
-		assert.equal(updates[22]!.spendBand, "ok", "the 23rd tuple is still ok");
-		assert.equal(updates[23]!.spendBand, "soft", "the 24th tuple is the soft transition");
-		const last = updates[23]!;
+		assert.equal(updates.length, 32);
+		assert.equal(updates[30]!.spendBand, "ok", "the 31st tuple is still ok");
+		assert.equal(updates[31]!.spendBand, "soft", "the 32nd tuple is the soft transition");
+		const last = updates[31]!;
 		assert.deepEqual(
 			{ turns: last.turns, totalTokens: last.totalTokens, outputTokens: last.outputTokens, spendBand: last.spendBand },
 			{ turns: result.spendState.turns, totalTokens: result.spendState.totalTokens, outputTokens: result.spendState.outputTokens, spendBand: result.spendBand },
@@ -1257,15 +1256,15 @@ test("progress band transitions ok → soft at the exact soft boundary and match
 });
 
 test("progress at the exact hard boundary matches the final spend facts (fail-closed outcome)", async () => {
-	// Standard hard turns = 36 exactly: the runner terminates fail-closed on
-	// the 36th event, and the LAST progress tuple still reports the exact
+	// Standard hard turns = 64 exactly: the runner terminates fail-closed on
+	// the 64th event, and the LAST progress tuple still reports the exact
 	// cumulative counters and the hard band of the final result.
-	const events = Array.from({ length: 36 }, () => assistantEvent()).join("\n");
+	const events = Array.from({ length: 64 }, () => assistantEvent()).join("\n");
 	const updates: Array<Record<string, unknown>> = [];
 	await withFakeWorker(
 		`process.stdout.write(${JSON.stringify(`${events}\n`)}); setInterval(() => {}, 1000);`,
 		async (invocation, dir) => {
-			const result = await runDeepseekWorker({
+			const result = await runPinnedWorker({
 				projectRoot: dir,
 				contract: CONTRACT,
 				timeoutMs: 2_000,
@@ -1274,15 +1273,15 @@ test("progress at the exact hard boundary matches the final spend facts (fail-cl
 			});
 			assert.equal(result.spendBand, "hard");
 			assert.deepEqual(result.spendReasons, ["turns"]);
-			assert.throws(() => assertWorkerSucceeded(result), /turns 36\/36/);
-			assert.equal(updates.length, 36);
-			const last = updates[35]!;
+			assert.throws(() => assertWorkerSucceeded(result), /turns 64\/64/);
+			assert.equal(updates.length, 64);
+			const last = updates[63]!;
 			assert.deepEqual(
 				{ turns: last.turns, totalTokens: last.totalTokens, outputTokens: last.outputTokens, spendBand: last.spendBand },
 				{ turns: result.spendState.turns, totalTokens: result.spendState.totalTokens, outputTokens: result.spendState.outputTokens, spendBand: result.spendBand },
 				"final hard-boundary progress tuple equals the final WorkerRunResult spend facts",
 			);
-			assert.equal(last.turns, 36);
+			assert.equal(last.turns, 64);
 			assert.equal(last.spendBand, "hard");
 			assertNumericOnlyProgress(updates, []);
 		},
@@ -1293,7 +1292,7 @@ test("runner retains the complete final assistant text for the durable report ar
 	const body = "## Completed\n" + "detailed implementation narrative\n".repeat(199) + "detailed implementation narrative";
 	const final = assistantEvent({ content: [{ type: "text", text: body }] });
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${final}\n`)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assertWorkerSucceeded(result);
 		assert.equal(result.reportText, body, "complete final assistant text retained for worker-report.md");
 		assert.equal(result.reportTextOversized, false);
@@ -1303,7 +1302,7 @@ test("runner retains the complete final assistant text for the durable report ar
 test("runner retains the COMPLETE final assistant text (never pre-truncated) and flags oversize from raw bytes", async () => {
 	const huge = assistantEvent({ content: [{ type: "text", text: "x".repeat(MAX_WORKER_REPORT_BYTES + 1000) }] });
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${huge}\n`)});`, async (invocation, dir) => {
-		const result = await runDeepseekWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assertWorkerSucceeded(result);
 		assert.equal(result.reportTextOversized, true, "oversized final text is flagged from the RAW bytes");
 		assert.equal(

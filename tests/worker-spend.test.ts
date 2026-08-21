@@ -21,6 +21,7 @@ import {
 	EMPTY_WORKER_SPEND_STATE,
 	WORKER_SPEND_DEFAULT_PROFILE,
 	WORKER_SPEND_LIMITS,
+	WORKER_SPEND_POLICY_ID,
 	WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE,
 	addWorkerSpendUsage,
 	formatWorkerSpendHardStop,
@@ -41,16 +42,16 @@ const PROFILES: WorkerSpendProfile[] = ["low", "standard", "extended"];
 test("spend profile constants: all 18 numbers exact, immutable, ordered", () => {
 	// Exact approved limits (plan §4.3) — six numbers per profile.
 	assert.deepEqual(WORKER_SPEND_LIMITS.low, {
-		soft: { turns: 8, totalTokens: 750_000, outputTokens: 40_000 },
-		hard: { turns: 12, totalTokens: 1_250_000, outputTokens: 75_000 },
+		soft: { turns: 8, totalTokens: 816_000, outputTokens: 50_000 },
+		hard: { turns: 16, totalTokens: 1_632_000, outputTokens: 100_000 },
 	});
 	assert.deepEqual(WORKER_SPEND_LIMITS.standard, {
-		soft: { turns: 24, totalTokens: 3_000_000, outputTokens: 120_000 },
-		hard: { turns: 36, totalTokens: 5_000_000, outputTokens: 200_000 },
+		soft: { turns: 32, totalTokens: 5_440_000, outputTokens: 160_000 },
+		hard: { turns: 64, totalTokens: 10_880_000, outputTokens: 320_000 },
 	});
 	assert.deepEqual(WORKER_SPEND_LIMITS.extended, {
-		soft: { turns: 48, totalTokens: 8_000_000, outputTokens: 200_000 },
-		hard: { turns: 64, totalTokens: 12_000_000, outputTokens: 300_000 },
+		soft: { turns: 64, totalTokens: 10_880_000, outputTokens: 320_000 },
+		hard: { turns: 96, totalTokens: 17_408_000, outputTokens: 512_000 },
 	});
 
 	// Immutable at runtime (frozen at every level).
@@ -83,6 +84,7 @@ test("spend profile constants: all 18 numbers exact, immutable, ordered", () => 
 
 	// standard is the exported default; steer message type is pinned.
 	assert.equal(WORKER_SPEND_DEFAULT_PROFILE, "standard");
+	assert.equal(WORKER_SPEND_POLICY_ID, "gpt-5.6-luna-xhigh-continuation-v1");
 	assert.equal(WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE, "workbench-worker-spend-soft-steer");
 	assert.deepEqual(EMPTY_WORKER_SPEND_STATE, { turns: 0, totalTokens: 0, outputTokens: 0 });
 	assert.ok(Object.isFrozen(EMPTY_WORKER_SPEND_STATE));
@@ -268,73 +270,76 @@ test("band evaluation boundary matrix: below/at/above every soft/hard dimension 
 		assert.equal(workerSpendBand({ turns: Number.NaN, totalTokens: -1, outputTokens: Infinity }, profile), "ok");
 	}
 	// All dimensions at their soft limit → soft; at their hard limit → hard.
-	assert.equal(workerSpendBand({ turns: 24, totalTokens: 3_000_000, outputTokens: 120_000 }, "standard"), "soft");
-	assert.equal(workerSpendBand({ turns: 36, totalTokens: 5_000_000, outputTokens: 200_000 }, "standard"), "hard");
+	assert.equal(workerSpendBand({ turns: 32, totalTokens: 5_440_000, outputTokens: 160_000 }, "standard"), "soft");
+	assert.equal(workerSpendBand({ turns: 64, totalTokens: 10_880_000, outputTokens: 320_000 }, "standard"), "hard");
 });
 
 test("band precedence: any hard dimension wins over soft, always", () => {
 	// hard+soft mix → hard.
-	assert.equal(workerSpendBand({ turns: 40, totalTokens: 100_000, outputTokens: 50_000 }, "standard"), "hard");
+	assert.equal(workerSpendBand({ turns: 70, totalTokens: 100_000, outputTokens: 50_000 }, "standard"), "hard");
 	// hard+hard → hard.
-	assert.equal(workerSpendBand({ turns: 40, totalTokens: 5_500_000, outputTokens: 0 }, "standard"), "hard");
+	assert.equal(workerSpendBand({ turns: 70, totalTokens: 11_000_000, outputTokens: 0 }, "standard"), "hard");
 	// multi-soft → soft.
-	assert.equal(workerSpendBand({ turns: 24, totalTokens: 3_000_000, outputTokens: 0 }, "standard"), "soft");
+	assert.equal(workerSpendBand({ turns: 32, totalTokens: 5_440_000, outputTokens: 0 }, "standard"), "soft");
 	// output-only soft trigger.
-	assert.equal(workerSpendBand({ turns: 0, totalTokens: 0, outputTokens: 120_000 }, "standard"), "soft");
+	assert.equal(workerSpendBand({ turns: 0, totalTokens: 0, outputTokens: 160_000 }, "standard"), "soft");
 	// total-only hard trigger.
-	assert.equal(workerSpendBand({ turns: 0, totalTokens: 5_000_000, outputTokens: 0 }, "standard"), "hard");
+	assert.equal(workerSpendBand({ turns: 0, totalTokens: 10_880_000, outputTokens: 0 }, "standard"), "hard");
 	// low profile: turns above soft but below hard.
-	assert.equal(workerSpendBand({ turns: 11, totalTokens: 0, outputTokens: 0 }, "low"), "soft");
-	assert.equal(workerSpendBand({ turns: 12, totalTokens: 0, outputTokens: 0 }, "low"), "hard");
+	assert.equal(workerSpendBand({ turns: 15, totalTokens: 0, outputTokens: 0 }, "low"), "soft");
+	assert.equal(workerSpendBand({ turns: 16, totalTokens: 0, outputTokens: 0 }, "low"), "hard");
 });
 
 test("reason ordering is always turns, total_tokens, output_tokens", () => {
-	assert.deepEqual(workerSpendReasons({ turns: 24, totalTokens: 3_000_000, outputTokens: 120_000 }, "standard"), [
+	assert.deepEqual(workerSpendReasons({ turns: 32, totalTokens: 5_440_000, outputTokens: 160_000 }, "standard"), [
 		"turns",
 		"total_tokens",
 		"output_tokens",
 	]);
 	// Output-only and total-only triggers.
-	assert.deepEqual(workerSpendReasons({ turns: 0, totalTokens: 0, outputTokens: 120_000 }, "standard"), ["output_tokens"]);
-	assert.deepEqual(workerSpendReasons({ turns: 0, totalTokens: 3_000_000, outputTokens: 0 }, "standard"), ["total_tokens"]);
+	assert.deepEqual(workerSpendReasons({ turns: 0, totalTokens: 0, outputTokens: 160_000 }, "standard"), ["output_tokens"]);
+	assert.deepEqual(workerSpendReasons({ turns: 0, totalTokens: 5_440_000, outputTokens: 0 }, "standard"), ["total_tokens"]);
 	// Turns-only trigger; below-soft state has no reasons.
-	assert.deepEqual(workerSpendReasons({ turns: 24, totalTokens: 0, outputTokens: 0 }, "standard"), ["turns"]);
-	assert.deepEqual(workerSpendReasons({ turns: 23, totalTokens: 0, outputTokens: 0 }, "standard"), []);
+	assert.deepEqual(workerSpendReasons({ turns: 32, totalTokens: 0, outputTokens: 0 }, "standard"), ["turns"]);
+	assert.deepEqual(workerSpendReasons({ turns: 31, totalTokens: 0, outputTokens: 0 }, "standard"), []);
 	assert.deepEqual(workerSpendReasons(EMPTY_WORKER_SPEND_STATE, "standard"), []);
 	// Hard band lists only the hard-triggered dimensions, in fixed order.
-	assert.deepEqual(workerSpendReasons({ turns: 36, totalTokens: 0, outputTokens: 120_000 }, "standard"), ["turns"]);
-	assert.deepEqual(workerSpendReasons({ turns: 40, totalTokens: 5_500_000, outputTokens: 210_000 }, "standard"), [
+	assert.deepEqual(workerSpendReasons({ turns: 64, totalTokens: 0, outputTokens: 160_000 }, "standard"), ["turns"]);
+	assert.deepEqual(workerSpendReasons({ turns: 70, totalTokens: 11_000_000, outputTokens: 330_000 }, "standard"), [
 		"turns",
 		"total_tokens",
 		"output_tokens",
 	]);
-	assert.deepEqual(workerSpendReasons({ turns: 40, totalTokens: 0, outputTokens: 250_000 }, "standard"), ["turns", "output_tokens"]);
-	assert.deepEqual(workerSpendReasons({ turns: 10, totalTokens: 1_300_000, outputTokens: 0 }, "low"), ["total_tokens"]);
+	assert.deepEqual(workerSpendReasons({ turns: 70, totalTokens: 0, outputTokens: 330_000 }, "standard"), ["turns", "output_tokens"]);
+	assert.deepEqual(workerSpendReasons({ turns: 10, totalTokens: 1_700_000, outputTokens: 0 }, "low"), ["total_tokens"]);
 });
 
 test("soft steer text is deterministic and names profile, reasons, and current/soft values", () => {
-	const steer = formatWorkerSpendSteerText({ turns: 24, totalTokens: 3_000_000, outputTokens: 100_000 }, "standard");
-	assert.equal(steer, formatWorkerSpendSteerText({ turns: 24, totalTokens: 3_000_000, outputTokens: 100_000 }, "standard"));
+	const steer = formatWorkerSpendSteerText({ turns: 32, totalTokens: 5_440_000, outputTokens: 100_000 }, "standard");
+	assert.equal(steer, formatWorkerSpendSteerText({ turns: 32, totalTokens: 5_440_000, outputTokens: 100_000 }, "standard"));
 	assert.match(steer, /profile standard/);
-	assert.ok(steer.includes("turns 24/24"), "steer names the triggered turn dimension with current/soft values");
-	assert.ok(steer.includes("total_tokens 3000000/3000000"), "steer names the triggered total dimension with current/soft values");
+	assert.ok(steer.includes("turns 32/32"), "steer names the triggered turn dimension with current/soft values");
+	assert.ok(steer.includes("total_tokens 5440000/5440000"), "steer names the triggered total dimension with current/soft values");
 	assert.ok(!steer.includes("output_tokens"), "untriggered dimensions are not named");
-	assert.match(steer, /Stop starting new implementation/i);
+	assert.match(steer, /continuation reserve/i);
+	assert.match(steer, /Stop starting unrelated work/i);
 	assert.match(steer, /handoff/i);
 	assert.match(steer, /remaining work/i);
+	assert.match(steer, /current Sol session/i);
+	assert.match(steer, /never ask the user to open a new Sol session/i);
 	assert.ok(steer.length < 1000, "steer stays small and bounded");
 
 	// All three dimensions triggered → fixed order in the facts line.
-	const steerAll = formatWorkerSpendSteerText({ turns: 24, totalTokens: 3_000_000, outputTokens: 120_000 }, "standard");
-	assert.ok(steerAll.includes("turns 24/24, total_tokens 3000000/3000000, output_tokens 120000/120000"));
+	const steerAll = formatWorkerSpendSteerText({ turns: 32, totalTokens: 5_440_000, outputTokens: 160_000 }, "standard");
+	assert.ok(steerAll.includes("turns 32/32, total_tokens 5440000/5440000, output_tokens 160000/160000"));
 
 	// Profile is named per profile; low-profile boundaries render correctly.
 	const steerLow = formatWorkerSpendSteerText({ turns: 8, totalTokens: 0, outputTokens: 0 }, "low");
 	assert.match(steerLow, /profile low/);
 	assert.ok(steerLow.includes("turns 8/8"));
-	const steerExtended = formatWorkerSpendSteerText({ turns: 48, totalTokens: 0, outputTokens: 0 }, "extended");
+	const steerExtended = formatWorkerSpendSteerText({ turns: 64, totalTokens: 0, outputTokens: 0 }, "extended");
 	assert.match(steerExtended, /profile extended/);
-	assert.ok(steerExtended.includes("turns 48/48"));
+	assert.ok(steerExtended.includes("turns 64/64"));
 
 	// Deterministic degenerate form when nothing is at a soft limit.
 	assert.equal(
@@ -345,80 +350,82 @@ test("soft steer text is deterministic and names profile, reasons, and current/s
 });
 
 test("hard-stop text is deterministic and names winning dimensions with current/hard values", () => {
+	const action = " Continue with a bounded follow-up delegation in the current Sol session after reviewing any partial delta; do not request a new Sol session.";
 	assert.equal(
-		formatWorkerSpendHardStop({ turns: 36, totalTokens: 5_000_000, outputTokens: 0 }, "standard"),
-		"Worker cumulative spend hard budget reached (profile standard): turns 36/36, total_tokens 5000000/5000000.",
+		formatWorkerSpendHardStop({ turns: 64, totalTokens: 10_880_000, outputTokens: 0 }, "standard"),
+		`Worker cumulative spend hard budget reached (profile standard): turns 64/64, total_tokens 10880000/10880000.${action}`,
 	);
 	assert.equal(
-		formatWorkerSpendHardStop({ turns: 40, totalTokens: 100_000, outputTokens: 250_000 }, "standard"),
-		"Worker cumulative spend hard budget reached (profile standard): turns 40/36, output_tokens 250000/200000.",
+		formatWorkerSpendHardStop({ turns: 70, totalTokens: 100_000, outputTokens: 330_000 }, "standard"),
+		`Worker cumulative spend hard budget reached (profile standard): turns 70/64, output_tokens 330000/320000.${action}`,
 	);
 	assert.equal(
-		formatWorkerSpendHardStop({ turns: 10, totalTokens: 1_300_000, outputTokens: 0 }, "low"),
-		"Worker cumulative spend hard budget reached (profile low): total_tokens 1300000/1250000.",
+		formatWorkerSpendHardStop({ turns: 10, totalTokens: 1_700_000, outputTokens: 0 }, "low"),
+		`Worker cumulative spend hard budget reached (profile low): total_tokens 1700000/1632000.${action}`,
 	);
 	assert.equal(
-		formatWorkerSpendHardStop({ turns: 64, totalTokens: 12_000_000, outputTokens: 300_000 }, "extended"),
-		"Worker cumulative spend hard budget reached (profile extended): turns 64/64, total_tokens 12000000/12000000, output_tokens 300000/300000.",
+		formatWorkerSpendHardStop({ turns: 96, totalTokens: 17_408_000, outputTokens: 512_000 }, "extended"),
+		`Worker cumulative spend hard budget reached (profile extended): turns 96/96, total_tokens 17408000/17408000, output_tokens 512000/512000.${action}`,
 	);
 	assert.equal(
 		formatWorkerSpendHardStop(EMPTY_WORKER_SPEND_STATE, "standard"),
-		"Worker cumulative spend hard budget reached (profile standard): no dimension at its hard limit.",
+		`Worker cumulative spend hard budget reached (profile standard): no dimension at its hard limit.${action}`,
 	);
 	// Deterministic: same inputs, same string.
 	assert.equal(
-		formatWorkerSpendHardStop({ turns: 40, totalTokens: 100_000, outputTokens: 250_000 }, "standard"),
-		formatWorkerSpendHardStop({ turns: 40, totalTokens: 100_000, outputTokens: 250_000 }, "standard"),
+		formatWorkerSpendHardStop({ turns: 70, totalTokens: 100_000, outputTokens: 330_000 }, "standard"),
+		formatWorkerSpendHardStop({ turns: 70, totalTokens: 100_000, outputTokens: 330_000 }, "standard"),
 	);
 });
 
 test("hard-stop text derives reasons strictly from hard flags; soft-only states render the degenerate form", () => {
+	const action = " Continue with a bounded follow-up delegation in the current Sol session after reviewing any partial delta; do not request a new Sol session.";
 	// Soft-only states (at/above soft, below every hard limit) must never
 	// reuse soft-band reasons with hard denominators — one dimension at a time.
 	assert.equal(
-		formatWorkerSpendHardStop({ turns: 30, totalTokens: 0, outputTokens: 0 }, "standard"),
-		"Worker cumulative spend hard budget reached (profile standard): no dimension at its hard limit.",
+		formatWorkerSpendHardStop({ turns: 40, totalTokens: 0, outputTokens: 0 }, "standard"),
+		`Worker cumulative spend hard budget reached (profile standard): no dimension at its hard limit.${action}`,
 	);
 	assert.equal(
-		formatWorkerSpendHardStop({ turns: 0, totalTokens: 4_000_000, outputTokens: 0 }, "standard"),
-		"Worker cumulative spend hard budget reached (profile standard): no dimension at its hard limit.",
+		formatWorkerSpendHardStop({ turns: 0, totalTokens: 8_000_000, outputTokens: 0 }, "standard"),
+		`Worker cumulative spend hard budget reached (profile standard): no dimension at its hard limit.${action}`,
 	);
 	assert.equal(
-		formatWorkerSpendHardStop({ turns: 0, totalTokens: 0, outputTokens: 150_000 }, "standard"),
-		"Worker cumulative spend hard budget reached (profile standard): no dimension at its hard limit.",
+		formatWorkerSpendHardStop({ turns: 0, totalTokens: 0, outputTokens: 200_000 }, "standard"),
+		`Worker cumulative spend hard budget reached (profile standard): no dimension at its hard limit.${action}`,
 	);
 	// Multiple soft dimensions at once: still no dimension at its hard limit.
 	assert.equal(
-		formatWorkerSpendHardStop({ turns: 30, totalTokens: 4_000_000, outputTokens: 150_000 }, "standard"),
-		"Worker cumulative spend hard budget reached (profile standard): no dimension at its hard limit.",
+		formatWorkerSpendHardStop({ turns: 40, totalTokens: 8_000_000, outputTokens: 200_000 }, "standard"),
+		`Worker cumulative spend hard budget reached (profile standard): no dimension at its hard limit.${action}`,
 	);
 	// Exactly at a soft limit (below hard) stays degenerate; other profiles too.
 	assert.equal(
-		formatWorkerSpendHardStop({ turns: 24, totalTokens: 0, outputTokens: 0 }, "standard"),
-		"Worker cumulative spend hard budget reached (profile standard): no dimension at its hard limit.",
+		formatWorkerSpendHardStop({ turns: 32, totalTokens: 0, outputTokens: 0 }, "standard"),
+		`Worker cumulative spend hard budget reached (profile standard): no dimension at its hard limit.${action}`,
 	);
 	assert.equal(
 		formatWorkerSpendHardStop({ turns: 10, totalTokens: 0, outputTokens: 0 }, "low"),
-		"Worker cumulative spend hard budget reached (profile low): no dimension at its hard limit.",
+		`Worker cumulative spend hard budget reached (profile low): no dimension at its hard limit.${action}`,
 	);
 	assert.equal(
-		formatWorkerSpendHardStop({ turns: 55, totalTokens: 0, outputTokens: 0 }, "extended"),
-		"Worker cumulative spend hard budget reached (profile extended): no dimension at its hard limit.",
+		formatWorkerSpendHardStop({ turns: 80, totalTokens: 0, outputTokens: 0 }, "extended"),
+		`Worker cumulative spend hard budget reached (profile extended): no dimension at its hard limit.${action}`,
 	);
 	// Mixed soft+hard: only the hard-triggered dimension is named, with the
 	// hard denominator — never a soft reason with a hard denominator.
 	assert.equal(
-		formatWorkerSpendHardStop({ turns: 30, totalTokens: 5_000_000, outputTokens: 0 }, "standard"),
-		"Worker cumulative spend hard budget reached (profile standard): total_tokens 5000000/5000000.",
+		formatWorkerSpendHardStop({ turns: 40, totalTokens: 10_880_000, outputTokens: 0 }, "standard"),
+		`Worker cumulative spend hard budget reached (profile standard): total_tokens 10880000/10880000.${action}`,
 	);
 	assert.equal(
-		formatWorkerSpendHardStop({ turns: 40, totalTokens: 4_000_000, outputTokens: 150_000 }, "standard"),
-		"Worker cumulative spend hard budget reached (profile standard): turns 40/36.",
+		formatWorkerSpendHardStop({ turns: 70, totalTokens: 8_000_000, outputTokens: 200_000 }, "standard"),
+		`Worker cumulative spend hard budget reached (profile standard): turns 70/64.${action}`,
 	);
 	// workerSpendReasons keeps current-band semantics: soft-only states still
 	// list their soft reasons there — formatter and band reasons stay distinct.
-	assert.deepEqual(workerSpendReasons({ turns: 30, totalTokens: 0, outputTokens: 0 }, "standard"), ["turns"]);
-	assert.deepEqual(workerSpendReasons({ turns: 30, totalTokens: 4_000_000, outputTokens: 150_000 }, "standard"), [
+	assert.deepEqual(workerSpendReasons({ turns: 40, totalTokens: 0, outputTokens: 0 }, "standard"), ["turns"]);
+	assert.deepEqual(workerSpendReasons({ turns: 40, totalTokens: 8_000_000, outputTokens: 200_000 }, "standard"), [
 		"turns",
 		"total_tokens",
 		"output_tokens",
@@ -428,28 +435,28 @@ test("hard-stop text derives reasons strictly from hard flags; soft-only states 
 test("spend summary formatter is deterministic with hard-limit denominators", () => {
 	assert.equal(
 		formatWorkerSpendSummary({ turns: 12, totalTokens: 1_500_000, outputTokens: 60_000 }, "standard"),
-		"spend budget : turns 12/36 | total 1500000/5000000 | output 60000/200000 | profile standard",
+		"spend budget : turns 12/64 | total 1500000/10880000 | output 60000/320000 | profile standard",
 	);
 	assert.equal(
 		formatWorkerSpendSummary({ turns: 5, totalTokens: 400_000, outputTokens: 20_000 }, "low"),
-		"spend budget : turns 5/12 | total 400000/1250000 | output 20000/75000 | profile low",
+		"spend budget : turns 5/16 | total 400000/1632000 | output 20000/100000 | profile low",
 	);
 	assert.equal(
 		formatWorkerSpendSummary({ turns: 50, totalTokens: 9_000_000, outputTokens: 250_000 }, "extended"),
-		"spend budget : turns 50/64 | total 9000000/12000000 | output 250000/300000 | profile extended",
+		"spend budget : turns 50/96 | total 9000000/17408000 | output 250000/512000 | profile extended",
 	);
 	assert.equal(
 		formatWorkerSpendSummary(EMPTY_WORKER_SPEND_STATE, "standard"),
-		"spend budget : turns 0/36 | total 0/5000000 | output 0/200000 | profile standard",
+		"spend budget : turns 0/64 | total 0/10880000 | output 0/320000 | profile standard",
 	);
 	// Malformed state renders zeros — never NaN, never a throw.
 	assert.equal(
 		formatWorkerSpendSummary(Number.NaN, "standard"),
-		"spend budget : turns 0/36 | total 0/5000000 | output 0/200000 | profile standard",
+		"spend budget : turns 0/64 | total 0/10880000 | output 0/320000 | profile standard",
 	);
 	assert.equal(
 		formatWorkerSpendSummary(null, "low"),
-		"spend budget : turns 0/12 | total 0/1250000 | output 0/75000 | profile low",
+		"spend budget : turns 0/16 | total 0/1632000 | output 0/100000 | profile low",
 	);
 });
 
@@ -460,13 +467,10 @@ test("spend summary formatter is deterministic with hard-limit denominators", ()
  * `20260805-085409-m7t4` record is excluded, as is the later
  * `20260805-092032-mwm8`).
  *
- * NOTE (verified against the ledger): the soft-output count under the
- * approved policy is 7/17 — nulo, hyou, zegk, exm6, efnk, 1oi4, agdo —
- * including hyou (129,163) and efnk (122,567) at/above the approved
- * 120,000 standard soft-output limit (the plan's §6.1 replay note was
- * corrected to this 7/17 list on 2026-08-05). This test follows the
- * verified data and the approved thresholds; every soft-output record is
- * asserted below.
+ * The historical corpus remains useful as a regression benchmark for the
+ * Luna continuation policy: it proves the new standard profile reduces
+ * hard stops from the old 10/17 to 7/17 while still stopping every extreme
+ * 64-turn/10.88M-token runaway.
  */
 const AUDIT_DELEGATIONS: ReadonlyArray<{
 	readonly id: string;
@@ -493,7 +497,7 @@ const AUDIT_DELEGATIONS: ReadonlyArray<{
 	{ id: "20260805-073945-agdo", turns: 132, totalTokens: 37_300_941, outputTokens: 177_413 },
 ];
 
-test("audit replay: 17-record baseline under the standard profile matches the verified facts", () => {
+test("historical 17-record replay demonstrates the Luna continuation reserve without removing runaway ceilings", () => {
 	// The tuples are exactly the 17 baseline records; m7t4 and mwm8 excluded.
 	assert.equal(AUDIT_DELEGATIONS.length, 17);
 	assert.ok(!AUDIT_DELEGATIONS.some((d) => d.totalTokens === 13_386_322), "post-baseline 20260805-085409-m7t4 is excluded");
@@ -507,50 +511,42 @@ test("audit replay: 17-record baseline under the standard profile matches the ve
 	const flags = (d: (typeof AUDIT_DELEGATIONS)[number]): ReturnType<typeof workerSpendDimensionFlags> =>
 		workerSpendDimensionFlags(d, "standard");
 
-	// Exactly 10/17 reach hard — the same 10 for turns and total_tokens.
+	// Exactly 7/17 extreme runs reach hard — the same seven for turns and total_tokens.
 	const hardIds = AUDIT_DELEGATIONS.filter((d) => workerSpendBand(d, "standard") === "hard").map((d) => d.id);
 	assert.deepEqual(hardIds, [
 		"20260804-180256-t1rd",
 		"20260804-190302-nulo",
-		"20260804-194211-2m0s",
 		"20260804-195733-hyou",
-		"20260804-201526-zegk",
 		"20260804-204126-exm6",
 		"20260804-214758-efnk",
 		"20260804-221545-1oi4",
-		"20260804-224356-3jal",
 		"20260805-073945-agdo",
 	]);
 	assert.deepEqual(
 		AUDIT_DELEGATIONS.filter((d) => flags(d).hard.turns).map((d) => d.id),
 		hardIds,
-		"the same 10 delegations reach hard on turns",
+		"the same seven delegations reach hard on turns",
 	);
 	assert.deepEqual(
 		AUDIT_DELEGATIONS.filter((d) => flags(d).hard.totalTokens).map((d) => d.id),
 		hardIds,
-		"the same 10 delegations reach hard on total_tokens",
+		"the same seven delegations reach hard on total_tokens",
 	);
 	assert.equal(AUDIT_DELEGATIONS.filter((d) => flags(d).hard.outputTokens).length, 0, "no delegation reaches hard on output");
-	assert.equal(Math.max(...AUDIT_DELEGATIONS.map((d) => d.outputTokens)), 193_852, "max observed output is below the 200,000 hard limit");
+	assert.equal(Math.max(...AUDIT_DELEGATIONS.map((d) => d.outputTokens)), 193_852, "max observed output is below the 320,000 hard limit");
 
-	// Soft counts: 11/17 turns, 10/17 total_tokens, 7/17 output_tokens.
-	// (Corrected §6.1 note: nulo, hyou, zegk, exm6, efnk, 1oi4, agdo all
-	// meet the approved >= 120,000 soft-output limit.)
-	assert.equal(AUDIT_DELEGATIONS.filter((d) => flags(d).soft.turns).length, 11);
-	assert.equal(AUDIT_DELEGATIONS.filter((d) => flags(d).soft.totalTokens).length, 10);
+	// Soft counts under the Luna policy: 10/17 turns, 9/17 total, 4/17 output.
+	assert.equal(AUDIT_DELEGATIONS.filter((d) => flags(d).soft.turns).length, 10);
+	assert.equal(AUDIT_DELEGATIONS.filter((d) => flags(d).soft.totalTokens).length, 9);
 	assert.deepEqual(
 		AUDIT_DELEGATIONS.filter((d) => flags(d).soft.outputTokens).map((d) => d.id),
-		["20260804-190302-nulo", "20260804-195733-hyou", "20260804-201526-zegk", "20260804-204126-exm6", "20260804-214758-efnk", "20260804-221545-1oi4", "20260805-073945-agdo"],
+		["20260804-190302-nulo", "20260804-204126-exm6", "20260804-221545-1oi4", "20260805-073945-agdo"],
 	);
 
-	// Every soft-output record, with its exact value.
+	// Every current soft-output record, with its exact value.
 	for (const [id, output] of [
 		["20260804-190302-nulo", 172_385],
-		["20260804-195733-hyou", 129_163],
-		["20260804-201526-zegk", 154_002],
 		["20260804-204126-exm6", 193_852],
-		["20260804-214758-efnk", 122_567],
 		["20260804-221545-1oi4", 185_279],
 		["20260805-073945-agdo", 177_413],
 	] as const) {
@@ -560,14 +556,17 @@ test("audit replay: 17-record baseline under the standard profile matches the ve
 	}
 
 	// Every hard delegation lists exactly the hard-triggered reasons in the
-	// fixed order; the single soft-only delegation (8wrv) lists turns only.
+	// fixed order; moderate historical runs now remain in the continuation reserve.
 	for (const d of AUDIT_DELEGATIONS) {
 		if (workerSpendBand(d, "standard") === "hard") {
 			assert.deepEqual(workerSpendReasons(d, "standard"), ["turns", "total_tokens"], `${d.id} hard reasons in fixed order`);
 		}
 	}
-	const softOnly = AUDIT_DELEGATIONS.find((d) => d.id === "20260804-182145-8wrv");
+	const softOnly = AUDIT_DELEGATIONS.find((d) => d.id === "20260804-194211-2m0s");
 	assert.ok(softOnly);
 	assert.equal(workerSpendBand(softOnly, "standard"), "soft");
-	assert.deepEqual(workerSpendReasons(softOnly, "standard"), ["turns"]);
+	assert.deepEqual(workerSpendReasons(softOnly, "standard"), ["turns", "total_tokens"]);
+	const formerlySoft = AUDIT_DELEGATIONS.find((d) => d.id === "20260804-182145-8wrv");
+	assert.ok(formerlySoft);
+	assert.equal(workerSpendBand(formerlySoft, "standard"), "ok", "31-turn ordinary work no longer enters the handoff reserve");
 });
