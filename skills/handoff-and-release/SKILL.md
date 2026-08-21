@@ -1,11 +1,12 @@
 ---
 name: handoff-and-release
-description: Prepare handoff notes, changelog entries, version bumps, and release verification so work can be continued or shipped by someone else. Use when finishing a milestone, handing work to another person, or preparing a release.
+description: Explicit specialist for a requested handoff or release. Produce concise continuation notes, changelog/version updates, and release-only verification; do not invoke after every ordinary implementation slice.
+disable-model-invocation: true
 ---
 
 # Handoff and Release
 
-## Handoff notes (any milestone)
+## Handoff notes
 
 Write down, in one place:
 
@@ -29,7 +30,8 @@ Write down, in one place:
 
 ## Release process
 
-1. Verify the full suite: typecheck, tests, build (via declared recipes).
+1. Run the declared release gate or full suite because this section applies
+   only to an actual release candidate.
 2. Check the working tree is clean and version/tag state is understood.
 3. Bump the version per the project's versioning convention; changelog
    updated; version referenced consistently (manifest, docs).
@@ -38,10 +40,9 @@ Write down, in one place:
 5. Tag/release only if explicitly asked — never publish or push without
    instruction.
 
-## Details
+## Conditional references
 
-- See [references/handoff-template.md](references/handoff-template.md) for
-  the handoff note template.
-- See [references/release-checklist.md](references/release-checklist.md) for
-  the release verification checklist.
-- Use `skill:validation-ladder` for the verification verdicts.
+- Read [references/handoff-template.md](references/handoff-template.md) only
+  when another session or person must continue the work.
+- Read [references/release-checklist.md](references/release-checklist.md) only
+  for a real release candidate.

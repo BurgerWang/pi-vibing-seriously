@@ -122,6 +122,11 @@ committed or analyzed against an unfrozen protocol.
 | `rubric_sha256` | SHA-256 of the raw bytes of the frozen schema-2 `rubric.json` | `6c223da4c117f4af857be20f1dab43b495f62eced638bfd4a9a2db80e0026046` |
 | `non_treatment_sha256` | Deterministic content-manifest hash over the frozen non-treatment bundle: `AGENTS.md` + everything under `skills/` + `prompts/` + `templates/` | `b7cc04cc44345f448105ab4272a9e80d795f79e663041f7b7f2276132448a2bd` |
 
+The exact 70 frozen path/digest rows are retained in
+`docs/baselines/commander-native-tool-non-treatment-manifest.txt`.
+Historical integrity checks hash that snapshot; evolving live product skills,
+prompts, or templates do not rewrite or invalidate the old cohort.
+
 The v2 milestone prompt and the v2 fixture tree are **byte-copies of
 the v1 inputs**, so their pins reproduce the v1 pins exactly; the v2
 non-treatment bundle is the same frozen bundle, so its pin equals the

@@ -55,6 +55,16 @@ publication, `/reload`, or measured live provider cache improvement is claimed.
 
 ### Changed
 
+- Skill loading is development-first: five concise workflow/router skills stay
+  model-visible, while nine orientation, CLI, release, and research specialists
+  are explicit-only. Prompt templates select one primary workflow, references
+  load conditionally, and ordinary build/debug paths use focused iteration plus
+  one risk-proportionate final pass instead of unconditional full-suite runs.
+- Generated AGENTS templates remain the complete fixed Sol → Luna policy
+  authority; build and implementation resources retain a mandatory pointer
+  without repeating the lease/review contract. The historical native-tool
+  benchmark now verifies its frozen 70-row non-treatment manifest, so current
+  skill improvements cannot rewrite or self-lock the old cohort.
 - Commander/worker active-history hard caps increase to 192/128 KiB; `other`
   remains 64 KiB. With the unchanged 64/48 KiB turn reserves and sixteen
   384-byte segment slots, the fixed anchors become 122/74/10 KiB for

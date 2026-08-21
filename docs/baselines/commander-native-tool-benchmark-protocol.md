@@ -101,6 +101,12 @@ an unfrozen protocol.
 | `rubric_sha256` | SHA-256 of the raw bytes of the frozen `rubric.json` | `dccfd406a69f7582a5fc44daad420d8e177c993cf3a7110ae11c6686beab74ed` |
 | `non_treatment_sha256` | Deterministic content-manifest hash over the frozen non-treatment bundle: `AGENTS.md` + everything under `skills/` + `prompts/` + `templates/` (same hash function as §5.2; captured at freeze time and re-captured in every collection record, §4.5) | `b7cc04cc44345f448105ab4272a9e80d795f79e663041f7b7f2276132448a2bd` |
 
+The exact 70 frozen path/digest rows are retained in
+`docs/baselines/commander-native-tool-non-treatment-manifest.txt`.
+Historical integrity checks hash that snapshot; they do not require the live
+product skills, prompts, or templates to remain permanently identical to the
+old cohort.
+
 ### 3.3 Pin resolution discipline
 
 The content pins were resolved **once**, at the fixture freeze

@@ -47,6 +47,26 @@ export const EXPECTED_SKILLS = [
 	"strategy-reporting",
 ] as const;
 
+const DEFAULT_VISIBLE_SKILLS = [
+	"implementation-workflow",
+	"debugging-workflow",
+	"validation-ladder",
+	"repository-audit",
+	"quant-research-design",
+] as const;
+
+const EXPLICIT_ONLY_SKILLS = [
+	"repository-orientation",
+	"cli-product-development",
+	"handoff-and-release",
+	"market-data-integrity",
+	"stock-selection-research",
+	"market-timing-research",
+	"backtest-integrity",
+	"experiment-validation",
+	"strategy-reporting",
+] as const;
+
 export const EXPECTED_PROMPTS = [
 	"q-audit",
 	"q-plan",
@@ -156,6 +176,60 @@ test("every skill SKILL.md has parseable frontmatter with legal name and non-emp
 	}
 });
 
+test("only the five workflow routers are model-visible; specialists are explicit-only", async () => {
+	const visible: string[] = [];
+	const explicit: string[] = [];
+	for (const name of EXPECTED_SKILLS) {
+		const content = await readFile(join(SKILLS_DIR, name, "SKILL.md"), "utf8");
+		const meta = parseYaml(splitFrontmatter(content).frontmatter) as Record<string, unknown>;
+		if (meta["disable-model-invocation"] === true) explicit.push(name);
+		else visible.push(name);
+	}
+	assert.deepEqual(visible.sort(), [...DEFAULT_VISIBLE_SKILLS].sort());
+	assert.deepEqual(explicit.sort(), [...EXPLICIT_ONLY_SKILLS].sort());
+});
+
+test("main skill instructions stay concise and rely on conditional references", async () => {
+	for (const name of EXPECTED_SKILLS) {
+		const content = await readFile(join(SKILLS_DIR, name, "SKILL.md"), "utf8");
+		const lines = content.split(/\r?\n/).length;
+		const words = content.trim().split(/\s+/).length;
+		assert.ok(lines <= 55, `${name}: main skill must stay at or below 55 lines (got ${lines})`);
+		assert.ok(words <= 350, `${name}: main skill must stay at or below 350 words (got ${words})`);
+	}
+});
+
+function escapeXml(value: string): string {
+	return value
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/\"/g, "&quot;")
+		.replace(/'/g, "&apos;");
+}
+
+test("default skill catalog stays below the prompt budget", async () => {
+	const lines = [
+		"\n\nThe following skills provide specialized instructions for specific tasks.",
+		"Use the read tool to load a skill's file when the task matches its description.",
+		"When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
+		"",
+		"<available_skills>",
+	];
+	for (const name of DEFAULT_VISIBLE_SKILLS) {
+		const filePath = join(SKILLS_DIR, name, "SKILL.md");
+		const meta = parseYaml(splitFrontmatter(await readFile(filePath, "utf8")).frontmatter) as Record<string, unknown>;
+		lines.push("  <skill>");
+		lines.push(`    <name>${escapeXml(String(meta.name))}</name>`);
+		lines.push(`    <description>${escapeXml(String(meta.description))}</description>`);
+		lines.push(`    <location>${escapeXml(filePath)}</location>`);
+		lines.push("  </skill>");
+	}
+	lines.push("</available_skills>");
+	const catalog = lines.join("\n");
+	assert.ok(Buffer.byteLength(catalog, "utf8") <= 3_000, `default skill catalog exceeds 3 KiB (${Buffer.byteLength(catalog, "utf8")} bytes)`);
+});
+
 test("no empty skills and no TODO-only skills", async () => {
 	for (const name of EXPECTED_SKILLS) {
 		const files = await skillFiles(name);
@@ -201,6 +275,21 @@ test("all expected prompt templates exist with parseable frontmatter", async () 
 		assert.equal(typeof hint, "string", `${name}: argument-hint missing`);
 		assert.ok((hint as string).trim().length > 0, `${name}: argument-hint must be non-empty`);
 		assert.ok(body.includes("$ARGUMENTS"), `${name}: template must use $ARGUMENTS`);
+	}
+});
+
+test("prompt templates choose a primary route instead of preloading workflows", async () => {
+	for (const name of EXPECTED_PROMPTS) {
+		const content = await readFile(join(PROMPTS_DIR, `${name}.md`), "utf8");
+		const references = [...content.matchAll(/skill:([a-z0-9-]+)/g)].map((match) => match[1]);
+		assert.ok(new Set(references).size <= 2, `${name}: prompt may route to at most two skills`);
+	}
+});
+
+test("ordinary build and debug prompts never require an unconditional full suite", async () => {
+	for (const name of ["q-build", "q-debug"] as const) {
+		const text = normalizeSpace(await readFile(join(PROMPTS_DIR, `${name}.md`), "utf8"));
+		assert.ok(!/then the full suite|run the full suite\.?$/i.test(text), `${name}: must not require a full suite after every change`);
 	}
 });
 
@@ -400,16 +489,16 @@ test("quant-research-design states the research scope boundary", async () => {
 
 // ----------------------------------------------- fixed Sol -> Luna contract
 
-/**
- * The build prompt, implementation skill, and generated AGENTS templates
- * keep the default path short. Legacy serialized names remain runtime
- * compatibility details, never a mandatory user workflow.
- */
-const FIXED_SOL_LUNA_SOURCES: ReadonlyArray<readonly [string, string]> = [
-	["prompts/q-build.md", "q-build prompt"],
-	["skills/implementation-workflow/SKILL.md", "implementation-workflow skill"],
+/** Project templates own the complete policy; workflow resources carry only
+ * a hard pointer so the same governance prose is not injected repeatedly. */
+const FIXED_SOL_LUNA_AUTHORITIES: ReadonlyArray<readonly [string, string]> = [
 	["templates/project/AGENTS.generic.md", "AGENTS.generic template"],
 	["templates/project/AGENTS.quant-research.md", "AGENTS.quant-research template"],
+];
+
+const FIXED_SOL_LUNA_POINTERS: ReadonlyArray<readonly [string, string]> = [
+	["prompts/q-build.md", "q-build prompt"],
+	["skills/implementation-workflow/SKILL.md", "implementation-workflow skill"],
 ];
 
 /** Collapse runs of whitespace so line wrapping can never hide a rule. */
@@ -421,13 +510,13 @@ async function fixedSolLunaText(relPath: string): Promise<string> {
 	return normalizeSpace(await readFile(join(ROOT, relPath), "utf8"));
 }
 
-test("fixed collaboration contract: routine writes belong to one bounded Luna delegation in all four sources", async () => {
+test("fixed collaboration authority: routine writes belong to one bounded Luna delegation", async () => {
 	const phrases = [
 		"Sol owns requirements",
 		"Routine source, test, and documentation writes in DEV belong to one bounded Luna delegation",
 		"Use one bounded delegation call",
 	] as const;
-	for (const [relPath, label] of FIXED_SOL_LUNA_SOURCES) {
+	for (const [relPath, label] of FIXED_SOL_LUNA_AUTHORITIES) {
 		const text = await fixedSolLunaText(relPath);
 		for (const phrase of phrases) {
 			assert.ok(text.includes(phrase), `${label} (${relPath}) must state \"${phrase}\"`);
@@ -435,9 +524,9 @@ test("fixed collaboration contract: routine writes belong to one bounded Luna de
 	}
 });
 
-test("fixed collaboration contract: delegation auto-closes and explicit review is recovery-only", async () => {
+test("fixed collaboration authority: delegation auto-closes and explicit review is recovery-only", async () => {
 	const phrases = ["reviewed and closed automatically", "explicit review/status", "recovery", "never acceptance"] as const;
-	for (const [relPath, label] of FIXED_SOL_LUNA_SOURCES) {
+	for (const [relPath, label] of FIXED_SOL_LUNA_AUTHORITIES) {
 		const text = await fixedSolLunaText(relPath);
 		for (const phrase of phrases) {
 			assert.ok(text.includes(phrase), `${label} (${relPath}) must state \"${phrase}\"`);
@@ -445,23 +534,33 @@ test("fixed collaboration contract: delegation auto-closes and explicit review i
 	}
 });
 
-test("fixed collaboration contract: direct Sol writes require an explicit bounded temporary lease", async () => {
+test("fixed collaboration authority: direct Sol writes require an explicit bounded temporary lease", async () => {
 	const phrase = "Sol may edit/write directly only through an active user-issued temporary lease";
-	for (const [relPath, label] of FIXED_SOL_LUNA_SOURCES) {
+	for (const [relPath, label] of FIXED_SOL_LUNA_AUTHORITIES) {
 		const text = await fixedSolLunaText(relPath);
 		assert.ok(text.includes(phrase), `${label} (${relPath}) must state \"${phrase}\"`);
 	}
 });
 
-test("fixed collaboration contract: focused feedback and one stable-candidate gate pass replace micro-step full verification", async () => {
+test("fixed collaboration authority: focused feedback and one stable-candidate gate pass replace micro-step full verification", async () => {
 	const phrases = ["focused tests", "stable candidate", "final gates once"] as const;
-	for (const [relPath, label] of FIXED_SOL_LUNA_SOURCES) {
+	for (const [relPath, label] of FIXED_SOL_LUNA_AUTHORITIES) {
 		const text = await fixedSolLunaText(relPath);
 		for (const phrase of phrases) {
 			assert.ok(text.includes(phrase), `${label} (${relPath}) must state \"${phrase}\"`);
 		}
 		assert.ok(!text.includes("Delegation is optional"), `${label} must not make routine delegation optional`);
 		assert.ok(!text.includes("Ordinary source, test, and documentation edits are direct"), `${label} must not restore direct routine writes`);
+	}
+});
+
+test("workflow resources point to the fixed collaboration contract without duplicating it", async () => {
+	for (const [relPath, label] of FIXED_SOL_LUNA_POINTERS) {
+		const text = await fixedSolLunaText(relPath);
+		assert.ok(text.includes("fixed Sol -> Luna") || text.includes("fixed Sol → Luna"), `${label} must retain the fixed collaboration pointer`);
+		assert.ok(text.includes("mandatory"), `${label} must state that fixed delivery is mandatory`);
+		assert.ok(!text.includes("Sol may edit/write directly only through an active user-issued temporary lease"), `${label} must not duplicate the full lease policy`);
+		assert.ok(!text.includes("reviewed and closed automatically"), `${label} must not duplicate the full review policy`);
 	}
 });
 

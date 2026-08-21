@@ -16,7 +16,9 @@
 Before editing, answer:
 
 - Which files change? (source, tests, config, docs)
-- Which existing tests could break? Run them before AND after.
+- Which existing tests could break? Run the smallest useful baseline only
+  when reproducing a failure or measuring an optimization, then rerun the
+  affected checks after the change.
 - Who calls the changed functions? Grep for callers and imports.
 - Does the change affect serialized formats, config schemas, or public
   interfaces? Note compatibility impact.

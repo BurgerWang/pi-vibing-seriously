@@ -7,7 +7,8 @@ After a root-cause fix, verify in this order:
 2. **Minimal repro** — the reduced case still passes (guards against
    over-fitting the fix to one scenario).
 3. **Adjacent behavior** — tests covering the module/area around the fix.
-4. **Full suite** — the complete test suite and typecheck.
+4. **Risk-proportionate boundary** — add typecheck, integration tests, or the
+   full suite only when the changed boundary or requested gate requires it.
 5. **New regression test** — if the fix has no test that failed before the
    fix, add one. A fix without a failing-test artifact is unproven.
 
@@ -25,5 +26,5 @@ After a root-cause fix, verify in this order:
 repro before : <command> → <original error>          (saved)
 repro after  : <command> → exit 0                    (saved)
 new test     : <test name> fails before fix / passes after
-full suite   : <command> → <counts>
+final scope  : <focused/typecheck/integration/full gate> → <counts>
 ```

@@ -1,56 +1,40 @@
 ---
 name: implementation-workflow
-description: End-to-end implementation workflow — requirement contract, impact scope, real implementation, tests, verification evidence, and remaining risk. Use whenever building or changing functionality.
+description: Primary workflow for building or changing functionality. Use for implementation tasks that need a scoped contract, real code, focused tests, proportionate final verification, and a concise risk report.
 ---
 
 # Implementation Workflow
 
-1. **Contract** — restate the requirement as acceptance criteria. Confirm
-   scope before coding. If the requirement is ambiguous, state the assumption
-   you implemented.
-2. **Impact scope** — identify files to change and tests to run. Check for
-   callers, config, and docs that the change touches.
-3. **Implement** — real code only. No stubs, no TODO shells, no empty
-   handlers pretending to be features.
-4. **Test** — add or update tests for the changed behavior; run them.
-5. **Verify** — use focused checks while the candidate changes. Once stable,
-   run one final typecheck/test/build or gate set proportionate to risk;
-   record exact commands and outputs.
-6. **Evidence** — report changed files, commands run, and results.
-7. **Risk** — list remaining risks; never claim completion of checks that did
-   not run.
+1. **Contract** — state observable acceptance conditions and the smallest
+   coherent scope. Record assumptions only when ambiguity affects behavior.
+2. **Inspect** — find the relevant callers, tests, configuration, and public
+   contracts. Do not perform a repository-wide orientation for a known area.
+3. **Implement** — write complete code and update the tests that exercise the
+   changed behavior. Do not leave stubs or placeholder completion claims.
+4. **Iterate narrowly** — run the smallest useful reproduction and affected
+   tests while the candidate is changing.
+5. **Verify once stable** — run one final check set proportionate to risk.
+   Use the full suite only for cross-cutting changes, formal gates, releases,
+   or an explicit user request.
+6. **Report briefly** — name changed files, checks that ran, and remaining
+   risk. Never claim an unrun check passed.
 
-## Rules
+## Coordination
 
-- A task is not done until its tests pass and the verification evidence is
-  written down.
-- Use the project's declared recipes (`.pi/workbench/recipes.yaml`) for
-  project commands when the active Pi mode requires them.
-- If a requirement turns out to be ambiguous, state the assumption you
-  implemented.
-- Do not commit, push, or publish unless explicitly asked.
+- Use this as the single primary development skill. Add at most one domain
+  specialist unless distinct task phases genuinely require more.
+- Obey the active project's AGENTS and runtime write-authority contract. In a
+  pi-dev-workbench product project, fixed Sol -> Luna delivery is mandatory;
+  this skill neither duplicates nor weakens that authority.
+- Use `skill:debugging-workflow` only after an actual failure and
+  `skill:validation-ladder` only for a formal verdict, not routine feedback.
+- Do not commit, push, publish, or release unless explicitly asked.
 
-## Fixed Sol -> Luna execution
+## Conditional references
 
-- Sol owns requirements, acceptance criteria, cross-cutting architecture,
-  approved paths, review, and the final verdict. Routine source, test, and
-  documentation writes in DEV belong to one bounded Luna delegation.
-- Use one bounded delegation call for a coherent implementation slice. Complete delivery is
-  reviewed and closed automatically; explicit review/status is only for
-  incomplete coverage, conflict, or recovery. A worker report is never
-  acceptance.
-- Sol may edit/write directly only through an active user-issued temporary
-  lease bounded by paths, tools, calls, and time. This is an explicit
-  exception, never the routine path, and never authorizes bash.
-- Use focused tests during development. Run final gates once on a stable
-  candidate when task or release risk requires them.
-
-## Details
-
-- See [references/contract-and-scope.md](references/contract-and-scope.md)
-  for turning requirements into acceptance criteria and mapping impact.
-- See [references/verification-evidence.md](references/verification-evidence.md)
-  for what counts as verification evidence and how to record it.
-- See [references/risk-reporting.md](references/risk-reporting.md) for
-  reporting remaining risk honestly.
-- Use `skill:validation-ladder` when reporting verification verdicts.
+- Read [references/contract-and-scope.md](references/contract-and-scope.md)
+  only when scope or compatibility is unclear.
+- Read [references/verification-evidence.md](references/verification-evidence.md)
+  only when formal evidence must be recorded.
+- Read [references/risk-reporting.md](references/risk-reporting.md) only for
+  a non-trivial residual-risk report.

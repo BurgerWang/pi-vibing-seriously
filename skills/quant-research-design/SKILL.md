@@ -1,57 +1,38 @@
 ---
 name: quant-research-design
-description: Design a quantitative research project before writing code — hypothesis, universe, period, frequency, data requirements, benchmark, evaluation plan, and documentation. Use at the start of any research task (stock selection, market timing, or data study).
+description: Route and design substantive mid/low-frequency quantitative research. Use for a research hypothesis, universe, benchmark, evaluation protocol, or selection/timing study; do not use for ordinary software changes.
 ---
 
 # Quant Research Design
 
-Goal: a written research plan that states what will be tested, on what data,
-against what benchmark, and how success will be judged — BEFORE any backtest
-code is written.
+Create the smallest research contract that makes the claim testable before
+writing or changing research code.
 
-## Scope
+## Contract
 
-This skill covers research design and evaluation planning for mid/low-
-frequency quantitative research: stock selection, market timing, data
-studies, and backtesting. Design and validation of exchange execution
-infrastructure is out of scope.
+Record the hypothesis, point-in-time universe, period and frequency, required
+data, benchmark, metrics, segmentation, adoption rule, and reproducible output.
+High-frequency execution infrastructure is out of scope.
 
-## Steps
+## Route only the current phase
 
-1. **Hypothesis** — one falsifiable statement: "feature X (as defined, at
-   time T) predicts relative return over horizon H". Write the definition
-   down; an undefined feature cannot be tested.
-2. **Universe and period** — which instruments, over which dates, at what
-   frequency. Define the universe point-in-time, not today's list.
-3. **Data requirements** — list every dataset needed, its resolution, and
-   its point-in-time availability. If the data cannot be obtained
-   point-in-time, say so before designing around it.
-4. **Benchmark** — choose a benchmark that matches the universe and the
-   strategy's exposure (see references). A strategy without a benchmark
-   cannot be evaluated.
-5. **Evaluation plan** — metrics, data segmentation (in-sample /
-   out-of-sample / walk-forward), and the decision rule in advance. Decide
-   how parameters will be chosen and validated BEFORE running experiments
-   (see `skill:experiment-validation`).
-6. **Document** — write the plan into the project (research notes or a
-   design doc). The plan is a living contract: changes to it are
-   deliberate, recorded changes.
+Load at most the specialist needed now; do not preload the whole research
+stack:
 
-## Rules
+- data trust → `skill:market-data-integrity`
+- cross-sectional selection → `skill:stock-selection-research`
+- time-series timing → `skill:market-timing-research`
+- backtest correctness → `skill:backtest-integrity`
+- tuning or research claims → `skill:experiment-validation`
+- final research write-up → `skill:strategy-reporting`
 
-- Design decisions come before code; changing the hypothesis after seeing
-  results is a different experiment and must be labeled as such.
-- State the assumptions (data vendor behavior, survivorship handling,
-  cost model) explicitly.
-- Never let the benchmark, period, or universe be chosen after the fact to
-  flatter results.
+Use ordinary `skill:implementation-workflow` for code changes after the
+research contract is clear. Re-route only when the task actually enters a new
+phase.
 
-## Details
+## Conditional references
 
-- See [references/research-plan.md](references/research-plan.md) for the
-  plan template and per-section checklists.
-- See [references/evaluation-plan.md](references/evaluation-plan.md) for
-  benchmark choice, metrics, and data segmentation.
-- Data quality is assumed by the design but verified by
-  `skill:market-data-integrity`; backtest correctness by
-  `skill:backtest-integrity`.
+- Open [references/research-plan.md](references/research-plan.md) only when a
+  durable research plan is requested or missing.
+- Open [references/evaluation-plan.md](references/evaluation-plan.md) only
+  when the benchmark, metrics, segmentation, or adoption rule is unsettled.

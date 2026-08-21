@@ -1,12 +1,13 @@
 ---
 name: cli-product-development
-description: Build command-line tools and scripts with product quality — predictable interface, disciplined stdout/stderr, exit codes, help text, config, and end-to-end tests. Use when creating or improving any CLI, script, or command-line product.
+description: "Explicit specialist for a user-facing CLI contract: flags, arguments, stdout/stderr, exit codes, help text, configuration, and process-level tests. Use in addition to the primary implementation workflow only when CLI behavior is in scope."
+disable-model-invocation: true
 ---
 
 # CLI Product Development
 
-Goal: a command-line tool that behaves predictably, fails informatively, and
-is testable — not a script that happens to work once.
+Goal: make the CLI boundary predictable without repeating the general
+implementation workflow.
 
 ## Principles
 
@@ -25,19 +26,9 @@ is testable — not a script that happens to work once.
 6. **Determinism** — same input, same output. No hidden dependence on cwd,
    locale, or environment unless documented.
 
-## Process
+## Conditional references
 
-1. Contract: subcommands, flags, inputs, outputs, exit codes.
-2. Implement the interface first (parse → run → render), then the logic.
-3. Test end-to-end: invoke the built binary with arguments; assert stdout,
-   stderr, and exit code separately.
-4. Verify help text, error paths, and the documented examples.
-
-## Details
-
-- See [references/interface-checklist.md](references/interface-checklist.md)
-  for flags, help, config, and stream discipline checklists.
-- See [references/cli-testing.md](references/cli-testing.md) for
-  end-to-end CLI test patterns.
-- Use `skill:implementation-workflow` for the implementation steps and
-  `skill:handoff-and-release` when shipping the tool.
+- Read [references/interface-checklist.md](references/interface-checklist.md)
+  only when designing or changing the public interface.
+- Read [references/cli-testing.md](references/cli-testing.md) only when the
+  project lacks an established CLI test pattern.

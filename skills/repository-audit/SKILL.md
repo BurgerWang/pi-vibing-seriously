@@ -1,21 +1,19 @@
 ---
 name: repository-audit
-description: Systematic read-only audit of code or repository state — collect evidence, classify findings as confirmed/probable/unknown, assign severity, and suggest fixes without applying them. Use when reviewing an existing codebase, a merge request, or a claim that code "looks fine".
+description: Primary read-only workflow for an audit or code review. Inspect the requested scope, report evidence-backed findings by severity and confidence, and do not apply fixes unless the user also requests implementation.
 ---
 
 # Repository Audit
 
-Goal: a defensible findings report. Everything is evidence-backed, nothing is
-changed. This skill is for review; use `skill:implementation-workflow` when
-the task is to change code, and `skill:validation-ladder` when the task is to
-verify specific claims.
+Goal: a concise, defensible findings report for the requested scope.
 
 ## Process
 
 1. **Scope** — state what is audited (paths, commits, or claims) and what is
    out of scope. Audit only that scope.
-2. **Collect evidence** — read the code and run read-only commands. Record
-   exact file paths, line numbers, and command output for every finding.
+2. **Collect evidence** — read the relevant code and run bounded read-only
+   checks. Cite the strongest evidence for each finding; do not dump all
+   command output.
 3. **Classify** — every finding is one of:
    - **confirmed** — directly observed (code path, output, file content);
    - **probable** — strongly implied by evidence but not directly observed
@@ -24,7 +22,9 @@ verify specific claims.
      resolve it).
 4. **Assign severity** — high / medium / low, with a one-line justification
    (impact, likelihood, blast radius).
-5. **Suggest fixes** — prose only. Never apply them during the audit.
+5. **Suggest fixes** — prose only for an audit-only request. If the user asks
+   to audit and fix, finish the audit phase and then switch once to
+   `skill:implementation-workflow` for confirmed findings.
 6. **Report coverage** — list what was checked and what was NOT checked
    (NOT_RUN). An audit that does not state its coverage invites false trust.
 
@@ -32,14 +32,13 @@ verify specific claims.
 
 - Read-only: no edits, no writes, no mutating commands.
 - A claim without evidence is not a finding — it is an open question.
-- Do not fix while auditing; fixing changes the thing under review.
+- Do not mix edits into the evidence-collection phase.
 - Distinguish "the code does X" (observed) from "the code should do Y"
   (judgment) — both are useful, but label them differently.
 
-## Details
+## Conditional references
 
-- See [references/audit-checklist.md](references/audit-checklist.md) for the
-  systematic checklist (build, tests, config, dependencies, error handling,
-  dead code, documentation drift).
-- See [references/findings-report.md](references/findings-report.md) for the
-  report format and classification rules.
+- Read [references/audit-checklist.md](references/audit-checklist.md) only for
+  a repository-wide or cross-cutting audit.
+- Read [references/findings-report.md](references/findings-report.md) only
+  when several findings need a formal report.

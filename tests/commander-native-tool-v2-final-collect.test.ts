@@ -236,6 +236,7 @@ import { cp, link, lstat, mkdir, readFile, readdir, rm, symlink, writeFile } fro
 import { basename, dirname, join, resolve } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { gunzipSync } from "node:zlib";
 
 import { withTempDir } from "./helpers.ts";
 
@@ -1772,12 +1773,26 @@ test("preflight: privacy — errors carry fixed child basenames only, never root
 
 /** Repository root — read-only real-tree references only (frozen bundle copy, package.json pin). */
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const FROZEN_BUNDLE_SNAPSHOT = join(REPO_ROOT, "fixtures", "commander-native-tool-non-treatment.snapshot.gz.b64");
 
-/** Byte-copy the frozen bundle; the root AGENTS bytes come from the historical generic template, never the live repository policy. */
+const FROZEN_BUNDLE_ROWS = gunzipSync(Buffer.from(readFileSync(FROZEN_BUNDLE_SNAPSHOT, "utf8").replace(/\s+/g, ""), "base64"))
+	.toString("utf8")
+	.trimEnd()
+	.split("\n")
+	.map((row) => {
+		const separator = row.indexOf("\t");
+		assert.ok(separator > 0, "frozen bundle snapshot row must contain a path and bytes");
+		const path = row.slice(0, separator);
+		assert.match(path, /^(?:AGENTS\.md|skills\/.+|prompts\/.+|templates\/.+)$/, "frozen bundle snapshot path");
+		return { path, bytes: Buffer.from(row.slice(separator + 1), "base64") };
+	});
+
+/** Materialize the historical frozen bundle, never the evolving live product resources. */
 async function makeBundleCopy(projectRoot: string): Promise<void> {
-	await cp(join(REPO_ROOT, "templates", "project", "AGENTS.generic.md"), join(projectRoot, "AGENTS.md"));
-	for (const dir of ["skills", "prompts", "templates"] as const) {
-		await cp(join(REPO_ROOT, dir), join(projectRoot, dir), { recursive: true });
+	for (const row of FROZEN_BUNDLE_ROWS) {
+		const target = join(projectRoot, ...row.path.split("/"));
+		await mkdir(dirname(target), { recursive: true });
+		await writeFile(target, row.bytes);
 	}
 }
 

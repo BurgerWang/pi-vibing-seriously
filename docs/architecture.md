@@ -1315,7 +1315,8 @@ run/cache/gate/delegation artifacts or execution counts.
 - P0 bootstrap (modes, commands, status, skills, templates, tests)
 - P1 project config, `/q-init`, declarative recipes, run records + redaction,
   VERIFY without free bash
-- P2 skills (7 general + 7 quant), prompt templates, project templates
+- P2 skills (5 default workflow/router skills + 9 explicit specialists),
+  concise prompt templates, project templates, and conditional references
 - P3 gate engine (B0-B5/Q0-Q5), evidence artifacts, quant-result contract
 - P4 TUI status/widget, run reports, run comparison, tool renderers, JSON
   artifact snapshots
@@ -1468,9 +1469,10 @@ run/cache/gate/delegation artifacts or execution counts.
 kind. Current DEV behavior is fixed Sol -> Luna: routine writes are delegated,
 direct Sol edit/write requires the bounded temporary lease, a successful v2
   delegation auto-reviews and closes, and B6 is presented as Development
-  Safety. Historical records remain readable for compatibility; q-build,
-  the implementation skill, and generated project AGENTS files all state the
-  fixed Sol -> Luna responsibility split.
+  Safety. Historical records remain readable for compatibility. Generated
+  project AGENTS files own the complete fixed Sol -> Luna policy; q-build and
+  the implementation skill carry a mandatory pointer without duplicating the
+  lease and review clauses in every prompt.
 - P8 (this release): safe nested project support — optional `project.yaml`
   `project_dir` (default `.`) resolved after config load into the safe
   effective project root (`core/config.ts`: absolute-path, `..`-escape and

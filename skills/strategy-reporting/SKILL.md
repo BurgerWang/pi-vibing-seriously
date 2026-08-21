@@ -1,42 +1,20 @@
 ---
 name: strategy-reporting
-description: Write a strategy research report — objective, data, methodology, results vs benchmark, risk, turnover, robustness, limitations, and reproducibility. Use when presenting research results or writing results into the project.
+description: Explicit specialist for the final quantitative strategy report. Load from quant-research-design only when research results are ready to present or persist.
+disable-model-invocation: true
 ---
 
 # Strategy Reporting
 
-Goal: a report that lets a reader (including future you) judge the claim,
-reproduce the numbers, and see the limitations — without needing to ask.
+Report the objective, data and universe, methodology, execution and costs,
+strategy versus benchmark results, risk and drawdowns, turnover, robustness,
+limitations, and exact reproduction path. Include gross and net results,
+define metrics, and show out-of-sample evidence and all relevant trials rather
+than only the best result.
 
-## Structure
+## Conditional references
 
-1. **Objective** — the hypothesis and the decision rule from the research
-   plan (`skill:quant-research-design`).
-2. **Data** — sources, universe, period, frequency, adjustment and
-   survivorship conventions (`skill:market-data-integrity`).
-3. **Methodology** — signal, portfolio rule, rebalance semantics,
-   execution and cost conventions (`skill:backtest-integrity`).
-4. **Results** — strategy vs benchmark: returns, risk, drawdowns,
-   turnover, net of costs, per sub-period and per regime.
-5. **Robustness** — walk-forward/out-of-sample results, parameter
-   stability, trials count and selection rule
-   (`skill:experiment-validation`).
-6. **Limitations** — what could invalidate the results: data gaps, cost
-   assumptions, regime dependence, capacity.
-7. **Reproducibility** — the exact commands/recipes (or a script path)
-   that regenerate every number.
-
-## Rules
-
-- Report gross AND net (of costs) results.
-- Report the benchmark's numbers next to the strategy's — a strategy
-  number without its benchmark is a fragment.
-- Every metric is defined (see references); no undefined jargon.
-- Limitations are a required section, not an optional confession.
-
-## Details
-
-- See [references/report-checklist.md](references/report-checklist.md) for
-  the report checklist.
-- See [references/performance-metrics.md](references/performance-metrics.md)
-  for metric definitions and comparison discipline.
+- Use [references/report-checklist.md](references/report-checklist.md) for a
+  formal deliverable.
+- Use [references/performance-metrics.md](references/performance-metrics.md)
+  only when metric definitions or comparison discipline are needed.

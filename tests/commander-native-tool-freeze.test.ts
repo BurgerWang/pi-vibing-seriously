@@ -5,8 +5,8 @@
  * Machine-checks every frozen fact the benchmark relies on, independently
  * of the benchmark runner:
  *  - the four production content pins (milestone prompt, fixture-manifest,
- *    non-treatment bundle, rubric) are independently recomputed from the
- *    current files and asserted equal to the frozen FROZEN_NRO_PROTOCOL
+ *    frozen non-treatment manifest, rubric) are independently recomputed
+ *    and asserted equal to the frozen FROZEN_NRO_PROTOCOL
  *  - the frozen benchmark's root AGENTS.md bytes come from the generic
  *    template snapshot, independently of the live repository workflow file
  *  - inputs/ has exactly the four pinned direct children
@@ -61,20 +61,21 @@ async function manifestHashOf(baseDir: string, relFiles: string[]): Promise<stri
 	return sha256Hex(rows.map((r) => `${r}\n`).join(""));
 }
 
-async function currentBundleHash(): Promise<string> {
-	const rows = [`AGENTS.md:${sha256Hex(await readFile(join(ROOT, "templates", "project", "AGENTS.generic.md")))}`];
-	for (const sub of ["skills", "prompts", "templates"]) {
-		for (const rel of await walkRel(join(ROOT, sub), sub)) {
-			rows.push(`${rel}:${sha256Hex(await readFile(join(ROOT, ...rel.split("/"))))}`);
-		}
-	}
-	return sha256Hex(rows.sort().map((row) => `${row}\n`).join(""));
+async function frozenBundleManifest(): Promise<string> {
+	const manifest = await readFile(FROZEN_NON_TREATMENT_MANIFEST, "utf8");
+	assert.ok(manifest.endsWith("\n"), "frozen non-treatment manifest must have a terminal newline");
+	const rows = manifest.slice(0, -1).split("\n");
+	assert.equal(rows.length, 70, "frozen non-treatment manifest row count");
+	for (const row of rows) assert.match(row, /^[^:\r\n]+:[0-9a-f]{64}$/, `invalid frozen manifest row: ${row}`);
+	assert.deepEqual(rows, [...rows].sort(), "frozen non-treatment manifest must be byte-sorted");
+	assert.equal(new Set(rows.map((row) => row.slice(0, row.lastIndexOf(":")))).size, rows.length, "frozen manifest paths must be unique");
+	return manifest;
 }
 
 test("production protocol is frozen: the four content pins reproduce the frozen inputs", async () => {
 	const milestone = sha256Hex(await readFile(join(INPUTS, "milestone-prompt.txt")));
 	const fixture = await manifestHashOf(FIXTURE, await walkRel(FIXTURE, ""));
-	const bundle = await currentBundleHash();
+	const bundle = sha256Hex(await frozenBundleManifest());
 	const rubric = sha256Hex(await readFile(join(INPUTS, "rubric.json")));
 
 	// Independent recomputation must reproduce the frozen production pins.
@@ -132,6 +133,7 @@ const ROOT = process.cwd();
 const INPUTS = join(ROOT, "fixtures", "commander-native-tool-benchmark", "inputs");
 const FIXTURE = join(INPUTS, "fixture");
 const SEARCH = join(FIXTURE, "search");
+const FROZEN_NON_TREATMENT_MANIFEST = join(ROOT, "docs", "baselines", "commander-native-tool-non-treatment-manifest.txt");
 
 const NEEDLE = "needle";
 
@@ -195,9 +197,10 @@ function isIgnored(p: string): boolean {
 	return segs[0] === "search" && segs[1] === "ignored";
 }
 
-test("the historical benchmark uses the frozen generic AGENTS snapshot, not the live repository workflow", async () => {
-	const bundle = await currentBundleHash();
-	assert.equal(bundle, FROZEN_NRO_PROTOCOL.nonTreatmentSha256);
+test("the historical benchmark uses its frozen manifest, not evolving live skills or templates", async () => {
+	const manifest = await frozenBundleManifest();
+	assert.equal(sha256Hex(manifest), FROZEN_NRO_PROTOCOL.nonTreatmentSha256);
+	assert.ok(manifest.includes("AGENTS.md:6636351df9762a9fb64ecc759b25387eeacdfed2cc0e3219bf1b8e124638b950"));
 });
 
 test("inputs has exactly the four pinned direct children", async () => {

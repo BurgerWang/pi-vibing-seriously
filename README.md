@@ -103,6 +103,10 @@ they are not an active worker selector.
 ## What ships
 
 - Pi-native commands, tools, skills, prompts, and compact TUI status.
+- Five concise default workflow/router skills; nine orientation, release, CLI,
+  and research specialists remain available explicitly without inflating every
+  model prompt. Detailed references load only when the current question needs
+  them.
 - Shell-free recipe definitions with contained paths and redacted run records.
 - Base gates `b0–b6` and quant gates `q0–q5`.
 - Bounded file reads, run pages, comparisons, gate output, diff reviews, and
@@ -114,7 +118,7 @@ they are not an active worker selector.
 
 ## Measured evidence
 
-- Current full check: **2,398 passed, 0 failed, 1 intentional skip**.
+- Current full check: **2,404 passed, 0 failed, 1 intentional skip**.
 - Formal context/output stress: **101/101 acceptance checks passed**.
 - Frozen native read/grep cohort: median gross tokens **−76.72%**, successful
   inline bytes **−89.46%**, and requests **−30%** versus its control arm.

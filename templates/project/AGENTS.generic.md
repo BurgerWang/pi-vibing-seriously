@@ -1,30 +1,13 @@
 # AGENTS — pi-dev-workbench generic profile
 
-Guidance for AI agents working in this repository.
+## Operating contract
 
-## Mode discipline
-
-- The project runs under the workbench mode policy: AUDIT (read-only),
-  DEV (implement), VERIFY (re-verify only).
-- Project commands run through declared workbench recipes
-  (`.pi/workbench/recipes.yaml`) — never improvise shell commands in VERIFY.
-
-## Working style
-
-1. **Orient first.** Before touching code, map the repository: entry points,
-   dependencies, test runner, configuration, and git state. Record file paths
-   as evidence.
-2. **Contract before code.** Restate the task as acceptance criteria and list
-   the files you will change before editing.
-3. **Real implementation.** No stubs, no TODO shells, no placeholder commits.
-   A change is not done until its tests pass.
-4. **Tests travel with code.** Add or update tests for every behavior change
-   and run them.
-5. **Verify, then report.** Run the project's declared verification recipes
-   (typecheck, tests, build). Report exact commands, results, and remaining
-   risks. Never claim a check passed that did not run.
-6. **Evidence over assertion.** Cite file paths, line numbers, and command
-   output. If you cannot verify something, say so.
+- AUDIT is read-only, DEV implements, and VERIFY re-checks a stable candidate.
+- In VERIFY, run project commands only through declared workbench recipes.
+- Implement complete behavior with tests; never claim a check that did not run.
+- Use focused tests while iterating. Run final gates once on a stable candidate
+  only when task or release risk requires them; no edit triggers an automatic
+  full suite.
 
 ## Fixed Sol -> Luna execution
 
@@ -36,23 +19,23 @@ Guidance for AI agents working in this repository.
   review/status is only for incomplete coverage, conflict, or recovery. A
   worker report is never acceptance.
 - Sol may edit/write directly only through an active user-issued temporary
-  lease bounded by paths, tools, calls, and time. This is an explicit
-  exception for bootstrap, worker unavailability, security emergencies, or
-  user direction; it is never the routine path and never authorizes bash.
-- Use focused tests during development. Run final gates once on a stable
-  candidate when task or release risk requires them.
+  lease bounded by paths, tools, calls, and time. It is an exceptional path
+  and never authorizes bash.
 
-## Skills
+## Efficient skill routing
 
-- `skill:repository-orientation` — start of work in an unexplored repository
-- `skill:implementation-workflow` — any implementation task
-- `skill:debugging-workflow` — any failure or unexpected behavior
-- `skill:validation-ladder` — any verification or review verdict
-- `skill:repository-audit` — systematic read-only review of code or repository
-- `skill:cli-product-development` — command-line tools and scripts
-- `skill:handoff-and-release` — handoff notes, changelog, release prep
+Use one primary skill and add at most one specialist when its subject is
+actually in scope:
+
+- `skill:implementation-workflow` — ordinary implementation
+- `skill:debugging-workflow` — a reproduced failure
+- `skill:repository-audit` — read-only audit or review
+- `skill:validation-ladder` — formal acceptance, gate, or release verdict
+
+Orientation, CLI, handoff, and research specialists are explicit on-demand
+tools, not automatic prerequisites. Read their references only when the
+current question needs the extra detail.
 
 ## Handoff
 
-Before handing off work: summarize what changed, how to verify it, what was
-deliberately not done, and known limitations.
+Briefly state what changed, what ran, what did not run, and remaining risk.
