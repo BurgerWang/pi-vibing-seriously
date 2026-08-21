@@ -14,6 +14,7 @@ import {
 	buildDelegationCommittedArtifactsV2,
 	deriveDelegationPersistedReportV2,
 	type DelegationBoundedTaskContractBindingV2,
+	type DelegationArtifactErrorCode,
 } from "./delegation-transaction-artifacts.ts";
 import {
 	MAX_ERROR_MESSAGE_CHARS,
@@ -148,6 +149,8 @@ interface DelegationExecutionV2Common {
 	after?: DelegationWorkspaceAfterFactsV2;
 	result?: DelegationExecutionMachineResultV2;
 	workerSummary?: LedgerWorkerSummaryRecord;
+	/** Bounded builder category; raw builder messages are never exposed. */
+	artifact_error_code?: DelegationArtifactErrorCode | "internal_error";
 }
 
 export type DelegationExecutionV2Result =
@@ -628,18 +631,24 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 			secrets: checked.secrets,
 		});
 	} catch {
-		state = await attemptRecovery(checked, state, input.clock, storageOptions, "committed artifact construction failed");
+		const artifactErrorCode = "internal_error" as const;
+		state = await attemptRecovery(checked, state, input.clock, storageOptions,
+			`committed artifact construction failed: ${artifactErrorCode}`);
 		const safeAfter = cloneAfterIfSafe(after);
 		return failure("artifact_failed", checked, input, {
 			durable_state: state,
+			artifact_error_code: artifactErrorCode,
 			...(safeAfter === undefined ? {} : { after: safeAfter }),
 		});
 	}
 	if (!artifacts.ok) {
-		state = await attemptRecovery(checked, state, input.clock, storageOptions, "committed artifact construction failed");
+		const artifactErrorCode = artifacts.error.code;
+		state = await attemptRecovery(checked, state, input.clock, storageOptions,
+			`committed artifact construction failed: ${artifactErrorCode}`);
 		const safeAfter = cloneAfterIfSafe(after);
 		return failure("artifact_failed", checked, input, {
 			durable_state: state,
+			artifact_error_code: artifactErrorCode,
 			...(safeAfter === undefined ? {} : { after: safeAfter }),
 		});
 	}

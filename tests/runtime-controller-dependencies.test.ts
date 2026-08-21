@@ -180,6 +180,7 @@ test("delegate controller refuses unavailable repair authority before execution"
 				legacyCalls += 1;
 				return null;
 			},
+			readRecoverableUnpublished: async () => ({ ok: false, error: { code: "not_recoverable" } }),
 			executeDelegation: async () => {
 				executionCalls += 1;
 				throw new Error("must not execute");
@@ -227,10 +228,65 @@ test("delegate controller refuses unavailable repair authority before execution"
 	assert.equal(executionCalls, 0);
 });
 
+test("delegate controller exposes only the bounded artifact builder category", async () => {
+	const fixed = new Date("2026-08-21T03:04:05.000Z");
+	const controller = {
+		services: {
+			now: () => fixed,
+			makeDelegationId: () => "20260821-030405-W1r2",
+			readCommittedGeneration: async () => ({ ok: false, error: { code: "not_found" } }),
+			readRecoverableUnpublished: async () => ({ ok: false, error: { code: "not_recoverable" } }),
+			readLegacyLedger: async () => null,
+			executeDelegation: async () => ({
+				ok: false,
+				code: "artifact_failed",
+				artifact_error_code: "invalid_facts",
+				durable_state: { status: "RECOVERY_REQUIRED", postcondition_reasons: [] },
+			}),
+			completeDefaultDelivery: async () => { throw new Error("must not deliver"); },
+			buildTrustedRecoveryAuthority: async () => undefined,
+		},
+		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+		secrets: [],
+		trustedOrError: () => undefined,
+		projectRootFor: async () => "/project",
+		reconcileProjectAuthority: async () => true,
+		getProjectAuthorityBlockReason: () => undefined,
+		collectCurrentDelegationBinding: async () => ({ status: "fresh", hash: "a".repeat(64) }),
+		projectTerminalReviewedBinding: async () => null,
+		getDelegationState: () => emptyDelegationState(),
+		setDelegationState: () => {},
+		persistDelegationState: () => {},
+		persistDelegationStateStrict: () => {},
+		markTerminalMirrorBlocked: () => {},
+		refreshStatus: async () => {},
+		bindTrustedIngressAuthority: () => undefined,
+		rememberTrustedIngressAuthority: () => {},
+	} as unknown as Omit<DelegateToolController<unknown>, "pi">;
+	const tool = captureRegistration(registerDelegateTool, controller);
+
+	await assert.rejects(
+		tool.execute("delegate-artifact", {
+			task: "Implement the bounded change.",
+			task_kind: "implementation",
+			allowed_paths: ["src/**"],
+			acceptance_criteria: ["The change is implemented."],
+			verification: [],
+			timeout_seconds: 60,
+		}, undefined, undefined, context()),
+		(error: unknown) => {
+			assert.match(String(error), /artifact_failed; artifact_error=invalid_facts; durable_status=RECOVERY_REQUIRED/);
+			assert.doesNotMatch(String(error), /private|path|worker facts conflict/);
+			return true;
+		},
+	);
+});
+
 test("production controller service bundle is immutable and complete", () => {
 	assert.ok(Object.isFrozen(RUNTIME_CONTROLLER_SERVICES));
 	for (const services of Object.values(RUNTIME_CONTROLLER_SERVICES)) assert.ok(Object.isFrozen(services));
 	assert.equal(typeof RUNTIME_CONTROLLER_SERVICES.delegate.now, "function");
+	assert.equal(typeof RUNTIME_CONTROLLER_SERVICES.delegate.readRecoverableUnpublished, "function");
 	assert.equal(typeof RUNTIME_CONTROLLER_SERVICES.review.reviewV2, "function");
 	assert.equal(typeof RUNTIME_CONTROLLER_SERVICES.compare.compareRuns, "function");
 	assert.equal(typeof RUNTIME_CONTROLLER_SERVICES.recovery.recoverReceipt, "function");

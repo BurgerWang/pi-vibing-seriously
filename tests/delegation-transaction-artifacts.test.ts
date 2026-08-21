@@ -154,8 +154,8 @@ function lifecycle(
 		schema_version: 2, kind: "file", path, byte_size: 7, sha256: "2".repeat(64),
 		stat: { dev: "1", ino: "2", mtime_ns: "3", ctime_ns: "4" },
 	};
-	const beforePresent: StreamingPathIdentity = {
-		...present, sha256: "1".repeat(64),
+	const middle: StreamingPathIdentity = {
+		...present, byte_size: 5, sha256: "3".repeat(64),
 		stat: { ...present.stat, mtime_ns: "2", ctime_ns: "2" },
 	};
 	const limits = {
@@ -166,14 +166,20 @@ function lifecycle(
 		schema_version: 2, delegation_id: ID, contract_hash: contractHash, state: "OPEN", revision: 0,
 		limits, meter: { paths_attempted: 0, paths_completed: 0, bytes_read: 0 }, operations: [], journal_hash: null,
 	};
-	const operations = kind === "implementation" ? [{
-		sequence: 1, operation_id: "1".repeat(64), kind: "write" as const, path, status: "completed" as const,
-		before: beforePresent, after: present, outcome: "succeeded" as const,
-	}] : [];
+	const operations = kind === "implementation" ? [
+		{
+			sequence: 1, operation_id: "1".repeat(64), kind: "write" as const, path, status: "completed" as const,
+			before: missing, after: middle, outcome: "succeeded" as const,
+		},
+		{
+			sequence: 2, operation_id: "2".repeat(64), kind: "edit" as const, path, status: "completed" as const,
+			before: middle, after: present, outcome: "succeeded" as const,
+		},
+	] : [];
 	const sealedBase: WorkerWriteJournalRecord = {
-		...open, state: "SEALED", revision: kind === "implementation" ? 3 : 1,
+		...open, state: "SEALED", revision: kind === "implementation" ? 5 : 1,
 		meter: kind === "implementation"
-			? { paths_attempted: 2, paths_completed: 2, bytes_read: 14 }
+			? { paths_attempted: 4, paths_completed: 4, bytes_read: 17 }
 			: { paths_attempted: 0, paths_completed: 0, bytes_read: 0 },
 		operations, journal_hash: "0".repeat(64),
 	};
@@ -287,6 +293,9 @@ test("artifact v2: implementation builds deterministic exact records without mut
 	const first = buildDelegationCommittedArtifactsV2(input);
 	const second = buildDelegationCommittedArtifactsV2(input);
 	assert.equal(first.ok, true);
+	assert.deepEqual(input.before.pathDigests, {}, "create-then-edit keeps the original missing before authority");
+	assert.equal(changeSetLifecycle.change_set.worker_delta[0]?.operation_count, 2);
+	assert.equal(changeSetLifecycle.change_set.worker_delta[0]?.before.kind, "missing");
 	assert.deepEqual(first, second);
 	assert.deepEqual(input, snapshot);
 	if (!first.ok) return;
@@ -318,6 +327,10 @@ test("artifact v2: tagged W file digests require exact ChangeSet keys and bytes"
 		{ "src/changed.ts": "f".repeat(64) },
 		{ "src/changed.ts": "2".repeat(64), "src/extra.ts": "e".repeat(64) },
 	];
+	const invalidBeforeVariants: Array<Record<string, string>> = [
+		{ "src/changed.ts": "f".repeat(64) },
+		{ "src/extra.ts": "e".repeat(64) },
+	];
 	for (const pathDigests of variants) {
 		const afterFacts = { ...workspace.after, pathDigests };
 		const built = buildDelegationCommittedArtifactsV2({
@@ -326,7 +339,7 @@ test("artifact v2: tagged W file digests require exact ChangeSet keys and bytes"
 		});
 		assert.equal(built.ok, false);
 	}
-	for (const pathDigests of variants) {
+	for (const pathDigests of invalidBeforeVariants) {
 		const beforeFacts = { ...workspace.before, pathDigests };
 		const built = buildDelegationCommittedArtifactsV2({
 			transaction: state, contract: contract.value, before: beforeFacts, after: workspace.after,

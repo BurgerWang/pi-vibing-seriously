@@ -194,6 +194,37 @@ async function journalWorker(
 	return { ...structuredClone(result), writeJournalObservation: observation };
 }
 
+async function createThenEditWorker(
+	projectRoot: string,
+	delegationId: string,
+	contractHash: string,
+	path: string,
+	result: WorkerRunResult,
+): Promise<WorkerRunResult> {
+	let revision = 0;
+	for (const [index, kind] of (["write", "edit"] as const).entries()) {
+		const operationId = (index + 1).toString(16).padStart(64, "a");
+		const begun = await beginWriteJournalOperation({
+			project_root: projectRoot, delegation_id: delegationId, contract_hash: contractHash,
+			expected_revision: revision, operation_id: operationId, kind, path,
+		});
+		if (!begun.ok) throw new Error(`journal begin failed:${begun.error.code}`);
+		revision = begun.value.revision;
+		await mkdir(dirname(join(projectRoot, path)), { recursive: true });
+		await writeFile(join(projectRoot, path), index === 0 ? "first worker version\n" : "final worker version\n");
+		const completed = await completeWriteJournalOperation({
+			project_root: projectRoot, delegation_id: delegationId, contract_hash: contractHash,
+			expected_revision: revision, operation_id: operationId, kind, path, outcome: "succeeded",
+		});
+		if (!completed.ok) throw new Error(`journal completion failed:${completed.error.code}`);
+		revision = completed.value.revision;
+	}
+	return {
+		...structuredClone(result),
+		writeJournalObservation: Object.freeze({ state: "complete", tool: "edit", outcome: "succeeded", code: "none", revision }),
+	};
+}
+
 async function input(
 	projectRoot: string,
 	delegationId: string,
@@ -264,6 +295,59 @@ test("execution v2: implementation commits PENDING_REVIEW and strict reader retu
 		workerIdentity: executionInput.workerIdentity,
 		secrets: executionInput.secrets,
 	});
+});
+
+test("execution v2: create then edit the same new file commits with missing pre-worker authority", async (t) => {
+	const projectRoot = await root(t);
+	const delegationId = id(30);
+	const path = "src/repeated-new.ts";
+	const bound = contract("implementation");
+	const report = completeReport([path]);
+	const before = await collectGitFacts(projectRoot, realExec);
+	const result = await executeDelegationV2({
+		projectRoot,
+		delegationId,
+		contract: bound,
+		before,
+		workerIdentity: { ...WORKER_IDENTITY },
+		clock: clock(),
+		exec: realExec,
+		runWorker: async () => createThenEditWorker(projectRoot, delegationId, bound.contract_hash, path, worker(report)),
+	});
+	assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result));
+	const committed = await readDelegationCommittedGenerationV2(projectRoot, delegationId);
+	assert.equal(committed.ok, true, committed.ok ? "" : committed.error.code);
+	if (!committed.ok) return;
+	const scope = committed.value.records["scope.json"] as Record<string, any>;
+	const beforeRecord = committed.value.records["before.json"] as Record<string, any>;
+	assert.equal(scope.change_set.worker_delta[0]?.before.kind, "missing");
+	assert.equal(scope.change_set.worker_delta[0]?.operation_count, 2);
+	assert.deepEqual(beforeRecord.path_digests, {});
+});
+
+test("execution v2: artifact failure preserves a bounded builder category in result and durable recovery", async (t) => {
+	const projectRoot = await root(t);
+	const delegationId = id(31);
+	const path = "src/invalid-worker-facts.ts";
+	const report = completeReport([path]);
+	const inconsistent = worker(report, {
+		spendState: { turns: 99, totalTokens: 160, outputTokens: 40 },
+	});
+	const result = await executeDelegationV2(await input(
+		projectRoot,
+		delegationId,
+		"implementation",
+		after([path]),
+		inconsistent,
+	));
+	assert.equal(result.ok, false);
+	if (result.ok) return;
+	assert.equal(result.code, "artifact_failed");
+	assert.equal(result.artifact_error_code, "binding_conflict");
+	assert.equal(result.durable_state?.status, "RECOVERY_REQUIRED");
+	assert.equal(result.durable_state?.committed_proof, null);
+	assert.equal(result.durable_state?.recovery_reason, "committed artifact construction failed: binding_conflict");
+	assert.doesNotMatch(JSON.stringify(result), /worker facts conflict with the pinned transaction outcome/);
 });
 
 test("execution v2 passes its checked delegation and contract identity to the injected runner", async (t) => {

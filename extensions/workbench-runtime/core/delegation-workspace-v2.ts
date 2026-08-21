@@ -134,16 +134,13 @@ export function deriveFinalizedDelegationWorkspaceFactsV2(
 		}
 
 		const workerPaths = finalized.change_set.worker_delta.map((entry) => entry.path);
-		const firstBefore = new Map<string, string>();
-		for (const operation of finalized.sealed_journal.operations) {
-			if (operation.status !== "completed" || !workerPaths.includes(operation.path)
-				|| firstBefore.has(operation.path) || operation.before.kind !== "file") continue;
-			firstBefore.set(operation.path, operation.before.sha256);
-		}
 		const beforeDigests: Record<string, string> = {};
-		for (const path of workerPaths) {
-			const digest = firstBefore.get(path);
-			if (digest !== undefined) beforeDigests[path] = digest;
+		for (const entry of finalized.change_set.worker_delta) {
+			// ChangeSet already binds each path to the first journal operation.
+			// Reading a later file-valued `before` after an initial `missing`
+			// would turn an intermediate worker version into false pre-worker
+			// authority for newly-created files.
+			if (entry.before.kind === "file") beforeDigests[entry.path] = entry.before.sha256;
 		}
 		const afterDigests: Record<string, string> = {};
 		for (const entry of finalized.change_set.worker_delta) {

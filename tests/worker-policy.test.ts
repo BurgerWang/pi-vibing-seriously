@@ -452,8 +452,10 @@ test("worker-delegation documentation defines fixed Sol/Luna boundaries and stri
 	assert.match(doc, /immutable final artifact/);
 	// Strict repair provenance and legacy compatibility allow a v1 read only
 	// for a true v2 not-found result; invalid v2 authority remains blocking.
-	assert.match(doc, /Only terminal v2 states `FAILED`,\s+`FINISHED`, or `REVIEWED` are referenceable/);
-	assert.match(doc, /Only a strict v2 `not_found` result permits the historical\s+read-only fallback/);
+	assert.match(doc, /Terminal v2 states `FAILED`,\s+`FINISHED`, or `REVIEWED` are referenceable/);
+	assert.match(doc, /one narrow recovery\s+exception for an unpublished artifact-construction failure/);
+	assert.match(doc, /explicit `repair_of` may then start a fresh repair and supersede the blocking\s+session mirror/);
+	assert.match(doc, /Only a strict\s+v2 `not_found` result permits the historical\s+read-only fallback/);
 	assert.match(doc, /pending, corrupt, unknown-[\s\S]*version[\s\S]*fails closed and never falls\s+back to v1/);
 	assert.match(doc, /v1 `manifest\.json`\/ledger\/review readers remain historical read-only\s+compatibility/);
 	assert.match(doc, /New public delegations never write v1/);

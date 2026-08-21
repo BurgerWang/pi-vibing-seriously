@@ -25,6 +25,7 @@ import { DELEGATION_WORKSPACE_DIFF_IDENTITY_KIND_V2 } from "./delegation-workspa
 import { readReviewRecord, type ReviewRecord } from "./diff-review.ts";
 import { collectReviewRelevanceV2, computeReviewRelevanceConflictHashV2 } from "./review-relevance-v2.ts";
 import { validateWorkspaceGuard, type WorkspaceGuardRecord } from "./workspace-guard.ts";
+import { readWorkerWriteJournal, type WorkerWriteJournalRecord } from "./write-journal.ts";
 
 /** Bound discovery work so a hostile artifacts directory cannot stall startup. */
 export const MAX_PROJECT_DELEGATION_ENTRIES_V2 = 10_000 as const;
@@ -75,6 +76,27 @@ export interface ProjectDelegationAuthorityIssueV2 {
 export type ReconcileProjectDelegationAuthorityV2Result =
 	| { ok: false; issue: ProjectDelegationAuthorityIssueV2 }
 	| { ok: true; state: DelegationState | null };
+
+export type RecoverableUnpublishedDelegationV2Result =
+	| {
+		ok: true;
+		value: {
+			transaction: DelegationTransactionRecord;
+			journal: WorkerWriteJournalRecord;
+		};
+	}
+	| { ok: false; error: { code: "not_found" | "not_recoverable" | "invalid_record" | "storage_failure" } };
+
+const RECOVERABLE_ARTIFACT_FAILURE_REASONS = new Set([
+	"committed artifact construction failed",
+	"committed artifact construction failed: invalid_contract",
+	"committed artifact construction failed: invalid_state",
+	"committed artifact construction failed: binding_conflict",
+	"committed artifact construction failed: invalid_facts",
+	"committed artifact construction failed: invalid_report",
+	"committed artifact construction failed: record_too_large",
+	"committed artifact construction failed: internal_error",
+]);
 
 function failure(
 	code: ProjectDelegationAuthorityErrorCodeV2,
@@ -164,6 +186,76 @@ export async function readLatestProjectDelegationTransactionV2(
 		}
 	}
 	return { ok: true, value: null };
+}
+
+/**
+ * Strictly recognize the one unpublished recovery shape that may be
+ * superseded by an explicit `repair_of` delegation.  The old transaction and
+ * sealed journal remain immutable evidence; this helper never marks them as
+ * reviewed and never reconstructs missing worker/report facts.
+ */
+export async function readRecoverableUnpublishedDelegationV2(
+	projectRoot: string,
+	delegationId: string,
+): Promise<RecoverableUnpublishedDelegationV2Result> {
+	const transaction = await readDelegationTransactionV2(projectRoot, delegationId);
+	if (!transaction.ok) {
+		return {
+			ok: false,
+			error: {
+				code: transaction.error.code === "not_found"
+					? "not_found"
+					: transaction.error.code === "storage_failure"
+						? "storage_failure"
+						: "invalid_record",
+			},
+		};
+	}
+	const state = transaction.value;
+	const outcome = state.terminal_outcome;
+	if (state.status !== "RECOVERY_REQUIRED" || state.revision !== 3 || state.committed_proof !== null ||
+		state.review !== null || outcome === null || !outcome.terminal_facts_complete || !outcome.scope_complete ||
+		state.recovery_reason === null || !RECOVERABLE_ARTIFACT_FAILURE_REASONS.has(state.recovery_reason)) {
+		return { ok: false, error: { code: "not_recoverable" } };
+	}
+
+	const journal = await readWorkerWriteJournal({
+		project_root: projectRoot,
+		delegation_id: delegationId,
+		contract_hash: state.contract_hash,
+	});
+	if (!journal.ok) {
+		return {
+			ok: false,
+			error: {
+				code: journal.error.code === "not_found"
+					? "not_found"
+					: journal.error.code === "storage_failure"
+						? "storage_failure"
+						: "invalid_record",
+			},
+		};
+	}
+	if (journal.value.state !== "SEALED" || journal.value.journal_hash === null ||
+		journal.value.operations.some((operation) => operation.status !== "completed")) {
+		return { ok: false, error: { code: "not_recoverable" } };
+	}
+
+	const generations = join(delegationsDir(projectRoot), delegationId, "v2", "generations");
+	try {
+		const stat = await lstat(generations);
+		if (!stat.isDirectory() || stat.isSymbolicLink()) {
+			return { ok: false, error: { code: "invalid_record" } };
+		}
+		if ((await readdir(generations)).length !== 0) {
+			return { ok: false, error: { code: "not_recoverable" } };
+		}
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+			return { ok: false, error: { code: "storage_failure" } };
+		}
+	}
+	return { ok: true, value: { transaction: state, journal: journal.value } };
 }
 
 /** Map durable transaction state to the session-level blocking disposition. */

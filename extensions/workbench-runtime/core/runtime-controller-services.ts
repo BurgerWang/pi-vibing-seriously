@@ -7,7 +7,11 @@ import { makeDelegationId, readDelegationLedger } from "./delegation-ledger.ts";
 import { reviewDelegationV2 } from "./delegation-review-v2.ts";
 import { readDelegationCommittedGenerationV2 } from "./delegation-transaction-storage.ts";
 import { reviewDelegation } from "./diff-review.ts";
-import { collectCurrentDelegationBindingV2, reconcileProjectDelegationAuthorityV2 } from "./delegation-project-authority.ts";
+import {
+	collectCurrentDelegationBindingV2,
+	readRecoverableUnpublishedDelegationV2,
+	reconcileProjectDelegationAuthorityV2,
+} from "./delegation-project-authority.ts";
 import { recoverReceipt } from "./tool-result-recovery.ts";
 import { buildTrustedRecoveryAuthority } from "./trusted-recovery-authority.ts";
 import type { CompareToolServices } from "./compare-tool-controller.ts";
@@ -23,6 +27,7 @@ const delegate = Object.freeze({
 	now,
 	makeDelegationId,
 	readCommittedGeneration: readDelegationCommittedGenerationV2,
+	readRecoverableUnpublished: readRecoverableUnpublishedDelegationV2,
 	readLegacyLedger: readDelegationLedger,
 	executeDelegation: executeDelegationV2,
 	completeDefaultDelivery: completeDefaultDelegationDeliveryV2,

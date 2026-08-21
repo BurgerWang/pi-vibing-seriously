@@ -6,8 +6,15 @@ import type { ExecFn } from "./config.ts";
 import type { completeDefaultDelegationDeliveryV2 } from "./delegation-default-delivery.ts";
 import type { executeDelegationV2 } from "./delegation-execution-v2.ts";
 import type { makeDelegationId, readDelegationLedger } from "./delegation-ledger.ts";
-import { observeDiffChange, recordDelegation, reviewBlockReason, type DelegationState } from "./delegation-state.ts";
+import {
+	observeDiffChange,
+	recordDelegation,
+	recordRepairDelegation,
+	reviewBlockReason,
+	type DelegationState,
+} from "./delegation-state.ts";
 import { normalizeDelegationBoundedTaskContractV2 } from "./delegation-transaction-artifacts.ts";
+import type { readRecoverableUnpublishedDelegationV2 } from "./delegation-project-authority.ts";
 import type { readDelegationCommittedGenerationV2 } from "./delegation-transaction-storage.ts";
 import { WORKBENCH_TOOL_METADATA, WORKBENCH_TOOL_PARAMETERS } from "./tool-catalog.ts";
 import type { buildTrustedRecoveryAuthority } from "./trusted-recovery-authority.ts";
@@ -50,6 +57,7 @@ export interface DelegateToolServices {
 	now(): Date;
 	makeDelegationId: typeof makeDelegationId;
 	readCommittedGeneration: typeof readDelegationCommittedGenerationV2;
+	readRecoverableUnpublished: typeof readRecoverableUnpublishedDelegationV2;
 	readLegacyLedger: typeof readDelegationLedger;
 	executeDelegation: typeof executeDelegationV2;
 	completeDefaultDelivery: typeof completeDefaultDelegationDeliveryV2;
@@ -87,6 +95,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 				const projectBlock = controller.getProjectAuthorityBlockReason("delegation");
 				if (projectBlock) throw new Error(`workbench_delegate_worker: ${projectBlock}`);
 
+				let recoverableRepairOf: string | undefined;
 				if (contract.value.repair_of !== undefined) {
 					const repairId = contract.value.repair_of;
 					const priorV2 = await controller.services.readCommittedGeneration(projectRoot, repairId);
@@ -99,6 +108,12 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 						if (priorV1 === null || priorV1.manifest.status !== "finished" || priorV1.after === null) {
 							throw new Error(`workbench_delegate_worker: repair_of ${repairId} does not reference a finished delegation authority`);
 						}
+					} else if (priorV2.error.code === "invalid_record") {
+						const recoverable = await controller.services.readRecoverableUnpublished(projectRoot, repairId);
+						if (!recoverable.ok) {
+							throw new Error(`workbench_delegate_worker: repair_of ${repairId} unpublished v2 authority is ${recoverable.error.code}`);
+						}
+						recoverableRepairOf = repairId;
 					} else {
 						throw new Error(`workbench_delegate_worker: repair_of ${repairId} v2 authority is ${priorV2.error.code}`);
 					}
@@ -118,8 +133,12 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 						currentState = observedState;
 					}
 				}
+				const exactRecoveryRepair = recoverableRepairOf !== undefined && currentState.latestId === recoverableRepairOf;
 				const reviewBlock = reviewBlockReason(currentState, "delegation");
-				if (reviewBlock) throw new Error(`workbench_delegate_worker: ${reviewBlock}`);
+				if (reviewBlock && !exactRecoveryRepair) throw new Error(`workbench_delegate_worker: ${reviewBlock}`);
+				if (recoverableRepairOf !== undefined && !exactRecoveryRepair) {
+					throw new Error(`workbench_delegate_worker: repair_of ${recoverableRepairOf} is not the latest blocking delegation`);
+				}
 
 				const delegationId = controller.services.makeDelegationId(controller.services.now());
 				const execution = await controller.services.executeDelegation({
@@ -135,12 +154,19 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					signal,
 					exec: controller.exec,
 					clock: () => controller.services.now().toISOString(),
-					onPrepared: (_transaction, preparedBefore) => {
-						const recorded = recordDelegation(controller.getDelegationState(), {
+					onPrepared: async (_transaction, preparedBefore) => {
+						if (recoverableRepairOf !== undefined) {
+							const revalidated = await controller.services.readRecoverableUnpublished(projectRoot, recoverableRepairOf);
+							if (!revalidated.ok) throw new Error("recoverable repair authority changed before worker launch");
+						}
+						const recordInput = {
 							id: delegationId,
 							diffHash: preparedBefore.diffHash,
 							now: startedAt,
-						});
+						};
+						const recorded = recoverableRepairOf === undefined
+							? recordDelegation(controller.getDelegationState(), recordInput)
+							: recordRepairDelegation(controller.getDelegationState(), recordInput, recoverableRepairOf);
 						if (!recorded.ok) throw new Error("delegation session mirror refused PREPARED");
 						controller.setDelegationState(recorded.state);
 						controller.persistDelegationStateStrict(recorded.state);
@@ -202,7 +228,10 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					}
 					const status = execution.durable_state?.status ?? "UNAVAILABLE";
 					const reasons = execution.durable_state?.postcondition_reasons.join(",") || "none";
-					throw new Error(`workbench_delegate_worker: delegation v2 ${execution.code}; durable_status=${status}; postconditions=${reasons}`);
+					const artifactError = execution.artifact_error_code === undefined
+						? ""
+						: `; artifact_error=${execution.artifact_error_code}`;
+					throw new Error(`workbench_delegate_worker: delegation v2 ${execution.code}${artifactError}; durable_status=${status}; postconditions=${reasons}`);
 				}
 				const result = execution.result;
 				const handoffSummary = execution.workerSummary;

@@ -67,6 +67,7 @@ function guard(entries: readonly WorkspaceGuardEntry[]): WorkspaceGuardRecord {
 function lifecycle(preDirtyCount = 0, unsafe: "none" | "drift" | "conflict" = "none"):
 	Readonly<FinalizedDelegationChangeSetLifecycleV2> {
 	const beforeW = missing(W);
+	const middleW = file(W, "e".repeat(64), 9, "8");
 	const afterW = file(W);
 	const preDirty = Array.from({ length: preDirtyCount }, (_, index) => {
 		const path = `predirty/${String(index).padStart(3, "0")}.ts`;
@@ -98,18 +99,30 @@ function lifecycle(preDirtyCount = 0, unsafe: "none" | "drift" | "conflict" = "n
 	const sealedBase: WorkerWriteJournalRecord = {
 		...open,
 		state: "SEALED",
-		revision: 3,
-		meter: { paths_attempted: 2, paths_completed: 2, bytes_read: afterW.byte_size },
-		operations: [{
-			sequence: 1,
-			operation_id: "f".repeat(64),
-			kind: "write",
-			path: W,
-			status: "completed",
-			before: beforeW,
-			after: afterW,
-			outcome: "succeeded",
-		}],
+		revision: 5,
+		meter: { paths_attempted: 4, paths_completed: 4, bytes_read: middleW.byte_size * 2 + afterW.byte_size },
+		operations: [
+			{
+				sequence: 1,
+				operation_id: "f".repeat(64),
+				kind: "write",
+				path: W,
+				status: "completed",
+				before: beforeW,
+				after: middleW,
+				outcome: "succeeded",
+			},
+			{
+				sequence: 2,
+				operation_id: "1".repeat(64),
+				kind: "edit",
+				path: W,
+				status: "completed",
+				before: middleW,
+				after: afterW,
+				outcome: "succeeded",
+			},
+		],
 		journal_hash: "0".repeat(64),
 	};
 	const sealed = { ...sealedBase, journal_hash: computeWorkerWriteJournalHash(sealedBase) };
@@ -157,10 +170,11 @@ test("0 vs 200 pre-dirty paths never add source-content reads and after exposes 
 		assert.equal(result.ok, true);
 		if (!result.ok) continue;
 		assert.deepEqual(result.value.after.changedPaths, [W]);
+		assert.deepEqual(result.value.before.pathDigests, {}, "a newly-created path has no pre-worker digest even after later edits");
 		assert.deepEqual(Object.keys(result.value.after.pathDigests), [W]);
 		assert.equal(source.prepared.before_guard.meter.content_bytes_read, 0);
 		assert.equal(source.after_guard.meter.content_bytes_read, 0);
-		assert.equal(source.sealed_journal.meter.bytes_read + source.change_set.finalization_meter.bytes_read, 22);
+		assert.equal(source.sealed_journal.meter.bytes_read + source.change_set.finalization_meter.bytes_read, 40);
 	}
 });
 

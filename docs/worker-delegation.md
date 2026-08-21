@@ -145,13 +145,19 @@ provenance only, never a resume:
   scope. The parent task itself must carry the bounded root-cause/failure
   evidence; the pointer adds none.
 - **Strict v2-first authority:** the runtime first strict-reads the prior
-  delegation's committed v2 authority. Only terminal v2 states `FAILED`,
-  `FINISHED`, or `REVIEWED` are referenceable. A pending, corrupt, unknown-
-  version, or otherwise invalid v2 authority fails closed and never falls
-  back to v1. Only a strict v2 `not_found` result permits the historical
-  read-only fallback, which accepts a finished v1 manifest with its `after`
-  record. This check finishes BEFORE any new v2 transaction is prepared or
-  any worker is launched.
+  delegation's committed v2 authority. Terminal v2 states `FAILED`,
+  `FINISHED`, or `REVIEWED` are referenceable. There is one narrow recovery
+  exception for an unpublished artifact-construction failure: the prior
+  transaction must be exactly `RECOVERY_REQUIRED` with complete terminal and
+  scope facts, `committed_proof=null`, an exact bounded artifact error reason,
+  a strict complete `SEALED` write journal, and no published generation. An
+  explicit `repair_of` may then start a fresh repair and supersede the blocking
+  session mirror; it never marks the old delegation reviewed and never rewrites
+  its transaction or journal. Other pending, corrupt, unknown-version, or
+  invalid v2 authority fails closed and never falls back to v1. Only a strict
+  v2 `not_found` result permits the historical read-only fallback, which
+  accepts a finished v1 manifest with its `after` record. This check finishes
+  BEFORE any new v2 transaction is prepared or any worker is launched.
 - **What is not inherited:** the fresh worker inherits no prior report
   (`worker-report.md`), no prior summary, no prior session, no prior
   allowed paths/scope, and no prior contract fields. `repair_of` never

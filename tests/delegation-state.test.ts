@@ -29,6 +29,7 @@ import {
 	observeDiffChange,
 	recordBlockedWriteAttempt,
 	recordDelegation,
+	recordRepairDelegation,
 	restoreDelegationState,
 	reviewBlockReason,
 	serializeDelegationState,
@@ -99,6 +100,20 @@ test("a pending or stale review blocks the next delegation; REVIEWED allows it",
 	assert.equal(next.status, "PENDING_REVIEW");
 	assert.equal(next.currentDiffHash, DIFF_B);
 	assert.equal(next.reviewedDiffHash, undefined, "a new delegation clears the previously reviewed hash");
+});
+
+test("an exact explicit repair may supersede only its latest blocking delegation", () => {
+	const pending = recordOk(emptyDelegationState(), "broken-1", DIFF_A);
+	const repaired = recordRepairDelegation(pending, { id: "repair-1", diffHash: DIFF_B, now: LATER }, "broken-1");
+	assert.equal(repaired.ok, true);
+	if (repaired.ok) {
+		assert.equal(repaired.state.latestId, "repair-1");
+		assert.equal(repaired.state.status, "PENDING_REVIEW");
+		assert.equal(repaired.state.currentDiffHash, DIFF_B);
+	}
+	assert.equal(recordRepairDelegation(pending, { id: "repair-2", diffHash: DIFF_B, now: LATER }, "other").ok, false);
+	assert.equal(recordRepairDelegation(reviewedOk(pending), { id: "repair-2", diffHash: DIFF_B, now: LATER }, "broken-1").ok, false);
+	assert.equal(recordRepairDelegation(pending, { id: "broken-1", diffHash: DIFF_B, now: LATER }, "broken-1").ok, false);
 });
 
 // ---------------------------------------------------------------------------

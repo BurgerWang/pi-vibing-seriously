@@ -8,13 +8,18 @@ import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import {
 	projectDelegationDispositionV2,
 	readLatestProjectDelegationTransactionV2,
+	readRecoverableUnpublishedDelegationV2,
 } from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
 import {
 	persistAbortedDelegationTransaction,
+	persistCommittingDelegationTransaction,
 	persistPreparedDelegationTransaction,
+	persistRecoveryRequiredDelegationTransaction,
+	persistRunningDelegationTransaction,
 } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
 import type { DelegationTransactionRecord } from "../extensions/workbench-runtime/core/delegation-transaction.ts";
 import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtime/core/worker-policy.ts";
+import { createWorkerWriteJournal, sealWorkerWriteJournal } from "../extensions/workbench-runtime/core/write-journal.ts";
 import { withTempDir } from "./helpers.ts";
 
 const HASH = "a".repeat(64);
@@ -39,6 +44,58 @@ async function prepared(root: string, id: string, second: number): Promise<Deleg
 	});
 	if (!result.ok) throw new Error(result.error.code);
 	return result.value;
+}
+
+async function recoverableUnpublished(root: string, id: string): Promise<DelegationTransactionRecord> {
+	const initial = await prepared(root, id, 0);
+	const journal = await createWorkerWriteJournal({
+		project_root: root,
+		delegation_id: id,
+		contract_hash: initial.contract_hash,
+	});
+	if (!journal.ok) throw new Error(journal.error.code);
+	const sealed = await sealWorkerWriteJournal({
+		project_root: root,
+		delegation_id: id,
+		contract_hash: initial.contract_hash,
+		expected_revision: journal.value.revision,
+	});
+	if (!sealed.ok) throw new Error(sealed.error.code);
+	const cas = (state: DelegationTransactionRecord, second: number) => ({
+		delegation_id: state.delegation_id,
+		contract_hash: state.contract_hash,
+		worker_identity: state.worker_identity,
+		expected_generation: state.generation,
+		expected_revision: state.revision,
+		now: at(second),
+	});
+	const running = await persistRunningDelegationTransaction(root, cas(initial, 1));
+	if (!running.ok) throw new Error(running.error.code);
+	const committing = await persistCommittingDelegationTransaction(root, {
+		...cas(running.value, 2),
+		outcome: {
+			delegation_id: id,
+			task_kind: "implementation",
+			worker_identity: initial.worker_identity,
+			provider_success: true,
+			exit_code: 0,
+			report_complete: true,
+			terminal_facts_complete: true,
+			scope_complete: true,
+			change_set_status: "ATTRIBUTED",
+			changed_paths: [],
+			successful_write_count: 0,
+			denied_write_count: 0,
+			delta_hash: "b".repeat(64),
+		},
+	});
+	if (!committing.ok) throw new Error(committing.error.code);
+	const recovery = await persistRecoveryRequiredDelegationTransaction(root, {
+		...cas(committing.value, 3),
+		reason: "committed artifact construction failed",
+	});
+	if (!recovery.ok) throw new Error(recovery.error.code);
+	return recovery.value;
 }
 
 test("project authority discovery returns null when no delegation root exists", async () => {
@@ -104,5 +161,25 @@ test("project authority rejects a valid-id symlink and classifies durable blocki
 		if (aborted.ok) {
 			assert.deepEqual(projectDelegationDispositionV2(aborted.value), { blocking: false, terminal_verdict: "FAIL" });
 		}
+	});
+});
+
+test("only an exact proof-null artifact failure with a sealed journal is recoverable by repair_of", async () => {
+	await withTempDir(async (root) => {
+		const id = "20260820-100003-rp01";
+		const recovery = await recoverableUnpublished(root, id);
+		assert.equal(recovery.status, "RECOVERY_REQUIRED");
+		assert.equal(recovery.committed_proof, null);
+		const accepted = await readRecoverableUnpublishedDelegationV2(root, id);
+		assert.equal(accepted.ok, true, accepted.ok ? "" : accepted.error.code);
+		if (accepted.ok) {
+			assert.equal(accepted.value.transaction.delegation_id, id);
+			assert.equal(accepted.value.journal.state, "SEALED");
+		}
+
+		const generations = join(root, CONFIG_DIR_NAME, "workbench", "delegations", id, "v2", "generations");
+		await mkdir(join(generations, "g00000001"), { recursive: true });
+		const refused = await readRecoverableUnpublishedDelegationV2(root, id);
+		assert.deepEqual(refused, { ok: false, error: { code: "not_recoverable" } });
 	});
 });

@@ -16,6 +16,7 @@ import {
 import workbenchRuntime from "../extensions/workbench-runtime/index.ts";
 import {
 	persistAbortedDelegationTransaction,
+	persistCommittingDelegationTransaction,
 	persistPreparedDelegationTransaction,
 	persistRecoveryRequiredDelegationTransaction,
 	persistRunningDelegationTransaction,
@@ -40,6 +41,7 @@ import {
 	WORKER_TASK_KIND_ENV,
 } from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { WORKER_SPEND_PROFILE_ENV } from "../extensions/workbench-runtime/core/worker-spend.ts";
+import { createWorkerWriteJournal, sealWorkerWriteJournal } from "../extensions/workbench-runtime/core/write-journal.ts";
 import { spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
 
 interface StubAPI {
@@ -243,6 +245,50 @@ async function seedProjectAuthorityRecovery(root: string, id: string): Promise<D
 	const recovery = await persistRecoveryRequiredDelegationTransaction(root, {
 		...projectAuthorityCas(running.value, 2),
 		reason: "bounded recovery evidence",
+	});
+	if (!recovery.ok) throw new Error(recovery.error.code);
+	return recovery.value;
+}
+
+async function seedArtifactConstructionRecovery(root: string, id: string): Promise<DelegationTransactionRecord> {
+	const prepared = await seedProjectAuthorityPrepared(root, id);
+	const journal = await createWorkerWriteJournal({
+		project_root: root,
+		delegation_id: id,
+		contract_hash: prepared.contract_hash,
+	});
+	if (!journal.ok) throw new Error(journal.error.code);
+	const sealed = await sealWorkerWriteJournal({
+		project_root: root,
+		delegation_id: id,
+		contract_hash: prepared.contract_hash,
+		expected_revision: journal.value.revision,
+	});
+	if (!sealed.ok) throw new Error(sealed.error.code);
+	const running = await persistRunningDelegationTransaction(root, projectAuthorityCas(prepared, 1));
+	if (!running.ok) throw new Error(running.error.code);
+	const committing = await persistCommittingDelegationTransaction(root, {
+		...projectAuthorityCas(running.value, 2),
+		outcome: {
+			delegation_id: id,
+			task_kind: "implementation",
+			worker_identity: prepared.worker_identity,
+			provider_success: true,
+			exit_code: 0,
+			report_complete: true,
+			terminal_facts_complete: true,
+			scope_complete: true,
+			change_set_status: "ATTRIBUTED",
+			changed_paths: [],
+			successful_write_count: 0,
+			denied_write_count: 0,
+			delta_hash: "e".repeat(64),
+		},
+	});
+	if (!committing.ok) throw new Error(committing.error.code);
+	const recovery = await persistRecoveryRequiredDelegationTransaction(root, {
+		...projectAuthorityCas(committing.value, 3),
+		reason: "committed artifact construction failed",
 	});
 	if (!recovery.ok) throw new Error(recovery.error.code);
 	return recovery.value;
@@ -856,6 +902,41 @@ test("RECOVERY_REQUIRED project authority survives a failed session append and b
 		assert.match(resultText(status), /latest\s+: .* PENDING_REVIEW/);
 		assert.doesNotMatch(resultText(status), /authority v2\s+: INVALID/);
 		assert.equal(await readFile(transactionPath, "utf8"), transactionBefore, "reconciliation never rewrites historical transaction authority");
+	});
+});
+
+test("an explicit repair_of safely supersedes an unpublished artifact failure without rewriting it", async () => {
+	await withTempDir(async (root) => {
+		await initializeProject(root);
+		const brokenId = "20260820-170003-artf";
+		const broken = await seedArtifactConstructionRecovery(root, brokenId);
+		assert.equal(broken.status, "RECOVERY_REQUIRED");
+		assert.equal(broken.committed_proof, null);
+		const transactionPath = join(root, CONFIG_DIR_NAME, "workbench", "delegations", brokenId, "v2", "transaction.json");
+		const transactionBefore = await readFile(transactionPath, "utf8");
+
+		const stub = commanderRuntime();
+		const ctx = commanderContext(root, "artifact-repair");
+		await startSession(stub, ctx);
+		assert.equal(latestSessionState(stub).latestId, brokenId);
+		assert.equal(latestSessionState(stub).status, "PENDING_REVIEW");
+
+		const script = await writeFakeWorker(root, {});
+		const repaired = await withFakeWorker(script, () => delegateTool(stub).execute(
+			"artifact-repair-call",
+			delegateParams({ task_kind: "diagnosis", repair_of: brokenId }),
+			undefined,
+			undefined,
+			ctx,
+		));
+		const repairId = delegationId(repaired);
+		assert.notEqual(repairId, brokenId);
+		const committed = await readDelegationCommittedGenerationV2(root, repairId);
+		assert.equal(committed.ok, true, committed.ok ? "" : committed.error.code);
+		if (committed.ok) assert.equal(committed.value.state.status, "FINISHED");
+		assert.equal(latestSessionState(stub).latestId, repairId);
+		assert.equal(latestSessionState(stub).status, "REVIEWED");
+		assert.equal(await readFile(transactionPath, "utf8"), transactionBefore, "the superseded recovery evidence remains immutable");
 	});
 });
 

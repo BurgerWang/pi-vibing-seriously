@@ -144,6 +144,41 @@ export function recordDelegation(
 }
 
 /**
+ * Supersede one exact blocking delegation with an explicitly-bound repair.
+ * The caller must first establish durable recoverability; this pure seam only
+ * prevents a stale session mirror from deadlocking that approved repair.
+ */
+export function recordRepairDelegation(
+	state: DelegationState,
+	input: RecordDelegationInput,
+	repairOf: string,
+): DelegationTransitionResult {
+	const priorId = repairOf.trim();
+	if (!priorId || state.latestId !== priorId || !blocksNextDelegation(state)) {
+		return { ok: false, error: "repair delegation must supersede the exact latest blocking delegation" };
+	}
+	const id = input.id.trim();
+	if (!id || id === priorId || id.length > MAX_ID_LENGTH) {
+		return { ok: false, error: `repair delegation id must be distinct and at most ${MAX_ID_LENGTH} characters` };
+	}
+	const diffHash = input.diffHash.trim();
+	if (!diffHash || diffHash.length > MAX_HASH_LENGTH) {
+		return { ok: false, error: `delegation diff hash must be a non-empty string of at most ${MAX_HASH_LENGTH} characters` };
+	}
+	return {
+		ok: true,
+		state: {
+			latestId: id,
+			status: "PENDING_REVIEW",
+			currentDiffHash: diffHash,
+			reviewedDiffHash: undefined,
+			blockedWriteAttempts: state.blockedWriteAttempts,
+			updatedAt: input.now,
+		},
+	};
+}
+
+/**
  * Mark the current diff as reviewed. Works from PENDING_REVIEW and STALE;
  * REVIEWED is bound to the CURRENT diff hash (reviewedDiffHash is set to
  * it), so REVIEWED always means "the reviewed hash equals the current
