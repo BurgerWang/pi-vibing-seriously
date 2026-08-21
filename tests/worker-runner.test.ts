@@ -110,7 +110,7 @@ test("runner consumes JSON events, pins model identity, and aggregates usage", a
 		assert.deepEqual(progress, [1, 2]);
 		// Phase 2 cumulative spend facts: every assistant event increments the
 		// spend state exactly once (turns + 1, normalized total/output added).
-		assert.equal(result.spendProfile, WORKER_SPEND_DEFAULT_PROFILE, "omitted profile resolves deterministically to standard");
+		assert.equal(result.spendProfile, WORKER_SPEND_DEFAULT_PROFILE, "omitted profile resolves deterministically to extended");
 		assert.deepEqual(result.spendState, { turns: 2, totalTokens: 70, outputTokens: 10 });
 		assert.equal(result.spendBand, "ok");
 		assert.deepEqual(result.spendReasons, []);
@@ -338,8 +338,8 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 		assert.ok(facts.argv[toolsFlag + 1]?.split(",").includes("edit"));
 		assert.ok(facts.argv[toolsFlag + 1]?.split(",").includes("write"));
 		assert.equal(facts.inheritedModel, null, "parent PI_MODEL must not masquerade as the child model");
-		assert.equal(facts.spendProfile, "standard", "the runner always writes a valid spend profile into the fixed child env contract");
-		assert.equal(result.spendProfile, "standard");
+		assert.equal(facts.spendProfile, "extended", "the runner writes the safe default into the fixed child env contract");
+		assert.equal(result.spendProfile, "extended");
 	});
 });
 
@@ -482,55 +482,56 @@ test("runner rejects malformed task kinds before spawning", async () => {
 	);
 });
 
-test("runner passes an explicit spend profile to the child env and records it on the result", async () => {
+test("runner passes either explicit active spend profile to the child env and result", async () => {
 	const script = `
 const facts = JSON.stringify({ spendProfile: process.env.${WORKER_SPEND_PROFILE_ENV} || null });
 console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "openai-codex", model: "gpt-5.6-luna", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
 `;
 	await withFakeWorker(script, async (invocation, dir) => {
-		const result = await runPinnedWorker({
-			projectRoot: dir,
-			contract: CONTRACT,
-			timeoutMs: 2_000,
-			invocation,
-			spendProfile: "extended",
-		});
-		assertWorkerSucceeded(result);
-		const facts = JSON.parse(result.output) as { spendProfile: string | null };
-		assert.equal(facts.spendProfile, "extended", "the explicit profile travels through the fixed child env contract");
-		assert.equal(result.spendProfile, "extended");
+		for (const profile of ["standard", "extended"] as const) {
+			const result = await runPinnedWorker({
+				projectRoot: dir,
+				contract: CONTRACT,
+				timeoutMs: 2_000,
+				invocation,
+				spendProfile: profile,
+			});
+			assertWorkerSucceeded(result);
+			const facts = JSON.parse(result.output) as { spendProfile: string | null };
+			assert.equal(facts.spendProfile, profile, "the explicit profile travels through the fixed child env contract");
+			assert.equal(result.spendProfile, profile);
+		}
 	});
 });
 
-test("retired low is defensively resolved to standard across task text, child env, and result", async () => {
+test("retired low and malformed internal input resolve to extended across task text, child env, and result", async () => {
 	const script = `
 const facts = JSON.stringify({ spendProfile: process.env.${WORKER_SPEND_PROFILE_ENV} || null, argv: process.argv.slice(2) });
 console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "openai-codex", model: "gpt-5.6-luna", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
 `;
 	await withFakeWorker(script, async (invocation, dir) => {
-		// Direct/internal callers may still carry the retired literal. The
-		// runner must never execute it as low.
-		const result = await runPinnedWorker({
-			projectRoot: dir,
-			contract: { ...CONTRACT, budgetProfile: "low" },
-			timeoutMs: 2_000,
-			invocation,
-			spendProfile: "low",
-		});
-		assertWorkerSucceeded(result);
-		const facts = JSON.parse(result.output) as { spendProfile: string | null; argv: string[] };
-		// The task text (the final child argv element) names the SAME resolved
-		// profile: Phase 5 adds one deterministic informational line that
-		// bounds cumulative spend only and never expands the parent-approved
-		// path/scope authority — enforcement stays in the runner and the
-		// fixed child env contract.
-		const taskText = facts.argv[facts.argv.length - 1] ?? "";
-		const taskProfile = /Worker spend-budget profile: (standard|extended)/.exec(taskText)?.[1];
-		assert.equal(taskProfile, "standard", "task text names the defensive standard profile");
-		assert.match(taskText, /bounds cumulative spend only/, "profile wording bounds cumulative spend only");
-		assert.match(taskText, /never expands parent-approved path\/scope authority/, "profile wording never expands parent-approved path/scope authority");
-		assert.equal(facts.spendProfile, taskProfile, "child env profile equals the task-text profile");
-		assert.equal(result.spendProfile, taskProfile, "result profile equals the task-text profile");
+		for (const invalid of ["low", "malformed"] as const) {
+			// Direct/internal callers may still carry retired or malformed literals.
+			// The runner must never execute either below the safe default.
+			const result = await runPinnedWorker({
+				projectRoot: dir,
+				contract: { ...CONTRACT, budgetProfile: invalid as never },
+				timeoutMs: 2_000,
+				invocation,
+				spendProfile: invalid as never,
+			});
+			assertWorkerSucceeded(result);
+			const facts = JSON.parse(result.output) as { spendProfile: string | null; argv: string[] };
+			// The task text (the final child argv element) names the SAME resolved
+			// profile used by child env and result.
+			const taskText = facts.argv[facts.argv.length - 1] ?? "";
+			const taskProfile = /Worker spend-budget profile: (standard|extended)/.exec(taskText)?.[1];
+			assert.equal(taskProfile, "extended", "task text names the defensive extended profile");
+			assert.match(taskText, /bounds cumulative spend only/, "profile wording bounds cumulative spend only");
+			assert.match(taskText, /never expands parent-approved path\/scope authority/, "profile wording never expands parent-approved path/scope authority");
+			assert.equal(facts.spendProfile, taskProfile, "child env profile equals the task-text profile");
+			assert.equal(result.spendProfile, taskProfile, "result profile equals the task-text profile");
+		}
 	});
 });
 
@@ -867,7 +868,7 @@ test("runner spend: exact soft boundaries never fail (turns/total/output)", asyn
 	// Luna standard soft turns = 32 exactly: band soft, still succeeds.
 	const turnsSoft = Array.from({ length: 32 }, () => assistantEvent()).join("\n");
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${turnsSoft}\n`)});`, async (invocation, dir) => {
-		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "standard" });
 		assertWorkerSucceeded(result);
 		assert.equal(result.spendBand, "soft");
 		assert.deepEqual(result.spendReasons, ["turns"]);
@@ -880,7 +881,7 @@ test("runner spend: exact soft boundaries never fail (turns/total/output)", asyn
 		.map((tokens) => assistantEvent({ usage: usageWith(tokens) }))
 		.join("\n");
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${totalSoft}\n`)});`, async (invocation, dir) => {
-		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "standard" });
 		assertWorkerSucceeded(result);
 		assert.equal(result.spendBand, "soft");
 		assert.deepEqual(result.spendReasons, ["total_tokens"]);
@@ -889,7 +890,7 @@ test("runner spend: exact soft boundaries never fail (turns/total/output)", asyn
 	// Standard soft output = 160,000 exactly (4 x 40,000 output).
 	const outputSoft = Array.from({ length: 4 }, () => assistantEvent({ usage: usageWith(40_030, { output: 40_000 }) })).join("\n");
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${outputSoft}\n`)});`, async (invocation, dir) => {
-		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "standard" });
 		assertWorkerSucceeded(result);
 		assert.equal(result.spendBand, "soft");
 		assert.deepEqual(result.spendReasons, ["output_tokens"]);
@@ -900,7 +901,7 @@ test("runner spend: exact soft boundaries never fail (turns/total/output)", asyn
 test("runner spend: Luna continuation reserve runs from soft 32 through hard 64", async () => {
 	const sixtyThree = Array.from({ length: 63 }, () => assistantEvent()).join("\n");
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${sixtyThree}\n`)});`, async (invocation, dir) => {
-		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "standard" });
 		assertWorkerSucceeded(result);
 		assert.equal(result.spendBand, "soft");
 		assert.deepEqual(result.spendReasons, ["turns"]);
@@ -909,7 +910,7 @@ test("runner spend: Luna continuation reserve runs from soft 32 through hard 64"
 	await withFakeWorker(
 		`process.stdout.write(${JSON.stringify(`${sixtyFour}\n`)}); setInterval(() => {}, 1000);`,
 		async (invocation, dir) => {
-			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "standard" });
 			assert.equal(result.exitCode, 1, "child terminated by the runner at the exact hard turns boundary");
 			assert.equal(result.spendBand, "hard");
 			assert.deepEqual(result.spendReasons, ["turns"]);
@@ -926,7 +927,7 @@ test("runner spend: hard total boundary at exactly 10,880,000; one below stays s
 	// one below the hard total — soft, no failure.
 	const below = [...Array.from({ length: 54 }, () => 200_000), 79_999].map((t) => assistantEvent({ usage: usageWith(t) })).join("\n");
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${below}\n`)});`, async (invocation, dir) => {
-		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "standard" });
 		assertWorkerSucceeded(result);
 		assert.equal(result.spendBand, "soft");
 		assert.deepEqual(result.spendReasons, ["turns", "total_tokens"]);
@@ -937,7 +938,7 @@ test("runner spend: hard total boundary at exactly 10,880,000; one below stays s
 	await withFakeWorker(
 		`process.stdout.write(${JSON.stringify(`${exact}\n`)}); setInterval(() => {}, 1000);`,
 		async (invocation, dir) => {
-			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "standard" });
 			assert.equal(result.exitCode, 1, "child terminated by the runner at the exact hard total boundary");
 			assert.equal(result.spendBand, "hard");
 			assert.deepEqual(result.spendReasons, ["total_tokens"]);
@@ -951,7 +952,7 @@ test("runner spend: hard total boundary at exactly 10,880,000; one below stays s
 test("runner spend: hard output boundary at exactly 320,000; one below stays soft", async () => {
 	const below = [80_000, 80_000, 80_000, 79_999].map((o) => assistantEvent({ usage: usageWith(80_030, { output: o }) })).join("\n");
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${below}\n`)});`, async (invocation, dir) => {
-		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "standard" });
 		assertWorkerSucceeded(result);
 		assert.equal(result.spendBand, "soft");
 		assert.deepEqual(result.spendReasons, ["output_tokens"]);
@@ -961,7 +962,7 @@ test("runner spend: hard output boundary at exactly 320,000; one below stays sof
 	await withFakeWorker(
 		`process.stdout.write(${JSON.stringify(`${exact}\n`)}); setInterval(() => {}, 1000);`,
 		async (invocation, dir) => {
-			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "standard" });
 			assert.equal(result.exitCode, 1, "child terminated by the runner at the exact hard output boundary");
 			assert.equal(result.spendBand, "hard");
 			assert.deepEqual(result.spendReasons, ["output_tokens"]);
@@ -979,7 +980,7 @@ test("runner spend: multi-dimension hard stop lists reasons in the fixed order",
 	await withFakeWorker(
 		`process.stdout.write(${JSON.stringify(`${allHard}\n`)}); setInterval(() => {}, 1000);`,
 		async (invocation, dir) => {
-			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "standard" });
 			assert.equal(result.spendBand, "hard");
 			assert.deepEqual(result.spendReasons, ["turns", "total_tokens", "output_tokens"], "fixed reason order — never alphabetical");
 			assert.deepEqual(result.spendHardExceeded, { turns: true, totalTokens: true, outputTokens: true });
@@ -1001,7 +1002,7 @@ test("runner spend: hard stop fails closed even when the child would exit 0", as
 	// deterministic hard-stop message, outranking the ordinary exit text.
 	const hard = [...Array.from({ length: 54 }, () => 200_000), 80_000].map((total) => assistantEvent({ usage: usageWith(total) })).join("\n");
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${hard}\n`)});`, async (invocation, dir) => {
-		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "standard" });
 		assert.equal(result.spendBand, "hard");
 		assert.deepEqual(result.spendReasons, ["total_tokens"]);
 		assert.equal(result.spendHardExceeded.totalTokens, true);
@@ -1009,13 +1010,16 @@ test("runner spend: hard stop fails closed even when the child would exit 0", as
 	});
 });
 
-test("runner spend: retired low resolves to standard while extended keeps its exact limit", async () => {
+test("runner spend: retired low resolves to extended while both active profiles retain exact limits", async () => {
 	const oneTurn = assistantEvent();
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${oneTurn}\n`)});`, async (invocation, dir) => {
 		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "low" });
-		assert.equal(result.spendProfile, "standard");
+		assert.equal(result.spendProfile, "extended");
 		assert.equal(result.spendBand, "ok");
 		assert.equal(result.spendHardExceeded.turns, false);
+		const standard = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation, spendProfile: "standard" });
+		assert.equal(standard.spendProfile, "standard");
+		assert.equal(standard.spendBand, "ok");
 	});
 	// extended hard turns = 96: the 96th turn terminates the child fail-closed.
 	const extTurns = Array.from({ length: 96 }, () => assistantEvent()).join("\n");
@@ -1218,6 +1222,7 @@ test("progress band transitions ok → soft at the exact soft boundary and match
 			contract: CONTRACT,
 			timeoutMs: 2_000,
 			invocation,
+			spendProfile: "standard",
 			onProgress: (progress) => updates.push({ ...progress }),
 		});
 		assertWorkerSucceeded(result); // soft is a steer, not a failure
@@ -1249,6 +1254,7 @@ test("progress at the exact hard boundary matches the final spend facts (fail-cl
 				contract: CONTRACT,
 				timeoutMs: 2_000,
 				invocation,
+				spendProfile: "standard",
 				onProgress: (progress) => updates.push({ ...progress }),
 			});
 			assert.equal(result.spendBand, "hard");

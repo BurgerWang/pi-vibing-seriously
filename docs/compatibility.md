@@ -214,9 +214,10 @@ records without them parse unchanged and are never rewritten (no
 migration).
 
 The current surface retires `low`: public JSON Schema exposes only
-`standard | extended`, omission still defaults to `standard`, and explicit
+`standard | extended`, omission now defaults to the safe `extended` profile,
+`standard` remains an explicit small-slice selection, and explicit
 `low` fails closed before transaction persistence or worker launch. Runner
-and child-env compatibility maps old/internal `low` input to `standard`.
+and child-env compatibility maps old/internal `low` input to `extended`.
 Frozen governance-v1 catalog/schema/hash evidence is unchanged, and already
 committed v1/v2 `low` records remain strict read/hash compatibility data;
 new committed artifacts cannot carry `low`. This intentional current-schema

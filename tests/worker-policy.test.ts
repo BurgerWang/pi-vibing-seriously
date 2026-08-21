@@ -258,8 +258,8 @@ test("formatted diagnosis task makes inspection-only authority explicit", () => 
 // Phase 3: budget-profile contract validation (worker token-budget repair)
 // ---------------------------------------------------------------------------
 
-test("budget-profile validation resolves omitted to standard and accepts only active profiles", () => {
-	assert.deepEqual(resolveWorkerBudgetProfile(undefined), { ok: true, profile: "standard" });
+test("budget-profile validation resolves omitted to extended and accepts both active profiles", () => {
+	assert.deepEqual(resolveWorkerBudgetProfile(undefined), { ok: true, profile: "extended" });
 	assert.deepEqual(resolveWorkerBudgetProfile("standard"), { ok: true, profile: "standard" });
 	assert.deepEqual(resolveWorkerBudgetProfile("extended"), { ok: true, profile: "extended" });
 	const retired = resolveWorkerBudgetProfile("low");
@@ -297,18 +297,20 @@ test("formatted worker task names the resolved spend profile deterministically (
 		acceptanceCriteria: ["Unit tests cover the new option"],
 		verification: [],
 	};
-	// Omitted budgetProfile resolves deterministically to standard.
-	const standardText = formatWorkerTask(base);
-	assert.match(standardText, /Worker spend-budget profile: standard/);
-	// Retired low is defensively rendered as standard; extended remains explicit.
-	assert.match(formatWorkerTask({ ...base, budgetProfile: "low" }), /Worker spend-budget profile: standard/);
-	const extendedText = formatWorkerTask({ ...base, budgetProfile: "extended" });
+	// Omitted and retired input resolve deterministically to the safe extended default.
+	const extendedText = formatWorkerTask(base);
 	assert.match(extendedText, /Worker spend-budget profile: extended/);
+	assert.match(formatWorkerTask({ ...base, budgetProfile: "low" }), /Worker spend-budget profile: extended/);
+	// Both active profiles remain explicit, including the smaller standard slice.
+	const standardText = formatWorkerTask({ ...base, budgetProfile: "standard" });
+	assert.match(standardText, /Worker spend-budget profile: standard/);
+	const explicitExtendedText = formatWorkerTask({ ...base, budgetProfile: "extended" });
+	assert.match(explicitExtendedText, /Worker spend-budget profile: extended/);
 	// The profile line states the profile bounds spend only — it never
 	// expands the parent-approved path/scope authority (informational
 	// wording; the runner/child env contract enforces the profile and
 	// thresholds are unchanged).
-	for (const text of [standardText, extendedText]) {
+	for (const text of [standardText, extendedText, explicitExtendedText]) {
 		assert.match(text, /bounds cumulative spend only/);
 		assert.match(text, /never expands parent-approved path\/scope authority/);
 	}
@@ -340,6 +342,8 @@ test("delegate-tool metadata codifies direct one-call development delivery", () 
 	const text = [meta.description, meta.promptSnippet, ...meta.promptGuidelines].join("\n");
 	assert.match(text, /normal implementation path/);
 	assert.match(text, /closes the session as REVIEWED in this same call/);
+	assert.match(text, /automatically continues bounded segmented actual-diff review/);
+	assert.match(text, /32-segment safety cap/);
 	assert.match(text, /continue directly to the next development step without calling review or status/);
 	assert.match(text, /concrete task/);
 	assert.match(text, /smallest useful allowed_paths set/);
@@ -354,7 +358,7 @@ test("delegate-tool metadata keeps explicit review out of the ordinary path", ()
 	const text = [meta.description, meta.promptSnippet, ...meta.promptGuidelines].join("\n");
 	assert.match(text, /automatic diff review and session close/);
 	assert.match(text, /Call workbench_review_worker_diff only when/);
-	assert.match(text, /explicit review required, incomplete coverage, a conflict, or a pending\/stale recovery state/);
+	assert.match(text, /explicit review required after a conflict, persistence failure, no-progress condition, the 32-segment safety cap, or a pending\/stale recovery state/);
 	assert.doesNotMatch(text, /after a worker returns: review the actual diff/);
 });
 
@@ -551,7 +555,7 @@ test("formatted worker task carries the repair provenance pointer line only when
 	// unchanged.
 	const without = formatWorkerTask(base);
 	assert.ok(!without.includes("Repair provenance"), "no provenance line when repairOf is omitted");
-	assert.match(without, /Worker spend-budget profile: standard/);
+	assert.match(without, /Worker spend-budget profile: extended/);
 	assert.match(without, /- src\/parser\/\*\*/);
 	assert.match(without, /- Unit tests cover the repaired option/);
 	assert.match(without, /Requested verification:/);
@@ -567,7 +571,7 @@ test("formatted worker task carries the repair provenance pointer line only when
 	for (const path of base.allowedPaths) assert.ok(withRepair.includes(path), `allowed path missing: ${path}`);
 	for (const criterion of base.acceptanceCriteria) assert.ok(withRepair.includes(criterion), `criterion missing: ${criterion}`);
 	for (const step of base.verification) assert.ok(withRepair.includes(step), `verification step missing: ${step}`);
-	assert.match(withRepair, /Worker spend-budget profile: standard/);
+	assert.match(withRepair, /Worker spend-budget profile: extended/);
 	// Adding repairOf changes nothing but the inserted line.
 	assert.equal(
 		withRepair,
@@ -576,7 +580,7 @@ test("formatted worker task carries the repair provenance pointer line only when
 	);
 	// Combined with an explicit budget profile, both lines coexist with the
 	// provenance pointer first and the profile rendering unchanged.
-	const combined = formatWorkerTask({ ...base, repairOf: VALID_REPAIR_ID, budgetProfile: "low" });
+	const combined = formatWorkerTask({ ...base, repairOf: VALID_REPAIR_ID, budgetProfile: "standard" });
 	assert.ok(combined.indexOf("Repair provenance:") < combined.indexOf("Worker spend-budget profile: standard"));
 	assert.match(combined, /Worker spend-budget profile: standard — bounds cumulative spend only/);
 });

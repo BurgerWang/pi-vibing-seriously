@@ -414,7 +414,7 @@ test("worker role sends exactly one hidden soft-budget steer at/above 80%", asyn
 
 	// At the soft threshold (80%): exactly one hidden CONTEXT steer. The
 	// independent cumulative spend state (435,199) stays below the Luna
-	// standard soft total (5,440,000), so no spend steer fires yet.
+	// default extended soft total (10,880,000), so no spend steer fires yet.
 	await handler(messageEndEvent(WORKER_SOFT_BUDGET), ctx);
 	assert.equal(stub.messages.length, 1);
 	const steer = stub.messages[0]!;
@@ -427,10 +427,11 @@ test("worker role sends exactly one hidden soft-budget steer at/above 80%", asyn
 
 	// The context steer is one-shot: further per-message soft/hard context
 	// never re-sends it. The INDEPENDENT spend steer fires exactly once when
-	// the cumulative total first crosses the standard soft limit. Twenty-five
-	// 200,000-token messages keep it at 5,435,199; the next reaches 5,635,199.
-	for (let i = 0; i < 25; i++) await handler(messageEndEvent(200_000), ctx);
-	assert.equal(stub.messages.length, 1, "cumulative spend (5,435,199) still below the standard soft total");
+	// the cumulative total first crosses the default extended soft limit.
+	// Fifty-two 200,000-token messages keep it at 10,835,199; the next reaches
+	// 11,035,199.
+	for (let i = 0; i < 52; i++) await handler(messageEndEvent(200_000), ctx);
+	assert.equal(stub.messages.length, 1, "cumulative spend (10,835,199) still below the extended soft total");
 	await handler(messageEndEvent(200_000), ctx);
 	assert.equal(stub.messages.length, 2, "one context steer + one independent spend steer");
 	const contextSteers = stub.messages.filter((m) => m.customType === WORKER_SOFT_STEER_MESSAGE_TYPE);
@@ -440,8 +441,8 @@ test("worker role sends exactly one hidden soft-budget steer at/above 80%", asyn
 	const spend = spendSteers[0]!;
 	assert.equal(spend.display, false, "spend steer is hidden from the TUI");
 	assert.deepEqual(spend.options, { deliverAs: "steer" });
-	assert.match(spend.content, /profile standard/);
-	assert.match(spend.content, /total_tokens 5635199\/5440000/);
+	assert.match(spend.content, /profile extended/);
+	assert.match(spend.content, /total_tokens 11035199\/10880000/);
 	assert.match(spend.content, /current Sol session/);
 
 	// One-shot again: another soft/hard message re-sends neither steer.
@@ -464,7 +465,7 @@ test("commander session never receives the worker soft-budget steer", async () =
 
 test("worker role sends exactly one hidden cumulative spend steer at the standard soft total boundary", async () => {
 	const stub = makeStub();
-	withWorkerRole(() => workbenchRuntime(stub));
+	withWorkerRoleAndSpendProfile("standard", () => workbenchRuntime(stub));
 	const messageEnd = stub.events.get("message_end");
 	assert.ok(messageEnd && messageEnd.length > 0);
 	const handler = (event: never, ctx: never) => fireMessageEnd(stub, event, ctx);
@@ -495,7 +496,7 @@ test("worker role sends exactly one hidden cumulative spend steer at the standar
 	assert.equal(stub.messages.length, 1, "the spend steer is one-shot");
 });
 
-test("worker role spend steer fires on the turns dimension (low profile, exact soft boundary)", async () => {
+test("worker role maps retired low to extended and steers at the exact soft-turn boundary", async () => {
 	const stub = makeStub();
 	withWorkerRoleAndSpendProfile("low", () => workbenchRuntime(stub));
 	const messageEnd = stub.events.get("message_end");
@@ -503,18 +504,18 @@ test("worker role spend steer fires on the turns dimension (low profile, exact s
 	const handler = (event: never, ctx: never) => fireMessageEnd(stub, event, ctx);
 	const ctx = fakeCtx([]) as never;
 
-	// 7 x 100 tokens: 7 turns stay below the low soft turns limit (8).
-	for (let i = 0; i < 7; i++) await handler(messageEndEvent(100), ctx);
+	// Retired low resolves to extended: 63 turns stay below its soft limit (64).
+	for (let i = 0; i < 63; i++) await handler(messageEndEvent(100), ctx);
 	assert.equal(stub.messages.length, 0);
 
-	// The 8th turn reaches the low soft turns limit exactly: one steer naming
-	// the low profile and the turns dimension.
+	// The 64th turn reaches the extended soft turns limit exactly: one steer
+	// naming the resolved profile and the turns dimension.
 	await handler(messageEndEvent(100), ctx);
 	assert.equal(stub.messages.length, 1);
 	const steer = stub.messages[0]!;
 	assert.equal(steer.customType, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE);
-	assert.match(steer.content, /profile low/);
-	assert.match(steer.content, /turns 8\/8/);
+	assert.match(steer.content, /profile extended/);
+	assert.match(steer.content, /turns 64\/64/);
 
 	// One-shot: two more turns re-send nothing.
 	await handler(messageEndEvent(100), ctx);
@@ -524,7 +525,7 @@ test("worker role spend steer fires on the turns dimension (low profile, exact s
 
 test("worker role spend steer fires on the output dimension at the exact soft boundary", async () => {
 	const stub = makeStub();
-	withWorkerRole(() => workbenchRuntime(stub));
+	withWorkerRoleAndSpendProfile("standard", () => workbenchRuntime(stub));
 	const messageEnd = stub.events.get("message_end");
 	assert.ok(messageEnd && messageEnd.length > 0);
 	const handler = (event: never, ctx: never) => fireMessageEnd(stub, event, ctx);
@@ -545,33 +546,35 @@ test("worker role spend steer fires on the output dimension at the exact soft bo
 	assert.match(steer.content, /output_tokens 160000\/160000/);
 });
 
-test("spend steer remains one-shot from the low-profile soft band through hard", async () => {
+test("retired low fallback keeps the extended spend steer one-shot from soft through hard", async () => {
 	const stub = makeStub();
-	// Low profile: soft total 816,000, hard total 1,632,000. Per-message
-	// totals stay below 217,600 so the context steer never fires.
+	// Retired low resolves to extended: soft total 10,880,000, hard total
+	// 17,408,000. Per-message totals stay below 217,600 so the context steer
+	// never fires.
 	withWorkerRoleAndSpendProfile("low", () => workbenchRuntime(stub));
 	const messageEnd = stub.events.get("message_end");
 	assert.ok(messageEnd && messageEnd.length > 0);
 	const handler = (event: never, ctx: never) => fireMessageEnd(stub, event, ctx);
 	const ctx = fakeCtx([]) as never;
 
-	// Four messages at 200,000: below the low soft total — band ok, no steer.
-	for (let i = 0; i < 4; i++) await handler(messageEndEvent(200_000), ctx);
+	// Fifty-four messages at 200,000: below the extended soft total — band ok,
+	// no steer.
+	for (let i = 0; i < 54; i++) await handler(messageEndEvent(200_000), ctx);
 	assert.equal(stub.messages.length, 0);
 
-	// The fifth message reaches 1,000,000: the first non-ok band is SOFT and
+	// The 55th message reaches 11,000,000: the first non-ok band is SOFT and
 	// triggers one steer.
 	await handler(messageEndEvent(200_000), ctx);
 	assert.equal(stub.messages.length, 1);
 	const steer = stub.messages[0]!;
 	assert.equal(steer.customType, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE);
-	assert.match(steer.content, /profile low/);
-	assert.match(steer.content, /total_tokens 1000000\/816000/, "the steer text renders soft-limit denominators");
-	for (let i = 0; i < 4; i++) await handler(messageEndEvent(200_000), ctx);
+	assert.match(steer.content, /profile extended/);
+	assert.match(steer.content, /total_tokens 11000000\/10880000/, "the steer text renders soft-limit denominators");
+	for (let i = 0; i < 33; i++) await handler(messageEndEvent(200_000), ctx);
 	assert.equal(stub.messages.length, 1, "one-shot even after the band becomes hard");
 });
 
-test("malformed spend-profile env falls back to standard defensively", async () => {
+test("malformed spend-profile env falls back to extended defensively", async () => {
 	const stub = makeStub();
 	withWorkerRoleAndSpendProfile("bogus-profile", () => workbenchRuntime(stub));
 	const messageEnd = stub.events.get("message_end");
@@ -579,11 +582,11 @@ test("malformed spend-profile env falls back to standard defensively", async () 
 	const handler = (event: never, ctx: never) => fireMessageEnd(stub, event, ctx);
 	const ctx = fakeCtx([]) as never;
 
-	// 32 x 170,000 = 5,440,000: the STANDARD soft total boundary.
-	for (let i = 0; i < 32; i++) await handler(messageEndEvent(170_000), ctx);
+	// 64 x 170,000 = 10,880,000: the EXTENDED soft total boundary.
+	for (let i = 0; i < 64; i++) await handler(messageEndEvent(170_000), ctx);
 	assert.equal(stub.messages.length, 1);
 	assert.equal(stub.messages[0]!.customType, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE);
-	assert.match(stub.messages[0]!.content, /profile standard/);
+	assert.match(stub.messages[0]!.content, /profile extended/);
 });
 
 test("commander session never receives the spend steer even with a profile env set", async () => {
@@ -607,7 +610,7 @@ test("commander session never receives the spend steer even with a profile env s
 
 test("a spend steer send failure is swallowed and never breaks a model request", async () => {
 	const stub = makeStub();
-	withWorkerRole(() => workbenchRuntime(stub));
+	withWorkerRoleAndSpendProfile("standard", () => workbenchRuntime(stub));
 	const originalSend = stub.sendMessage;
 	stub.sendMessage = ((
 		message: Parameters<typeof stub.sendMessage>[0],

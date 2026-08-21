@@ -845,13 +845,13 @@ async function installLegacyFinishedFixture(root: string, id: string): Promise<v
 	}
 }
 
-test("repair provenance prefers strict v2, allows terminal v2/v1, and never falls back from corrupt or incomplete-review v2", async () => {
+test("repair provenance prefers strict v2, large default review converges, and corrupt v2 never falls back", async () => {
 	await withTempDir(async (root) => {
 		await initializeProject(root);
 		const diagnosisScript = await writeFakeWorker(root, {});
-		const incompletePaths = Array.from({ length: 20 }, (_, index) => `src/pending-${String(index).padStart(2, "0")}.txt`);
+		const segmentedPaths = Array.from({ length: 20 }, (_, index) => `src/segmented-${String(index).padStart(2, "0")}.txt`);
 		const implementationScript = await writeFakeWorker(root, {
-			changedPaths: incompletePaths,
+			changedPaths: segmentedPaths,
 			body: `${"large review line ".repeat(256)}\n`,
 		});
 
@@ -882,25 +882,44 @@ test("repair provenance prefers strict v2, allows terminal v2/v1, and never fall
 		));
 		assert.notEqual(delegationId(legacyRepair), legacyId);
 
-		const pendingStub = commanderRuntime();
-		await assert.rejects(
-			withFakeWorker(implementationScript, () => delegateTool(pendingStub).execute(
-				"repair-source-pending", delegateParams({ task_kind: "implementation" }), undefined, undefined, commanderContext(root, "repair-source-pending"),
-			)),
-			/default delivery review_incomplete/,
+		const segmentedStub = commanderRuntime();
+		const segmented = await withFakeWorker(implementationScript, () => delegateTool(segmentedStub).execute(
+			"default-review-segmented", delegateParams({ task_kind: "implementation" }), undefined, undefined,
+			commanderContext(root, "default-review-segmented"),
+		));
+		const segmentedId = delegationId(segmented);
+		assert.equal(latestSessionState(segmentedStub).status, "REVIEWED");
+		const segmentedAuthority = await readDelegationCommittedGenerationV2(root, segmentedId);
+		assert.equal(segmentedAuthority.ok, true);
+		if (segmentedAuthority.ok) assert.equal(segmentedAuthority.value.state.status, "REVIEWED");
+
+		// Restore the committed transaction's pre-publication PENDING_REVIEW
+		// shape to keep the repair provenance guard covered without creating a
+		// second oversized worker fixture. The immutable generation and proof
+		// stay untouched; only the mutable transaction publication is rewound
+		// for the check and then restored byte-for-byte.
+		const segmentedTransactionPath = join(
+			root, CONFIG_DIR_NAME, "workbench", "delegations", segmentedId, "v2", "transaction.json",
 		);
-		const pendingId = latestSessionState(pendingStub).latestId!;
-		const pendingAuthority = await readDelegationCommittedGenerationV2(root, pendingId);
+		const segmentedTransactionBefore = await readFile(segmentedTransactionPath, "utf8");
+		const pendingTransaction = JSON.parse(segmentedTransactionBefore) as Record<string, unknown>;
+		pendingTransaction.revision = 3;
+		pendingTransaction.status = "PENDING_REVIEW";
+		pendingTransaction.review = null;
+		await writeFile(segmentedTransactionPath, `${JSON.stringify(pendingTransaction, null, 2)}\n`, "utf8");
+		const pendingAuthority = await readDelegationCommittedGenerationV2(root, segmentedId);
 		assert.equal(pendingAuthority.ok, true);
 		if (pendingAuthority.ok) assert.equal(pendingAuthority.value.state.status, "PENDING_REVIEW");
 		const beforePendingRefusal = await delegationDirectories(root);
 		await assert.rejects(
 			withFakeWorker(diagnosisScript, () => delegateTool(commanderRuntime()).execute(
-				"repair-pending-refused", delegateParams({ task_kind: "diagnosis", repair_of: pendingId }), undefined, undefined, commanderContext(root, "repair-pending-refused"),
+				"repair-pending-refused", delegateParams({ task_kind: "diagnosis", repair_of: segmentedId }), undefined, undefined,
+				commanderContext(root, "repair-pending-refused"),
 			)),
 			/non-terminal v2 status PENDING_REVIEW/,
 		);
 		assert.deepEqual(await delegationDirectories(root), beforePendingRefusal, "pending provenance refuses before creating a transaction");
+		await writeFile(segmentedTransactionPath, segmentedTransactionBefore, "utf8");
 
 		await installLegacyFinishedFixture(root, finishedId);
 		await writeFile(join(root, CONFIG_DIR_NAME, "workbench", "delegations", finishedId, "v2", "transaction.json"), "{\"schema_version\":2", "utf8");

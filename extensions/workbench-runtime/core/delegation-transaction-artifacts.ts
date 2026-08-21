@@ -314,7 +314,7 @@ export function normalizeDelegationBoundedTaskContractV2(
 	if (!Number.isSafeInteger(timeout_seconds) || (timeout_seconds as number) < 60 || (timeout_seconds as number) > 3_600) {
 		return fail("invalid_contract", "delegation v2 public timeout is outside the fixed bound");
 	}
-	const budget_profile = raw.budget_profile === undefined ? "standard" : raw.budget_profile;
+	const budget_profile = raw.budget_profile === undefined ? "extended" : raw.budget_profile;
 	if (!CURRENT_SPEND_PROFILES.includes(budget_profile as WorkerSpendProfile)) {
 		return fail("invalid_contract", "delegation v2 public budget profile is invalid");
 	}

@@ -238,7 +238,7 @@ test("governance v1 freezes schema constants, public tool input/output categorie
 		["standard", "extended"],
 		"current budget exposes only the active profile enum",
 	);
-	assert.equal((currentBudgetProfile as { default?: unknown }).default, "standard");
+	assert.equal((currentBudgetProfile as { default?: unknown }).default, "extended");
 	const currentMetadata = WORKBENCH_TOOL_METADATA.workbench_delegate_worker;
 	const currentMetadataText = [
 		currentMetadata.description,

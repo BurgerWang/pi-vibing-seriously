@@ -356,9 +356,12 @@ PENDING_REVIEW → REVIEWED → (versioned binding conflicts) → STALE
 
 - **Default implementation delivery:** after a successful worker result, the
   same `workbench_delegate_worker` call reads the current workspace guard,
-  performs the bounded review below over every attributed worker path, and
-  publishes a complete PASS as `REVIEWED`. Ordinary development therefore
-  continues without a manual `review` or `status` call.
+  automatically continues the bounded segmented review below over every
+  attributed worker path, and publishes a complete PASS as `REVIEWED` in the
+  same call. Ordinary development therefore continues without a manual
+  `review` or `status` call. Explicit review recovery is required only for a
+  review conflict, persistence failure, no-progress condition, or the fixed
+  32-segment safety cap.
 - **`workbench_review_worker_diff`** (DEV-only recovery path): reads the current
   workspace guard and strict v2 authority, scope-checks EVERY worker path
   against the parent-approved `allowed_paths` with a realpath/symlink-safe check
@@ -743,13 +746,13 @@ deterministic hard-stop message). The worker-role lifecycle reads the
 spend profile from the fixed child env contract
 (`WORKBENCH_WORKER_SPEND_PROFILE` — the runner writes `standard` or
 `extended`; retired `low` and malformed/missing child env fall back to
-`standard` defensively), accumulates its own independent spend state
+`extended` defensively), accumulates its own independent spend state
 on assistant `message_end` events, and sends exactly one hidden cumulative
 soft steer when the band first becomes soft or hard. **Phase 3 status:
 public selection, contract validation, v2 generation persistence and handoff
 rendering landed.** The optional `budget_profile` tool parameter (closed
-literal union `standard | extended`, default `standard`, `extended` never
-inferred) is resolved by the strict contract validation in
+literal union `standard | extended`, default `extended`; `standard` is
+explicit for clearly small bounded slices) is resolved by the strict contract validation in
 `core/worker-policy.ts` BEFORE any v2 transaction preparation or child launch, the
 resolved profile is recorded in the before contract
 (`before.json` → `contract.budget_profile`) and passed to the runner (the
@@ -761,8 +764,8 @@ Per-message context safety (above) is unchanged.
 
 | Profile | Soft turns | Soft total | Soft output | Hard turns | Hard total | Hard output |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `standard` (default) | 32 | 5,440,000 | 160,000 | 64 | 10,880,000 | 320,000 |
-| `extended` (explicit) | 64 | 10,880,000 | 320,000 | 96 | 17,408,000 | 512,000 |
+| `standard` (explicit small slice) | 32 | 5,440,000 | 160,000 | 64 | 10,880,000 | 320,000 |
+| `extended` (safe default) | 64 | 10,880,000 | 320,000 | 96 | 17,408,000 | 512,000 |
 
 These are the current `gpt-5.6-luna-xhigh-continuation-v1` limits. Total-token
 thresholds are fixed multiples of Luna's Pi-advertised 272,000-token context
@@ -808,25 +811,25 @@ Hard remains a fail-closed runaway ceiling.
   generation are complete; incomplete persistence requires
   `RECOVERY_REQUIRED`. The 60-minute timeout remains an independent failure
   path.
-- **Profiles:** `standard` is the deterministic default for every
-  delegation without an explicit request; `extended` is explicit
-  Sol-approved only and is never inferred or auto-promoted. The public
+- **Profiles:** `extended` is the deterministic safe default for every
+  delegation without an explicit request; `standard` is selected explicitly
+  only for a clearly small bounded slice. The public
   `budget_profile` tool parameter (optional, closed literal union
   `standard | extended`, default
-  `standard`) is validated by the pure contract check in
-  `core/worker-policy.ts` — omitted resolves to `standard`; unknown,
+  `extended`) is validated by the pure contract check in
+  `core/worker-policy.ts` — omitted resolves to `extended`; unknown,
   empty, wrong-type and case-variant values fail closed with a bounded
   error before the v2 transaction is prepared or the child starts. The pure
-  resolver defaults to `standard` only where a default is explicitly
+  resolver defaults to `extended` only where a default is explicitly
   requested, while strict validation rejects unknown values.
 - **Historical compatibility:** committed v1/v2 records carrying `low`
   remain strictly readable and hash-verifiable, but `low` is rejected for
   every new public contract and committed artifact. Direct/internal runner
-  input and child env `low` resolve defensively to `standard`.
+  input and child env `low` resolve defensively to `extended`.
 - **Child env contract (wired):** the runner passes the resolved profile to
   the worker child through the fixed `WORKBENCH_WORKER_SPEND_PROFILE` env
   variable; the worker-role lifecycle strictly validates it and falls back
-  to `standard` on malformed/missing values (defensive — the runner always
+  to `extended` on malformed/missing values (defensive — the runner always
   writes a valid value).
 - **Deterministic summary** (rendered into the parent handoff and immutable generation):
   `spend budget : turns N/M | total X/Y | output A/B | profile P` with the
@@ -862,7 +865,7 @@ path-by-path `include_paths` re-reviews (max 50 paths per call).
     "Existing valid input remains compatible"
   ],
   "verification": ["Run the unit-test recipe"],
-  "budget_profile": "standard",
+  "budget_profile": "extended",
   "repair_of": "20260101-120000-abcd",
   "timeout_seconds": 1800
 }
@@ -873,11 +876,10 @@ path-by-path `include_paths` re-reviews (max 50 paths per call).
 `mechanical`, case variants, unknown strings, and wrong types fail closed.
 
 `budget_profile` is optional and selects the cumulative delegation-spend
-profile (`standard | extended`; omitted resolves to `standard`). The profile
+profile (`standard | extended`; omitted resolves to `extended`). The profile
 bounds cumulative spend only — it never expands the approved paths or scope.
-`standard` is the deterministic default; `extended` is explicit
-Sol-approved only for an approved larger slice and is never inferred or
-auto-promoted. The worker task text carries the resolved profile as one
+`extended` is the deterministic safe default; `standard` is explicit only
+for a clearly small bounded slice. The worker task text carries the resolved profile as one
 informational line; enforcement is the runner's fixed child-env contract,
 never task prose.
 
@@ -971,6 +973,11 @@ third (and final, for this repair) — the cache telemetry records each as
 returned as nested tool usage and the child workbench can continue using the
 existing content-free hash-and-numeric cache telemetry.
 
+The later current-only safe-default and segmented-delivery update changes
+the current static delegate schema/metadata fingerprint once more. Frozen v1
+catalog/hash evidence remains unchanged; after reload, the new current-mode
+fingerprint is deterministic and cache telemetry semantics are unchanged.
+
 NRO N1/N2 (Commander Native Tool Optimization,
 `docs/plans/commander-native-tool-optimization.md`) adds the three fixed
 same-name `read`/`grep`/`find` overrides, registered statically BEFORE the
@@ -1062,8 +1069,8 @@ The tool fails rather than silently falling back when:
 - an assistant event reports another provider/model;
 - an assistant event reaches the 244,800-token (90%) hard context budget;
 - any cumulative spend dimension reaches its hard limit (turns / total
-  tokens / output tokens per the active profile — `standard` by default,
-  `extended` as the only explicit opt-in via the optional `budget_profile`
+  tokens / output tokens per the active profile — `extended` by default,
+  `standard` as the explicit small-slice selection via the optional `budget_profile`
   parameter);
 - the child emits any `compaction_start` event (a compaction attempt);
 - the child exits non-zero, times out, or is aborted;

@@ -433,7 +433,7 @@ test("artifact v2: public contract normalizer trims and defaults before strict b
 	assert.deepEqual(normalized.value.acceptance_criteria, ["First criterion.", "Second criterion."]);
 	assert.deepEqual(normalized.value.verification, ["npm test", "npm run typecheck"]);
 	assert.equal(normalized.value.timeout_seconds, 1_800);
-	assert.equal(normalized.value.budget_profile, "standard");
+	assert.equal(normalized.value.budget_profile, "extended");
 	assert.equal(Object.prototype.hasOwnProperty.call(normalized.value, "repair_of"), false);
 	assert.deepEqual(bindDelegationBoundedTaskContractV2({
 		task_kind: "implementation",
@@ -442,7 +442,7 @@ test("artifact v2: public contract normalizer trims and defaults before strict b
 		acceptance_criteria: ["First criterion.", "Second criterion."],
 		verification: ["npm test", "npm run typecheck"],
 		timeout_seconds: 1_800,
-		budget_profile: "standard",
+		budget_profile: "extended",
 	}), normalized);
 });
 

@@ -231,8 +231,8 @@ wording and granularity guidance since Phase 5):
 - operates independently of the per-message context budget above (which is
   unchanged) and accumulates turns, total tokens and output tokens over
   all assistant messages of a delegation run;
-- two active profiles — `standard` (the default), `extended`
-  (explicit opt-in only, never inferred) — with exact soft/hard turns,
+- two active profiles — `extended` (the safe default), `standard`
+  (explicit for clearly small bounded slices) — with exact soft/hard turns,
   total-token and output-token limits; "reached" means at or above (`>=`);
 - per-message totals reuse the context-budget semantics (positive
   `totalTokens` authoritative, else the non-negative
@@ -250,10 +250,10 @@ wording and granularity guidance since Phase 5):
   independent of the context steer, send failures swallowed);
 - the spend profile reaches the child through the fixed
   `WORKBENCH_WORKER_SPEND_PROFILE` env contract (the runner always writes
-  a valid active value; retired `low` and malformed/missing child env fall back to `standard`
+  a valid active value; retired `low` and malformed/missing child env fall back to `extended`
   defensively); public profile selection is an optional `budget_profile`
   tool parameter (closed literal union `standard | extended`,
-  default `standard`, `extended` never inferred) validated fail-closed by
+  default `extended`) validated fail-closed by
   the pure contract check in `core/worker-policy.ts` BEFORE any ledger
   creation or child launch; the resolved profile is recorded in the before
   contract and the canonical cumulative `spend` object (profile, turns,
@@ -276,7 +276,7 @@ wording and granularity guidance since Phase 5):
 Historical committed v1/v2 records with `low` remain read-only compatible.
 The public contract and new committed-artifact boundary reject `low` before
 persistence or launch; runtime/internal `low` inputs never execute below the
-`standard` limits.
+safe `extended` default limits.
 
 Only recipes with an empty declared `writes` list are available to a worker.
 Recipe mutation policy (P7): every recipe declares

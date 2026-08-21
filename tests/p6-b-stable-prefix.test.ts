@@ -186,7 +186,7 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 
 test("v0.10.0 public tool surface has the intentional canonical transition hash", () => {
 	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
-	const currentHash = "a8bc925d4e0d698699077a7b222ca640a3de4e9748ebbb623468130bce1e5aad";
+	const currentHash = "292dfa098c192a3a8443990821ee664875f8ce5e5ec8dda36a96ba30acdcfc45";
 	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
 	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the documented 0.10.0 hash");
 });
@@ -375,7 +375,10 @@ test("workbench_delegate_worker metadata is static and defaults to one-call deli
 	}
 	const text = [meta.description, meta.promptSnippet, ...meta.promptGuidelines].join("\n");
 	assert.match(text, /normal implementation path/);
+	assert.match(text, /automatically continues bounded segmented actual-diff review/);
 	assert.match(text, /closes the session as REVIEWED in this same call/);
+	assert.match(text, /no-progress condition/);
+	assert.match(text, /32-segment safety cap/);
 	assert.match(text, /continue directly to the next development step without calling review or status/);
 	assert.match(text, /smallest useful allowed_paths set/);
 	assert.match(text, /observable acceptance criteria/);
@@ -392,7 +395,7 @@ test("workbench_delegate_worker metadata is static and defaults to one-call deli
 	assert.equal(WORKBENCH_TOOL_NAMES.indexOf("workbench_delegate_worker"), WORKBENCH_TOOL_NAMES.length - 4, "delegate tool keeps its registration position (seven existing → delegate → review → status → recovery)");
 	// The canonical schema object itself (not only its hash): budget_profile
 	// stays OPTIONAL — absent from `required` — and its nested union carries
-	// the JSON Schema `default: "standard"` annotation plus the exact
+	// the JSON Schema `default: "extended"` annotation plus the exact
 	// closed alternatives in the fixed standard|extended order. This
 	// inspects the real serialized shape so the pin below can never pass on
 	// a self-comparison or a drifted-but-self-consistent schema.
@@ -405,7 +408,7 @@ test("workbench_delegate_worker metadata is static and defaults to one-call deli
 	assert.ok(!(delegateParameters.required ?? []).includes("budget_profile"), "budget_profile stays optional — no required-list regression");
 	const budgetProfileSchema = delegateParameters.properties.budget_profile;
 	assert.ok(budgetProfileSchema, "budget_profile is present in the serialized parameter schema");
-	assert.equal(budgetProfileSchema.default, "standard", "the nested budget_profile schema carries the JSON Schema default annotation standard");
+	assert.equal(budgetProfileSchema.default, "extended", "the nested budget_profile schema carries the JSON Schema safe default annotation extended");
 	assert.deepEqual(
 		(budgetProfileSchema.anyOf ?? []).map((alternative) => alternative.const),
 		["standard", "extended"],
@@ -452,8 +455,8 @@ test("workbench_delegate_worker metadata is static and defaults to one-call deli
 	);
 	assert.equal(
 		canonicalHash(WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker),
-		"788c73e103fa79b1bf78c44b44040463e4c8ca11ffd9e9dd4be0784ce5283adc",
-		"current delegate parameter schema hash is machine-pinned after low retirement",
+		"94416c9663e568d453787022249ee9b1aa770d898cef57064843fb4c25becb9c",
+		"current delegate parameter schema hash is machine-pinned after the extended safe-default transition",
 	);
 });
 
@@ -651,8 +654,8 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.equal(
 		canonicalHash(workbenchToolMetadataOrdered()),
-		"b904a9a21904b9ae6b786ebd5699098df426cb7e8030fe5783dc1b602ac8f4fb",
-		"current public catalog hash is machine-pinned after low retirement",
+		"daaffea4371c2521e9d87785fafeafaec1b02528e5080eef9c14f144e30617db",
+		"current public catalog hash is machine-pinned after safe-default and segmented-delivery guidance",
 	);
 });
 

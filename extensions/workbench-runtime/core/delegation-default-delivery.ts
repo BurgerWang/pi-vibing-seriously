@@ -21,6 +21,7 @@ import {
 
 export const DEFAULT_DELIVERY_REVIEW_MAX_LINES = 400 as const;
 export const DEFAULT_DELIVERY_REVIEW_MAX_BYTES = 32_768 as const;
+export const DEFAULT_DELIVERY_REVIEW_MAX_SEGMENTS = 32 as const;
 
 export type DefaultDelegationDeliveryErrorCode =
 	| "review_failed"
@@ -82,9 +83,12 @@ function persistProjected(
  * Review and close one ordinary successful implementation delivery.
  *
  * No worker prose is accepted here. Success requires the immutable v2 review
- * boundary to produce a finalized PASS with complete coverage. Large or
- * segmented reviews remain PENDING_REVIEW and use the explicit review tool as
- * a recovery path.
+ * boundary to produce a finalized PASS with complete coverage. Incomplete
+ * ordinary reviews automatically continue against only the prior segment's
+ * remaining paths. The durable v2 review adapter binds and merges those
+ * segments; this boundary adds a fixed segment cap and strict progress check
+ * so automatic delivery can never loop indefinitely. Explicit review remains
+ * the recovery path for conflicts, storage failures, and bounded exhaustion.
  */
 export async function completeDefaultDelegationDeliveryV2(
 	input: CompleteDefaultDelegationDeliveryV2Input,
@@ -94,72 +98,115 @@ export async function completeDefaultDelegationDeliveryV2(
 		return { ok: false, code: "state_transition_failed", state: input.state };
 	}
 
-	const review = await (dependencies.review ?? reviewDelegationV2)({
-		projectRoot: input.projectRoot,
-		delegationId: input.delegationId,
-		exec: input.exec,
-		includePaths: [...input.changedPaths],
-		maxLines: DEFAULT_DELIVERY_REVIEW_MAX_LINES,
-		maxBytes: DEFAULT_DELIVERY_REVIEW_MAX_BYTES,
-		...(input.secrets === undefined ? {} : { secrets: [...input.secrets] }),
-		now: input.now,
-	});
+	const runReview = dependencies.review ?? reviewDelegationV2;
+	let includePaths = [...input.changedPaths];
+	let projected = input.state;
+	let boundDiffHash: string | undefined;
+	let lastReviewPath: string | undefined;
 
-	if (!review.ok) {
-		if (review.binding_hash !== undefined) {
-			const projected = observeDiffChange(input.state, review.binding_hash, input.now);
+	for (let segment = 0; segment < DEFAULT_DELIVERY_REVIEW_MAX_SEGMENTS; segment += 1) {
+		const review = await runReview({
+			projectRoot: input.projectRoot,
+			delegationId: input.delegationId,
+			exec: input.exec,
+			includePaths: [...includePaths],
+			maxLines: DEFAULT_DELIVERY_REVIEW_MAX_LINES,
+			maxBytes: DEFAULT_DELIVERY_REVIEW_MAX_BYTES,
+			...(input.secrets === undefined ? {} : { secrets: [...input.secrets] }),
+			now: input.now,
+		});
+
+		if (!review.ok) {
+			if (review.binding_hash !== undefined) {
+				projected = observeDiffChange(input.state, review.binding_hash, input.now);
+			}
 			const persistenceFailure = persistProjected(input, projected);
 			if (persistenceFailure !== undefined) return persistenceFailure;
-		}
-		return {
-			ok: false,
-			code: "review_failed",
-			state: input.state,
-			review_error: review.error.code,
-		};
-	}
-
-	const record = review.review.record;
-	if (!review.review.ok || record === undefined) {
-		return {
-			ok: false,
-			code: "review_failed",
-			state: input.state,
-			review_path: review.review_path,
-		};
-	}
-
-	let projected = observeDiffChange(input.state, record.bound_diff_hash, input.now);
-	const complete = review.finalized
-		&& record.verdict === "PASS"
-		&& record.coverage_complete
-		&& record.remaining_paths.length === 0;
-	if (!complete) {
-		const persistenceFailure = persistProjected(input, projected);
-		if (persistenceFailure !== undefined) return persistenceFailure;
-		return {
-			ok: false,
-			code: "review_incomplete",
-			state: projected,
-			review_path: review.review_path,
-		};
-	}
-
-	if (projected.status !== "REVIEWED") {
-		const marked = markReviewed(projected, input.now);
-		if (!marked.ok) {
 			return {
 				ok: false,
-				code: "state_transition_failed",
-				state: input.state,
+				code: "review_failed",
+				state: projected,
+				review_error: review.error.code,
+			};
+		}
+
+		lastReviewPath = review.review_path;
+		const record = review.review.record;
+		if (!review.review.ok || record === undefined) {
+			const persistenceFailure = persistProjected(input, projected);
+			if (persistenceFailure !== undefined) return persistenceFailure;
+			return {
+				ok: false,
+				code: "review_failed",
+				state: projected,
 				review_path: review.review_path,
 			};
 		}
-		projected = marked.state;
+
+		if (boundDiffHash !== undefined && record.bound_diff_hash !== boundDiffHash) {
+			projected = observeDiffChange(input.state, record.bound_diff_hash, input.now);
+			const persistenceFailure = persistProjected(input, projected);
+			if (persistenceFailure !== undefined) return persistenceFailure;
+			return {
+				ok: false,
+				code: "review_failed",
+				state: projected,
+				review_path: review.review_path,
+			};
+		}
+		boundDiffHash = record.bound_diff_hash;
+		projected = observeDiffChange(input.state, boundDiffHash, input.now);
+
+		const complete = review.finalized
+			&& record.verdict === "PASS"
+			&& record.coverage_complete
+			&& record.remaining_paths.length === 0;
+		if (complete) {
+			if (projected.status !== "REVIEWED") {
+				const marked = markReviewed(projected, input.now);
+				if (!marked.ok) {
+					return {
+						ok: false,
+						code: "state_transition_failed",
+						state: input.state,
+						review_path: review.review_path,
+					};
+				}
+				projected = marked.state;
+			}
+			const persistenceFailure = persistProjected(input, projected);
+			if (persistenceFailure !== undefined) {
+				return { ...persistenceFailure, review_path: review.review_path };
+			}
+			return { ok: true, state: projected, review };
+		}
+		if (record.coverage_complete || record.remaining_paths.length === 0) {
+			const persistenceFailure = persistProjected(input, projected);
+			if (persistenceFailure !== undefined) return persistenceFailure;
+			return {
+				ok: false,
+				code: "review_failed",
+				state: projected,
+				review_path: review.review_path,
+			};
+		}
+
+		const previousPaths = new Set(includePaths);
+		const remainingPaths = [...record.remaining_paths];
+		const remainingSet = new Set(remainingPaths);
+		const progressed = remainingPaths.length < includePaths.length
+			&& remainingSet.size === remainingPaths.length
+			&& remainingPaths.every((path) => previousPaths.has(path));
+		if (!progressed) break;
+		includePaths = remainingPaths;
 	}
+
 	const persistenceFailure = persistProjected(input, projected);
-	if (persistenceFailure !== undefined) {
-		return { ...persistenceFailure, review_path: review.review_path };
-	}
-	return { ok: true, state: projected, review };
+	if (persistenceFailure !== undefined) return persistenceFailure;
+	return {
+		ok: false,
+		code: "review_incomplete",
+		state: projected,
+		...(lastReviewPath === undefined ? {} : { review_path: lastReviewPath }),
+	};
 }

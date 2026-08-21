@@ -34,10 +34,10 @@
  *     directly (non-negative finite; malformed → 0), independent of which
  *     path the per-message total took; a provider that omits `output`
  *     undercounts the dimension (accepted, documented heuristic guard).
- *   - Two active profiles (`standard` — the default, `extended` — explicit
- *     only), with exact soft/hard limits. The retired `low` limits remain in
+ *   - Two active profiles (`extended` — the safe default, `standard` —
+ *     explicit for small bounded slices), with exact soft/hard limits. The retired `low` limits remain in
  *     this module solely to validate already-committed historical records;
- *     runtime selection always maps `low` to `standard`.
+ *     runtime selection always maps `low` to `extended`.
  *   - Band evaluation on every processed message: any hard dimension →
  *     `hard` (hard wins over soft, always); else any soft dimension →
  *     `soft`; else `ok`. The triggered-reasons list is the subset of
@@ -50,7 +50,7 @@
  *
  * Malformed counters, malformed usage, and unrecognized profile values
  * never throw and never produce NaN: counters normalize to zero, and limit
- * lookups fall back to the `standard` profile (defensive mirror of
+ * lookups fall back to the `extended` profile (defensive mirror of
  * `resolveWorkerSpendProfile`).
  */
 
@@ -97,7 +97,7 @@ export interface WorkerSpendDimensionFlags {
 type SpendDimensionKey = "turns" | "totalTokens" | "outputTokens";
 
 /** Default profile for every delegation that does not explicitly request another. */
-export const WORKER_SPEND_DEFAULT_PROFILE = "standard" as const;
+export const WORKER_SPEND_DEFAULT_PROFILE = "extended" as const;
 
 /** Current model-specific spend policy; persisted for diagnostics/tests. */
 export const WORKER_SPEND_POLICY_ID = "gpt-5.6-luna-xhigh-continuation-v1" as const;
@@ -108,7 +108,7 @@ export const WORKER_SPEND_POLICY_ID = "gpt-5.6-luna-xhigh-continuation-v1" as co
  * lifecycle enforces the SAME profile the runner accumulates against. The
  * runner always writes a valid active `standard` | `extended` value;
  * worker-role readers map retired `low` and malformed/missing values to
- * `standard` (defensive mirror of `resolveWorkerSpendProfile`).
+ * `extended` (defensive mirror of `resolveWorkerSpendProfile`).
  */
 export const WORKER_SPEND_PROFILE_ENV = "WORKBENCH_WORKER_SPEND_PROFILE";
 
@@ -183,7 +183,7 @@ function limitValue(limits: WorkerSpendDimensionLimits, reason: WorkerSpendReaso
 	}
 }
 
-/** Defensive limit lookup: an unrecognized profile value resolves to `standard`. */
+/** Defensive limit lookup: an unrecognized profile value resolves to the current default (`extended`). */
 function limitsFor(profile: WorkerSpendProfile): WorkerSpendLimits {
 	return WORKER_SPEND_LIMITS[profile] ?? WORKER_SPEND_LIMITS[WORKER_SPEND_DEFAULT_PROFILE];
 }
@@ -200,7 +200,7 @@ export function isWorkerSpendProfile(value: unknown): value is ActiveWorkerSpend
 
 /**
  * Profile normalization with an explicit default: any unrecognized value
- * resolves to `WORKER_SPEND_DEFAULT_PROFILE` (`standard`). This fallback
+ * resolves to `WORKER_SPEND_DEFAULT_PROFILE` (`extended`). This fallback
  * exists only here, where a default is explicitly requested; strict
  * validation (`isWorkerSpendProfile`) still rejects unknown values.
  */
@@ -255,7 +255,9 @@ export function addWorkerSpendUsage(state: unknown, usage: unknown): WorkerSpend
  * Per-dimension soft/hard trigger flags for a state against a profile.
  * Every dimension is evaluated with `>=` semantics ("reached" means at or
  * above the limit). Malformed state normalizes to zero; an unrecognized
- * profile value resolves to the `standard` limits.
+ * profile value resolves to the current default (`extended`) limits. The
+ * historical `low` literal remains directly evaluable only for committed-record
+ * compatibility; current runtime selection normalizes it before evaluation.
  */
 export function workerSpendDimensionFlags(state: unknown, profile: WorkerSpendProfile): WorkerSpendDimensionFlags {
 	const s = normalizeWorkerSpendState(state);

@@ -185,7 +185,7 @@ export interface LedgerContract {
 	/**
 	 * Phase 3 (worker token-budget repair): the resolved cumulative
 	 * spend-budget profile (additive, optional). Omitted resolves to
-	 * `standard` in boundLedgerContract — new before records always carry
+	 * `extended` in boundLedgerContract — new before records always carry
 	 * the resolved literal.
 	 */
 	budgetProfile?: WorkerSpendProfile;
@@ -306,7 +306,7 @@ export interface LedgerBeforeRecord {
 		 * records genuinely omit it — reads of those expose `undefined` and
 		 * they are never rewritten (additive, no migration). New before
 		 * records ALWAYS carry the resolved literal: boundLedgerContract
-		 * resolves omitted to `standard` before any write.
+		 * resolves omitted to `extended` before any write.
 		 */
 		budget_profile?: string;
 		/**
@@ -935,7 +935,7 @@ export function boundLedgerContract(raw: LedgerContract): { ok: true; contract: 
 		.slice(0, MAX_VERIFICATION_STEPS);
 	const timeoutSeconds = Number.isInteger(raw.timeoutSeconds) && raw.timeoutSeconds >= 60 && raw.timeoutSeconds <= 3600 ? raw.timeoutSeconds : 1800;
 	// Phase 3: resolve the spend-budget profile deterministically — omitted
-	// resolves to `standard`; any other value must be exactly one of the two
+	// resolves to `extended`; any other value must be exactly one of the two
 	// active literals or the contract FAILS CLOSED (retired low/unknown/empty/wrong-
 	// typed profile must never reach a ledger record or a child launch).
 	const profile = resolveWorkerBudgetProfile(raw.budgetProfile);

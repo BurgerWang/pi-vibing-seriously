@@ -11,7 +11,7 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 
 import type { RecipeMutation } from "./recipe-schema.ts";
 import type { WorkerSpendProfile } from "./worker-spend.ts";
-import { WORKER_SPEND_DEFAULT_PROFILE } from "./worker-spend.ts";
+import { resolveWorkerSpendProfile, WORKER_SPEND_DEFAULT_PROFILE } from "./worker-spend.ts";
 
 export const WORKER_TOOL_NAME = "workbench_delegate_worker";
 export const WORKER_ROLE_ENV = "WORKBENCH_AGENT_ROLE";
@@ -50,7 +50,7 @@ export interface WorkerTaskContract {
 	/**
 	 * Phase 3 (worker token-budget repair): the resolved cumulative
 	 * spend-budget profile (additive, optional). Omitted resolves to
-	 * `standard`; `extended` is the only explicit opt-in. Historical `low`
+	 * `extended`; `standard` remains available explicitly for small bounded slices. Historical `low`
 	 * values are never accepted for a new contract. The profile is
 	 * carried on the contract for ledger/record consistency — the runner
 	 * enforces it through the fixed WORKER_SPEND_PROFILE_ENV child env
@@ -224,7 +224,7 @@ export function workerRecipeBlockReason(role: string | undefined, recipeName: st
  * Strict deterministic budget-profile validation/resolution for the
  * delegation task contract (Phase 3 of the worker token-budget repair):
  *
- *   - omitted/undefined → `standard` (the only default path);
+ *   - omitted/undefined → `extended` (the only default path);
  *   - exactly `standard` | `extended` accepted;
  *   - everything else (unknown strings, empty strings, case variants,
  *     null, numbers, objects, arrays) FAILS CLOSED with a bounded useful
@@ -365,7 +365,7 @@ export function recipeMutationBlockReason(
  * Stable task text: fixed instructions plus dynamic contract in the user
  * message. Phase 5: the text includes one short deterministic
  * spend-profile line naming the resolved active `budgetProfile` (omitted or
- * retired `low` → `standard`; explicit `extended` named when supplied) and stating
+ * retired `low` → `extended`; explicit `standard` remains named when supplied) and stating
  * that the profile bounds cumulative spend only — it never expands the
  * parent-approved path/scope authority. Phase 4A: when and only when
  * `repairOf` is present, a deterministic `Repair provenance:` line
@@ -379,7 +379,7 @@ export function formatWorkerTask(contract: WorkerTaskContract): string {
 	const resolvedTaskKind = resolveWorkerTaskKind(contract.taskKind);
 	if (!resolvedTaskKind.ok) throw new Error(resolvedTaskKind.error);
 	const diagnosis = resolvedTaskKind.taskKind === "diagnosis";
-	const profile = contract.budgetProfile === "extended" ? "extended" : WORKER_SPEND_DEFAULT_PROFILE;
+	const profile = resolveWorkerSpendProfile(contract.budgetProfile);
 	const lines = [
 		diagnosis ? "Delegated diagnosis task (strictly read-only):" : "Delegated implementation task:",
 		contract.task.trim(),

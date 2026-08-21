@@ -263,11 +263,11 @@ spend dimension with the deterministic hard-stop message, and records the
 final profile/state/band/reasons facts on every run result; the
 worker-role lifecycle reads the profile from the fixed
 `WORKBENCH_WORKER_SPEND_PROFILE` child env contract (retired `low` and
-malformed/missing values fall back to `standard` defensively) and sends exactly one hidden
+malformed/missing values fall back to `extended` defensively) and sends exactly one hidden
 cumulative soft steer when the band first becomes soft/hard. Phase 3 adds
 the public profile surface: the optional `budget_profile` tool parameter
-(closed literal union `standard | extended`, default `standard`,
-`extended` never inferred) is resolved fail-closed by the pure contract
+(closed literal union `standard | extended`, default `extended`; `standard`
+is explicit for clearly small bounded slices) is resolved fail-closed by the pure contract
 check in `core/worker-policy.ts` before ledger creation/child launch, the
 resolved profile travels into the before contract
 (`before.json` → `contract.budget_profile`) and the runner (child env +
@@ -281,7 +281,7 @@ derived from the SAME persisted worker-summary spend object).
 The retired `low` literal is historical-read-only: frozen v1 metadata and
 already committed v1/v2 records remain readable and hash-verifiable, while
 new public contracts and committed generations reject it. Direct/internal
-runner input and child env `low` resolve to `standard`.
+runner input and child env `low` resolve to `extended`.
 
 Phase 4 adds
 the numeric-only progress surface: `WorkerProgress` exposes the cumulative

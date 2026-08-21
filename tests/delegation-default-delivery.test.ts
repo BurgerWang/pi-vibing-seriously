@@ -5,6 +5,7 @@ import {
 	completeDefaultDelegationDeliveryV2,
 	DEFAULT_DELIVERY_REVIEW_MAX_BYTES,
 	DEFAULT_DELIVERY_REVIEW_MAX_LINES,
+	DEFAULT_DELIVERY_REVIEW_MAX_SEGMENTS,
 } from "../extensions/workbench-runtime/core/delegation-default-delivery.ts";
 import type { DelegationReviewV2Result } from "../extensions/workbench-runtime/core/delegation-review-v2.ts";
 import type { DelegationState } from "../extensions/workbench-runtime/core/delegation-state.ts";
@@ -25,7 +26,9 @@ function pendingState(overrides: Partial<DelegationState> = {}): DelegationState
 	};
 }
 
-function successfulReview(overrides: Record<string, unknown> = {}): DelegationReviewV2Result {
+function successfulReview(
+	overrides: Record<string, unknown> = {},
+): Extract<DelegationReviewV2Result, { ok: true }> {
 	return {
 		ok: true,
 		finalized: true,
@@ -63,6 +66,12 @@ function successfulReview(overrides: Record<string, unknown> = {}): DelegationRe
 	};
 }
 
+function provisionalReview(
+	overrides: Record<string, unknown>,
+): Extract<DelegationReviewV2Result, { ok: true }> {
+	return { ...successfulReview(overrides), finalized: false };
+}
+
 const exec = async () => ({ code: 0, stdout: "", stderr: "", killed: false });
 
 test("ordinary implementation auto-reviews once and persists REVIEWED", async () => {
@@ -94,8 +103,151 @@ test("ordinary implementation auto-reviews once and persists REVIEWED", async ()
 	assert.equal(captured?.maxBytes, DEFAULT_DELIVERY_REVIEW_MAX_BYTES);
 });
 
-test("incomplete review stays pending for explicit recovery", async () => {
+test("incomplete review automatically converges over only the prior remaining paths", async () => {
 	const persisted: DelegationState[] = [];
+	const included: string[][] = [];
+	let calls = 0;
+	const result = await completeDefaultDelegationDeliveryV2({
+		projectRoot: "/project",
+		delegationId: ID,
+		changedPaths: ["src/a.ts", "src/b.ts", "src/c.ts"],
+		state: pendingState(),
+		exec,
+		now: NOW,
+		persistState: (state) => persisted.push(state),
+	}, {
+		review: async (input) => {
+			included.push([...(input.includePaths ?? [])]);
+			calls += 1;
+			if (calls === 1) {
+				return provisionalReview({
+					displayed_paths: ["src/a.ts"],
+					coverage_complete: false,
+					remaining_paths: ["src/b.ts", "src/c.ts"],
+				});
+			}
+			if (calls === 2) {
+				return provisionalReview({
+					displayed_paths: ["src/a.ts", "src/b.ts"],
+					coverage_complete: false,
+					remaining_paths: ["src/c.ts"],
+				});
+			}
+			return successfulReview({
+				displayed_paths: ["src/a.ts", "src/b.ts", "src/c.ts"],
+			});
+		},
+	});
+
+	assert.equal(result.ok, true);
+	if (!result.ok) return;
+	assert.equal(result.state.status, "REVIEWED");
+	assert.deepEqual(included, [
+		["src/a.ts", "src/b.ts", "src/c.ts"],
+		["src/b.ts", "src/c.ts"],
+		["src/c.ts"],
+	]);
+	assert.deepEqual(persisted, [result.state], "only the completed REVIEWED mirror is persisted");
+});
+
+test("incomplete review with no remaining-path progress stays pending", async () => {
+	const persisted: DelegationState[] = [];
+	let calls = 0;
+	const result = await completeDefaultDelegationDeliveryV2({
+		projectRoot: "/project",
+		delegationId: ID,
+		changedPaths: ["src/a.ts", "src/b.ts"],
+		state: pendingState(),
+		exec,
+		now: NOW,
+		persistState: (state) => persisted.push(state),
+	}, {
+		review: async () => {
+			calls += 1;
+			return provisionalReview({
+				coverage_complete: false,
+				remaining_paths: ["src/a.ts", "src/b.ts"],
+			});
+		},
+	});
+
+	assert.equal(result.ok, false);
+	if (result.ok) return;
+	assert.equal(result.code, "review_incomplete");
+	assert.equal(result.state.status, "PENDING_REVIEW");
+	assert.equal(result.state.currentDiffHash, REVIEW_HASH);
+	assert.equal(calls, 1);
+	assert.deepEqual(persisted, [result.state]);
+});
+
+test("automatic review stops at the fixed segment cap even while coverage progresses", async () => {
+	const changedPaths = Array.from(
+		{ length: DEFAULT_DELIVERY_REVIEW_MAX_SEGMENTS + 1 },
+		(_, index) => `src/${String(index).padStart(2, "0")}.ts`,
+	);
+	const included: string[][] = [];
+	const persisted: DelegationState[] = [];
+	const result = await completeDefaultDelegationDeliveryV2({
+		projectRoot: "/project",
+		delegationId: ID,
+		changedPaths,
+		state: pendingState(),
+		exec,
+		now: NOW,
+		persistState: (state) => persisted.push(state),
+	}, {
+		review: async (input) => {
+			const current = [...(input.includePaths ?? [])];
+			included.push(current);
+			return provisionalReview({
+				coverage_complete: false,
+				remaining_paths: current.slice(1),
+			});
+		},
+	});
+
+	assert.equal(result.ok, false);
+	if (result.ok) return;
+	assert.equal(result.code, "review_incomplete");
+	assert.equal(included.length, DEFAULT_DELIVERY_REVIEW_MAX_SEGMENTS);
+	assert.deepEqual(included[0], changedPaths);
+	assert.deepEqual(included.at(-1), changedPaths.slice(DEFAULT_DELIVERY_REVIEW_MAX_SEGMENTS - 1));
+	assert.deepEqual(persisted, [result.state]);
+});
+
+test("a changed binding between automatic segments fails closed", async () => {
+	const changedHash = "d".repeat(64);
+	const persisted: DelegationState[] = [];
+	let calls = 0;
+	const result = await completeDefaultDelegationDeliveryV2({
+		projectRoot: "/project",
+		delegationId: ID,
+		changedPaths: ["src/a.ts", "src/b.ts"],
+		state: pendingState(),
+		exec,
+		now: NOW,
+		persistState: (state) => persisted.push(state),
+	}, {
+		review: async () => {
+			calls += 1;
+			return calls === 1
+				? provisionalReview({ coverage_complete: false, remaining_paths: ["src/b.ts"] })
+				: successfulReview({ bound_diff_hash: changedHash, recorded_after_hash: changedHash });
+		},
+	});
+
+	assert.equal(result.ok, false);
+	if (result.ok) return;
+	assert.equal(result.code, "review_failed");
+	assert.equal(result.state.status, "PENDING_REVIEW");
+	assert.equal(result.state.currentDiffHash, changedHash);
+	assert.equal(calls, 2);
+	assert.deepEqual(persisted, [result.state]);
+});
+
+test("complete coverage with a FAIL verdict stops without an empty-path replay", async () => {
+	const persisted: DelegationState[] = [];
+	let calls = 0;
 	const result = await completeDefaultDelegationDeliveryV2({
 		projectRoot: "/project",
 		delegationId: ID,
@@ -105,17 +257,23 @@ test("incomplete review stays pending for explicit recovery", async () => {
 		now: NOW,
 		persistState: (state) => persisted.push(state),
 	}, {
-		review: async () => successfulReview({ coverage_complete: false, remaining_paths: ["src/a.ts"] }),
+		review: async () => {
+			calls += 1;
+			return provisionalReview({
+				verdict: "FAIL",
+				coverage_complete: true,
+				remaining_paths: [],
+				violations: [{ path: "src/a.ts", reason: "outside allowed scope" }],
+			});
+		},
 	});
 
-	assert.deepEqual(result, {
-		ok: false,
-		code: "review_incomplete",
-		state: persisted[0],
-		review_path: `.pi/workbench/delegations/${ID}/v2/review.json`,
-	});
-	assert.equal(persisted[0]?.status, "PENDING_REVIEW");
-	assert.equal(persisted[0]?.currentDiffHash, REVIEW_HASH);
+	assert.equal(result.ok, false);
+	if (result.ok) return;
+	assert.equal(result.code, "review_failed");
+	assert.equal(result.state.status, "PENDING_REVIEW");
+	assert.equal(calls, 1);
+	assert.deepEqual(persisted, [result.state]);
 });
 
 test("review conflict updates the blocking hash without claiming delivery", async () => {
@@ -143,6 +301,40 @@ test("review conflict updates the blocking hash without claiming delivery", asyn
 	assert.equal(result.review_error, "review_conflict");
 	assert.equal(persisted[0]?.status, "PENDING_REVIEW");
 	assert.equal(persisted[0]?.currentDiffHash, conflictHash);
+});
+
+test("review storage failure after a provisional segment stays pending", async () => {
+	const persisted: DelegationState[] = [];
+	let calls = 0;
+	const result = await completeDefaultDelegationDeliveryV2({
+		projectRoot: "/project",
+		delegationId: ID,
+		changedPaths: ["src/a.ts", "src/b.ts"],
+		state: pendingState(),
+		exec,
+		now: NOW,
+		persistState: (state) => persisted.push(state),
+	}, {
+		review: async () => {
+			calls += 1;
+			if (calls === 1) {
+				return provisionalReview({ coverage_complete: false, remaining_paths: ["src/b.ts"] });
+			}
+			return {
+				ok: false,
+				error: { code: "storage_failure", message: "injected" },
+			};
+		},
+	});
+
+	assert.equal(result.ok, false);
+	if (result.ok) return;
+	assert.equal(result.code, "review_failed");
+	assert.equal(result.review_error, "storage_failure");
+	assert.equal(result.state.status, "PENDING_REVIEW");
+	assert.equal(result.state.currentDiffHash, REVIEW_HASH);
+	assert.equal(calls, 2);
+	assert.deepEqual(persisted, [result.state]);
 });
 
 test("session append failure never exposes REVIEWED", async () => {

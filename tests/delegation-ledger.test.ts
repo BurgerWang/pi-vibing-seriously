@@ -486,7 +486,7 @@ test("createDelegationLedger writes atomic bounded manifest + before records", a
 		assert.deepEqual(beforeRecord.contract.verification, ["Run the unit-test recipe"]);
 		assert.equal(beforeRecord.contract.timeout_seconds, 900);
 		assert.ok("budget_profile" in beforeRecord.contract, "new before records ALWAYS carry the resolved budget_profile");
-		assert.equal(beforeRecord.contract.budget_profile, "standard", "omitted budget_profile resolves deterministically to standard in the before contract");
+		assert.equal(beforeRecord.contract.budget_profile, "extended", "omitted budget_profile resolves deterministically to extended in the before contract");
 		// Atomic bounded writes: mode 0600 on the records.
 		const st = await stat(join(dirPath, "manifest.json"));
 		assert.equal(st.mode & 0o777, 0o600);
@@ -677,7 +677,7 @@ test("synthetic pre-repair schema_version 1 records without budget_profile/spend
 		// Strip the new additive field from the before contract to recreate
 		// the exact pre-repair shape (schema_version stays 1).
 		const beforeRecord = JSON.parse(await readFile(join(dirPath, "before.json"), "utf8")) as { contract: Record<string, unknown> };
-		assert.equal(beforeRecord.contract.budget_profile, "standard");
+		assert.equal(beforeRecord.contract.budget_profile, "extended");
 		delete beforeRecord.contract.budget_profile;
 		await writeFile(join(dirPath, "before.json"), `${JSON.stringify(beforeRecord, null, 2)}\n`, "utf8");
 		// Finish normally, then strip spend from both records to recreate the
