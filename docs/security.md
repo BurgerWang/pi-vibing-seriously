@@ -183,8 +183,14 @@ is not PASS with complete coverage (a scope FAIL or an incomplete PASS,
 e.g. a legacy partial
 review record) invalidates a prior REVIEWED state fail-closed (demoted to
 PENDING_REVIEW with the reviewed hash cleared — pending/stale stay safely
-blocking). A pending or stale review blocks the next delegation
-AND VERIFY (mode entry and gate runs in VERIFY are refused). New tagged v2
+blocking). A pending or stale review blocks VERIFY (mode entry and gate runs
+in VERIFY are refused) and normally blocks the next delegation. The sole
+successor exception requires the exact latest mirror to be STALE and a strict
+committed v2 read to prove its immutable review is already FINAL/PASS; after a
+second pre-launch authority check, a fresh delegation may adopt the current
+workspace as its new baseline. It does not rewrite the old review or use
+`repair_of`. Pending, corrupt, unpublished, recovery-required, non-final,
+legacy, and untagged authority remain blocked. New tagged v2
 uses a W/D/S relevance binding: baseline unrelated dirty paths and recognized
 workbench artifacts do not stale it, while Git HEAD, W/D/S, or a new
 unknown-origin path fails closed. Historical untagged v2/v1 retains the
@@ -298,8 +304,9 @@ resumed (fresh-worker continuation), so no worker state persists between
 delegations. The tool executes sequentially and a worker can never delegate,
 so at most one writing worker exists per worktree at any time; Sol must not
 start a second writing delegation before the first has returned and its diff
-has been reviewed (a pending or stale review blocks the next delegation in
-code as well). See
+has been reviewed. A strict finalized-v2 STALE successor is a new sequential
+task after the old worker and immutable review have both completed; it never
+creates concurrent writers. See
 [worker-delegation.md](worker-delegation.md).
 
 ## Records and redaction

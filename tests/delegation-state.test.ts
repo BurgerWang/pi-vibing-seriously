@@ -30,6 +30,7 @@ import {
 	recordBlockedWriteAttempt,
 	recordDelegation,
 	recordRepairDelegation,
+	recordSuccessorAfterFinalizedReview,
 	restoreDelegationState,
 	reviewBlockReason,
 	serializeDelegationState,
@@ -114,6 +115,41 @@ test("an exact explicit repair may supersede only its latest blocking delegation
 	assert.equal(recordRepairDelegation(pending, { id: "repair-2", diffHash: DIFF_B, now: LATER }, "other").ok, false);
 	assert.equal(recordRepairDelegation(reviewedOk(pending), { id: "repair-2", diffHash: DIFF_B, now: LATER }, "broken-1").ok, false);
 	assert.equal(recordRepairDelegation(pending, { id: "broken-1", diffHash: DIFF_B, now: LATER }, "broken-1").ok, false);
+});
+
+test("a strictly authorized successor may replace only the exact latest STALE mirror", () => {
+	const pending = recordOk(emptyDelegationState(), "reviewed-1", DIFF_A);
+	const stale = observeDiffChange(reviewedOk(pending), DIFF_B, LATER);
+	const withBlockedAttempt = recordBlockedWriteAttempt(stale, LATER);
+	const successor = recordSuccessorAfterFinalizedReview(
+		withBlockedAttempt,
+		{ id: "successor-1", diffHash: DIFF_B, now: LATER },
+		"reviewed-1",
+	);
+	assert.equal(successor.ok, true);
+	if (successor.ok) {
+		assert.equal(successor.state.latestId, "successor-1");
+		assert.equal(successor.state.status, "PENDING_REVIEW");
+		assert.equal(successor.state.currentDiffHash, DIFF_B);
+		assert.equal(successor.state.reviewedDiffHash, undefined);
+		assert.equal(successor.state.blockedWriteAttempts, 1);
+	}
+	assert.equal(
+		recordSuccessorAfterFinalizedReview(stale, { id: "successor-2", diffHash: DIFF_B, now: LATER }, "other").ok,
+		false,
+	);
+	assert.equal(
+		recordSuccessorAfterFinalizedReview(pending, { id: "successor-2", diffHash: DIFF_B, now: LATER }, "reviewed-1").ok,
+		false,
+	);
+	assert.equal(
+		recordSuccessorAfterFinalizedReview(reviewedOk(pending), { id: "successor-2", diffHash: DIFF_B, now: LATER }, "reviewed-1").ok,
+		false,
+	);
+	assert.equal(
+		recordSuccessorAfterFinalizedReview(stale, { id: "reviewed-1", diffHash: DIFF_B, now: LATER }, "reviewed-1").ok,
+		false,
+	);
 });
 
 // ---------------------------------------------------------------------------

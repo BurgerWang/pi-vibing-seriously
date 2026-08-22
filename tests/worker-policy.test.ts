@@ -349,6 +349,9 @@ test("delegate-tool metadata codifies direct one-call development delivery", () 
 	assert.match(text, /smallest useful allowed_paths set/);
 	assert.match(text, /observable acceptance criteria/);
 	assert.match(text, /High-risk permission and final verification remain explicit boundaries/);
+	assert.match(text, /immutable FINAL\/PASS v2 review later becomes STALE/);
+	assert.match(text, /fresh successor after strict live authority revalidation/);
+	assert.match(text, /PENDING_REVIEW, corrupt, unpublished, recovery-required, and non-final authority remain blocking/);
 	assert.doesNotMatch(text, /minimum repository orientation/);
 	assert.doesNotMatch(text, /source\+tests\+docs vertical slices/);
 });
@@ -358,7 +361,7 @@ test("delegate-tool metadata keeps explicit review out of the ordinary path", ()
 	const text = [meta.description, meta.promptSnippet, ...meta.promptGuidelines].join("\n");
 	assert.match(text, /automatic diff review and session close/);
 	assert.match(text, /Call workbench_review_worker_diff only when/);
-	assert.match(text, /explicit review required after a conflict, persistence failure, no-progress condition, the 32-segment safety cap, or a pending\/stale recovery state/);
+	assert.match(text, /explicit review required after a conflict, persistence failure, no-progress condition, the 32-segment safety cap, or a pending\/non-final-stale recovery state/);
 	assert.doesNotMatch(text, /after a worker returns: review the actual diff/);
 });
 
@@ -472,9 +475,12 @@ test("worker-delegation documentation defines fixed Sol/Luna boundaries and stri
 	assert.match(doc, /Current committed\s+transaction\/run records and current test output determine observed state/);
 	assert.match(doc, /worker report remains bounded presentation, never acceptance authority/);
 	assert.doesNotMatch(doc, /remain `NOT_RUN` until Sol runs and records them/);
-	// Existing hard blocking language remains stable.
-	assert.match(doc, /a pending or stale review blocks BOTH the next delegation/);
-	assert.match(doc, /and VERIFY \(`\/q-mode-verify`\s+refuses/);
+	// VERIFY remains hard-blocking; delegation recovery is narrowly limited to
+	// an exact strict finalized-v2 successor transition.
+	assert.match(doc, /pending or stale review blocks VERIFY \(`\/q-mode-verify`\s+refuses/);
+	assert.match(doc, /only successor exception is exact latest\s+`STALE` plus strict committed v2 FINAL\/PASS authority/);
+	assert.match(doc, /old\s+review is preserved, the authority is revalidated immediately before worker\s+launch/);
+	assert.match(doc, /`PENDING_REVIEW`,\s+corrupt, unpublished, recovery-required, non-final, v1, and untagged\s+authority remain blocked/);
 });
 
 test("security documentation distinguishes new-v2 relevance from legacy full-diff review gating", async () => {

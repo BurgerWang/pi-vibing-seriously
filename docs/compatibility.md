@@ -386,9 +386,12 @@ additive and backward compatible:
   coverage — a scope FAIL or an incomplete PASS, e.g. a legacy partial
   review record — demotes a prior REVIEWED state to PENDING_REVIEW
   fail-closed via the pure
-  `demoteReviewedToPending` transition). PENDING_REVIEW / STALE blocking
-  semantics, the hash-binding invariants, delegation/VERIFY blocking and
-  B6 Worker-First Compliance are unchanged for every reachable state.
+  `demoteReviewedToPending` transition). PENDING_REVIEW and VERIFY blocking,
+  the hash-binding invariants, and B6 Worker-First Compliance remain
+  unchanged. Current v2 adds one delegation-only recovery seam: exact latest
+  STALE plus a strict committed FINAL/PASS review may be replaced by a fresh
+  successor after live revalidation; the old authority remains immutable and
+  all other stale authority stays blocked.
 - **Phase 5 compact/withheld entries: additive record surface,
   unchanged schema and tool.** Review `schema_version` stays `1`; the
   `patch[].source` literals `compact` and `withheld` (mirrored in the

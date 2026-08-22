@@ -22,7 +22,11 @@
  *     exactly the reviewed hash re-validates the review (back to
  *     REVIEWED);
  *   - a pending or stale review blocks BOTH the next delegation and VERIFY
- *     (final gate verification) until the current diff is reviewed;
+ *     (final gate verification) by default. A separate, narrowly-scoped
+ *     successor transition may replace an exact STALE session mirror only
+ *     after the caller has strictly proved that its durable v2 transaction
+ *     already carries a FINAL/PASS review. VERIFY remains blocked until the
+ *     successor itself is reviewed;
  *   - a bounded blocked-write-attempt counter records how many write
  *     attempts were refused while a review was outstanding;
  *   - the state serializes to a compact JSON record and restores
@@ -160,6 +164,45 @@ export function recordRepairDelegation(
 	const id = input.id.trim();
 	if (!id || id === priorId || id.length > MAX_ID_LENGTH) {
 		return { ok: false, error: `repair delegation id must be distinct and at most ${MAX_ID_LENGTH} characters` };
+	}
+	const diffHash = input.diffHash.trim();
+	if (!diffHash || diffHash.length > MAX_HASH_LENGTH) {
+		return { ok: false, error: `delegation diff hash must be a non-empty string of at most ${MAX_HASH_LENGTH} characters` };
+	}
+	return {
+		ok: true,
+		state: {
+			latestId: id,
+			status: "PENDING_REVIEW",
+			currentDiffHash: diffHash,
+			reviewedDiffHash: undefined,
+			blockedWriteAttempts: state.blockedWriteAttempts,
+			updatedAt: input.now,
+		},
+	};
+}
+
+/**
+ * Replace one exact STALE session mirror with a fresh successor delegation.
+ *
+ * This pure transition does NOT establish review authority. The caller must
+ * first strictly read the prior v2 committed generation and prove that its
+ * durable transaction is REVIEWED (which also proves a FINAL/PASS review
+ * artifact). Keeping that proof outside this framework-free module prevents
+ * a generic STALE state from becoming an authorization bypass.
+ */
+export function recordSuccessorAfterFinalizedReview(
+	state: DelegationState,
+	input: RecordDelegationInput,
+	finalizedPriorId: string,
+): DelegationTransitionResult {
+	const priorId = finalizedPriorId.trim();
+	if (!priorId || state.latestId !== priorId || state.status !== "STALE") {
+		return { ok: false, error: "successor delegation must replace the exact latest STALE delegation" };
+	}
+	const id = input.id.trim();
+	if (!id || id === priorId || id.length > MAX_ID_LENGTH) {
+		return { ok: false, error: `successor delegation id must be distinct and at most ${MAX_ID_LENGTH} characters` };
 	}
 	const diffHash = input.diffHash.trim();
 	if (!diffHash || diffHash.length > MAX_HASH_LENGTH) {

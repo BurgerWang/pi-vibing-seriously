@@ -569,6 +569,80 @@ test("implementation real in-scope delta auto-reviews and permits the next deleg
 	});
 });
 
+test("a FINAL/PASS v2 delegation that becomes STALE permits a fresh successor with the current workspace as its baseline", async () => {
+	await withTempDir(async (root) => {
+		await initializeProject(root);
+		const implementationScript = await writeFakeWorker(root, { changedPath: "src/implemented.txt" });
+		const diagnosisScript = await writeFakeWorker(root, {});
+		const stub = commanderRuntime();
+		const tool = delegateTool(stub);
+		const ctx = commanderContext(root, "finalized-stale-successor");
+
+		const first = await withFakeWorker(implementationScript, () => tool.execute(
+			"finalized-stale-first",
+			delegateParams(),
+			undefined,
+			undefined,
+			ctx,
+		));
+		const firstId = delegationId(first);
+		const firstAuthority = await readDelegationCommittedGenerationV2(root, firstId);
+		assert.equal(firstAuthority.ok, true);
+		if (!firstAuthority.ok) return;
+		assert.equal(firstAuthority.value.state.status, "REVIEWED");
+
+		await writeFile(join(root, "src", "implemented.txt"), "intentional post-review policy drift\n", "utf8");
+		const staleStatus = await delegationStatusTool(stub).execute("finalized-stale-status", {}, undefined, undefined, ctx);
+		assert.match(resultText(staleStatus), /latest\s+: .* STALE/);
+		assert.match(resultText(staleStatus), /successor\s+: ALLOWED after live revalidation/);
+		assert.match(resultText(staleStatus), /verify block\s+: VERIFY remains blocked/);
+		assert.doesNotMatch(resultText(staleStatus), /blocked\s+: Starting a new worker delegation/);
+		const second = await withFakeWorker(diagnosisScript, () => tool.execute(
+			"finalized-stale-successor",
+			delegateParams({ task_kind: "diagnosis" }),
+			undefined,
+			undefined,
+			ctx,
+		));
+		const secondId = delegationId(second);
+		assert.notEqual(secondId, firstId);
+		assert.equal(latestSessionState(stub).latestId, secondId);
+		assert.equal(latestSessionState(stub).status, "REVIEWED");
+		const stillImmutable = await readDelegationCommittedGenerationV2(root, firstId);
+		assert.equal(stillImmutable.ok, true);
+		if (stillImmutable.ok) assert.equal(stillImmutable.value.state.status, "REVIEWED");
+	});
+});
+
+test("a STALE mirror never bypasses a corrupt finalized v2 authority", async () => {
+	await withTempDir(async (root) => {
+		await initializeProject(root);
+		const implementationScript = await writeFakeWorker(root, { changedPath: "src/implemented.txt" });
+		const stub = commanderRuntime();
+		const tool = delegateTool(stub);
+		const ctx = commanderContext(root, "corrupt-stale-authority");
+		const first = await withFakeWorker(implementationScript, () => tool.execute(
+			"corrupt-stale-first",
+			delegateParams(),
+			undefined,
+			undefined,
+			ctx,
+		));
+		const firstId = delegationId(first);
+		const review = await readDelegationReviewV2(root, firstId);
+		assert.equal(review.ok, true);
+		if (!review.ok) return;
+		await writeFile(join(root, review.value.review_path), "{\"truncated\":true}", "utf8");
+		await writeFile(join(root, "src", "implemented.txt"), "post-review drift\n", "utf8");
+		const directoriesBefore = await delegationDirectories(root);
+		await assert.rejects(
+			tool.execute("corrupt-stale-second", delegateParams({ task_kind: "diagnosis" }), undefined, undefined, ctx),
+			/invalid_record.*fails closed/,
+		);
+		assert.deepEqual(await delegationDirectories(root), directoriesBefore, "corrupt authority is rejected before a successor transaction is created");
+	});
+});
+
 test("implementation auto-review append failure stays blocking and creates no second transaction", async () => {
 	await withTempDir(async (root) => {
 		await initializeProject(root);

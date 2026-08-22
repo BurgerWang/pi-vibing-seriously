@@ -186,7 +186,7 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 
 test("v0.10.0 public tool surface has the intentional canonical transition hash", () => {
 	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
-	const currentHash = "7cc79f784d084bf45c16cf4c9d961e7a49ac7f114dec70933c9f3120dc386bb3";
+	const currentHash = "94bb202c8ff94772604595d83e962ef95531ab8dfe369207729e998b02c93ee3";
 	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
 	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the documented 0.10.0 hash");
 });
@@ -636,6 +636,7 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.deepEqual(meta.promptGuidelines, [
 		"Routine successful delivery closes as REVIEWED in the delegate call; use status only for diagnostics or recovery.",
+		"When STALE is backed by a strict v2 FINAL/PASS review, follow the reported successor action instead of retrying immutable review; VERIFY remains blocked until that successor is reviewed.",
 		"In the TUI, WF:LOCKED means routine writes belong to Luna, WF:LEASE means a bounded temporary Sol write exception is active, and WF:REVIEW means recovery review is outstanding.",
 	], "current status guidelines keep routine work out of the recovery chain");
 	assert.match(meta.description, /existing hash field names are retained for compatibility/);
@@ -643,10 +644,12 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	assert.match(meta.description, /baseline unrelated dirty paths and recognized workbench artifacts do not stale it/);
 	assert.match(meta.description, /Git HEAD, W\/D\/S drift, or a new unknown-origin path fails closed/);
 	assert.match(meta.description, /Historical untagged v2 and v1 authority retain the complete full-diff binding/);
+	assert.match(meta.description, /STALE plus strict v2 FINAL\/PASS authority/);
+	assert.match(meta.description, /fresh successor is allowed after live revalidation while VERIFY remains blocked/);
 	assert.doesNotMatch(meta.description, /real git diff \(any change after REVIEWED turns it STALE\)/);
 	assert.equal(
 		canonicalHash(meta),
-		"57129d1a8eac087ecb498f4f7a9117476858723c7cd94cd69a2121cca6abe224",
+		"48033dd8c8b4509eed92393407ec532ebe3d4a5b3aacec22df0fb389b925a0cf",
 		"current status metadata hash is machine-pinned after the relevance-contract correction",
 	);
 	assert.equal(
@@ -656,7 +659,7 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.equal(
 		canonicalHash(workbenchToolMetadataOrdered()),
-		"bf6d1f0de7b5114c18b7307d3dfafa802b55a00c303cf5a5f28e70a9c42e763a",
+		"f37b569970c72f7aacd8ffe6e30588327412747463f84fca645ddcb101a6c6aa",
 		"current public catalog hash is machine-pinned after safe-default, segmented delivery, and advisory turn-marker guidance",
 	);
 });
@@ -670,7 +673,7 @@ test("delegation review metadata is a recovery path and still binds the complete
 	);
 	assert.deepEqual(meta.promptGuidelines, [
 		"Do not call this after an ordinary successful REVIEWED delegation; the default delivery already completed the actual-diff review.",
-		"Use it only when delegation output reports explicit review required, incomplete coverage, or status shows PENDING_REVIEW/STALE.",
+		"Use it only when delegation output reports explicit review required or incomplete coverage. For STALE, inspect status first: a finalized PASS v2 review cannot be rewritten and should advance through a fresh successor; only non-final recoverable review state belongs here.",
 		"The review always checks the entire worker delta against allowed_paths; include_paths narrows only the bounded patch presentation.",
 		"Repeat segmented review only for remaining paths until PASS and complete coverage close the session.",
 	], "review guidance avoids the routine delegate-review-status chain");
@@ -680,9 +683,11 @@ test("delegation review metadata is a recovery path and still binds the complete
 	assert.match(meta.description, /Baseline unrelated dirty paths and recognized workbench artifacts do not stale new tagged v2/);
 	assert.match(meta.description, /Git HEAD, W\/D\/S drift, or a new unknown-origin path fails closed/);
 	assert.match(meta.description, /Historical untagged v2\/v1 retain full-diff binding/);
+	assert.match(meta.description, /finalized PASS v2 review is immutable/);
+	assert.match(meta.description, /status permits an ordinary fresh successor after strict revalidation/);
 	assert.equal(
 		canonicalHash(meta),
-		"a5b530e55a8ea0a3bf7d7813d81ba07f453e57fb0ce3a7ee174e4463a78ec672",
+		"7d51ed8e661cbad8d75716e3063de02d810ca1a6a15244d804311abec7a5db58",
 		"current review metadata hash is machine-pinned after recovery-only guidance",
 	);
 	assert.equal(

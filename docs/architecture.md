@@ -187,7 +187,9 @@ every tool call  →  checkToolCall(mode, tool, input)           (layer 2)
 GPT-5.6 Sol parent in DEV
   → workbench_delegate_worker(task, allowed_paths, acceptance_criteria)
   → trust + commander identity check
-  → P7: real-git diff refresh + review gate (PENDING_REVIEW/STALE blocks)
+  → P7: real-git diff refresh + review gate (PENDING_REVIEW blocks;
+       STALE blocks unless exact strict v2 FINAL/PASS authority permits a
+       fresh successor after live revalidation; VERIFY always stays blocked)
   → P7: bounded ledger created (.pi/workbench/delegations/<id>/before.json,
        manifest.json — recorded BEFORE the worker starts)
   → short-lived pi --mode json --no-session
@@ -223,7 +225,9 @@ GPT-5.6 Sol parent in DEV
        coverage (a scope FAIL or an incomplete PASS, e.g. a legacy partial
        review record) invalidates a prior REVIEWED state fail-closed
        (demoted to PENDING_REVIEW, reviewed hash cleared); pending/stale
-       blocks the next delegation and VERIFY
+       blocks VERIFY and normally blocks the next delegation. Exact latest
+       STALE plus strict v2 FINAL/PASS may start a fresh successor without
+       rewriting the old review; every other authority stays blocked
   → Sol runs final VERIFY recipes/gates → final judgment
 ```
 

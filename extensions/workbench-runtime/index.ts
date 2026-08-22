@@ -477,7 +477,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			return `review delegation ${state.latestId} (PENDING_REVIEW) before the next delegation or VERIFY`;
 		}
 		if (state.status === "STALE") {
-			return `re-review delegation ${state.latestId} (STALE — the diff changed since the review)`;
+			return `delegation ${state.latestId} is STALE — inspect status; a prior v2 FINAL/PASS review permits a fresh successor, otherwise recover the outstanding review; VERIFY remains blocked`;
 		}
 		return `delegation ${state.latestId} REVIEWED — start the next delegation or run final verification`;
 	}
@@ -860,9 +860,20 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				`reviewed hash: ${delegationState.reviewedDiffHash ?? "(none)"}`,
 				`blocked writes: ${delegationState.blockedWriteAttempts}`,
 			);
-			const block = reviewBlockReason(delegationState, "delegation");
-			if (block) lines.push(`blocked      : ${block}`);
 			const authority = await readDelegationAuthorityObservation(projectRoot, delegationState.latestId);
+			const block = reviewBlockReason(delegationState, "delegation");
+			const finalizedReviewedStaleSuccessor = delegationState.status === "STALE"
+				&& authority.kind === "v2"
+				&& authority.transactionStatus === "REVIEWED"
+				&& authority.finalized
+				&& authority.review?.verdict === "PASS";
+			if (block && !finalizedReviewedStaleSuccessor) lines.push(`blocked      : ${block}`);
+			if (block && finalizedReviewedStaleSuccessor) {
+				lines.push(
+					"successor    : ALLOWED after live revalidation — prior v2 review is FINAL/PASS; a fresh delegation adopts the current workspace as its new baseline",
+					"verify block : VERIFY remains blocked until the fresh successor is reviewed",
+				);
+			}
 			if (authority.kind === "invalid-v2") {
 				const recoverable = authority.code === "invalid_record"
 					? await readRecoverableUnpublishedDelegationV2(projectRoot, delegationState.latestId)

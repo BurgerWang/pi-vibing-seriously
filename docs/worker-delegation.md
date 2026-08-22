@@ -171,8 +171,11 @@ provenance only, never a resume:
 The delegation tool executes sequentially and a worker can never delegate,
 so at most one worker writes to a worktree at any time. Sol never starts a
 second delegation that could write the same worktree before the first has
-returned and its diff has been reviewed (a pending or stale review blocks the
-next delegation in code as well). Parallel reads are fine; parallel writes
+returned and its diff has been reviewed. `PENDING_REVIEW` remains a hard
+block. A `STALE` mirror is also blocking unless strict v2 authority proves the
+old transaction already has an immutable FINAL/PASS review; in that one case
+an ordinary fresh successor may atomically adopt the current workspace as its
+new baseline after live revalidation. Parallel reads are fine; parallel writes
 are not supported and must never be attempted.
 
 ## Pi-native lifecycle
@@ -187,10 +190,15 @@ One invocation:
    `implementation`; Stage 1 enables only `implementation` and `diagnosis`,
    while `mechanical` (or any unknown value) fails closed;
 3. refreshes the delegation review state against its versioned binding and
-   refuses to start while a review is pending or stale: a new tagged v2
-   generation uses the ChangeSet relevance binding described below, while
-   historical untagged v2/v1 authority retains the complete full-diff
-   binding;
+   refuses to start while review authority is pending, invalid, unpublished,
+   recovery-required, or non-final. If the exact latest mirror is `STALE` but
+   strict v2 committed authority proves its old review is already FINAL/PASS,
+   an ordinary fresh successor is allowed after a second pre-launch authority
+   check and atomically adopts the current workspace as its new baseline. The
+   old transaction and review remain immutable; VERIFY stays blocked until the
+   successor is reviewed. A new tagged v2 generation uses the ChangeSet
+   relevance binding described below, while historical untagged v2/v1
+   authority retains the complete full-diff binding;
 4. writes `PREPARED` to the single v2 transaction authority at
    `.pi/workbench/delegations/<id>/v2/transaction.json` BEFORE the child is
    launched, then advances it to `RUNNING` using revision-checked state
@@ -394,10 +402,16 @@ PENDING_REVIEW → REVIEWED → (versioned binding conflicts) → STALE
   workbench artifacts do not stale it, while Git HEAD, W/D/S, or U conflicts
   fail closed. Historical untagged v2/v1 refreshes the complete full-diff
   binding, so any diff change there turns a reviewed delegation STALE.
-- **Blocking:** a pending or stale review blocks BOTH the next delegation
-  (`workbench_delegate_worker` refuses to start) and VERIFY (`/q-mode-verify`
+- **Blocking:** a pending or stale review blocks VERIFY (`/q-mode-verify`
   refuses, and `/q-gate`/`workbench_run_gate` are refused in VERIFY) until
-  the versioned binding is reviewed. `reviewedDiffHash === currentDiffHash`
+  the active delegation's versioned binding is reviewed. It also blocks the
+  next delegation by default. The only successor exception is exact latest
+  `STALE` plus strict committed v2 FINAL/PASS authority: the immutable old
+  review is preserved, the authority is revalidated immediately before worker
+  launch, and a fresh delegation replaces the stale session mirror with its
+  current-workspace baseline. No `repair_of` is used. `PENDING_REVIEW`,
+  corrupt, unpublished, recovery-required, non-final, v1, and untagged
+  authority remain blocked. `reviewedDiffHash === currentDiffHash`
   remains the compact compatibility invariant: those fields hold the W/D/S
   projection hash for new tagged v2 and the complete diff hash for historical
   authority. A binding that returns to exactly the reviewed hash re-validates
@@ -941,8 +955,11 @@ command can still write despite an empty declaration.
    locked read/control/delegation surface. The second-layer `tool_call` guard
    blocks bash and foreign tools; any direct edit/write requires an active
    human-issued lease within its exact scope.
-9. **Review gating:** a pending or stale delegation review blocks the next
-   delegation and VERIFY. New tagged v2 binds W/D/S relevance, so baseline
+9. **Review gating:** a pending or stale delegation review blocks VERIFY and
+   normally blocks the next delegation. Exact latest `STALE` backed by strict
+   committed v2 FINAL/PASS authority may start only a fresh successor after
+   live revalidation; the old review stays immutable and all other authority
+   remains blocked. New tagged v2 binds W/D/S relevance, so baseline
    unrelated dirty paths and recognized workbench artifacts do not stale it;
    Git HEAD, W/D/S, or new unknown-origin drift fails closed. Historical
    untagged v2/v1 binds the complete full diff, where any later diff change

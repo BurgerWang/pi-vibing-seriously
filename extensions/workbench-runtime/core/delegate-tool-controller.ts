@@ -10,6 +10,7 @@ import {
 	observeDiffChange,
 	recordDelegation,
 	recordRepairDelegation,
+	recordSuccessorAfterFinalizedReview,
 	reviewBlockReason,
 	type DelegationState,
 } from "./delegation-state.ts";
@@ -138,7 +139,21 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 				const exactBlockingRepair = reviewBlock !== undefined
 					&& v2RepairAuthority !== undefined
 					&& currentState.latestId === v2RepairAuthority.id;
-				if (reviewBlock && !exactBlockingRepair) throw new Error(`workbench_delegate_worker: ${reviewBlock}`);
+				let finalizedStaleSuccessorId: string | undefined;
+				if (
+					reviewBlock !== undefined
+					&& contract.value.repair_of === undefined
+					&& currentState.status === "STALE"
+					&& currentState.latestId !== undefined
+				) {
+					const prior = await controller.services.readCommittedGeneration(projectRoot, currentState.latestId);
+					if (prior.ok && prior.value.state.status === "REVIEWED") {
+						finalizedStaleSuccessorId = currentState.latestId;
+					}
+				}
+				if (reviewBlock && !exactBlockingRepair && finalizedStaleSuccessorId === undefined) {
+					throw new Error(`workbench_delegate_worker: ${reviewBlock}`);
+				}
 				if (v2RepairAuthority?.kind === "unpublished" && !exactBlockingRepair) {
 					throw new Error(`workbench_delegate_worker: repair_of ${v2RepairAuthority.id} is not the latest blocking delegation`);
 				}
@@ -166,6 +181,11 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 							if (!revalidated.ok || !new Set<string>(["FAILED", "FINISHED", "REVIEWED"]).has(revalidated.value.state.status)) {
 								throw new Error("committed repair authority changed before worker launch");
 							}
+						} else if (finalizedStaleSuccessorId !== undefined) {
+							const revalidated = await controller.services.readCommittedGeneration(projectRoot, finalizedStaleSuccessorId);
+							if (!revalidated.ok || revalidated.value.state.status !== "REVIEWED") {
+								throw new Error("finalized stale successor authority changed before worker launch");
+							}
 						}
 						const recordInput = {
 							id: delegationId,
@@ -174,7 +194,9 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 						};
 						const recorded = exactBlockingRepair
 							? recordRepairDelegation(controller.getDelegationState(), recordInput, v2RepairAuthority!.id)
-							: recordDelegation(controller.getDelegationState(), recordInput);
+							: finalizedStaleSuccessorId !== undefined
+								? recordSuccessorAfterFinalizedReview(controller.getDelegationState(), recordInput, finalizedStaleSuccessorId)
+								: recordDelegation(controller.getDelegationState(), recordInput);
 						if (!recorded.ok) throw new Error("delegation session mirror refused PREPARED");
 						controller.setDelegationState(recorded.state);
 						controller.persistDelegationStateStrict(recorded.state);
