@@ -11,6 +11,7 @@ import type {
 	readDelegationCommittedGenerationV2,
 	readDelegationTransactionV2,
 } from "./delegation-transaction-storage.ts";
+import type { DelegationReviewStatus, DelegationState } from "./delegation-state.ts";
 import { ownDataValue } from "./runtime-output-controller.ts";
 
 export const DELEGATION_CLAIM_GUARD_SCHEMA = "workbench-delegation-claim-guard-v1" as const;
@@ -20,19 +21,19 @@ export const DELEGATION_CLAIM_GUARD_TEXT = [
 	DELEGATION_CLAIM_GUARD_CODE,
 	"The assistant attempted to report delegation execution without matching machine authority.",
 	"No delegation id, status, or completion claim from the rejected message is accepted.",
-	"Invoke workbench_delegate_worker and report only the persisted transaction returned by the tool.",
+	"Query workbench_delegation_status and follow its persisted next action: review PENDING_REVIEW/STALE; delegate only when unblocked.",
 ].join("\n");
 
 const DELEGATION_ID_SCAN_RE = /\b\d{8}-\d{6}-[A-Za-z0-9]{4}\b/g;
-const STATUS_SCAN_RE = /\b(?:SUCCESS|REVIEWED|PENDING_REVIEW|RECOVERY_REQUIRED|FINISHED|FAILED|ABORTED|RUNNING|PREPARED|COMMITTING)\b/gi;
+const STATUS_SCAN_RE = /\b(?:SUCCESS|REVIEWED|STALE|PENDING_REVIEW|RECOVERY_REQUIRED|FINISHED|FAILED|ABORTED|RUNNING|PREPARED|COMMITTING)\b/gi;
 const DELEGATION_WORD_RE = /\bdelegation(?:s)?\b|委派|工作线程/i;
 const WORKER_MACHINE_CLAIM_RE = /\bworker(?:s)?\b.{0,80}\b(?:SUCCESS|REVIEWED|FINISHED)\b|\bworker(?:s)?\b.{0,80}成功退出/is;
 const EXECUTION_WORD_RE = /\b(?:start(?:ed)?|launch(?:ed)?|execut(?:e|ed)|creat(?:e|ed)|return(?:ed)?|complet(?:e|ed)|attempt(?:ed)?)\b|(?:已|重新|本次|刚刚|刚才|新(?:的)?|全新(?:的)?|再次)?(?:启动|执行|调用|创建|完成|改用|返回|尝试)/i;
 const SUCCESS_WORD_RE = /\b(?:SUCCESS|SUCCEEDED|REVIEWED|FINISHED)\b|成功(?:退出|完成)?|已完成|已落地/i;
 const NEGATED_WORD_RE = /\b(?:not|never)\s+(?:started|launched|executed|created|completed|found)\b|\bdoes\s+not\s+exist\b|不存在|未创建|未启动|未执行|没有(?:启动|执行|创建|形成)|虚构/i;
 const NEGATED_CLAIM_SCAN_RE = /\b(?:not|never)\s+(?:started|launched|executed|created|completed|found|successful)\b|\bdoes\s+not\s+exist\b|不存在|未创建|未启动|未执行|未完成|没有(?:启动|执行|创建|形成|完成)|并未(?:启动|执行|创建|完成)|虚构/gi;
+const BLOCKED_EXECUTION_SCAN_RE = /(?:\b(?:starting|launching|creating)\b.{0,120}\bdelegation\b.{0,120}\bis blocked\b|(?:启动|开始|创建).{0,80}(?:委派|worker|工作线程).{0,80}(?:被阻止|被拦截|已阻止|无法启动))/gis;
 const RECENT_WORD_RE = /\b(?:new|fresh|this\s+(?:turn|attempt|delegation)|just)\b|本次|刚刚|刚才|全新(?:的)?|新(?:的)?\s*delegation|已按要求/i;
-const ID_LABEL_RE = /\bdelegation(?:_id)?\s*[:=]|委派\s*(?:ID|编号)?\s*[:=]/i;
 const LOCAL_CONTEXT_CHARS = 160;
 const MAX_CLAIM_IDS = 32;
 
@@ -41,6 +42,7 @@ export type DelegationClaimAuthorityStatus = DelegationTransactionStatus | "LEGA
 export interface DelegationClaimAuthority {
 	readonly id: string;
 	readonly status: DelegationClaimAuthorityStatus;
+	readonly sessionStatus?: DelegationReviewStatus;
 }
 
 export interface DelegationClaimInspection {
@@ -100,8 +102,10 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 	const text = assistantText(message);
 	if (text === undefined || text.length === 0 || (!DELEGATION_WORD_RE.test(text) && !WORKER_MACHINE_CLAIM_RE.test(text))) return undefined;
 	const ids = [...new Set(text.match(DELEGATION_ID_SCAN_RE) ?? [])].slice(0, MAX_CLAIM_IDS);
-	const affirmativeText = text.replace(NEGATED_CLAIM_SCAN_RE, "");
-	const executionClaim = EXECUTION_WORD_RE.test(affirmativeText) || ID_LABEL_RE.test(affirmativeText);
+	const affirmativeText = text
+		.replace(NEGATED_CLAIM_SCAN_RE, "")
+		.replace(BLOCKED_EXECUTION_SCAN_RE, "");
+	const executionClaim = EXECUTION_WORD_RE.test(affirmativeText);
 	const successClaim = SUCCESS_WORD_RE.test(affirmativeText);
 	const recentClaim = RECENT_WORD_RE.test(text);
 	const negativeOnly = NEGATED_WORD_RE.test(text) && !executionClaim && !successClaim;
@@ -111,12 +115,17 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 	return { ids, expectedStatuses, executionClaim, successClaim, recentClaim, negativeOnly };
 }
 
-function authoritySatisfiesStatus(status: DelegationClaimAuthorityStatus, expected: string): boolean {
+function authoritySatisfiesStatus(authority: DelegationClaimAuthority, expected: string): boolean {
+	const status = authority.status;
 	if (expected === "SUCCESS") {
 		return status === "FINISHED" || status === "PENDING_REVIEW" || status === "REVIEWED" || status === "LEGACY_FINISHED";
 	}
 	if (expected === "FINISHED") return status === "FINISHED" || status === "LEGACY_FINISHED";
 	if (expected === "RUNNING") return status === "RUNNING" || status === "LEGACY_RUNNING";
+	if (expected === "STALE") return authority.sessionStatus === "STALE";
+	if (expected === "PENDING_REVIEW" || expected === "REVIEWED") {
+		return status === expected || authority.sessionStatus === expected;
+	}
 	return status === expected;
 }
 
@@ -132,7 +141,7 @@ export function validateDelegationClaims(
 		const authority = authorityById.get(id);
 		if (!authority) return { ok: false, code: "missing_authority" };
 		for (const expected of inspection.expectedStatuses[id] ?? []) {
-			if (!authoritySatisfiesStatus(authority.status, expected)) return { ok: false, code: "status_mismatch" };
+			if (!authoritySatisfiesStatus(authority, expected)) return { ok: false, code: "status_mismatch" };
 		}
 	}
 	if (inspection.recentClaim && inspection.executionClaim && turn.attemptedCalls === 0) {
@@ -173,6 +182,7 @@ export interface DelegationClaimGuardController {
 	pi: Pick<ExtensionAPI, "on">;
 	isCommander(): boolean;
 	projectRootFor(ctx: ExtensionContext): Promise<string>;
+	getDelegationState(): Pick<DelegationState, "latestId" | "status">;
 	readTransaction: typeof readDelegationTransactionV2;
 	readCommittedGeneration: typeof readDelegationCommittedGenerationV2;
 	readLegacyLedger: typeof readDelegationLedger;
@@ -230,6 +240,7 @@ export function registerDelegationClaimGuard(controller: DelegationClaimGuardCon
 		const authorities: DelegationClaimAuthority[] = [];
 		try {
 			const projectRoot = await controller.projectRootFor(ctx);
+			const sessionState = controller.getDelegationState();
 			const authorityIds = new Set(inspection.ids);
 			if (inspection.successClaim) for (const id of successfulResultIds) authorityIds.add(id);
 			for (const id of authorityIds) {
@@ -239,12 +250,22 @@ export function registerDelegationClaimGuard(controller: DelegationClaimGuardCon
 						const committed = await controller.readCommittedGeneration(projectRoot, id);
 						if (!committed.ok || committed.value.state.status !== current.value.status) continue;
 					}
-					authorities.push({ id, status: current.value.status });
+					authorities.push({
+						id,
+						status: current.value.status,
+						...(sessionState.latestId === id ? { sessionStatus: sessionState.status } : {}),
+					});
 					continue;
 				}
 				if (current.error.code !== "not_found") continue;
 				const legacy = await controller.readLegacyLedger(projectRoot, id);
-				if (legacy) authorities.push({ id, status: legacy.manifest.status === "finished" ? "LEGACY_FINISHED" : "LEGACY_RUNNING" });
+				if (legacy) {
+					authorities.push({
+						id,
+						status: legacy.manifest.status === "finished" ? "LEGACY_FINISHED" : "LEGACY_RUNNING",
+						...(sessionState.latestId === id ? { sessionStatus: sessionState.status } : {}),
+					});
+				}
 			}
 		} catch {
 			// An unreadable project root or authority is not execution evidence.

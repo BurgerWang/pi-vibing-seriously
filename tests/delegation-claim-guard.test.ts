@@ -108,6 +108,7 @@ function register(
 	state: Stub,
 	readStatus: (id: string) => string | undefined,
 	committedAuthority = true,
+	sessionStatus?: "PENDING_REVIEW" | "REVIEWED" | "STALE",
 ): void {
 	registerDelegationClaimGuard({
 		pi: {
@@ -119,6 +120,10 @@ function register(
 		} as never,
 		isCommander: () => true,
 		projectRootFor: async () => "/project",
+		getDelegationState: () => ({
+			...(sessionStatus === undefined ? {} : { latestId: REAL_ID }),
+			status: sessionStatus ?? "PENDING_REVIEW",
+		}),
 		readTransaction: (async (_root: string, id: string) => {
 			const status = readStatus(id);
 			return status === undefined
@@ -182,6 +187,34 @@ test("controller permits a strict matching transaction and a real same-turn resu
 		await emit(state, "message_end", { type: "message_end", message: assistant("delegation worker SUCCESS; completed.") }),
 		[undefined],
 	);
+});
+
+test("status output with a STALE session mirror and REVIEWED transaction is not an execution claim", async () => {
+	const message = assistant([
+		`latest       : ${REAL_ID} STALE`,
+		"current hash : 23ccf6528ecf62a458e74103bbcb8594c638402a61239b9312ebb2ee884b10c2",
+		"reviewed hash: 789907762ba18c1c8411c4650cd3fe2f681593453329a7daa4eb348751534203",
+		`blocked      : Starting a new worker delegation is blocked while delegation ${REAL_ID} is STALE; review the current diff first`,
+		"authority v2 : transaction REVIEWED",
+		"review v2    : PASS at 2026-08-22T03:57:19.888Z (FINAL)",
+	].join("\n"));
+	const inspection = inspectDelegationClaims(message);
+	assert.ok(inspection);
+	assert.equal(inspection.executionClaim, false, "a blocked next action is not a claimed execution");
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(), [{ id: REAL_ID, status: "REVIEWED", sessionStatus: "STALE" }]),
+		{ ok: true },
+	);
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(), [{ id: REAL_ID, status: "REVIEWED", sessionStatus: "REVIEWED" }]),
+		{ ok: false, code: "status_mismatch" },
+		"STALE remains machine-validated against the session mirror",
+	);
+
+	const state = stub();
+	register(state, (id) => id === REAL_ID ? "REVIEWED" : undefined, true, "STALE");
+	await emit(state, "agent_start", { type: "agent_start" });
+	assert.deepEqual(await emit(state, "message_end", { type: "message_end", message }), [undefined]);
 });
 
 test("terminal transaction prose is rejected when its committed generation is unavailable", async () => {

@@ -1441,6 +1441,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		pi,
 		isCommander: () => outputTurnRole() === "commander",
 		projectRootFor,
+		getDelegationState: delegationSession.getState,
 		readTransaction: readDelegationTransactionV2,
 		readCommittedGeneration: readDelegationCommittedGenerationV2,
 		readLegacyLedger: readDelegationLedger,
