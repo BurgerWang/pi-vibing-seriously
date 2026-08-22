@@ -913,6 +913,16 @@ checkpoint: rebuild the anchor, clear the chain, and advance the epoch. If
 lowered policy caps cannot reserve the topology, the controller checkpoints or
 fails closed; pairing is verified on every branch.
 
+A process interruption may leave one assistant tool batch without all of its
+results in append-only JSONL. When—and only when—a later user message proves
+that batch was abandoned, projection removes its call blocks and any partial
+results, inserts a bounded content-free interruption marker, and then validates
+the repaired history normally. The marker tells the model to follow the latest
+complete persisted status immediately rather than wait for another user
+confirmation. An incomplete live tail, orphan result, duplicate id, wrong tool
+name, or any other ambiguous pairing still enters the fixed fail-closed
+boundary. Healthy histories do not run the recovery scan.
+
 The projected anchor and every segment end with a deterministic bounded hidden
 marker. Its safe `boundaryId` derives only from projected/provider-visible
 structural content—not a hash of raw secret text—and the exact marker/ID list is

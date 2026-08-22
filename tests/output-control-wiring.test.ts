@@ -1064,6 +1064,42 @@ test("context success and fail-closed projections update latest numeric history 
 	assert.equal(snapshot.activeHistoryToolTextBytes, historyToolTextBytes(failed), "active history is the latest gauge, not a sum");
 });
 
+test("context recovery keeps the latest durable status after a pre-user interrupted tool batch", async () => {
+	const stub = makeRoleRuntime("commander");
+	const ctx = trustedCtx(process.cwd(), "history-interruption-recovery") as ExtensionContext;
+	const messages: AgentMessage[] = [
+		{ role: "user", content: "start", timestamp: 1 } as unknown as AgentMessage,
+		{
+			role: "assistant",
+			content: [
+				{ type: "toolCall", id: "interrupted-a", name: "workbench_run_recipe", arguments: {} },
+				{ type: "toolCall", id: "interrupted-b", name: "read", arguments: {} },
+			],
+			timestamp: 2,
+		} as unknown as AgentMessage,
+		{
+			role: "toolResult", toolCallId: "interrupted-a", toolName: "workbench_run_recipe",
+			content: [{ type: "text", text: "INTERRUPTED-PARTIAL-RAW" }], isError: false, timestamp: 3,
+		} as unknown as AgentMessage,
+		{ role: "user", content: "刚才断电了，请继续", timestamp: 4 } as unknown as AgentMessage,
+		{
+			role: "assistant",
+			content: [{ type: "toolCall", id: "current-status", name: "workbench_delegation_status", arguments: {} }],
+			timestamp: 5,
+		} as unknown as AgentMessage,
+		{
+			role: "toolResult", toolCallId: "current-status", toolName: "workbench_delegation_status",
+			content: [{ type: "text", text: "successor: ALLOWED after live revalidation\nreview: FINAL/PASS" }], isError: false, timestamp: 6,
+		} as unknown as AgentMessage,
+	];
+
+	const projected = await emitContext(stub, messages, ctx);
+	assert.equal(validateContextToolPairing(projected), true);
+	assert.match(JSON.stringify(projected), /successor: ALLOWED after live revalidation/);
+	assert.match(JSON.stringify(projected), /do not wait for another user confirmation/);
+	assert.doesNotMatch(JSON.stringify(projected), /INTERRUPTED-PARTIAL-RAW|interrupted-a|interrupted-b/);
+});
+
 test("runtime registers exactly three ordered tool_result handlers and envelope bounds unknown custom text and errors", async () => {
 	const stub = makeStub(); workbenchRuntime(stub);
 	assert.equal(stub.events.get("tool_result")?.length, 3);

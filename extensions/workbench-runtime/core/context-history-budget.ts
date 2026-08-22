@@ -469,6 +469,115 @@ export function validateContextToolPairing(messages: readonly AgentMessage[]): b
 	}
 }
 
+function interruptedToolBatchMessage(input: {
+	batches: number;
+	results: number;
+	omittedBytes: number;
+	timestamp: number;
+}): AgentMessage {
+	return {
+		role: "custom",
+		customType: "workbench-history-interrupted-tool-batch",
+		content: [
+			"[workbench interrupted tool batch]",
+			"A previous tool batch ended without all results and was omitted after a later user turn proved it abandoned.",
+			"Treat that batch as non-authoritative. Follow the latest complete persisted status or re-query durable state now; do not wait for another user confirmation.",
+		].join("\n"),
+		display: false,
+		details: {
+			interrupted_batches: Math.max(0, Math.floor(input.batches)),
+			removed_results: Math.max(0, Math.floor(input.results)),
+			omitted_tool_text_bytes: Math.max(0, Math.floor(input.omittedBytes)),
+		},
+		timestamp: input.timestamp,
+	} as AgentMessage;
+}
+
+/**
+ * Repair only a provably abandoned tool batch: one whose missing results are
+ * followed by a later user message. This is the durable shape left when Pi is
+ * interrupted or the machine loses power during a tool call. Orphan results,
+ * mismatched names/ids, duplicates, and an incomplete current tail remain
+ * unsafe and are deliberately left for the fixed fail-closed boundary.
+ */
+function repairInterruptedToolHistory(messages: readonly AgentMessage[]): AgentMessage[] | undefined {
+	const output: AgentMessage[] = [];
+	const seenCalls = new Set<string>();
+	const seenResults = new Set<string>();
+	let interruptedBatches = 0;
+
+	for (let index = 0; index < messages.length;) {
+		const message = messages[index];
+		if (!message) return undefined;
+		const role = roleOf(message);
+		if (role === "toolResult") return undefined;
+		if (role !== "assistant") {
+			output.push(message);
+			index += 1;
+			continue;
+		}
+
+		const calls = extractToolCalls(message);
+		if (!calls) return undefined;
+		if (calls.length === 0) {
+			output.push(message);
+			index += 1;
+			continue;
+		}
+
+		const expected = new Map<string, string>();
+		for (const call of calls) {
+			if (seenCalls.has(call.id)) return undefined;
+			seenCalls.add(call.id);
+			expected.set(call.id, call.name);
+		}
+
+		const results: AgentMessage[] = [];
+		let cursor = index + 1;
+		while (cursor < messages.length && roleOf(messages[cursor]!) === "toolResult") {
+			const resultMessage = messages[cursor]!;
+			const result = extractToolResultIdentity(resultMessage);
+			if (!result || seenResults.has(result.id)) return undefined;
+			const expectedName = expected.get(result.id);
+			if (expectedName === undefined || expectedName !== result.name) return undefined;
+			seenResults.add(result.id);
+			expected.delete(result.id);
+			results.push(resultMessage);
+			cursor += 1;
+		}
+
+		if (expected.size === 0 && results.length === calls.length) {
+			output.push(message, ...results);
+			index = cursor;
+			continue;
+		}
+
+		let boundary = cursor;
+		while (boundary < messages.length) {
+			const boundaryRole = roleOf(messages[boundary]!);
+			if (boundaryRole === "user") break;
+			if (boundaryRole === "assistant" || boundaryRole === "toolResult") return undefined;
+			boundary += 1;
+		}
+		if (boundary >= messages.length || roleOf(messages[boundary]!) !== "user") return undefined;
+
+		const stripped = stripToolCalls(message);
+		if (stripped) output.push(stripped);
+		interruptedBatches += 1;
+		const removedBytes = results.reduce((sum, result) => sum + toolResultTextBytes(result), 0);
+		output.push(interruptedToolBatchMessage({
+			batches: 1,
+			results: results.length,
+			omittedBytes: removedBytes,
+			timestamp: timestampOf(messages[boundary]),
+		}));
+		index = cursor;
+	}
+
+	if (interruptedBatches === 0) return undefined;
+	return output;
+}
+
 function boundedPointer(value: unknown): string | undefined {
 	if (typeof value !== "string" || utf8Bytes(value) > 384) return undefined;
 	if (!BOUNDED_PATH_PATTERN.test(value) || value.includes("..") || value.includes("//")) return undefined;
@@ -2675,12 +2784,22 @@ export class HistoryProjectionController {
 			activeBundlesBefore: 0,
 		};
 		try {
+			// Canonical hashing is the bounded, trap-free structural preflight.
+			// Only after it succeeds may interrupted-batch recovery inspect values.
+			const rawHash = hashHistoryMessages(input.messages);
 			const hardToolTextBytes = effectiveByteCap(input);
 			const hardBundles = effectiveBundleCap(input.maxBundles);
 			failureDecision = { ...failureDecision, hardToolTextBytes, hardBundles };
-			const rawHash = hashHistoryMessages(input.messages);
 			rawToolTextBytes = historyToolTextBytes(input.messages);
-			const analysis = analyzeContextHistory(input.messages);
+			let analysis = analyzeContextHistory(input.messages);
+			if (!analysis.valid) {
+				const repaired = repairInterruptedToolHistory(input.messages);
+				if (repaired) {
+					input = { ...input, messages: repaired };
+					rawToolTextBytes = historyToolTextBytes(input.messages);
+					analysis = analyzeContextHistory(input.messages);
+				}
+			}
 			if (!analysis.valid) return this.failure(rawToolTextBytes, 0, failureDecision);
 			rawBundles = analysis.bundles.length;
 			const rawDecision: HistoryProjectionDecisionFacts = {

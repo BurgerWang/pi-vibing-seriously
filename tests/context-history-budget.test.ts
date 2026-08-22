@@ -849,6 +849,71 @@ test("public failure projection preserves the latest locally complete batch and 
 	)), true);
 });
 
+test("controller repairs an abandoned interrupted tool batch and preserves the latest complete durable status", () => {
+	const controller = new HistoryProjectionController();
+	const raw: AgentMessage[] = [user("initial task")];
+	for (let index = 0; index < 28; index += 1) {
+		raw.push(...bundle(`old-${index}`, `old-result-${index}:` + "x".repeat(8 * 1_024)));
+	}
+	const config = {
+		maxToolTextBytes: COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES,
+		maxBundles: HISTORY_MAX_BUNDLES,
+		descriptorMaxBytes: HISTORY_DESCRIPTOR_MAX_BYTES,
+		role: "commander" as const,
+	};
+	const initial = controller.project({ messages: raw, ...config });
+	assert.equal(initial.transitionCause, "initial_hard_limit");
+
+	const interrupted = assistant([
+		{ id: "lost-a", name: "workbench_run_recipe" },
+		{ id: "lost-b", name: "read" },
+	], [{ type: "text", text: "keep bounded planning" }]);
+	raw.push(
+		interrupted,
+		result("lost-a", "PARTIAL-INTERRUPTED-RAW-SECRET", { name: "workbench_run_recipe" }),
+		asMessage({ role: "custom", customType: "turn-ended", content: "", display: false, timestamp: nextTimestamp++ }),
+		user("刚才因为断电中断，请继续推进"),
+		...bundle("fresh-status", [
+			"latest: prior STALE",
+			"successor: ALLOWED after live revalidation",
+			"review: FINAL/PASS",
+		].join("\n")),
+	);
+
+	const recovered = controller.project({ messages: raw, ...config });
+	assert.equal(validateContextToolPairing(recovered.messages), true);
+	assert.ok(historyToolTextBytes(recovered.messages) <= COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES);
+	assert.doesNotMatch(JSON.stringify(recovered.messages), /PARTIAL-INTERRUPTED-RAW-SECRET|lost-a|lost-b/);
+	assert.match(recovered.messages.map(textOf).join("\n"), /刚才因为断电中断，请继续推进/);
+	assert.match(recovered.messages.map(textOf).join("\n"), /successor: ALLOWED after live revalidation/);
+	assert.match(recovered.messages.map(textOf).join("\n"), /do not wait for another user confirmation/);
+	assert.equal(recovered.facts.protectedLatestBundles >= 1, true);
+
+	const stateBeforeReplay = controller.serialize();
+	const replayed = controller.project({ messages: raw, ...config });
+	assert.deepEqual(replayed.messages, recovered.messages, "the same abandoned batch repairs deterministically on every provider request");
+	assert.deepEqual(controller.serialize(), stateBeforeReplay, "serialized recovery state remains canonical");
+});
+
+test("controller does not repair an incomplete live tail or unsafe orphan and mismatch histories", () => {
+	const config = {
+		maxToolTextBytes: COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES,
+		maxBundles: HISTORY_MAX_BUNDLES,
+		descriptorMaxBytes: HISTORY_DESCRIPTOR_MAX_BYTES,
+		role: "commander" as const,
+	};
+	for (const messages of [
+		[user("live"), assistant([{ id: "still-running", name: "read" }])],
+		[user("orphan"), result("orphan", "ORPHAN-SECRET", { name: "read" }), user("continue")],
+		[user("mismatch"), assistant([{ id: "wrong", name: "read" }]), result("wrong", "MISMATCH-SECRET", { name: "write" }), user("continue")],
+	]) {
+		const projected = new HistoryProjectionController().project({ messages, ...config });
+		assert.deepEqual(projected.messages, safeHistoryProjectionFailureMessages());
+		assert.equal(projected.transitionCause, "failure");
+		assert.doesNotMatch(JSON.stringify(projected.messages), /SECRET|still-running/);
+	}
+});
+
 test("absolute projection failures yield one fixed hidden custom message instead of an empty or raw context", () => {
 	let trapCalls = 0;
 	const hostile = new Proxy({ role: "toolResult" }, {

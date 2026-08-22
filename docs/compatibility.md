@@ -153,7 +153,12 @@ after reload.
 Inactive v3 also encodes a fixed non-secret failure sentinel inside the
 existing signed fields. It de-duplicates a repeated failure across JSONL
 restore and emits one recovery boundary on the first healthy projection. No
-new wire key is introduced. Projection identity uses exact UTF-16 code units,
+wire schema changes for interrupted calls: a missing-result batch followed by
+a later user message is projected as one bounded custom recovery marker, while
+ambiguous/live/mismatched pairings retain the fixed failure sentinel. This lets
+existing append-only sessions recover after process or power loss without
+accepting any partial tool result as authority. It introduces no new wire key.
+Projection identity uses exact UTF-16 code units,
 JSON property enumeration order, omitted object `undefined`, and array holes as
 `null`; bounded array/depth/work checks reject Proxies, accessors, and hostile
 or over-budget values without running application code. Boundary marker IDs
