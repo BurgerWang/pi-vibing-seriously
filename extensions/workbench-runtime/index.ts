@@ -59,6 +59,7 @@ import {
 import { type WorkerFirstGateFacts } from "./core/gate-schema.ts";
 import {
 	listRuns,
+	readCommittedManifest,
 } from "./core/runs.ts";
 import { join } from "node:path";
 import { runStatusLabel, fitToWidth } from "./core/format.ts";
@@ -1458,6 +1459,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		readTransaction: readDelegationTransactionV2,
 		readCommittedGeneration: readDelegationCommittedGenerationV2,
 		readLegacyLedger: readDelegationLedger,
+		readCommittedRun: readCommittedManifest,
 	});
 	// Safe flush: persist the session state entry (append-only JSONL records
 	// are already written per request; nothing is buffered here).

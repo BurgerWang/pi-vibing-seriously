@@ -1040,6 +1040,38 @@ test("a fresh session discovers durable ABORTED project authority without report
 	});
 });
 
+test("resuming an older session mirror advances monotonically to the newest durable project transaction", async () => {
+	await withTempDir(async (root) => {
+		await initializeProject(root);
+		const oldId = "20260820-165900-old1";
+		const newestId = "20260820-170000-new1";
+		await seedProjectAuthorityAborted(root, oldId);
+		await seedProjectAuthorityAborted(root, newestId);
+		const stub = commanderRuntime();
+		const ctx = commanderContext(root, "project-monotonic-resume", [{
+			type: "custom",
+			customType: DELEGATION_STATE_ENTRY_TYPE,
+			data: {
+				latestId: oldId,
+				status: "PENDING_REVIEW",
+				currentDiffHash: "1".repeat(64),
+				blockedWriteAttempts: 0,
+				updatedAt: projectAuthorityTime(1),
+			},
+		}]);
+		await startSession(stub, ctx);
+
+		const mirror = latestSessionState(stub);
+		assert.equal(mirror.latestId, newestId, "the session-local old id never overrides newer project authority");
+		assert.equal(mirror.status, "REVIEWED");
+		const status = await delegationStatusTool(stub).execute("project-monotonic-status", {}, undefined, undefined, ctx);
+		assert.match(resultText(status), new RegExp(`latest\\s+: ${newestId} REVIEWED`, "u"));
+		assert.match(resultText(status), /authority v2\s+: transaction ABORTED/u);
+		assert.doesNotMatch(resultText(status), new RegExp(oldId, "u"));
+		assert.doesNotMatch(resultText(status), /blocked\s+: Starting a new worker delegation/u);
+	});
+});
+
 test("session_start atomically aborts an ownerless preboot empty RUNNING transaction and removes the review block", async () => {
 	await withTempDir(async (root) => {
 		await initializeProject(root);

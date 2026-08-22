@@ -65,6 +65,56 @@ test("the reproduced three fabricated SUCCESS/REVIEWED delegations fail closed",
 	);
 });
 
+test("the reproduced inline-code fake worker and run report cannot borrow an older reviewed authority", () => {
+	const inspection = inspectDelegationClaims(assistant([
+		"新 worker 已成功完成修复：",
+		"",
+		"- Delegation：`20260822-230337-hdwr`",
+		"- 修改：G1 使用 step-scoped bytecode cache prefix，并新增碰撞回归测试",
+		"- Focused tests：`20260822-230649-uvdr`，28 passed",
+		"- Commit tests：`20260822-230659-idf7`，12 passed",
+		"- 完整 G1：`20260822-230712-lu3z`",
+		"  - 26 个本地步骤全部 PASS",
+	].join("\n")));
+	assert.ok(inspection);
+	assert.deepEqual(inspection.ids, ["20260822-230337-hdwr"], "run ids are not misclassified as delegations");
+	assert.deepEqual(inspection.runIds, [
+		"20260822-230649-uvdr",
+		"20260822-230659-idf7",
+		"20260822-230712-lu3z",
+	]);
+	assert.equal(inspection.recentClaim, true, "a newly completed worker is a same-run claim");
+	assert.equal(inspection.successClaim, true);
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(), [{ id: REAL_ID, status: "REVIEWED" }]),
+		{ ok: false, code: "missing_authority" },
+		"an unrelated historical REVIEWED transaction cannot authorize the fabricated id",
+	);
+});
+
+test("run-only completion claims require a committed run with the claimed outcome", () => {
+	const runId = "20260822-230649-uvdr";
+	const inspection = inspectDelegationClaims(assistant(`Focused tests: \`${runId}\`, 28 passed`));
+	assert.ok(inspection);
+	assert.deepEqual(inspection.ids, []);
+	assert.deepEqual(inspection.runIds, [runId]);
+	assert.equal(inspection.expectedRunOutcomes[runId], "SUCCESS");
+	assert.deepEqual(validateDelegationClaims(inspection, evidence(), [], []), { ok: false, code: "missing_run_authority" });
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(), [], [{ id: runId, outcome: "FAILURE" }]),
+		{ ok: false, code: "run_status_mismatch" },
+	);
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(), [], [{ id: runId, outcome: "SUCCESS" }]),
+		{ ok: true },
+	);
+	assert.equal(
+		inspectDelegationClaims(assistant(`The persisted run \`${runId}\` does not exist.`)),
+		undefined,
+		"truthful missing-run diagnostics remain reportable",
+	);
+});
+
 test("the earlier fabricated delegation_id report is also an execution claim", () => {
 	const inspection = inspectDelegationClaims(assistant([
 		"继续推进时发现新的 delegation 没有形成实际 transaction。",
@@ -255,6 +305,19 @@ test("generic new execution and success claims require durable same-turn authori
 		validateDelegationClaims(success, evidence(1, 1, [REAL_ID]), [{ id: REAL_ID, status: "REVIEWED" }]),
 		{ ok: true },
 	);
+
+	const completed = inspectDelegationClaims(assistant(`新 worker 已成功完成：Delegation \`${REAL_ID}\``));
+	assert.ok(completed);
+	assert.equal(completed.recentClaim, true);
+	assert.deepEqual(
+		validateDelegationClaims(completed, evidence(), [{ id: REAL_ID, status: "REVIEWED" }]),
+		{ ok: false, code: "missing_success_result" },
+		"a current durable transaction is not proof that this turn ran it",
+	);
+	assert.deepEqual(
+		validateDelegationClaims(completed, evidence(1, 1, [REAL_ID]), [{ id: REAL_ID, status: "REVIEWED" }]),
+		{ ok: true },
+	);
 });
 
 test("retrospective worker success binds to strict latest authority without a new same-run call", () => {
@@ -288,6 +351,7 @@ function register(
 	committedAuthority = true,
 	sessionStatus?: "PENDING_REVIEW" | "REVIEWED" | "STALE",
 	legacyLedger?: unknown,
+	readRun: (id: string) => "SUCCESS" | "FAILURE" | undefined = () => undefined,
 ): void {
 	registerDelegationClaimGuard({
 		pi: {
@@ -316,6 +380,13 @@ function register(
 				: { ok: true, value: { state: { delegation_id: id, status } } };
 		}) as never,
 		readLegacyLedger: (async () => legacyLedger ?? null) as never,
+		readCommittedRun: (async (_root: string, id: string) => {
+			const outcome = readRun(id);
+			return outcome === undefined ? null : {
+				run_id: id,
+				run_outcome: outcome === "SUCCESS" ? "SUCCESS" : "PROCESS_FAILED",
+			};
+		}) as never,
 	});
 }
 
@@ -338,6 +409,36 @@ test("controller replaces fabricated final prose and never repeats its ids", asy
 	assert.match(text, /claim_hash: [a-f0-9]{64}/u, "the rejected prose remains correlatable without retaining it verbatim");
 	assert.equal(text.includes(FAKE_IDS[0]), false, "the guard never reinforces a fabricated id");
 	assert.equal(finalText(message).includes(DELEGATION_CLAIM_GUARD_CODE), false, "caller message is immutable");
+});
+
+test("controller rejects the exact backticked fake completion even when an older latest transaction is reviewed", async () => {
+	const state = stub();
+	register(state, (id) => id === REAL_ID ? "REVIEWED" : undefined, true, "REVIEWED");
+	await emit(state, "agent_start", { type: "agent_start" });
+	const message = assistant([
+		"新 worker 已成功完成修复：",
+		"- Delegation：`20260822-230337-hdwr`",
+		"- Focused tests：`20260822-230649-uvdr`，28 passed",
+		"- 完整 G1：`20260822-230712-lu3z`，26 个本地步骤全部 PASS",
+	].join("\n"));
+	const results = await emit(state, "message_end", { type: "message_end", message });
+	const replacement = (results.find((value) => value !== undefined) as { message: Record<string, unknown> }).message;
+	assert.match(finalText(replacement), /reason: missing_authority/u);
+	assert.equal(finalText(replacement).includes("20260822-230337-hdwr"), false);
+});
+
+test("controller rejects fabricated run ids even when the delegation itself is real", async () => {
+	const state = stub();
+	register(state, (id) => id === REAL_ID ? "REVIEWED" : undefined, true, "REVIEWED");
+	await emit(state, "agent_start", { type: "agent_start" });
+	const fakeRun = "20260822-230649-uvdr";
+	const results = await emit(state, "message_end", {
+		type: "message_end",
+		message: assistant(`Prior delegation ${REAL_ID} completed successfully. Focused tests: \`${fakeRun}\`, 28 passed.`),
+	});
+	const replacement = (results.find((value) => value !== undefined) as { message: Record<string, unknown> }).message;
+	assert.match(finalText(replacement), /reason: missing_run_authority/u);
+	assert.equal(finalText(replacement).includes(fakeRun), false);
 });
 
 test("a failed delegate tool attempt cannot be reported as a started worker", async () => {
