@@ -94,7 +94,11 @@ import {
 	createCacheTelemetry,
 	type CacheTelemetry,
 } from "./cache/cache-telemetry.ts";
-import { type GitFacts } from "./core/delegation-ledger.ts";
+import { readDelegationLedger, type GitFacts } from "./core/delegation-ledger.ts";
+import {
+	readDelegationCommittedGenerationV2,
+	readDelegationTransactionV2,
+} from "./core/delegation-transaction-storage.ts";
 import {
 	readRecoverableUnpublishedDelegationV2,
 	readDelegationAuthorityObservationV2 as readDelegationAuthorityObservation,
@@ -201,6 +205,7 @@ import { createDelegationSessionController } from "./core/delegation-session-con
 import { registerToolResultMiddleware } from "./core/tool-result-middleware-controller.ts";
 import { registerToolCallGuard } from "./core/tool-call-guard-controller.ts";
 import { registerMessageEndController } from "./core/message-end-controller.ts";
+import { registerDelegationClaimGuard } from "./core/delegation-claim-guard-controller.ts";
 
 export {
 	installNativeReadV3TestHooks,
@@ -1431,6 +1436,14 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		}),
 		projectRootFor,
 		refreshStatus,
+	});
+	registerDelegationClaimGuard({
+		pi,
+		isCommander: () => outputTurnRole() === "commander",
+		projectRootFor,
+		readTransaction: readDelegationTransactionV2,
+		readCommittedGeneration: readDelegationCommittedGenerationV2,
+		readLegacyLedger: readDelegationLedger,
 	});
 	// Safe flush: persist the session state entry (append-only JSONL records
 	// are already written per request; nothing is buffered here).

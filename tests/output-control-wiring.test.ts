@@ -48,6 +48,8 @@ import {
 } from "../extensions/workbench-runtime/core/turn-output-budget.ts";
 import { COMPARE_SUMMARY_MAX_BYTES, COMPARE_SUMMARY_MAX_LINES } from "../extensions/workbench-runtime/core/render.ts";
 import { deriveResultId } from "../extensions/workbench-runtime/core/tool-result-recovery.ts";
+import { DELEGATION_CLAIM_GUARD_CODE } from "../extensions/workbench-runtime/core/delegation-claim-guard-controller.ts";
+import { persistPreparedDelegationTransaction } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
 import {
 	TOOL_RESULT_INGRESS_BUDGET_BYTES,
 	TOOL_RESULT_INGRESS_METADATA_MAX_BYTES,
@@ -68,7 +70,13 @@ import {
 	parseOutputControlTelemetry,
 	serializeOutputControlTelemetry,
 } from "../extensions/workbench-runtime/core/output-control-telemetry.ts";
-import { WORKER_ALLOWED_PATHS_ENV, WORKER_PROJECT_ROOT_ENV, WORKER_ROLE_ENV } from "../extensions/workbench-runtime/core/worker-policy.ts";
+import {
+	WORKER_ALLOWED_PATHS_ENV,
+	WORKER_MODEL_ID,
+	WORKER_PROJECT_ROOT_ENV,
+	WORKER_PROVIDER,
+	WORKER_ROLE_ENV,
+} from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { WORKER_SPEND_PROFILE_ENV } from "../extensions/workbench-runtime/core/worker-spend.ts";
 import { spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
 
@@ -1859,6 +1867,48 @@ test("message_end fail-safe bounds immediate results before later persistence ob
 		assert.equal(JSON.stringify(details).includes("secret"), false);
 		assert.equal((details.output_envelope as Record<string, unknown>).policy, "run-summary");
 		await assert.rejects(readFile(join(root, CONFIG_DIR_NAME, "workbench", "tool-results", `${deriveResultId("output-control-wiring-session", "blocked-1")}.started`), "utf8"), { code: "ENOENT" });
+	});
+});
+
+test("commander message_end rejects fabricated delegation execution claims before display", async () => {
+	await withTempDir(async (root) => {
+		await writeConfigFile(root, "project.yaml", "name: output-control-wiring\nprofile: generic\n");
+		const stub = makeStub(); workbenchRuntime(stub); const ctx = trustedCtx(root);
+		await startBudgetTurn(stub, ctx as ExtensionContext, "commander", 71, []);
+		const fabricatedId = "20260822-124052-xSAX";
+		const fabricated = {
+			role: "assistant",
+			content: [{ type: "text", text: `已按要求启动新的 delegation ${fabricatedId} — SUCCESS/REVIEWED` }],
+			provider: "openai-codex", model: "gpt-5.6-sol", stopReason: "stop", timestamp: 1,
+		};
+		const guarded = await emitMessageEnd(stub, fabricated, ctx as ExtensionContext);
+		const shown = textOf(guarded.content as Array<Record<string, unknown>>);
+		assert.ok(shown.includes(DELEGATION_CLAIM_GUARD_CODE));
+		assert.equal(shown.includes(fabricatedId), false, "fixed failure never repeats the fabricated id");
+		assert.equal(textOf(fabricated.content).includes(DELEGATION_CLAIM_GUARD_CODE), false, "input message remains unchanged");
+
+		const realId = "20260822-130000-real";
+		const prepared = await persistPreparedDelegationTransaction(root, {
+			delegation_id: realId,
+			task_kind: "implementation",
+			contract_hash: "a".repeat(64),
+			allowed_paths: ["src/**"],
+			worker_identity: { provider: WORKER_PROVIDER, model: WORKER_MODEL_ID, worker_id: `worker:${realId}` },
+			generation: 1,
+			now: "2026-08-22T06:00:00.000Z",
+		});
+		assert.equal(prepared.ok, true);
+		const authoritative = {
+			...fabricated,
+			content: [{ type: "text", text: `delegation ${realId} — PREPARED` }],
+		};
+		assert.deepEqual(await emitMessageEnd(stub, authoritative, ctx as ExtensionContext), authoritative, "strict persisted authority remains reportable");
+
+		const negative = {
+			...fabricated,
+			content: [{ type: "text", text: `delegation ${fabricatedId} does not exist and was not executed.` }],
+		};
+		assert.deepEqual(await emitMessageEnd(stub, negative, ctx as ExtensionContext), negative, "truthful negative audit remains visible");
 	});
 });
 
