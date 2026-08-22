@@ -22,6 +22,10 @@ import {
 } from "./delegation-transaction-storage.ts";
 import type { DelegationTransactionRecord } from "./delegation-transaction.ts";
 import { DELEGATION_WORKSPACE_DIFF_IDENTITY_KIND_V2 } from "./delegation-workspace-v2.ts";
+import {
+	recoverInterruptedDelegationV2,
+	type DelegationExecutionOwnerOptionsV2,
+} from "./delegation-execution-owner.ts";
 import { readReviewRecord, type ReviewRecord } from "./diff-review.ts";
 import { collectReviewRelevanceV2, computeReviewRelevanceConflictHashV2 } from "./review-relevance-v2.ts";
 import { validateWorkspaceGuard, type WorkspaceGuardRecord } from "./workspace-guard.ts";
@@ -432,6 +436,7 @@ export async function reconcileProjectDelegationAuthorityV2(input: {
 	exec: ExecFn;
 	terminal_mirror_blocked?: boolean;
 	defer_reviewed_freshness?: boolean;
+	interruption_recovery_options?: DelegationExecutionOwnerOptionsV2;
 }): Promise<ReconcileProjectDelegationAuthorityV2Result> {
 	const latest = await readLatestProjectDelegationTransactionV2(input.project_root);
 	if (!latest.ok) {
@@ -444,7 +449,16 @@ export async function reconcileProjectDelegationAuthorityV2(input: {
 		};
 	}
 	if (latest.value === null) return { ok: true, state: null };
-	const transaction = latest.value;
+	let transaction = latest.value;
+	const interruption = await recoverInterruptedDelegationV2({
+		project_root: input.project_root,
+		transaction,
+		now: input.now,
+		...(input.interruption_recovery_options === undefined
+			? {}
+			: { options: input.interruption_recovery_options }),
+	});
+	if (interruption.status === "recovered") transaction = interruption.transaction;
 	const authority = await readDelegationAuthorityObservationV2(input.project_root, transaction.delegation_id);
 	if (authority.kind === "invalid-v2") {
 		return { ok: false, issue: { code: authority.code, delegationId: transaction.delegation_id } };

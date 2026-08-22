@@ -352,6 +352,9 @@ test("delegate-tool metadata codifies direct one-call development delivery", () 
 	assert.match(text, /immutable FINAL\/PASS v2 review later becomes STALE/);
 	assert.match(text, /fresh successor after strict live authority revalidation/);
 	assert.match(text, /PENDING_REVIEW, corrupt, unpublished, recovery-required, and non-final authority remain blocking/);
+	assert.match(text, /durable execution-owner record spans PREPARED\/RUNNING/);
+	assert.match(text, /atomically ABORTS only a provably dead transaction with no worker-write evidence/);
+	assert.match(text, /nonempty-journal, COMMITTING, corrupt, or ambiguous authority remains fail-closed/);
 	assert.doesNotMatch(text, /minimum repository orientation/);
 	assert.doesNotMatch(text, /source\+tests\+docs vertical slices/);
 });
@@ -442,6 +445,9 @@ test("worker-delegation documentation defines fixed Sol/Luna boundaries and stri
 	assert.match(doc, /Both\s+successful paths also require provider success, exit code 0, a complete\s+report, complete terminal facts, and the exact pinned\/observed worker\s+identity/);
 	assert.match(doc, /Provider success, exit code 0, or reassuring worker prose cannot\s+bypass any other postcondition/);
 	assert.match(doc, /failure\s+becomes `FAILED`; incomplete terminal or generation facts become\s+`RECOVERY_REQUIRED`/);
+	assert.match(doc, /`v2\/execution-owner\.json` while the owning Pi process is executing/);
+	assert.match(doc, /transaction timestamp plus both transaction and journal file mtimes to predate\s+the current OS boot/);
+	assert.match(doc, /any write evidence,\s+`COMMITTING`, corrupt data, or ambiguous inventory remains blocking/);
 	// V2 review authority is separate, coverage-gated, immutable after final
 	// PASS, and cannot unlock through a failed session-mirror append.
 	assert.match(doc, /\.pi\/workbench\/delegations\/<id>\/v2\/review\.json/);

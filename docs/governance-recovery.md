@@ -38,6 +38,17 @@ v2 record never falls back to v1. Run and artifact details can be inspected
 with the existing read tools; inspection itself must not write receipts or
 change authority.
 
+Current v2 records also carry `execution-owner.json` across PREPARED/RUNNING.
+On restart, Pi automatically and atomically marks a provably dead transaction
+`ABORTED` only when its write journal is absent before launch or exactly empty
+OPEN revision 0 and the v2 directory contains no other execution artifacts.
+For historical ownerless records, both transaction and journal mtimes plus the
+transaction time must predate the current OS boot. Status then reports the
+terminal abort and tells the caller to start a fresh delegation; review is not
+required. Any write operation/meter, generation, review, lock, temporary file,
+COMMITTING state, live/unknown owner, or invalid evidence keeps recovery
+blocked for manual diagnosis.
+
 ## Explicit reconcile
 
 Reconciliation never edits an immutable generation or historical run:
@@ -66,8 +77,11 @@ Stop recovery and preserve the current files when any of these is true:
 - project authority is INVALID, has an unknown schema, or cannot be read;
 - a run/delegation identity, commit inventory, review hash, or contract hash
   does not match;
-- a transaction is `RUNNING`, `COMMITTING`, `RECOVERY_REQUIRED`, or otherwise
-  lacks the exact terminal proof required by its state;
+- a transaction is `COMMITTING`, `RECOVERY_REQUIRED`, or otherwise lacks the
+  exact terminal proof required by its state; a `PREPARED`/`RUNNING` record is
+  also a stop unless current startup reconciliation has already proved the
+  owner dead, proved the journal/inventory pristine, and durably changed it to
+  `ABORTED`;
 - the workspace changes during diagnosis/reconciliation;
 - storage is full, unavailable, unexpectedly symlinked, or exceeds a bounded
   inventory/record limit;

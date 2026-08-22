@@ -186,7 +186,7 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 
 test("v0.10.0 public tool surface has the intentional canonical transition hash", () => {
 	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
-	const currentHash = "94bb202c8ff94772604595d83e962ef95531ab8dfe369207729e998b02c93ee3";
+	const currentHash = "9e7394a7eb8e1c9960baee532fabd9f2c13d248329bcfde0696c73cc67550559";
 	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
 	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the documented 0.10.0 hash");
 });
@@ -383,6 +383,8 @@ test("workbench_delegate_worker metadata is static and defaults to one-call deli
 	assert.match(text, /smallest useful allowed_paths set/);
 	assert.match(text, /observable acceptance criteria/);
 	assert.match(text, /committed delegation-v2 transaction/);
+	assert.match(text, /durable execution-owner record spans PREPARED\/RUNNING/);
+	assert.match(text, /startup atomically ABORTS only a provably dead transaction with no worker-write evidence/);
 	assert.match(text, /Diagnosis is strictly read-only/);
 	assert.match(text, /zero successful or denied writes/);
 	assert.match(text, /explicit permission, destructive-action confirmation, or final verification gates/);
@@ -659,8 +661,8 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.equal(
 		canonicalHash(workbenchToolMetadataOrdered()),
-		"f37b569970c72f7aacd8ffe6e30588327412747463f84fca645ddcb101a6c6aa",
-		"current public catalog hash is machine-pinned after safe-default, segmented delivery, and advisory turn-marker guidance",
+		"62a498d58b54f1352ec0d241364fd01f1cba7a759ffadb593f5f839952002b7c",
+		"current public catalog hash is machine-pinned after crash-safe execution-owner guidance",
 	);
 });
 

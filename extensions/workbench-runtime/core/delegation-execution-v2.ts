@@ -51,6 +51,11 @@ import {
 	type DelegationTransactionStorageOptions,
 } from "./delegation-transaction-storage.ts";
 import {
+	claimDelegationExecutionOwnerV2,
+	releaseDelegationExecutionOwnerV2,
+	type DelegationExecutionOwnerOptionsV2,
+} from "./delegation-execution-owner.ts";
+import {
 	DELEGATION_TRANSACTION_HASH_RE,
 	DELEGATION_TRANSACTION_ID_RE,
 	DELEGATION_TRANSACTION_WORKER_ID_RE,
@@ -141,6 +146,8 @@ export interface ExecuteDelegationV2Input {
 	runWorker?: RunDelegationWorkerV2;
 	collectAfter?: CollectDelegationAfterV2;
 	storageOptions?: DelegationTransactionStorageOptions;
+	/** Test seam for boot identity; storage remains bound to storageOptions. */
+	executionOwnerOptions?: Omit<DelegationExecutionOwnerOptionsV2, "storage_options">;
 }
 
 interface DelegationExecutionV2Common {
@@ -450,6 +457,36 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 	}, storageOptions).catch(() => undefined);
 	if (prepared === undefined || !prepared.ok) return failure("prepare_failed", checked, input);
 	let state = prepared.value;
+	const ownerAt = safeClock(input.clock);
+	if (ownerAt === undefined) {
+		const aborted = await persistAbortedDelegationTransaction(checked.projectRoot, {
+			delegation_id: checked.delegationId,
+			contract_hash: checked.contract.contract_hash,
+			worker_identity: checked.workerIdentity,
+			expected_generation: state.generation,
+			expected_revision: state.revision,
+			now: preparedAt,
+			reason: "execution owner time was unavailable before worker launch",
+		}, storageOptions).catch(() => undefined);
+		if (aborted?.ok) state = aborted.value;
+		return failure("start_failed", checked, input, { durable_state: state });
+	}
+	const ownerOptions: DelegationExecutionOwnerOptionsV2 = {
+		...(input.executionOwnerOptions ?? {}),
+		...(storageOptions === undefined ? {} : { storage_options: storageOptions }),
+	};
+	const owner = await claimDelegationExecutionOwnerV2(
+		checked.projectRoot,
+		state,
+		ownerAt,
+		ownerOptions,
+	).catch(() => undefined);
+	if (owner === undefined || !owner.ok) {
+		// A conflict may be a live concurrent owner, while a storage failure may
+		// have published partial evidence. Never abort either ambiguity here.
+		return failure("start_failed", checked, input, { durable_state: state });
+	}
+	try {
 	let changeSetPrepared: Readonly<PreparedDelegationChangeSetLifecycleV2>;
 	if (input.exec === undefined) {
 		state = await attemptPreparedAbort(checked, state, input.clock, storageOptions,
@@ -510,7 +547,11 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 		expected_revision: state.revision,
 		now: runningAt,
 	}, storageOptions).catch(() => undefined);
-	if (running === undefined || !running.ok) return failure("start_failed", checked, input, { durable_state: state });
+	if (running === undefined || !running.ok) {
+		state = await attemptPreparedAbort(checked, state, input.clock, storageOptions,
+			"running state could not be persisted before worker launch");
+		return failure("start_failed", checked, input, { durable_state: state });
+	}
 	state = running.value;
 
 	let worker: WorkerRunResult;
@@ -693,4 +734,16 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 		return failure("postconditions_failed", checked, input, common);
 	}
 	return failure("unexpected_terminal_state", checked, input, common);
+	} finally {
+		// A still-incomplete state retains the owner as crash evidence. Terminal
+		// states remove only the exact token; cleanup never downgrades a result.
+		if (state.status !== "PREPARED" && state.status !== "RUNNING" && state.status !== "COMMITTING") {
+			await releaseDelegationExecutionOwnerV2(
+				checked.projectRoot,
+				state,
+				owner.value.token,
+				ownerOptions,
+			).catch(() => undefined);
+		}
+	}
 }

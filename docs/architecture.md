@@ -85,8 +85,10 @@ extensions/workbench-runtime/
     │                        #   argv-only git facts (pure + injected exec); Phase 3:
     │                        #   resolved budget_profile in the before contract + canonical
     │                        #   cumulative spend object in usage.json/worker-summary.json
-    ├── delegation-state.ts  # P7 review lifecycle: PENDING_REVIEW → REVIEWED → STALE,
-    │                        #   hash binding invariants, delegation/VERIFY blocking (pure)
+	├── delegation-state.ts  # P7 review lifecycle: PENDING_REVIEW → REVIEWED → STALE,
+	│                        #   hash binding invariants, delegation/VERIFY blocking (pure)
+	├── delegation-execution-owner.ts # v2 PREPARED/RUNNING owner identity +
+	│                        #   fail-closed crash/reboot orphan reconciliation
     ├── diff-review.ts       # P7 workbench_review_worker_diff service: real-diff scope
     │                        #   check over EVERY worker path, bound hash vs recorded
     │                        #   after hash, drift, bounded redacted patch, displayed-
@@ -196,6 +198,9 @@ GPT-5.6 Sol parent in DEV
        --model openai-codex/gpt-5.6-luna:xhigh
   → child role matrix + hard guard: no recursion, no bash, no final gates
   → edit/write limited to parent-approved paths
+	→ execution owner is durable before baseline collection/worker launch;
+	     restart ABORTS only a provably dead owner with no write evidence,
+	     while nonempty/COMMITTING/ambiguous authority remains blocked
   → worker-role lifecycle: one hidden soft-budget steer at 80%, cancel
        session_before_compact before reading its preparation
   → bounded JSON event stream + verified model identity + nested usage

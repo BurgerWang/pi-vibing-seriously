@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, symlink, writeFile } from "node:fs/promises";
+import { mkdir, symlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -9,7 +9,10 @@ import {
 	projectDelegationDispositionV2,
 	readLatestProjectDelegationTransactionV2,
 	readRecoverableUnpublishedDelegationV2,
+	reconcileProjectDelegationAuthorityV2,
 } from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
+import type { ExecFn } from "../extensions/workbench-runtime/core/config.ts";
+import { emptyDelegationState } from "../extensions/workbench-runtime/core/delegation-state.ts";
 import {
 	persistAbortedDelegationTransaction,
 	persistCommittingDelegationTransaction,
@@ -181,5 +184,51 @@ test("only an exact proof-null artifact failure with a sealed journal is recover
 		await mkdir(join(generations, "g00000001"), { recursive: true });
 		const refused = await readRecoverableUnpublishedDelegationV2(root, id);
 		assert.deepEqual(refused, { ok: false, error: { code: "not_recoverable" } });
+	});
+});
+
+test("project reconciliation terminates a legacy preboot empty RUNNING transaction and unlocks the session mirror", async () => {
+	await withTempDir(async (root) => {
+		const id = "20260820-100004-boot";
+		const initial = await prepared(root, id, 0);
+		const journal = await createWorkerWriteJournal({ project_root: root, delegation_id: id, contract_hash: HASH });
+		assert.equal(journal.ok, true, journal.ok ? "" : journal.error.code);
+		const running = await persistRunningDelegationTransaction(root, {
+			delegation_id: id,
+			contract_hash: HASH,
+			worker_identity: initial.worker_identity,
+			expected_generation: 1,
+			expected_revision: 0,
+			now: at(1),
+		});
+		assert.equal(running.ok, true, running.ok ? "" : running.error.code);
+		if (!running.ok) return;
+		const v2 = join(root, CONFIG_DIR_NAME, "workbench", "delegations", id, "v2");
+		const preboot = new Date("2026-08-20T10:00:02.000Z");
+		await utimes(join(v2, "transaction.json"), preboot, preboot);
+		await utimes(join(v2, "write-journal.json"), preboot, preboot);
+		const exec: ExecFn = async (_command, args) => args[0] === "rev-parse"
+			? { stdout: "", stderr: "", code: 1, killed: false }
+			: { stdout: "", stderr: "", code: 0, killed: false };
+		const reconciled = await reconcileProjectDelegationAuthorityV2({
+			project_root: root,
+			current_state: emptyDelegationState(),
+			now: "2026-08-20T10:10:00.000Z",
+			exec,
+			interruption_recovery_options: {
+				boot_facts: {
+					boot_id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+					system_boot_time_ms: Date.parse("2026-08-20T10:05:00.000Z"),
+					runtime_started_at: "2026-08-20T10:05:01.000Z",
+				},
+			},
+		});
+		assert.equal(reconciled.ok, true, reconciled.ok ? "" : reconciled.issue.code);
+		if (!reconciled.ok) return;
+		assert.equal(reconciled.state?.latestId, id);
+		assert.equal(reconciled.state?.status, "REVIEWED");
+		assert.equal(reconciled.state?.reviewedDiffHash, reconciled.state?.currentDiffHash);
+		const durable = await readLatestProjectDelegationTransactionV2(root);
+		assert.equal(durable.ok && durable.value?.status, "ABORTED");
 	});
 });

@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { promisify } from "node:util";
+
+import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import {
 	bindDelegationBoundedTaskContractV2,
@@ -255,6 +257,17 @@ test("execution v2: implementation commits PENDING_REVIEW and strict reader retu
 	const executionInput = await input(projectRoot, delegationId, "implementation", after(["src/changed.ts"]), worker(report), {
 		secrets: ["not-present"],
 	});
+	const ownerPath = join(projectRoot, CONFIG_DIR_NAME, "workbench", "delegations", delegationId, "v2", "execution-owner.json");
+	const originalRunner = executionInput.runWorker!;
+	let ownerObserved = false;
+	executionInput.runWorker = async (options) => {
+		const owner = JSON.parse(await readFile(ownerPath, "utf8")) as Record<string, unknown>;
+		assert.equal(owner.delegation_id, delegationId);
+		assert.equal(owner.contract_hash, executionInput.contract.contract_hash);
+		assert.equal(owner.process_id, process.pid);
+		ownerObserved = true;
+		return originalRunner(options);
+	};
 	const inputSnapshot = {
 		contract: structuredClone(executionInput.contract),
 		before: structuredClone(executionInput.before),
@@ -265,6 +278,8 @@ test("execution v2: implementation commits PENDING_REVIEW and strict reader retu
 	assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result));
 	if (!result.ok) return;
 	assert.equal(result.status, "PENDING_REVIEW");
+	assert.equal(ownerObserved, true);
+	await assert.rejects(access(ownerPath), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
 	assert.equal(result.durable_state.status, "PENDING_REVIEW");
 	assert.deepEqual(result.after.changedSinceBefore, ["src/changed.ts"]);
 	assert.equal(result.result.provider, WORKER_PROVIDER);

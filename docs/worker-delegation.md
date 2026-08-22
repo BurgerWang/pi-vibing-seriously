@@ -320,6 +320,22 @@ bypass any other postcondition. A fully recorded worker/postcondition failure
 becomes `FAILED`; incomplete terminal or generation facts become
 `RECOVERY_REQUIRED`.
 
+`PREPARED` and `RUNNING` also carry a separate bounded
+`v2/execution-owner.json` while the owning Pi process is executing. The owner
+binds the delegation, contract, worker identity, OS boot id, PID, and process
+start identity; normal terminal paths remove only their exact owner token. On
+session start, reconciliation may atomically convert an interrupted transaction
+to `ABORTED` without review only when the owner is provably dead and the write
+journal is either not yet created for PREPARED or is exactly empty OPEN
+revision 0, with no generation, review, lock, temporary, or other artifact.
+Historical transactions written before execution-owner support require the
+transaction timestamp plus both transaction and journal file mtimes to predate
+the current OS boot. A live/reused/unverifiable owner, any write evidence,
+`COMMITTING`, corrupt data, or ambiguous inventory remains blocking and is
+never cleared optimistically. A recovered `ABORTED` transaction is terminal
+FAIL evidence; status instructs the parent to start a fresh delegation rather
+than retry review.
+
 Records are atomic, bounded, redacted, and never contain full worker
 transcripts or secrets; the delegation directory is excluded from workspace
 facts. New tagged v2 `before.json`/`after.json` records identify their

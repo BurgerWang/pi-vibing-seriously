@@ -143,6 +143,17 @@ transcripts or secrets), and the ledger's own directory is excluded from the
 git facts it records so records never pollute the diff they describe. Git
 facts come from argv-only `exec` calls (shell=false), never shell strings.
 
+The v2 transaction lock protects individual atomic updates; a separate
+bounded `execution-owner.json` protects the complete PREPARED/RUNNING worker
+lifetime. It binds boot id, PID, process-start identity, delegation, contract,
+and pinned worker identity. Restart reconciliation auto-terminates only a
+provably dead, artifact-free transaction whose write journal contains no
+attempted path, completed path, byte read, or operation. Historical ownerless
+records additionally require both durable record mtimes and the transaction
+time to predate the current system boot. PID reuse is detected by process-start
+identity. Any write evidence, COMMITTING state, live/unknown owner, malformed
+record, extra artifact, or storage uncertainty remains fail-closed.
+
 `workbench_review_worker_diff` (DEV-only, Sol) re-evaluates the CURRENT
 workspace authority. Every record generation scope-checks all worker-delta
 paths W against the parent-approved `allowed_paths` (realpath/symlink-safe;

@@ -1,7 +1,7 @@
 /** S1.1 public workbench_delegate_worker wiring through delegation-v2. */
 
 import assert from "node:assert/strict";
-import { cp, mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, readdir, utimes, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -22,6 +22,7 @@ import {
 	persistRunningDelegationTransaction,
 	readDelegationCommittedGenerationV2,
 	readDelegationReviewV2,
+	readDelegationTransactionV2,
 } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
 import type { DelegationTransactionRecord } from "../extensions/workbench-runtime/core/delegation-transaction.ts";
 import {
@@ -1034,7 +1035,66 @@ test("a fresh session discovers durable ABORTED project authority without report
 		const status = await delegationStatusTool(stub).execute("project-aborted-status", {}, undefined, undefined, ctx);
 		assert.match(resultText(status), /authority v2\s+: transaction ABORTED/);
 		assert.match(resultText(status), /completion v2: FAIL/);
+		assert.match(resultText(status), /next action\s+: start a fresh delegation; the terminal before-worker transaction needs no review/);
 		assert.doesNotMatch(resultText(status), /INVALID|\(no delegation\)/);
+	});
+});
+
+test("session_start atomically aborts an ownerless preboot empty RUNNING transaction and removes the review block", async () => {
+	await withTempDir(async (root) => {
+		await initializeProject(root);
+		const id = "20260820-170000-boot";
+		const initial = await persistPreparedDelegationTransaction(root, {
+			delegation_id: id,
+			task_kind: "implementation",
+			contract_hash: PROJECT_AUTHORITY_CONTRACT_HASH,
+			allowed_paths: ["src/**"],
+			worker_identity: { provider: WORKER_PROVIDER, model: WORKER_MODEL_ID, worker_id: `worker:${id}` },
+			generation: 1,
+			now: "1970-01-01T00:00:01.000Z",
+		});
+		assert.equal(initial.ok, true, initial.ok ? "" : initial.error.code);
+		if (!initial.ok) return;
+		const journal = await createWorkerWriteJournal({
+			project_root: root,
+			delegation_id: id,
+			contract_hash: initial.value.contract_hash,
+		});
+		assert.equal(journal.ok, true, journal.ok ? "" : journal.error.code);
+		const running = await persistRunningDelegationTransaction(root, {
+			...projectAuthorityCas(initial.value, 1),
+			now: "1970-01-01T00:00:02.000Z",
+		});
+		assert.equal(running.ok, true, running.ok ? "" : running.error.code);
+		if (!running.ok) return;
+		const v2 = join(root, CONFIG_DIR_NAME, "workbench", "delegations", id, "v2");
+		const beforeBoot = new Date("1970-01-01T00:00:03.000Z");
+		await utimes(join(v2, "transaction.json"), beforeBoot, beforeBoot);
+		await utimes(join(v2, "write-journal.json"), beforeBoot, beforeBoot);
+
+		const stub = commanderRuntime();
+		const ctx = commanderContext(root, "project-interrupted", [{
+			type: "custom",
+			customType: DELEGATION_STATE_ENTRY_TYPE,
+			data: {
+				latestId: id,
+				status: "PENDING_REVIEW",
+				currentDiffHash: "3".repeat(64),
+				blockedWriteAttempts: 0,
+				updatedAt: "1970-01-01T00:00:03.000Z",
+			},
+		}]);
+		await startSession(stub, ctx);
+		const durable = await readDelegationTransactionV2(root, id);
+		assert.equal(durable.ok, true, durable.ok ? "" : durable.error.code);
+		if (durable.ok) {
+			assert.equal(durable.value.status, "ABORTED");
+			assert.match(durable.value.abort_reason ?? "", /runtime interrupted before any worker write/);
+		}
+		assert.equal(latestSessionState(stub).status, "REVIEWED");
+		const status = await delegationStatusTool(stub).execute("project-interrupted-status", {}, undefined, undefined, ctx);
+		assert.doesNotMatch(resultText(status), /blocked\s+: Starting a new worker delegation/);
+		assert.match(resultText(status), /next action\s+: start a fresh delegation/);
 	});
 });
 

@@ -125,6 +125,8 @@ export interface DelegationStorageEntry {
 export interface DelegationStorageStat {
 	kind: "file" | "directory" | "symlink" | "other";
 	size: number;
+	/** Present for the Node adapter; omitted adapters fail closed for legacy reboot proof. */
+	mtime_ms?: number;
 }
 
 export interface DelegationTransactionStorageAdapter {
@@ -193,7 +195,7 @@ export function createNodeDelegationTransactionStorageAdapter(
 		},
 		async inspect(path) {
 			const stats = await lstat(path);
-			return { kind: kindOf(stats), size: Number(stats.size) };
+			return { kind: kindOf(stats), size: Number(stats.size), mtime_ms: stats.mtimeMs };
 		},
 		removeFile: unlink,
 		randomToken: () => randomBytes(16).toString("hex"),
