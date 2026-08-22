@@ -26,8 +26,13 @@ function assistant(text: string): Record<string, unknown> {
 	};
 }
 
-function evidence(attemptedCalls = 0, successfulResults = 0, resultIds: readonly string[] = []) {
-	return { attemptedCalls, successfulResults, resultIds };
+function evidence(
+	attemptedCalls = 0,
+	successfulResults = 0,
+	resultIds: readonly string[] = [],
+	startedIds: readonly string[] = resultIds,
+) {
+	return { attemptedCalls, successfulResults, resultIds, startedIds };
 }
 
 function finalText(message: Record<string, unknown>): string {
@@ -49,6 +54,15 @@ test("the reproduced three fabricated SUCCESS/REVIEWED delegations fail closed",
 	assert.equal(inspection.successClaim, true);
 	assert.equal(inspection.recentClaim, true);
 	assert.deepEqual(validateDelegationClaims(inspection, evidence(), []), { ok: false, code: "missing_authority" });
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(3, 3, [...FAKE_IDS]), [
+			{ id: FAKE_IDS[0], status: "REVIEWED" },
+			{ id: FAKE_IDS[1], status: "FAILED" },
+			{ id: FAKE_IDS[2], status: "REVIEWED" },
+		]),
+		{ ok: false, code: "status_mismatch" },
+		"a distributive success claim applies to every listed delegation",
+	);
 });
 
 test("the earlier fabricated delegation_id report is also an execution claim", () => {
@@ -80,19 +94,183 @@ test("negative audit mentions remain readable while status mismatches fail", () 
 	);
 });
 
-test("generic new execution and success claims require same-turn tool evidence", () => {
+test("quoted evidence, code blocks, and negated clauses cannot fabricate authority", () => {
+	const inspection = inspectDelegationClaims(assistant([
+		"Rejected transcript:",
+		"```text",
+		`delegation ${FAKE_IDS[0]} — SUCCESS/REVIEWED`,
+		"```",
+		`I did not start delegation ${FAKE_IDS[1]}.`,
+		`delegation ${REAL_ID} — REVIEWED`,
+	].join("\n")));
+	assert.ok(inspection);
+	assert.deepEqual(inspection.ids, [REAL_ID]);
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(), [{ id: REAL_ID, status: "REVIEWED" }]),
+		{ ok: true },
+	);
+
+	const audit = inspectDelegationClaims(assistant("本次根因审计已完成；未启动任何 delegation。"));
+	assert.ok(audit);
+	assert.equal(audit.negativeOnly, true);
+	assert.deepEqual(validateDelegationClaims(audit, evidence(), []), { ok: true });
+});
+
+test("multiple ids and transaction/session statuses bind only to their own clauses and sources", () => {
+	const multi = inspectDelegationClaims(assistant([
+		`delegation ${FAKE_IDS[0]} REVIEWED.`,
+		`delegation ${FAKE_IDS[1]} FAILED.`,
+	].join("\n")));
+	assert.ok(multi);
+	assert.deepEqual(multi.ids, [FAKE_IDS[0], FAKE_IDS[1]]);
+	assert.deepEqual(
+		validateDelegationClaims(multi, evidence(), [
+			{ id: FAKE_IDS[0], status: "REVIEWED" },
+			{ id: FAKE_IDS[1], status: "FAILED" },
+		]),
+		{ ok: true },
+	);
+
+	const sourced = inspectDelegationClaims(assistant([
+		`latest: ${REAL_ID} REVIEWED`,
+		"authority v2: transaction FAILED",
+	].join("\n")));
+	assert.ok(sourced);
+	assert.deepEqual(sourced.expectedStatuses[REAL_ID], [
+		{ status: "REVIEWED", source: "session" },
+		{ status: "FAILED", source: "transaction" },
+	]);
+	assert.deepEqual(
+		validateDelegationClaims(sourced, evidence(), [{ id: REAL_ID, status: "FAILED", sessionStatus: "REVIEWED" }]),
+		{ ok: true },
+	);
+
+	const forgedTransaction = inspectDelegationClaims(assistant(
+		`authority v2: transaction REVIEWED for delegation ${REAL_ID}`,
+	));
+	assert.ok(forgedTransaction);
+	assert.deepEqual(
+		validateDelegationClaims(forgedTransaction, evidence(), [{ id: REAL_ID, status: "FAILED", sessionStatus: "REVIEWED" }]),
+		{ ok: false, code: "status_mismatch" },
+		"a REVIEWED session mirror cannot satisfy a transaction-labeled claim",
+	);
+
+	const semanticSuccess = inspectDelegationClaims(assistant(`delegation ${REAL_ID} completed successfully`));
+	assert.ok(semanticSuccess);
+	assert.deepEqual(
+		validateDelegationClaims(semanticSuccess, evidence(), [{ id: REAL_ID, status: "FAILED" }]),
+		{ ok: false, code: "status_mismatch" },
+	);
+
+	const ambiguous = inspectDelegationClaims(assistant([
+		`delegation ${FAKE_IDS[0]}`,
+		`delegation ${FAKE_IDS[1]}`,
+		"worker SUCCESS",
+	].join("\n")));
+	assert.ok(ambiguous);
+	assert.deepEqual(
+		validateDelegationClaims(ambiguous, evidence(), [
+			{ id: FAKE_IDS[0], status: "REVIEWED" },
+			{ id: FAKE_IDS[1], status: "REVIEWED" },
+		]),
+		{ ok: false, code: "ambiguous_status_binding" },
+	);
+});
+
+test("claim id overflow fails closed instead of silently ignoring later ids", () => {
+	const ids = Array.from({ length: 33 }, (_, index) => `20260822-130000-A${String(index).padStart(3, "0")}`);
+	const inspection = inspectDelegationClaims(assistant(ids.map((id) => `delegation ${id} REVIEWED`).join("\n")));
+	assert.ok(inspection);
+	assert.equal(inspection.overflow, true);
+	assert.equal(inspection.ids.length, 32);
+	assert.deepEqual(validateDelegationClaims(inspection, evidence(), []), { ok: false, code: "claim_overflow" });
+});
+
+test("future plans are not past-tense execution claims, and broad recent reports bind every listed id", () => {
+	assert.equal(
+		inspectDelegationClaims(assistant("下一步可以启动新的 delegation worker。")),
+		undefined,
+	);
+	assert.equal(
+		inspectDelegationClaims(assistant("I will start a new delegation worker after review.")),
+		undefined,
+	);
+	const priorStart = inspectDelegationClaims(assistant("The Luna worker started."));
+	assert.ok(priorStart);
+	assert.equal(priorStart.workerStartClaim, true);
+	assert.deepEqual(validateDelegationClaims(priorStart, evidence(), []), { ok: false, code: "missing_authority" });
+	assert.deepEqual(
+		validateDelegationClaims(priorStart, evidence(), [{ id: REAL_ID, status: "RUNNING" }]),
+		{ ok: true },
+	);
+
+	const inspection = inspectDelegationClaims(assistant([
+		"已按要求改用两个全新的 delegation：",
+		FAKE_IDS[0],
+		FAKE_IDS[1],
+	].join("\n")));
+	assert.ok(inspection);
+	assert.deepEqual(inspection.sameRunStartIds, [FAKE_IDS[0], FAKE_IDS[1]]);
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(1, 1, [FAKE_IDS[0]]), [
+			{ id: FAKE_IDS[0], status: "REVIEWED" },
+			{ id: FAKE_IDS[1], status: "REVIEWED" },
+		]),
+		{ ok: false, code: "missing_started_authority" },
+	);
+});
+
+test("generic new execution and success claims require durable same-turn authority", () => {
 	const recent = inspectDelegationClaims(assistant("已按要求启动新的 delegation worker。"));
 	assert.ok(recent);
-	assert.deepEqual(validateDelegationClaims(recent, evidence(), []), { ok: false, code: "missing_call" });
-	assert.deepEqual(validateDelegationClaims(recent, evidence(1), []), { ok: true });
+	assert.deepEqual(validateDelegationClaims(recent, evidence(), []), { ok: false, code: "missing_started_authority" });
+	assert.deepEqual(
+		validateDelegationClaims(recent, evidence(1), []),
+		{ ok: false, code: "missing_started_authority" },
+		"an attempted tool call is not proof that a worker started",
+	);
+	assert.deepEqual(
+		validateDelegationClaims(recent, evidence(1, 0, [], [REAL_ID]), []),
+		{ ok: false, code: "missing_started_authority" },
+		"a changed session pointer is not enough without readable authority",
+	);
+	assert.deepEqual(
+		validateDelegationClaims(recent, evidence(1, 0, [], [REAL_ID]), [{ id: REAL_ID, status: "PREPARED" }]),
+		{ ok: false, code: "missing_started_authority" },
+		"a PREPARED transaction does not prove that the Luna child started",
+	);
+	assert.deepEqual(
+		validateDelegationClaims(recent, evidence(1, 0, [], [REAL_ID]), [{ id: REAL_ID, status: "RUNNING" }]),
+		{ ok: true },
+	);
 
-	const success = inspectDelegationClaims(assistant("delegation worker SUCCESS; implementation completed."));
+	const success = inspectDelegationClaims(assistant("The new delegation worker was started and returned SUCCESS; implementation completed."));
 	assert.ok(success);
-	assert.deepEqual(validateDelegationClaims(success, evidence(1), []), { ok: false, code: "missing_success_result" });
-	assert.deepEqual(validateDelegationClaims(success, evidence(1, 1, [REAL_ID]), []), { ok: false, code: "missing_authority" });
+	assert.deepEqual(
+		validateDelegationClaims(success, evidence(1, 0, [], [REAL_ID]), [{ id: REAL_ID, status: "RUNNING" }]),
+		{ ok: false, code: "missing_success_result" },
+	);
+	assert.deepEqual(validateDelegationClaims(success, evidence(1, 1, [REAL_ID]), []), { ok: false, code: "missing_started_authority" });
 	assert.deepEqual(
 		validateDelegationClaims(success, evidence(1, 1, [REAL_ID]), [{ id: REAL_ID, status: "REVIEWED" }]),
 		{ ok: true },
+	);
+});
+
+test("retrospective worker success binds to strict latest authority without a new same-run call", () => {
+	const inspection = inspectDelegationClaims(assistant(
+		"Read-only diagnosis: the prior delegation worker completed successfully; the review now reports review_conflict.",
+	));
+	assert.ok(inspection);
+	assert.equal(inspection.recentClaim, false);
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(), [{ id: REAL_ID, status: "REVIEWED", sessionStatus: "STALE" }]),
+		{ ok: true },
+	);
+	assert.deepEqual(validateDelegationClaims(inspection, evidence(), []), { ok: false, code: "missing_authority" });
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(), [{ id: REAL_ID, status: "FAILED", sessionStatus: "STALE" }]),
+		{ ok: false, code: "status_mismatch" },
 	);
 });
 
@@ -109,6 +287,7 @@ function register(
 	readStatus: (id: string) => string | undefined,
 	committedAuthority = true,
 	sessionStatus?: "PENDING_REVIEW" | "REVIEWED" | "STALE",
+	legacyLedger?: unknown,
 ): void {
 	registerDelegationClaimGuard({
 		pi: {
@@ -136,7 +315,7 @@ function register(
 				? { ok: false, error: { code: "not_found", message: "missing" } }
 				: { ok: true, value: { state: { delegation_id: id, status } } };
 		}) as never,
-		readLegacyLedger: (async () => null) as never,
+		readLegacyLedger: (async () => legacyLedger ?? null) as never,
 	});
 }
 
@@ -155,8 +334,82 @@ test("controller replaces fabricated final prose and never repeats its ids", asy
 	const replacement = (results.find((value) => value !== undefined) as { message: Record<string, unknown> }).message;
 	const text = finalText(replacement);
 	assert.ok(text.includes(DELEGATION_CLAIM_GUARD_CODE));
+	assert.ok(text.includes("reason: missing_authority"), "the bounded machine reason makes future failures diagnosable");
+	assert.match(text, /claim_hash: [a-f0-9]{64}/u, "the rejected prose remains correlatable without retaining it verbatim");
 	assert.equal(text.includes(FAKE_IDS[0]), false, "the guard never reinforces a fabricated id");
 	assert.equal(finalText(message).includes(DELEGATION_CLAIM_GUARD_CODE), false, "caller message is immutable");
+});
+
+test("a failed delegate tool attempt cannot be reported as a started worker", async () => {
+	const state = stub();
+	register(state, () => undefined);
+	await emit(state, "agent_start", { type: "agent_start" });
+	await emit(state, "message_end", {
+		type: "message_end",
+		message: {
+			role: "assistant",
+			content: [
+				{ type: "text", text: "Starting a delegation." },
+				{ type: "toolCall", id: "call-failed", name: "workbench_delegate_worker", arguments: {} },
+			],
+		},
+	});
+	await emit(state, "tool_execution_end", {
+		type: "tool_execution_end",
+		toolCallId: "call-failed",
+		toolName: "workbench_delegate_worker",
+		isError: true,
+		result: { details: { status: "error" } },
+	});
+	const results = await emit(state, "message_end", {
+		type: "message_end",
+		message: assistant("I started a new delegation worker."),
+	});
+	const replacement = (results.find((value) => value !== undefined) as { message: Record<string, unknown> }).message;
+	assert.ok(finalText(replacement).includes("reason: missing_started_authority"));
+});
+
+test("legacy fallback accepts only internally consistent schema-v1 authority", async () => {
+	const complete = {
+		manifest: {
+			schema_version: 1,
+			delegation_id: REAL_ID,
+			status: "finished",
+			review_status: "PENDING_REVIEW",
+			finished_at: "2026-08-22T00:00:00.000Z",
+			diff_hash_after: "after-hash",
+			diff_hash_before: "before-hash",
+		},
+		before: { schema_version: 1, delegation_id: REAL_ID, diff_hash: "before-hash" },
+		after: {
+			schema_version: 1,
+			delegation_id: REAL_ID,
+			status: "success",
+			exit_code: 0,
+			review_status: "PENDING_REVIEW",
+			diff_hash: "after-hash",
+		},
+		workerSummary: {
+			schema_version: 1,
+			delegation_id: REAL_ID,
+			status: "success",
+			exit_code: 0,
+		},
+	};
+	for (const [label, ledger, accepted] of [
+		["complete", complete, true],
+		["unknown schema", { ...complete, manifest: { ...complete.manifest, schema_version: 9 } }, false],
+		["partial", { ...complete, workerSummary: null }, false],
+	] as const) {
+		const state = stub();
+		register(state, () => undefined, true, undefined, ledger);
+		await emit(state, "agent_start", { type: "agent_start" });
+		const results = await emit(state, "message_end", {
+			type: "message_end",
+			message: assistant(`delegation ${REAL_ID} SUCCESS`),
+		});
+		assert.equal(results[0] === undefined, accepted, label);
+	}
 });
 
 test("controller permits a strict matching transaction and a real same-turn result", async () => {
@@ -214,6 +467,16 @@ test("status output with a STALE session mirror and REVIEWED transaction is not 
 	const state = stub();
 	register(state, (id) => id === REAL_ID ? "REVIEWED" : undefined, true, "STALE");
 	await emit(state, "agent_start", { type: "agent_start" });
+	assert.deepEqual(await emit(state, "message_end", { type: "message_end", message }), [undefined]);
+});
+
+test("controller resolves an id-less retrospective completion against strict latest authority", async () => {
+	const state = stub();
+	register(state, (id) => id === REAL_ID ? "REVIEWED" : undefined, true, "STALE");
+	await emit(state, "agent_start", { type: "agent_start" });
+	const message = assistant(
+		"Read-only diagnosis: the prior delegation worker completed successfully; the review now reports review_conflict.",
+	);
 	assert.deepEqual(await emit(state, "message_end", { type: "message_end", message }), [undefined]);
 });
 

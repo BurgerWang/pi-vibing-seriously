@@ -2,7 +2,12 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
-import type { readDelegationLedger } from "./delegation-ledger.ts";
+import { sha256Hex } from "../cache/canonical-hash.ts";
+import {
+	DELEGATION_SCHEMA_VERSION,
+	type DelegationLedger,
+	type readDelegationLedger,
+} from "./delegation-ledger.ts";
 import {
 	DELEGATION_TRANSACTION_ID_RE,
 	type DelegationTransactionStatus,
@@ -27,17 +32,27 @@ export const DELEGATION_CLAIM_GUARD_TEXT = [
 const DELEGATION_ID_SCAN_RE = /\b\d{8}-\d{6}-[A-Za-z0-9]{4}\b/g;
 const STATUS_SCAN_RE = /\b(?:SUCCESS|REVIEWED|STALE|PENDING_REVIEW|RECOVERY_REQUIRED|FINISHED|FAILED|ABORTED|RUNNING|PREPARED|COMMITTING)\b/gi;
 const DELEGATION_WORD_RE = /\bdelegation(?:s)?\b|委派|工作线程/i;
-const WORKER_MACHINE_CLAIM_RE = /\bworker(?:s)?\b.{0,80}\b(?:SUCCESS|REVIEWED|FINISHED)\b|\bworker(?:s)?\b.{0,80}成功退出/is;
+const WORKER_WORD_RE = /\bworker(?:s)?\b|工作线程/iu;
+const WORKER_MACHINE_CLAIM_RE = /\bworker(?:s)?\b.{0,80}\b(?:SUCCESS(?:FUL(?:LY)?)?|SUCCEEDED|REVIEWED|FINISHED)\b|\bworker(?:s)?\b.{0,80}成功(?:退出|完成)?/isu;
 const EXECUTION_WORD_RE = /\b(?:start(?:ed)?|launch(?:ed)?|execut(?:e|ed)|creat(?:e|ed)|return(?:ed)?|complet(?:e|ed)|attempt(?:ed)?)\b|(?:已|重新|本次|刚刚|刚才|新(?:的)?|全新(?:的)?|再次)?(?:启动|执行|调用|创建|完成|改用|返回|尝试)/i;
-const SUCCESS_WORD_RE = /\b(?:SUCCESS|SUCCEEDED|REVIEWED|FINISHED)\b|成功(?:退出|完成)?|已完成|已落地/i;
-const NEGATED_WORD_RE = /\b(?:not|never)\s+(?:started|launched|executed|created|completed|found)\b|\bdoes\s+not\s+exist\b|不存在|未创建|未启动|未执行|没有(?:启动|执行|创建|形成)|虚构/i;
-const NEGATED_CLAIM_SCAN_RE = /\b(?:not|never)\s+(?:started|launched|executed|created|completed|found|successful)\b|\bdoes\s+not\s+exist\b|不存在|未创建|未启动|未执行|未完成|没有(?:启动|执行|创建|形成|完成)|并未(?:启动|执行|创建|完成)|虚构/gi;
+const SUCCESS_WORD_RE = /\b(?:SUCCESS(?:FUL(?:LY)?)?|SUCCEEDED|REVIEWED|FINISHED)\b|成功(?:退出|完成)?|已完成|已落地/i;
+const NEGATED_WORD_RE = /\b(?:(?:did|does|is|was|were|has|have)\s+not|didn't|doesn't|isn't|wasn't|weren't|hasn't|haven't|never)\s+(?:start|launch|execute|create|complete|find|exist|succeed|review|finish|fail|started|launched|executed|created|completed|found|successful|reviewed|finished|failed)\b|\bno\s+delegation\b|不存在|不是|并非|未创建|未启动|未执行|没有(?:启动|执行|创建|形成)|虚构/i;
+const NEGATED_CLAIM_SCAN_RE = /\b(?:(?:did|does|is|was|were|has|have)\s+not|didn't|doesn't|isn't|wasn't|weren't|hasn't|haven't|never|not)\s+(?:start|launch|execute|create|complete|find|exist|succeed|review|finish|fail|started|launched|executed|created|completed|found|successful|reviewed|finished|failed)\b|\bno\s+delegation\b|不存在|不是|并非|未创建|未启动|未执行|未完成|没有(?:启动|执行|创建|形成|完成)|并未(?:启动|执行|创建|完成)|虚构/gi;
 const BLOCKED_EXECUTION_SCAN_RE = /(?:\b(?:starting|launching|creating)\b.{0,120}\bdelegation\b.{0,120}\bis blocked\b|(?:启动|开始|创建).{0,80}(?:委派|worker|工作线程).{0,80}(?:被阻止|被拦截|已阻止|无法启动))/gis;
 const RECENT_WORD_RE = /\b(?:new|fresh|this\s+(?:turn|attempt|delegation)|just)\b|本次|刚刚|刚才|全新(?:的)?|新(?:的)?\s*delegation|已按要求/i;
-const LOCAL_CONTEXT_CHARS = 160;
+const START_WORD_RE = /\b(?:start(?:ed)?|launch(?:ed)?|creat(?:e|ed)|call(?:ed)?)\b|启动|创建|调用|改用/i;
+const ASSERTED_START_RE = /\b(?:started|launched|created|called)\b|已(?:按要求)?(?:启动|创建|调用|改用)|(?:启动|创建|调用|改用)了/iu;
+const PLANNED_EXECUTION_RE = /\b(?:will|can|could|should|may|might|plan(?:ned)?\s+to|need\s+to|ready\s+to|going\s+to)\b.{0,32}\b(?:start|launch|execute|create|call)\b|(?:下一步|计划|准备|打算|可以|需要).{0,24}(?:启动|执行|创建|调用|改用)/iu;
+const DISTRIBUTIVE_CLAIM_RE = /\b(?:all|both|each|these|those)\b|(?:两|三|四|五|六|七|八|九|十|多)次|(?:全部|都|分别|上述|这些)/iu;
 const MAX_CLAIM_IDS = 32;
 
-export type DelegationClaimAuthorityStatus = DelegationTransactionStatus | "LEGACY_RUNNING" | "LEGACY_FINISHED";
+export type DelegationClaimAuthorityStatus = DelegationTransactionStatus | "LEGACY_RUNNING" | "LEGACY_SUCCEEDED" | "LEGACY_FAILED";
+export type DelegationClaimStatusSource = "transaction" | "session" | "unspecified";
+
+export interface DelegationClaimExpectedStatus {
+	readonly status: string;
+	readonly source: DelegationClaimStatusSource;
+}
 
 export interface DelegationClaimAuthority {
 	readonly id: string;
@@ -47,22 +62,27 @@ export interface DelegationClaimAuthority {
 
 export interface DelegationClaimInspection {
 	readonly ids: readonly string[];
-	readonly expectedStatuses: Readonly<Record<string, readonly string[]>>;
+	readonly expectedStatuses: Readonly<Record<string, readonly DelegationClaimExpectedStatus[]>>;
+	readonly sameRunStartIds: readonly string[];
 	readonly executionClaim: boolean;
+	readonly workerStartClaim: boolean;
 	readonly successClaim: boolean;
 	readonly recentClaim: boolean;
 	readonly negativeOnly: boolean;
+	readonly overflow: boolean;
+	readonly ambiguousStatusBinding: boolean;
 }
 
 export interface DelegationClaimTurnEvidence {
 	readonly attemptedCalls: number;
 	readonly successfulResults: number;
 	readonly resultIds: readonly string[];
+	readonly startedIds: readonly string[];
 }
 
 export interface DelegationClaimValidation {
 	readonly ok: boolean;
-	readonly code?: "missing_authority" | "status_mismatch" | "missing_call" | "missing_success_result";
+	readonly code?: "claim_overflow" | "ambiguous_status_binding" | "missing_authority" | "status_mismatch" | "missing_started_authority" | "missing_success_result";
 }
 
 function assistantText(message: unknown): string | undefined {
@@ -83,50 +103,228 @@ function assistantText(message: unknown): string | undefined {
 	return parts.join("\n");
 }
 
-function statusesNear(text: string, id: string): string[] {
-	const statuses = new Set<string>();
-	let offset = 0;
-	while (offset < text.length) {
-		const index = text.indexOf(id, offset);
-		if (index < 0) break;
-		const start = Math.max(0, index - LOCAL_CONTEXT_CHARS);
-		const end = Math.min(text.length, index + id.length + LOCAL_CONTEXT_CHARS);
-		for (const match of text.slice(start, end).matchAll(STATUS_SCAN_RE)) statuses.add(match[0]!.toUpperCase());
-		offset = index + id.length;
+function claimClauses(text: string): string[] {
+	const clauses: string[] = [];
+	let fence: "`" | "~" | undefined;
+	for (const rawLine of text.split(/\r?\n/u)) {
+		const trimmed = rawLine.trim();
+		const marker = trimmed.match(/^(`{3,}|~{3,})/u)?.[1]?.[0] as "`" | "~" | undefined;
+		if (marker !== undefined) {
+			if (fence === undefined) fence = marker;
+			else if (fence === marker) fence = undefined;
+			continue;
+		}
+		if (fence !== undefined || /^\s*>/u.test(rawLine)) continue;
+		if (/^["'“‘].*["'”’]$/u.test(trimmed)) continue;
+		const withoutInlineCode = rawLine.replace(/`[^`]*`/gu, " ");
+		for (const part of withoutInlineCode.split(/[.;,，。；!?！？]+/u)) {
+			const clause = part.trim();
+			if (clause.length > 0) clauses.push(clause);
+		}
 	}
-	return [...statuses];
+	return clauses;
 }
 
-/** Inspect only visible assistant text; reasoning blocks are never execution evidence. */
+function statusSource(clause: string, status: string, statusIndex: number): DelegationClaimStatusSource {
+	if (status === "STALE") return "session";
+	const prefix = clause.slice(0, statusIndex);
+	const transactionLabels = [...prefix.matchAll(/\btransaction\b|authority\s+v2/giu)];
+	const sessionLabels = [...prefix.matchAll(/\blatest\b|\bsession\b|会话|review[_ ]status/giu)];
+	const transactionIndex = transactionLabels.at(-1)?.index ?? -1;
+	const sessionIndex = sessionLabels.at(-1)?.index ?? -1;
+	if (transactionIndex > sessionIndex) return "transaction";
+	if (sessionIndex > transactionIndex) return "session";
+	return "unspecified";
+}
+
+function statusesIn(clause: string): DelegationClaimExpectedStatus[] {
+	const seen = new Set<string>();
+	const statuses: DelegationClaimExpectedStatus[] = [];
+	for (const match of clause.matchAll(new RegExp(STATUS_SCAN_RE.source, "gi"))) {
+		const status = match[0]!.toUpperCase();
+		const source = statusSource(clause, status, match.index ?? 0);
+		const key = `${source}:${status}`;
+		if (seen.has(key)) continue;
+		seen.add(key);
+		statuses.push({ status, source });
+	}
+	return statuses;
+}
+
+function statusImpliesSuccess(status: string): boolean {
+	return status === "SUCCESS" || status === "REVIEWED" || status === "FINISHED";
+}
+
+function addSemanticSuccess(
+	statuses: DelegationClaimExpectedStatus[],
+	text: string,
+): DelegationClaimExpectedStatus[] {
+	if (!SUCCESS_WORD_RE.test(text) || statuses.some((status) => statusImpliesSuccess(status.status))) return statuses;
+	return [...statuses, { status: "SUCCESS", source: "unspecified" }];
+}
+
+function strictLegacyStatus(ledger: DelegationLedger, id: string): DelegationClaimAuthorityStatus | undefined {
+	if (
+		ledger.manifest.schema_version !== DELEGATION_SCHEMA_VERSION
+		|| ledger.before.schema_version !== DELEGATION_SCHEMA_VERSION
+		|| ledger.manifest.delegation_id !== id
+		|| ledger.before.delegation_id !== id
+		|| ledger.manifest.review_status !== "PENDING_REVIEW"
+		|| typeof ledger.before.diff_hash !== "string"
+		|| ledger.before.diff_hash.length === 0
+		|| ledger.manifest.diff_hash_before !== ledger.before.diff_hash
+	) return undefined;
+	if (ledger.manifest.status === "running") {
+		return ledger.manifest.finished_at === null
+			&& ledger.manifest.diff_hash_after === null
+			&& ledger.after === null
+			&& ledger.workerSummary === null
+			? "LEGACY_RUNNING"
+			: undefined;
+	}
+	if (
+		ledger.manifest.status !== "finished"
+		|| typeof ledger.manifest.finished_at !== "string"
+		|| ledger.manifest.finished_at.length === 0
+		|| typeof ledger.manifest.diff_hash_after !== "string"
+		|| ledger.manifest.diff_hash_after.length === 0
+		|| ledger.after === null
+		|| ledger.workerSummary === null
+		|| ledger.after.schema_version !== DELEGATION_SCHEMA_VERSION
+		|| ledger.workerSummary.schema_version !== DELEGATION_SCHEMA_VERSION
+		|| ledger.after.delegation_id !== id
+		|| ledger.workerSummary.delegation_id !== id
+		|| ledger.after.review_status !== "PENDING_REVIEW"
+		|| ledger.after.diff_hash !== ledger.manifest.diff_hash_after
+		|| ledger.after.status !== ledger.workerSummary.status
+		|| ledger.after.exit_code !== ledger.workerSummary.exit_code
+	) return undefined;
+	return ledger.after.status === "success" && ledger.after.exit_code === 0
+		? "LEGACY_SUCCEEDED"
+		: "LEGACY_FAILED";
+}
+
+/** Inspect only affirmative, unquoted visible clauses; reasoning and quoted logs are never execution evidence. */
 export function inspectDelegationClaims(message: unknown): DelegationClaimInspection | undefined {
 	const text = assistantText(message);
-	if (text === undefined || text.length === 0 || (!DELEGATION_WORD_RE.test(text) && !WORKER_MACHINE_CLAIM_RE.test(text))) return undefined;
-	const ids = [...new Set(text.match(DELEGATION_ID_SCAN_RE) ?? [])].slice(0, MAX_CLAIM_IDS);
-	const affirmativeText = text
-		.replace(NEGATED_CLAIM_SCAN_RE, "")
-		.replace(BLOCKED_EXECUTION_SCAN_RE, "");
-	const executionClaim = EXECUTION_WORD_RE.test(affirmativeText);
-	const successClaim = SUCCESS_WORD_RE.test(affirmativeText);
-	const recentClaim = RECENT_WORD_RE.test(text);
-	const negativeOnly = NEGATED_WORD_RE.test(text) && !executionClaim && !successClaim;
-	if (ids.length === 0 && !executionClaim && !successClaim) return undefined;
-	const expectedStatuses: Record<string, readonly string[]> = {};
-	for (const id of ids) expectedStatuses[id] = statusesNear(text, id);
-	return { ids, expectedStatuses, executionClaim, successClaim, recentClaim, negativeOnly };
+	if (text === undefined || text.length === 0) return undefined;
+	const hasIdStatusPair = new RegExp(DELEGATION_ID_SCAN_RE.source).test(text)
+		&& new RegExp(STATUS_SCAN_RE.source, "i").test(text);
+	const hasWorkerExecutionPair = WORKER_WORD_RE.test(text)
+		&& (EXECUTION_WORD_RE.test(text) || SUCCESS_WORD_RE.test(text));
+	if (!DELEGATION_WORD_RE.test(text) && !WORKER_MACHINE_CLAIM_RE.test(text) && !hasWorkerExecutionPair && !hasIdStatusPair) return undefined;
+	const idOrder: string[] = [];
+	const expectedStatuses = new Map<string, DelegationClaimExpectedStatus[]>();
+	const sameRunStartIds = new Set<string>();
+	const unboundStatusClaims: Array<{
+		readonly statuses: readonly DelegationClaimExpectedStatus[];
+		readonly distributive: boolean;
+	}> = [];
+	let executionClaim = false;
+	let workerStartClaim = false;
+	let successClaim = false;
+	let recentClaim = false;
+	let sawNegativeDelegation = false;
+
+	for (const rawClause of claimClauses(text)) {
+		const clause = rawClause.replace(BLOCKED_EXECUTION_SCAN_RE, " ");
+		const hasDelegationSubject = DELEGATION_WORD_RE.test(clause) || WORKER_WORD_RE.test(clause);
+		const negative = hasDelegationSubject && (
+			NEGATED_WORD_RE.test(clause)
+			|| new RegExp(NEGATED_CLAIM_SCAN_RE.source, "i").test(clause)
+		);
+		if (negative) {
+			sawNegativeDelegation = true;
+			continue;
+		}
+		const idMatches = [...clause.matchAll(new RegExp(DELEGATION_ID_SCAN_RE.source, "g"))];
+		const plannedExecution = hasDelegationSubject && PLANNED_EXECUTION_RE.test(clause);
+		if (plannedExecution && idMatches.length === 0 && statusesIn(clause).length === 0) continue;
+		const clauseExecution = hasDelegationSubject && !plannedExecution && EXECUTION_WORD_RE.test(clause);
+		const clauseSuccess = hasDelegationSubject && !plannedExecution && SUCCESS_WORD_RE.test(clause);
+		const clauseStart = clauseExecution && ASSERTED_START_RE.test(clause);
+		const clauseRecent = clauseStart && RECENT_WORD_RE.test(clause) && START_WORD_RE.test(clause);
+		executionClaim ||= clauseExecution;
+		workerStartClaim ||= clauseStart;
+		successClaim ||= clauseSuccess;
+		recentClaim ||= clauseRecent;
+
+		for (let index = 0; index < idMatches.length; index += 1) {
+			const match = idMatches[index]!;
+			const id = match[0]!;
+			if (!expectedStatuses.has(id)) {
+				idOrder.push(id);
+				expectedStatuses.set(id, []);
+			}
+			const nextIndex = idMatches[index + 1]?.index ?? clause.length;
+			const segment = clause.slice(index === 0 ? 0 : (match.index ?? 0), nextIndex);
+			const statuses = addSemanticSuccess(statusesIn(segment), segment);
+			expectedStatuses.get(id)!.push(...statuses);
+			if (clauseRecent) sameRunStartIds.add(id);
+		}
+		if (idMatches.length > 1 && DISTRIBUTIVE_CLAIM_RE.test(clause)) {
+			const distributedStatuses = addSemanticSuccess(statusesIn(clause), clause);
+			if (distributedStatuses.length > 0 && distributedStatuses.every((status) => statusImpliesSuccess(status.status))) {
+				for (const match of idMatches) expectedStatuses.get(match[0]!)!.push(...distributedStatuses);
+			}
+		}
+		if (idMatches.length === 0) {
+			const statuses = addSemanticSuccess(statusesIn(clause), clause);
+			if (statuses.length > 0 && (hasDelegationSubject || statuses.some((status) => status.source !== "unspecified"))) {
+				unboundStatusClaims.push({ statuses, distributive: DISTRIBUTIVE_CLAIM_RE.test(clause) });
+			}
+		}
+	}
+
+	const overflow = idOrder.length > MAX_CLAIM_IDS;
+	const ids = idOrder.slice(0, MAX_CLAIM_IDS);
+	let ambiguousStatusBinding = false;
+	for (const claim of unboundStatusClaims) {
+		if (ids.length === 1) expectedStatuses.get(ids[0]!)!.push(...claim.statuses);
+		else if (ids.length > 1 && claim.distributive) {
+			for (const id of ids) expectedStatuses.get(id)!.push(...claim.statuses);
+		} else if (ids.length > 1) ambiguousStatusBinding = true;
+	}
+	const negativeOnly = sawNegativeDelegation && ids.length === 0 && !executionClaim && !successClaim;
+	if (ids.length === 0 && !overflow && !executionClaim && !successClaim && !negativeOnly) return undefined;
+	const boundSameRunStartIds = recentClaim ? ids : [...sameRunStartIds].filter((id) => ids.includes(id));
+	return {
+		ids,
+		expectedStatuses: Object.fromEntries(ids.map((id) => [id, expectedStatuses.get(id) ?? []])),
+		sameRunStartIds: boundSameRunStartIds,
+		executionClaim,
+		workerStartClaim,
+		successClaim,
+		recentClaim,
+		negativeOnly,
+		overflow,
+		ambiguousStatusBinding,
+	};
 }
 
-function authoritySatisfiesStatus(authority: DelegationClaimAuthority, expected: string): boolean {
-	const status = authority.status;
+function transactionSatisfiesStatus(status: DelegationClaimAuthorityStatus, expected: string): boolean {
 	if (expected === "SUCCESS") {
-		return status === "FINISHED" || status === "PENDING_REVIEW" || status === "REVIEWED" || status === "LEGACY_FINISHED";
+		return status === "FINISHED" || status === "PENDING_REVIEW" || status === "REVIEWED" || status === "LEGACY_SUCCEEDED";
 	}
-	if (expected === "FINISHED") return status === "FINISHED" || status === "LEGACY_FINISHED";
+	if (expected === "FINISHED") return status === "FINISHED" || status === "LEGACY_SUCCEEDED" || status === "LEGACY_FAILED";
+	if (expected === "FAILED") return status === "FAILED" || status === "LEGACY_FAILED";
 	if (expected === "RUNNING") return status === "RUNNING" || status === "LEGACY_RUNNING";
-	if (expected === "STALE") return authority.sessionStatus === "STALE";
-	if (expected === "PENDING_REVIEW" || expected === "REVIEWED") {
-		return status === expected || authority.sessionStatus === expected;
-	}
 	return status === expected;
+}
+
+function authoritySatisfiesStatus(authority: DelegationClaimAuthority, expected: DelegationClaimExpectedStatus): boolean {
+	const status = authority.status;
+	if (expected.source === "transaction") return transactionSatisfiesStatus(status, expected.status);
+	if (expected.source === "session") return authority.sessionStatus === expected.status;
+	if (expected.status === "STALE") return authority.sessionStatus === "STALE";
+	if (expected.status === "PENDING_REVIEW" || expected.status === "REVIEWED") {
+		return transactionSatisfiesStatus(status, expected.status) || authority.sessionStatus === expected.status;
+	}
+	return transactionSatisfiesStatus(status, expected.status);
+}
+
+function authorityProvesWorkerStart(authority: DelegationClaimAuthority): boolean {
+	return authority.status !== "PREPARED" && authority.status !== "ABORTED";
 }
 
 /** Pure verdict: current-turn observations never replace strict on-disk authority. */
@@ -136,6 +334,8 @@ export function validateDelegationClaims(
 	authorities: readonly DelegationClaimAuthority[],
 ): DelegationClaimValidation {
 	if (inspection.negativeOnly) return { ok: true };
+	if (inspection.overflow) return { ok: false, code: "claim_overflow" };
+	if (inspection.ambiguousStatusBinding) return { ok: false, code: "ambiguous_status_binding" };
 	const authorityById = new Map(authorities.map((authority) => [authority.id, authority]));
 	for (const id of inspection.ids) {
 		const authority = authorityById.get(id);
@@ -144,14 +344,38 @@ export function validateDelegationClaims(
 			if (!authoritySatisfiesStatus(authority, expected)) return { ok: false, code: "status_mismatch" };
 		}
 	}
-	if (inspection.recentClaim && inspection.executionClaim && turn.attemptedCalls === 0) {
-		return { ok: false, code: "missing_call" };
+	if (inspection.recentClaim && inspection.workerStartClaim) {
+		const started = new Set(turn.startedIds);
+		if (started.size === 0) return { ok: false, code: "missing_started_authority" };
+		if (inspection.sameRunStartIds.some((id) => !started.has(id))) {
+			return { ok: false, code: "missing_started_authority" };
+		}
+		if (![...started].some((id) => {
+			const authority = authorityById.get(id);
+			return authority !== undefined && authorityProvesWorkerStart(authority);
+		})) {
+			return { ok: false, code: "missing_started_authority" };
+		}
 	}
-	if (inspection.successClaim && inspection.ids.length === 0 && turn.successfulResults === 0) {
-		return { ok: false, code: "missing_success_result" };
+	if (inspection.workerStartClaim && !inspection.recentClaim && inspection.ids.length === 0) {
+		if (!authorities.some(authorityProvesWorkerStart)) return { ok: false, code: "missing_authority" };
 	}
-	if (inspection.successClaim && inspection.ids.length === 0 && !turn.resultIds.some((id) => authorityById.has(id))) {
-		return { ok: false, code: "missing_authority" };
+	if (inspection.successClaim && inspection.ids.length === 0) {
+		if (inspection.recentClaim) {
+			if (turn.successfulResults === 0) return { ok: false, code: "missing_success_result" };
+			const resultAuthorities = turn.startedIds
+				.map((id) => authorityById.get(id))
+				.filter((authority): authority is DelegationClaimAuthority => authority !== undefined);
+			if (resultAuthorities.length === 0) return { ok: false, code: "missing_authority" };
+			if (!resultAuthorities.some((authority) => authoritySatisfiesStatus(authority, { status: "SUCCESS", source: "transaction" }))) {
+				return { ok: false, code: "status_mismatch" };
+			}
+		} else {
+			if (authorities.length === 0) return { ok: false, code: "missing_authority" };
+			if (!authorities.some((authority) => authoritySatisfiesStatus(authority, { status: "SUCCESS", source: "transaction" }))) {
+				return { ok: false, code: "status_mismatch" };
+			}
+		}
 	}
 	return { ok: true };
 }
@@ -160,15 +384,20 @@ function validToolCallId(value: unknown): string | undefined {
 	return typeof value === "string" && value.length > 0 && value.length <= 512 ? value : undefined;
 }
 
-function replacementMessage(message: unknown): Record<string, unknown> {
+function replacementMessage(
+	message: unknown,
+	code: NonNullable<DelegationClaimValidation["code"]>,
+): Record<string, unknown> {
 	const timestamp = ownDataValue(message, "timestamp");
 	const provider = ownDataValue(message, "provider");
 	const model = ownDataValue(message, "model");
 	const api = ownDataValue(message, "api");
 	const usage = ownDataValue(message, "usage");
+	const rejectedText = assistantText(message) ?? "";
+	const claimHash = sha256Hex(rejectedText);
 	return {
 		role: "assistant",
-		content: [{ type: "text", text: DELEGATION_CLAIM_GUARD_TEXT }],
+		content: [{ type: "text", text: `${DELEGATION_CLAIM_GUARD_TEXT}\nreason: ${code}\nclaim_hash: ${claimHash}` }],
 		...(typeof provider === "string" ? { provider } : {}),
 		...(typeof model === "string" ? { model } : {}),
 		...(typeof api === "string" ? { api } : {}),
@@ -192,10 +421,14 @@ export interface DelegationClaimGuardController {
 export function registerDelegationClaimGuard(controller: DelegationClaimGuardController): void {
 	const attemptedCallIds = new Set<string>();
 	const successfulResultIds = new Set<string>();
+	let baselineLatestId: string | undefined;
+	let baselineCaptured = false;
 
 	const resetTurn = (): void => {
 		attemptedCallIds.clear();
 		successfulResultIds.clear();
+		baselineLatestId = controller.getDelegationState().latestId;
+		baselineCaptured = true;
 	};
 
 	// One Pi agent run can contain many turn_start events (one before every
@@ -238,11 +471,25 @@ export function registerDelegationClaimGuard(controller: DelegationClaimGuardCon
 		if (inspection.negativeOnly) return undefined;
 
 		const authorities: DelegationClaimAuthority[] = [];
+		const startedIds = new Set(successfulResultIds);
 		try {
 			const projectRoot = await controller.projectRootFor(ctx);
 			const sessionState = controller.getDelegationState();
+			if (
+				baselineCaptured
+				&& attemptedCallIds.size > 0
+				&& sessionState.latestId !== undefined
+				&& sessionState.latestId !== baselineLatestId
+			) startedIds.add(sessionState.latestId);
 			const authorityIds = new Set(inspection.ids);
-			if (inspection.successClaim) for (const id of successfulResultIds) authorityIds.add(id);
+			if (
+				inspection.ids.length === 0
+				&& (inspection.successClaim || inspection.workerStartClaim)
+				&& sessionState.latestId !== undefined
+			) {
+				authorityIds.add(sessionState.latestId);
+			}
+			if (inspection.recentClaim || inspection.successClaim) for (const id of startedIds) authorityIds.add(id);
 			for (const id of authorityIds) {
 				const current = await controller.readTransaction(projectRoot, id);
 				if (current.ok) {
@@ -259,10 +506,11 @@ export function registerDelegationClaimGuard(controller: DelegationClaimGuardCon
 				}
 				if (current.error.code !== "not_found") continue;
 				const legacy = await controller.readLegacyLedger(projectRoot, id);
-				if (legacy) {
+				const legacyStatus = legacy === null ? undefined : strictLegacyStatus(legacy, id);
+				if (legacyStatus !== undefined) {
 					authorities.push({
 						id,
-						status: legacy.manifest.status === "finished" ? "LEGACY_FINISHED" : "LEGACY_RUNNING",
+						status: legacyStatus,
 						...(sessionState.latestId === id ? { sessionStatus: sessionState.status } : {}),
 					});
 				}
@@ -274,7 +522,8 @@ export function registerDelegationClaimGuard(controller: DelegationClaimGuardCon
 			attemptedCalls: attemptedCallIds.size,
 			successfulResults: successfulResultIds.size,
 			resultIds: [...successfulResultIds],
+			startedIds: [...startedIds],
 		}, authorities);
-		return verdict.ok ? undefined : { message: replacementMessage(message) as never };
+		return verdict.ok ? undefined : { message: replacementMessage(message, verdict.code ?? "missing_authority") as never };
 	});
 }

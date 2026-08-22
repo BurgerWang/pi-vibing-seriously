@@ -1909,6 +1909,26 @@ test("commander message_end rejects fabricated delegation execution claims befor
 			content: [{ type: "text", text: `delegation ${fabricatedId} does not exist and was not executed.` }],
 		};
 		assert.deepEqual(await emitMessageEnd(stub, negative, ctx as ExtensionContext), negative, "truthful negative audit remains visible");
+
+		await emitMessageEnd(stub, assistantBatch([
+			{ id: "delegate-failed", name: "workbench_delegate_worker", arguments: {} },
+		]), ctx as ExtensionContext);
+		await emitEvent(stub, "tool_execution_end", {
+			type: "tool_execution_end",
+			toolCallId: "delegate-failed",
+			toolName: "workbench_delegate_worker",
+			isError: true,
+			result: { details: { status: "error" } },
+		}, ctx as ExtensionContext);
+		const failedAttempt = await emitMessageEnd(stub, {
+			...fabricated,
+			content: [{ type: "text", text: "I started a new delegation worker." }],
+		}, ctx as ExtensionContext);
+		assert.match(
+			textOf(failedAttempt.content as Array<Record<string, unknown>>),
+			/reason: missing_started_authority/u,
+			"a failed tool attempt is not promoted to a durable worker start",
+		);
 	});
 });
 
