@@ -31,8 +31,9 @@ function evidence(
 	successfulResults = 0,
 	resultIds: readonly string[] = [],
 	startedIds: readonly string[] = resultIds,
+	observedStatusIds: readonly string[] = [],
 ) {
-	return { attemptedCalls, successfulResults, resultIds, startedIds };
+	return { attemptedCalls, successfulResults, resultIds, startedIds, observedStatusIds };
 }
 
 function finalText(message: Record<string, unknown>): string {
@@ -337,6 +338,37 @@ test("retrospective worker success binds to strict latest authority without a ne
 	);
 });
 
+test("a fresh status observation authorizes a recent-word summary without pretending the worker ran this turn", () => {
+	const inspection = inspectDelegationClaims(assistant(`新 worker 已成功完成：Delegation \`${REAL_ID}\` REVIEWED`));
+	assert.ok(inspection);
+	assert.deepEqual(
+		validateDelegationClaims(
+			inspection,
+			evidence(0, 0, [], [], [REAL_ID]),
+			[{ id: REAL_ID, status: "REVIEWED", sessionStatus: "REVIEWED" }],
+		),
+		{ ok: true },
+	);
+	assert.deepEqual(
+		validateDelegationClaims(
+			inspection,
+			evidence(1, 0, [], [], [REAL_ID]),
+			[{ id: REAL_ID, status: "REVIEWED", sessionStatus: "REVIEWED" }],
+		),
+		{ ok: false, code: "missing_success_result" },
+		"a failed same-run delegation cannot borrow an observed historical success",
+	);
+	assert.deepEqual(
+		validateDelegationClaims(
+			inspection,
+			evidence(0, 0, [], [], [REAL_ID]),
+			[{ id: REAL_ID, status: "FAILED", sessionStatus: "REVIEWED" }],
+		),
+		{ ok: false, code: "missing_success_result" },
+		"a REVIEWED session mirror cannot turn a failed transaction into worker success",
+	);
+});
+
 interface Stub {
 	handlers: Map<string, Array<(event: unknown, ctx: unknown) => unknown>>;
 }
@@ -579,6 +611,57 @@ test("controller resolves an id-less retrospective completion against strict lat
 		"Read-only diagnosis: the prior delegation worker completed successfully; the review now reports review_conflict.",
 	);
 	assert.deepEqual(await emit(state, "message_end", { type: "message_end", message }), [undefined]);
+});
+
+test("controller accepts a durable-success summary immediately after a fresh status query", async () => {
+	const state = stub();
+	register(state, (id) => id === REAL_ID ? "REVIEWED" : undefined, true, "REVIEWED");
+	await emit(state, "agent_start", { type: "agent_start" });
+	await emit(state, "message_end", {
+		type: "message_end",
+		message: {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "status-current", name: "workbench_delegation_status", arguments: {} }],
+		},
+	});
+	await emit(state, "tool_execution_end", {
+		type: "tool_execution_end",
+		toolCallId: "status-current",
+		toolName: "workbench_delegation_status",
+		isError: false,
+		result: { details: { git_refresh: "fresh" } },
+	});
+	assert.deepEqual(
+		await emit(state, "message_end", {
+			type: "message_end",
+			message: assistant(`新 worker 已成功完成：Delegation \`${REAL_ID}\` REVIEWED`),
+		}),
+		[undefined],
+	);
+});
+
+test("unavailable or failed status observations cannot authorize recent success prose", async () => {
+	for (const [label, isError, gitRefresh] of [
+		["failed", true, "fresh"],
+		["unavailable", false, "unavailable"],
+	] as const) {
+		const state = stub();
+		register(state, (id) => id === REAL_ID ? "REVIEWED" : undefined, true, "REVIEWED");
+		await emit(state, "agent_start", { type: "agent_start" });
+		await emit(state, "tool_execution_end", {
+			type: "tool_execution_end",
+			toolCallId: `status-${label}`,
+			toolName: "workbench_delegation_status",
+			isError,
+			result: { details: { git_refresh: gitRefresh } },
+		});
+		const results = await emit(state, "message_end", {
+			type: "message_end",
+			message: assistant(`新 worker 已成功完成：Delegation \`${REAL_ID}\` REVIEWED`),
+		});
+		const replacement = (results.find((value) => value !== undefined) as { message: Record<string, unknown> }).message;
+		assert.match(finalText(replacement), /reason: missing_success_result/u, label);
+	}
 });
 
 test("terminal transaction prose is rejected when its committed generation is unavailable", async () => {
