@@ -15,6 +15,7 @@ import { readDelegationCommittedGenerationV2 } from "./delegation-transaction-st
 import type { DelegationTransactionStatus } from "./delegation-transaction.ts";
 import { readDelegationAuthorityObservationV2 } from "./delegation-project-authority.ts";
 import type { DelegationState } from "./delegation-state.ts";
+import { isStrictSemanticAcceptedOrZeroDelta } from "./diff-review.ts";
 import type { WorkerFirstGateFacts } from "./gate-schema.ts";
 import {
 	planReferenceHash,
@@ -216,13 +217,17 @@ export async function buildDelegationWorkerFirstGateFacts(
 		if (authority.kind === "invalid-v2") {
 			reviewBlock = `delegation ${state.latestId} v2 authority is ${authority.code}; verification fails closed`;
 		} else if (authority.kind === "legacy") {
-			if (authority.review) {
+			if (authority.zeroDelta && authority.review && isStrictSemanticAcceptedOrZeroDelta(authority.review)) {
 				reviewVerdict = authority.review.verdict;
 				reviewViolationCount = authority.review.violations.length;
+			} else {
+				reviewBlock = `delegation ${state.latestId} legacy review lacks strict semantic acceptance`;
 			}
-		} else if (authority.review && authority.finalized) {
+		} else if (authority.review && authority.finalized && isStrictSemanticAcceptedOrZeroDelta(authority.review)) {
 			reviewVerdict = authority.review.verdict;
 			reviewViolationCount = authority.review.violations.length;
+		} else if (authority.review && authority.finalized) {
+			reviewBlock = `delegation ${state.latestId} finalized review lacks strict semantic acceptance`;
 		} else if (authority.review) {
 			reviewBlock = `delegation ${state.latestId} v2 review authority is provisional`;
 		} else if (authority.transactionVerdict !== null) {

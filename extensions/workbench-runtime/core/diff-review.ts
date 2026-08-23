@@ -1,5 +1,7 @@
 /**
- * P7 worker-diff review service — the Sol commander's actual-diff review.
+ * P7 worker-diff scope/integrity service — bounded actual-diff evidence for
+ * the Sol commander.  Its PASS/FAIL verdict is mechanical scope/integrity
+ * evidence only: it is never semantic quality acceptance or Gate authority.
  * Pure logic with injected exec (git calls are argv-only, shell=false),
  * no Pi imports.
  *
@@ -92,11 +94,12 @@
  *     verdict; the runtime wiring (index.ts) is the only component that
  *     touches the delegation state entry.
  *
- * Verdicts: PASS when no worker-delta path W is outside the approved scope;
+ * Scope/integrity verdicts: PASS when no worker-delta path W is outside the approved scope;
  * FAIL when any violation exists (the runtime then refuses to mark the
- * delegation REVIEWED, and a scope FAIL invalidates a prior same-hash
+ * delegation accepted, and a scope FAIL invalidates a prior same-hash
  * REVIEWED state fail-closed via core/delegation-state.ts). The review
- * never modifies project files and never computes business metrics.
+ * never modifies project files, never assesses semantic correctness, never
+ * grants Gate authority, and never computes business metrics.
  */
 
 import { createHash } from "node:crypto";
@@ -340,6 +343,16 @@ export interface ReviewPatchPathStat {
 	truncated: boolean;
 }
 
+export interface SemanticAcceptanceRecord {
+	decision: "ACCEPT";
+	expected_bound_diff_hash: string;
+	reviewer: {
+		provider: "openai" | "openai-codex";
+		model: "gpt-5.6-sol";
+	};
+	accepted_at: string;
+}
+
 export interface ReviewRecord {
 	schema_version: number;
 	delegation_id: string;
@@ -386,12 +399,78 @@ export interface ReviewRecord {
 	displayed_paths: string[];
 	remaining_paths: string[];
 	coverage_complete: boolean;
+	/**
+	 * Same-hash paths whose patch entry was presented without global or
+	 * per-path truncation.  These additive fields are optional only for
+	 * historical records; newly written records always carry all three.
+	 */
+	fully_presented_paths?: string[];
+	presentation_remaining_paths?: string[];
+	presentation_complete?: boolean;
+	/** New strict semantic provenance. Historical records omit both fields. */
+	semantic_review?: "required" | "accepted" | "not_required";
+	semantic_acceptance?: SemanticAcceptanceRecord;
 	/** Durable project-relative review.json path (reviewRecordRelPath). */
 	review_path: string;
 	/** New-v2 only. Legacy v1 and old-v2 schema1 records omit these fields. */
 	diff_identity_kind?: typeof REVIEW_RELEVANCE_KIND_V2;
 	relevance_binding?: ReviewRelevanceBindingV2;
 	relevance_projection?: ReviewRelevanceProjectionV2;
+}
+
+export type SemanticReviewRisk = "low" | "medium" | "high";
+
+export interface SemanticReviewClassification {
+	risk: SemanticReviewRisk;
+	required: boolean;
+	reason: "zero_delta" | "documentation_only" | "compact_evidence" | "sensitive_or_governance" | "implementation_or_unknown";
+}
+
+const PLAIN_DOCUMENTATION_EXTENSIONS = new Set([".md", ".rst", ".txt"]);
+const SENSITIVE_PATH_TOKENS = new Set([
+	"api", "apis", "auth", "authorization", "config", "configs", "delegation", "delegations",
+	"gate", "gates", "migration", "migrations", "permission", "permissions", "policy", "policies",
+	"runtime", "schema", "schemas", "security",
+]);
+
+function pathExtension(path: string): string {
+	const name = path.split("/").at(-1)?.toLowerCase() ?? "";
+	const dot = name.lastIndexOf(".");
+	return dot >= 0 ? name.slice(dot) : "";
+}
+
+function isSensitiveReviewPath(path: string): boolean {
+	const lower = path.toLowerCase();
+	const segments = lower.split("/");
+	if (segments.some((segment) => segment.startsWith("."))) return true;
+	if (["agents.md", "security.md", "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock"].includes(segments.at(-1) ?? "")) return true;
+	return segments.some((segment) => {
+		const words = segment.split(/[^a-z0-9]+/u).filter(Boolean);
+		return words.some((word) => SENSITIVE_PATH_TOKENS.has(word));
+	});
+}
+
+/**
+ * Conservative, path-only risk hint for the commander handoff.  It cannot
+ * lower authority: every non-zero implementation delta still requires an
+ * explicit Sol semantic ACCEPT in the P0 policy, including low-risk docs.
+ */
+export function classifySemanticReviewRisk(paths: readonly string[]): SemanticReviewClassification {
+	if (paths.length === 0) return { risk: "low", required: false, reason: "zero_delta" };
+	// Large JSON/SVG paths may be rendered through the strict compact-facts
+	// packet.  Keep the path-only hint conservative so the risk remains high
+	// across segmented reviews even when the compact entry is in a prior
+	// same-hash segment and is no longer present in the current patch array.
+	if (paths.some((path) => COMPACT_ELIGIBLE_EXTENSIONS.includes(pathExtension(path) as ".svg" | ".json"))) {
+		return { risk: "high", required: true, reason: "compact_evidence" };
+	}
+	if (paths.some(isSensitiveReviewPath)) {
+		return { risk: "high", required: true, reason: "sensitive_or_governance" };
+	}
+	if (paths.every((path) => PLAIN_DOCUMENTATION_EXTENSIONS.has(pathExtension(path)))) {
+		return { risk: "low", required: true, reason: "documentation_only" };
+	}
+	return { risk: "medium", required: true, reason: "implementation_or_unknown" };
 }
 
 export interface ReviewResult {
@@ -875,6 +954,25 @@ export function renderCompactFacts(facts: ReviewCompactFacts): string {
 }
 
 /**
+ * Whether one visible patch entry is a complete bounded presentation unit.
+ *
+ * Ordinary sources must be shown without truncation.  A strict compact entry
+ * is intentionally a complete *fact packet* rather than the full file bytes:
+ * its current digest must match the worker's recorded-after digest, its
+ * structured facts must render byte-for-byte to the visible text, and its
+ * source remains explicit.  Generator equality is deliberately NOT_VERIFIED
+ * and therefore remains a high-risk final-verification concern; it is never
+ * upgraded into a Gate fact here.
+ */
+export function isCompleteReviewPresentationEntry(entry: ReviewPatchEntry): boolean {
+	if (!entry.truncated) return true;
+	if (entry.source !== "compact" || entry.compact === undefined) return false;
+	return entry.compact.digest_matches_after === true
+		&& entry.compact.generator_equality === "NOT_VERIFIED"
+		&& entry.text === renderCompactFacts(entry.compact);
+}
+
+/**
  * Bounded redacted patch entry for ONE path. Phase 5: a sufficiently
  * large CURRENT REGULAR `.svg`/`.json` worker path takes the compact path
  * FIRST — no per-path git diff capture and no additional unbounded/
@@ -979,6 +1077,12 @@ export interface ReviewCoverage {
 	coverage_complete: boolean;
 }
 
+export interface ReviewPresentationCoverage {
+	fully_presented_paths: string[];
+	presentation_remaining_paths: string[];
+	presentation_complete: boolean;
+}
+
 /**
  * Merge the displayed-path coverage of one review segment: the paths
  * ACTUALLY rendered in this call's patch (a globally omitted path never
@@ -1040,6 +1144,45 @@ export function mergeReviewCoverage(
 		displayed_paths: displayedPaths,
 		remaining_paths: remainingPaths,
 		coverage_complete: remainingPaths.length === 0,
+	};
+}
+
+/**
+ * Merge only complete, untruncated patch presentations for the same bound
+ * hash.  Unlike mechanical displayed-path coverage, a truncated entry never
+ * advances semantic-review readiness.
+ */
+export function mergeReviewPresentationCoverage(
+	workerPaths: readonly string[],
+	fullyPresentedPaths: readonly string[],
+	prior: ReviewRecord | null,
+	boundDiffHash: string,
+): ReviewPresentationCoverage {
+	const workerSet = new Set(workerPaths);
+	const fullyPresented = new Set<string>();
+	for (const path of fullyPresentedPaths) {
+		if (workerSet.has(path)) fullyPresented.add(path);
+	}
+	if (prior && prior.bound_diff_hash === boundDiffHash) {
+		const priorChecked = Array.isArray(prior.checked_paths)
+			? prior.checked_paths.filter((path): path is string => typeof path === "string")
+			: [];
+		const priorCheckedSet = new Set(priorChecked);
+		const priorCandidates = Array.isArray(prior.fully_presented_paths)
+			? prior.fully_presented_paths
+			: Array.isArray(prior.patch)
+				? prior.patch.filter(isCompleteReviewPresentationEntry).map((entry) => entry.path)
+				: [];
+		for (const path of priorCandidates) {
+			if (typeof path === "string" && priorCheckedSet.has(path) && workerSet.has(path)) fullyPresented.add(path);
+		}
+	}
+	const completePaths = workerPaths.filter((path) => fullyPresented.has(path));
+	const remainingPaths = workerPaths.filter((path) => !fullyPresented.has(path));
+	return {
+		fully_presented_paths: completePaths,
+		presentation_remaining_paths: remainingPaths,
+		presentation_complete: remainingPaths.length === 0,
 	};
 }
 
@@ -1246,7 +1389,9 @@ async function reviewDelegationInner(
 	);
 	const candidatePatch = bounded.entries;
 	const verdict: ReviewVerdict = violations.length > 0 ? "FAIL" : "PASS";
+	const semanticClassification = classifySemanticReviewRisk(workerPaths);
 	const priorCoverage = mergeReviewCoverage(workerPaths, [], priorReview, boundDiffHash);
+	const priorPresentationCoverage = mergeReviewPresentationCoverage(workerPaths, [], priorReview, boundDiffHash);
 	const provisionalRecord: ReviewRecord = {
 		schema_version: relevanceSupplied ? 2 : REVIEW_SCHEMA_VERSION,
 		delegation_id: delegationId,
@@ -1267,6 +1412,10 @@ async function reviewDelegationInner(
 		displayed_paths: priorCoverage.displayed_paths,
 		remaining_paths: priorCoverage.remaining_paths,
 		coverage_complete: priorCoverage.coverage_complete,
+		fully_presented_paths: priorPresentationCoverage.fully_presented_paths,
+		presentation_remaining_paths: priorPresentationCoverage.presentation_remaining_paths,
+		presentation_complete: priorPresentationCoverage.presentation_complete,
+		semantic_review: semanticClassification.required ? "required" : "not_required",
 		review_path: reviewPath,
 		...(relevanceSupplied ? {
 			diff_identity_kind: REVIEW_RELEVANCE_KIND_V2,
@@ -1296,6 +1445,12 @@ async function reviewDelegationInner(
 	// content advance this call; prior same-hash durable coverage still
 	// merges normally (legacy records infer it from their persisted patch).
 	const coverage = mergeReviewCoverage(workerPaths, patch.map((entry) => entry.path), priorReview, boundDiffHash);
+	const presentationCoverage = mergeReviewPresentationCoverage(
+		workerPaths,
+		patch.filter(isCompleteReviewPresentationEntry).map((entry) => entry.path),
+		priorReview,
+		boundDiffHash,
+	);
 	const record: ReviewRecord = {
 		...provisionalRecord,
 		patch,
@@ -1304,6 +1459,9 @@ async function reviewDelegationInner(
 		displayed_paths: coverage.displayed_paths,
 		remaining_paths: coverage.remaining_paths,
 		coverage_complete: coverage.coverage_complete,
+		fully_presented_paths: presentationCoverage.fully_presented_paths,
+		presentation_remaining_paths: presentationCoverage.presentation_remaining_paths,
+		presentation_complete: presentationCoverage.presentation_complete,
 	};
 	const presentation = renderReviewPresentationInner(record, { maxBytes, maxLines });
 	if (
@@ -1423,6 +1581,99 @@ export function normalizeReviewCoverage(record: ReviewRecord): ReviewCoverage {
 	};
 }
 
+/** Normalize additive untruncated-presentation facts; historical records
+ * fail closed to the untruncated entries physically present in their patch. */
+export function normalizeReviewPresentationCoverage(record: ReviewRecord): ReviewPresentationCoverage {
+	const checked = Array.isArray(record.checked_paths)
+		? record.checked_paths.filter((path): path is string => typeof path === "string")
+		: [];
+	const checkedSet = new Set(checked);
+	const candidates = Array.isArray(record.fully_presented_paths)
+		? record.fully_presented_paths
+		: Array.isArray(record.patch)
+			? record.patch.filter(isCompleteReviewPresentationEntry).map((entry) => entry.path)
+			: [];
+	const completeSet = new Set(candidates.filter((path): path is string => typeof path === "string" && checkedSet.has(path)));
+	const fullyPresentedPaths = checked.filter((path) => completeSet.has(path));
+	const remainingPaths = checked.filter((path) => !completeSet.has(path));
+	return {
+		fully_presented_paths: fullyPresentedPaths,
+		presentation_remaining_paths: remainingPaths,
+		presentation_complete: remainingPaths.length === 0,
+	};
+}
+
+/**
+ * Strict packet readiness used before semantic ACCEPT.  A scope PASS alone
+ * is insufficient; the packet must bind the recorded state, have no drift,
+ * and have presented every worker path without truncation across same-hash
+ * segments.  This remains presentation evidence, never Gate authority.
+ */
+export function isScopeIntegrityPacketComplete(record: ReviewRecord): boolean {
+	const coverage = normalizeReviewCoverage(record);
+	const presentation = normalizeReviewPresentationCoverage(record);
+	return record.verdict === "PASS"
+		&& record.mismatch === false
+		&& Array.isArray(record.violations) && record.violations.length === 0
+		&& Array.isArray(record.drift_paths) && record.drift_paths.length === 0
+		&& coverage.coverage_complete
+		&& coverage.remaining_paths.length === 0
+		&& presentation.presentation_complete
+		&& presentation.presentation_remaining_paths.length === 0;
+}
+
+/**
+ * Final review-authority predicate shared by persistence, reconciliation and
+ * Gate projection. Historical mechanical REVIEWED records remain readable,
+ * but a non-zero delta is authoritative only when a current schema-2 packet
+ * carries the exact hash-bound Sol acceptance. An actually empty delta needs
+ * no semantic decision and remains compatible with historical records.
+ */
+export function isStrictSemanticAcceptedOrZeroDelta(record: ReviewRecord): boolean {
+	try {
+		if (!isScopeIntegrityPacketComplete(record)) return false;
+		const checkedPaths = Array.isArray(record.checked_paths) ? record.checked_paths : [];
+		if (checkedPaths.length === 0) {
+			return record.semantic_acceptance === undefined
+				&& (record.semantic_review === undefined || record.semantic_review === "not_required");
+		}
+		if (record.schema_version !== 2 || record.semantic_review !== "accepted") return false;
+		const acceptance = exactOwnDataRecord(record.semantic_acceptance, [
+			"decision", "expected_bound_diff_hash", "reviewer", "accepted_at",
+		]);
+		if (acceptance === undefined) return false;
+		const reviewer = exactOwnDataRecord(acceptance.reviewer, ["provider", "model"]);
+		return reviewer !== undefined
+			&& acceptance.decision === "ACCEPT"
+			&& acceptance.expected_bound_diff_hash === record.bound_diff_hash
+			&& acceptance.accepted_at === record.reviewed_at
+			&& (reviewer.provider === "openai" || reviewer.provider === "openai-codex")
+			&& reviewer.model === "gpt-5.6-sol";
+	} catch {
+		return false;
+	}
+}
+
+function exactOwnDataRecord(value: unknown, fields: readonly string[]): Record<string, unknown> | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	try {
+		const prototype = Object.getPrototypeOf(value);
+		if (prototype !== Object.prototype && prototype !== null) return undefined;
+		const descriptors = Object.getOwnPropertyDescriptors(value);
+		const keys = Object.keys(descriptors);
+		if (keys.length !== fields.length || fields.some((field) => !Object.prototype.hasOwnProperty.call(descriptors, field))) return undefined;
+		const result: Record<string, unknown> = {};
+		for (const field of fields) {
+			const descriptor = descriptors[field];
+			if (descriptor === undefined || !("value" in descriptor)) return undefined;
+			result[field] = descriptor.value;
+		}
+		return result;
+	} catch {
+		return undefined;
+	}
+}
+
 interface ReviewSectionFacts {
 	original: number;
 	shown: number;
@@ -1449,7 +1700,10 @@ function reviewPathOf(record: ReviewRecord): string {
 function renderPatchSection(record: ReviewRecord, maxBytes: number, maxLines: number): { lines: string[]; facts: ReviewSectionFacts } {
 	const original = selectedPatchCount(record);
 	if (maxBytes <= 0 || maxLines <= 0) return { lines: [], facts: { original, shown: 0, omitted: original, truncated: original > 0 || record.patch_truncated, visiblePaths: [] } };
-	const marker = `Patch content truncated or omitted — full review: ${reviewPathOf(record)}; review segments via workbench_review_worker_diff include_paths (max ${MAX_REVIEW_PATCH_PATHS} paths per call).`;
+	const presentation = normalizeReviewPresentationCoverage(record);
+	const marker = presentation.presentation_complete
+		? `Compact content is intentionally summarized — strict digest/size/head/tail facts form the complete bounded evidence packet; generator equality remains NOT_VERIFIED for final verification. Scope/integrity artifact: ${reviewPathOf(record)}.`
+		: `Patch content truncated or omitted — scope/integrity artifact: ${reviewPathOf(record)}; request bounded presentation segments via workbench_review_worker_diff include_paths (max ${MAX_REVIEW_PATCH_PATHS} paths per call). Semantic ACCEPT remains blocked until presentation is complete.`;
 	const markerReserveBytes = Buffer.byteLength(marker, "utf8") + 1;
 	const content = new ReviewLineBuilder(Math.max(0, maxBytes - markerReserveBytes), Math.max(0, maxLines - 1));
 	const placeholder = `patch (${original} path(s), shown ${original}, omitted ${original}${record.patch_truncated ? ", truncated" : ""}):`;
@@ -1554,6 +1808,8 @@ function renderControlSection(
 ): string[] {
 	if (maxBytes <= 0 || maxLines <= 0) return [];
 	const coverage = normalizeReviewCoverage(record);
+	const presentationCoverage = normalizeReviewPresentationCoverage(record);
+	const semantic = classifySemanticReviewRisk(Array.isArray(record.checked_paths) ? record.checked_paths : []);
 	const checkedCount = Array.isArray(record.checked_paths) ? record.checked_paths.length : 0;
 	const violations = Array.isArray(record.violations) ? record.violations : [];
 	const notes = Array.isArray(record.notes) ? record.notes : [];
@@ -1569,33 +1825,36 @@ function renderControlSection(
 	const statOriginal = countText(statFacts.original);
 	const statShown = countText(statFacts.shown);
 	const statOmitted = countText(statFacts.omitted);
-	const summaryReserve = `presentation: violations=${violationCount}/${violationCount}/${violationCount}; notes=${noteCount}/${noteCount}/${noteCount}; drift=${driftCount}/${driftCount}/${driftCount}; patch=${patchOriginal}/${patchShown}/${patchOmitted}; stats=${statOriginal}/${statShown}/${statOmitted}; full=${reviewPathOf(record)}; bounded summary is not acceptance evidence`;
+	const summaryReserve = `packet stats: violations=${violationCount}/${violationCount}/${violationCount}; notes=${noteCount}/${noteCount}/${noteCount}; drift=${driftCount}/${driftCount}/${driftCount}; patch=${patchOriginal}/${patchShown}/${patchOmitted}; stats=${statOriginal}/${statShown}/${statOmitted}; full=${reviewPathOf(record)}; scope/integrity evidence is not semantic acceptance or Gate authority`;
 	const base = [
+		"review kind: scope_integrity (mechanical; no semantic-quality or Gate authority)",
 		`delegation : ${boundedInline(record.delegation_id, 64)}`,
-		`verdict    : ${record.verdict === "FAIL" ? "FAIL" : "PASS"}`,
-		`reviewed   : ${boundedInline(record.reviewed_at, 40)}`,
+		`scope check: ${record.verdict === "FAIL" ? "FAIL" : "PASS"}`,
+		`inspected  : ${boundedInline(record.reviewed_at, 40)}`,
 		`bound hash : ${boundedInline(record.bound_diff_hash, 64)}`,
 		`after hash : ${boundedInline(record.recorded_after_hash, 64)}${record.mismatch ? " (MISMATCH)" : ""}`,
 		`checked    : ${checkedCount} worker path(s)${Array.isArray(record.include_paths) && record.include_paths.length > 0 && record.include_paths.length !== checkedCount ? `, patch narrowed to ${record.include_paths.length} path(s)` : ""}`,
 		`displayed  : ${coverage.displayed_paths.length} of ${checkedCount} worker path(s)`,
 		`remaining  : ${coverage.remaining_paths.length} worker path(s)`,
-		`coverage   : ${coverage.coverage_complete ? "COMPLETE — every worker path displayed for this bound hash" : "INCOMPLETE — review incomplete until every worker path is displayed (per-path truncated entries count; globally omitted paths do not)"}`,
+		`coverage   : ${coverage.coverage_complete ? "COMPLETE — every worker path has a bounded scope/integrity segment" : "INCOMPLETE — scope/integrity packet needs the remaining worker paths"}`,
+		`evidence   : ${presentationCoverage.presentation_complete ? "COMPLETE — each worker path has a full patch or strict compact fact packet" : `INCOMPLETE — ${presentationCoverage.presentation_remaining_paths.length} path(s) still need a full patch or strict compact fact packet`}`,
+		`semantic   : ${semantic.required ? `REQUIRED (${semantic.risk} risk; explicit Sol ACCEPT must bind this hash${semantic.risk === "high" && Array.isArray(record.checked_paths) && record.checked_paths.some((path) => COMPACT_ELIGIBLE_EXTENSIONS.includes(pathExtension(path) as ".svg" | ".json")) ? "; compact generator equality remains NOT_VERIFIED for final verification" : ""})` : "NOT_REQUIRED (zero actual delta)"}`,
 		summaryReserve,
 	];
 	const builder = new ReviewLineBuilder(maxBytes, maxLines);
 	if (!builder.add(base)) {
 		const fallback = new ReviewLineBuilder(maxBytes, maxLines);
 		for (const line of [
-			"[workbench-diff-review v1]",
-			`delegation=${boundedInline(record.delegation_id, 64)} verdict=${record.verdict === "FAIL" ? "FAIL" : "PASS"}`,
+			"[workbench-scope-integrity-review v1; mechanical; no Gate authority]",
+			`delegation=${boundedInline(record.delegation_id, 64)} scope_integrity=${record.verdict === "FAIL" ? "FAIL" : "PASS"}`,
 			`coverage=${coverage.coverage_complete ? "COMPLETE" : "INCOMPLETE"} checked=${checkedCount} displayed=${coverage.displayed_paths.length} remaining=${coverage.remaining_paths.length}`,
-			`presentation bounded; full=${reviewPathOf(record)}; summary is not acceptance evidence`,
+			`full_patch=${presentationCoverage.presentation_complete ? "COMPLETE" : "INCOMPLETE"}; full=${reviewPathOf(record)}; packet is not semantic acceptance or Gate authority`,
 		]) {
 			if (!fallback.add([line])) break;
 		}
 		return fallback.lines;
 	}
-	for (const line of [nextIncludeLine(coverage.remaining_paths), `review path: ${reviewPathOf(record)}`, allowedScopeLine(allowedPaths)]) {
+	for (const line of [nextIncludeLine(presentationCoverage.presentation_remaining_paths), `scope artifact: ${reviewPathOf(record)}`, allowedScopeLine(allowedPaths)]) {
 		builder.add([line]);
 	}
 	let violationsShown = 0;
@@ -1620,8 +1879,9 @@ function renderControlSection(
 		if (!builder.add([`drift      : ${complete}`])) break;
 		driftShown += 1;
 	}
-	const summary = `presentation: violations=${violationCount}/${violationsShown}/${violations.length - violationsShown}; notes=${noteCount}/${notesShown}/${notes.length - notesShown}; drift=${driftCount}/${driftShown}/${drift.length - driftShown}; patch=${patchOriginal}/${patchShown}/${patchOmitted}; stats=${statOriginal}/${statShown}/${statOmitted}; full=${reviewPathOf(record)}; bounded summary is not acceptance evidence`;
-	builder.lines[9] = summary;
+	const summary = `packet stats: violations=${violationCount}/${violationsShown}/${violations.length - violationsShown}; notes=${noteCount}/${notesShown}/${notes.length - notesShown}; drift=${driftCount}/${driftShown}/${drift.length - driftShown}; patch=${patchOriginal}/${patchShown}/${patchOmitted}; stats=${statOriginal}/${statShown}/${statOmitted}; full=${reviewPathOf(record)}; scope/integrity evidence is not semantic acceptance or Gate authority`;
+	const summaryIndex = builder.lines.indexOf(summaryReserve);
+	if (summaryIndex >= 0) builder.lines[summaryIndex] = summary;
 	return builder.lines;
 }
 
@@ -1636,9 +1896,9 @@ function renderReviewPresentationInner(record: ReviewRecord, caps: ReviewRenderC
 	const maxLines = boundInt(caps.maxLines, DEFAULT_REVIEW_MAX_LINES, 1, DEFAULT_REVIEW_MAX_LINES);
 	if (maxBytes < 1024 || maxLines < 16) {
 		const fallback = [
-			"[workbench-diff-review v1]",
-			`delegation=${boundedInline(record.delegation_id, 64)} verdict=${record.verdict === "FAIL" ? "FAIL" : "PASS"}`,
-			`full=${reviewPathOf(record)}; bounded summary is not acceptance evidence`,
+			"[workbench-scope-integrity-review v1; mechanical; no Gate authority]",
+			`delegation=${boundedInline(record.delegation_id, 64)} scope_integrity=${record.verdict === "FAIL" ? "FAIL" : "PASS"}`,
+			`full=${reviewPathOf(record)}; bounded packet is not semantic acceptance`,
 		];
 		const builder = new ReviewLineBuilder(maxBytes, maxLines);
 		for (const line of fallback) if (!builder.add([line])) break;

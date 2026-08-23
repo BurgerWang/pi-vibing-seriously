@@ -24,6 +24,7 @@ import {
 	emptyDelegationState,
 	hasPendingReview,
 	hasStaleReview,
+	markSemanticAccepted,
 	markReviewed,
 	MAX_BLOCKED_WRITE_ATTEMPTS,
 	observeDiffChange,
@@ -168,6 +169,19 @@ test("markReviewed binds REVIEWED to the current diff hash", () => {
 	assert.equal(markReviewed(state, LATER).ok, false);
 	// Reviewing without any delegation is refused.
 	assert.equal(markReviewed(emptyDelegationState(), NOW).ok, false);
+});
+
+test("markSemanticAccepted requires the exact latest delegation and current bound hash", () => {
+	const pending = recordOk(emptyDelegationState());
+	const accepted = markSemanticAccepted(pending, { delegationId: "dlg-1", expectedDiffHash: DIFF_A, now: LATER });
+	assert.equal(accepted.ok, true);
+	if (accepted.ok) {
+		assert.equal(accepted.state.status, "REVIEWED");
+		assert.equal(accepted.state.reviewedDiffHash, DIFF_A);
+	}
+	assert.equal(markSemanticAccepted(pending, { delegationId: "other", expectedDiffHash: DIFF_A, now: LATER }).ok, false);
+	assert.equal(markSemanticAccepted(pending, { delegationId: "dlg-1", expectedDiffHash: DIFF_B, now: LATER }).ok, false);
+	assert.equal(markSemanticAccepted(emptyDelegationState(), { delegationId: "dlg-1", expectedDiffHash: DIFF_A, now: LATER }).ok, false);
 });
 
 test("a current diff hash change after review automatically marks the delegation STALE", () => {

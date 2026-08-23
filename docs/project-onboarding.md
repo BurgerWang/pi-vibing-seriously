@@ -182,8 +182,9 @@ verification.
 
 In DEV, GPT-5.6 Sol defines the contract, architecture, scope, and verdict;
 GPT-5.6 Luna performs routine source, test, and documentation writes. A
-successful bounded implementation is reviewed and closed in the same call,
-while explicit review/status is only a recovery path. A temporary commander
+successful bounded implementation returns a provisional scope/integrity
+packet in the same call and stays pending until Sol explicitly accepts its
+complete unchanged hash; final recipes and Gates remain separate. A temporary commander
 lease is an explicit exception bounded by calls, time, tools, and project-
 relative paths; it never enables bash. Worker edit/write calls remain limited
 to the parent-approved path contract.

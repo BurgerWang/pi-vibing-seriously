@@ -40,6 +40,7 @@
 		"commander:nro:pilot": "tsx scripts/commander-native-tool-dev-pilot.ts",
 		"cache:report": "tsx scripts/cache-benchmark.ts report",
 		"cache:doctor": "tsx scripts/cache-benchmark.ts doctor",
+		"worker:canary": "tsx scripts/cache-benchmark.ts canary",
 		"benchmark:context-output": "tsx scripts/context-output-benchmark.ts",
 		"session:sanitize": "tsx scripts/workbench-session-sanitize.ts",
 		"governance:rollback-check": "tsx scripts/governance-rollback-check.ts"

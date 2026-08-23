@@ -186,7 +186,7 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 
 test("v0.10.0 public tool surface has the intentional framework-reliability transition hash", () => {
 	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
-	const currentHash = "5eb0e3071371603325924d731e0ecda3c4a919f9f166f9dd5b1204011e8646de";
+	const currentHash = "96fd7c5bbf23dc363371e2f23e1d02372ef7b5c43a335d2b107d95199804516e";
 	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
 	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the documented 0.10.0 hash");
 });
@@ -366,7 +366,7 @@ test("tool metadata audit flags dynamic values and passes static catalog metadat
 	}
 });
 
-test("workbench_delegate_worker metadata is static and defaults to one-call delivery", () => {
+test("workbench_delegate_worker metadata is static, compact, and preserves authority boundaries", () => {
 	const meta = WORKBENCH_TOOL_METADATA.workbench_delegate_worker;
 	// Every metadata field stays free of dynamic values (no dates, times,
 	// hashes, absolute paths, or concrete run/gate/task ids).
@@ -374,21 +374,18 @@ test("workbench_delegate_worker metadata is static and defaults to one-call deli
 		assert.deepEqual(findDynamicValueMarkers(field), [], `delegate metadata must be static: ${field.slice(0, 80)}`);
 	}
 	const text = [meta.description, meta.promptSnippet, ...meta.promptGuidelines].join("\n");
-	assert.match(text, /normal implementation path/);
-	assert.match(text, /automatically continues bounded segmented actual-diff review/);
-	assert.match(text, /closes the session as REVIEWED in this same call/);
-	assert.match(text, /no-progress condition/);
-	assert.match(text, /32-segment safety cap/);
-	assert.match(text, /continue directly to the next development step without calling review or status/);
-	assert.match(text, /smallest useful allowed_paths set/);
-	assert.match(text, /observable acceptance criteria/);
-	assert.match(text, /committed delegation-v2 transaction/);
-	assert.match(text, /durable execution-owner record spans PREPARED\/RUNNING/);
-	assert.match(text, /startup atomically ABORTS only a provably dead transaction with no worker-write evidence/);
-	assert.match(text, /Diagnosis is strictly read-only/);
-	assert.match(text, /zero successful or denied writes/);
-	assert.match(text, /explicit permission, destructive-action confirmation, or final verification gates/);
-	assert.match(text, /Historical v1 ledgers remain read-only/);
+	assert.ok(Buffer.byteLength(text, "utf8") < 2_500, "delegate metadata stays context-efficient");
+	assert.match(text, /GPT-5\.6 Luna xhigh/);
+	assert.match(text, /Implementation may write only approved paths/);
+	assert.match(text, /diagnosis is strictly read-only/);
+	assert.match(text, /smallest useful allowed_paths/);
+	assert.match(text, /recipe:<declared-name>/);
+	assert.match(text, /12 KiB/);
+	assert.match(text, /64 KiB/);
+	assert.match(text, /fresh no-session process/);
+	assert.match(text, /ambiguous authority fails closed/);
+	assert.match(text, /bounded immutable failure facts, not the old session, report, or authority/);
+	assert.match(text, /Sol owns semantic acceptance, final verification, Gates, permissions and the final verdict/);
 	assert.doesNotMatch(text, /deepseek/i, "current delegate metadata contains no retired provider wording");
 	// Registration name/order stay stable. The current schema/hash intentionally
 	// advances for the additive optional task_kind field, while the separately
@@ -466,6 +463,11 @@ test("workbench_delegate_worker metadata is static and defaults to one-call deli
 	assert.equal(planRefSchema.properties.criteria.minItems, 1);
 	assert.equal(planRefSchema.properties.criteria.maxItems, 20);
 	assert.equal(planRefSchema.properties.criteria.items.additionalProperties, false, "plan criteria reject unknown fields");
+	const extendedReasonSchema = delegateParameters.properties.extended_reason;
+	assert.ok(extendedReasonSchema, "extended_reason is an optional current-contract field");
+	assert.ok(!(delegateParameters.required ?? []).includes("extended_reason"));
+	assert.equal(extendedReasonSchema.maxLength, 500);
+	assert.match(extendedReasonSchema.description ?? "", /12 KiB ordinary soft limit/);
 	assert.equal(
 		canonicalHash(WORKBENCH_DELEGATE_WORKER_V1_PARAMETERS),
 		"dc1db21e3590c7f57cfa88f042052964a92d495116966747918d72f2018176a7",
@@ -473,8 +475,8 @@ test("workbench_delegate_worker metadata is static and defaults to one-call deli
 	);
 	assert.equal(
 		canonicalHash(WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker),
-		"1ccb80c82baf4475a9de1f0445317b502ccc006b9c85d9e005ded0bdec79d61f",
-		"current delegate parameter schema hash is machine-pinned after optional plan_ref traceability",
+		"3468c8525a80043b329ef2437889a8b4093bc6b641908b6c21cb1ea67e207928",
+		"current delegate parameter schema hash is pinned after recipe refs and contract sizing",
 	);
 });
 
@@ -651,7 +653,7 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 		"the established status prompt snippet stays byte-identical",
 	);
 	assert.deepEqual(meta.promptGuidelines, [
-		"Routine successful delivery closes as REVIEWED in the delegate call; use status only for diagnostics or recovery.",
+		"Successful non-zero implementation delivery returns a provisional scope/integrity packet and stays PENDING_REVIEW; after inspecting a complete unchanged packet, use workbench_review_worker_diff for hash-bound Sol ACCEPT. Use status only for diagnostics or recovery.",
 		"When STALE is backed by a strict v2 FINAL/PASS review, follow the reported successor action instead of retrying immutable review; VERIFY remains blocked until that successor is reviewed.",
 		"In the TUI, WF:LOCKED means routine writes belong to Luna, WF:LEASE means a bounded temporary Sol write exception is active, and WF:REVIEW means recovery review is outstanding.",
 	], "current status guidelines keep routine work out of the recovery chain");
@@ -665,7 +667,7 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	assert.doesNotMatch(meta.description, /real git diff \(any change after REVIEWED turns it STALE\)/);
 	assert.equal(
 		canonicalHash(meta),
-		"48033dd8c8b4509eed92393407ec532ebe3d4a5b3aacec22df0fb389b925a0cf",
+		"1c176896d60c9ad11b5b9684b6378239fb56aee41e2be67f604c7221430b1cc2",
 		"current status metadata hash is machine-pinned after the relevance-contract correction",
 	);
 	assert.equal(
@@ -675,41 +677,53 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.equal(
 		canonicalHash(workbenchToolMetadataOrdered()),
-		"404d3da83ba6e0d057c3d3a5a2dd6198e15c7b75d63cb8458ce8b7f29f35deb3",
+		"e87bf7df8a3a9aec51de415b62dea519afbf2e4dc5c2df1454e4444a078d020c",
 		"current public catalog hash is machine-pinned after the combined framework-reliability changes",
 	);
 });
 
-test("delegation review metadata is a recovery path and still binds the complete worker delta", () => {
+test("delegation review metadata separates provisional inspection from explicit Sol acceptance", () => {
 	const meta = WORKBENCH_TOOL_METADATA.workbench_review_worker_diff;
 	assert.equal(
 		meta.promptSnippet,
-		"Recover an incomplete, pending, stale, or conflicted delegation review",
-		"the current prompt presents review as recovery, not routine chaining",
+		"Inspect a bound worker diff, then explicitly ACCEPT only the complete unchanged packet",
+		"the current prompt separates inspection from semantic acceptance",
 	);
 	assert.deepEqual(meta.promptGuidelines, [
-		"Do not call this after an ordinary successful REVIEWED delegation; the default delivery already completed the actual-diff review.",
-		"Use it only when delegation output reports explicit review required or incomplete coverage. For STALE, inspect status first: a finalized PASS v2 review cannot be rewritten and should advance through a fresh successor; only non-final recoverable review state belongs here.",
-		"The review always checks the entire worker delta against allowed_paths; include_paths narrows only the bounded patch presentation.",
-		"Repeat segmented review only for remaining paths until PASS and complete coverage close the session.",
-	], "review guidance avoids the routine delegate-review-status chain");
-	assert.match(meta.description, /Recovery review/);
-	assert.match(meta.description, /checks the entire attributed worker delta W against allowed_paths/);
-	assert.match(meta.description, /full streaming identities for W, the explicit dependency closure D, and relevant controls S/);
-	assert.match(meta.description, /Baseline unrelated dirty paths and recognized workbench artifacts do not stale new tagged v2/);
-	assert.match(meta.description, /Git HEAD, W\/D\/S drift, or a new unknown-origin path fails closed/);
-	assert.match(meta.description, /Historical untagged v2\/v1 retain full-diff binding/);
-	assert.match(meta.description, /finalized PASS v2 review is immutable/);
-	assert.match(meta.description, /status permits an ordinary fresh successor after strict revalidation/);
+		"First call without semantic fields to inspect the provisional scope/integrity packet; this cannot finalize review.",
+		"Only after Sol inspects the complete packet, call with semantic_decision=ACCEPT and its exact expected_bound_diff_hash. Always provide both or neither.",
+		"include_paths changes presentation only. Never accept after drift, incomplete packet coverage, unresolved semantic risk, or an unverified hash.",
+		"Review authority never substitutes for final verification or Gate authority.",
+	]);
+	assert.match(meta.description, /only provisional presentation/);
+	assert.match(meta.description, /supply both semantic_decision=ACCEPT and the exact packet-bound diff hash/);
+	assert.match(meta.description, /either field alone fails closed/);
+	assert.match(meta.description, /never project files or Gate results/);
+	const reviewParameters = WORKBENCH_TOOL_PARAMETERS.workbench_review_worker_diff as unknown as {
+		required?: string[];
+		properties: Record<string, { const?: unknown; pattern?: string; minLength?: number; maxLength?: number; description?: string }>;
+	};
+	const semantic = reviewParameters.properties.semantic_decision;
+	const expectedHash = reviewParameters.properties.expected_bound_diff_hash;
+	assert.equal(semantic?.const, "ACCEPT");
+	assert.equal(expectedHash?.pattern, "^[a-f0-9]{64}$");
+	assert.equal(expectedHash?.minLength, 64);
+	assert.equal(expectedHash?.maxLength, 64);
+	assert.ok(!(reviewParameters.required ?? []).includes("semantic_decision"));
+	assert.ok(!(reviewParameters.required ?? []).includes("expected_bound_diff_hash"));
+	assert.match(`${semantic?.description}\n${expectedHash?.description}`, /together/);
+	assert.match(`${semantic?.description}\n${expectedHash?.description}`, /Sol has inspected the complete semantic-review packet/);
+	assert.match(`${semantic?.description}\n${expectedHash?.description}`, /provisional scope\/integrity presentation/);
+	assert.match(`${semantic?.description}\n${expectedHash?.description}`, /no review or Gate authority/);
 	assert.equal(
 		canonicalHash(meta),
-		"7d51ed8e661cbad8d75716e3063de02d810ca1a6a15244d804311abec7a5db58",
-		"current review metadata hash is machine-pinned after recovery-only guidance",
+		"c64111740b19bfc3fd821903dfbc9ef0a05672cc6d1b61261630a9b98d6f2574",
+		"current review metadata hash is pinned after semantic acceptance guidance",
 	);
 	assert.equal(
 		canonicalHash(WORKBENCH_TOOL_PARAMETERS.workbench_review_worker_diff),
-		"63c7a5543e256e9641364d845a78327828c354c59e71aaab8184d4aed05cde6a",
-		"review input schema stays byte-identical",
+		"23dc4ffa0a314a9a972889affaa38471f76a7ed3d26a5b0b2a1a141a20804682",
+		"review input schema pins the paired semantic ACCEPT fields",
 	);
 });
 

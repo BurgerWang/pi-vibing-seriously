@@ -61,6 +61,7 @@ import {
 	REVIEW_RECORD_MAX_BYTES,
 	mergeReviewCoverage,
 	normalizeReviewCoverage,
+	isStrictSemanticAcceptedOrZeroDelta,
 	readReviewRecord,
 	renderReviewLines,
 	reviewDelegation,
@@ -439,7 +440,7 @@ test("any per-path truncated patch entry sets patch_truncated and renders the se
 		assert.ok(!record.patch.some((p) => p.text.includes("pad-secret-token-xyz")), "secrets scrubbed from the patch");
 		const rendered = renderReviewLines(record).join("\n");
 		assert.ok(
-			rendered.includes("review segments via workbench_review_worker_diff include_paths"),
+			rendered.includes("bounded presentation segments via workbench_review_worker_diff include_paths"),
 			"segmented include_paths guidance renders when any entry is per-path truncated",
 		);
 		assert.ok(rendered.includes("src/secretly-huge.ts (file-content"), "per-path stat rendered");
@@ -700,8 +701,8 @@ test("renderReviewLines is deterministic and carries verdict, hashes and the pat
 		assert.ok(result.ok && result.record);
 		const lines = renderReviewLines(result.record);
 		const text = lines.join("\n");
-		assert.ok(lines[0]?.startsWith("delegation : "));
-		assert.ok(text.includes("verdict    : PASS"));
+		assert.equal(lines[0], "review kind: scope_integrity (mechanical; no semantic-quality or Gate authority)");
+		assert.ok(text.includes("scope check: PASS"));
 		assert.ok(text.includes("bound hash : "));
 		assert.ok(text.includes("after hash : "));
 		assert.ok(text.includes("--- src/main.ts (git-diff"));
@@ -736,18 +737,21 @@ test("small review renderer keeps the compact v1 text format stable", () => {
 	};
 	const allowedHash = createHash("sha256").update(JSON.stringify(["src/**"])).digest("hex");
 	assert.deepEqual(renderReviewLines(record), [
+		"review kind: scope_integrity (mechanical; no semantic-quality or Gate authority)",
 		"delegation : 20260601-120000-abcd",
-		"verdict    : PASS",
-		`reviewed   : ${NOW}`,
+		"scope check: PASS",
+		`inspected  : ${NOW}`,
 		`bound hash : ${"a".repeat(64)}`,
 		`after hash : ${"a".repeat(64)}`,
 		"checked    : 1 worker path(s)",
 		"displayed  : 1 of 1 worker path(s)",
 		"remaining  : 0 worker path(s)",
-		"coverage   : COMPLETE — every worker path displayed for this bound hash",
-		`presentation: violations=0/0/0; notes=0/0/0; drift=0/0/0; patch=1/1/0; stats=1/1/0; full=${reviewPath}; bounded summary is not acceptance evidence`,
+		"coverage   : COMPLETE — every worker path has a bounded scope/integrity segment",
+		"evidence   : COMPLETE — each worker path has a full patch or strict compact fact packet",
+		"semantic   : REQUIRED (medium risk; explicit Sol ACCEPT must bind this hash)",
+		`packet stats: violations=0/0/0; notes=0/0/0; drift=0/0/0; patch=1/1/0; stats=1/1/0; full=${reviewPath}; scope/integrity evidence is not semantic acceptance or Gate authority`,
 		"next incl. : (none — every worker path displayed for this bound hash)",
-		`review path: ${reviewPath}`,
+		`scope artifact: ${reviewPath}`,
 		`allowed    : count=1 hash=${allowedHash} shown=["src/**"] omitted=0`,
 		"patch (1 path(s), shown 1, omitted 0):",
 		"--- src/a.ts (git-diff) ---",
@@ -756,6 +760,78 @@ test("small review renderer keeps the compact v1 text format stable", () => {
 		"  - src/a.ts (git-diff, 2 bytes)",
 		"Scope checks always cover the entire worker diff; include_paths only narrows the bounded patch above.",
 	]);
+});
+
+test("strict semantic authority accepts only an exact schema-2 Sol decision or a genuinely empty delta", () => {
+	const base: ReviewRecord = {
+		schema_version: 1,
+		delegation_id: "20260601-120000-abcd",
+		reviewed_at: NOW,
+		verdict: "PASS",
+		bound_diff_hash: "a".repeat(64),
+		recorded_after_hash: "a".repeat(64),
+		mismatch: false,
+		drift_paths: [],
+		violations: [],
+		allowed_paths: ["src/**"],
+		checked_paths: ["src/a.ts"],
+		include_paths: ["src/a.ts"],
+		patch: [{ path: "src/a.ts", source: "git-diff", text: "+a", truncated: false }],
+		patch_truncated: false,
+		patch_paths: [{ path: "src/a.ts", source: "git-diff", bytes: 2, truncated: false }],
+		notes: [],
+		displayed_paths: ["src/a.ts"],
+		remaining_paths: [],
+		coverage_complete: true,
+		fully_presented_paths: ["src/a.ts"],
+		presentation_remaining_paths: [],
+		presentation_complete: true,
+		semantic_review: "required",
+		review_path: ".pi/workbench/delegations/20260601-120000-abcd/review.json",
+	};
+	assert.equal(isStrictSemanticAcceptedOrZeroDelta(base), false, "historical mechanical REVIEWED is never semantic authority");
+
+	const accepted: ReviewRecord = {
+		...base,
+		schema_version: 2,
+		semantic_review: "accepted",
+		semantic_acceptance: {
+			decision: "ACCEPT",
+			expected_bound_diff_hash: base.bound_diff_hash,
+			reviewer: { provider: "openai-codex", model: "gpt-5.6-sol" },
+			accepted_at: NOW,
+		},
+	};
+	assert.equal(isStrictSemanticAcceptedOrZeroDelta(accepted), true);
+	assert.equal(isStrictSemanticAcceptedOrZeroDelta({
+		...accepted,
+		semantic_acceptance: { ...accepted.semantic_acceptance!, expected_bound_diff_hash: "b".repeat(64) },
+	}), false, "acceptance must bind the exact packet hash");
+	for (const hostileAcceptance of [null, "ACCEPT", { decision: "ACCEPT" }, { ...accepted.semantic_acceptance, reviewer: null }]) {
+		assert.doesNotThrow(() => {
+			assert.equal(isStrictSemanticAcceptedOrZeroDelta({
+				...accepted,
+				semantic_acceptance: hostileAcceptance,
+			} as unknown as ReviewRecord), false);
+		}, "malformed legacy semantic acceptance fails closed without throwing");
+	}
+	const hostileReviewer = new Proxy({}, { getOwnPropertyDescriptor: () => { throw new Error("hostile"); } });
+	assert.equal(isStrictSemanticAcceptedOrZeroDelta({
+		...accepted,
+		semantic_acceptance: { ...accepted.semantic_acceptance!, reviewer: hostileReviewer },
+	} as unknown as ReviewRecord), false, "hostile nested acceptance data fails closed");
+
+	const empty: ReviewRecord = {
+		...base,
+		checked_paths: [],
+		include_paths: [],
+		patch: [],
+		patch_paths: [],
+		displayed_paths: [],
+		fully_presented_paths: [],
+		semantic_review: undefined,
+	};
+	assert.equal(isStrictSemanticAcceptedOrZeroDelta(empty), true, "historical zero delta needs no semantic decision");
 });
 
 test("review patch defaults are 400 lines / 32 KiB, enforced GLOBALLY over the rendered patch", async () => {
@@ -788,7 +864,7 @@ test("review patch defaults are 400 lines / 32 KiB, enforced GLOBALLY over the r
 		assert.deepEqual(record.checked_paths.sort(), ["src/a.ts", "src/b.ts", "src/c.ts"], "all worker paths scope-checked");
 		// The explicit segmented-review instruction is rendered.
 		const rendered = renderReviewLines(record).join("\n");
-		assert.ok(rendered.includes("review segments via workbench_review_worker_diff include_paths"), "segmented include_paths instruction when truncated");
+		assert.ok(rendered.includes("bounded presentation segments via workbench_review_worker_diff include_paths"), "segmented include_paths instruction when truncated");
 		assert.ok(rendered.includes("patch paths (3)"), "bounded path/stat info rendered");
 	});
 });
@@ -829,7 +905,7 @@ test("whole renderer bounds 500 paths and exact section omissions under one 32 K
 	const firstPatch = text.indexOf(`--- ${paths[0]} (git-diff, truncated) ---`);
 	const secondPatch = text.indexOf(`--- ${paths[1]} (git-diff, truncated) ---`);
 	assert.ok(firstPatch >= 0 && secondPatch > firstPatch, "bounded patch entries preserve deterministic source order");
-	const summary = /presentation: violations=(\d+)\/(\d+)\/(\d+); notes=(\d+)\/(\d+)\/(\d+); drift=(\d+)\/(\d+)\/(\d+);/.exec(text);
+	const summary = /packet stats: violations=(\d+)\/(\d+)\/(\d+); notes=(\d+)\/(\d+)\/(\d+); drift=(\d+)\/(\d+)\/(\d+);/.exec(text);
 	assert.ok(summary, text);
 	const values = summary.slice(1).map(Number);
 	assert.deepEqual([values[0], values[3], values[6]], [80, 40, 80]);
@@ -846,7 +922,7 @@ test("whole renderer bounds 500 paths and exact section omissions under one 32 K
 	assert.equal((text.match(/^note       :/gm) ?? []).length, values[4]);
 	assert.equal((text.match(/^drift      :/gm) ?? []).length, values[7]);
 	assert.match(text, /full=\.pi\/workbench\/delegations\/20260601-120000-abcd\/review\.json/);
-	assert.match(text, /bounded summary is not acceptance evidence/);
+	assert.match(text, /scope\/integrity evidence is not semantic acceptance or Gate authority/);
 });
 
 test("whole renderer honors caller lower caps and keeps its omission marker inside the cap", () => {
@@ -918,7 +994,7 @@ test("Slice B2: displayed and remaining coverage preserve trusted Unicode worker
 	assert.deepEqual(normalized.remaining_paths, []);
 });
 
-test("Slice B2: globally omitted paths stay remaining; include_paths segments merge displayed coverage; bounded truncated entries count; complete only when every worker path rendered", async () => {
+test("Slice B2: displayed coverage can complete while ordinary truncated source presentation remains blocking", async () => {
 	await withTempDir(async (dir) => {
 		const { id, afterHash } = await setupDelegation(dir, async (d) => {
 			for (const name of ["a.ts", "b.ts", "c.ts"]) {
@@ -939,6 +1015,9 @@ test("Slice B2: globally omitted paths stay remaining; include_paths segments me
 		assert.deepEqual(record.displayed_paths, ["src/a.ts"], "only actually rendered entries count as displayed");
 		assert.deepEqual(record.remaining_paths, ["src/b.ts", "src/c.ts"], "globally omitted paths stay remaining");
 		assert.equal(record.coverage_complete, false);
+		assert.deepEqual(record.fully_presented_paths, [], "a line-cut ordinary source entry is not complete semantic-review evidence");
+		assert.deepEqual(record.presentation_remaining_paths, ["src/a.ts", "src/b.ts", "src/c.ts"]);
+		assert.equal(record.presentation_complete, false);
 		assert.equal(record.bound_diff_hash, afterHash, "the complete current diff hash binds every segment");
 		assert.equal(record.review_path, reviewRecordRelPath(id));
 		assert.equal(record.review_path, `.pi/workbench/delegations/${id}/review.json`);
@@ -961,7 +1040,7 @@ test("Slice B2: globally omitted paths stay remaining; include_paths segments me
 		assert.ok(rendered2.includes("displayed  : 2 of 3 worker path(s)"), rendered2);
 		assert.ok(rendered2.includes("remaining  : 1 worker path(s)"), rendered2);
 		assert.ok(rendered2.includes("coverage   : INCOMPLETE"), rendered2);
-		assert.ok(rendered2.includes(`next incl. : ["src/c.ts"] (max ${MAX_REVIEW_PATCH_PATHS} paths per call; ≤ ${MAX_REVIEW_GUIDANCE_BYTES} bytes)`), rendered2);
+		assert.ok(rendered2.includes(`next incl. : ["src/a.ts", "src/b.ts", "src/c.ts"] (max ${MAX_REVIEW_PATCH_PATHS} paths per call; ≤ ${MAX_REVIEW_GUIDANCE_BYTES} bytes)`), rendered2);
 
 		// Segment 3: the last path completes coverage.
 		const third = await reviewDelegation(reviewInput(dir, id, { includePaths: ["src/c.ts"] }));
@@ -969,15 +1048,19 @@ test("Slice B2: globally omitted paths stay remaining; include_paths segments me
 		record = third.record!;
 		assert.deepEqual(record.displayed_paths, ["src/a.ts", "src/b.ts", "src/c.ts"]);
 		assert.deepEqual(record.remaining_paths, []);
-		assert.equal(record.coverage_complete, true, "no REVIEWED until every worker path is rendered");
+		assert.equal(record.coverage_complete, true, "mechanical displayed-path coverage is complete");
+		assert.equal(record.presentation_complete, false, "ordinary source truncation remains blocking even after every path has a bounded segment");
+		assert.deepEqual(record.fully_presented_paths, []);
+		assert.deepEqual(record.presentation_remaining_paths, ["src/a.ts", "src/b.ts", "src/c.ts"]);
 		assert.equal(record.bound_diff_hash, afterHash, "scope checks and the bound hash covered the complete diff in every segment");
 		assert.deepEqual(record.checked_paths.sort(), ["src/a.ts", "src/b.ts", "src/c.ts"]);
 		const rendered = renderReviewLines(record).join("\n");
 		assert.ok(rendered.includes("displayed  : 3 of 3 worker path(s)"), rendered);
 		assert.ok(rendered.includes("remaining  : 0 worker path(s)"), rendered);
 		assert.ok(rendered.includes("coverage   : COMPLETE"), rendered);
-		assert.ok(rendered.includes("next incl. : (none — every worker path displayed for this bound hash)"), rendered);
-		assert.ok(rendered.includes(`review path: .pi/workbench/delegations/${id}/review.json`), rendered);
+		assert.ok(rendered.includes("evidence   : INCOMPLETE"), rendered);
+		assert.ok(rendered.includes(`next incl. : ["src/a.ts", "src/b.ts", "src/c.ts"] (max ${MAX_REVIEW_PATCH_PATHS} paths per call; ≤ ${MAX_REVIEW_GUIDANCE_BYTES} bytes)`), rendered);
+		assert.ok(rendered.includes(`scope artifact: .pi/workbench/delegations/${id}/review.json`), rendered);
 		// Deterministic: two renders of the same record are identical.
 		assert.deepEqual(renderReviewLines(record), renderReviewLines(record));
 	});
@@ -1835,7 +1918,7 @@ test("Phase 5: scope-violating worker paths (an out-of-scope large JSON and a sr
 		assert.deepEqual(record.displayed_paths, ["outsidescope.json", "src/escape.json"]);
 		assert.deepEqual(record.remaining_paths, []);
 		assert.equal(record.coverage_complete, true, "withheld entries count as displayed evidence segments");
-		assert.ok(rendered.includes("verdict    : FAIL"), rendered);
+		assert.ok(rendered.includes("scope check: FAIL"), rendered);
 		assert.ok(rendered.includes("displayed  : 2 of 2 worker path(s)"), rendered);
 
 		// The whole-diff git facts collection is UNCHANGED: collectGitFacts

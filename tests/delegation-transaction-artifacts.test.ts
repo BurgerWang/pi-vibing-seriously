@@ -393,6 +393,7 @@ test("artifact v2: canonical contract hashing preserves array order and omits ab
 	assert.deepEqual(ordinary, same);
 	assert.equal(Object.prototype.hasOwnProperty.call(ordinary.ok && ordinary.value, "repair_of"), false);
 	assert.equal(Object.prototype.hasOwnProperty.call(ordinary.ok && ordinary.value, "plan_ref"), false);
+	assert.equal(Object.prototype.hasOwnProperty.call(ordinary.ok && ordinary.value, "extended_reason"), false);
 	assert.equal(reordered.ok && reversed.ok && reordered.value.contract_hash !== reversed.value.contract_hash, true);
 	assert.equal(bindDelegationBoundedTaskContractV2({ ...payload(), repair_of: undefined }).ok, false);
 	assert.equal(bindDelegationBoundedTaskContractV2({ ...payload(), task_kind: "mechanical" }).ok, false);
@@ -425,7 +426,11 @@ test("artifact v2: plan_ref is strictly cloned and hash-bound with repair_of ind
 	if (tampered.ok) assert.notEqual(tampered.value.contract_hash, planOnly.value.contract_hash);
 
 	const callerPlan = planRef();
-	const normalized = normalizeDelegationBoundedTaskContractV2({ ...payload(), plan_ref: callerPlan });
+	const normalized = normalizeDelegationBoundedTaskContractV2({
+		...payload(),
+		verification: ["recipe:unit-test"],
+		plan_ref: callerPlan,
+	});
 	assert.equal(normalized.ok, true);
 	if (normalized.ok) {
 		(callerPlan.criteria as Array<Record<string, unknown>>)[0]!.id = "MUTATED";
@@ -471,7 +476,7 @@ test("artifact v2: public contract normalizer trims and defaults before strict b
 		task: "  Implement a bounded change.  ",
 		allowed_paths: [" tests/** ", " src/**  "],
 		acceptance_criteria: ["  First criterion. ", "Second criterion.  "],
-		verification: [" npm test ", "  npm run typecheck"],
+		verification: [" recipe:unit-test ", "  recipe:typecheck"],
 		timeout_seconds: undefined,
 		budget_profile: undefined,
 		repair_of: undefined,
@@ -484,7 +489,7 @@ test("artifact v2: public contract normalizer trims and defaults before strict b
 	assert.equal(normalized.value.task, "Implement a bounded change.");
 	assert.deepEqual(normalized.value.allowed_paths, ["src/**", "tests/**"]);
 	assert.deepEqual(normalized.value.acceptance_criteria, ["First criterion.", "Second criterion."]);
-	assert.deepEqual(normalized.value.verification, ["npm test", "npm run typecheck"]);
+	assert.deepEqual(normalized.value.verification, ["recipe:unit-test", "recipe:typecheck"]);
 	assert.equal(normalized.value.timeout_seconds, 1_800);
 	assert.equal(normalized.value.budget_profile, "extended");
 	assert.equal(Object.prototype.hasOwnProperty.call(normalized.value, "repair_of"), false);
@@ -493,7 +498,7 @@ test("artifact v2: public contract normalizer trims and defaults before strict b
 		task: "Implement a bounded change.",
 		allowed_paths: ["src/**", "tests/**"],
 		acceptance_criteria: ["First criterion.", "Second criterion."],
-		verification: ["npm test", "npm run typecheck"],
+		verification: ["recipe:unit-test", "recipe:typecheck"],
 		timeout_seconds: 1_800,
 		budget_profile: "extended",
 	}), normalized);
@@ -525,11 +530,11 @@ test("artifact v2: public contract normalizer rejects invalid and over-bound val
 		task: "Diagnose the bounded issue.",
 		allowed_paths: ["src/**"],
 		acceptance_criteria: ["Evidence is bounded."],
-		verification: ["npm test"],
+		verification: ["recipe:unit-test"],
 	};
 	const cases: Array<[string, unknown]> = [
 		["unresolved kind", { ...base, task_kind: "mechanical" }],
-		["duplicate normalized paths", { ...base, allowed_paths: ["src/**", " src/** "] }],
+		["free-form verification", { ...base, verification: ["npm test"] }],
 		["empty normalized path", { ...base, allowed_paths: ["   "] }],
 		["invalid path", { ...base, allowed_paths: ["../escape/**"] }],
 		["over-bound task", { ...base, task: "x".repeat(20_001) }],
@@ -546,6 +551,69 @@ test("artifact v2: public contract normalizer rejects invalid and over-bound val
 		assert.equal(normalizeDelegationBoundedTaskContractV2(candidate).ok, false, name);
 		assert.deepEqual(candidate, snapshot, `${name}: input is unchanged`);
 	}
+});
+
+test("artifact v2: public canonical lint de-duplicates without rewriting meaningful text", () => {
+	const raw = {
+		task_kind: "implementation",
+		task: "  Preserve\n  yaml:\n    key: value  ",
+		allowed_paths: [" src/** ", "src/**", " tests/** "],
+		acceptance_criteria: ["Keep  exact\n spacing.", " Keep exact spacing. ", "Second criterion."],
+		verification: [" recipe:unit-test ", "recipe:unit-test", "recipe:typecheck"],
+	};
+	const normalized = normalizeDelegationBoundedTaskContractV2(raw);
+	assert.equal(normalized.ok, true);
+	if (!normalized.ok) return;
+	assert.equal(normalized.value.task, "Preserve\n  yaml:\n    key: value", "internal layout is never collapsed");
+	assert.deepEqual(normalized.value.allowed_paths, ["src/**", "tests/**"]);
+	assert.deepEqual(normalized.value.acceptance_criteria, ["Keep  exact\n spacing.", "Second criterion."]);
+	assert.deepEqual(normalized.value.verification, ["recipe:unit-test", "recipe:typecheck"]);
+});
+
+test("artifact v2: 12 KiB soft limit requires explicit extended plus reason; 64 KiB stays absolute", () => {
+	const largeCriteria = Array.from(
+		{ length: 14 },
+		(_, index) => `${index}:` + String.fromCharCode(65 + index).repeat(950),
+	);
+	const base = {
+		task_kind: "implementation",
+		task: "Implement the bounded large contract.",
+		allowed_paths: ["src/**"],
+		acceptance_criteria: largeCriteria,
+		verification: ["recipe:unit-test"],
+	};
+	assert.equal(normalizeDelegationBoundedTaskContractV2(base).ok, false, "default extended is not an explicit size exception");
+	assert.equal(normalizeDelegationBoundedTaskContractV2({ ...base, budget_profile: "extended" }).ok, false, "explicit extended still needs a reason");
+	assert.equal(normalizeDelegationBoundedTaskContractV2({ ...base, extended_reason: "large but bounded" }).ok, false, "a reason still needs explicit extended");
+	const accepted = normalizeDelegationBoundedTaskContractV2({
+		...base,
+		budget_profile: "extended",
+		extended_reason: "  Cross-module acceptance details are intentionally retained.  ",
+	});
+	assert.equal(accepted.ok, true);
+	if (accepted.ok) {
+		assert.equal(accepted.value.extended_reason, "Cross-module acceptance details are intentionally retained.");
+		const { contract_hash, ...persistedPayload } = accepted.value;
+		const rebound = bindDelegationBoundedTaskContractV2(persistedPayload);
+		assert.equal(rebound.ok, true);
+		if (rebound.ok) assert.equal(rebound.value.contract_hash, contract_hash, "extended reason is hash-bound authority");
+	}
+
+	const oversizedPlan = planRef({
+		criteria: Array.from({ length: 20 }, (_, criterion) => ({
+			id: `C${criterion}`,
+			gate_id: `b${criterion}`,
+			check_ids: Array.from({ length: 20 }, (_, check) => `check-${criterion}-${check}`),
+			evidence_paths: Array.from({ length: 20 }, (_, evidence) =>
+				`evidence/${criterion}/${evidence}/${"x".repeat(300)}`),
+		})),
+	});
+	assert.equal(normalizeDelegationBoundedTaskContractV2({
+		...base,
+		budget_profile: "extended",
+		extended_reason: "Bounded plan traceability.",
+		plan_ref: oversizedPlan,
+	}).ok, false, "explicit extended can never cross the 64 KiB absolute ceiling");
 });
 
 test("artifact v2: report authority helper derives complete, missing, truncated, and redacted facts", () => {

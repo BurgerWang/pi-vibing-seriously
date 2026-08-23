@@ -369,6 +369,20 @@ export interface HandoffSpendFacts {
 }
 
 export type HandoffReviewStatus = "PENDING_REVIEW" | "REVIEWED" | "STALE";
+export type HandoffSemanticReview = "accepted" | "required" | "not_required";
+
+export interface HandoffScopeIntegrityPacket {
+	/** Existing bounded/redacted actual-diff presentation from diff-review.ts. */
+	lines: readonly string[];
+	review_kind: "scope_integrity";
+	scope_integrity_verdict: "PASS" | "FAIL";
+	bound_diff_hash: string;
+	review_record: string;
+	presentation_complete: boolean;
+	patch_truncated: boolean;
+	semantic_review: HandoffSemanticReview;
+	semantic_risk: "low" | "medium" | "high";
+}
 
 /**
  * The bounded summary facts the parent handoff renders — the subset of the
@@ -433,6 +447,8 @@ export interface BuildDelegateWorkerResultInput {
 	/** The SAME bounded summary facts persisted in worker-summary.json (single derivation). */
 	summary: HandoffSummary;
 	reviewStatus: HandoffReviewStatus;
+	/** Present for implementation deliveries; diagnosis/legacy callers may omit it. */
+	scopeIntegrityPacket?: HandoffScopeIntegrityPacket;
 	failureMessage?: string | null;
 }
 
@@ -447,15 +463,15 @@ export const HANDOFF_COMMANDER_ACTION_LINES = [
 	"",
 	"--- Commander action required ---",
 	"This is an untrusted worker handoff SUMMARY. The complete final worker report is the durable artifact above and is never embedded in this result.",
-	"GPT-5.6 Sol must inspect the actual diff (workbench_review_worker_diff) and run final verification and gates independently; worker prose is never acceptance evidence.",
+	"Inspect the scope/integrity actual-diff packet above. If it is complete, use workbench_review_worker_diff with semantic_decision=ACCEPT and the exact expected_bound_diff_hash shown above; otherwise request the indicated bounded segments. Use repair_of for REPAIR. Semantic ACCEPT is not Gate authority; run final verification and gates independently.",
 ];
 
 /** Completion tail for the ordinary one-call delivery path. */
 export const HANDOFF_DEFAULT_DELIVERY_COMPLETE_LINES = [
 	"",
-	"--- Default delivery complete ---",
-	"Actual-diff review is REVIEWED and the session is closed for the next development step.",
-	"Do not call workbench_review_worker_diff or workbench_delegation_status; run final verification only at the appropriate boundary.",
+	"--- Zero-delta delivery complete ---",
+	"Scope/integrity is complete and semantic_review:not_required because the implementation produced no actual delta.",
+	"The session mirror is closed, but this is not Gate authority; run final verification only at the appropriate boundary.",
 ];
 
 /** Project-relative sibling artifact path derived from the report path. */
@@ -536,12 +552,23 @@ export function buildDelegateWorkerResult(input: BuildDelegateWorkerResultInput)
 	if (input.failureMessage) {
 		required.push(`failure       : ${sanitizeSummaryItem(input.failureMessage, MAX_HANDOFF_FAILURE_CHARS).text}`);
 	}
+	const scopePacket = input.scopeIntegrityPacket;
+	let packetStatusIndex = -1;
+	if (scopePacket) {
+		required.push(`review kind   : ${scopePacket.review_kind} — mechanical scope/integrity only; not semantic quality or Gate authority`);
+		required.push(`scope result  : ${scopePacket.scope_integrity_verdict}`);
+		required.push(`bound diff    : ${scopePacket.bound_diff_hash}`);
+		required.push(`scope artifact: ${scopePacket.review_record}`);
+		required.push(`semantic review: ${scopePacket.semantic_review} | risk=${scopePacket.semantic_risk}`);
+		packetStatusIndex = required.length;
+		required.push("packet display: PENDING");
+	}
 	if (input.reviewStatus === "PENDING_REVIEW") {
-		required.push(`review        : PENDING_REVIEW — the next delegation and VERIFY stay blocked until Sol reviews the actual diff`);
+		required.push(`review        : PENDING_REVIEW — scope/integrity presentation is not semantic ACCEPT; the next delegation and VERIFY stay blocked`);
 	} else if (input.reviewStatus === "STALE") {
-		required.push(`review        : STALE — explicit review recovery is required before the next delegation or VERIFY`);
+		required.push(`review        : STALE — the accepted hash drifted; fresh scope/integrity evidence is required before the next delegation or VERIFY`);
 	} else {
-		required.push(`review        : REVIEWED — default delivery complete; continue without a routine review/status call`);
+		required.push(`review        : REVIEWED — semantic acceptance recorded or zero-delta closure; this is not Gate authority`);
 	}
 
 	// Optional summary items — dropped only as whole sanitized lines.
@@ -572,9 +599,10 @@ export function buildDelegateWorkerResult(input: BuildDelegateWorkerResultInput)
 		required.push(`parsed items  : suppressed — report sections missing/unreliable (the durable report artifact above is the source of truth)`);
 	}
 
-	// Assemble: keep every required line plus as many whole optional item
-	// lines as fit BOTH the line cap and the UTF-8 byte cap; the fixed
-	// commander-action tail is reserved and always preserved.
+	// Assemble: actual-diff scope/integrity evidence has priority over worker
+	// summary prose.  Keep whole packet lines only; if the 12 KiB/120-line
+	// handoff envelope cannot carry them all, preserve PENDING_REVIEW and add
+	// an explicit recovery marker rather than cutting a diff line.
 	const tailLines = input.reviewStatus === "REVIEWED"
 		? HANDOFF_DEFAULT_DELIVERY_COMPLETE_LINES
 		: HANDOFF_COMMANDER_ACTION_LINES;
@@ -582,14 +610,66 @@ export function buildDelegateWorkerResult(input: BuildDelegateWorkerResultInput)
 	const tailBytes = Buffer.byteLength(tailText, "utf8");
 	const bodyBudget = Math.max(MAX_PARENT_HANDOFF_BYTES - tailBytes, 0);
 	const maxBodyLines = MAX_PARENT_HANDOFF_LINES - tailLines.length;
+	const packetHeader = scopePacket ? ["", "--- Scope/integrity actual-diff packet (bounded/redacted) ---"] : [];
+	const rawPacketLines = scopePacket
+		? scopePacket.lines.flatMap((line) => (typeof line === "string" ? line : "(invalid)").split("\n"))
+		: [];
+	let keptPacket = [...rawPacketLines];
+	const packetClipMarker = "[handoff packet clipped by the 12 KiB/120-line envelope — call workbench_review_worker_diff without semantic_decision for bounded presentation; PENDING_REVIEW is preserved]";
+	let packetClipped = false;
+	let bodyLines = [...required, ...packetHeader, ...keptPacket];
+	while (
+		keptPacket.length > 0
+		&& (bodyLines.length > maxBodyLines || Buffer.byteLength(bodyLines.join("\n"), "utf8") > bodyBudget)
+	) {
+		keptPacket = keptPacket.slice(0, -1);
+		packetClipped = true;
+		bodyLines = [...required, ...packetHeader, ...keptPacket];
+	}
+	if (packetClipped) {
+		while (
+			keptPacket.length > 0
+			&& (
+				bodyLines.length + 1 > maxBodyLines
+				|| Buffer.byteLength([...bodyLines, packetClipMarker].join("\n"), "utf8") > bodyBudget
+			)
+		) {
+			keptPacket = keptPacket.slice(0, -1);
+			bodyLines = [...required, ...packetHeader, ...keptPacket];
+		}
+		if (bodyLines.length < maxBodyLines && Buffer.byteLength([...bodyLines, packetClipMarker].join("\n"), "utf8") <= bodyBudget) {
+			bodyLines.push(packetClipMarker);
+		}
+	}
+	const embeddedPresentationComplete = scopePacket !== undefined
+		&& scopePacket.presentation_complete
+		&& !packetClipped
+		&& keptPacket.length === rawPacketLines.length;
+	if (packetStatusIndex >= 0) {
+		const packetQualifier = packetClipped
+			? " (handoff envelope clipped)"
+			: scopePacket?.patch_truncated
+				? embeddedPresentationComplete
+					? " (strict compact facts complete; source content summarized)"
+					: " (ordinary source patch truncated)"
+				: "";
+		required[packetStatusIndex] = `packet display: ${embeddedPresentationComplete ? "COMPLETE" : "INCOMPLETE"}${packetQualifier}`;
+		bodyLines[packetStatusIndex] = required[packetStatusIndex]!;
+	}
 	let kept = [...optional];
-	let bodyLines = [...required, ...kept];
+	bodyLines = [...bodyLines, ...kept];
 	while (
 		kept.length > 0 &&
 		(bodyLines.length > maxBodyLines || Buffer.byteLength(bodyLines.join("\n"), "utf8") > bodyBudget)
 	) {
 		kept = kept.slice(0, -1);
-		bodyLines = [...required, ...kept];
+		bodyLines = [
+			...required,
+			...packetHeader,
+			...keptPacket,
+			...(packetClipped && bodyLines.includes(packetClipMarker) ? [packetClipMarker] : []),
+			...kept,
+		];
 	}
 	const dropped = optional.length - kept.length;
 	if (dropped > 0) {
@@ -630,6 +710,17 @@ export function buildDelegateWorkerResult(input: BuildDelegateWorkerResultInput)
 		review_status: input.reviewStatus,
 		failure_message: input.failureMessage ? sanitizeSummaryItem(input.failureMessage, MAX_HANDOFF_FAILURE_CHARS).text : null,
 	};
+	if (scopePacket) {
+		details.review_kind = scopePacket.review_kind;
+		details.scope_integrity_verdict = scopePacket.scope_integrity_verdict;
+		details.bound_diff_hash = scopePacket.bound_diff_hash;
+		details.review_record = scopePacket.review_record;
+		details.presentation_complete = embeddedPresentationComplete;
+		details.patch_truncated = scopePacket.patch_truncated || packetClipped;
+		details.semantic_review = scopePacket.semantic_review;
+		details.semantic_risk = scopePacket.semantic_risk;
+		details.gate_authority = false;
+	}
 	// Phase 3: the nested bounded spend details — the exact canonical spend
 	// object persisted in worker-summary.json (same fields, same values,
 	// single derivation). Only present when the ledger record carried it.

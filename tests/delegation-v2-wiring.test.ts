@@ -180,6 +180,43 @@ function reviewTool(stub: StubAPI): RuntimeTool {
 	return tool as RuntimeTool;
 }
 
+async function acceptCurrentSemanticReview(
+	root: string,
+	stub: StubAPI,
+	ctx: ExtensionContext,
+	delegationId: string,
+): Promise<RuntimeResult> {
+	const tool = reviewTool(stub);
+	for (let segment = 0; segment < 500; segment += 1) {
+		const current = await readDelegationReviewV2(root, delegationId);
+		assert.equal(current.ok, true);
+		if (!current.ok) throw new Error("strict provisional review is unavailable");
+		const record = current.value.review as unknown as Record<string, unknown>;
+		if (record.presentation_complete === true) {
+			const bound = record.bound_diff_hash;
+			assert.equal(typeof bound, "string");
+			const accepted = await tool.execute("semantic-accept", {
+				delegation_id: delegationId,
+				semantic_decision: "ACCEPT",
+				expected_bound_diff_hash: bound,
+			}, undefined, undefined, ctx);
+			assert.equal(accepted.details.ok, true, resultText(accepted));
+			assert.equal(accepted.details.review_status, "REVIEWED");
+			return accepted;
+		}
+		const remaining = record.presentation_remaining_paths;
+		assert.ok(Array.isArray(remaining) && remaining.length > 0, "incomplete review names at least one remaining path");
+		const presented = await tool.execute(`semantic-segment-${segment}`, {
+			delegation_id: delegationId,
+			include_paths: [remaining[0]],
+			max_lines: 400,
+			max_bytes: 32768,
+		}, undefined, undefined, ctx);
+		assert.equal(presented.details.ok, true, resultText(presented));
+	}
+	throw new Error("semantic presentation did not converge within the delegation path bound");
+}
+
 function resultText(result: RuntimeResult): string {
 	return result.content
 		.map((item) => typeof item.text === "string" ? item.text : "")
@@ -625,7 +662,7 @@ test("diagnosis REVIEWED mirror append failure stays PENDING_REVIEW and blocks t
 	});
 });
 
-test("implementation real in-scope delta auto-reviews and permits the next delegation", async () => {
+test("implementation real in-scope delta stays pending until explicit Sol acceptance, then permits the next delegation", async () => {
 	await withTempDir(async (root) => {
 		await initializeProject(root);
 		const script = await writeFakeWorker(root, { changedPath: "src/implemented.txt" });
@@ -639,15 +676,28 @@ test("implementation real in-scope delta auto-reviews and permits the next deleg
 			const committed = await readDelegationCommittedGenerationV2(root, id);
 			assert.equal(committed.ok, true);
 			if (!committed.ok) return;
-			assert.equal(committed.value.state.status, "REVIEWED");
+			assert.equal(committed.value.state.status, "PENDING_REVIEW");
 			assert.deepEqual((committed.value.records["after.json"] as Record<string, unknown>).changed_since_before, ["src/implemented.txt"]);
-			assert.equal(latestSessionState(stub).status, "REVIEWED");
-			assert.equal(result.details.review_status, "REVIEWED");
+			assert.equal(latestSessionState(stub).status, "PENDING_REVIEW");
+			assert.equal(result.details.review_status, "PENDING_REVIEW");
 			await assertNoNewV1WriterFiles(root, id);
+			const directoriesBeforeBlockedSuccessor = await delegationDirectories(root);
+			await assert.rejects(
+				withFakeWorker(diagnosisScript, () => tool.execute(
+					"implementation-blocked-before-accept", delegateParams({ task_kind: "diagnosis" }), undefined, undefined, ctx,
+				)),
+				/PENDING_REVIEW/,
+			);
+			assert.deepEqual(await delegationDirectories(root), directoriesBeforeBlockedSuccessor);
+			await acceptCurrentSemanticReview(root, stub, ctx, id);
+			const accepted = await readDelegationCommittedGenerationV2(root, id);
+			assert.equal(accepted.ok, true);
+			if (accepted.ok) assert.equal(accepted.value.state.status, "REVIEWED");
+			assert.equal(latestSessionState(stub).status, "REVIEWED");
 			const second = await withFakeWorker(diagnosisScript, () => tool.execute(
 				"implementation-next-2", delegateParams({ task_kind: "diagnosis" }), undefined, undefined, ctx,
 			));
-			assert.notEqual(delegationId(second), id, "ordinary delivery needs no manual review/status chain");
+			assert.notEqual(delegationId(second), id, "a hash-bound semantic ACCEPT releases the next delegation");
 		});
 	});
 });
@@ -672,7 +722,11 @@ test("a FINAL/PASS v2 delegation that becomes STALE permits a fresh successor wi
 		const firstAuthority = await readDelegationCommittedGenerationV2(root, firstId);
 		assert.equal(firstAuthority.ok, true);
 		if (!firstAuthority.ok) return;
-		assert.equal(firstAuthority.value.state.status, "REVIEWED");
+		assert.equal(firstAuthority.value.state.status, "PENDING_REVIEW");
+		await acceptCurrentSemanticReview(root, stub, ctx, firstId);
+		const acceptedAuthority = await readDelegationCommittedGenerationV2(root, firstId);
+		assert.equal(acceptedAuthority.ok, true);
+		if (acceptedAuthority.ok) assert.equal(acceptedAuthority.value.state.status, "REVIEWED");
 
 		await writeFile(join(root, "src", "implemented.txt"), "intentional post-review policy drift\n", "utf8");
 		const staleStatus = await delegationStatusTool(stub).execute("finalized-stale-status", {}, undefined, undefined, ctx);
@@ -726,38 +780,49 @@ test("a STALE mirror never bypasses a corrupt finalized v2 authority", async () 
 	});
 });
 
-test("implementation auto-review append failure stays blocking and creates no second transaction", async () => {
+test("semantic-accept mirror append failure reports failure, then durable FINAL reconciles before a successor", async () => {
 	await withTempDir(async (root) => {
 		await initializeProject(root);
 		const launchMarkerPath = join(root, ".git", "worker-launches");
 		const script = await writeFakeWorker(root, { changedPath: "src/implemented.txt", launchMarkerPath });
+		const diagnosisScript = await writeFakeWorker(root, { launchMarkerPath });
 		const stub = commanderRuntime();
 		const tool = delegateTool(stub);
-		const ctx = commanderContext(root, "implementation-auto-review-append-failure");
-		stub.failDelegationStateAppendOnceWhen = (state) => state.status === "REVIEWED";
+		const ctx = commanderContext(root, "implementation-semantic-review-append-failure");
 
 		await withFakeWorker(script, async () => {
-			await assert.rejects(
-				tool.execute("implementation-auto-review-failure-1", delegateParams(), undefined, undefined, ctx),
-				/default delivery session_persistence_failed/,
-			);
+			const delivered = await tool.execute("implementation-semantic-review-failure-1", delegateParams(), undefined, undefined, ctx);
+			const id = delegationId(delivered);
+			assert.equal(delivered.details.review_status, "PENDING_REVIEW");
+			const provisional = await readDelegationReviewV2(root, id);
+			assert.equal(provisional.ok, true);
+			if (!provisional.ok) return;
+			stub.failDelegationStateAppendOnceWhen = (state) => state.status === "REVIEWED";
+			const acceptance = await reviewTool(stub).execute("implementation-semantic-accept-append-failure", {
+				delegation_id: id,
+				semantic_decision: "ACCEPT",
+				expected_bound_diff_hash: provisional.value.review.bound_diff_hash,
+			}, undefined, undefined, ctx);
+			assert.equal(acceptance.details.ok, false);
+			assert.equal(acceptance.details.error, "session_persistence_failed");
 			assert.equal(stub.failedDelegationStateAppendCount, 1);
 			const directories = await delegationDirectories(root);
 			assert.equal(directories.length, 1);
 			const committed = await readDelegationCommittedGenerationV2(root, directories[0]!);
 			assert.equal(committed.ok, true);
 			if (!committed.ok) return;
-			assert.equal(committed.value.state.status, "REVIEWED", "the immutable review was published before the mirror append failed");
+			assert.equal(committed.value.state.status, "REVIEWED", "the immutable semantic review was published before the mirror append failed");
 			assert.equal(latestSessionState(stub).status, "PENDING_REVIEW", "the last successful session entry stays blocking");
 
 			const launchesBefore = (await readFile(launchMarkerPath, "utf8")).trim().split("\n").length;
-			await assert.rejects(
-				tool.execute("implementation-auto-review-failure-2", delegateParams({ task_kind: "diagnosis" }), undefined, undefined, ctx),
-				/PENDING_REVIEW|mirror persistence/i,
-			);
-			assert.deepEqual(await delegationDirectories(root), directories);
+			const successor = await withFakeWorker(diagnosisScript, () => tool.execute(
+				"implementation-semantic-review-failure-2", delegateParams({ task_kind: "diagnosis" }), undefined, undefined, ctx,
+			));
+			assert.notEqual(delegationId(successor), id);
+			assert.equal(latestSessionState(stub).latestId, delegationId(successor));
+			assert.equal(latestSessionState(stub).status, "REVIEWED");
 			const launchesAfter = (await readFile(launchMarkerPath, "utf8")).trim().split("\n").length;
-			assert.equal(launchesAfter, launchesBefore, "the blocked retry never launches another worker");
+			assert.equal(launchesAfter, launchesBefore + 1, "the next call first reconciles strict durable FINAL, then launches once");
 		});
 	});
 });
@@ -787,9 +852,15 @@ test("public implementation result exposes only ChangeSet worker delta while the
 			const review = await readDelegationReviewV2(root, id);
 			assert.equal(review.ok, true);
 			if (!review.ok) return;
-			assert.equal(review.value.finalized, true);
-			assert.equal(latestSessionState(stub).currentDiffHash, review.value.review.bound_diff_hash, "session authority observes the finalized relevance binding");
-			assert.equal(latestSessionState(stub).reviewedDiffHash, review.value.review.bound_diff_hash);
+			assert.equal(review.value.finalized, false);
+			assert.equal(latestSessionState(stub).currentDiffHash, review.value.review.bound_diff_hash, "session mirror observes the provisional relevance binding");
+			assert.equal(latestSessionState(stub).reviewedDiffHash, undefined);
+			await acceptCurrentSemanticReview(root, stub, ctx, id);
+			const acceptedReview = await readDelegationReviewV2(root, id);
+			assert.equal(acceptedReview.ok, true);
+			if (!acceptedReview.ok) return;
+			assert.equal(acceptedReview.value.finalized, true);
+			assert.equal(latestSessionState(stub).reviewedDiffHash, acceptedReview.value.review.bound_diff_hash);
 		});
 	});
 });
@@ -1045,6 +1116,8 @@ test("repair provenance prefers strict v2, large default review converges, and c
 			commanderContext(root, "default-review-segmented"),
 		));
 		const segmentedId = delegationId(segmented);
+		assert.equal(latestSessionState(segmentedStub).status, "PENDING_REVIEW");
+		await acceptCurrentSemanticReview(root, segmentedStub, commanderContext(root, "default-review-segmented"), segmentedId);
 		assert.equal(latestSessionState(segmentedStub).status, "REVIEWED");
 		const segmentedAuthority = await readDelegationCommittedGenerationV2(root, segmentedId);
 		assert.equal(segmentedAuthority.ok, true);

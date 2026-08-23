@@ -262,6 +262,8 @@ test("buildBenchmarkReport: all required fields with correct aggregation", async
 			"requestCount",
 			"schema13Rows",
 			"observability",
+			"modelRoleObservability",
+			"delegationEfficiency",
 			"uncachedInputTokens",
 			"cacheReadTokens",
 			"outputTokens",
@@ -333,6 +335,37 @@ test("buildBenchmarkReport: all required fields with correct aggregation", async
 		assert.equal(report.truncatedTelemetryRecords, 0);
 		assert.equal(report.schema13Rows, 0);
 		assert.equal(report.observability, null, "legacy rows remain unobserved rather than zero-filled 1.3 facts");
+		assert.equal(report.modelRoleObservability.commander.requestCount, 0);
+		assert.equal(report.modelRoleObservability.worker.requestCount, 0);
+		assert.deepEqual(report.delegationEfficiency, {
+			metrics: {
+				attempts: 0,
+				worker_outcomes_known: 0,
+				worker_successes: 0,
+				semantic_outcomes_known: 0,
+				semantic_accepted: 0,
+				semantic_not_required: 0,
+				accepted_yield: "unknown",
+				accepted_repair_depth_known: 0,
+				accepted_repair_depth_unknown: 0,
+				first_attempt_accepted: 0,
+				first_accepted_yield: "unknown",
+				repair_depth_known: 0,
+				repair_depth_unknown: 0,
+				max_repair_depth: "unknown",
+				review_bytes_known: 0,
+				review_bytes_unknown: 0,
+				review_bytes_observed_total: 0,
+				review_presentation_known: 0,
+				review_presentation_unknown: 0,
+				review_presentation_complete: 0,
+			},
+			directories: 0,
+			strictRecords: 0,
+			legacyOrNotV2: 0,
+			invalidOrUnavailable: 0,
+			sourceIncomplete: false,
+		});
 	});
 });
 
@@ -580,6 +613,10 @@ test("parseCliArgs: commands, options and positional names", () => {
 	const session = parseCliArgs(["report", "--session", "abc", "--save", "x"]);
 	assert.equal(session.session, "abc");
 	assert.equal(session.save, "x");
+	const canary = parseCliArgs(["canary", "abba.json", "--json"]);
+	assert.equal(canary.command, "canary");
+	assert.deepEqual(canary.names, ["abba.json"]);
+	assert.equal(canary.json, true);
 	// Unknown command degrades to report (documented behavior).
 	assert.equal(parseCliArgs(["bogus"]).command, "report");
 });
@@ -672,5 +709,24 @@ test("CLI: compare exits 1 with a clear message when no saved reports exist", as
 		const result = await spawnExec(tsx, [script, "compare", "nope", "--project", root], { timeout: 60000 });
 		assert.equal(result.code, 1);
 		assert.ok(result.stderr.includes("no saved reports found"));
+	});
+});
+
+test("CLI: canary has a strict read-only descriptive entry point", async () => {
+	await withTempDir(async (root) => {
+		const manifest = join(root, "abba.json");
+		await writeFile(manifest, JSON.stringify({
+			schema: "workbench-sol-luna-abba-v1",
+			variants: { A: "extended baseline", B: "advisory routed" },
+			trials: [],
+		}), "utf8");
+		const tsx = join(process.cwd(), "node_modules", ".bin", "tsx");
+		const script = join(process.cwd(), "scripts", "cache-benchmark.ts");
+		const result = await spawnExec(tsx, [script, "canary", manifest, "--json"], { timeout: 60000 });
+		assert.equal(result.code, 0);
+		const parsed = JSON.parse(result.stdout) as { authority: string; decision: string; minimum_complete_blocks: number };
+		assert.equal(parsed.authority, "DESCRIPTIVE_ONLY");
+		assert.equal(parsed.decision, "NOT_EVALUABLE");
+		assert.equal(parsed.minimum_complete_blocks, 12);
 	});
 });

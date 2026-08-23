@@ -133,6 +133,21 @@ const WORKBENCH_DELEGATE_WORKER_CURRENT_BUDGET_PROFILE = Type.Optional(
 /** Exact governance-v1 delegate input schema retained for characterization. */
 export const WORKBENCH_DELEGATE_WORKER_V1_PARAMETERS = Type.Object(WORKBENCH_DELEGATE_WORKER_V1_PROPERTIES);
 
+/** Exact governance-v1 review input schema retained for characterization. */
+const WORKBENCH_REVIEW_WORKER_DIFF_V1_PROPERTIES = {
+	delegation_id: Type.String({ description: "Delegation id, e.g. 20260101-120000-abcd" }),
+	include_paths: Type.Optional(
+		Type.Array(Type.String({ minLength: 1, maxLength: 300 }), {
+			description: "Only these worker paths get patch content; scope checks always cover the entire worker diff and include_paths can never hide a violation",
+			maxItems: 50,
+		}),
+	),
+	max_lines: Type.Optional(Type.Integer({ description: "Whole-result line cap (default/max 400)", minimum: 1, maximum: 400 })),
+	max_bytes: Type.Optional(Type.Integer({ description: "Whole-result byte cap (default/max 32 KiB)", minimum: 1, maximum: 32768 })),
+} as const;
+
+export const WORKBENCH_REVIEW_WORKER_DIFF_V1_PARAMETERS = Type.Object(WORKBENCH_REVIEW_WORKER_DIFF_V1_PROPERTIES);
+
 /**
  * Parameter schemas, keyed by tool name. `as const` preserves the exact
  * typebox types so the extension's registerTool calls infer the params type
@@ -205,15 +220,22 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 		b: Type.String({ description: "Second run id, e.g. 20260102-120000-efgh" }),
 	}),
 	workbench_review_worker_diff: Type.Object({
-		delegation_id: Type.String({ description: "Delegation id, e.g. 20260101-120000-abcd" }),
-		include_paths: Type.Optional(
-			Type.Array(Type.String({ minLength: 1, maxLength: 300 }), {
-				description: "Only these worker paths get patch content; scope checks always cover the entire worker diff and include_paths can never hide a violation",
-				maxItems: 50,
+		...WORKBENCH_REVIEW_WORKER_DIFF_V1_PROPERTIES,
+		semantic_decision: Type.Optional(
+			Type.Literal("ACCEPT", {
+				description:
+					"Must be supplied together with expected_bound_diff_hash, and only after Sol has inspected the complete semantic-review packet. Omission produces provisional scope/integrity presentation only and grants no review or Gate authority.",
 			}),
 		),
-		max_lines: Type.Optional(Type.Integer({ description: "Whole-result line cap (default/max 400)", minimum: 1, maximum: 400 })),
-		max_bytes: Type.Optional(Type.Integer({ description: "Whole-result byte cap (default/max 32 KiB)", minimum: 1, maximum: 32768 })),
+		expected_bound_diff_hash: Type.Optional(
+			Type.String({
+				pattern: "^[a-f0-9]{64}$",
+				minLength: 64,
+				maxLength: 64,
+				description:
+					"Exact packet-bound diff hash paired with semantic_decision=ACCEPT after Sol inspects the complete packet. It prevents accepting drift; either field alone is invalid and neither can grant Gate authority.",
+			}),
+		),
 	}),
 	workbench_delegation_status: Type.Object({}),
 	// P8b: public read-only recovery tool. Both params are OPTIONAL in the
@@ -244,6 +266,15 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 	}),
 	workbench_delegate_worker: Type.Object({
 		...WORKBENCH_DELEGATE_WORKER_V1_PROPERTIES,
+		verification: Type.Optional(Type.Array(Type.String({
+			minLength: 8,
+			maxLength: 207,
+			pattern: "^recipe:[^\\r\\n\\u0000-\\u001f\\u007f]{1,200}$",
+		}), {
+			description:
+				"Machine-readable references to declared write-free recipes, each exactly recipe:<declared-name>. The runtime validates existence, mutation:none and parameter compatibility before launch; final Gates remain commander-only.",
+			maxItems: 20,
+		})),
 		// Current schema supersedes only the budget description/limits. The
 		// frozen governance-v1 schema continues to use the original property.
 		budget_profile: WORKBENCH_DELEGATE_WORKER_CURRENT_BUDGET_PROFILE,
@@ -278,6 +309,14 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 			}, {
 				additionalProperties: false,
 				description: "Optional immutable plan snapshot traceability. Current project bytes must match plan_sha256; it adds no scope, review, or Gate authority.",
+			}),
+		),
+		extended_reason: Type.Optional(
+			Type.String({
+				minLength: 1,
+				maxLength: 500,
+				description:
+					"Canonical one-line reason for a contract above the 12 KiB ordinary soft limit. Such a call must also set budget_profile explicitly to extended. Every contract remains subject to the absolute 64 KiB limit.",
 			}),
 		),
 	}),
@@ -411,27 +450,26 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 	workbench_delegate_worker: {
 		...WORKBENCH_DELEGATE_WORKER_V1_METADATA,
 		description:
-			"Deliver one bounded development task to the pinned GPT-5.6 Luna xhigh worker through the committed delegation-v2 transaction. The normal implementation path executes the worker, checks the immutable ChangeSet and approved scope, automatically continues bounded segmented actual-diff review, and closes the session as REVIEWED in this same call when coverage is complete; the parent should continue development without a routine review/status chain. Only a review conflict, persistence failure, no-progress condition, or the 32-segment safety cap leaves explicit review recovery required. A durable execution-owner record spans PREPARED/RUNNING: after a crash or reboot, startup atomically ABORTS only a provably dead transaction with no worker-write evidence, then permits a fresh delegation without review; live, unproven, nonempty-journal, COMMITTING, corrupt, or ambiguous authority remains fail-closed. When an immutable FINAL/PASS v2 review later becomes STALE because relevant workspace state changed, an ordinary new call may start a fresh successor after strict live authority revalidation; it preserves the old review, adopts the current workspace as the new baseline, and does not use repair_of. PENDING_REVIEW, corrupt, unpublished, recovery-required, and non-final authority remain blocking. Diagnosis is strictly read-only and closes only with zero changed paths, zero successful or denied writes, and a complete report. The current spend profiles are extended (safe default) and standard (explicit small bounded slices); retired low is historical-read-only. This default path never bypasses explicit permission, destructive-action confirmation, or final verification gates. Historical v1 ledgers remain read-only repair provenance only.",
+			"Run one bounded delegation-v2 task on pinned GPT-5.6 Luna xhigh. Implementation may write only approved paths; diagnosis is strictly read-only. New contracts are canonicalized, verification names only declared mutation:none recipes, and contracts above 12 KiB require explicit extended budget plus extended_reason; 64 KiB is absolute. The worker runs in a fresh no-session process and cannot delegate, use free-form bash, or run final Gates. Immutable transaction, ChangeSet, journal, report and usage facts are retained; ambiguous authority fails closed. repair_of may supply only a minimal authority-derived repair capsule and never resumes a session or imports prior prose. Sol retains architecture, semantic review, final verification, Gates and verdict authority.",
 		promptSnippet:
-			"Deliver a bounded implementation to GPT-5.6 Luna xhigh in one call with automatic diff review and session close, or run a read-only diagnosis",
+			"Run one bounded Luna xhigh implementation or read-only diagnosis under an immutable contract",
 		promptGuidelines: [
-			"Use one workbench_delegate_worker call for an ordinary bounded implementation; after a successful REVIEWED result, continue directly to the next development step without calling review or status.",
-			"Provide a concrete task, the smallest useful allowed_paths set, and observable acceptance criteria. Omit task_kind for implementation; choose diagnosis explicitly for read-only investigation. Omit budget_profile for the safe extended default; select standard explicitly only for a clearly small bounded slice. Retired low is rejected.",
-			"If status reports STALE with a strict prior v2 FINAL/PASS review, start an ordinary fresh successor: the runtime revalidates the old authority and captures the current workspace as the new baseline. Do not use repair_of and do not try to rewrite the immutable review. Other stale, pending, corrupt, unpublished, or recovery-required authority stays fail-closed.",
-			"Call workbench_review_worker_diff only when this tool reports explicit review required after a conflict, persistence failure, no-progress condition, the 32-segment safety cap, or a pending/non-final-stale recovery state.",
-			"A successful diagnosis requires zero actual delta, zero successful or denied writes, and a complete four-section report. High-risk permission and final verification remain explicit boundaries.",
+			"Delegate one coherent slice with the smallest useful allowed_paths and observable criteria; use diagnosis only when the root cause or scope is genuinely unknown.",
+			"Verification entries are exact recipe:<declared-name> references. Omit budget_profile for the normal extended default; a contract above 12 KiB must explicitly set extended and provide extended_reason.",
+			"Use repair_of only for a known-root-cause repair. The fresh worker receives bounded immutable failure facts, not the old session, report, or authority.",
+			"Treat worker output as implementation evidence only. Sol owns semantic acceptance, final verification, Gates, permissions and the final verdict.",
 		],
 	},
 	workbench_review_worker_diff: {
 		...WORKBENCH_REVIEW_WORKER_DIFF_V1_METADATA,
 		description:
-			"Recovery review for a delegation that could not complete the default one-call delivery. It checks the entire attributed worker delta W against allowed_paths while include_paths narrows only rendered output, and binds full streaming identities for W, the explicit dependency closure D, and relevant controls S. Use segmented calls for large diffs until coverage is complete. Baseline unrelated dirty paths and recognized workbench artifacts do not stale new tagged v2; Git HEAD, W/D/S drift, or a new unknown-origin path fails closed. Historical untagged v2/v1 retain full-diff binding. A finalized PASS v2 review is immutable: if later drift makes its session mirror STALE, do not retry review; status permits an ordinary fresh successor after strict revalidation. This tool writes only review authority and the session mirror, never project files.",
-		promptSnippet: "Recover an incomplete, pending, stale, or conflicted delegation review",
+			"Inspect the immutable worker delta and its scope/integrity binding. A call without semantic_decision and expected_bound_diff_hash produces only provisional presentation and grants no review or Gate authority. After Sol has inspected the complete semantic-review packet, supply both semantic_decision=ACCEPT and the exact packet-bound diff hash; either field alone fails closed. include_paths narrows rendering only, never scope checks. Workspace drift invalidates the binding. The tool writes review authority only, never project files or Gate results.",
+		promptSnippet: "Inspect a bound worker diff, then explicitly ACCEPT only the complete unchanged packet",
 		promptGuidelines: [
-			"Do not call this after an ordinary successful REVIEWED delegation; the default delivery already completed the actual-diff review.",
-			"Use it only when delegation output reports explicit review required or incomplete coverage. For STALE, inspect status first: a finalized PASS v2 review cannot be rewritten and should advance through a fresh successor; only non-final recoverable review state belongs here.",
-			"The review always checks the entire worker delta against allowed_paths; include_paths narrows only the bounded patch presentation.",
-			"Repeat segmented review only for remaining paths until PASS and complete coverage close the session.",
+			"First call without semantic fields to inspect the provisional scope/integrity packet; this cannot finalize review.",
+			"Only after Sol inspects the complete packet, call with semantic_decision=ACCEPT and its exact expected_bound_diff_hash. Always provide both or neither.",
+			"include_paths changes presentation only. Never accept after drift, incomplete packet coverage, unresolved semantic risk, or an unverified hash.",
+			"Review authority never substitutes for final verification or Gate authority.",
 		],
 	},
 	workbench_delegation_status: {
@@ -439,7 +477,7 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 		description:
 			"Show the write-authority and delegation-review state: actor, write policy, lease status, latest delegation, review status (PENDING_REVIEW/REVIEWED/STALE), current and actual diff hashes, reviewed hash, blocked write attempts, and the latest review verdict. The existing hash field names are retained for compatibility: a new tagged v2 delegation refreshes a ChangeSet relevance binding over W (the attributed worker delta), D (the explicit dependency closure), and S (relevant controls); baseline unrelated dirty paths and recognized workbench artifacts do not stale it, while Git HEAD, W/D/S drift, or a new unknown-origin path fails closed and makes a reviewed delegation STALE. Historical untagged v2 and v1 authority retain the complete full-diff binding, where any diff change makes a reviewed delegation STALE. For STALE plus strict v2 FINAL/PASS authority, status reports that a fresh successor is allowed after live revalidation while VERIFY remains blocked; all other blocking authority remains fail-closed. Emits an explicit CONTEXT RISK line when the latest delegation handoff is detected too large for safe context compaction.",
 		promptGuidelines: [
-			"Routine successful delivery closes as REVIEWED in the delegate call; use status only for diagnostics or recovery.",
+			"Successful non-zero implementation delivery returns a provisional scope/integrity packet and stays PENDING_REVIEW; after inspecting a complete unchanged packet, use workbench_review_worker_diff for hash-bound Sol ACCEPT. Use status only for diagnostics or recovery.",
 			"When STALE is backed by a strict v2 FINAL/PASS review, follow the reported successor action instead of retrying immutable review; VERIFY remains blocked until that successor is reviewed.",
 			"In the TUI, WF:LOCKED means routine writes belong to Luna, WF:LEASE means a bounded temporary Sol write exception is active, and WF:REVIEW means recovery review is outstanding.",
 		],
@@ -531,6 +569,8 @@ export function workbenchToolMetadataV1Ordered(): readonly (WorkbenchToolMeta & 
 							: (WORKBENCH_TOOL_METADATA[name] as WorkbenchToolMeta)),
 		parameters: name === "workbench_delegate_worker"
 			? WORKBENCH_DELEGATE_WORKER_V1_PARAMETERS
+			: name === "workbench_review_worker_diff"
+				? WORKBENCH_REVIEW_WORKER_DIFF_V1_PARAMETERS
 			: name === "workbench_run_gate"
 				? WORKBENCH_RUN_GATE_V1_PARAMETERS
 				: WORKBENCH_TOOL_PARAMETERS[name],

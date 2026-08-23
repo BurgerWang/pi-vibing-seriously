@@ -20,6 +20,7 @@ telemetry records.
 | `tsx scripts/cache-benchmark.ts report [options]` | `npm run cache:report` | Full benchmark report (see fields below). |
 | `tsx scripts/cache-benchmark.ts doctor [options]` | `npm run cache:doctor` | Offline health checks: telemetry hygiene + action-cache integrity. Exits non-zero when any check FAILs. |
 | `tsx scripts/cache-benchmark.ts compare <report>...` | — | Side-by-side table of saved reports (`reports/*.json`), e.g. `p6a-baseline p6b-stable-dev p6c-action-cache`. |
+| `tsx scripts/cache-benchmark.ts canary <manifest.json> [--json]` | `npm run worker:canary -- <manifest.json> [--json]` | Strict read-only Sol/Luna ABBA evaluation; output is always `DESCRIPTIVE_ONLY`. |
 
 Options: `--project <root>` (default: current directory), `--json`
 (machine-readable), `--session <hashed-id>` (scope telemetry to one hashed
@@ -39,6 +40,13 @@ write into `reports/<name>.json`).
    (`execution_source`, `action_key`, `reused_from_run_id`, `duration_ms`).
 4. **Action cache records** — `.pi/workbench/cache/actions/*.json`,
    `cache-index.json`, `locks/*.lock`, `tmp/corrupt-*` quarantine copies.
+5. **Delegation v2 authority** — strict transaction, committed generation,
+   and review readers under `.pi/workbench/delegations/`; legacy/non-v2
+   directories are labeled and excluded, while malformed or unavailable v2
+   authority makes that source incomplete.
+6. **Explicit canary manifest** — only for the `canary` command: one bounded
+   stable regular UTF-8 JSON file (maximum 1 MiB), strict schema
+   `workbench-sol-luna-abba-v1`.
 
 ## What the benchmark NEVER does
 
@@ -77,6 +85,8 @@ equal in-Pi numbers.
 | `observability.correlationCounts` | Counts of `unwired`, `exact`, `multipleOrStale`, and `missing`. Non-exact rows are unknown-actor rows with no projection facts and cannot support actor/cohort conclusions. |
 | `observability.wholeItemLcp` | Eligible exact-correlated local observations plus whole-item LCP item and UTF-8 byte totals. The local observation has `finalityCode=0`; no final-wire or partial-item/token claim is made. |
 | `observability.actorCohorts` | Separate `unknown`, `commander`, and `worker` usage cohorts. Commander and worker must be evaluated separately. |
+| `modelRoleObservability` | Existing strict schema-1.3 facts by actor. Assistant-message provider/model is reported as effective; Pi's selected `thinkingLevel` is requested reasoning. Requested provider/model and provider-confirmed effective reasoning were not persisted by schema 1.3, so they remain explicit `null`/`unknown`, never inferred. |
+| `delegationEfficiency` | Project-lifetime (not telemetry-session-scoped) strict v2 worker outcome, durable semantic acceptance, first-accepted yield, repair depth, latest durable review-packet bytes, and full-presentation completeness. A missing v2 transaction is counted separately as `legacyOrNotV2` and does not make the v2 source corrupt/incomplete; only malformed or unavailable v2 authority increments `invalidOrUnavailable`. Only a strict schema-2, hash-bound `semantic_review: accepted` object whose acceptance hash, Sol reviewer, and timestamp match counts as accepted; historical mechanical `REVIEWED` and pending reviews remain unknown. Diagnosis/zero-delta `not_required` is counted separately and excluded from the yield denominator. First-accepted yield is the share of explicit acceptances at repair depth zero; failures do not enter that denominator, and any accepted row with unknown lineage makes it unknown. Historical review records without `presentation_complete` and broken repair chains remain unknown. Overwritten older review packets cannot be reconstructed, so the offline byte total is not cumulative review spend. |
 | `extensionVersionCohorts` | Prompt-usage cohorts grouped in one pass by the record's exact extension version after the requested session/time filters. Each cohort retains its own semantic-status and hit ratio; unlike-version totals are never presented as a current-version improvement. A package version is not a source-commit identity, so an uncommitted/current-HEAD benefit still requires a fresh canary. Human output is bounded to 20 version rows with an omitted count; JSON retains all cohorts from the bounded telemetry window. |
 | `observability.projectionCohorts` | Separate `segmentSeal` and `epochTransition` usage cohorts with numeric event/cause and hard-overflow counts. |
 | `usageSemanticStatus` | Worst status across records: `verified` (api kind verified + internally consistent numbers), `partial` (structure ok, api kind unverified), `unverified` (invalid/missing usage). Never guessed. |
@@ -198,9 +208,56 @@ are evaluation targets only and cannot be satisfied by offline/fake-provider
 data. The larger caps likewise make no cache-hit promise until repository
 dependencies resolve (the current tree resolves Pi 0.84.2), declared gates
 pass, `/reload` is applied, and a fresh live Commander/worker cohort is
-measured. Current size qualification is
-limited to the 272k Commander model and pinned 1M worker; `other` and arbitrary
+measured. Current size qualification is limited to Pi's advertised 272,000-token
+context window for both pinned GPT-5.6 Sol and GPT-5.6 Luna; `other` and arbitrary
 64k/128k model windows remain unqualified.
+
+## Sol/Luna ABBA canary
+
+`npm run worker:canary -- <manifest.json> --json` evaluates an explicit ABBA
+manifest without launching Pi, a model, or a workbench product flow. Each
+four-trial block must be ordered `A,B,B,A` and use one task-family stratum.
+The input is a strict, stable, regular UTF-8 JSON file bounded to 1 MiB;
+unknown/missing fields, source changes during reading, and non-regular inputs
+fail closed.
+The report remains `NOT_EVALUABLE` until it has at least 12 complete blocks
+(24 tasks per arm), no incomplete/invalid block, and every identity and KPI
+fact is known.
+
+Each trial uses exact keys only. `block_id`, `position` (`1..4`), `arm`, and
+`task_family` define the stratum/order. `commander` and `worker` each contain
+exact `requested` and `effective` objects with `provider`, `model`, and
+`reasoning` (string or `null`). The remaining fields are `elapsed_ms`,
+`first_accepted`, `repair_depth`, `review_bytes`,
+`review_presentation_complete`, `regressions`, `critical_defects`,
+`scope_defects`, `authority_defects`, `commander_tokens`, and `worker_tokens`.
+Numeric facts are non-negative integers or `null`; booleans are boolean or
+`null`; `elapsed_ms`, when known, must be positive. `first_accepted` is true
+only when the first delegation attempt has a
+durable semantic ACCEPT; a pending/mechanical review is `null`, not false.
+`repair_depth` is zero at the root and follows strict `repair_of` links;
+missing or broken links are `null`.
+
+In the canary manifest, `review_presentation_complete` means the review packet was
+semantically inspectable end to end: an ordinary packet was untruncated, or a
+compact/segmented packet completed full presentation. It must not be copied
+from the older mechanical `coverage_complete` field. `review_bytes` is the
+trial's cumulative bytes presented across all strict review packets, rather
+than the latest durable packet alone.
+
+The registered target is: B improves median end-to-end wall time by at least
+20%, improves first semantic-acceptance yield by at least 10 percentage
+points, does not reduce complete review coverage or increase regressions,
+does not regress wall-time p90 by more than 10%, and has zero critical,
+scope, or authority defects. Missing effective reasoning, repair depth,
+review bytes, token totals, or any other declared field stays unknown and
+forces `NOT_EVALUABLE`. `TARGET_MET` is descriptive canary evidence only; it
+never grants release, review, Gate, or production authority.
+
+Local audit snapshot (2026-08-23): the repository contains 281 historical
+delegation directories, all classified `legacyOrNotV2`; strict v2 records are
+0, invalid/unavailable v2 records are 0, and semantic acceptance/yield is
+unknown. The absence of v2 data is not corruption and is not Luna evidence.
 
 ## Statistics, reproducibility
 

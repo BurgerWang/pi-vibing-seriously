@@ -42,6 +42,8 @@ import {
 } from "./delegation-transaction.ts";
 import {
 	REVIEW_RECORD_MAX_BYTES,
+	isCompleteReviewPresentationEntry,
+	isStrictSemanticAcceptedOrZeroDelta,
 	type ReviewPatchEntry,
 	type ReviewRecord,
 } from "./diff-review.ts";
@@ -327,8 +329,25 @@ const REVIEW_RECORD_FIELDS = [
 	"checked_paths", "include_paths", "patch", "patch_truncated", "patch_paths", "notes",
 	"displayed_paths", "remaining_paths", "coverage_complete", "review_path",
 ] as const;
+const REVIEW_PRESENTATION_FIELDS = [
+	"fully_presented_paths", "presentation_remaining_paths", "presentation_complete",
+] as const;
+const REVIEW_SEMANTIC_FIELDS = ["semantic_review"] as const;
+const REVIEW_SEMANTIC_ACCEPTANCE_FIELDS = ["semantic_acceptance"] as const;
+const REVIEW_RECORD_FIELDS_WITH_PRESENTATION = [
+	...REVIEW_RECORD_FIELDS, ...REVIEW_PRESENTATION_FIELDS, ...REVIEW_SEMANTIC_FIELDS,
+] as const;
+const REVIEW_RECORD_FIELDS_WITH_ACCEPTANCE = [
+	...REVIEW_RECORD_FIELDS_WITH_PRESENTATION, ...REVIEW_SEMANTIC_ACCEPTANCE_FIELDS,
+] as const;
 const REVIEW_RECORD_FIELDS_RELEVANCE_V2 = [
 	...REVIEW_RECORD_FIELDS, "diff_identity_kind", "relevance_binding", "relevance_projection",
+] as const;
+const REVIEW_RECORD_FIELDS_RELEVANCE_V2_WITH_PRESENTATION = [
+	...REVIEW_RECORD_FIELDS_WITH_PRESENTATION, "diff_identity_kind", "relevance_binding", "relevance_projection",
+] as const;
+const REVIEW_RECORD_FIELDS_RELEVANCE_V2_WITH_ACCEPTANCE = [
+	...REVIEW_RECORD_FIELDS_WITH_ACCEPTANCE, "diff_identity_kind", "relevance_binding", "relevance_projection",
 ] as const;
 
 function failure<T>(
@@ -457,7 +476,19 @@ function validReviewPatchEntry(value: unknown): value is ReviewPatchEntry {
 function validReviewRecordForState(value: unknown, state: DelegationTransactionRecord): value is ReviewRecord {
 	if (!isRecord(value)) return false;
 	const relevanceV2 = value.schema_version === 2;
-	if (!(relevanceV2 ? exactFields(value, REVIEW_RECORD_FIELDS_RELEVANCE_V2) : exactFields(value, REVIEW_RECORD_FIELDS))) return false;
+	const hasPresentation = REVIEW_PRESENTATION_FIELDS.every((field) => Object.prototype.hasOwnProperty.call(value, field));
+	const hasPartialPresentation = REVIEW_PRESENTATION_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(value, field)) && !hasPresentation;
+	const hasSemantic = Object.prototype.hasOwnProperty.call(value, "semantic_review");
+	const hasAcceptance = Object.prototype.hasOwnProperty.call(value, "semantic_acceptance");
+	if (hasPartialPresentation || hasPresentation !== hasSemantic || (hasAcceptance && !hasSemantic)) return false;
+	const fieldsValid = relevanceV2
+		? exactFields(value, hasAcceptance
+			? REVIEW_RECORD_FIELDS_RELEVANCE_V2_WITH_ACCEPTANCE
+			: hasPresentation ? REVIEW_RECORD_FIELDS_RELEVANCE_V2_WITH_PRESENTATION : REVIEW_RECORD_FIELDS_RELEVANCE_V2)
+		: exactFields(value, hasAcceptance
+			? REVIEW_RECORD_FIELDS_WITH_ACCEPTANCE
+			: hasPresentation ? REVIEW_RECORD_FIELDS_WITH_PRESENTATION : REVIEW_RECORD_FIELDS);
+	if (!fieldsValid) return false;
 	if ((value.schema_version !== 1 && !relevanceV2) || value.delegation_id !== state.delegation_id || !isCanonicalTime(value.reviewed_at) ||
 		(value.verdict !== "PASS" && value.verdict !== "FAIL") ||
 		typeof value.bound_diff_hash !== "string" || !DELEGATION_TRANSACTION_HASH_RE.test(value.bound_diff_hash) ||
@@ -467,6 +498,21 @@ function validReviewRecordForState(value: unknown, state: DelegationTransactionR
 	if (!validReviewPaths(value.drift_paths) || !validReviewPaths(value.allowed_paths, 50) ||
 		!validByteSortedPaths(value.checked_paths, 500) || !validReviewPaths(value.include_paths, 50) ||
 		!validByteSortedPaths(value.displayed_paths, 500) || !validByteSortedPaths(value.remaining_paths, 500)) return false;
+	if (hasPresentation && (
+		!validByteSortedPaths(value.fully_presented_paths, 500)
+		|| !validByteSortedPaths(value.presentation_remaining_paths, 500)
+		|| typeof value.presentation_complete !== "boolean"
+	)) return false;
+	if (hasSemantic && !["required", "accepted", "not_required"].includes(String(value.semantic_review))) return false;
+	if (hasAcceptance) {
+		const acceptance = value.semantic_acceptance;
+		if (!isRecord(acceptance) || !exactFields(acceptance, ["decision", "expected_bound_diff_hash", "reviewer", "accepted_at"]) ||
+			acceptance.decision !== "ACCEPT" || acceptance.expected_bound_diff_hash !== value.bound_diff_hash ||
+			!isCanonicalTime(acceptance.accepted_at) || acceptance.accepted_at !== value.reviewed_at || !isRecord(acceptance.reviewer) ||
+			!exactFields(acceptance.reviewer, ["provider", "model"]) ||
+			!(["openai", "openai-codex"] as unknown[]).includes(acceptance.reviewer.provider) ||
+			acceptance.reviewer.model !== "gpt-5.6-sol") return false;
+	}
 	if (relevanceV2 && (value.diff_identity_kind !== REVIEW_RELEVANCE_KIND_V2 ||
 		!validateReviewRelevanceBindingV2(value.relevance_binding) ||
 		!validateReviewRelevanceProjectionV2(value.relevance_projection) ||
@@ -493,6 +539,21 @@ function validReviewRecordForState(value: unknown, state: DelegationTransactionR
 	if (!displayed.every((path) => checked.includes(path)) || !remaining.every((path) => checked.includes(path)) ||
 		displayed.some((path) => remaining.includes(path)) ||
 		!samePathSetByte([...displayed, ...remaining], checked) || value.coverage_complete !== (remaining.length === 0)) return false;
+	if (hasPresentation) {
+		const fullyPresented = value.fully_presented_paths as string[];
+		const presentationRemaining = value.presentation_remaining_paths as string[];
+		if (!fullyPresented.every((path) => checked.includes(path)) || !presentationRemaining.every((path) => checked.includes(path)) ||
+			fullyPresented.some((path) => presentationRemaining.includes(path)) ||
+			!samePathSetByte([...fullyPresented, ...presentationRemaining], checked) ||
+			value.presentation_complete !== (presentationRemaining.length === 0)) return false;
+		const compactEntries = (value.patch as ReviewPatchEntry[]).filter((entry) => entry.source === "compact");
+		if (compactEntries.some((entry) => fullyPresented.includes(entry.path) && !isCompleteReviewPresentationEntry(entry))) return false;
+		if (checked.length === 0) {
+			if (value.semantic_review !== "not_required" || hasAcceptance) return false;
+		} else if ((value.semantic_review === "accepted") !== hasAcceptance || value.semantic_review === "not_required") {
+			return false;
+		}
+	}
 	const expectedPath = delegationReviewRelativePathV2(state.delegation_id);
 	return expectedPath !== undefined && value.review_path === expectedPath;
 }
@@ -1513,8 +1574,8 @@ export async function publishDelegationReviewV2(
 		}
 		const parsedArtifact = parseReviewArtifactForState(input.artifact, current);
 		if (parsedArtifact === undefined || parsedArtifact.review.schema_version !== 2 ||
-			parsedArtifact.review.verdict !== "PASS" || !parsedArtifact.review.coverage_complete) {
-			return failure("invalid_input", "only a complete PASS review artifact may finalize a delegation");
+			!isStrictSemanticAcceptedOrZeroDelta(parsedArtifact.review)) {
+			return failure("invalid_input", "only a complete untruncated scope/integrity PASS packet may finalize a delegation");
 		}
 		const generation = generationName(current.generation);
 		if (generation === undefined) return failure("invalid_record", "delegation review generation is invalid");

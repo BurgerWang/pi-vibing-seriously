@@ -9,6 +9,7 @@ import {
 	computeDiffHash,
 	delegationsDir,
 	isValidDelegationId,
+	readDelegationLedger,
 } from "./delegation-ledger.ts";
 import {
 	observeDiffChange,
@@ -26,7 +27,11 @@ import {
 	recoverInterruptedDelegationV2,
 	type DelegationExecutionOwnerOptionsV2,
 } from "./delegation-execution-owner.ts";
-import { readReviewRecord, type ReviewRecord } from "./diff-review.ts";
+import {
+	isStrictSemanticAcceptedOrZeroDelta,
+	readReviewRecord,
+	type ReviewRecord,
+} from "./diff-review.ts";
 import { collectReviewRelevanceV2, computeReviewRelevanceConflictHashV2 } from "./review-relevance-v2.ts";
 import { validateWorkspaceGuard, type WorkspaceGuardRecord } from "./workspace-guard.ts";
 import { readWorkerWriteJournal, type WorkerWriteJournalRecord } from "./write-journal.ts";
@@ -69,7 +74,7 @@ export type DelegationAuthorityObservationV2 =
 		reviewPath: string | null;
 		finalized: boolean;
 	}
-	| { kind: "legacy"; review: ReviewRecord | null }
+	| { kind: "legacy"; review: ReviewRecord | null; zeroDelta: boolean }
 	| { kind: "invalid-v2"; code: string };
 
 export interface ProjectDelegationAuthorityIssueV2 {
@@ -358,9 +363,19 @@ export async function readDelegationAuthorityObservationV2(
 	if (!raw.ok) {
 		if (raw.error.code !== "not_found") return { kind: "invalid-v2", code: raw.error.code };
 		try {
-			return { kind: "legacy", review: await readReviewRecord(projectRoot, delegationId) };
+			const [review, ledger] = await Promise.all([
+				readReviewRecord(projectRoot, delegationId),
+				readDelegationLedger(projectRoot, delegationId),
+			]);
+			return {
+				kind: "legacy",
+				review,
+				zeroDelta: ledger?.after !== null
+					&& ledger?.after !== undefined
+					&& ledger.after.changed_since_before.length === 0,
+			};
 		} catch {
-			return { kind: "legacy", review: null };
+			return { kind: "legacy", review: null, zeroDelta: false };
 		}
 	}
 
@@ -448,7 +463,37 @@ export async function reconcileProjectDelegationAuthorityV2(input: {
 			},
 		};
 	}
-	if (latest.value === null) return { ok: true, state: null };
+	if (latest.value === null) {
+		// A restored legacy session mirror cannot retain REVIEWED authority merely
+		// because an old mechanical review exists (or its review is unavailable).
+		// Keep the record readable, but project it back to the existing blocking
+		// review state so only an exact bounded repair can advance development.
+		if (input.current_state.latestId !== undefined && input.current_state.status === "REVIEWED") {
+			const legacy = await readDelegationAuthorityObservationV2(input.project_root, input.current_state.latestId);
+			if (legacy.kind === "legacy" &&
+				(legacy.review === null || !legacy.zeroDelta || !isStrictSemanticAcceptedOrZeroDelta(legacy.review))) {
+				const binding = await collectCurrentDelegationBindingV2(
+					input.project_root,
+					input.current_state.latestId,
+					input.exec,
+				);
+				if (binding.status === "unavailable") {
+					return { ok: false, issue: { code: "binding_unavailable", delegationId: input.current_state.latestId } };
+				}
+				return {
+					ok: true,
+					state: {
+						latestId: input.current_state.latestId,
+						status: "PENDING_REVIEW",
+						currentDiffHash: binding.hash,
+						blockedWriteAttempts: input.current_state.blockedWriteAttempts,
+						updatedAt: input.now,
+					},
+				};
+			}
+		}
+		return { ok: true, state: null };
+	}
 	let transaction = latest.value;
 	const interruption = await recoverInterruptedDelegationV2({
 		project_root: input.project_root,
@@ -467,6 +512,18 @@ export async function reconcileProjectDelegationAuthorityV2(input: {
 	if (transaction.status === "REVIEWED" && input.defer_reviewed_freshness === true) {
 		if (authority.kind !== "v2" || authority.review === null || !authority.finalized) {
 			return { ok: false, issue: { code: "invalid_record", delegationId: transaction.delegation_id } };
+		}
+		if (!isStrictSemanticAcceptedOrZeroDelta(authority.review)) {
+			return {
+				ok: true,
+				state: {
+					latestId: transaction.delegation_id,
+					status: "PENDING_REVIEW",
+					currentDiffHash: authority.review.bound_diff_hash,
+					blockedWriteAttempts: input.current_state.blockedWriteAttempts,
+					updatedAt: input.now,
+				},
+			};
 		}
 		if (input.current_state.latestId === transaction.delegation_id) return { ok: true, state: input.current_state };
 		return {
@@ -505,8 +562,12 @@ export async function reconcileProjectDelegationAuthorityV2(input: {
 		if (authority.kind !== "v2" || authority.review === null || !authority.finalized) {
 			return { ok: false, issue: { code: "invalid_record", delegationId: transaction.delegation_id } };
 		}
-		reviewedDiffHash = authority.review.bound_diff_hash;
-		status = binding.status === "fresh" && binding.hash === reviewedDiffHash ? "REVIEWED" : "STALE";
+		if (!isStrictSemanticAcceptedOrZeroDelta(authority.review)) {
+			status = "PENDING_REVIEW";
+		} else {
+			reviewedDiffHash = authority.review.bound_diff_hash;
+			status = binding.status === "fresh" && binding.hash === reviewedDiffHash ? "REVIEWED" : "STALE";
+		}
 	} else if (!disposition.blocking) {
 		status = "REVIEWED";
 		reviewedDiffHash = binding.hash;

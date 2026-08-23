@@ -218,7 +218,8 @@ import { registerToolResultMiddleware } from "./core/tool-result-middleware-cont
 import { registerToolCallGuard } from "./core/tool-call-guard-controller.ts";
 import { registerMessageEndController } from "./core/message-end-controller.ts";
 import { registerDelegationClaimGuard } from "./core/delegation-claim-guard-controller.ts";
-
+import { solCommanderDriftStatus } from "./core/development-efficiency.ts";
+import { registerWorkerNoProgressController } from "./core/worker-no-progress-controller.ts";
 export {
 	installNativeReadV3TestHooks,
 	type NativeReadV3TestHookFacts,
@@ -279,8 +280,9 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	 * finalized; a replayed call or the recovery tool never enters this map.
 	 */
 	const pendingReceiptHandles = new Map<string, { handle: ReceiptHandle; projectRoot: string }>();
-	/** Latest known commander identity facts (updated on session_start/model_select). */
-	let currentModelFacts: { provider?: string; model?: string } = {};
+	/** Latest selected identity/reasoning facts (updated on session_start/select events). */
+	let currentModelFacts: { provider?: string; model?: string; thinking?: string } = {};
+	let workerBudgetSteerSent = false;
 	const workerRoleContext = {
 		role: process.env[WORKER_ROLE_ENV],
 		projectRoot: process.env[WORKER_PROJECT_ROOT_ENV],
@@ -735,6 +737,12 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		if (advisorySegment) line = line ? `${line} | ${advisorySegment}` : advisorySegment;
 		const outputAdvisorySegment = contextOutputAdvisoryStatusSegment(ensureOutputControlTelemetry().snapshot().advisory);
 		if (outputAdvisorySegment) line = line ? `${line} | ${outputAdvisorySegment}` : outputAdvisorySegment;
+		const driftSegment = workerRoleContext.role === "worker" ? null : solCommanderDriftStatus({
+			provider: ctx.model?.provider ?? currentModelFacts.provider,
+			model: ctx.model?.id ?? currentModelFacts.model,
+			reasoning: ctx.thinkingLevel ?? currentModelFacts.thinking ?? pi.getThinkingLevel(),
+		});
+		if (driftSegment) line = line ? `${line} | ${driftSegment}` : driftSegment;
 		syncLeaseLock();
 		const actor = detectActorRole({
 			roleEnv: workerRoleContext.role,
@@ -1010,6 +1018,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 
 	pi.on("session_start", async (event, ctx) => {
 		transientState.resetTrustedIngressAuthorities();
+		workerBudgetSteerSent = false;
 		// Restore the most recent persisted mode and workbench state from the
 		// current session's custom entries. Custom entries survive compaction
 		// and every session-replacement path (/new, /resume, /fork, /clone,
@@ -1034,7 +1043,10 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		// longer qualifies.
 		delegationSession.restore(entries);
 		writeLease = loadLeaseFromEntries(entries);
-		if (ctx.model) currentModelFacts = { provider: ctx.model.provider, model: ctx.model.id };
+		const selectedThinking = ctx.thinkingLevel ?? pi.getThinkingLevel();
+		currentModelFacts = ctx.model
+			? { provider: ctx.model.provider, model: ctx.model.id, thinking: selectedThinking }
+			: { thinking: selectedThinking };
 		if (event.reason === "new" || event.reason === "fork") {
 			resetHistoryProjection();
 			persistHistoryProjectionState();
@@ -1078,7 +1090,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		const sessionId = ctx.sessionManager.getSessionFile() ?? ctx.sessionManager.getSessionId() ?? ctx.cwd;
 		cacheTelemetry.setSessionId(sessionId);
 		cacheTelemetry.setMode(mode);
-		cacheTelemetry.setThinkingLevel(ctx.thinkingLevel ?? pi.getThinkingLevel());
+		cacheTelemetry.setThinkingLevel(selectedThinking);
 		cacheTelemetry.restoreFromEntries(entries);
 		if (event.reason === "reload") cacheTelemetry.observeReload();
 		if (event.reason === "new") cacheTelemetry.observeNewSession();
@@ -1412,13 +1424,13 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 
 	// Model/thinking/mode changes are the strongest (explicit) invalidation
 	// signals; the next message_end classifies them as such.
-	pi.on("model_select", (event) => {
+	pi.on("model_select", (event, ctx) => {
 		cacheTelemetry.observeModelChange({ provider: event.model.provider, id: event.model.id, api: event.model.api });
 		// P7: the actor identity (and with it the strict Sol DEV tool set and
 		// the write lease validity) follows the provider/model pair — update
 		// the facts, revoke a lease bound to a different commander identity,
 		// and recompute the active tool set.
-		currentModelFacts = { provider: event.model.provider, model: event.model.id };
+		currentModelFacts = { ...currentModelFacts, provider: event.model.provider, model: event.model.id };
 		if (writeLease) {
 			const now = new Date().toISOString();
 			const reason = leaseRevokeReason(writeLease, {
@@ -1432,10 +1444,13 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			}
 		}
 		applyModeTools();
+		void refreshStatus(ctx);
 	});
 
-	pi.on("thinking_level_select", (event) => {
+	pi.on("thinking_level_select", (event, ctx) => {
 		cacheTelemetry.observeThinkingChange(event.level);
+		currentModelFacts = { ...currentModelFacts, thinking: event.level };
+		void refreshStatus(ctx);
 	});
 
 	// Pi 0.84.2 calls `context` before constructing every provider request. It
@@ -1668,6 +1683,13 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		}),
 		projectRootFor,
 		refreshStatus,
+		onWorkerBudgetSteerSent: () => { workerBudgetSteerSent = true; },
+	});
+	registerWorkerNoProgressController({
+		pi,
+		workerRole: workerRoleContext.role,
+		workerTaskKind: workerRoleContext.taskKind,
+		budgetSteerSent: () => workerBudgetSteerSent,
 	});
 	registerDelegationClaimGuard({
 		pi,

@@ -201,8 +201,13 @@ every tool call  →  checkToolCall(mode, tool, input)           (layer 2)
 
 ```
 GPT-5.6 Sol parent in DEV
-  → workbench_delegate_worker(task, allowed_paths, acceptance_criteria[, plan_ref])
+  → workbench_delegate_worker(task, allowed_paths, acceptance_criteria,
+       verification[, budget_profile, extended_reason, repair_of, plan_ref])
   → trust + commander identity check
+  → canonical contract lint: preserve meaningful text layout, stable-deduplicate,
+       12 KiB soft / 64 KiB absolute; above soft requires explicit extended+reason
+  → recipe:<name> verification preflight: declared, mutation:none, no required
+       params; run once before authority work and re-check immediately pre-launch
   → optional plan_ref: strict project-contained current-byte SHA-256 binding
   → P7: real-git diff refresh + review gate (PENDING_REVIEW blocks;
        STALE blocks unless exact strict v2 FINAL/PASS authority permits a
@@ -211,6 +216,8 @@ GPT-5.6 Sol parent in DEV
        manifest.json — recorded BEFORE the worker starts)
   → short-lived pi --mode json --no-session
        --model openai-codex/gpt-5.6-luna:xhigh
+       (known-root-cause repair receives only an <=8 KiB immutable machine-fact
+       capsule; never prior prose, logs, session, scope, or contract)
   → child role matrix + hard guard: no recursion, no bash, no final gates
   → edit/write limited to parent-approved paths
 	→ execution owner is durable before baseline collection/worker launch;
@@ -226,8 +233,8 @@ GPT-5.6 Sol parent in DEV
   → P7: ledger finished on EVERY outcome (success and failure) — after.json,
        worker-summary.json, review.json placeholder; review_status
        PENDING_REVIEW (never falls back)
-  → the same delegation call automatically reviews the ACTUAL diff and
-       closes ordinary complete PASS deliveries as REVIEWED: whole-worker-diff scope check
+  → the same delegation call mechanically checks the ACTUAL diff and returns
+       a provisional scope/integrity packet: whole-worker-diff scope check
        vs allowed_paths, current diff hash bound to the reviewed hash,
        mismatch/drift warnings, bounded redacted patch with displayed-path
        coverage facts — a path counts as displayed only when it appears in
@@ -237,10 +244,15 @@ GPT-5.6 Sol parent in DEV
        prior-hash coverage is dropped — this call's rendered paths stay
        displayed), and every segment re-runs the full scope check and the
        complete diff hash (include_paths narrows only the patch)
-  → workbench_review_worker_diff is used only as the recovery path for a
-       large/incomplete, pending, stale, or conflicted review
-  → REVIEWED requires scope PASS AND complete displayed-path coverage
-       (any later diff change → STALE); FAIL stays PENDING_REVIEW and ANY
+  → every non-zero delta remains PENDING_REVIEW; after inspecting the complete
+       unchanged packet, Sol calls workbench_review_worker_diff with paired
+       semantic_decision=ACCEPT + the exact expected_bound_diff_hash
+  → strict compact facts may completely present a large regular SVG/JSON while
+       keeping generator equality NOT_VERIFIED; ordinary truncation, omission,
+       handoff clipping, first-call ACCEPT, legacy authority, or drift blocks ACCEPT
+  → REVIEWED requires scope PASS, complete presentation, and durable hash-bound
+       Sol semantic acceptance (zero delta alone is not_required); FAIL stays
+       PENDING_REVIEW and ANY
        re-review of the same current diff that is not PASS with complete
        coverage (a scope FAIL or an incomplete PASS, e.g. a legacy partial
        review record) invalidates a prior REVIEWED state fail-closed
@@ -254,9 +266,11 @@ GPT-5.6 Sol parent in DEV
 Responsibility split is fixed Sol -> Luna. Sol owns the contract,
 cross-cutting architecture, scope, review, and verdict; Luna owns routine
 source, test, and documentation implementation inside one bounded task. A
-successful delegation owns its local implementation decisions, then the same public call
-scope-checks, reviews, and closes the delivery. Explicit review/status is a
-recovery surface only. The serialized `worker-first-strict` policy name and
+successful delegation owns its local implementation decisions; the same
+public call scope-checks and presents the delivery, while Sol makes the
+separate semantic ACCEPT/repair decision inside the same agent cycle.
+Semantic review remains distinct from final recipes/Gates. The serialized
+`worker-first-strict` policy name and
 the gate check kind remain stable identifiers and describe the fixed product
 workflow. Any direct Sol edit/write requires a user-issued temporary lease;
 it is an explicit exception, not the routine path. See
@@ -306,6 +320,22 @@ The retired `low` literal is historical-read-only: frozen v1 metadata and
 already committed v1/v2 records remain readable and hash-verifiable, while
 new public contracts and committed generations reject it. Direct/internal
 runner input and child env `low` resolve to `extended`.
+
+Development-efficiency policy stays advisory and reuses existing evidence.
+The pure router recommends `standard` only for a fully evidenced, bounded,
+low-risk implementation; missing evidence and diagnosis recommend `extended`,
+while the explicit profile and compatible `extended` default remain effective.
+The worker runtime may emit one session-scoped no-progress steer after three
+consecutive implementation intervals with neither a successful write nor a
+new successful recipe run id; it never loops, terminates, or changes authority,
+and diagnosis is disabled. Safety-budget steering wins in the same interval
+and permanently suppresses the lower-priority no-progress advisory for that
+session. Model/reasoning cohorts come from existing strict
+cache telemetry, while acceptance, review bytes/full-presentation facts, and
+repair depth are aggregated offline from existing strict v2 delegation artifacts. Historical
+mechanical `REVIEWED` is not semantic acceptance, and all missing facts remain
+unknown. Sol/xhigh drift is status-only. The ABBA canary is descriptive and
+cannot grant review, Gate, release, or production authority.
 
 Phase 4 adds
 the numeric-only progress surface: `WorkerProgress` exposes the cumulative
@@ -1011,8 +1041,9 @@ streaming, retries, or provider invocation. Allowed/warned Commander events
 keep Pi's native summary; the capacity preflight only cancels an envelope
 conservatively estimated at or above model context capacity.
 
-These cap values are currently sized for the 272k Commander model and pinned
-1M worker only. `other` and arbitrary 64k/128k model windows remain
+These cap values are currently sized for Pi's advertised 272,000-token context
+window for both pinned GPT-5.6 Sol and GPT-5.6 Luna. `other` and arbitrary
+64k/128k model windows remain
 unqualified. The source change is not a cache-hit result: verify the repository
 Pi 0.84.2 dependencies (the current tree resolves them), pass declared gates,
 `/reload`, and collect fresh exact-correlated Commander and worker provider
@@ -1449,10 +1480,10 @@ run/cache/gate/delegation artifacts or execution counts.
 - Commander token optimization Slice B2 (P2 coverage-gated segmented
   actual-diff review): additive displayed-path coverage facts on review
   records (`core/diff-review.ts` displayed_paths / remaining_paths /
-  coverage_complete / review_path) — a worker path is displayed only
+  coverage_complete plus presentation fields / review_path) — a worker path is displayed only
   when it appears in an ACTUALLY rendered patch entry (a globally
-  omitted path never counts; a bounded/per-path-truncated entry counts
-  as that path's bounded evidence segment); prior displayed coverage
+  omitted path never counts; an ordinary truncated source entry is visible
+  but does not complete semantic presentation); prior displayed coverage
   merges ONLY from the persisted review.json with the SAME
   bound_diff_hash and valid worker-path membership (legacy
   schema_version-1 records stay readable and infer prior coverage ONLY
@@ -1467,11 +1498,12 @@ run/cache/gate/delegation artifacts or execution counts.
   32 KiB, max 50 include_paths, redaction and the worker scope
   unchanged);
   `workbench_review_worker_diff` is callable repeatedly on the latest
-  delegation (PENDING_REVIEW / STALE / REVIEWED) — REVIEWED requires
-  scope PASS AND complete coverage, a same-hash complete PASS rerender
-  keeps the valid REVIEWED binding, a changed hash resets coverage
-  (PASS stays blocking until fresh coverage is complete), and ANY
-  re-review that is not PASS with complete coverage (a scope FAIL or an
+  delegation (PENDING_REVIEW / STALE / REVIEWED). Every non-zero delta
+  first remains provisional/PENDING_REVIEW. REVIEWED requires scope PASS,
+  complete presentation, and a second active-Sol call with paired
+  semantic_decision=ACCEPT plus the exact previously presented bound hash;
+  a same-hash accepted replay is idempotent, a changed hash resets coverage
+  and acceptance, and ANY re-review that is not PASS with complete presentation (a scope FAIL or an
   incomplete PASS, e.g. a legacy partial review record) invalidates a
   prior same-hash REVIEWED state fail-closed via the
   pure `demoteReviewedToPending` transition
@@ -1481,8 +1513,9 @@ run/cache/gate/delegation artifacts or execution counts.
   50 paths AND ≤ 1024 UTF-8 bytes, complete paths only with an exact
   omitted count), the review-complete fact and the durable
   project-relative review.json path; details expose review_record +
-  coverage facts; no caller/prose acknowledgement API; no
-  tool/order/mode/schema change; review writes stay review.json + the
+  presentation facts; the explicit semantic API is Sol-only, hash-bound,
+  unavailable to legacy/finalized mechanical records, and never Gate
+  authority; review writes stay review.json + the
   existing state entry only. Phase 5 (Execution Efficiency
   Optimization) adds compact/withheld presentation, still internal to
   the same service: compact eligibility is automatic — a CURRENT
@@ -1510,10 +1543,10 @@ run/cache/gate/delegation artifacts or execution counts.
   the fixed bounded `withheld` marker, decided BEFORE any per-path git
   diff/open/read/digest/render, while the whole-diff scope check and
   the current complete diff-hash binding still cover the complete
-  actual worker diff; compact and withheld entries count as actually
-  rendered displayed-path segments (coverage) exactly like other
-  rendered entries, and full scope semantics,
-  include_paths-as-display-filter, coverage completion and later-change
+  actual worker diff. A complete strict compact entry can satisfy
+  presentation while remaining high risk and requiring final generator
+  verification; withheld, malformed compact, omitted and ordinary truncated
+  entries cannot. Full scope semantics, include_paths-as-display-filter and later-change
   STALE semantics are unchanged
 - P7: worker context-budget protection — pure `core/worker-budget.ts`
   (272,000-token pinned window, 80% soft handoff / 90% hard stop,
@@ -1525,7 +1558,8 @@ run/cache/gate/delegation artifacts or execution counts.
   bounded leases, delegation records, review state, and the B6 machine check
 kind. Current DEV behavior is fixed Sol -> Luna: routine writes are delegated,
 direct Sol edit/write requires the bounded temporary lease, a successful v2
-  delegation auto-reviews and closes, and B6 is presented as Development
+  delegation returns a provisional scope/integrity packet and stays pending
+  until explicit hash-bound Sol semantic acceptance, and B6 is presented as Development
   Safety. Historical records remain readable for compatibility. Generated
   project AGENTS files own the complete fixed Sol -> Luna policy; q-build and
   the implementation skill carry a mandatory pointer without duplicating the

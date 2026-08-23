@@ -8,6 +8,8 @@ import { posix } from "node:path";
 
 import {
 	collectReviewBoundDiffHash,
+	isScopeIntegrityPacketComplete,
+	isStrictSemanticAcceptedOrZeroDelta,
 	renderReviewLines,
 	reviewDelegationFromAuthority,
 	type ReviewAuthorityFacts,
@@ -43,6 +45,7 @@ import {
 } from "./delegation-transaction.ts";
 import type { ExecFn } from "./config.ts";
 import { isWorkerPathAllowedRealpath } from "../worker/path-scope.ts";
+import { COMMANDER_MODEL_ID, COMMANDER_PROVIDERS } from "./worker-policy.ts";
 
 const AFTER_FIELDS = [
 	"schema_version", "delegation_id", "recorded_at", "status", "exit_code", "pinned_identity",
@@ -103,6 +106,12 @@ export interface ReviewDelegationV2Input {
 	maxBytes?: number;
 	secrets?: readonly string[];
 	now?: string;
+	/** Explicit Sol decision.  Omission performs scope/integrity presentation only. */
+	semanticDecision?: "ACCEPT";
+	/** Exact hash shown in the prior complete provisional packet. */
+	expectedBoundDiffHash?: string;
+	/** Runtime-validated active commander identity, required for ACCEPT. */
+	reviewer?: { provider: string; model: string };
 	storage?: DelegationTransactionStorageOptions;
 }
 
@@ -210,7 +219,7 @@ function authorityFromGeneration(generation: DelegationCommittedGenerationV2): G
 		!(guardV2 ? validByteSortedPaths(after.changed_since_before) : validPaths(after.changed_since_before)) || !validPaths(after.reported_paths) ||
 		!isRecord(before.workspace_guard) || !isRecord(after.workspace_guard)) return undefined;
 	const contract = before.contract;
-	if (!isRecord(contract) || !exactFields(contract, CONTRACT_REQUIRED_FIELDS, ["repair_of", "plan_ref"]) ||
+	if (!isRecord(contract) || !exactFields(contract, CONTRACT_REQUIRED_FIELDS, ["repair_of", "plan_ref", "extended_reason"]) ||
 		contract.task_kind !== state.task_kind || contract.contract_hash !== state.contract_hash ||
 		!sameJson(contract.allowed_paths, state.allowed_paths)) return undefined;
 	const { contract_hash: suppliedHash, ...contractPayload } = contract;
@@ -343,6 +352,18 @@ function artifactFor(state: DelegationTransactionRecord, reviewedAt: string, rev
 /** Public fail-closed v2 review boundary. */
 export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promise<DelegationReviewV2Result> {
 	try {
+		const semanticDecisionSupplied = input.semanticDecision !== undefined || input.expectedBoundDiffHash !== undefined || input.reviewer !== undefined;
+		if (
+			semanticDecisionSupplied
+			&& (input.semanticDecision !== "ACCEPT"
+				|| typeof input.expectedBoundDiffHash !== "string"
+				|| !DELEGATION_TRANSACTION_HASH_RE.test(input.expectedBoundDiffHash)
+				|| input.reviewer === undefined
+				|| input.reviewer.model !== COMMANDER_MODEL_ID
+				|| !COMMANDER_PROVIDERS.includes(input.reviewer.provider))
+		) {
+			return fail("review_invalid", "semantic ACCEPT requires an exact expected bound diff hash");
+		}
 		// Required ordering: immutable committed-generation authority is always
 		// resolved before the mutable v2 review path is inspected.
 		const generation = await readDelegationCommittedGenerationV2(input.projectRoot, input.delegationId, input.storage);
@@ -363,6 +384,16 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 		if (state.status === "REVIEWED") {
 			const existing = await readDelegationReviewV2(input.projectRoot, state.delegation_id, input.storage);
 			if (!existing.ok || !existing.value.finalized) return fail("authority_invalid", "finalized review authority is unavailable", { transaction: state });
+			if (semanticDecisionSupplied) {
+				const acceptance = existing.value.review.semantic_acceptance;
+				if (existing.value.review.semantic_review !== "accepted" || acceptance === undefined) {
+					return fail("authority_invalid", "historical or zero-delta finalized scope/integrity authority cannot be upgraded to semantic acceptance; use a fresh bounded repair", { transaction: state });
+				}
+				if (acceptance.expected_bound_diff_hash !== input.expectedBoundDiffHash ||
+					acceptance.reviewer.provider !== input.reviewer!.provider || acceptance.reviewer.model !== input.reviewer!.model) {
+					return fail("review_conflict", "semantic ACCEPT replay does not match the immutable acceptance authority", { transaction: state });
+				}
+			}
 			if (authorityInfo.kind === "guard-v2") {
 				const expected = projectionFromReview(existing.value.review);
 				if (expected === undefined) return fail("authority_invalid", "new-v2 finalized review lacks a strict relevance projection", { transaction: state });
@@ -399,6 +430,9 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 				record: existing.value.review,
 				lines: renderReviewLines(existing.value.review, { maxBytes: input.maxBytes, maxLines: input.maxLines }),
 			};
+			if (semanticDecisionSupplied && existing.value.review.bound_diff_hash !== input.expectedBoundDiffHash) {
+				return fail("review_conflict", "semantic ACCEPT hash does not match the finalized scope/integrity packet", { transaction: state });
+			}
 			return {
 				ok: true,
 				review,
@@ -417,6 +451,17 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 		} else if (priorRead.error.code !== "not_found") {
 			return fail("authority_invalid", "existing provisional review is corrupt or unsafe", { transaction: state });
 		}
+		if (semanticDecisionSupplied) {
+			if (priorReview === null) {
+				return fail("review_invalid", "semantic ACCEPT requires a complete provisional scope/integrity packet from an earlier call", { transaction: state });
+			}
+			if (priorReview.bound_diff_hash !== input.expectedBoundDiffHash) {
+				return fail("review_conflict", "semantic ACCEPT hash does not match the prior scope/integrity packet", { transaction: state });
+			}
+			if (!isScopeIntegrityPacketComplete(priorReview)) {
+				return fail("review_invalid", "semantic ACCEPT requires a complete untruncated and drift-free scope/integrity packet", { transaction: state });
+			}
+		}
 		if (authorityInfo.kind === "legacy-v2") {
 			// Historical experimental v2 is strict read-only. Existing schema1
 			// evidence may be replayed, but this adapter never rewrites/upgrades it.
@@ -426,6 +471,9 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 			const currentHash = await collectReviewBoundDiffHash(input.projectRoot, input.exec);
 			if (currentHash === null || currentHash !== priorReview.bound_diff_hash) {
 				return fail("review_conflict", "legacy-v2 full diff no longer matches its read-only review", { transaction: state });
+			}
+			if (semanticDecisionSupplied) {
+				return fail("authority_invalid", "historical legacy-v2 review cannot publish new semantic acceptance; use bounded repair", { transaction: state });
 			}
 			return {
 				ok: true,
@@ -459,19 +507,45 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 		const authority = authorityWithRelevance(authorityInfo.authority, relevance.value);
 		const reviewedAt = input.now ?? new Date().toISOString();
 		if (!isCanonicalTime(reviewedAt)) return fail("review_invalid", "review time must be canonical ISO-8601", { transaction: state });
-		const review = await reviewDelegationFromAuthority({
-			projectRoot: input.projectRoot,
-			delegationId: state.delegation_id,
-			exec: input.exec,
-			includePaths: input.includePaths === undefined ? undefined : [...input.includePaths],
-			maxLines: input.maxLines,
-			maxBytes: input.maxBytes,
-			secrets: input.secrets === undefined ? undefined : [...input.secrets],
-			now: reviewedAt,
-			authority,
-			priorReview,
-			reviewPath,
-		});
+		let review: ReviewResult;
+		if (semanticDecisionSupplied) {
+			if (relevance.value.binding.projection_hash !== input.expectedBoundDiffHash || priorReview === null) {
+				return fail("review_conflict", "semantic ACCEPT no longer matches the current diff binding", { transaction: state });
+			}
+			const acceptedRecord: ReviewRecord = {
+				...priorReview,
+				reviewed_at: reviewedAt,
+				semantic_review: "accepted",
+				semantic_acceptance: {
+					decision: "ACCEPT",
+					expected_bound_diff_hash: input.expectedBoundDiffHash!,
+					reviewer: {
+						provider: input.reviewer!.provider as "openai" | "openai-codex",
+						model: COMMANDER_MODEL_ID,
+					},
+					accepted_at: reviewedAt,
+				},
+			};
+			review = {
+				ok: true,
+				record: acceptedRecord,
+				lines: renderReviewLines(acceptedRecord, { maxBytes: input.maxBytes, maxLines: input.maxLines }),
+			};
+		} else {
+			review = await reviewDelegationFromAuthority({
+				projectRoot: input.projectRoot,
+				delegationId: state.delegation_id,
+				exec: input.exec,
+				includePaths: input.includePaths === undefined ? undefined : [...input.includePaths],
+				maxLines: input.maxLines,
+				maxBytes: input.maxBytes,
+				secrets: input.secrets === undefined ? undefined : [...input.secrets],
+				now: reviewedAt,
+				authority,
+				priorReview,
+				reviewPath,
+			});
+		}
 		if (!review.ok || review.record === undefined) return fail("review_invalid", "delegation diff review failed closed", { review, transaction: state });
 		const artifact = artifactFor(state, reviewedAt, review.record);
 		const cas = {
@@ -483,7 +557,8 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 			now: reviewedAt,
 			artifact,
 		};
-		const persisted = review.record.verdict === "PASS" && review.record.coverage_complete
+		const mayFinalize = isStrictSemanticAcceptedOrZeroDelta(review.record);
+		const persisted = mayFinalize
 			? await publishDelegationReviewV2(input.projectRoot, cas, input.storage)
 			: await persistDelegationReviewProvisionalV2(input.projectRoot, cas, input.storage);
 		if (!persisted.ok) {

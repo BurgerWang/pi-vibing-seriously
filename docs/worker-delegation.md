@@ -116,9 +116,9 @@ is used when nothing changed. `Verification` reports only the command and
 its observed outcome — never logs; the task and acceptance criteria are
 never repeated. The exemption preserves path auditability in the report
 while the actual diff remains authoritative: mechanical scope enforcement,
-the automatic real-diff review in the normal delegation call (with
-`workbench_review_worker_diff` retained for incomplete/conflict recovery),
-and final verification never depend on the prompt's format rules. These are
+the provisional real-diff scope/integrity packet returned by the normal
+delegation call, Sol's separate hash-bound semantic acceptance, and final
+verification never depend on the prompt's format rules. These are
 worker-side format rules; the mechanical report caps (≤ 8 parsed items per
 section, ≤ 500 characters per item, byte-bounded rendering) still apply on
 top.
@@ -128,8 +128,13 @@ top.
 A partial or defective delivery is repaired through a fresh bounded
 `--no-session` Luna worker because worker sessions are intentionally not
 resumed. The optional `repair_of` field records provenance for that repair;
-it never adds a second governance step or expands scope. Mechanical scope
-checks and risk-proportionate final verification remain authoritative.
+it never adds a second governance step or expands scope. Immediately before
+the fresh process starts, the runtime derives an at-most-8-KiB machine-fact
+capsule from the strict referenced authority (status, hashes, bounded changed
+paths, coded failure/run facts, and optional plan identity). It never copies
+worker prose, logs, error text, session state, or prior scope. Mechanical
+scope checks, Sol semantic review, and risk-proportionate final verification
+remain authoritative.
 
 ### Repair provenance pointer (`repair_of`, Phase 4A)
 
@@ -142,8 +147,9 @@ provenance only, never a resume:
   ordinary delegations; any malformed value fails closed with a bounded
   error before any v2 transaction is prepared or any worker is launched.
 - **Use:** only after Sol has fixed the known root cause and decided the
-  scope. The parent task itself must carry the bounded root-cause/failure
-  evidence; the pointer adds none.
+  scope. The pointer authorizes only extraction of the bounded immutable
+  repair capsule described above; the new task remains the sole source of
+  requirements, scope, and acceptance criteria.
 - **Strict v2-first authority:** the runtime first strict-reads the prior
   delegation's committed v2 authority. Terminal v2 states `FAILED`,
   `FINISHED`, or `REVIEWED` are referenceable. There is one narrow recovery
@@ -159,9 +165,10 @@ provenance only, never a resume:
   accepts a finished v1 manifest with its `after` record. This check finishes
   BEFORE any new v2 transaction is prepared or any worker is launched.
 - **What is not inherited:** the fresh worker inherits no prior report
-  (`worker-report.md`), no prior summary, no prior session, no prior
-  allowed paths/scope, and no prior contract fields. `repair_of` never
-  expands path/scope/authority and never resumes the prior worker.
+  (`worker-report.md`), summary prose, transcript, log, error message,
+  session, prior allowed paths/scope, or prior contract. It receives only
+  the strict machine-fact capsule, which never expands path/scope/authority
+  and never resumes the prior worker.
 - **Unknown root causes** still follow bounded diagnosis → Sol
   architecture/scope decision → bounded implementation; `repair_of` is
   never a substitute for that path.
@@ -393,9 +400,11 @@ Implementation review authority is written only to
 the immutable committed generation is validated before the mutable review
 artifact is read. A segmented provisional PASS, incomplete coverage, or any
 FAIL may persist bounded evidence but never grants authority and never moves
-the transaction to `REVIEWED`. Only a complete `PASS` with complete path
-coverage atomically publishes the final review and the `REVIEWED` transaction
-state. For new tagged v2, the immutable review binds a schema-v2
+the transaction to `REVIEWED`. Every non-zero delta additionally requires
+explicit Sol semantic acceptance of a previously presented complete packet;
+only complete scope `PASS`, complete presentation, and the exact accepted
+hash atomically publish the final review and `REVIEWED` transaction state.
+For new tagged v2, the immutable review binds a schema-v2
 `changeset-relevance-v2` projection over the closed relevance set: W is the
 attributed worker delta, D is the explicit dependency closure (empty by
 default), and S is the relevant control set (fixed workbench configuration,
@@ -419,14 +428,12 @@ PENDING_REVIEW → REVIEWED → (versioned binding conflicts) → STALE
 ```
 
 - **Default implementation delivery:** after a successful worker result, the
-  same `workbench_delegate_worker` call reads the current workspace guard,
-  automatically continues the bounded segmented review below over every
-  attributed worker path, and publishes a complete PASS as `REVIEWED` in the
-  same call. Ordinary development therefore continues without a manual
-  `review` or `status` call. Explicit review recovery is required only for a
-  review conflict, persistence failure, no-progress condition, or the fixed
-  32-segment safety cap.
-- **`workbench_review_worker_diff`** (DEV-only recovery path): reads the current
+  same `workbench_delegate_worker` call reads the current workspace guard and
+  persists exactly one provisional, globally bounded scope/integrity packet
+  (5 KiB / 56 lines in the handoff). Every non-zero delta stays
+  `PENDING_REVIEW`; the packet is implementation evidence, not semantic or
+  Gate authority.
+- **`workbench_review_worker_diff`** (DEV-only review path): reads the current
   workspace guard and strict v2 authority, scope-checks EVERY worker path
   against the parent-approved `allowed_paths` with a realpath/symlink-safe check
   (`include_paths` narrows only the patch output and can never hide a
@@ -439,14 +446,17 @@ PENDING_REVIEW → REVIEWED → (versioned binding conflicts) → STALE
   plus a segmented `include_paths` review instruction when truncated or
   omitted — scope checks always cover the complete worker delta, while the
   bound hash covers W/D/S relevance for new tagged v2 or the complete diff
-  for legacy authority). Verdict `PASS` marks the delegation REVIEWED;
-  `FAIL` (any out-of-scope path) keeps it PENDING_REVIEW. Large or incomplete
-  coverage also stays pending and is the reason to call this recovery tool.
-  The v2 review artifact binds
+  for legacy authority). Calls without semantic fields persist provisional
+  presentation segments. After Sol has inspected a complete unchanged
+  packet, a later call must pair `semantic_decision=ACCEPT` with its exact
+  `expected_bound_diff_hash`; first-call, non-Sol, legacy, incomplete,
+  truncated ordinary-source, drifted, or mismatched acceptance fails closed.
+  `FAIL` (any out-of-scope path) keeps the transaction PENDING_REVIEW. The v2 review artifact binds
   the versioned current binding. The session mirror is prospective:
-  `REVIEWED` unlocks only after its append succeeds. An append failure never
-  unlocks memory or the compact mirror and is returned as a persistence
-  failure; retry may replay the immutable final artifact. A failed blocking
+  `REVIEWED` unlocks in the current call only after its append succeeds. An
+  append failure is returned as a persistence failure; a later tool call first
+  reconciles the strict durable FINAL artifact and may safely rebuild the
+  session mirror if freshness still holds. A failed blocking
   `STALE` append remains a hard in-memory/compact block and is never reported
   as durably persisted.
 - **`workbench_delegation_status`** (and `/q-delegation-status`): actor,
@@ -902,6 +912,51 @@ the independent timeout still bounds wall-clock execution.
   remain strictly readable and hash-verifiable, but `low` is rejected for
   every new public contract and committed artifact. Direct/internal runner
   input and child env `low` resolve defensively to `extended`.
+
+### Development-efficiency observation and advisory routing (unreleased)
+
+No live Luna development-efficiency baseline exists yet. Availability smoke,
+identity checks, and unit/integration tests do not establish throughput,
+first semantic-acceptance yield, repair depth, or defect-rate improvement.
+Those claims remain **NOT_MEASURED** until the strict ABBA canary below runs.
+
+`core/development-efficiency.ts` exposes a pure advisory decision for
+`standard` versus `extended`. It recommends `standard` only when evidence is
+complete for a low-risk, non-cross-cutting implementation with a known root
+cause, one to four allowed paths, at least one acceptance criterion, and at
+least one verification reference. Missing evidence or diagnosis recommends
+`extended`. This recommendation is not wired as authority: an explicit
+profile remains effective, and omission retains the compatible `extended`
+default.
+
+The worker role also has one session-scoped no-progress advisory. After three
+consecutive assistant intervals with neither a successful `edit`/`write` nor
+a new successful recipe run id, it sends one hidden steer to make a concrete
+bounded change, collect new evidence, or hand off the blocker. It never loops,
+never terminates the worker, and is disabled for diagnosis until a separate
+threshold is measured. Context/spend safety steering is registered first: a
+budget steer in the same interval wins, and once any budget steer is sent the
+lower-priority no-progress advisory stays suppressed for that session.
+
+Existing schema-1.3 cache telemetry reports assistant-message provider/model
+as effective and selected `thinkingLevel` as requested reasoning, separately
+for Commander and worker actor cohorts. Requested provider/model and
+provider-confirmed effective reasoning were not persisted by that schema and
+therefore remain `unknown`. Sol/xhigh drift is visible in the status footer but
+does not grant or revoke authority. Delegation quality metrics are read
+offline from strict existing v2 transaction/review/usage authority; only the
+new hash-bound semantic `ACCEPT` marker counts as accepted. Historical
+mechanical `REVIEWED`, pending review, missing repair links, and missing facts
+are never guessed.
+
+Run `npm run worker:canary -- <manifest.json> --json` for the strict ABBA
+report. It requires 12 complete `A,B,B,A` blocks (24 stratified tasks per arm)
+with no incomplete/invalid block and complete identity/KPI facts. Targets are
+median wall time at least 20%
+better, first semantic acceptance at least 10 percentage points better,
+quality not lower, p90 wall time no more than 10% worse, and zero critical,
+scope, or authority defects. The report is always `DESCRIPTIVE_ONLY` and
+cannot grant review, Gate, release, or production authority.
 - **Child env contract (wired):** the runner passes the resolved profile to
   the worker child through the fixed `WORKBENCH_WORKER_SPEND_PROFILE` env
   variable; the worker-role lifecycle strictly validates it and falls back
@@ -914,7 +969,7 @@ the independent timeout still bounds wall-clock execution.
   v2 generation persisted in worker-summary.json (never recomputed from runner
   internals or worker prose).
 
-## Review patch bounds (P7)
+## Review presentation and semantic acceptance (P7)
 
 `workbench_review_worker_diff` renders a redacted patch bounded by default
 at 400 lines / 32 KiB, enforced GLOBALLY over the rendered patch content
@@ -929,6 +984,29 @@ bytes, truncated/omitted), and when patch content is truncated or omitted
 the review returns an explicit segmented-review instruction: drive
 path-by-path `include_paths` re-reviews (max 50 paths per call).
 
+That scope/integrity result is provisional. For every non-zero actual delta,
+the first call only persists the current bound packet and leaves the
+delegation `PENDING_REVIEW`; a mechanical scope `PASS` is not a code-quality
+decision. After inspecting the complete current packet, Sol calls the same
+tool again with the pair `semantic_decision: "ACCEPT"` and
+`expected_bound_diff_hash: <the exact 64-character packet hash>`. Supplying
+only one field, using another model identity, accepting on the first call,
+accepting a legacy/finalized mechanical record, or accepting after drift all
+fail closed. A successful acceptance persists the reviewer provider/model,
+decision, exact hash, and timestamp inside the immutable review authority.
+`REPAIR` is expressed by a fresh `repair_of` delegation, not by a review
+verdict. A zero-delta delivery alone is `semantic_review: not_required`.
+
+Ordinary source entries must be fully rendered across one or more segments.
+For sufficiently large current regular `.svg` and `.json` files, a strict
+bounded compact packet (status, size, digest binding, head/tail previews and
+explicit `generator_equality: NOT_VERIFIED`) may satisfy presentation
+completeness without embedding the full generated file. This is always
+high-risk semantic review and still requires final generator/recipe
+verification. A truncated ordinary source entry, omitted path, handoff
+clipping, corrupt record, or incomplete compact packet can never be accepted.
+Semantic acceptance is review authority only; it never grants a Gate PASS.
+
 ## Task contract
 
 ```json
@@ -940,8 +1018,9 @@ path-by-path `include_paths` re-reviews (max 50 paths per call).
     "Invalid input returns a structured error",
     "Existing valid input remains compatible"
   ],
-  "verification": ["Run the unit-test recipe"],
+  "verification": ["recipe:unit-test"],
   "budget_profile": "extended",
+  "extended_reason": "The approved cross-module slice needs the larger bounded spend profile.",
   "repair_of": "20260101-120000-abcd",
   "plan_ref": {
     "schema": "workbench-plan-ref-v1",
@@ -975,17 +1054,34 @@ for a clearly small bounded slice. The worker task text carries the resolved pro
 informational line; enforcement is the runner's fixed child-env contract,
 never task prose.
 
+New contracts are canonical-linted before any transaction is created. Task
+and criterion text is trimmed but its internal code/YAML/newline layout is
+preserved; comparison-only whitespace normalization removes duplicates.
+The canonical contract has a 12-KiB soft limit and 64-KiB absolute limit. A
+contract above the soft limit is accepted only with an explicit
+`budget_profile: "extended"` and a bounded one-line `extended_reason`; that
+reason is hash-bound into v2 authority and never expands scope or spend.
+Historical committed contracts without the additive field remain readable.
+
+Every new `verification` item must be a machine-readable
+`recipe:<declared-name>` reference. Before governance reconciliation or a new
+transaction, and again immediately before the worker launch, the runtime
+requires the named recipe to exist, declare `mutation: none`, and require no
+unrepresented parameters. Relevant `recipes.yaml` parse/schema problems fail
+closed. An empty list stays compatible and does not require a recipe catalog;
+the preflight validates declarations only and does not execute a recipe.
+
 `repair_of` is optional and is the strict prior delegation-id provenance
 pointer for a known-root-cause repair (see Repair provenance pointer
 above): exactly the 20-character `^\d{8}-\d{6}-[A-Za-z0-9]{4}$` delegation
 id shape, used only after Sol has fixed the known root cause and decided
-the scope, with the bounded failure evidence carried in the task itself;
-the runtime strict-reads v2 first and accepts only a referenced terminal
+the scope. The runtime strict-reads v2 first and accepts only a referenced terminal
 `FAILED`, `FINISHED`, or `REVIEWED` v2 authority. Only v2 `not_found` permits
 the finished-v1 read-only fallback; corrupt, pending, or unknown v2 authority
 never falls back. This check precedes any new v2 transaction or child launch,
-and the fresh worker inherits no prior report/session/scope/contract — the
-pointer adds no path/scope/authority. Ordinary delegations omit it entirely;
+and the fresh worker receives only the bounded machine-fact repair capsule,
+not prior prose/session/scope/contract — the pointer adds no
+path/scope/authority. Ordinary delegations omit it entirely;
 unknown root causes still use bounded diagnosis, then a Sol decision.
 
 `plan_ref` is optional traceability only (see Plan traceability reference
@@ -1056,8 +1152,9 @@ untrusted repositories or unattended automation.
    affected files, and concrete risk.
 2. Give Luna one bounded contract for the coherent source, test, and
    documentation slice. Use focused recipes while the candidate is changing.
-3. A normal successful implementation auto-reviews and closes; call explicit
-   review/status only when the result says recovery is required.
+3. Inspect the provisional scope/integrity packet returned with every non-zero
+   implementation. Complete any bounded presentation segments, then explicitly
+   ACCEPT the unchanged packet hash or start a bounded `repair_of` delegation.
 4. Use the temporary Sol lease only for an explicit user-authorized exception;
    never turn it into the routine implementation path.
 5. Once the candidate is stable, switch to VERIFY and run one final recipe or

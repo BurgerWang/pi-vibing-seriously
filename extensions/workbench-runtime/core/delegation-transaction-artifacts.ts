@@ -73,6 +73,17 @@ import {
 	workerSpendReasons,
 	type WorkerSpendProfile,
 } from "./worker-spend.ts";
+import {
+	canonicalWorkerContractBytes,
+	normalizeWorkerContractReason,
+	normalizeWorkerContractText,
+	parseWorkerVerificationRecipeReference,
+	stableUniqueStrings,
+	workerContractComparisonKey,
+	WORKER_CONTRACT_ABSOLUTE_MAX_BYTES,
+	WORKER_CONTRACT_EXTENDED_REASON_MAX_CHARS,
+	WORKER_CONTRACT_SOFT_MAX_BYTES,
+} from "./worker-contract.ts";
 
 const ACCEPTANCE_ITEM_MAX_CHARS = 1_000;
 const VERIFICATION_ITEM_MAX_CHARS = 500;
@@ -96,7 +107,9 @@ const NORMALIZABLE_TASK_CONTRACT_REQUIRED_FIELDS = [
 	"allowed_paths",
 	"acceptance_criteria",
 ] as const;
-const NORMALIZABLE_TASK_CONTRACT_OPTIONAL_FIELDS = ["verification", "timeout_seconds", "budget_profile", "repair_of", "plan_ref"] as const;
+const NORMALIZABLE_TASK_CONTRACT_OPTIONAL_FIELDS = [
+	"verification", "timeout_seconds", "budget_profile", "repair_of", "plan_ref", "extended_reason",
+] as const;
 const DELEGATION_DELTA_MISSING_STATUS_V2 = "__MISSING_STATUS_V2__";
 const DELEGATION_DELTA_MISSING_DIGEST_V2 = "__MISSING_DIGEST_V2__";
 
@@ -110,6 +123,8 @@ export interface DelegationBoundedTaskContractPayloadV2 {
 	budget_profile: WorkerSpendProfile;
 	repair_of?: string;
 	plan_ref?: PlanReferenceV1;
+	/** Public justification required when a new canonical contract exceeds the 12 KiB soft limit. */
+	extended_reason?: string;
 }
 
 export interface DelegationBoundedTaskContractBindingV2 extends DelegationBoundedTaskContractPayloadV2 {
@@ -214,11 +229,12 @@ function cloneContractPayload(payload: DelegationBoundedTaskContractPayloadV2): 
 		budget_profile: payload.budget_profile,
 		...(payload.repair_of === undefined ? {} : { repair_of: payload.repair_of }),
 		...(payload.plan_ref === undefined ? {} : { plan_ref: structuredClone(payload.plan_ref) }),
+		...(payload.extended_reason === undefined ? {} : { extended_reason: payload.extended_reason }),
 	};
 }
 
 function parseContractPayload(raw: unknown): DelegationArtifactResult<DelegationBoundedTaskContractPayloadV2> {
-	if (!isRecord(raw) || !exactFields(raw, TASK_CONTRACT_FIELDS, ["repair_of", "plan_ref"])) {
+	if (!isRecord(raw) || !exactFields(raw, TASK_CONTRACT_FIELDS, ["repair_of", "plan_ref", "extended_reason"])) {
 		return fail("invalid_contract", "delegation v2 task contract must have the exact normalized field set");
 	}
 	if (raw.task_kind !== "implementation" && raw.task_kind !== "diagnosis") {
@@ -249,6 +265,17 @@ function parseContractPayload(raw: unknown): DelegationArtifactResult<Delegation
 	}
 	if (Object.prototype.hasOwnProperty.call(raw, "plan_ref") && parsePlanReference(raw.plan_ref) === undefined) {
 		return fail("invalid_contract", "delegation v2 plan reference is invalid");
+	}
+	if (Object.prototype.hasOwnProperty.call(raw, "extended_reason") &&
+		(typeof raw.extended_reason !== "string" || raw.extended_reason.length === 0 ||
+			raw.extended_reason.length > WORKER_CONTRACT_EXTENDED_REASON_MAX_CHARS ||
+			raw.extended_reason !== normalizeWorkerContractReason(raw.extended_reason) || raw.extended_reason.includes("\0") ||
+			raw.budget_profile !== "extended")) {
+		return fail("invalid_contract", "delegation v2 extended reason is not normalized and bounded");
+	}
+	const contractBytes = canonicalWorkerContractBytes(raw);
+	if (contractBytes === undefined || contractBytes > WORKER_CONTRACT_ABSOLUTE_MAX_BYTES) {
+		return fail("invalid_contract", `delegation v2 task contract exceeds the fixed ${WORKER_CONTRACT_ABSOLUTE_MAX_BYTES}-byte bound`);
 	}
 	const value = raw as unknown as DelegationBoundedTaskContractPayloadV2;
 	return { ok: true, value: cloneContractPayload({
@@ -294,7 +321,7 @@ export function normalizeDelegationBoundedTaskContractV2(
 		return fail("invalid_contract", "delegation v2 public task kind must already be resolved");
 	}
 	if (typeof raw.task !== "string") return fail("invalid_contract", "delegation v2 public task must be a string");
-	const task = raw.task.trim();
+	const task = normalizeWorkerContractText(raw.task);
 	if (task.length === 0 || task.length > MAX_TASK_CHARS || task.includes("\0")) {
 		return fail("invalid_contract", "delegation v2 public task is empty, invalid, or exceeds its bound");
 	}
@@ -302,18 +329,17 @@ export function normalizeDelegationBoundedTaskContractV2(
 		!raw.allowed_paths.every((item) => typeof item === "string")) {
 		return fail("invalid_contract", "delegation v2 public allowed paths are invalid or exceed their bound");
 	}
-	const allowed_paths = (raw.allowed_paths as string[]).map((item) => item.trim());
+	const allowed_paths = [...new Set((raw.allowed_paths as string[]).map((item) => item.trim()))];
 	if (!allowed_paths.every(isAllowedPath)) {
 		return fail("invalid_contract", "delegation v2 public allowed paths contain an empty or invalid rule");
 	}
 	allowed_paths.sort();
-	if (!isSortedUniqueStrings(allowed_paths)) {
-		return fail("invalid_contract", "delegation v2 public allowed paths collide after normalization");
-	}
 	const normalizeItems = (value: unknown, maxItems: number, maxChars: number): string[] | undefined => {
 		if (!Array.isArray(value) || value.length > maxItems || !value.every((item) => typeof item === "string")) return undefined;
-		const items = (value as string[]).map((item) => item.trim());
-		return items.every((item) => item.length > 0 && item.length <= maxChars && !item.includes("\0")) ? items : undefined;
+		const items = (value as string[]).map(normalizeWorkerContractText);
+		return items.every((item) => item.length > 0 && item.length <= maxChars && !item.includes("\0"))
+			? stableUniqueStrings(items, workerContractComparisonKey)
+			: undefined;
 	};
 	const acceptance_criteria = normalizeItems(raw.acceptance_criteria, MAX_ACCEPTANCE_CRITERIA, ACCEPTANCE_ITEM_MAX_CHARS);
 	const verification = raw.verification === undefined
@@ -321,6 +347,9 @@ export function normalizeDelegationBoundedTaskContractV2(
 		: normalizeItems(raw.verification, MAX_VERIFICATION_STEPS, VERIFICATION_ITEM_MAX_CHARS);
 	if (acceptance_criteria === undefined || acceptance_criteria.length === 0 || verification === undefined) {
 		return fail("invalid_contract", "delegation v2 public criteria or verification are invalid or exceed their bounds");
+	}
+	if (!verification.every((reference) => parseWorkerVerificationRecipeReference(reference) !== undefined)) {
+		return fail("invalid_contract", "delegation v2 public verification must contain only recipe:<declared-name> references");
 	}
 	const timeout_seconds = raw.timeout_seconds === undefined ? 1_800 : raw.timeout_seconds;
 	if (!Number.isSafeInteger(timeout_seconds) || (timeout_seconds as number) < 60 || (timeout_seconds as number) > 3_600) {
@@ -337,7 +366,20 @@ export function normalizeDelegationBoundedTaskContractV2(
 	if (raw.plan_ref !== undefined && plan_ref === undefined) {
 		return fail("invalid_contract", "delegation v2 public plan reference is invalid");
 	}
-	return bindDelegationBoundedTaskContractV2({
+	const extended_reason = raw.extended_reason === undefined
+		? undefined
+		: typeof raw.extended_reason === "string"
+			? normalizeWorkerContractReason(raw.extended_reason)
+			: undefined;
+	if (raw.extended_reason !== undefined &&
+		(extended_reason === undefined || extended_reason.length === 0 ||
+			extended_reason.length > WORKER_CONTRACT_EXTENDED_REASON_MAX_CHARS || extended_reason.includes("\0"))) {
+		return fail("invalid_contract", "delegation v2 public extended reason is invalid or exceeds its bound");
+	}
+	if (extended_reason !== undefined && raw.budget_profile !== "extended") {
+		return fail("invalid_contract", "delegation v2 extended_reason requires explicit budget_profile extended");
+	}
+	const payload = {
 		task_kind: raw.task_kind,
 		task,
 		allowed_paths,
@@ -347,7 +389,20 @@ export function normalizeDelegationBoundedTaskContractV2(
 		budget_profile: budget_profile as WorkerSpendProfile,
 		...(raw.repair_of === undefined ? {} : { repair_of: raw.repair_of }),
 		...(plan_ref === undefined ? {} : { plan_ref }),
-	});
+		...(extended_reason === undefined ? {} : { extended_reason }),
+	};
+	const contractBytes = canonicalWorkerContractBytes(payload);
+	if (contractBytes === undefined || contractBytes > WORKER_CONTRACT_ABSOLUTE_MAX_BYTES) {
+		return fail("invalid_contract", `delegation v2 public task contract exceeds the fixed ${WORKER_CONTRACT_ABSOLUTE_MAX_BYTES}-byte bound`);
+	}
+	if (contractBytes > WORKER_CONTRACT_SOFT_MAX_BYTES &&
+		(raw.budget_profile !== "extended" || extended_reason === undefined)) {
+		return fail(
+			"invalid_contract",
+			`delegation v2 public task contract exceeds the ${WORKER_CONTRACT_SOFT_MAX_BYTES}-byte soft limit; explicit extended budget and reason are required`,
+		);
+	}
+	return bindDelegationBoundedTaskContractV2(payload);
 }
 
 function parseContractBinding(raw: unknown): DelegationArtifactResult<DelegationBoundedTaskContractBindingV2> {

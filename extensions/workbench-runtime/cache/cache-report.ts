@@ -118,6 +118,8 @@ export interface CacheReport {
 	schema13Rows: number;
 	/** Null means schema-1.3 facts were not observed; it never means zero. */
 	observability: CacheObservabilityReport | null;
+	/** Model/reasoning evidence already present in strict telemetry rows. */
+	modelRoleObservability?: ModelRoleObservabilityReport;
 	byMode: Record<string, number>;
 	byModel: Record<string, number>;
 	totals: {
@@ -159,6 +161,25 @@ export interface CacheReport {
 	truncatedRecords?: number;
 }
 
+export interface ModelReasoningCohortObservation {
+	requestCount: number;
+	/** The selected/requested identity is not persisted in schema 1.3. */
+	requestedProviderModels: null;
+	/** Assistant-message provider/model, grouped without inferring request identity. */
+	effectiveProviderModels: Record<string, number> | null;
+	/** Pi's selected effort at message_end; this is a request fact. */
+	requestedReasoningLevels: Record<string, number> | null;
+	/** No provider-confirmed effective reasoning fact exists in schema 1.3. */
+	effectiveReasoningLevels: null;
+}
+
+export interface ModelRoleObservabilityReport {
+	sourceSchema: "1.3";
+	commander: ModelReasoningCohortObservation;
+	worker: ModelReasoningCohortObservation;
+	unknownRole: ModelReasoningCohortObservation;
+}
+
 export interface CacheReportQuality {
 	skippedRecords?: number;
 	sourceIncomplete?: boolean;
@@ -178,6 +199,28 @@ function countBy<T>(items: readonly T[], key: (item: T) => string | null | undef
 function addSafe(left: number, right: number): number {
 	const sum = left + right;
 	return Number.isSafeInteger(sum) && sum >= 0 ? sum : Number.MAX_SAFE_INTEGER;
+}
+
+function modelReasoningCohort(rows: readonly TelemetryRecord[]): ModelReasoningCohortObservation {
+	const providerModels = countBy(rows, (row) => `${row.provider}/${row.model}`);
+	const reasoning = countBy(rows, (row) => row.thinkingLevel);
+	return {
+		requestCount: rows.length,
+		requestedProviderModels: null,
+		effectiveProviderModels: rows.length > 0 ? providerModels : null,
+		requestedReasoningLevels: Object.keys(reasoning).length > 0 ? reasoning : null,
+		effectiveReasoningLevels: null,
+	};
+}
+
+function buildModelRoleObservability(records: readonly TelemetryRecord[]): ModelRoleObservabilityReport {
+	const rows = records.filter((record) => record.schemaVersion === "1.3");
+	return {
+		sourceSchema: "1.3",
+		commander: modelReasoningCohort(rows.filter((row) => row.actorRoleCode === 1)),
+		worker: modelReasoningCohort(rows.filter((row) => row.actorRoleCode === 2)),
+		unknownRole: modelReasoningCohort(rows.filter((row) => row.actorRoleCode !== 1 && row.actorRoleCode !== 2)),
+	};
 }
 
 const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
@@ -458,6 +501,7 @@ export function buildCacheReport(
 		requestCount: validRecords.length,
 		schema13Rows: observability.schema13Rows,
 		observability: observability.observability,
+		modelRoleObservability: buildModelRoleObservability(validRecords),
 		byMode: countBy(validRecords, (r) => r.workbenchMode),
 		byModel: countBy(validRecords, (r) => `${r.provider}/${r.model}`),
 		totals,
@@ -485,6 +529,12 @@ export function buildCacheReport(
 function pct(ratio: number | null): string {
 	if (ratio === null) return "N/A";
 	return `${Math.round(ratio * 100)}%`;
+}
+
+function renderCountMap(value: Record<string, number> | null): string {
+	if (value === null) return "unknown";
+	return Object.entries(value).sort(([left], [right]) => left.localeCompare(right))
+		.map(([key, count]) => `${key}=${count}`).join(",") || "unknown";
 }
 
 function usd(value: number | null): string {
@@ -565,6 +615,15 @@ export function renderCacheReport(report: CacheReport): string[] {
 	];
 	const observed = report.observability;
 	lines.push(`schema 1.3      : rows=${report.schema13Rows} observed=${observed === null ? 0 : 1}`);
+	const modelRoles = report.modelRoleObservability ?? buildModelRoleObservability([]);
+	for (const [role, cohort] of [
+		["commander", modelRoles.commander],
+		["worker", modelRoles.worker],
+	] as const) {
+		lines.push(
+			`${role} identity : requests=${cohort.requestCount} requested-model=unknown effective=${renderCountMap(cohort.effectiveProviderModels)} requested-reasoning=${renderCountMap(cohort.requestedReasoningLevels)} effective-reasoning=unknown`,
+		);
+	}
 	if (observed !== null) {
 		lines.push(
 			`request correlation: unwired=${observed.correlationCounts.unwired} exact=${observed.correlationCounts.exact} multiple-or-stale=${observed.correlationCounts.multipleOrStale} missing=${observed.correlationCounts.missing}`,

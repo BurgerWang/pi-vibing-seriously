@@ -64,6 +64,7 @@ import {
 	WORKER_SPEND_PROFILE_ENV,
 	WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE,
 } from "../extensions/workbench-runtime/core/worker-spend.ts";
+import { WORKER_NO_PROGRESS_STEER_MESSAGE_TYPE } from "../extensions/workbench-runtime/core/development-efficiency.ts";
 import { spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
 
 interface StubAPI {
@@ -654,6 +655,10 @@ async function fireMessageEnd(stub: StubAPI, event: never, ctx: never): Promise<
 	for (const handler of handlers) await handler(event, ctx);
 }
 
+function messagesOfType(stub: StubAPI, customType: string): StubAPI["messages"] {
+	return stub.messages.filter((message) => message.customType === customType);
+}
+
 test("worker role sends exactly one hidden soft-budget steer at/above 80%", async () => {
 	const stub = makeStub();
 	withWorkerRole(() => workbenchRuntime(stub));
@@ -664,14 +669,14 @@ test("worker role sends exactly one hidden soft-budget steer at/above 80%", asyn
 
 	// Below the soft threshold: no steer.
 	await handler(messageEndEvent(WORKER_SOFT_BUDGET - 1), ctx);
-	assert.equal(stub.messages.length, 0);
+	assert.equal(messagesOfType(stub, WORKER_SOFT_STEER_MESSAGE_TYPE).length, 0);
 
 	// At the soft threshold (80%): exactly one hidden CONTEXT steer. The
 	// independent cumulative spend state (435,199) stays below the Luna
 	// default extended soft total (10,880,000), so no spend steer fires yet.
 	await handler(messageEndEvent(WORKER_SOFT_BUDGET), ctx);
-	assert.equal(stub.messages.length, 1);
-	const steer = stub.messages[0]!;
+	assert.equal(messagesOfType(stub, WORKER_SOFT_STEER_MESSAGE_TYPE).length, 1);
+	const steer = messagesOfType(stub, WORKER_SOFT_STEER_MESSAGE_TYPE)[0]!;
 	assert.equal(steer.customType, WORKER_SOFT_STEER_MESSAGE_TYPE);
 	assert.equal(steer.display, false, "steer is hidden from the TUI");
 	assert.deepEqual(steer.options, { deliverAs: "steer" }, "delivered in the active tool loop, not deferred to a future user turn");
@@ -685,9 +690,10 @@ test("worker role sends exactly one hidden soft-budget steer at/above 80%", asyn
 	// Fifty-two 200,000-token messages keep it at 10,835,199; the next reaches
 	// 11,035,199.
 	for (let i = 0; i < 52; i++) await handler(messageEndEvent(200_000), ctx);
-	assert.equal(stub.messages.length, 1, "cumulative spend (10,835,199) still below the extended soft total");
+	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 0, "cumulative spend (10,835,199) still below the extended soft total");
 	await handler(messageEndEvent(200_000), ctx);
-	assert.equal(stub.messages.length, 2, "one context steer + one independent spend steer");
+	assert.equal(messagesOfType(stub, WORKER_SOFT_STEER_MESSAGE_TYPE).length, 1);
+	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 1);
 	const contextSteers = stub.messages.filter((m) => m.customType === WORKER_SOFT_STEER_MESSAGE_TYPE);
 	const spendSteers = stub.messages.filter((m) => m.customType === WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE);
 	assert.equal(contextSteers.length, 1, "the context steer is one-shot");
@@ -701,7 +707,9 @@ test("worker role sends exactly one hidden soft-budget steer at/above 80%", asyn
 
 	// One-shot again: another soft/hard message re-sends neither steer.
 	await handler(messageEndEvent(200_000), ctx);
-	assert.equal(stub.messages.length, 2, "both steers stay one-shot");
+	assert.equal(messagesOfType(stub, WORKER_SOFT_STEER_MESSAGE_TYPE).length, 1, "the context steer stays one-shot");
+	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 1, "the spend steer stays one-shot");
+	assert.equal(messagesOfType(stub, WORKER_NO_PROGRESS_STEER_MESSAGE_TYPE).length, 0, "an earlier safety-budget steer suppresses no-progress advice");
 });
 
 test("commander session never receives the worker soft-budget steer", async () => {
@@ -728,13 +736,13 @@ test("worker role sends exactly one hidden cumulative spend steer at the standar
 	// 31 x 170,000 = 5,270,000: below the standard soft total (5,440,000) and
 	// below the per-message 80% context threshold (no context steer either).
 	for (let i = 0; i < 31; i++) await handler(messageEndEvent(170_000), ctx);
-	assert.equal(stub.messages.length, 0);
+	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 0);
 
 	// The 32nd message reaches exactly 5,440,000: the spend band first becomes
 	// soft and exactly one hidden spend steer fires (total_tokens dimension).
 	await handler(messageEndEvent(170_000), ctx);
-	assert.equal(stub.messages.length, 1);
-	const steer = stub.messages[0]!;
+	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 1);
+	const steer = messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE)[0]!;
 	assert.equal(steer.customType, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE);
 	assert.equal(steer.display, false, "spend steer is hidden from the TUI");
 	assert.deepEqual(steer.options, { deliverAs: "steer" }, "delivered in the active tool loop, not deferred to a future user turn");
@@ -747,7 +755,7 @@ test("worker role sends exactly one hidden cumulative spend steer at the standar
 	// One-shot: further soft-band messages never re-send the steer.
 	await handler(messageEndEvent(170_000), ctx);
 	await handler(messageEndEvent(170_000), ctx);
-	assert.equal(stub.messages.length, 1, "the spend steer is one-shot");
+	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 1, "the spend steer is one-shot");
 });
 
 test("worker role maps retired low to extended and steers at the exact soft-turn boundary", async () => {
@@ -760,13 +768,13 @@ test("worker role maps retired low to extended and steers at the exact soft-turn
 
 	// Retired low resolves to extended: 63 turns stay below its soft limit (64).
 	for (let i = 0; i < 63; i++) await handler(messageEndEvent(100), ctx);
-	assert.equal(stub.messages.length, 0);
+	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 0);
 
 	// The 64th turn reaches the extended soft turns limit exactly: one steer
 	// naming the resolved profile and the turns dimension.
 	await handler(messageEndEvent(100), ctx);
-	assert.equal(stub.messages.length, 1);
-	const steer = stub.messages[0]!;
+	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 1);
+	const steer = messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE)[0]!;
 	assert.equal(steer.customType, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE);
 	assert.match(steer.content, /profile extended/);
 	assert.match(steer.content, /turns 64\/64/);
@@ -774,7 +782,7 @@ test("worker role maps retired low to extended and steers at the exact soft-turn
 	// One-shot: two more turns re-send nothing.
 	await handler(messageEndEvent(100), ctx);
 	await handler(messageEndEvent(100), ctx);
-	assert.equal(stub.messages.length, 1);
+	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 1);
 });
 
 test("worker role spend steer fires on the output dimension at the exact soft boundary", async () => {
@@ -787,17 +795,18 @@ test("worker role spend steer fires on the output dimension at the exact soft bo
 
 	// 3 x 40,000 output = 120,000: below the standard soft output (160,000).
 	for (let i = 0; i < 3; i++) await handler(messageEndEvent(40_030, { output: 40_000 }), ctx);
-	assert.equal(stub.messages.length, 0);
+	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 0);
 
 	// The 4th message reaches exactly 160,000 output: one steer naming the
 	// output_tokens dimension (cumulative total 160,120 stays below the
 	// standard soft total and 4 turns below the soft turns limit).
 	await handler(messageEndEvent(40_030, { output: 40_000 }), ctx);
-	assert.equal(stub.messages.length, 1);
-	const steer = stub.messages[0]!;
+	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 1);
+	const steer = messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE)[0]!;
 	assert.equal(steer.customType, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE);
 	assert.match(steer.content, /profile standard/);
 	assert.match(steer.content, /output_tokens 160000\/160000/);
+	assert.equal(messagesOfType(stub, WORKER_NO_PROGRESS_STEER_MESSAGE_TYPE).length, 0, "same-interval safety-budget steering wins arbitration");
 });
 
 test("retired low fallback keeps the extended spend steer one-shot from soft through hard", async () => {
@@ -814,18 +823,18 @@ test("retired low fallback keeps the extended spend steer one-shot from soft thr
 	// Fifty-four messages at 200,000: below the extended soft total — band ok,
 	// no steer.
 	for (let i = 0; i < 54; i++) await handler(messageEndEvent(200_000), ctx);
-	assert.equal(stub.messages.length, 0);
+	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 0);
 
 	// The 55th message reaches 11,000,000: the first non-ok band is SOFT and
 	// triggers one steer.
 	await handler(messageEndEvent(200_000), ctx);
-	assert.equal(stub.messages.length, 1);
-	const steer = stub.messages[0]!;
+	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 1);
+	const steer = messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE)[0]!;
 	assert.equal(steer.customType, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE);
 	assert.match(steer.content, /profile extended/);
 	assert.match(steer.content, /total_tokens 11000000\/10880000/, "the steer text renders soft-limit denominators");
 	for (let i = 0; i < 33; i++) await handler(messageEndEvent(200_000), ctx);
-	assert.equal(stub.messages.length, 1, "one-shot even after the band becomes hard");
+	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 1, "one-shot even after the band becomes hard");
 });
 
 test("malformed spend-profile env falls back to extended defensively", async () => {
@@ -838,9 +847,8 @@ test("malformed spend-profile env falls back to extended defensively", async () 
 
 	// 64 x 170,000 = 10,880,000: the EXTENDED soft total boundary.
 	for (let i = 0; i < 64; i++) await handler(messageEndEvent(170_000), ctx);
-	assert.equal(stub.messages.length, 1);
-	assert.equal(stub.messages[0]!.customType, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE);
-	assert.match(stub.messages[0]!.content, /profile extended/);
+	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 1);
+	assert.match(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE)[0]!.content, /profile extended/);
 });
 
 test("commander session never receives the spend steer even with a profile env set", async () => {
@@ -883,13 +891,13 @@ test("a spend steer send failure is swallowed and never breaks a model request",
 	for (let i = 0; i < 32; i++) {
 		await assert.doesNotReject(handler(messageEndEvent(170_000), ctx) as Promise<unknown>);
 	}
-	assert.equal(stub.messages.length, 0, "the failing spend steer is never recorded as sent");
+	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 0, "the failing spend steer is never recorded as sent");
 	// The one-shot flag stays unset, so a later soft-band message retries; the
 	// failure is still swallowed and the request keeps working.
 	for (let i = 0; i < 3; i++) {
 		await assert.doesNotReject(handler(messageEndEvent(170_000), ctx) as Promise<unknown>);
 	}
-	assert.equal(stub.messages.length, 0);
+	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 0);
 });
 
 // ---------------------------------------------------------------------------
@@ -1938,7 +1946,7 @@ test("the gate tool injects delegation-blocked facts: a pending review BLOCKs B6
 	});
 });
 
-test("B6 diff freshness fails closed when the real current git facts cannot be collected (failing git exec)", async () => {
+test("B6 rejects a legacy REVIEWED session mirror when current project authority and git facts are unavailable", async () => {
 	await withTempDir(async (root) => {
 		await writeConfigFile(root, "project.yaml", "name: t\nprofile: generic\n");
 		// A delegation that was REVIEWED with reviewed == current: the stale
@@ -1974,9 +1982,9 @@ test("B6 diff freshness fails closed when the real current git facts cannot be c
 		const b6 = details.gates?.find((g) => g.id === "b6");
 		assert.notEqual(b6?.status, "PASS", "B6 never PASSes from a stale reviewed hash");
 
-		// The reviewed/current hash check is NOT_RUN: the injected current
-		// hash is MISSING (never the stale in-memory hash), so the stale
-		// reviewed hash cannot satisfy the freshness check.
+		// Strict semantic/project authority now blocks before the stale session
+		// mirror can reach the current-hash comparison. The injected hash stays
+		// unavailable and the old in-memory pair can never satisfy B6.
 		assert.ok(details.run_id, "gate run recorded");
 		const gatesFile = JSON.parse(
 			await readFile(join(root, CONFIG_DIR_NAME, "workbench", "runs", details.run_id, "gates.json"), "utf8"),
@@ -1985,7 +1993,7 @@ test("B6 diff freshness fails closed when the real current git facts cannot be c
 		assert.ok(b6Entry, "b6 record present in gates.json");
 		const hashCheck = b6Entry.checks.find((c) => c.check_id === "b6.5");
 		assert.ok(hashCheck, "b6.5 check record present");
-		assert.equal(hashCheck.status, "NOT_RUN", "reviewed-hash-matches-current is NOT_RUN, never PASS");
+		assert.equal(hashCheck.status, "BLOCKED", "missing strict project authority blocks freshness; stale mirror never PASSes");
 
 		// The authoritative delegation state was neither mutated nor
 		// re-persisted by the failed refresh: still REVIEWED with the bound
@@ -2003,7 +2011,7 @@ test("B6 diff freshness fails closed when the real current git facts cannot be c
 	});
 });
 
-test("B6 diff freshness fails closed on a NON-ZERO git status exit (no fabricated clean tree)", async () => {
+test("B6 rejects a legacy REVIEWED session mirror on a non-zero git status exit", async () => {
 	await withTempDir(async (root) => {
 		await writeConfigFile(root, "project.yaml", "name: t\nprofile: generic\n");
 		// The stale in-memory pair that must NEVER re-PASS the freshness check
@@ -2035,8 +2043,9 @@ test("B6 diff freshness fails closed on a NON-ZERO git status exit (no fabricate
 		const b6 = details.gates?.find((g) => g.id === "b6");
 		assert.notEqual(b6?.status, "PASS", "B6 never PASSes from a stale reviewed hash");
 
-		// The reviewed/current hash check is NOT_RUN: the injected current
-		// hash is MISSING (never the stale in-memory hash).
+		// Strict semantic/project authority blocks before the stale session
+		// mirror can authorize freshness; non-zero git status cannot fabricate
+		// a clean current tree.
 		assert.ok(details.run_id, "gate run recorded");
 		const gatesFile = JSON.parse(
 			await readFile(join(root, CONFIG_DIR_NAME, "workbench", "runs", details.run_id, "gates.json"), "utf8"),
@@ -2045,7 +2054,7 @@ test("B6 diff freshness fails closed on a NON-ZERO git status exit (no fabricate
 		assert.ok(b6Entry, "b6 record present in gates.json");
 		const hashCheck = b6Entry.checks.find((c) => c.check_id === "b6.5");
 		assert.ok(hashCheck, "b6.5 check record present");
-		assert.equal(hashCheck.status, "NOT_RUN", "reviewed-hash-matches-current is NOT_RUN, never PASS");
+		assert.equal(hashCheck.status, "BLOCKED", "missing strict project authority blocks freshness; stale mirror never PASSes");
 
 		// The authoritative delegation state was neither mutated nor
 		// re-persisted by the failed refresh.

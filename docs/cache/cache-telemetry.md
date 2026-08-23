@@ -56,8 +56,9 @@ Projection state remains v3 and telemetry remains schema 1.3. Restoring a
 valid v3 state created under a former role cap emits one `policy_changed`
 transition and then stabilizes under the new cap; it does not rewrite the
 telemetry wire. The increased caps are a structural experiment, not measured
-provider cache improvement. Their current size qualification is limited to the
-272k Commander model and pinned 1M worker; `other` and arbitrary 64k/128k
+provider cache improvement. Their current size qualification is limited to
+Pi's advertised 272,000-token context window for both pinned GPT-5.6 Sol and
+GPT-5.6 Luna; `other` and arbitrary 64k/128k
 model windows are unqualified. The current tree resolves the repository Pi
 0.84.2 dependencies; pass declared gates, `/reload`, and collect fresh
 exact-correlated Commander and worker rows before evaluating the canary.

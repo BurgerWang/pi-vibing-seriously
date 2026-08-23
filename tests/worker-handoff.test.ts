@@ -656,16 +656,81 @@ test("the fixed commander-action tail is exactly the documented four lines", () 
 	assert.ok(HANDOFF_COMMANDER_ACTION_LINES[3]?.includes("workbench_review_worker_diff"));
 });
 
-test("REVIEWED handoff says delivery is complete and forbids the redundant review/status chain", () => {
-	const result = buildDelegateWorkerResult(handoffInput({ reviewStatus: "REVIEWED" }));
+test("REVIEWED zero-delta handoff states semantic review is not required and never implies Gate authority", () => {
+	const result = buildDelegateWorkerResult(handoffInput({ reviewStatus: "REVIEWED", changedPaths: [] }));
 	const text = result.content[0]?.text ?? "";
-	assert.match(text, /review\s+: REVIEWED — default delivery complete/);
-	assert.match(text, /--- Default delivery complete ---/);
-	assert.match(text, /Do not call workbench_review_worker_diff or workbench_delegation_status/);
+	assert.match(text, /review\s+: REVIEWED — semantic acceptance recorded or zero-delta closure/);
+	assert.match(text, /--- Zero-delta delivery complete ---/);
+	assert.match(text, /semantic_review:not_required/);
+	assert.match(text, /not Gate authority/);
 	assert.doesNotMatch(text, /--- Commander action required ---/);
 	assert.equal(HANDOFF_DEFAULT_DELIVERY_COMPLETE_LINES.length, 4);
 	assert.ok(Buffer.byteLength(text, "utf8") <= MAX_PARENT_HANDOFF_BYTES);
 	assert.ok(text.split("\n").length <= MAX_PARENT_HANDOFF_LINES);
+});
+
+test("complete handoff-sized scope/integrity packet is embedded wholly before worker prose under worst-case path pressure", () => {
+	const paths = Array.from({ length: 500 }, (_, index) => `src/${"p".repeat(390)}${index}.ts`);
+	const packetLines = Array.from({ length: 48 }, (_, index) => `+ packet-${String(index).padStart(2, "0")}-${"x".repeat(80)}`);
+	assert.ok(Buffer.byteLength(packetLines.join("\n"), "utf8") < 5_120);
+	const result = buildDelegateWorkerResult(handoffInput({
+		changedPaths: paths,
+		stopReason: "s".repeat(100),
+		failureMessage: "f".repeat(500),
+		spend: SPEND_FACTS,
+		summary: {
+			completed: [], verification_commands: [], verification_observations: [], remaining_risks: [],
+			parse_warning: "w".repeat(500), parse_reliable: false, truncated_items: false,
+		},
+		scopeIntegrityPacket: {
+			lines: packetLines,
+			review_kind: "scope_integrity",
+			scope_integrity_verdict: "PASS",
+			bound_diff_hash: "b".repeat(64),
+			review_record: ".pi/workbench/delegations/20260601-120000-abcd/v2/review.json",
+			presentation_complete: true,
+			patch_truncated: false,
+			semantic_review: "required",
+			semantic_risk: "medium",
+		},
+	}));
+	const text = result.content[0]?.text ?? "";
+	assert.equal(result.details.presentation_complete, true, "a backend-complete default packet must never be clipped in the delegate result");
+	assert.equal(result.details.patch_truncated, false);
+	for (const line of packetLines) assert.ok(text.includes(line), `whole packet line embedded: ${line.slice(0, 20)}`);
+	assert.ok(text.indexOf(packetLines[0]!) < text.indexOf("--- Commander action required ---"), "actual diff packet precedes the required commander tail");
+	assert.ok(Buffer.byteLength(text, "utf8") <= MAX_PARENT_HANDOFF_BYTES);
+	assert.ok(text.split("\n").length <= MAX_PARENT_HANDOFF_LINES);
+	assert.equal(result.details.semantic_review, "required");
+	assert.equal(result.details.gate_authority, false);
+});
+
+test("a complete strict compact-facts packet remains presentation-complete despite honest source-content summarization", () => {
+	const result = buildDelegateWorkerResult(handoffInput({
+		scopeIntegrityPacket: {
+			lines: [
+				"review kind: scope_integrity (mechanical; no semantic-quality or Gate authority)",
+				"evidence   : COMPLETE — each worker path has a full patch or strict compact fact packet",
+				"compact   : status=\" M\" size=40000 bytes digest=" + "a".repeat(64) + " (sha256)",
+				"generator : generator equality NOT_VERIFIED — independent current-state generator validation is required",
+			],
+			review_kind: "scope_integrity",
+			scope_integrity_verdict: "PASS",
+			bound_diff_hash: "c".repeat(64),
+			review_record: ".pi/workbench/delegations/20260601-120000-abcd/v2/review.json",
+			presentation_complete: true,
+			patch_truncated: true,
+			semantic_review: "required",
+			semantic_risk: "high",
+		},
+	}));
+	const text = result.content[0]?.text ?? "";
+	assert.equal(result.details.presentation_complete, true);
+	assert.equal(result.details.patch_truncated, true, "source content summarization remains explicit");
+	assert.match(text, /packet display: COMPLETE \(strict compact facts complete; source content summarized\)/);
+	assert.match(text, /generator equality NOT_VERIFIED/);
+	assert.equal(result.details.semantic_risk, "high");
+	assert.equal(result.details.gate_authority, false);
 });
 
 // ---------------------------------------------------------------------------

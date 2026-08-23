@@ -420,8 +420,8 @@ so offline tests and benchmarks cannot substantiate a hit-rate improvement.
 Verify the Pi 0.84.2 repository dependencies (the current tree resolves them),
 pass declared gates, deploy with `/reload`, start a new live session, and
 measure subsequent Commander and worker provider usage before making any
-recovery claim. Current size qualification is limited to the 272k Commander
-model and pinned 1M worker;
+recovery claim. Current size qualification is limited to Pi's advertised
+272,000-token context window for both pinned GPT-5.6 Sol and GPT-5.6 Luna;
 `other` and arbitrary 64k/128k model windows are not qualified by the cap
 expansion.
 

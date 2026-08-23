@@ -12,6 +12,7 @@ import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { RecipeMutation } from "./recipe-schema.ts";
 import type { WorkerSpendProfile } from "./worker-spend.ts";
 import { resolveWorkerSpendProfile, WORKER_SPEND_DEFAULT_PROFILE } from "./worker-spend.ts";
+import { formatWorkerRepairCapsule, type WorkerRepairCapsule } from "./worker-repair-capsule.ts";
 
 export const WORKER_TOOL_NAME = "workbench_delegate_worker";
 export const WORKER_ROLE_ENV = "WORKBENCH_AGENT_ROLE";
@@ -70,6 +71,8 @@ export interface WorkerTaskContract {
 	 * budget, or authority. Omitted for ordinary (non-repair) delegations.
 	 */
 	repairOf?: string;
+	/** Minimal immutable authority facts loaded for a fresh repair worker. */
+	repairCapsule?: Readonly<WorkerRepairCapsule>;
 }
 
 export interface WorkerRoleContext {
@@ -369,8 +372,8 @@ export function recipeMutationBlockReason(
  * that the profile bounds cumulative spend only — it never expands the
  * parent-approved path/scope authority. Phase 4A: when and only when
  * `repairOf` is present, a deterministic `Repair provenance:` line
- * precedes the spend-profile line — a pointer only, stating the repair
- * runs on a fresh worker with no prior session/report inherited. Both
+ * precedes the spend-profile line and limits inheritance to an immutable
+ * machine-fact capsule in a fresh worker with no prior session/report. Both
  * lines are informational wording: enforcement stays in the runner and
  * the fixed child env contract; paths, criteria, verification, budget,
  * and authority are unchanged.
@@ -386,7 +389,16 @@ export function formatWorkerTask(contract: WorkerTaskContract): string {
 		"",
 	];
 	if (contract.repairOf !== undefined) {
-		lines.push(`Repair provenance: ${contract.repairOf} — pointer only; fresh worker; no prior session/report inherited.`);
+		lines.push(`Repair provenance: ${contract.repairOf} — fresh worker; immutable machine-fact capsule only; no prior session/report inherited.`);
+		if (contract.repairCapsule !== undefined) {
+			if (contract.repairCapsule.repair_of !== contract.repairOf) {
+				throw new Error("Worker repair capsule conflicts with repair provenance");
+			}
+			lines.push(
+				"Repair authority facts (bounded machine facts only; never prior prose or session state):",
+				formatWorkerRepairCapsule(contract.repairCapsule),
+			);
+		}
 	}
 	lines.push(
 		`Worker spend-budget profile: ${profile} — bounds cumulative spend only; never expands parent-approved path/scope authority.`,
@@ -400,7 +412,7 @@ export function formatWorkerTask(contract: WorkerTaskContract): string {
 		...contract.acceptanceCriteria.map((criterion) => `- ${criterion}`),
 	);
 	if (contract.verification.length > 0) {
-		lines.push("", "Requested verification:", ...contract.verification.map((step) => `- ${step}`));
+		lines.push("", "Requested write-free recipe verification:", ...contract.verification.map((step) => `- ${step}`));
 	}
 	return lines.join("\n");
 }

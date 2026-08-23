@@ -22,6 +22,7 @@ import type { readDelegationCommittedGenerationV2 } from "./delegation-transacti
 import { WORKBENCH_TOOL_METADATA, WORKBENCH_TOOL_PARAMETERS } from "./tool-catalog.ts";
 import type { buildTrustedRecoveryAuthority } from "./trusted-recovery-authority.ts";
 import type { TrustedRecoveryAuthority } from "./tool-result-ingress-projection.ts";
+import { workerVerificationRecipeNames } from "./worker-contract.ts";
 import {
 	commanderBlockReason,
 	resolveWorkerTaskKind,
@@ -29,7 +30,8 @@ import {
 	WORKER_MODEL_SELECTOR,
 	WORKER_PROVIDER,
 } from "./worker-policy.ts";
-import { buildDelegateWorkerResult } from "../worker/handoff.ts";
+import { validateWorkerVerificationRecipes } from "./worker-verification.ts";
+import { buildDelegateWorkerResult, type HandoffScopeIntegrityPacket } from "../worker/handoff.ts";
 
 type CurrentDelegationBinding =
 	| { readonly status: "unavailable" }
@@ -92,9 +94,22 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					...(params.budget_profile === undefined ? {} : { budget_profile: params.budget_profile }),
 					...(params.repair_of === undefined ? {} : { repair_of: params.repair_of }),
 					...(params.plan_ref === undefined ? {} : { plan_ref: params.plan_ref }),
+					...(params.extended_reason === undefined ? {} : { extended_reason: params.extended_reason }),
 				});
 				if (!contract.ok) throw new Error(`workbench_delegate_worker: ${contract.error.code}`);
 				const projectRoot = await controller.projectRootFor(ctx);
+				const verificationRecipes = workerVerificationRecipeNames(contract.value.verification);
+				if (verificationRecipes === undefined) {
+					throw new Error("workbench_delegate_worker: invalid verification recipe reference");
+				}
+				const verifyRecipesBeforeLaunch = async (): Promise<void> => {
+					const preflight = await validateWorkerVerificationRecipes(projectRoot, verificationRecipes);
+					if (!preflight.ok) {
+						const recipe = preflight.recipe === undefined ? "" : `; recipe=${preflight.recipe}`;
+						throw new Error(`workbench_delegate_worker: verification ${preflight.code}${recipe}`);
+					}
+				};
+				await verifyRecipesBeforeLaunch();
 				if (contract.value.plan_ref !== undefined) {
 					const currentPlan = await verifyCurrentPlanReference(projectRoot, contract.value.plan_ref);
 					if (!currentPlan.ok) throw new Error(`workbench_delegate_worker: plan_ref ${currentPlan.error.code}`);
@@ -193,6 +208,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					exec: controller.exec,
 					clock: () => controller.services.now().toISOString(),
 					onPrepared: async (_transaction, preparedBefore) => {
+						await verifyRecipesBeforeLaunch();
 						if (contract.value.plan_ref !== undefined) {
 							const currentPlan = await verifyCurrentPlanReference(projectRoot, contract.value.plan_ref);
 							if (!currentPlan.ok) throw new Error(`plan_ref ${currentPlan.error.code} before worker launch`);
@@ -309,6 +325,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					],
 				});
 				if (authority === undefined) throw new Error("workbench_delegate_worker: delegation v2 trusted report authority unavailable");
+				let scopeIntegrityPacket: HandoffScopeIntegrityPacket | undefined;
 				if (taskKind.taskKind === "diagnosis") {
 					const reviewed = await controller.projectTerminalReviewedBinding(projectRoot, delegationId, controller.services.now().toISOString());
 					if (reviewed === null) throw new Error("workbench_delegate_worker: diagnosis session mirror could not enter REVIEWED");
@@ -334,6 +351,19 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 						const reviewError = delivery.review_error === undefined ? "" : `; review_error=${delivery.review_error}`;
 						throw new Error(`workbench_delegate_worker: default delivery ${delivery.code}${reviewError}; explicit review required`);
 					}
+					const reviewRecord = delivery.review.review.record;
+					if (reviewRecord === undefined) throw new Error("workbench_delegate_worker: scope/integrity packet record unavailable");
+					scopeIntegrityPacket = {
+						lines: [...delivery.review.review.lines],
+						review_kind: delivery.review_kind,
+						scope_integrity_verdict: delivery.scope_integrity_verdict,
+						bound_diff_hash: reviewRecord.bound_diff_hash,
+						review_record: delivery.review.review_path,
+						presentation_complete: delivery.presentation_complete,
+						patch_truncated: reviewRecord.patch_truncated,
+						semantic_review: delivery.semantic_review,
+						semantic_risk: delivery.semantic_risk,
+					};
 				}
 				const toolResult = buildDelegateWorkerResult({
 					delegationId,
@@ -358,6 +388,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					summary: handoffSummary,
 					spend: handoffSummary.spend,
 					reviewStatus: controller.getDelegationState().status,
+					...(scopeIntegrityPacket === undefined ? {} : { scopeIntegrityPacket }),
 				});
 				void controller.refreshStatus(ctx);
 				trustedIngress = controller.bindTrustedIngressAuthority(authority, toolResult.content);

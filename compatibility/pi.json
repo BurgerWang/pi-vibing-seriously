@@ -12,7 +12,9 @@
 		"selector": "openai-codex/gpt-5.6-luna:xhigh",
 		"pi_catalog_context_window": 272000,
 		"qualified_on": "2026-08-21",
-		"evidence": "real no-tools temporary-directory availability smoke plus runner/model-identity integration tests; no private repository content was sent in the live smoke"
+		"evidence": "real no-tools temporary-directory availability smoke plus runner/model-identity integration tests; no private repository content was sent in the live smoke",
+		"development_efficiency_evidence": "NOT_MEASURED",
+		"efficiency_measurement": "strict v2 semantic acceptance plus at least 12 complete ABBA blocks (24 stratified tasks per arm), no incomplete/invalid block, and complete identity/KPI facts are required; availability smoke is not efficiency evidence"
 	},
 	"pi": {
 		"package": "@earendil-works/pi-coding-agent",

@@ -33,6 +33,10 @@ import {
 	WORKER_WRITE_JOURNAL_RUNTIME_TELEMETRY_ENTRY_TYPE,
 	WORKER_WRITE_JOURNAL_RUNTIME_TELEMETRY_SCHEMA,
 } from "../extensions/workbench-runtime/core/worker-write-journal-runtime.ts";
+import {
+	WORKER_REPAIR_CAPSULE_SCHEMA,
+	type WorkerRepairCapsule,
+} from "../extensions/workbench-runtime/core/worker-repair-capsule.ts";
 
 const CONTRACT: WorkerTaskContract = {
 	task: "Implement one bounded change",
@@ -200,121 +204,45 @@ test("runner makes explicit journal failures and malformed matching entries stic
 });
 
 test("worker system prompt grants local implementation ownership inside the approved contract and reserves final authority to Sol", () => {
-	// Worker-owned: routine local implementation decisions inside the contract.
-	assert.match(WORKER_SYSTEM_PROMPT, /You own routine local implementation decisions inside the approved contract/);
-	assert.match(WORKER_SYSTEM_PROMPT, /concrete design choices, naming, file structure within the approved scope/);
-	assert.match(WORKER_SYSTEM_PROMPT, /how the slice is implemented, tested, and documented/);
-	// Sol-owned: requirements, cross-cutting architecture, scope, actual-diff
-	// review, final verification/gates, and the verdict.
-	assert.match(WORKER_SYSTEM_PROMPT, /The GPT-5\.6 Sol parent owns requirements, cross-cutting architecture, scope, review of the actual diff, final verification and gates, and the final verdict/);
+	assert.ok(Buffer.byteLength(WORKER_SYSTEM_PROMPT, "utf8") < 2_500, "stable worker prefix stays compact");
+	assert.match(WORKER_SYSTEM_PROMPT, /Sol owns requirements, cross-cutting architecture, approved scope, semantic diff review, final verification, Gates and verdict/);
+	assert.match(WORKER_SYSTEM_PROMPT, /You own local design and the complete source\+tests\+docs slice inside the contract/);
 	assert.match(WORKER_SYSTEM_PROMPT, /never acceptance evidence/);
-	// Complete-slice duties: investigation, production source changes, tests,
-	// docs, write-free recipe checks, and in-scope repair — not a narrow edit.
-	assert.match(WORKER_SYSTEM_PROMPT, /Implement the complete delegated slice, not a narrow code edit/);
-	assert.match(WORKER_SYSTEM_PROMPT, /Before changing code, inspect the relevant files/);
-	assert.match(WORKER_SYSTEM_PROMPT, /Make the production source changes, add the tests and docs/);
-	assert.match(WORKER_SYSTEM_PROMPT, /requested write-free declared workbench recipes when available/);
-	assert.match(WORKER_SYSTEM_PROMPT, /repair in-scope defects you find/);
-	assert.match(WORKER_SYSTEM_PROMPT, /not stubs or TODO shells/);
-	// Unchanged hard guards: bounded scope, no recursion, no final gates, no
-	// free-form bash.
-	assert.match(WORKER_SYSTEM_PROMPT, /Implement only the delegated task and only within the parent-approved paths/);
-	assert.match(WORKER_SYSTEM_PROMPT, /Never delegate another worker/);
-	assert.match(WORKER_SYSTEM_PROMPT, /Never run final validation gates/);
-	assert.match(WORKER_SYSTEM_PROMPT, /Free-form bash is unavailable/);
-	// Exact final report sections preserved, and the no-acceptance rule is an
-	// explicit prohibition in the prompt — not a banned substring: the prompt
-	// itself must state that the worker never claims final PASS/acceptance.
-	assert.match(WORKER_SYSTEM_PROMPT, /Finish with exactly these sections:/);
+	assert.match(WORKER_SYSTEM_PROMPT, /Edit\/write only approved paths/);
+	assert.match(WORKER_SYSTEM_PROMPT, /issue writes sequentially/);
+	assert.match(WORKER_SYSTEM_PROMPT, /never delegate, never use free-form bash and never run final Gates/);
+	assert.match(WORKER_SYSTEM_PROMPT, /requested declared mutation:none recipes/);
+	assert.match(WORKER_SYSTEM_PROMPT, /no stubs or TODO shells/);
+	assert.match(WORKER_SYSTEM_PROMPT, /Stop for unapproved architecture, security\/policy, destructive action or scope expansion/);
+	assert.match(WORKER_SYSTEM_PROMPT, /Finish with exactly:/);
 	assert.match(WORKER_SYSTEM_PROMPT, /## Completed\n## Files Changed\n## Verification\n## Remaining Risks/);
-	assert.match(WORKER_SYSTEM_PROMPT, /do not claim final PASS or acceptance/, "the prompt must explicitly prohibit claiming final PASS or acceptance");
-	assert.match(WORKER_SYSTEM_PROMPT, /report only commands and observed results/);
-	assert.match(WORKER_SYSTEM_PROMPT, /Never label an acceptance criterion satisfied, met, passed, accepted, or complete/);
-	assert.match(WORKER_SYSTEM_PROMPT, /only Sol maps evidence to criteria/);
-	// Stop-and-report boundary: when completion needs an unapproved
-	// architecture, security/policy, destructive, or out-of-scope decision,
-	// the worker stops and reports instead of guessing or expanding scope.
-	assert.match(WORKER_SYSTEM_PROMPT, /unapproved architecture, security\/policy, destructive, or out-of-scope decision/);
-	assert.match(WORKER_SYSTEM_PROMPT, /stop and report/);
-	assert.match(WORKER_SYSTEM_PROMPT, /instead of guessing or expanding scope/);
+	assert.match(WORKER_SYSTEM_PROMPT, /Do not claim final PASS or label criteria satisfied, met, passed, accepted or complete/);
 });
 
 test("diagnosis system prompt is read-only and keeps acceptance with Sol", () => {
-	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /strictly read-only diagnosis/);
-	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /Do not edit, write, create, delete, rename/);
-	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /configuration, state, ledger, receipt, or artifact/);
-	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /inspection scope only and never write authority/);
-	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /mutation is exactly none/);
-	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /never run a recipe with mutation other than none/);
-	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /must not claim final PASS or acceptance/);
-	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /only Sol maps evidence to criteria/);
+	assert.ok(Buffer.byteLength(WORKER_DIAGNOSIS_SYSTEM_PROMPT, "utf8") < 1_500, "diagnosis prefix stays compact");
+	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /This task is strictly read-only/);
+	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /never edit, write, create, delete, rename, delegate, use free-form bash or run final Gates/);
+	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /inspection scope, never write authority/);
+	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /declared mutation:none recipes/);
+	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /Do not claim final PASS or label criteria satisfied, met, passed, accepted or complete/);
 	assert.match(WORKER_DIAGNOSIS_SYSTEM_PROMPT, /## Files Changed\n- None\./);
 });
 
 test("worker system prompt pins the three mandatory execution disciplines (early checkpoint, stopping hygiene, short report)", () => {
-	// Discipline 1 — EARLY CHECKPOINT: after relevant-file inspection and
-	// before the first write, privately compare planned changed paths /
-	// acceptance criteria / verification against the exact contract and the
-	// remaining spend; stop/report rather than expand; a known-root-cause
-	// repair must not reopen broad diagnosis.
-	assert.match(WORKER_SYSTEM_PROMPT, /EARLY CHECKPOINT/);
-	assert.match(WORKER_SYSTEM_PROMPT, /after inspecting the relevant files and before the first write/);
-	assert.match(WORKER_SYSTEM_PROMPT, /privately compare/);
-	assert.match(WORKER_SYSTEM_PROMPT, /planned changed paths, acceptance criteria, and verification/);
-	assert.match(WORKER_SYSTEM_PROMPT, /the exact contract and the remaining spend/);
-	assert.match(WORKER_SYSTEM_PROMPT, /if the plan does not fit, stop and report to Sol rather than expand/);
-	assert.match(WORKER_SYSTEM_PROMPT, /known root cause must not reopen broad diagnosis/);
-	// Discipline 2 — STOPPING HYGIENE: before the final response, re-read
-	// every changed path; no accidental out-of-scope writes, no stubs/TODO
-	// placeholders, no accidental generated artifacts; requested checks
-	// reported truthfully; hygiene never triggers unrelated cleanup.
-	assert.match(WORKER_SYSTEM_PROMPT, /STOPPING HYGIENE/);
-	assert.match(WORKER_SYSTEM_PROMPT, /before your final response, re-read every changed path/);
-	assert.match(WORKER_SYSTEM_PROMPT, /no accidental out-of-scope writes/);
-	assert.match(WORKER_SYSTEM_PROMPT, /no stubs or TODO placeholders/);
-	assert.match(WORKER_SYSTEM_PROMPT, /no accidental generated artifacts/);
-	assert.match(WORKER_SYSTEM_PROMPT, /every requested check is reported truthfully/);
-	assert.match(WORKER_SYSTEM_PROMPT, /hygiene must not trigger unrelated cleanup/);
-	// Discipline 3 — SHORT REPORT: exactly the four final headings; the
-	// four-bullet / 240-char cap applies ONLY to Completed, Verification,
-	// and Remaining Risks — Files Changed is explicitly exempt and must
-	// list EVERY actually changed project-relative path, one exact path per
-	// single-line bullet, with no prose (mechanically bounded by the
-	// ledger's existing 500 changed-path fail-closed limit; `- None.` when nothing changed);
-	// Verification reports only the command and its observed outcome, never
-	// logs; no task/criteria repetition.
-	assert.match(WORKER_SYSTEM_PROMPT, /SHORT REPORT/);
-	assert.match(WORKER_SYSTEM_PROMPT, /keep exactly the four final headings/);
-	// The four-bullet / 240-char cap is scoped to the three prose sections.
-	assert.match(WORKER_SYSTEM_PROMPT, /Completed, Verification, and Remaining Risks each take at most 4 single-line bullets of at most 240 characters/);
-	// Files Changed is explicitly exempt from the cap and must list every
-	// actually changed path truthfully, one per single-line bullet.
-	assert.match(WORKER_SYSTEM_PROMPT, /Files Changed is exempt from that cap/);
-	assert.match(WORKER_SYSTEM_PROMPT, /EVERY actually changed project-relative path/);
-	assert.match(WORKER_SYSTEM_PROMPT, /one exact project-relative path per single-line bullet/);
-	assert.match(WORKER_SYSTEM_PROMPT, /with no prose/);
-	assert.match(WORKER_SYSTEM_PROMPT, /ledger's existing 500 changed-path fail-closed limit/);
-	assert.match(WORKER_SYSTEM_PROMPT, /reports only the command and its observed outcome, never logs/);
-	assert.match(WORKER_SYSTEM_PROMPT, /never repeat the task or acceptance criteria/);
+	assert.match(WORKER_SYSTEM_PROMPT, /Before the first write, compare planned paths, criteria, requested recipes and remaining spend with the contract/);
+	assert.match(WORKER_SYSTEM_PROMPT, /A repair uses only its bounded authority facts; do not reopen broad diagnosis/);
+	assert.match(WORKER_SYSTEM_PROMPT, /Before reporting, re-read changed paths and check scope, placeholders, generated artifacts and truthful verification without unrelated cleanup/);
+	assert.match(WORKER_SYSTEM_PROMPT, /Completed, Verification and Remaining Risks: at most 4 single-line bullets, each at most 240 characters/);
+	assert.match(WORKER_SYSTEM_PROMPT, /Files Changed: every actual project-relative path, one per bullet with no prose/);
+	assert.match(WORKER_SYSTEM_PROMPT, /recipe:<name> run:<run-id> outcome:SUCCESS/);
+	assert.match(WORKER_SYSTEM_PROMPT, /never include logs/);
+	assert.match(WORKER_SYSTEM_PROMPT, /Do not repeat the task or criteria/);
 	assert.match(WORKER_SYSTEM_PROMPT, /- None\./);
-	// Negative guard: a global four-bullet cap ("at most 4 single-line
-	// bullets per section") would re-impose the Files Changed cap and must
-	// fail this test.
 	assert.ok(
 		!/at most 4 single-line bullets per section/.test(WORKER_SYSTEM_PROMPT),
 		"the four-bullet cap must be scoped to Completed/Verification/Remaining Risks, never Files Changed",
 	);
-	// Structure: the three disciplines appear in fixed order before the final
-	// headings block, and the never-acceptance/final-gate rules survive
-	// unchanged beside them.
-	const indexOf = (needle: string) => WORKER_SYSTEM_PROMPT.indexOf(needle);
-	assert.ok(indexOf("EARLY CHECKPOINT") >= 0);
-	assert.ok(indexOf("EARLY CHECKPOINT") < indexOf("STOPPING HYGIENE"), "EARLY CHECKPOINT precedes STOPPING HYGIENE");
-	assert.ok(indexOf("STOPPING HYGIENE") < indexOf("SHORT REPORT"), "STOPPING HYGIENE precedes SHORT REPORT");
-	assert.ok(indexOf("SHORT REPORT") < indexOf("Finish with exactly these sections:"), "SHORT REPORT precedes the final headings block");
-	assert.match(WORKER_SYSTEM_PROMPT, /Never run final validation gates/);
-	assert.match(WORKER_SYSTEM_PROMPT, /do not claim final PASS or acceptance/);
-	assert.match(WORKER_SYSTEM_PROMPT, /## Completed\n## Files Changed\n## Verification\n## Remaining Risks/);
 });
 
 test("runner pins xhigh model selector and passes a non-recursive worker role contract", async () => {
@@ -341,6 +269,62 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 		assert.equal(facts.spendProfile, "extended", "the runner writes the safe default into the fixed child env contract");
 		assert.equal(result.spendProfile, "extended");
 	});
+});
+
+test("repair runner injects only the bounded immutable authority capsule into a fresh process", async () => {
+	const repairOf = "20260820-150000-r1T2";
+	const capsule: WorkerRepairCapsule = {
+		schema: WORKER_REPAIR_CAPSULE_SCHEMA,
+		repair_of: repairOf,
+		authority_kind: "v2_committed",
+		authority_status: "FAILED",
+		contract_hash: "a".repeat(64),
+		generation_content_hash: "b".repeat(64),
+		journal_hash: null,
+		failure: { exit_code: 1, reason_codes: ["WORKER_FAILED"], successful_write_count: 1, denied_write_count: 0 },
+		changed_paths: ["src/main.ts"],
+		changed_paths_omitted: 0,
+		failed_runs: [{ recipe: "unit-test", run_id: "20260820-150100-r2T3", outcome: "PROCESS_FAILED" }],
+		plan_ref: null,
+	};
+	const script = `
+const argv = process.argv.slice(2);
+console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "openai-codex", model: "gpt-5.6-luna", content: [{ type: "text", text: JSON.stringify({ argv }) }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
+`;
+	await withFakeWorker(script, async (invocation, dir) => {
+		let reads = 0;
+		const result = await runPinnedWorker({
+			projectRoot: dir,
+			contract: { ...CONTRACT, repairOf },
+			timeoutMs: 2_000,
+			invocation,
+			readRepairAuthority: async (root, id) => {
+				reads += 1;
+				assert.equal(root, dir);
+				assert.equal(id, repairOf);
+				return { ok: true, capsule };
+			},
+		});
+		assertWorkerSucceeded(result);
+		assert.equal(reads, 1);
+		const facts = JSON.parse(result.output) as { argv: string[] };
+		assert.ok(facts.argv.includes("--no-session"));
+		const taskText = facts.argv.at(-1) ?? "";
+		assert.match(taskText, /"changed_paths":\["src\/main\.ts"\]/);
+		assert.match(taskText, /"run_id":"20260820-150100-r2T3"/);
+		assert.doesNotMatch(taskText, /worker-report|error_message|transcript|session_state/);
+	});
+
+	await assert.rejects(
+		runPinnedWorker({
+			projectRoot: "/tmp",
+			contract: { ...CONTRACT, repairOf },
+			timeoutMs: 2_000,
+			invocation: { command: "must-not-spawn", argsPrefix: [] },
+			readRepairAuthority: async () => ({ ok: false, code: "authority_invalid" }),
+		}),
+		/Worker repair authority is authority_invalid/,
+	);
 });
 
 test("runner passes an exact validated delegation-v2 runtime identity to the child", async () => {

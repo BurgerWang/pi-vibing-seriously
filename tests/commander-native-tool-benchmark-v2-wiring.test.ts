@@ -67,6 +67,7 @@ const READ_V3_SCRIPT = "tsx --test tests/native-tool-policy.test.ts tests/native
 const CONTEXT_OUTPUT_BENCHMARK_SCRIPT = "tsx scripts/context-output-benchmark.ts";
 const SESSION_SANITIZE_SCRIPT = "tsx scripts/workbench-session-sanitize.ts";
 const GOVERNANCE_ROLLBACK_CHECK_SCRIPT = "tsx scripts/governance-rollback-check.ts";
+const WORKER_CANARY_SCRIPT = "tsx scripts/cache-benchmark.ts canary";
 
 test("package.json: exact script inventory includes v2, context-output and rollback-check scripts", async () => {
 	const pkg = JSON.parse(await readFile(join(process.cwd(), "package.json"), "utf8")) as { version?: string; scripts?: Record<string, string> };
@@ -80,6 +81,7 @@ test("package.json: exact script inventory includes v2, context-output and rollb
 	assert.equal(pkg.scripts?.["benchmark:context-output"], CONTEXT_OUTPUT_BENCHMARK_SCRIPT);
 	assert.equal(pkg.scripts?.["session:sanitize"], SESSION_SANITIZE_SCRIPT);
 	assert.equal(pkg.scripts?.["governance:rollback-check"], GOVERNANCE_ROLLBACK_CHECK_SCRIPT);
+	assert.equal(pkg.scripts?.["worker:canary"], WORKER_CANARY_SCRIPT);
 
 	// The complete scripts map is exactly the pre-existing scripts plus the
 	// three v2 scripts and the additive test:release-assets,
@@ -113,6 +115,7 @@ test("package.json: exact script inventory includes v2, context-output and rollb
 		"commander:nro:pilot": "tsx scripts/commander-native-tool-dev-pilot.ts",
 		"cache:report": "tsx scripts/cache-benchmark.ts report",
 		"cache:doctor": "tsx scripts/cache-benchmark.ts doctor",
+		"worker:canary": WORKER_CANARY_SCRIPT,
 		"benchmark:context-output": CONTEXT_OUTPUT_BENCHMARK_SCRIPT,
 		"session:sanitize": SESSION_SANITIZE_SCRIPT,
 		"governance:rollback-check": GOVERNANCE_ROLLBACK_CHECK_SCRIPT,

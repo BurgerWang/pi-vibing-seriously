@@ -153,6 +153,20 @@ test("schema 1.3 report aggregates exact local observations and disjoint read/wr
 	assert.equal(report.observability.actorCohorts.commander.cacheWriteShare, 0.01);
 	assert.equal(report.observability.actorCohorts.worker.cacheWriteShare, null);
 	assert.equal(report.observability.actorCohorts.unknown.requestCount, 0, "unknown actors are not guessed");
+	assert.deepEqual(report.modelRoleObservability?.commander, {
+		requestCount: 1,
+		requestedProviderModels: null,
+		effectiveProviderModels: { "openai/gpt-5.6": 1 },
+		requestedReasoningLevels: { high: 1 },
+		effectiveReasoningLevels: null,
+	});
+	assert.deepEqual(report.modelRoleObservability?.worker, {
+		requestCount: 1,
+		requestedProviderModels: null,
+		effectiveProviderModels: { "deepseek/deepseek-v4-flash": 1 },
+		requestedReasoningLevels: { high: 1 },
+		effectiveReasoningLevels: null,
+	});
 	assert.equal(report.observability.projectionCohorts.segmentSeal.requestCount, 1);
 	assert.equal(report.observability.projectionCohorts.epochTransition.requestCount, 1);
 	const facts: DoctorFacts = {

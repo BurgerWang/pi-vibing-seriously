@@ -8,6 +8,8 @@
  *   3. Run manifests                    (.pi/workbench/runs/<run-id>/manifest.json)
  *   4. Action cache records             (.pi/workbench/cache/actions/*.json,
  *                                       cache-index.json, locks/, tmp/)
+ *   5. Strict delegation v2 authority   (.pi/workbench/delegations/<id>/v2/)
+ *   6. Explicit ABBA canary manifests   (caller-selected bounded JSON file)
  *
  * It NEVER:
  *   - calls a model or sends any HTTP request
@@ -25,6 +27,7 @@
  *           [--until <iso>] [--cost-map <file>] [--save <name>]
  *   doctor  [--project <root>] [--json]
  *   compare <report-name>... [--project <root>] [--json]
+ *   canary  <abba-manifest.json> [--json]
  *
  * Statistical definitions: docs/cache/cache-benchmark.md.
  */
@@ -41,6 +44,7 @@ import {
 	type CacheReport,
 	type CacheObservabilityReport,
 	type ExplicitBreakpointVerifiedUsage,
+	type ModelRoleObservabilityReport,
 } from "../extensions/workbench-runtime/cache/cache-report.ts";
 import { runDoctor, renderDoctor, doctorToJson, type DoctorFacts } from "../extensions/workbench-runtime/cache/cache-doctor.ts";
 import {
@@ -54,6 +58,22 @@ import { LOCK_STALE_MS } from "../extensions/workbench-runtime/cache/action-type
 import type { TelemetryRecord } from "../extensions/workbench-runtime/cache/cache-types.ts";
 import { readJsonFileBounded } from "../extensions/workbench-runtime/core/bounded-file-io.ts";
 import { isValidRunId, RUN_JSON_INPUT_MAX_BYTES } from "../extensions/workbench-runtime/core/runs.ts";
+import {
+	readDelegationCommittedGenerationV2,
+	readDelegationReviewV2,
+	readDelegationTransactionV2,
+} from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
+import { DELEGATION_TRANSACTION_ID_RE } from "../extensions/workbench-runtime/core/delegation-transaction.ts";
+import {
+	aggregateDelegationEfficiency,
+	type DelegationEfficiencyFact,
+	type DelegationEfficiencyMetrics,
+} from "../extensions/workbench-runtime/core/development-efficiency.ts";
+import {
+	buildWorkerCanaryReport,
+	parseWorkerCanaryManifest,
+	type WorkerCanaryReport,
+} from "../extensions/workbench-runtime/core/worker-canary.ts";
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -61,6 +81,8 @@ import { isValidRunId, RUN_JSON_INPUT_MAX_BYTES } from "../extensions/workbench-
 
 export const WORKBENCH_CACHE_DIR = join(CONFIG_DIR_NAME, "workbench", CACHE_DIR_NAME);
 export const RUNS_REL_DIR = join(CONFIG_DIR_NAME, "workbench", "runs");
+export const DELEGATIONS_REL_DIR = join(CONFIG_DIR_NAME, "workbench", "delegations");
+export const WORKER_CANARY_INPUT_MAX_BYTES = 1_048_576 as const;
 
 export function cacheDir(projectRoot: string): string {
 	return join(projectRoot, WORKBENCH_CACHE_DIR);
@@ -163,6 +185,149 @@ export async function readRunManifests(projectRoot: string): Promise<RunReadResu
 		}
 	}
 	return { manifests, corrupt };
+}
+
+// ---------------------------------------------------------------------------
+// Existing delegation-v2 efficiency evidence (strict, read-only)
+// ---------------------------------------------------------------------------
+
+export interface DelegationEfficiencyReadResult {
+	metrics: DelegationEfficiencyMetrics;
+	directories: number;
+	strictRecords: number;
+	legacyOrNotV2: number;
+	invalidOrUnavailable: number;
+	sourceIncomplete: boolean;
+}
+
+function contractRepairOf(records: Record<string, unknown>): string | null | undefined {
+	const before = records["before.json"];
+	if (!before || typeof before !== "object" || Array.isArray(before)) return undefined;
+	const contract = (before as Record<string, unknown>).contract;
+	if (!contract || typeof contract !== "object" || Array.isArray(contract)) return undefined;
+	if (!Object.prototype.hasOwnProperty.call(contract, "repair_of")) return null;
+	const value = (contract as Record<string, unknown>).repair_of;
+	return typeof value === "string" && DELEGATION_TRANSACTION_ID_RE.test(value) ? value : undefined;
+}
+
+/** Classify a review record only after the strict v2 artifact reader accepts it. */
+export function semanticReviewFromStrictRecord(record: Record<string, unknown>): true | "not_required" | "unknown" {
+	if (record.schema_version !== 2) return "unknown";
+	if (record.semantic_review === "not_required") return "not_required";
+	if (record.semantic_review !== "accepted") return "unknown";
+	const acceptance = record.semantic_acceptance;
+	if (!acceptance || typeof acceptance !== "object" || Array.isArray(acceptance)) return "unknown";
+	const value = acceptance as Record<string, unknown>;
+	const reviewer = value.reviewer;
+	if (!reviewer || typeof reviewer !== "object" || Array.isArray(reviewer)) return "unknown";
+	const reviewerValue = reviewer as Record<string, unknown>;
+	return value.decision === "ACCEPT"
+		&& value.expected_bound_diff_hash === record.bound_diff_hash
+		&& value.accepted_at === record.reviewed_at
+		&& (reviewerValue.provider === "openai" || reviewerValue.provider === "openai-codex")
+		&& reviewerValue.model === "gpt-5.6-sol"
+		? true
+		: "unknown";
+}
+
+/**
+ * Read current strict v2 transaction/review authority. PENDING and historical
+ * mechanical REVIEWED states stay semantically unknown. Only a strict durable
+ * semantic-acceptance marker is accepted; FAILED is rejected.
+ */
+export async function readDelegationEfficiency(projectRoot: string): Promise<DelegationEfficiencyReadResult> {
+	const dir = join(projectRoot, DELEGATIONS_REL_DIR);
+	let names: string[] = [];
+	try {
+		names = (await readdir(dir, { withFileTypes: true }))
+			.filter((entry) => entry.isDirectory() && DELEGATION_TRANSACTION_ID_RE.test(entry.name))
+			.map((entry) => entry.name).sort();
+	} catch (error) {
+		const missing = (error as NodeJS.ErrnoException).code === "ENOENT";
+		return {
+			metrics: aggregateDelegationEfficiency([]),
+			directories: 0,
+			strictRecords: 0,
+			legacyOrNotV2: 0,
+			invalidOrUnavailable: missing ? 0 : 1,
+			sourceIncomplete: !missing,
+		};
+	}
+	const nodes = new Map<string, { repairOf: string | null | undefined; fact: DelegationEfficiencyFact }>();
+	let invalidOrUnavailable = 0;
+	let legacyOrNotV2 = 0;
+	for (const delegationId of names) {
+		const transaction = await readDelegationTransactionV2(projectRoot, delegationId);
+		if (!transaction.ok) {
+			if (transaction.error.code === "not_found") legacyOrNotV2 += 1;
+			else invalidOrUnavailable += 1;
+			continue;
+		}
+		const state = transaction.value;
+		const generation = await readDelegationCommittedGenerationV2(projectRoot, delegationId);
+		const repairOf = generation.ok
+			? contractRepairOf(generation.value.records as unknown as Record<string, unknown>)
+			: undefined;
+		let reviewBytes: number | "unknown" = "unknown";
+		let reviewPresentation: boolean | "unknown" = "unknown";
+		let semanticAccepted: boolean | "not_required" | "unknown" = state.status === "FAILED"
+			? false
+			: state.task_kind === "diagnosis" && state.status === "FINISHED"
+				? "not_required"
+				: "unknown";
+		if (state.task_kind === "implementation" && (state.status === "PENDING_REVIEW" || state.status === "REVIEWED")) {
+			const review = await readDelegationReviewV2(projectRoot, delegationId);
+			if (review.ok) {
+				const reviewRecord = review.value.review as unknown as Record<string, unknown>;
+				reviewBytes = review.value.review.patch_paths.reduce((total, path) => total + path.bytes, 0);
+				reviewPresentation = typeof reviewRecord.presentation_complete === "boolean"
+					? reviewRecord.presentation_complete
+					: "unknown";
+				semanticAccepted = semanticReviewFromStrictRecord(reviewRecord);
+			}
+		}
+		const workerOutcome = state.status === "FAILED"
+			? "failure"
+			: state.status === "FINISHED" || state.status === "PENDING_REVIEW" || state.status === "REVIEWED"
+				? "success"
+				: "unknown";
+		nodes.set(delegationId, {
+			repairOf,
+			fact: {
+				delegation_id: delegationId,
+				worker_outcome: workerOutcome,
+				semantic_accepted: semanticAccepted,
+				repair_depth: "unknown",
+				review_bytes: reviewBytes,
+				review_presentation_complete: reviewPresentation,
+			},
+		});
+	}
+	for (const [delegationId, node] of nodes) {
+		if (node.repairOf === undefined) continue;
+		let depth = 0;
+		let cursor: string | null = delegationId;
+		const visited = new Set<string>();
+		while (cursor !== null && depth <= 32) {
+			if (visited.has(cursor)) { depth = -1; break; }
+			visited.add(cursor);
+			const current = nodes.get(cursor);
+			if (!current || current.repairOf === undefined) { depth = -1; break; }
+			if (current.repairOf === null) break;
+			depth += 1;
+			cursor = current.repairOf;
+		}
+		node.fact.repair_depth = depth >= 0 && depth <= 32 ? depth : "unknown";
+	}
+	const facts = [...nodes.values()].map((node) => node.fact);
+	return {
+		metrics: aggregateDelegationEfficiency(facts),
+		directories: names.length,
+		strictRecords: facts.length,
+		legacyOrNotV2,
+		invalidOrUnavailable,
+		sourceIncomplete: invalidOrUnavailable > 0,
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -356,10 +521,13 @@ export interface BenchmarkReport {
 		rotatedFiles: number;
 		runManifests: number;
 		actionRecords: number;
+		delegationDirectories: number;
 	};
 	requestCount: number;
 	schema13Rows: number;
 	observability: CacheObservabilityReport | null;
+	modelRoleObservability: ModelRoleObservabilityReport;
+	delegationEfficiency: DelegationEfficiencyReadResult;
 	uncachedInputTokens: number;
 	cacheReadTokens: number;
 	outputTokens: number;
@@ -450,6 +618,7 @@ export async function buildBenchmarkReport(input: BenchmarkInput): Promise<Bench
 	const telemetry = await readTelemetry(projectRoot);
 	const runs = await readRunManifests(projectRoot);
 	const actionCache = await readActionCache(projectRoot);
+	const delegationEfficiency = await readDelegationEfficiency(projectRoot);
 
 	let records = telemetry.records;
 	if (input.sessionId) records = records.filter((r) => r.hashedSessionId === input.sessionId);
@@ -542,10 +711,13 @@ export async function buildBenchmarkReport(input: BenchmarkInput): Promise<Bench
 			rotatedFiles: telemetry.rotatedFiles,
 			runManifests: runs.manifests.length,
 			actionRecords: actionCache.records,
+			delegationDirectories: delegationEfficiency.directories,
 		},
 		requestCount: report.requestCount,
 		schema13Rows: report.schema13Rows,
 		observability: report.observability,
+		modelRoleObservability: report.modelRoleObservability!,
+		delegationEfficiency,
 		uncachedInputTokens: report.totals.input,
 		cacheReadTokens: report.totals.cacheRead,
 		outputTokens: report.totals.output,
@@ -595,6 +767,12 @@ function pct(value: number | null): string {
 	return `${Math.round(value * 100)}%`;
 }
 
+function renderCountMap(value: Record<string, number> | null): string {
+	if (value === null) return "unknown";
+	return Object.entries(value).sort(([left], [right]) => left.localeCompare(right))
+		.map(([key, count]) => `${key}=${count}`).join(",") || "unknown";
+}
+
 function seconds(value: number): string {
 	if (!Number.isFinite(value)) return "n/a";
 	if (value >= 60) return `${(value / 60).toFixed(1)} min`;
@@ -610,6 +788,13 @@ function bytes(value: number): string {
 /** Human-readable rendering — plain facts, never sensitive content. */
 export function renderBenchmarkReport(report: BenchmarkReport): string[] {
 	const telemetryObservationIncomplete = report.telemetrySourceIncomplete || report.truncatedTelemetryRecords > 0;
+	const reviewMetrics = report.delegationEfficiency.metrics;
+	const reviewBytesLabel = reviewMetrics.review_bytes_known === 0
+		? "unknown"
+		: `${reviewMetrics.review_bytes_observed_total} observed${reviewMetrics.review_bytes_unknown > 0 ? ` (${reviewMetrics.review_bytes_unknown} unknown)` : ""}`;
+	const reviewPresentationLabel = reviewMetrics.review_presentation_known === 0
+		? "unknown"
+		: `${reviewMetrics.review_presentation_complete}/${reviewMetrics.review_presentation_known}${reviewMetrics.review_presentation_unknown > 0 ? ` (${reviewMetrics.review_presentation_unknown} unknown)` : ""}`;
 	const qualityLabel = report.telemetrySourceIncomplete
 		? "PARTIAL"
 		: report.truncatedTelemetryRecords > 0
@@ -637,6 +822,9 @@ export function renderBenchmarkReport(report: BenchmarkReport): string[] {
 		`explicit breakpoints: applied=${report.explicitBreakpointAppliedRequests} verified requests=${report.explicitBreakpointVerifiedUsage.requestCount} input=${report.explicitBreakpointVerifiedUsage.input} cacheRead=${report.explicitBreakpointVerifiedUsage.cacheRead} cacheWrite=${report.explicitBreakpointVerifiedUsage.cacheWrite} ratio=${pct(report.explicitBreakpointVerifiedUsage.hitRatio)} (provider usage; cacheRead=0 is not a failure)`,
 		`changes         : mode=${report.modeChanges} model=${report.modelChanges} thinking=${report.thinkingChanges} reload=${report.reloads} compaction=${report.compactions}`,
 		`recipes         : executed=${report.recipeExecutions} hits=${report.recipeCacheHits} misses=${report.recipeCacheMisses} unknown=${report.recipeCacheUnknown} hit=${pct(report.recipeHitRatio)}`,
+		`delegations     : strict=${report.delegationEfficiency.strictRecords}/${report.delegationEfficiency.directories} legacy/not-v2=${report.delegationEfficiency.legacyOrNotV2} invalid=${report.delegationEfficiency.invalidOrUnavailable} accepted=${report.delegationEfficiency.metrics.semantic_outcomes_known === 0 ? "unknown" : `${report.delegationEfficiency.metrics.semantic_accepted}/${report.delegationEfficiency.metrics.semantic_outcomes_known}`} not-required=${report.delegationEfficiency.metrics.semantic_not_required} first-yield=${typeof report.delegationEfficiency.metrics.first_accepted_yield === "number" ? pct(report.delegationEfficiency.metrics.first_accepted_yield) : "unknown"}`,
+		`review evidence : bytes=${reviewBytesLabel} presentation=${reviewPresentationLabel} max-repair-depth=${report.delegationEfficiency.metrics.max_repair_depth}`,
+		`delegation scope: project lifetime (delegation authority has no telemetry session id)`,
 		`recipe cohort scope: project lifetime (run manifests have no session id)`,
 		`version cohort caveat: extension version is not a source-commit identity`,
 		`local time avoided: ${seconds(report.localExecutionTimeAvoided)}`,
@@ -648,6 +836,14 @@ export function renderBenchmarkReport(report: BenchmarkReport): string[] {
 		`run manifests   : ${report.sources.runManifests} (action records: ${report.sources.actionRecords})`,
 	];
 	const versionCohorts = Object.entries(report.extensionVersionCohorts).sort(([left], [right]) => left.localeCompare(right));
+	for (const [role, cohort] of [
+		["commander", report.modelRoleObservability.commander],
+		["worker", report.modelRoleObservability.worker],
+	] as const) {
+		lines.push(
+			`${role} identity : requests=${cohort.requestCount} requested-model=unknown effective=${renderCountMap(cohort.effectiveProviderModels)} requested-reasoning=${renderCountMap(cohort.requestedReasoningLevels)} effective-reasoning=unknown`,
+		);
+	}
 	for (const [version, cohort] of versionCohorts.slice(0, MAX_RENDERED_VERSION_COHORTS)) {
 		lines.push(
 			`version cohort ${version}: requests=${cohort.requestCount} hit=${pct(cohort.cacheHitRatio)} input=${cohort.uncachedInputTokens} cacheRead=${cohort.cacheReadTokens} output=${cohort.outputTokens} semantics=${cohort.usageSemanticStatus ?? "unverified"}`,
@@ -770,6 +966,38 @@ export function renderCompare(rows: readonly CompareRow[]): string[] {
 	return lines;
 }
 
+export function renderWorkerCanaryReport(report: WorkerCanaryReport): string[] {
+	const rate = (value: number | null): string => value === null ? "unknown" : `${(value * 100).toFixed(1)}%`;
+	const number = (value: number | null): string => value === null ? "unknown" : String(value);
+	const lines = [
+		"Sol/Luna ABBA canary — descriptive evidence only",
+		`decision        : ${report.decision} (never release or Gate authority)`,
+		`variants        : A=${report.variants.A} | B=${report.variants.B}`,
+		`ABBA blocks     : complete=${report.complete_abba_blocks} minimum=${report.minimum_complete_blocks} incomplete=${report.incomplete_or_invalid_blocks}`,
+	];
+	for (const arm of ["A", "B"] as const) {
+		const summary = report.arms[arm];
+		lines.push(
+			`${arm} trials        : ${summary.trials}`,
+			`${arm} elapsed       : median=${number(summary.elapsed_ms.median)}ms p90=${number(summary.elapsed_ms.p90)}ms known=${summary.elapsed_ms.known} unknown=${summary.elapsed_ms.unknown}`,
+			`${arm} first accepted: ${summary.first_accepted.positive}/${summary.first_accepted.known} (${rate(summary.first_accepted.rate)}) unknown=${summary.first_accepted.unknown}`,
+			`${arm} repair depth  : median=${number(summary.repair_depth.median)} known=${summary.repair_depth.known} unknown=${summary.repair_depth.unknown}`,
+			`${arm} review        : bytes median=${number(summary.review_bytes.median)} presentation=${rate(summary.review_presentation_complete.rate)} regressions=${number(summary.regressions.total)}`,
+			`${arm} hard defects  : critical=${number(summary.critical_defects.total)} scope=${number(summary.scope_defects.total)} authority=${number(summary.authority_defects.total)}`,
+			`${arm} identity gaps : commander=${summary.commander_identity_unknown} worker=${summary.worker_identity_unknown}`,
+		);
+	}
+	lines.push(
+		`B/A elapsed     : ${report.differences.elapsed_ratio_b_over_a === null ? "unknown" : report.differences.elapsed_ratio_b_over_a.toFixed(3)}`,
+		`B/A elapsed p90 : ${report.differences.elapsed_p90_ratio_b_over_a === null ? "unknown" : report.differences.elapsed_p90_ratio_b_over_a.toFixed(3)}`,
+		`B-A first yield : ${rate(report.differences.first_accepted_rate_delta_b_minus_a)}`,
+		`B-A presentation: ${rate(report.differences.review_presentation_rate_delta_b_minus_a)}`,
+		`B-A regressions : ${number(report.differences.regression_total_delta_b_minus_a)}`,
+		`reasons         : ${report.reasons.join(",") || "none"}`,
+	);
+	return lines;
+}
+
 // ---------------------------------------------------------------------------
 // Doctor (offline)
 // ---------------------------------------------------------------------------
@@ -825,8 +1053,9 @@ function usage(): string {
 		"                                     [--since <iso>] [--until <iso>] [--cost-map <file>] [--save <name>]",
 		"  tsx scripts/cache-benchmark.ts doctor [--project <root>] [--json]",
 		"  tsx scripts/cache-benchmark.ts compare <report-name>... [--project <root>] [--json]",
+		"  tsx scripts/cache-benchmark.ts canary <abba-manifest.json> [--json]",
 		"",
-		"reads only: telemetry JSONL, run manifests, action cache records, saved reports",
+		"reads only: telemetry JSONL, v2 delegation authority, run manifests, action cache records, saved reports, explicit canary manifests",
 		"never: model calls, HTTP, auth.json, models.json, provider modification, hardcoded prices",
 	].join("\n");
 }
@@ -852,7 +1081,7 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
 		}
 	}
 	return {
-		command: ["report", "doctor", "compare"].includes(command) ? command : "report",
+		command: ["report", "doctor", "compare", "canary"].includes(command) ? command : "report",
 		projectRoot: resolve(options.project ?? process.cwd()),
 		json: options.json === "true",
 		session: options.session,
@@ -902,6 +1131,22 @@ export async function saveBenchmarkReport(projectRoot: string, name: string, dat
 export async function main(argv: readonly string[]): Promise<number> {
 	const options = parseCliArgs(argv);
 	try {
+		if (options.command === "canary") {
+			const inputPath = options.names[0];
+			if (!inputPath || options.names.length !== 1) {
+				process.stderr.write(`${usage()}\n`);
+				return 1;
+			}
+			const absolute = resolve(inputPath);
+			const source = await readJsonFileBounded<unknown>(absolute, WORKER_CANARY_INPUT_MAX_BYTES);
+			if (!source.ok) throw new Error(`canary manifest read failed: ${source.error.code}`);
+			const manifest = parseWorkerCanaryManifest(source.value.value);
+			if (!manifest) throw new Error("canary manifest does not match workbench-sol-luna-abba-v1");
+			const report = buildWorkerCanaryReport(manifest);
+			if (options.json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+			else for (const line of renderWorkerCanaryReport(report)) process.stdout.write(`${line}\n`);
+			return 0;
+		}
 		if (options.command === "report") {
 			const telemetry = await readTelemetry(options.projectRoot);
 			if (

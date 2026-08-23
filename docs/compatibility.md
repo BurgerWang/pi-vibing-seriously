@@ -14,6 +14,14 @@ advertised a 272,000-token context window for that route; a real no-tools
 temporary-directory availability smoke verified the provider/model and exit
 status without sending private repository content. Runner argument, identity,
 budget, and lifecycle behavior are covered by the current integration suite.
+This establishes availability, not development efficiency: Luna throughput,
+first semantic-acceptance yield, repair depth, and defect rate remain
+**NOT_MEASURED**. A claim requires strict v2 semantic-acceptance evidence,
+at least 12 complete ABBA blocks (24 stratified tasks per arm), no incomplete
+block, and complete identity/KPI facts; missing facts remain unknown. The same
+installed Pi catalog advertised a 272,000-token
+context window for the pinned Sol route; neither catalog size is a measured
+quality or speed result.
 DeepSeek rows below are retained only as historical v0.10.0/cache-provider
 compatibility evidence and are not the active worker selector.
 
@@ -291,14 +299,49 @@ unsuccessful partial binding. Current-state assessment rechecks plan bytes and
 coverage, so drift never reuses an older PASS. These are additive no-plan
 reader semantics; no existing no-plan record is rewritten.
 
-This additive field intentionally changes the delegate schema fingerprint
-once. The current delegate parameter-schema hash is
-`1ccb80c82baf4475a9de1f0445317b502ccc006b9c85d9e005ded0bdec79d61f` and
+The additive `plan_ref` field changed the delegate schema fingerprint once at
+that transition. Subsequent current contract/review additions documented
+below yield the current delegate parameter-schema hash
+`3468c8525a80043b329ef2437889a8b4093bc6b641908b6c21cb1ea67e207928` and
 the combined current unreleased framework-reliability public tool-surface
 hash (including the stricter Gate evidence wording) is
-`5eb0e3071371603325924d731e0ecda3c4a919f9f166f9dd5b1204011e8646de`.
+`96fd7c5bbf23dc363371e2f23e1d02372ef7b5c43a335d2b107d95199804516e`.
 Repeated same-mode builds remain deterministic; the separately retained
 governance-v1 schema hash does not change.
+
+## Worker contract and semantic-review transition (current unreleased)
+
+The current delegate surface keeps all historical fields readable and adds
+only bounded current-call rules:
+
+- new verification strings are exact `recipe:<declared-name>` references;
+  preflight requires a valid write-free, parameter-free recipe before
+  authority work and rechecks it immediately before launch;
+- canonical contract bytes have a 12-KiB soft ceiling and 64-KiB absolute
+  ceiling; crossing the soft ceiling requires explicit `extended` plus the
+  optional additive `extended_reason`, which is included in v2 contract hashes;
+- historical committed contracts without `extended_reason`, and historical
+  free-text verification values read through the frozen strict readers and
+  are never rewritten. They do not become valid inputs for a new call merely
+  because they remain readable;
+- current `repair_of` still starts a fresh process and grants no new scope. It
+  now supplies only an at-most-8-KiB machine-fact capsule derived from strict
+  immutable authority; the historical pointer-only record shape remains
+  readable without fabricating missing capsule facts.
+
+Review evolution is additive at the record boundary. Historical v1/v2
+mechanical review records remain strict-readable, but their `REVIEWED` or
+coverage fields are never inferred as semantic acceptance. Every new non-zero
+delta first persists a provisional scope/integrity packet, then requires a
+second Sol call carrying paired `semantic_decision=ACCEPT` and the exact bound
+hash. New accepted records include strict `semantic_review` and
+`semantic_acceptance` provenance; legacy/finalized mechanical records cannot be
+upgraded in place. Zero-delta records alone use `not_required`. Compact facts
+for large regular SVG/JSON files are an additive presentation shape; ordinary
+truncation and malformed or historical partial presentations remain
+non-acceptable. None of these fields grants Gate authority.
+The current review parameter-schema hash, including the paired ACCEPT fields,
+is `23dc4ffa0a314a9a972889affaa38471f76a7ed3d26a5b0b2a1a141a20804682`.
 
 ## Commander Token Optimization Slice A (P0 + P1) — additive compatibility
 
@@ -392,6 +435,13 @@ additive and backward compatible:
   claimed before P9 measurement.
 
 ## Commander Token Optimization Slice B2 (P2 coverage-gated segmented actual-diff review) — additive compatibility
+
+The bullets in this subsection preserve the historical Slice B2 transition.
+They are not the current write contract: the current unreleased transition
+above adds schema-2 semantic markers, paired ACCEPT/hash parameters, and
+presentation completeness while keeping historical schema-1 records
+readable. In particular, historical mechanical `REVIEWED` is not current
+semantic acceptance.
 
 - **Additive review-record fields, unchanged `schema_version`.** The
   completed `review.json` records now carry the Slice B2 coverage facts

@@ -26,6 +26,7 @@ import {
 	type WorkerTaskContract,
 } from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { isWorkerPathAllowedRealpath } from "../extensions/workbench-runtime/worker/path-scope.ts";
+import { WORKER_REPAIR_CAPSULE_SCHEMA, type WorkerRepairCapsule } from "../extensions/workbench-runtime/core/worker-repair-capsule.ts";
 import { withTempDir } from "./helpers.ts";
 
 test("only GPT-5.6 Sol on an approved provider may command the worker", () => {
@@ -227,7 +228,7 @@ test("formatted worker task carries the complete bounded contract in the user me
 	assert.match(text, /Delegated implementation task:/);
 	assert.match(text, /- src\/\*\*/);
 	assert.match(text, /- Reject invalid input/);
-	assert.match(text, /Requested verification:/);
+	assert.match(text, /Requested write-free recipe verification:/);
 	assert.ok(!text.includes("final PASS"));
 });
 
@@ -324,7 +325,7 @@ test("the complete-slice task contract travels fully and stays acceptance-free",
 		task: "Implement the parser slice with tests and docs",
 		allowedPaths: ["src/parser/**", "tests/parser.test.ts", "docs/parser.md"],
 		acceptanceCriteria: ["Unit tests cover the new option", "Docs describe the new option"],
-		verification: ["Run the unit-test recipe", "Run the docs-check recipe"],
+		verification: ["recipe:unit-test", "recipe:docs-check"],
 	};
 	const text = formatWorkerTask(contract);
 	// Source, tests, and docs paths plus observable criteria and requested
@@ -337,45 +338,33 @@ test("the complete-slice task contract travels fully and stays acceptance-free",
 	assert.ok(!text.includes("final PASS"), "the task text never grants a final verdict");
 });
 
-test("delegate-tool metadata codifies direct one-call development delivery", () => {
+test("delegate-tool metadata is concise while retaining the hard authority boundaries", () => {
 	const meta = WORKBENCH_TOOL_METADATA.workbench_delegate_worker;
 	const text = [meta.description, meta.promptSnippet, ...meta.promptGuidelines].join("\n");
-	assert.match(text, /normal implementation path/);
-	assert.match(text, /closes the session as REVIEWED in this same call/);
-	assert.match(text, /automatically continues bounded segmented actual-diff review/);
-	assert.match(text, /32-segment safety cap/);
-	assert.match(text, /continue directly to the next development step without calling review or status/);
-	assert.match(text, /concrete task/);
-	assert.match(text, /smallest useful allowed_paths set/);
-	assert.match(text, /observable acceptance criteria/);
-	assert.match(text, /High-risk permission and final verification remain explicit boundaries/);
-	assert.match(text, /immutable FINAL\/PASS v2 review later becomes STALE/);
-	assert.match(text, /fresh successor after strict live authority revalidation/);
-	assert.match(text, /PENDING_REVIEW, corrupt, unpublished, recovery-required, and non-final authority remain blocking/);
-	assert.match(text, /durable execution-owner record spans PREPARED\/RUNNING/);
-	assert.match(text, /atomically ABORTS only a provably dead transaction with no worker-write evidence/);
-	assert.match(text, /nonempty-journal, COMMITTING, corrupt, or ambiguous authority remains fail-closed/);
-	assert.doesNotMatch(text, /minimum repository orientation/);
-	assert.doesNotMatch(text, /source\+tests\+docs vertical slices/);
+	assert.ok(Buffer.byteLength(text, "utf8") < 2_500, "static delegate metadata stays context-efficient");
+	assert.match(text, /GPT-5\.6 Luna xhigh/);
+	assert.match(text, /Implementation may write only approved paths/);
+	assert.match(text, /diagnosis is strictly read-only/);
+	assert.match(text, /fresh no-session process/);
+	assert.match(text, /cannot delegate, use free-form bash, or run final Gates/);
+	assert.match(text, /ambiguous authority fails closed/);
+	assert.match(text, /Sol retains architecture, semantic review, final verification, Gates and verdict authority/);
 });
 
-test("delegate-tool metadata keeps explicit review out of the ordinary path", () => {
+test("delegate-tool metadata exposes canonical recipe, size and repair contracts", () => {
 	const meta = WORKBENCH_TOOL_METADATA.workbench_delegate_worker;
 	const text = [meta.description, meta.promptSnippet, ...meta.promptGuidelines].join("\n");
-	assert.match(text, /automatic diff review and session close/);
-	assert.match(text, /Call workbench_review_worker_diff only when/);
-	assert.match(text, /explicit review required after a conflict, persistence failure, no-progress condition, the 32-segment safety cap, or a pending\/non-final-stale recovery state/);
-	assert.doesNotMatch(text, /after a worker returns: review the actual diff/);
-});
-
-test("delegate-tool metadata leaves detailed repair provenance in the parameter contract", () => {
-	const meta = WORKBENCH_TOOL_METADATA.workbench_delegate_worker;
-	const text = [meta.description, meta.promptSnippet, ...meta.promptGuidelines].join("\n");
-	assert.doesNotMatch(text, /known-root-cause repair/);
-	assert.doesNotMatch(text, /fresh worker inherits/);
 	const schema = WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker as unknown as {
-		properties: Record<string, { description?: string }>;
+		properties: Record<string, { description?: string; items?: { pattern?: string } }>;
 	};
+	assert.match(text, /recipe:<declared-name>/);
+	assert.match(text, /12 KiB/);
+	assert.match(text, /64 KiB/);
+	assert.match(text, /known-root-cause repair/);
+	assert.match(text, /not the old session, report, or authority/);
+	assert.match(schema.properties.verification?.description ?? "", /mutation:none/);
+	assert.equal(schema.properties.verification?.items?.pattern, "^recipe:[^\\r\\n\\u0000-\\u001f\\u007f]{1,200}$");
+	assert.match(schema.properties.extended_reason?.description ?? "", /12 KiB ordinary soft limit/);
 	assert.match(schema.properties.repair_of?.description ?? "", /strict prior delegation-id provenance/);
 	assert.match(schema.properties.repair_of?.description ?? "", /adds no path\/scope\/authority/);
 });
@@ -411,7 +400,8 @@ test("worker-delegation documentation defines fixed Sol/Luna boundaries and stri
 	assert.match(doc, /`WF:LOCKED` otherwise/);
 	assert.match(doc, /## Recommended development workflow/);
 	assert.match(doc, /Give Luna one bounded contract for the coherent source, test, and\s+documentation slice/);
-	assert.match(doc, /normal successful implementation auto-reviews and closes/i);
+	assert.match(doc, /Inspect the provisional scope\/integrity packet returned with every non-zero\s+implementation/);
+	assert.match(doc, /explicitly\s+ACCEPT the unchanged packet hash or start a bounded `repair_of` delegation/);
 	assert.match(doc, /run one final recipe or\s+gate set proportionate to task or release risk/);
 	assert.match(doc, /## Delegation transaction and review lifecycle \(P7\)/);
 	assert.match(doc, /\.pi\/workbench\/delegations\/<id>\/v2\/transaction\.json/);
@@ -448,11 +438,14 @@ test("worker-delegation documentation defines fixed Sol/Luna boundaries and stri
 	assert.match(doc, /`v2\/execution-owner\.json` while the owning Pi process is executing/);
 	assert.match(doc, /transaction timestamp plus both transaction and journal file mtimes to predate\s+the current OS boot/);
 	assert.match(doc, /any write evidence,\s+`COMMITTING`, corrupt data, or ambiguous inventory remains blocking/);
-	// V2 review authority is separate, coverage-gated, immutable after final
-	// PASS, and cannot unlock through a failed session-mirror append.
+	// V2 review authority separates mechanical presentation from explicit
+	// hash-bound Sol acceptance and rebuilds the mirror only from durable FINAL.
 	assert.match(doc, /\.pi\/workbench\/delegations\/<id>\/v2\/review\.json/);
 	assert.match(doc, /segmented provisional PASS, incomplete coverage, or any\s+FAIL[\s\S]*never grants authority/);
-	assert.match(doc, /Only a complete `PASS` with complete path\s+coverage atomically publishes[\s\S]*`REVIEWED`/);
+	assert.match(doc, /Every non-zero delta additionally requires\s+explicit Sol semantic acceptance of a previously presented complete packet/);
+	assert.match(doc, /only complete scope `PASS`, complete presentation, and the exact accepted\s+hash atomically publish[\s\S]*`REVIEWED`/);
+	assert.match(doc, /persists exactly one provisional, globally bounded scope\/integrity packet/);
+	assert.match(doc, /later call must pair `semantic_decision=ACCEPT` with its exact\s+`expected_bound_diff_hash`/);
 	assert.match(doc, /PENDING_REVIEW → REVIEWED → \(versioned binding conflicts\) → STALE/);
 	assert.match(doc, /`changeset-relevance-v2` projection over the closed relevance set/);
 	assert.match(doc, /W is the\s+attributed worker delta, D is the explicit dependency closure/);
@@ -463,8 +456,7 @@ test("worker-delegation documentation defines fixed Sol/Luna boundaries and stri
 	assert.match(doc, /compatibility field names remain[\s\S]*new tagged v2 refreshes the W\/D\/S relevance binding/);
 	assert.match(doc, /Historical untagged v2\/v1 refreshes the complete full-diff\s+binding/);
 	assert.doesNotMatch(doc, /refreshes against the real git diff, so\s+any change after REVIEWED turns the delegation STALE/);
-	assert.match(doc, /An append failure never\s+unlocks memory or the compact mirror/);
-	assert.match(doc, /immutable final artifact/);
+	assert.match(doc, /append failure is returned as a persistence failure; a later tool call first\s+reconciles the strict durable FINAL artifact/);
 	// Strict repair provenance and legacy compatibility allow a v1 read only
 	// for a true v2 not-found result; invalid v2 authority remains blocking.
 	assert.match(doc, /Terminal v2 states `FAILED`,\s+`FINISHED`, or `REVIEWED` are referenceable/);
@@ -561,7 +553,7 @@ test("formatted worker task carries the repair provenance pointer line only when
 		task: "Repair the parser slice",
 		allowedPaths: ["src/parser/**", "tests/parser.test.ts"],
 		acceptanceCriteria: ["Unit tests cover the repaired option"],
-		verification: ["Run unit-test recipe"],
+		verification: ["recipe:unit-test"],
 	};
 	// Omitted: no provenance line at all; the rest of the contract travels
 	// unchanged.
@@ -570,10 +562,10 @@ test("formatted worker task carries the repair provenance pointer line only when
 	assert.match(without, /Worker spend-budget profile: extended/);
 	assert.match(without, /- src\/parser\/\*\*/);
 	assert.match(without, /- Unit tests cover the repaired option/);
-	assert.match(without, /Requested verification:/);
+	assert.match(without, /Requested write-free recipe verification:/);
 	// Present: the exact deterministic line precedes the spend-profile line.
 	const withRepair = formatWorkerTask({ ...base, repairOf: VALID_REPAIR_ID });
-	const repairLine = `Repair provenance: ${VALID_REPAIR_ID} — pointer only; fresh worker; no prior session/report inherited.`;
+	const repairLine = `Repair provenance: ${VALID_REPAIR_ID} — fresh worker; immutable machine-fact capsule only; no prior session/report inherited.`;
 	assert.ok(withRepair.includes(repairLine), "exact provenance line is present");
 	const repairIndex = withRepair.indexOf("Repair provenance:");
 	const profileIndex = withRepair.indexOf("Worker spend-budget profile:");
@@ -595,4 +587,43 @@ test("formatted worker task carries the repair provenance pointer line only when
 	const combined = formatWorkerTask({ ...base, repairOf: VALID_REPAIR_ID, budgetProfile: "standard" });
 	assert.ok(combined.indexOf("Repair provenance:") < combined.indexOf("Worker spend-budget profile: standard"));
 	assert.match(combined, /Worker spend-budget profile: standard — bounds cumulative spend only/);
+});
+
+test("formatted repair task carries only a bounded structured authority capsule", () => {
+	const capsule: WorkerRepairCapsule = {
+		schema: WORKER_REPAIR_CAPSULE_SCHEMA,
+		repair_of: VALID_REPAIR_ID,
+		authority_kind: "v2_committed",
+		authority_status: "FAILED",
+		contract_hash: "a".repeat(64),
+		generation_content_hash: "b".repeat(64),
+		journal_hash: null,
+		failure: { exit_code: 1, reason_codes: ["WORKER_FAILED"], successful_write_count: 1, denied_write_count: 0 },
+		changed_paths: ["src/parser/index.ts"],
+		changed_paths_omitted: 0,
+		failed_runs: [{ recipe: "unit-test", run_id: "20250101-120100-run1", outcome: "PROCESS_FAILED" }],
+		plan_ref: {
+			plan_id: "repair-plan", version: "1", plan_path: "docs/plan.md", plan_sha256: "c".repeat(64), candidate: "CURRENT",
+		},
+	};
+	const text = formatWorkerTask({
+		task: "Repair the parser",
+		allowedPaths: ["src/parser/**"],
+		acceptanceCriteria: ["The parser handles the case."],
+		verification: ["recipe:unit-test"],
+		repairOf: VALID_REPAIR_ID,
+		repairCapsule: capsule,
+	});
+	assert.match(text, /Repair authority facts \(bounded machine facts only; never prior prose or session state\):/);
+	assert.match(text, /"changed_paths":\["src\/parser\/index\.ts"\]/);
+	assert.match(text, /"run_id":"20250101-120100-run1"/);
+	assert.doesNotMatch(text, /worker-report|transcript|error_message/);
+	assert.throws(() => formatWorkerTask({
+		task: "Repair",
+		allowedPaths: ["src/**"],
+		acceptanceCriteria: ["Repair is bounded."],
+		verification: [],
+		repairOf: VALID_REPAIR_ID,
+		repairCapsule: { ...capsule, repair_of: "20250101-120000-wxyz" },
+	}), /conflicts with repair provenance/);
 });

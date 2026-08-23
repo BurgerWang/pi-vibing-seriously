@@ -34,6 +34,7 @@ export interface MessageEndController {
 	getWorkerContext(): WorkerMessageContext;
 	projectRootFor(ctx: ExtensionContext): Promise<string>;
 	refreshStatus(ctx: ExtensionContext, pendingMessage?: unknown): Promise<void>;
+	onWorkerBudgetSteerSent?(): void;
 }
 
 /** Register the best-effort message_end observer. */
@@ -41,6 +42,12 @@ export function registerMessageEndController(controller: MessageEndController): 
 	let workerSoftSteerSent = false;
 	let workerSpendSoftSteerSent = false;
 	let workerSpendState: WorkerSpendState = { ...EMPTY_WORKER_SPEND_STATE };
+
+	controller.pi.on("session_start", () => {
+		workerSoftSteerSent = false;
+		workerSpendSoftSteerSent = false;
+		workerSpendState = { ...EMPTY_WORKER_SPEND_STATE };
+	});
 
 	controller.pi.on("message_end", async (event, ctx) => {
 		const message = event.message as {
@@ -105,6 +112,7 @@ export function registerMessageEndController(controller: MessageEndController): 
 							},
 						}, { deliverAs: "steer" });
 						workerSoftSteerSent = true;
+						controller.onWorkerBudgetSteerSent?.();
 					}
 				} catch {
 					// A steer must never alter a model request.
@@ -128,6 +136,7 @@ export function registerMessageEndController(controller: MessageEndController): 
 							},
 						}, { deliverAs: "steer" });
 						workerSpendSoftSteerSent = true;
+						controller.onWorkerBudgetSteerSent?.();
 					}
 				} catch {
 					// Spend steering must never alter a model request.

@@ -382,13 +382,21 @@ async function latestGateRecord(root: string): Promise<Record<string, unknown>> 
 	return JSON.parse(await readFile(join(runs, names.at(-1)!, "gates.json"), "utf8")) as Record<string, unknown>;
 }
 
+function semanticAccept(boundDiffHash: string): Record<string, unknown> {
+	return {
+		delegation_id: ID,
+		semantic_decision: "ACCEPT",
+		expected_bound_diff_hash: boundDiffHash,
+	};
+}
+
 before(() => {
 	for (const name of [WORKER_ROLE_ENV, WORKER_PROJECT_ROOT_ENV, WORKER_ALLOWED_PATHS_ENV, WORKER_TASK_KIND_ENV, WORKER_SPEND_PROFILE_ENV]) {
 		delete process.env[name];
 	}
 });
 
-test("registered review is v2-first, finalizes without top-level v1 files, and feeds status plus gate facts", async () => {
+test("registered review is v2-first, stays provisional until a second Sol ACCEPT, then feeds status plus gate facts", async () => {
 	await withTempDir(async (root) => {
 		const fixture = await seedV2(root);
 		const { stub, ctx } = await runtimeFor(root, stateEntry(fixture.id, fixture.afterHash));
@@ -398,15 +406,19 @@ test("registered review is v2-first, finalizes without top-level v1 files, and f
 			WORKBENCH_TOOL_PARAMETERS.workbench_review_worker_diff,
 			"review tool schema is unchanged",
 		);
-		const review = await tool(stub, "workbench_review_worker_diff").execute(
+		const reviewTool = tool(stub, "workbench_review_worker_diff");
+		const review = await reviewTool.execute(
 			"v2-final", { delegation_id: fixture.id }, undefined, undefined, ctx,
 		);
 		assert.equal(review.details.ok, true, text(review));
 		assert.equal(review.details.authority_version, 2);
-		assert.equal(review.details.finalized, true);
-		assert.equal(review.details.review_status, "REVIEWED");
+		assert.equal(review.details.finalized, false);
+		assert.equal(review.details.review_status, "PENDING_REVIEW");
+		assert.equal(review.details.review_kind, "scope_integrity");
+		assert.equal(review.details.semantic_review, "required");
+		assert.equal(review.details.gate_authority, false);
 		assert.match(String(review.details.review_record), /\/v2\/review\.json$/);
-		assert.equal(latestState(stub).status, "REVIEWED");
+		assert.equal(latestState(stub).status, "PENDING_REVIEW");
 		assert.equal(
 			await readFile(join(root, CONFIG_DIR_NAME, "workbench", "delegations", fixture.id, "review.json"), "utf8").catch(() => null),
 			null,
@@ -414,8 +426,26 @@ test("registered review is v2-first, finalizes without top-level v1 files, and f
 		);
 		const strict = await readDelegationReviewV2(root, fixture.id);
 		assert.equal(strict.ok, true);
-		if (strict.ok) assert.equal(strict.value.finalized, true);
+		if (strict.ok) {
+			assert.equal(strict.value.finalized, false);
+			assert.equal(strict.value.review.semantic_review, "required");
+			assert.equal(strict.value.review.semantic_acceptance, undefined);
+		}
 		const reviewBound = strict.ok ? strict.value.review.bound_diff_hash : "";
+		const accepted = await reviewTool.execute("v2-accept", semanticAccept(reviewBound), undefined, undefined, ctx);
+		assert.equal(accepted.details.ok, true, text(accepted));
+		assert.equal(accepted.details.finalized, true);
+		assert.equal(accepted.details.review_status, "REVIEWED");
+		assert.equal(accepted.details.semantic_review, "accepted");
+		assert.equal(accepted.details.gate_authority, false);
+		assert.equal(latestState(stub).status, "REVIEWED");
+		const finalized = await readDelegationReviewV2(root, fixture.id);
+		assert.equal(finalized.ok, true);
+		if (finalized.ok) {
+			assert.equal(finalized.value.finalized, true);
+			assert.equal(finalized.value.review.semantic_acceptance?.expected_bound_diff_hash, reviewBound);
+			assert.equal(finalized.value.review.semantic_acceptance?.reviewer.model, "gpt-5.6-sol");
+		}
 
 		const status = await tool(stub, "workbench_delegation_status").execute("v2-status", {}, undefined, undefined, ctx);
 		assert.match(text(status), /authority v2 : transaction REVIEWED/);
@@ -475,8 +505,16 @@ test("segmented v2 review stays provisional, and a stale REVIEWED session cannot
 			"v2-segment-b", { delegation_id: fixture.id, include_paths: ["src/b.ts"] }, undefined, undefined, ctx,
 		);
 		assert.equal(second.details.ok, true);
-		assert.equal(second.details.finalized, true);
-		assert.equal(second.details.review_status, "REVIEWED");
+		assert.equal(second.details.finalized, false);
+		assert.equal(second.details.presentation_complete, true);
+		assert.equal(second.details.review_status, "PENDING_REVIEW");
+		const accepted = await reviewTool.execute(
+			"v2-segment-accept", semanticAccept(String(second.details.bound_diff_hash)), undefined, undefined, ctx,
+		);
+		assert.equal(accepted.details.ok, true, text(accepted));
+		assert.equal(accepted.details.finalized, true);
+		assert.equal(accepted.details.semantic_review, "accepted");
+		assert.equal(accepted.details.review_status, "REVIEWED");
 	});
 });
 
@@ -498,6 +536,50 @@ test("v2 scope failure stops before content and publishes no review while sessio
 		const strict = await readDelegationReviewV2(root, fixture.id);
 		assert.equal(strict.ok, false);
 		if (!strict.ok) assert.equal(strict.error.code, "not_found");
+	});
+});
+
+test("registered semantic ACCEPT rejects first-call, incomplete, hash-mismatch, and non-Sol requests without publishing", async () => {
+	await withTempDir(async (root) => {
+		const fixture = await seedV2(root, ["src/a.ts", "src/b.ts"]);
+		const { stub, ctx } = await runtimeFor(root, stateEntry(fixture.id, fixture.afterHash));
+		const reviewTool = tool(stub, "workbench_review_worker_diff");
+		const direct = await reviewTool.execute("v2-direct-accept", semanticAccept("a".repeat(64)), undefined, undefined, ctx);
+		assert.equal(direct.details.ok, false);
+		assert.equal(direct.details.error, "review_invalid");
+
+		const partial = await reviewTool.execute(
+			"v2-partial-present", { delegation_id: fixture.id, include_paths: ["src/a.ts"] }, undefined, undefined, ctx,
+		);
+		assert.equal(partial.details.ok, true, text(partial));
+		assert.equal(partial.details.presentation_complete, false);
+		const incomplete = await reviewTool.execute(
+			"v2-partial-accept", semanticAccept(String(partial.details.bound_diff_hash)), undefined, undefined, ctx,
+		);
+		assert.equal(incomplete.details.ok, false);
+		assert.equal(incomplete.details.error, "review_invalid");
+
+		const wrongHash = await reviewTool.execute("v2-wrong-hash", semanticAccept("f".repeat(64)), undefined, undefined, ctx);
+		assert.equal(wrongHash.details.ok, false);
+		assert.equal(wrongHash.details.error, "review_conflict");
+
+		const nonSolCtx = {
+			...ctx,
+			model: { provider: "openai-codex", id: "gpt-5.6-luna", api: "responses" },
+		} as unknown as ExtensionContext;
+		const nonSol = await reviewTool.execute(
+			"v2-non-sol", semanticAccept(String(partial.details.bound_diff_hash)), undefined, undefined, nonSolCtx,
+		);
+		assert.equal(nonSol.details.ok, false);
+		assert.equal(nonSol.details.error, "semantic_accept_requires_sol");
+
+		const strict = await readDelegationReviewV2(root, fixture.id);
+		assert.equal(strict.ok, true);
+		if (strict.ok) {
+			assert.equal(strict.value.finalized, false);
+			assert.equal(strict.value.review.semantic_acceptance, undefined);
+		}
+		assert.equal(latestState(stub).status, "PENDING_REVIEW");
 	});
 });
 
@@ -531,11 +613,18 @@ test("no v2 root uses the unchanged read-only legacy fallback", async () => {
 		);
 		assert.equal(result.details.ok, true, text(result));
 		assert.equal(result.details.authority_version, 1);
-		assert.equal(result.details.review_status, "REVIEWED");
+		assert.equal(result.details.review_status, "PENDING_REVIEW");
+		assert.equal(result.details.semantic_review, "required");
 		assert.match(String(result.details.review_record), new RegExp(`${fixture.id}/review\\.json$`));
 		assert.doesNotMatch(String(result.details.review_record), /\/v2\//);
 		const legacy = JSON.parse(await readFile(join(root, result.details.review_record as string), "utf8")) as Record<string, unknown>;
 		assert.equal(legacy.verdict, "PASS");
+		const refused = await tool(stub, "workbench_review_worker_diff").execute(
+			"legacy-accept", semanticAccept(String(result.details.bound_diff_hash)), undefined, undefined, ctx,
+		);
+		assert.equal(refused.details.ok, false);
+		assert.equal(refused.details.error, "semantic_accept_requires_v2");
+		assert.equal(latestState(stub).status, "PENDING_REVIEW");
 	});
 });
 
@@ -543,9 +632,13 @@ test("final v2 artifact survives a one-shot REVIEWED mirror append failure and r
 	await withTempDir(async (root) => {
 		const fixture = await seedV2(root);
 		const { stub, ctx } = await runtimeFor(root, stateEntry(fixture.id, fixture.afterHash));
-		stub.failDelegationAppendOnce = (state) => state.status === "REVIEWED";
 		const reviewTool = tool(stub, "workbench_review_worker_diff");
-		const first = await reviewTool.execute("v2-append-fail", { delegation_id: fixture.id }, undefined, undefined, ctx);
+		const presented = await reviewTool.execute("v2-append-present", { delegation_id: fixture.id }, undefined, undefined, ctx);
+		assert.equal(presented.details.ok, true, text(presented));
+		assert.equal(presented.details.finalized, false);
+		stub.failDelegationAppendOnce = (state) => state.status === "REVIEWED";
+		const acceptance = semanticAccept(String(presented.details.bound_diff_hash));
+		const first = await reviewTool.execute("v2-append-fail", acceptance, undefined, undefined, ctx);
 		assert.equal(first.details.ok, false);
 		assert.equal(first.details.error, "session_persistence_failed");
 		assert.equal(first.details.finalized, true);
@@ -559,7 +652,7 @@ test("final v2 artifact survives a one-shot REVIEWED mirror append failure and r
 		await persistCompact(stub, ctx);
 		assert.equal(latestCompact(stub).pendingDelegationReview, true);
 
-		const retry = await reviewTool.execute("v2-append-retry", { delegation_id: fixture.id }, undefined, undefined, ctx);
+		const retry = await reviewTool.execute("v2-append-retry", acceptance, undefined, undefined, ctx);
 		assert.equal(retry.details.ok, true, text(retry));
 		assert.equal(retry.details.finalized, true);
 		assert.equal(latestState(stub).status, "REVIEWED");
@@ -572,8 +665,10 @@ test("finalized v2 drift durably appends one STALE mirror, returns review_confli
 		const fixture = await seedV2(root);
 		const { stub, ctx } = await runtimeFor(root, stateEntry(fixture.id, fixture.afterHash));
 		const reviewTool = tool(stub, "workbench_review_worker_diff");
-		const finalized = await reviewTool.execute("v2-normal-drift-finalize", { delegation_id: fixture.id }, undefined, undefined, ctx);
-		assert.equal(finalized.details.ok, true);
+		const presented = await reviewTool.execute("v2-normal-drift-present", { delegation_id: fixture.id }, undefined, undefined, ctx);
+		assert.equal(presented.details.ok, true);
+		const finalized = await reviewTool.execute("v2-normal-drift-finalize", semanticAccept(String(presented.details.bound_diff_hash)), undefined, undefined, ctx);
+		assert.equal(finalized.details.ok, true, text(finalized));
 		const strict = await readDelegationReviewV2(root, fixture.id);
 		assert.equal(strict.ok, true);
 		if (!strict.ok) return;
@@ -602,8 +697,10 @@ test("finalized v2 drift keeps the artifact immutable and remains STALE in memor
 		const fixture = await seedV2(root);
 		const { stub, ctx } = await runtimeFor(root, stateEntry(fixture.id, fixture.afterHash));
 		const reviewTool = tool(stub, "workbench_review_worker_diff");
-		const finalized = await reviewTool.execute("v2-drift-finalize", { delegation_id: fixture.id }, undefined, undefined, ctx);
-		assert.equal(finalized.details.ok, true);
+		const presented = await reviewTool.execute("v2-drift-present", { delegation_id: fixture.id }, undefined, undefined, ctx);
+		assert.equal(presented.details.ok, true);
+		const finalized = await reviewTool.execute("v2-drift-finalize", semanticAccept(String(presented.details.bound_diff_hash)), undefined, undefined, ctx);
+		assert.equal(finalized.details.ok, true, text(finalized));
 		const strict = await readDelegationReviewV2(root, fixture.id);
 		assert.equal(strict.ok, true);
 		if (!strict.ok) return;

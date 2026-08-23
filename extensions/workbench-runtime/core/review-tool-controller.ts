@@ -5,6 +5,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { ExecFn } from "./config.ts";
 import {
 	demoteReviewedToPending,
+	markSemanticAccepted,
 	markReviewed,
 	observeDiffChange,
 	type DelegationState,
@@ -16,6 +17,9 @@ import {
 	MAX_REVIEW_GUIDANCE_BYTES,
 	MAX_REVIEW_PATCH_PATHS,
 	MAX_REVIEW_PATH_BYTES,
+	classifySemanticReviewRisk,
+	isStrictSemanticAcceptedOrZeroDelta,
+	normalizeReviewPresentationCoverage,
 	type reviewDelegation,
 } from "./diff-review.ts";
 import {
@@ -24,12 +28,32 @@ import {
 	clampWholeResultText,
 } from "./output-policy.ts";
 import { WORKBENCH_TOOL_METADATA, WORKBENCH_TOOL_PARAMETERS } from "./tool-catalog.ts";
+import { commanderBlockReason } from "./worker-policy.ts";
 import { workbenchToolRenderer } from "../ui/tool-renderers.ts";
 
 interface OutputAuthorizationReservation {
 	readonly allowed: boolean;
 	readonly allocatedBytes: number;
 }
+
+const SEMANTIC_REVIEW_HEADER_LINES = 2;
+const SEMANTIC_REVIEW_HEADER_SEPARATOR_BYTES = 2;
+const MAX_BOUND_DIFF_HASH = "f".repeat(64);
+
+function semanticReviewHeader(
+	semanticReview: "accepted" | "required" | "not_required",
+	boundDiffHash: string,
+): string[] {
+	return [
+		"review kind: scope_integrity (mechanical evidence; never Gate authority)",
+		`semantic review: ${semanticReview.toUpperCase()}${semanticReview === "accepted" ? ` — explicit Sol ACCEPT bound ${boundDiffHash}` : semanticReview === "required" ? ` — inspect the complete packet, then call again with semantic_decision=ACCEPT and expected_bound_diff_hash=${boundDiffHash}; use repair_of for REPAIR` : " — zero actual delta"}`,
+	];
+}
+
+const SEMANTIC_REVIEW_HEADER_MAX_BYTES = Math.max(
+	...(["accepted", "required", "not_required"] as const).map((status) =>
+		Buffer.byteLength(semanticReviewHeader(status, MAX_BOUND_DIFF_HASH).join("\n"), "utf8")),
+);
 
 export interface ReviewToolController {
 	pi: Pick<ExtensionAPI, "registerTool">;
@@ -76,10 +100,36 @@ export function registerReviewTool(controller: ReviewToolController): void {
 					? Math.min(requestedMaxBytes, pendingAuthorization.allocatedBytes)
 					: 0;
 			const renderMaxLines = Math.min(params.max_lines ?? DIFF_REVIEW_RESULT_MAX_LINES, DIFF_REVIEW_RESULT_MAX_LINES);
+			const packetMaxBytes = renderMaxBytes - SEMANTIC_REVIEW_HEADER_MAX_BYTES - SEMANTIC_REVIEW_HEADER_SEPARATOR_BYTES;
+			const packetMaxLines = renderMaxLines - SEMANTIC_REVIEW_HEADER_LINES;
 			const reviewText = (value: unknown): string => clampWholeResultText(value, {
 				maxBytes: renderMaxBytes,
 				maxLines: renderMaxLines,
 			}).text;
+			const semanticDecisionRaw = (params as unknown as { semantic_decision?: unknown }).semantic_decision;
+			const expectedBoundDiffHashRaw = (params as unknown as { expected_bound_diff_hash?: unknown }).expected_bound_diff_hash;
+			const semanticDecisionSupplied = semanticDecisionRaw !== undefined || expectedBoundDiffHashRaw !== undefined;
+			if (
+				semanticDecisionSupplied
+				&& (semanticDecisionRaw !== "ACCEPT"
+					|| typeof expectedBoundDiffHashRaw !== "string"
+					|| !/^[0-9a-f]{64}$/u.test(expectedBoundDiffHashRaw))
+			) {
+				return {
+					content: [{ type: "text", text: reviewText("workbench_review_worker_diff: invalid semantic ACCEPT; semantic_decision=ACCEPT and expected_bound_diff_hash=<64 lowercase hex> must be supplied together") }],
+					details: { ok: false, error: "invalid_semantic_accept", review_kind: "scope_integrity", gate_authority: false },
+				};
+			}
+			const expectedBoundDiffHash = semanticDecisionSupplied ? expectedBoundDiffHashRaw as string : undefined;
+			if (semanticDecisionSupplied) {
+				const commanderError = commanderBlockReason(ctx.model?.provider, ctx.model?.id);
+				if (commanderError) {
+					return {
+						content: [{ type: "text", text: reviewText(`workbench_review_worker_diff: semantic ACCEPT refused; ${commanderError}`) }],
+						details: { ok: false, error: "semantic_accept_requires_sol", review_kind: "scope_integrity", gate_authority: false },
+					};
+				}
+			}
 			const repairRequired = (delegationId: string) => ({
 				content: [{
 					type: "text" as const,
@@ -95,7 +145,9 @@ export function registerReviewTool(controller: ReviewToolController): void {
 					next_action: "workbench_delegate_worker",
 				},
 			});
-			if (renderMaxBytes <= 0) return { content: [], details: { ok: false, error: "output_allocation_unavailable" } };
+			if (packetMaxBytes <= 0 || packetMaxLines <= 0) {
+				return { content: [], details: { ok: false, error: "output_allocation_unavailable" } };
+			}
 			const trustError = controller.trustedOrError(ctx);
 			if (trustError) {
 				return { content: [{ type: "text", text: reviewText(`workbench_review_worker_diff: ${trustError}`) }], details: {} };
@@ -127,6 +179,8 @@ export function registerReviewTool(controller: ReviewToolController): void {
 			let authorityVersion: 1 | 2;
 			let finalized = false;
 			let reviewRecordPath: string | undefined;
+			let semanticReview: "accepted" | "required" | "not_required" = "required";
+			let semanticRisk: "low" | "medium" | "high" = "medium";
 			if (v2Preflight.ok) {
 				if (v2Preflight.value.state.status === "FAILED") return repairRequired(delegationId);
 				authorityVersion = 2;
@@ -135,10 +189,15 @@ export function registerReviewTool(controller: ReviewToolController): void {
 					delegationId,
 					exec: controller.exec,
 					includePaths: params.include_paths,
-					maxLines: renderMaxLines,
-					maxBytes: renderMaxBytes,
+					maxLines: packetMaxLines,
+					maxBytes: packetMaxBytes,
 					secrets: controller.secrets,
 					now,
+					...(semanticDecisionSupplied ? {
+						semanticDecision: "ACCEPT" as const,
+						expectedBoundDiffHash: expectedBoundDiffHash!,
+						reviewer: { provider: ctx.model!.provider, model: ctx.model!.id },
+					} : {}),
 				});
 				if (!v2Result.ok) {
 					if (v2Result.binding_hash !== undefined) {
@@ -173,13 +232,20 @@ export function registerReviewTool(controller: ReviewToolController): void {
 					};
 				}
 
+				const semantic = classifySemanticReviewRisk(result.record.checked_paths);
+				semanticRisk = semantic.risk;
+				semanticReview = result.record.semantic_review === "accepted"
+					? "accepted"
+					: result.record.semantic_review === "not_required" || !semantic.required ? "not_required" : "required";
 				let projected = observeDiffChange(controller.getDelegationState(), result.record.bound_diff_hash, now);
-				if (finalized && result.record.verdict === "PASS" && result.record.coverage_complete) {
+				if (finalized && isStrictSemanticAcceptedOrZeroDelta(result.record)) {
 					if (projected.status !== "REVIEWED") {
-						const marked = markReviewed(projected, now);
+						const marked = result.record.semantic_review === "accepted"
+							? markSemanticAccepted(projected, { delegationId, expectedDiffHash: result.record.bound_diff_hash, now })
+							: markReviewed(projected, now);
 						if (!marked.ok) {
 							return {
-								content: [{ type: "text", text: reviewText(`workbench_review_worker_diff: finalized v2 review could not project REVIEWED: ${marked.error}`) }],
+								content: [{ type: "text", text: reviewText(`workbench_review_worker_diff: finalized v2 scope/integrity packet could not project semantic acceptance: ${marked.error}`) }],
 								details: { ok: false, error: "session_transition_failed", authority_version: 2, finalized: true },
 							};
 						}
@@ -206,20 +272,29 @@ export function registerReviewTool(controller: ReviewToolController): void {
 				}
 			} else if (v2Preflight.error.code === "not_found") {
 				authorityVersion = 1;
+				if (semanticDecisionSupplied) {
+					return {
+						content: [{ type: "text", text: reviewText("workbench_review_worker_diff: semantic ACCEPT requires strict v2 provisional authority; legacy review is read-only compatibility evidence and must use bounded repair") }],
+						details: { ok: false, error: "semantic_accept_requires_v2", authority_version: 1, review_kind: "scope_integrity", gate_authority: false, next_action: "workbench_delegate_worker_repair_of" },
+					};
+				}
 				result = await controller.services.reviewLegacy({
 					projectRoot,
 					delegationId,
 					exec: controller.exec,
 					includePaths: params.include_paths,
-					maxLines: renderMaxLines,
-					maxBytes: renderMaxBytes,
+					maxLines: packetMaxLines,
+					maxBytes: packetMaxBytes,
 					secrets: controller.secrets,
 				});
 				if (!result.ok || !result.record) {
 					return { content: [{ type: "text", text: reviewText(`workbench_review_worker_diff: ${result.error ?? "review failed"}`) }], details: { ok: false, error: result.error } };
 				}
+				const semantic = classifySemanticReviewRisk(result.record.checked_paths);
+				semanticRisk = semantic.risk;
+				semanticReview = !semantic.required ? "not_required" : "required";
 				let nextState = observeDiffChange(controller.getDelegationState(), result.record.bound_diff_hash, now);
-				if (result.record.verdict === "PASS" && result.record.coverage_complete) {
+				if (isStrictSemanticAcceptedOrZeroDelta(result.record)) {
 					if (nextState.status !== "REVIEWED") {
 						const marked = markReviewed(nextState, now);
 						if (!marked.ok) {
@@ -248,10 +323,12 @@ export function registerReviewTool(controller: ReviewToolController): void {
 			}
 			void controller.refreshStatus(ctx);
 			const record = result.record;
-			const text = reviewText(result.lines.join("\n"));
+			const presentation = normalizeReviewPresentationCoverage(record);
+			const semanticHeader = semanticReviewHeader(semanticReview, record.bound_diff_hash);
+			const text = reviewText([...semanticHeader, ...result.lines].join("\n"));
 			const nextIncludePaths: string[] = [];
 			let nextIncludeBytes = 0;
-			for (const path of record.remaining_paths) {
+			for (const path of presentation.presentation_remaining_paths) {
 				if (nextIncludePaths.length >= MAX_REVIEW_PATCH_PATHS) break;
 				if (typeof path !== "string" || Buffer.byteLength(path, "utf8") > MAX_REVIEW_PATH_BYTES) break;
 				if (/[\u0000-\u001f\u007f]/.test(path)) break;
@@ -262,12 +339,17 @@ export function registerReviewTool(controller: ReviewToolController): void {
 			}
 			return {
 				content: [{ type: "text", text }],
-				details: {
-					ok: true,
-					delegation_id: delegationId,
-					verdict: record.verdict,
-					review_status: controller.getDelegationState().status,
-					bound_diff_hash: record.bound_diff_hash,
+					details: {
+						ok: true,
+						delegation_id: delegationId,
+						review_kind: "scope_integrity",
+						verdict: record.verdict,
+						scope_integrity_verdict: record.verdict,
+						review_status: controller.getDelegationState().status,
+						semantic_review: semanticReview,
+						semantic_risk: semanticRisk,
+						gate_authority: false,
+						bound_diff_hash: record.bound_diff_hash,
 					recorded_after_hash: record.recorded_after_hash,
 					mismatch: record.mismatch,
 					violation_count: record.violations.length,
@@ -275,7 +357,10 @@ export function registerReviewTool(controller: ReviewToolController): void {
 					checked_count: record.checked_paths.length,
 					displayed_count: record.displayed_paths.length,
 					remaining_count: record.remaining_paths.length,
-					coverage_complete: record.coverage_complete,
+						coverage_complete: record.coverage_complete,
+						presentation_complete: presentation.presentation_complete,
+						fully_presented_count: presentation.fully_presented_paths.length,
+						presentation_remaining_count: presentation.presentation_remaining_paths.length,
 					review_record: reviewRecordPath ?? record.review_path,
 					next_include_paths: nextIncludePaths,
 					patch_truncated: record.patch_truncated,

@@ -28,10 +28,11 @@ function pendingState(overrides: Partial<DelegationState> = {}): DelegationState
 
 function successfulReview(
 	overrides: Record<string, unknown> = {},
+	finalized = false,
 ): Extract<DelegationReviewV2Result, { ok: true }> {
 	return {
 		ok: true,
-		finalized: true,
+		finalized,
 		review_hash: "c".repeat(64),
 		review_path: `.pi/workbench/delegations/${ID}/v2/review.json`,
 		transaction: {} as never,
@@ -46,10 +47,16 @@ function successfulReview(
 				checked_paths: ["src/a.ts"],
 				displayed_paths: ["src/a.ts"],
 				remaining_paths: [],
+				fully_presented_paths: ["src/a.ts"],
+				presentation_remaining_paths: [],
+				presentation_complete: true,
+				semantic_review: "required",
 				path_stats: [],
 				violations: [],
 				notes: [],
+				drift_paths: [],
 				verdict: "PASS",
+				mismatch: false,
 				coverage_complete: true,
 				bound_diff_hash: REVIEW_HASH,
 				recorded_after_hash: REVIEW_HASH,
@@ -69,12 +76,12 @@ function successfulReview(
 function provisionalReview(
 	overrides: Record<string, unknown>,
 ): Extract<DelegationReviewV2Result, { ok: true }> {
-	return { ...successfulReview(overrides), finalized: false };
+	return successfulReview(overrides, false);
 }
 
 const exec = async () => ({ code: 0, stdout: "", stderr: "", killed: false });
 
-test("ordinary implementation auto-reviews once and persists REVIEWED", async () => {
+test("ordinary non-zero implementation returns one complete scope/integrity packet but stays PENDING for Sol ACCEPT", async () => {
 	const persisted: DelegationState[] = [];
 	let captured: Record<string, unknown> | undefined;
 	const result = await completeDefaultDelegationDeliveryV2({
@@ -94,16 +101,21 @@ test("ordinary implementation auto-reviews once and persists REVIEWED", async ()
 
 	assert.equal(result.ok, true);
 	if (!result.ok) return;
-	assert.equal(result.state.status, "REVIEWED");
+	assert.equal(result.state.status, "PENDING_REVIEW");
 	assert.equal(result.state.currentDiffHash, REVIEW_HASH);
-	assert.equal(result.state.reviewedDiffHash, REVIEW_HASH);
+	assert.equal(result.state.reviewedDiffHash, undefined);
 	assert.deepEqual(persisted, [result.state]);
+	assert.equal(result.review_kind, "scope_integrity");
+	assert.equal(result.scope_integrity_verdict, "PASS");
+	assert.equal(result.presentation_complete, true);
+	assert.equal(result.semantic_review, "required");
+	assert.equal(result.semantic_risk, "medium");
 	assert.deepEqual(captured?.includePaths, ["src/a.ts"]);
 	assert.equal(captured?.maxLines, DEFAULT_DELIVERY_REVIEW_MAX_LINES);
 	assert.equal(captured?.maxBytes, DEFAULT_DELIVERY_REVIEW_MAX_BYTES);
 });
 
-test("incomplete review automatically converges over only the prior remaining paths", async () => {
+test("incomplete default packet makes exactly one call and returns PENDING with explicit presentation incompleteness", async () => {
 	const persisted: DelegationState[] = [];
 	const included: string[][] = [];
 	let calls = 0;
@@ -119,35 +131,25 @@ test("incomplete review automatically converges over only the prior remaining pa
 		review: async (input) => {
 			included.push([...(input.includePaths ?? [])]);
 			calls += 1;
-			if (calls === 1) {
-				return provisionalReview({
-					displayed_paths: ["src/a.ts"],
-					coverage_complete: false,
-					remaining_paths: ["src/b.ts", "src/c.ts"],
-				});
-			}
-			if (calls === 2) {
-				return provisionalReview({
-					displayed_paths: ["src/a.ts", "src/b.ts"],
-					coverage_complete: false,
-					remaining_paths: ["src/c.ts"],
-				});
-			}
-			return successfulReview({
-				displayed_paths: ["src/a.ts", "src/b.ts", "src/c.ts"],
+			return provisionalReview({
+				checked_paths: ["src/a.ts", "src/b.ts", "src/c.ts"],
+				displayed_paths: ["src/a.ts"],
+				coverage_complete: false,
+				remaining_paths: ["src/b.ts", "src/c.ts"],
+				fully_presented_paths: ["src/a.ts"],
+				presentation_remaining_paths: ["src/b.ts", "src/c.ts"],
+				presentation_complete: false,
 			});
 		},
 	});
 
 	assert.equal(result.ok, true);
 	if (!result.ok) return;
-	assert.equal(result.state.status, "REVIEWED");
-	assert.deepEqual(included, [
-		["src/a.ts", "src/b.ts", "src/c.ts"],
-		["src/b.ts", "src/c.ts"],
-		["src/c.ts"],
-	]);
-	assert.deepEqual(persisted, [result.state], "only the completed REVIEWED mirror is persisted");
+	assert.equal(result.state.status, "PENDING_REVIEW");
+	assert.equal(result.presentation_complete, false);
+	assert.equal(calls, 1);
+	assert.deepEqual(included, [["src/a.ts", "src/b.ts", "src/c.ts"]]);
+	assert.deepEqual(persisted, [result.state]);
 });
 
 test("incomplete review with no remaining-path progress stays pending", async () => {
@@ -165,22 +167,26 @@ test("incomplete review with no remaining-path progress stays pending", async ()
 		review: async () => {
 			calls += 1;
 			return provisionalReview({
+				checked_paths: ["src/a.ts", "src/b.ts"],
 				coverage_complete: false,
 				remaining_paths: ["src/a.ts", "src/b.ts"],
+				fully_presented_paths: [],
+				presentation_remaining_paths: ["src/a.ts", "src/b.ts"],
+				presentation_complete: false,
 			});
 		},
 	});
 
-	assert.equal(result.ok, false);
-	if (result.ok) return;
-	assert.equal(result.code, "review_incomplete");
+	assert.equal(result.ok, true);
+	if (!result.ok) return;
+	assert.equal(result.presentation_complete, false);
 	assert.equal(result.state.status, "PENDING_REVIEW");
 	assert.equal(result.state.currentDiffHash, REVIEW_HASH);
 	assert.equal(calls, 1);
 	assert.deepEqual(persisted, [result.state]);
 });
 
-test("automatic review stops at the fixed segment cap even while coverage progresses", async () => {
+test("default delivery never auto-pages beyond its single handoff-sized segment", async () => {
 	const changedPaths = Array.from(
 		{ length: DEFAULT_DELIVERY_REVIEW_MAX_SEGMENTS + 1 },
 		(_, index) => `src/${String(index).padStart(2, "0")}.ts`,
@@ -200,23 +206,25 @@ test("automatic review stops at the fixed segment cap even while coverage progre
 			const current = [...(input.includePaths ?? [])];
 			included.push(current);
 			return provisionalReview({
+				checked_paths: current,
 				coverage_complete: false,
 				remaining_paths: current.slice(1),
+				fully_presented_paths: [],
+				presentation_remaining_paths: current,
+				presentation_complete: false,
 			});
 		},
 	});
 
-	assert.equal(result.ok, false);
-	if (result.ok) return;
-	assert.equal(result.code, "review_incomplete");
+	assert.equal(result.ok, true);
+	if (!result.ok) return;
+	assert.equal(result.presentation_complete, false);
 	assert.equal(included.length, DEFAULT_DELIVERY_REVIEW_MAX_SEGMENTS);
 	assert.deepEqual(included[0], changedPaths);
-	assert.deepEqual(included.at(-1), changedPaths.slice(DEFAULT_DELIVERY_REVIEW_MAX_SEGMENTS - 1));
 	assert.deepEqual(persisted, [result.state]);
 });
 
-test("a changed binding between automatic segments fails closed", async () => {
-	const changedHash = "d".repeat(64);
+test("default delivery binds only the single returned packet and never observes a hypothetical later segment", async () => {
 	const persisted: DelegationState[] = [];
 	let calls = 0;
 	const result = await completeDefaultDelegationDeliveryV2({
@@ -230,22 +238,24 @@ test("a changed binding between automatic segments fails closed", async () => {
 	}, {
 		review: async () => {
 			calls += 1;
-			return calls === 1
-				? provisionalReview({ coverage_complete: false, remaining_paths: ["src/b.ts"] })
-				: successfulReview({ bound_diff_hash: changedHash, recorded_after_hash: changedHash });
+			return provisionalReview({
+				coverage_complete: false,
+				remaining_paths: ["src/b.ts"],
+				presentation_complete: false,
+				presentation_remaining_paths: ["src/b.ts"],
+			});
 		},
 	});
 
-	assert.equal(result.ok, false);
-	if (result.ok) return;
-	assert.equal(result.code, "review_failed");
+	assert.equal(result.ok, true);
+	if (!result.ok) return;
 	assert.equal(result.state.status, "PENDING_REVIEW");
-	assert.equal(result.state.currentDiffHash, changedHash);
-	assert.equal(calls, 2);
+	assert.equal(result.state.currentDiffHash, REVIEW_HASH);
+	assert.equal(calls, 1);
 	assert.deepEqual(persisted, [result.state]);
 });
 
-test("complete coverage with a FAIL verdict stops without an empty-path replay", async () => {
+test("scope/integrity FAIL returns its packet without closing or replaying", async () => {
 	const persisted: DelegationState[] = [];
 	let calls = 0;
 	const result = await completeDefaultDelegationDeliveryV2({
@@ -268,9 +278,10 @@ test("complete coverage with a FAIL verdict stops without an empty-path replay",
 		},
 	});
 
-	assert.equal(result.ok, false);
-	if (result.ok) return;
-	assert.equal(result.code, "review_failed");
+	assert.equal(result.ok, true);
+	if (!result.ok) return;
+	assert.equal(result.scope_integrity_verdict, "FAIL");
+	assert.equal(result.presentation_complete, false);
 	assert.equal(result.state.status, "PENDING_REVIEW");
 	assert.equal(calls, 1);
 	assert.deepEqual(persisted, [result.state]);
@@ -303,7 +314,7 @@ test("review conflict updates the blocking hash without claiming delivery", asyn
 	assert.equal(persisted[0]?.currentDiffHash, conflictHash);
 });
 
-test("review storage failure after a provisional segment stays pending", async () => {
+test("scope/integrity storage failure stays pending and fails the delivery boundary", async () => {
 	const persisted: DelegationState[] = [];
 	let calls = 0;
 	const result = await completeDefaultDelegationDeliveryV2({
@@ -317,9 +328,6 @@ test("review storage failure after a provisional segment stays pending", async (
 	}, {
 		review: async () => {
 			calls += 1;
-			if (calls === 1) {
-				return provisionalReview({ coverage_complete: false, remaining_paths: ["src/b.ts"] });
-			}
 			return {
 				ok: false,
 				error: { code: "storage_failure", message: "injected" },
@@ -332,8 +340,38 @@ test("review storage failure after a provisional segment stays pending", async (
 	assert.equal(result.code, "review_failed");
 	assert.equal(result.review_error, "storage_failure");
 	assert.equal(result.state.status, "PENDING_REVIEW");
-	assert.equal(result.state.currentDiffHash, REVIEW_HASH);
-	assert.equal(calls, 2);
+	assert.equal(result.state.currentDiffHash, BEFORE_HASH);
+	assert.equal(calls, 1);
+	assert.deepEqual(persisted, []);
+});
+
+test("complete zero-delta packet is the only mechanical implementation closure", async () => {
+	const persisted: DelegationState[] = [];
+	const result = await completeDefaultDelegationDeliveryV2({
+		projectRoot: "/project",
+		delegationId: ID,
+		changedPaths: [],
+		state: pendingState(),
+		exec,
+		now: NOW,
+		persistState: (state) => persisted.push(state),
+	}, {
+		review: async () => successfulReview({
+			checked_paths: [],
+			displayed_paths: [],
+			remaining_paths: [],
+			fully_presented_paths: [],
+			presentation_remaining_paths: [],
+			presentation_complete: true,
+			semantic_review: "not_required",
+			patch: [],
+		}, true),
+	});
+	assert.equal(result.ok, true);
+	if (!result.ok) return;
+	assert.equal(result.state.status, "REVIEWED");
+	assert.equal(result.semantic_review, "not_required");
+	assert.equal(result.semantic_risk, "low");
 	assert.deepEqual(persisted, [result.state]);
 });
 

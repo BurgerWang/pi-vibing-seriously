@@ -14,6 +14,7 @@ import {
 	type DelegateToolController,
 } from "../extensions/workbench-runtime/core/delegate-tool-controller.ts";
 import { emptyDelegationState } from "../extensions/workbench-runtime/core/delegation-state.ts";
+import type { ReviewRecord } from "../extensions/workbench-runtime/core/diff-review.ts";
 import {
 	registerRecoveryTool,
 	type RecoveryToolController,
@@ -23,6 +24,7 @@ import {
 	type ReviewToolController,
 } from "../extensions/workbench-runtime/core/review-tool-controller.ts";
 import { RUNTIME_CONTROLLER_SERVICES } from "../extensions/workbench-runtime/core/runtime-controller-services.ts";
+import { withTempDir, writeConfigFile } from "./helpers.ts";
 
 interface ToolResult {
 	content: Array<{ type: string; text?: string }>;
@@ -164,6 +166,100 @@ test("review controller refuses corrupt v2 authority and never falls back to leg
 	assert.doesNotMatch(resultText(result), /private storage detail/);
 });
 
+test("review controller reserves the outer semantic header before rendering a complete packet", async () => {
+	const fixed = new Date("2026-08-21T01:12:13.000Z");
+	const delegationId = "20260821-011213-W1r2";
+	const boundHash = "a".repeat(64);
+	let packetMaxBytes = 0;
+	let packetMaxLines = 0;
+	let packetText = "";
+	const state = {
+		latestId: delegationId,
+		status: "PENDING_REVIEW" as const,
+		currentDiffHash: boundHash,
+		blockedWriteAttempts: 0,
+		updatedAt: fixed.toISOString(),
+	};
+	const record: ReviewRecord = {
+		schema_version: 2,
+		delegation_id: delegationId,
+		reviewed_at: fixed.toISOString(),
+		verdict: "PASS",
+		bound_diff_hash: boundHash,
+		recorded_after_hash: boundHash,
+		mismatch: false,
+		drift_paths: [],
+		violations: [],
+		allowed_paths: ["src/**"],
+		checked_paths: ["src/a.ts"],
+		include_paths: ["src/a.ts"],
+		patch: [{ path: "src/a.ts", source: "git-diff", text: "+a", truncated: false }],
+		patch_truncated: false,
+		patch_paths: [{ path: "src/a.ts", source: "git-diff", bytes: 2, truncated: false }],
+		notes: [],
+		displayed_paths: ["src/a.ts"],
+		remaining_paths: [],
+		coverage_complete: true,
+		fully_presented_paths: ["src/a.ts"],
+		presentation_remaining_paths: [],
+		presentation_complete: true,
+		semantic_review: "required",
+		review_path: `.pi/workbench/delegations/${delegationId}/v2/review.json`,
+	};
+	const controller = {
+		services: {
+			now: () => fixed,
+			readCommittedGeneration: async () => ({ ok: true, value: { state: { status: "PENDING_REVIEW" } } }),
+			readRecoverableUnpublished: async () => ({ ok: false, error: { code: "not_recoverable" } }),
+			reviewV2: async (input: { maxBytes: number; maxLines: number }) => {
+				packetMaxBytes = input.maxBytes;
+				packetMaxLines = input.maxLines;
+				packetText = "x".repeat(packetMaxBytes);
+				return {
+					ok: true,
+					review: { ok: true, record, lines: [packetText] },
+					transaction: { status: "PENDING_REVIEW" },
+					review_hash: "b".repeat(64),
+					review_path: record.review_path,
+					finalized: false,
+				};
+			},
+			reviewLegacy: async () => { throw new Error("must use v2"); },
+		},
+		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+		secrets: [],
+		trustedOrError: () => undefined,
+		projectRootFor: async () => "/project",
+		peekOutputAuthorization: () => undefined,
+		syncLease: () => {},
+		reconcileProjectAuthority: async () => true,
+		getProjectAuthorityBlockReason: () => undefined,
+		getProjectAuthorityIssueCode: () => undefined,
+		getDelegationState: () => state,
+		setDelegationState: () => {},
+		isStrictMirrorDirty: () => false,
+		setStrictMirrorDirty: () => {},
+		persistDelegationState: () => {},
+		persistDelegationStateStrict: () => {},
+		refreshCompactFacts: () => {},
+		refreshStatus: async () => {},
+	} as unknown as Omit<ReviewToolController, "pi">;
+	const tool = captureRegistration(registerReviewTool, controller);
+	const result = await tool.execute(
+		"review-budget",
+		{ delegation_id: delegationId, max_bytes: 4_096, max_lines: 56 },
+		undefined,
+		undefined,
+		context(),
+	);
+
+	assert.ok(packetMaxBytes > 0 && packetMaxBytes < 4_096, "semantic header bytes are removed from the packet budget");
+	assert.equal(packetMaxLines, 54, "the two semantic header lines are removed from the packet line budget");
+	assert.equal(resultText(result).split("\n").at(-1), packetText, "the outer clamp presents the complete saturated packet");
+	assert.ok(Buffer.byteLength(resultText(result), "utf8") <= 4_096);
+	assert.equal(result.details.presentation_complete, true);
+});
+
 test("delegate controller refuses unavailable repair authority before execution", async () => {
 	const fixed = new Date("2026-08-21T02:03:04.000Z");
 	let legacyCalls = 0;
@@ -227,6 +323,99 @@ test("delegate controller refuses unavailable repair authority before execution"
 	assert.equal(reconcileTime, fixed.toISOString());
 	assert.equal(legacyCalls, 0);
 	assert.equal(executionCalls, 0);
+});
+
+test("delegate controller preflights recipe references before authority work and rechecks them before launch", async () => {
+	await withTempDir(async (projectRoot) => {
+		const recipeYaml = (mutation: "none" | "source") => [
+			"recipes:",
+			"  - name: unit",
+			"    command: [node, --test]",
+			`    mutation: ${mutation}`,
+			"",
+		].join("\n");
+		await writeConfigFile(projectRoot, "recipes.yaml", recipeYaml("source"));
+
+		const fixed = new Date("2026-08-21T02:13:14.000Z");
+		let reconcileCalls = 0;
+		let executionCalls = 0;
+		let stateWrites = 0;
+		let capturedContract: Record<string, unknown> | undefined;
+		const controller = {
+			services: {
+				now: () => fixed,
+				makeDelegationId: () => "20260821-021314-W1r2",
+				readCommittedGeneration: async () => ({ ok: false, error: { code: "not_found" } }),
+				readRecoverableUnpublished: async () => ({ ok: false, error: { code: "not_recoverable" } }),
+				readLegacyLedger: async () => null,
+				executeDelegation: async (input: {
+					contract: Record<string, unknown>;
+					onPrepared?: (transaction: unknown, before: { diffHash: string }) => Promise<void>;
+				}) => {
+					executionCalls += 1;
+					capturedContract = input.contract;
+					await writeConfigFile(projectRoot, "recipes.yaml", recipeYaml("source"));
+					try {
+						await input.onPrepared?.({}, { diffHash: "a".repeat(64) });
+					} catch {
+						return {
+							ok: false,
+							code: "prepared_callback_failed",
+							durable_state: { status: "ABORTED", postcondition_reasons: [] },
+						};
+					}
+					throw new Error("verification drift should stop before worker launch");
+				},
+				completeDefaultDelivery: async () => { throw new Error("must not deliver"); },
+				buildTrustedRecoveryAuthority: async () => undefined,
+			},
+			exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+			secrets: [],
+			trustedOrError: () => undefined,
+			projectRootFor: async () => projectRoot,
+			reconcileProjectAuthority: async () => { reconcileCalls += 1; },
+			getProjectAuthorityBlockReason: () => undefined,
+			collectCurrentDelegationBinding: async () => ({ status: "fresh", hash: "a".repeat(64) }),
+			projectTerminalReviewedBinding: async () => null,
+			getDelegationState: () => emptyDelegationState(),
+			setDelegationState: () => { stateWrites += 1; },
+			persistDelegationState: () => {},
+			persistDelegationStateStrict: () => { stateWrites += 1; },
+			markTerminalMirrorBlocked: () => {},
+			refreshStatus: async () => {},
+			bindTrustedIngressAuthority: () => undefined,
+			rememberTrustedIngressAuthority: () => {},
+		} as unknown as Omit<DelegateToolController<unknown>, "pi">;
+		const tool = captureRegistration(registerDelegateTool, controller);
+		const params = {
+			task: "Implement the bounded change.",
+			task_kind: "implementation",
+			allowed_paths: ["src/**"],
+			acceptance_criteria: ["The change is implemented."],
+			verification: ["recipe:unit"],
+			timeout_seconds: 60,
+			budget_profile: "extended",
+			extended_reason: "Cross-module evidence is intentionally retained.",
+		};
+
+		await assert.rejects(
+			tool.execute("delegate-preflight", params, undefined, undefined, context()),
+			/verification recipe_mutates; recipe=unit/,
+		);
+		assert.equal(reconcileCalls, 0, "invalid requested recipe stops before authority reconciliation");
+		assert.equal(executionCalls, 0, "invalid requested recipe stops before transaction execution");
+
+		await writeConfigFile(projectRoot, "recipes.yaml", recipeYaml("none"));
+		await assert.rejects(
+			tool.execute("delegate-recheck", params, undefined, undefined, context()),
+			/prepared_callback_failed/,
+		);
+		assert.equal(reconcileCalls, 2, "authority is reconciled before execution and again after the aborted transaction");
+		assert.equal(executionCalls, 1);
+		assert.equal(stateWrites, 0, "recipe drift is detected before the prepared callback projects session state");
+		assert.equal(capturedContract?.extended_reason, "Cross-module evidence is intentionally retained.");
+		assert.deepEqual(capturedContract?.verification, ["recipe:unit"]);
+	});
 });
 
 test("delegate controller exposes only the bounded artifact builder category", async () => {

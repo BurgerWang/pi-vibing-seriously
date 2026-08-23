@@ -1,10 +1,10 @@
 /**
  * Fixed Sol -> Luna default delivery for successful implementation workers.
  *
- * The public runtime delegates execution once, then this boundary performs the
- * ordinary actual-diff review and closes the session mirror when that review is
- * complete. The explicit review tool remains available for incomplete,
- * conflicting, or recovery cases.
+ * The public runtime delegates execution once, then this boundary produces one
+ * bounded scope/integrity actual-diff packet.  Any non-zero implementation
+ * delta stays PENDING_REVIEW until Sol explicitly accepts the exact bound hash;
+ * a mechanical PASS is never semantic quality or Gate authority.
  */
 
 import type { ExecFn } from "./config.ts";
@@ -18,10 +18,17 @@ import {
 	observeDiffChange,
 	type DelegationState,
 } from "./delegation-state.ts";
+import {
+	classifySemanticReviewRisk,
+	isScopeIntegrityPacketComplete,
+	type SemanticReviewRisk,
+} from "./diff-review.ts";
 
-export const DEFAULT_DELIVERY_REVIEW_MAX_LINES = 400 as const;
-export const DEFAULT_DELIVERY_REVIEW_MAX_BYTES = 32_768 as const;
-export const DEFAULT_DELIVERY_REVIEW_MAX_SEGMENTS = 32 as const;
+/** Leaves room for the fixed worker handoff facts inside its 12 KiB/120-line cap. */
+export const DEFAULT_DELIVERY_REVIEW_MAX_LINES = 56 as const;
+export const DEFAULT_DELIVERY_REVIEW_MAX_BYTES = 5_120 as const;
+/** Compatibility export: default delivery intentionally emits one packet only. */
+export const DEFAULT_DELIVERY_REVIEW_MAX_SEGMENTS = 1 as const;
 
 export type DefaultDelegationDeliveryErrorCode =
 	| "review_failed"
@@ -48,6 +55,11 @@ export interface DefaultDelegationDeliveryV2Success {
 	ok: true;
 	state: DelegationState;
 	review: Extract<DelegationReviewV2Result, { ok: true }>;
+	review_kind: "scope_integrity";
+	scope_integrity_verdict: "PASS" | "FAIL";
+	presentation_complete: boolean;
+	semantic_review: "required" | "not_required";
+	semantic_risk: SemanticReviewRisk;
 }
 
 export interface DefaultDelegationDeliveryV2Failure {
@@ -80,15 +92,14 @@ function persistProjected(
 }
 
 /**
- * Review and close one ordinary successful implementation delivery.
+ * Produce one scope/integrity packet for an ordinary implementation delivery.
  *
- * No worker prose is accepted here. Success requires the immutable v2 review
- * boundary to produce a finalized PASS with complete coverage. Incomplete
- * ordinary reviews automatically continue against only the prior segment's
- * remaining paths. The durable v2 review adapter binds and merges those
- * segments; this boundary adds a fixed segment cap and strict progress check
- * so automatic delivery can never loop indefinitely. Explicit review remains
- * the recovery path for conflicts, storage failures, and bounded exhaustion.
+ * No worker prose is accepted here.  A single, handoff-sized packet is
+ * generated so Sol sees actual diff evidence in the delegate result itself.
+ * Incomplete/truncated packets remain provisional and use the explicit review
+ * tool for bounded follow-up segments.  Only a complete zero-delta packet may
+ * close mechanically; every actual implementation delta remains pending for a
+ * separate hash-bound Sol semantic ACCEPT.
  */
 export async function completeDefaultDelegationDeliveryV2(
 	input: CompleteDefaultDelegationDeliveryV2Input,
@@ -99,114 +110,47 @@ export async function completeDefaultDelegationDeliveryV2(
 	}
 
 	const runReview = dependencies.review ?? reviewDelegationV2;
-	let includePaths = [...input.changedPaths];
+	const review = await runReview({
+		projectRoot: input.projectRoot,
+		delegationId: input.delegationId,
+		exec: input.exec,
+		includePaths: [...input.changedPaths],
+		maxLines: DEFAULT_DELIVERY_REVIEW_MAX_LINES,
+		maxBytes: DEFAULT_DELIVERY_REVIEW_MAX_BYTES,
+		...(input.secrets === undefined ? {} : { secrets: [...input.secrets] }),
+		now: input.now,
+	});
 	let projected = input.state;
-	let boundDiffHash: string | undefined;
-	let lastReviewPath: string | undefined;
-
-	for (let segment = 0; segment < DEFAULT_DELIVERY_REVIEW_MAX_SEGMENTS; segment += 1) {
-		const review = await runReview({
-			projectRoot: input.projectRoot,
-			delegationId: input.delegationId,
-			exec: input.exec,
-			includePaths: [...includePaths],
-			maxLines: DEFAULT_DELIVERY_REVIEW_MAX_LINES,
-			maxBytes: DEFAULT_DELIVERY_REVIEW_MAX_BYTES,
-			...(input.secrets === undefined ? {} : { secrets: [...input.secrets] }),
-			now: input.now,
-		});
-
-		if (!review.ok) {
-			if (review.binding_hash !== undefined) {
-				projected = observeDiffChange(input.state, review.binding_hash, input.now);
-			}
-			const persistenceFailure = persistProjected(input, projected);
-			if (persistenceFailure !== undefined) return persistenceFailure;
-			return {
-				ok: false,
-				code: "review_failed",
-				state: projected,
-				review_error: review.error.code,
-			};
-		}
-
-		lastReviewPath = review.review_path;
-		const record = review.review.record;
-		if (!review.review.ok || record === undefined) {
-			const persistenceFailure = persistProjected(input, projected);
-			if (persistenceFailure !== undefined) return persistenceFailure;
-			return {
-				ok: false,
-				code: "review_failed",
-				state: projected,
-				review_path: review.review_path,
-			};
-		}
-
-		if (boundDiffHash !== undefined && record.bound_diff_hash !== boundDiffHash) {
-			projected = observeDiffChange(input.state, record.bound_diff_hash, input.now);
-			const persistenceFailure = persistProjected(input, projected);
-			if (persistenceFailure !== undefined) return persistenceFailure;
-			return {
-				ok: false,
-				code: "review_failed",
-				state: projected,
-				review_path: review.review_path,
-			};
-		}
-		boundDiffHash = record.bound_diff_hash;
-		projected = observeDiffChange(input.state, boundDiffHash, input.now);
-
-		const complete = review.finalized
-			&& record.verdict === "PASS"
-			&& record.coverage_complete
-			&& record.remaining_paths.length === 0;
-		if (complete) {
-			if (projected.status !== "REVIEWED") {
-				const marked = markReviewed(projected, input.now);
-				if (!marked.ok) {
-					return {
-						ok: false,
-						code: "state_transition_failed",
-						state: input.state,
-						review_path: review.review_path,
-					};
-				}
-				projected = marked.state;
-			}
-			const persistenceFailure = persistProjected(input, projected);
-			if (persistenceFailure !== undefined) {
-				return { ...persistenceFailure, review_path: review.review_path };
-			}
-			return { ok: true, state: projected, review };
-		}
-		if (record.coverage_complete || record.remaining_paths.length === 0) {
-			const persistenceFailure = persistProjected(input, projected);
-			if (persistenceFailure !== undefined) return persistenceFailure;
-			return {
-				ok: false,
-				code: "review_failed",
-				state: projected,
-				review_path: review.review_path,
-			};
-		}
-
-		const previousPaths = new Set(includePaths);
-		const remainingPaths = [...record.remaining_paths];
-		const remainingSet = new Set(remainingPaths);
-		const progressed = remainingPaths.length < includePaths.length
-			&& remainingSet.size === remainingPaths.length
-			&& remainingPaths.every((path) => previousPaths.has(path));
-		if (!progressed) break;
-		includePaths = remainingPaths;
+	if (!review.ok) {
+		if (review.binding_hash !== undefined) projected = observeDiffChange(input.state, review.binding_hash, input.now);
+		const persistenceFailure = persistProjected(input, projected);
+		if (persistenceFailure !== undefined) return persistenceFailure;
+		return { ok: false, code: "review_failed", state: projected, review_error: review.error.code };
 	}
-
+	const record = review.review.record;
+	if (!review.review.ok || record === undefined) {
+		return { ok: false, code: "review_failed", state: projected, review_path: review.review_path };
+	}
+	projected = observeDiffChange(input.state, record.bound_diff_hash, input.now);
+	const semantic = classifySemanticReviewRisk(record.checked_paths);
+	const presentationComplete = isScopeIntegrityPacketComplete(record);
+	if (!semantic.required && presentationComplete && review.finalized && projected.status !== "REVIEWED") {
+		const marked = markReviewed(projected, input.now);
+		if (!marked.ok) {
+			return { ok: false, code: "state_transition_failed", state: input.state, review_path: review.review_path };
+		}
+		projected = marked.state;
+	}
 	const persistenceFailure = persistProjected(input, projected);
-	if (persistenceFailure !== undefined) return persistenceFailure;
+	if (persistenceFailure !== undefined) return { ...persistenceFailure, review_path: review.review_path };
 	return {
-		ok: false,
-		code: "review_incomplete",
+		ok: true,
 		state: projected,
-		...(lastReviewPath === undefined ? {} : { review_path: lastReviewPath }),
+		review,
+		review_kind: "scope_integrity",
+		scope_integrity_verdict: record.verdict,
+		presentation_complete: presentationComplete,
+		semantic_review: semantic.required ? "required" : "not_required",
+		semantic_risk: semantic.risk,
 	};
 }

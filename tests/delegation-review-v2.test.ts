@@ -8,6 +8,7 @@ import test from "node:test";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import { reviewDelegationV2 } from "../extensions/workbench-runtime/core/delegation-review-v2.ts";
+import { reconcileProjectDelegationAuthorityV2 } from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
 import { deriveFinalizedDelegationWorkspaceFactsV2 } from "../extensions/workbench-runtime/core/delegation-workspace-v2.ts";
 import { bindDelegationBoundedTaskContractV2, buildDelegationCommittedArtifactsV2 } from "../extensions/workbench-runtime/core/delegation-transaction-artifacts.ts";
 import { finalizeDelegationChangeSetLifecycleV2, prepareDelegationChangeSetLifecycleV2 } from "../extensions/workbench-runtime/core/delegation-change-set-lifecycle.ts";
@@ -49,6 +50,7 @@ const IDENTITY: DelegationWorkerIdentity = {
 	model: WORKER_MODEL_ID,
 	worker_id: "review-v2-worker",
 };
+const SOL_REVIEWER = { provider: "openai-codex", model: "gpt-5.6-sol" } as const;
 
 function at(second: number): string {
 	return `2026-08-17T17:00:${String(second).padStart(2, "0")}.000Z`;
@@ -92,14 +94,14 @@ interface ReviewFixture {
 	records: DelegationCommittedRecords;
 }
 
-function workerFacts(report: string): LedgerWorkerFacts {
+function workerFacts(report: string, spendProfile: "standard" | "extended" = "standard"): LedgerWorkerFacts {
 	return {
 		provider: WORKER_PROVIDER, model: WORKER_MODEL_ID, status: "success", exitCode: 0, turns: 1,
 		stopReason: "end_turn", errorMessage: null,
 		usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 		cacheHitRatio: 0,
 		budget: { maxContextTokens: 15, maxContextRatio: 0.001, softBudgetReached: false, hardBudgetExceeded: false, compactionCount: 0, compactionReasons: [] },
-		spendProfile: "standard", spendState: { turns: 1, totalTokens: 15, outputTokens: 5 }, spendBand: "ok",
+		spendProfile, spendState: { turns: 1, totalTokens: 15, outputTokens: 5 }, spendBand: "ok",
 		spendReasons: [], spendSoftReached: { turns: false, totalTokens: false, outputTokens: false },
 		spendHardExceeded: { turns: false, totalTokens: false, outputTokens: false }, reportSummary: report,
 	};
@@ -110,6 +112,8 @@ async function setupReviewFixture(
 	preDirtyPath?: string,
 	writeOrder: readonly string[] = paths,
 	withPlanReference = false,
+	withExtendedReason = false,
+	workerContent: (path: string) => string | Buffer = (path) => `worker:${path}\n`,
 ): Promise<ReviewFixture> {
 	const root = await mkdtemp(join(tmpdir(), "delegation-review-v2-"));
 	await git(root, ["init"]);
@@ -132,7 +136,8 @@ async function setupReviewFixture(
 		acceptance_criteria: ["all authorized paths are changed"],
 		verification: ["inspect the exact worker diff"],
 		timeout_seconds: 600,
-		budget_profile: "standard",
+		budget_profile: withExtendedReason ? "extended" : "standard",
+		...(withExtendedReason ? { extended_reason: "Cross-module review fixture preserves bounded authority." } : {}),
 		...(withPlanReference ? {
 			repair_of: "20260817-160000-rp01",
 			plan_ref: {
@@ -181,7 +186,7 @@ async function setupReviewFixture(
 		assert.equal(begun.ok, true);
 		if (!begun.ok) throw new Error("journal begin failed");
 		revision = begun.value.revision;
-		await writeFile(join(root, path), `worker:${path}\n`);
+		await writeFile(join(root, path), workerContent(path));
 		const completed = await completeWriteJournalOperation({
 			project_root: root, delegation_id: ID, contract_hash: contract.value.contract_hash,
 			expected_revision: revision, operation_id: operationId, kind: "write", path, outcome: "succeeded",
@@ -222,7 +227,7 @@ async function setupReviewFixture(
 	const report = `## Completed\n- changed fixture files\n## Files Changed\n${workerPaths.map((path) => `- ${path}`).join("\n")}\n## Verification\n- facts\n## Remaining Risks\n- none\n`;
 	const built = buildDelegationCommittedArtifactsV2({
 		transaction: committing.value, contract: contract.value, before: workspace.value.before, after: workspace.value.after,
-		changeSetLifecycle: lifecycle.value, worker: workerFacts(report), reportText: report,
+		changeSetLifecycle: lifecycle.value, worker: workerFacts(report, withExtendedReason ? "extended" : "standard"), reportText: report,
 	});
 	assert.equal(built.ok, true);
 	if (!built.ok) throw new Error("artifact build failed");
@@ -248,8 +253,8 @@ test("review v2 fixture: reverse journal order builds, commits, and strict-reads
 	}
 });
 
-test("review v2: plan_ref and repair_of coexist in the committed contract and strict review rebinds both", async () => {
-	const fixture = await setupReviewFixture(["src/a.ts"], undefined, ["src/a.ts"], true);
+test("review v2: plan_ref, repair_of, and extended_reason coexist and strict review rebinds their hash", async () => {
+	const fixture = await setupReviewFixture(["src/a.ts"], undefined, ["src/a.ts"], true, true);
 	try {
 		const strict = await readDelegationCommittedGenerationV2(fixture.root, ID);
 		assert.equal(strict.ok, true, strict.ok ? "" : strict.error.code);
@@ -258,6 +263,8 @@ test("review v2: plan_ref and repair_of coexist in the committed contract and st
 		const contract = before.contract as Record<string, unknown>;
 		assert.equal((contract.plan_ref as Record<string, unknown>).plan_id, "review-v2-plan");
 		assert.equal(contract.repair_of, "20260817-160000-rp01");
+		assert.equal(contract.extended_reason, "Cross-module review fixture preserves bounded authority.");
+		assert.equal(contract.contract_hash, strict.value.state.contract_hash, "extended reason remains in strict hash authority");
 		const reviewed = await reviewDelegationV2({
 			projectRoot: fixture.root,
 			delegationId: ID,
@@ -291,7 +298,38 @@ async function cleanup(fixture: ReviewFixture): Promise<void> {
 	await rm(fixture.root, { recursive: true, force: true });
 }
 
-test("review v2: complete PASS finalizes exact persisted bytes and immutable replay refuses drift", async () => {
+async function acceptPresentedReview(
+	fixture: ReviewFixture,
+	boundDiffHash: string,
+	second: number,
+	storage?: Parameters<typeof reviewDelegationV2>[0]["storage"],
+) {
+	return reviewDelegationV2({
+		projectRoot: fixture.root,
+		delegationId: ID,
+		exec: spawnExec,
+		now: at(second),
+		semanticDecision: "ACCEPT",
+		expectedBoundDiffHash: boundDiffHash,
+		reviewer: SOL_REVIEWER,
+		...(storage === undefined ? {} : { storage }),
+	});
+}
+
+async function presentAndAcceptReview(fixture: ReviewFixture, second = 4) {
+	const presented = await reviewDelegationV2({
+		projectRoot: fixture.root, delegationId: ID, exec: spawnExec, now: at(second),
+	});
+	assert.equal(presented.ok, true, presented.ok ? "" : JSON.stringify(presented.error));
+	if (!presented.ok || presented.review.record === undefined) throw new Error("presentation failed");
+	assert.equal(presented.finalized, false);
+	const accepted = await acceptPresentedReview(fixture, presented.review.record.bound_diff_hash, second + 1);
+	assert.equal(accepted.ok, true, accepted.ok ? "" : JSON.stringify(accepted.error));
+	if (!accepted.ok) throw new Error("acceptance failed");
+	return accepted;
+}
+
+test("review v2: complete scope packet stays provisional until a second bound Sol ACCEPT, then immutable replay refuses drift", async () => {
 	const fixture = await setupReviewFixture();
 	try {
 		const input = { projectRoot: fixture.root, delegationId: ID, exec: spawnExec, includePaths: ["src/a.ts"], secrets: ["test-secret"], now: at(4) };
@@ -300,25 +338,164 @@ test("review v2: complete PASS finalizes exact persisted bytes and immutable rep
 		assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
 		if (!result.ok) return;
 		assert.deepEqual(input, inputSnapshot, "review does not mutate caller-owned input arrays");
-		assert.equal(result.finalized, true);
-		assert.equal(result.transaction.status, "REVIEWED");
+		assert.equal(result.finalized, false);
+		assert.equal(result.transaction.status, "PENDING_REVIEW");
+		assert.equal(result.review.record?.semantic_review, "required");
+		assert.equal(result.review.record?.semantic_acceptance, undefined);
+		const boundHash = result.review.record?.bound_diff_hash;
+		assert.equal(typeof boundHash, "string");
+		const accepted = await acceptPresentedReview(fixture, boundHash!, 5);
+		assert.equal(accepted.ok, true, accepted.ok ? "" : JSON.stringify(accepted.error));
+		if (!accepted.ok) return;
+		assert.equal(accepted.finalized, true);
+		assert.equal(accepted.transaction.status, "REVIEWED");
+		assert.equal(accepted.review.record?.semantic_review, "accepted");
+		assert.deepEqual(accepted.review.record?.semantic_acceptance, {
+			decision: "ACCEPT",
+			expected_bound_diff_hash: boundHash,
+			reviewer: SOL_REVIEWER,
+			accepted_at: at(5),
+		});
 		const bytes = await readFile(reviewPath(fixture.root));
 		const hash = createHash("sha256").update(bytes).digest("hex");
-		assert.equal(result.review_hash, hash);
-		assert.equal(result.transaction.review?.review_hash, hash);
+		assert.equal(accepted.review_hash, hash);
+		assert.equal(accepted.transaction.review?.review_hash, hash);
 		const strict = await readDelegationReviewV2(fixture.root, ID);
 		assert.equal(strict.ok, true);
-		if (strict.ok) assert.deepEqual(result.review.record, strict.value.review, "returned and exact persisted records share one canonical shape");
-		const replay = await reviewDelegationV2(input);
+		if (strict.ok) assert.deepEqual(accepted.review.record, strict.value.review, "returned and exact persisted records share one canonical shape");
+		const explicitReplay = await acceptPresentedReview(fixture, boundHash!, 6);
+		assert.equal(explicitReplay.ok, true, explicitReplay.ok ? "" : JSON.stringify(explicitReplay.error));
+		assert.deepEqual(await readFile(reviewPath(fixture.root)), bytes, "matching explicit ACCEPT replay is idempotent");
+		const wrongReplayIdentity = await reviewDelegationV2({
+			projectRoot: fixture.root,
+			delegationId: ID,
+			exec: spawnExec,
+			now: at(6),
+			semanticDecision: "ACCEPT",
+			expectedBoundDiffHash: boundHash!,
+			reviewer: { provider: "openai", model: "gpt-5.6-sol" },
+		});
+		assert.equal(wrongReplayIdentity.ok, false);
+		if (!wrongReplayIdentity.ok) assert.equal(wrongReplayIdentity.error.code, "review_conflict");
+		const wrongReplayHash = await acceptPresentedReview(fixture, "f".repeat(64), 6);
+		assert.equal(wrongReplayHash.ok, false);
+		if (!wrongReplayHash.ok) assert.equal(wrongReplayHash.error.code, "review_conflict");
+		const replay = await reviewDelegationV2({ ...input, now: at(6) });
 		assert.equal(replay.ok, true);
 		assert.deepEqual(await readFile(reviewPath(fixture.root)), bytes, "finalized bytes never change on replay");
 		await writeFile(join(fixture.root, "src/a.ts"), "post-review drift\n");
-		const drift = await reviewDelegationV2(input);
+		const drift = await reviewDelegationV2({ ...input, now: at(7) });
 		assert.equal(drift.ok, false);
 		if (!drift.ok) assert.equal(drift.error.code, "review_conflict");
 		assert.deepEqual(await readFile(reviewPath(fixture.root)), bytes);
 	} finally {
 		await cleanup(fixture);
+	}
+});
+
+test("review v2: first-call ACCEPT, wrong hash, non-Sol identity, and incomplete packet all fail closed", async () => {
+	const fixture = await setupReviewFixture(["src/a.ts", "src/b.ts"]);
+	try {
+		const firstAccept = await acceptPresentedReview(fixture, "a".repeat(64), 4);
+		assert.equal(firstAccept.ok, false);
+		if (!firstAccept.ok) assert.equal(firstAccept.error.code, "review_invalid");
+		const first = await reviewDelegationV2({
+			projectRoot: fixture.root, delegationId: ID, exec: spawnExec, includePaths: ["src/a.ts"], now: at(5),
+		});
+		assert.equal(first.ok, true, first.ok ? "" : JSON.stringify(first.error));
+		if (!first.ok || first.review.record === undefined) return;
+		assert.equal(first.review.record.presentation_complete, false);
+		const incompleteAccept = await acceptPresentedReview(fixture, first.review.record.bound_diff_hash, 6);
+		assert.equal(incompleteAccept.ok, false);
+		if (!incompleteAccept.ok) assert.equal(incompleteAccept.error.code, "review_invalid");
+		const second = await reviewDelegationV2({
+			projectRoot: fixture.root, delegationId: ID, exec: spawnExec, includePaths: ["src/b.ts"], now: at(7),
+		});
+		assert.equal(second.ok, true, second.ok ? "" : JSON.stringify(second.error));
+		if (!second.ok || second.review.record === undefined) return;
+		assert.equal(second.review.record.presentation_complete, true);
+		const wrongHash = await acceptPresentedReview(fixture, "f".repeat(64), 8);
+		assert.equal(wrongHash.ok, false);
+		if (!wrongHash.ok) assert.equal(wrongHash.error.code, "review_conflict");
+		const wrongIdentity = await reviewDelegationV2({
+			projectRoot: fixture.root,
+			delegationId: ID,
+			exec: spawnExec,
+			now: at(8),
+			semanticDecision: "ACCEPT",
+			expectedBoundDiffHash: second.review.record.bound_diff_hash,
+			reviewer: { provider: "openai-codex", model: "gpt-5.6-luna" },
+		});
+		assert.equal(wrongIdentity.ok, false);
+		if (!wrongIdentity.ok) assert.equal(wrongIdentity.error.code, "review_invalid");
+		const durable = await readDelegationTransactionV2(fixture.root, ID);
+		assert.equal(durable.ok, true);
+		if (durable.ok) assert.equal(durable.value.status, "PENDING_REVIEW");
+	} finally {
+		await cleanup(fixture);
+	}
+});
+
+test("review v2: strict compact SVG/JSON fact packets can terminate through Sol ACCEPT while ordinary truncated source cannot", async () => {
+	const compactFixture = await setupReviewFixture(
+		["src/large.svg", "src/bundle.json"],
+		undefined,
+		["src/large.svg", "src/bundle.json"],
+		false,
+		false,
+		(path) => path.endsWith(".svg")
+			? `<svg>${"<path d=\"M0 0\"/>".repeat(3_000)}</svg>\n`
+			: JSON.stringify({ payload: "x".repeat(40_000), tail: "done" }),
+	);
+	try {
+		const presented = await reviewDelegationV2({
+			projectRoot: compactFixture.root, delegationId: ID, exec: spawnExec, now: at(4),
+		});
+		assert.equal(presented.ok, true, presented.ok ? "" : JSON.stringify(presented.error));
+		if (!presented.ok || presented.review.record === undefined) return;
+		assert.equal(presented.finalized, false);
+		assert.equal(presented.review.record.patch_truncated, true, "compact content remains honestly summarized");
+		assert.deepEqual(presented.review.record.patch.map((entry) => entry.source), ["compact", "compact"]);
+		assert.deepEqual(presented.review.record.fully_presented_paths, ["src/bundle.json", "src/large.svg"]);
+		assert.equal(presented.review.record.presentation_complete, true, "strict compact facts are a complete bounded presentation unit");
+		assert.match(presented.review.lines.join("\n"), /high risk/);
+		assert.match(presented.review.lines.join("\n"), /generator equality remains NOT_VERIFIED/);
+		const accepted = await acceptPresentedReview(compactFixture, presented.review.record.bound_diff_hash, 5);
+		assert.equal(accepted.ok, true, accepted.ok ? "" : JSON.stringify(accepted.error));
+		if (accepted.ok) {
+			assert.equal(accepted.finalized, true);
+			assert.equal(accepted.transaction.status, "REVIEWED");
+			assert.equal(accepted.review.record?.semantic_review, "accepted");
+		}
+	} finally {
+		await cleanup(compactFixture);
+	}
+
+	const sourceFixture = await setupReviewFixture(
+		["src/large.ts"],
+		undefined,
+		["src/large.ts"],
+		false,
+		false,
+		() => "const value = 1;\n".repeat(4_000),
+	);
+	try {
+		const presented = await reviewDelegationV2({
+			projectRoot: sourceFixture.root, delegationId: ID, exec: spawnExec, maxBytes: 4_096, maxLines: 56, now: at(4),
+		});
+		assert.equal(presented.ok, true, presented.ok ? "" : JSON.stringify(presented.error));
+		if (!presented.ok || presented.review.record === undefined) return;
+		assert.equal(presented.review.record.patch[0]?.source, "git-diff");
+		assert.equal(presented.review.record.patch[0]?.truncated, true);
+		assert.equal(presented.review.record.presentation_complete, false);
+		const refused = await acceptPresentedReview(sourceFixture, presented.review.record.bound_diff_hash, 5);
+		assert.equal(refused.ok, false);
+		if (!refused.ok) assert.equal(refused.error.code, "review_invalid");
+		const durable = await readDelegationTransactionV2(sourceFixture.root, ID);
+		assert.equal(durable.ok, true);
+		if (durable.ok) assert.equal(durable.value.status, "PENDING_REVIEW");
+	} finally {
+		await cleanup(sourceFixture);
 	}
 });
 
@@ -329,12 +506,16 @@ test("review v2: strict schema2 read rejects canonical role, set, hash, identity
 		(artifact) => { artifact.review.relevance_projection.entries[0].path = "src/other.ts"; },
 		(artifact) => { artifact.review.relevance_binding.projection_hash = "f".repeat(64); },
 		(artifact) => { artifact.review.relevance_projection.entries[0].full_identity.sha256 = "e".repeat(64); },
+		(artifact) => { artifact.review.semantic_review = "required"; },
+		(artifact) => { artifact.review.semantic_acceptance.expected_bound_diff_hash = "f".repeat(64); },
+		(artifact) => { artifact.review.semantic_acceptance.reviewer.model = "gpt-5.6-luna"; },
+		(artifact) => { artifact.review.semantic_acceptance.accepted_at = at(59); },
+		(artifact) => { delete artifact.review.semantic_acceptance; },
 	];
 	for (const mutate of variants) {
 		const fixture = await setupReviewFixture();
 		try {
-			const finalized = await reviewDelegationV2({ projectRoot: fixture.root, delegationId: ID, exec: spawnExec, now: at(4) });
-			assert.equal(finalized.ok, true, finalized.ok ? "" : JSON.stringify(finalized.error));
+			await presentAndAcceptReview(fixture);
 			const artifact = JSON.parse(await readFile(reviewPath(fixture.root), "utf8")) as Record<string, any>;
 			mutate(artifact);
 			const bytes = Buffer.from(`${JSON.stringify(artifact, null, 2)}\n`, "utf8");
@@ -354,8 +535,7 @@ test("review v2: strict schema2 read rejects canonical role, set, hash, identity
 test("review v2: historical untagged schema1 authority is full-diff replay-only and never rewritten", async () => {
 	const fixture = await setupReviewFixture();
 	try {
-		const finalized = await reviewDelegationV2({ projectRoot: fixture.root, delegationId: ID, exec: spawnExec, now: at(4) });
-		assert.equal(finalized.ok, true, finalized.ok ? "" : JSON.stringify(finalized.error));
+		await presentAndAcceptReview(fixture);
 		const current = await collectGitFacts(fixture.root, spawnExec);
 		const legacyHash = computeDiffHash(current.changedPaths, current.pathDigests, current.pathStatuses);
 
@@ -390,6 +570,11 @@ test("review v2: historical untagged schema1 authority is full-diff replay-only 
 		delete artifact.review.diff_identity_kind;
 		delete artifact.review.relevance_binding;
 		delete artifact.review.relevance_projection;
+		delete artifact.review.fully_presented_paths;
+		delete artifact.review.presentation_remaining_paths;
+		delete artifact.review.presentation_complete;
+		delete artifact.review.semantic_review;
+		delete artifact.review.semantic_acceptance;
 		artifact.review.bound_diff_hash = legacyHash;
 		artifact.review.recorded_after_hash = legacyHash;
 		artifact.review.mismatch = false;
@@ -406,6 +591,27 @@ test("review v2: historical untagged schema1 authority is full-diff replay-only 
 		const replay = await reviewDelegationV2({ projectRoot: fixture.root, delegationId: ID, exec: spawnExec, now: at(5) });
 		assert.equal(replay.ok, true, replay.ok ? "" : JSON.stringify(replay.error));
 		if (replay.ok) assert.equal(replay.review.record?.schema_version, 1);
+		const reconciled = await reconcileProjectDelegationAuthorityV2({
+			project_root: fixture.root,
+			current_state: {
+				latestId: ID,
+				status: "REVIEWED",
+				currentDiffHash: legacyHash,
+				reviewedDiffHash: legacyHash,
+				blockedWriteAttempts: 0,
+				updatedAt: at(5),
+			},
+			now: at(6),
+			exec: spawnExec,
+		});
+		assert.equal(reconciled.ok, true, reconciled.ok ? "" : JSON.stringify(reconciled.issue));
+		if (reconciled.ok) {
+			assert.equal(reconciled.state?.status, "PENDING_REVIEW", "historical non-zero mechanical REVIEWED cannot survive reconciliation");
+			assert.equal(reconciled.state?.reviewedDiffHash, undefined);
+		}
+		const upgradeRefused = await acceptPresentedReview(fixture, legacyHash, 6);
+		assert.equal(upgradeRefused.ok, false);
+		if (!upgradeRefused.ok) assert.equal(upgradeRefused.error.code, "authority_invalid");
 		assert.deepEqual(await readFile(reviewPath(fixture.root)), legacyReviewBytes);
 	} finally {
 		await cleanup(fixture);
@@ -456,21 +662,24 @@ test("review v2: segmented relevance ignores baseline and artifact drift and rep
 		const second = await reviewDelegationV2({ projectRoot: fixture.root, delegationId: ID, exec: spawnExec, includePaths: ["src/b.ts"], now: at(5) });
 		assert.equal(second.ok, true, second.ok ? "" : JSON.stringify(second.error));
 		if (second.ok) {
-			assert.equal(second.finalized, true);
+			assert.equal(second.finalized, false);
 			assert.equal(second.review.record?.coverage_complete, true);
-			assert.equal(second.transaction.status, "REVIEWED");
+			assert.equal(second.review.record?.presentation_complete, true);
+			assert.equal(second.transaction.status, "PENDING_REVIEW");
 			assert.equal(second.review.record?.bound_diff_hash, first.review.record?.bound_diff_hash);
 		}
+		const accepted = await acceptPresentedReview(fixture, second.ok ? second.review.record!.bound_diff_hash : "", 6);
+		assert.equal(accepted.ok, true, accepted.ok ? "" : JSON.stringify(accepted.error));
 		const finalizedBytes = await readFile(reviewPath(fixture.root));
 		await writeFile(join(fixture.root, "src/pre-dirty.ts"), "after-finalized\n");
 		const artifactPath = join(fixture.root, CONFIG_DIR_NAME, "workbench", "runs", "review-relevance", "report.json");
 		await mkdir(dirname(artifactPath), { recursive: true });
 		await writeFile(artifactPath, "{}\n");
-		const replay = await reviewDelegationV2({ projectRoot: fixture.root, delegationId: ID, exec: spawnExec, now: at(6) });
+		const replay = await reviewDelegationV2({ projectRoot: fixture.root, delegationId: ID, exec: spawnExec, now: at(7) });
 		assert.equal(replay.ok, true, replay.ok ? "" : JSON.stringify(replay.error));
 		if (replay.ok) {
 			assert.equal(replay.finalized, true);
-			assert.equal(replay.review.record?.bound_diff_hash, second.ok ? second.review.record?.bound_diff_hash : undefined);
+			assert.equal(replay.review.record?.bound_diff_hash, accepted.ok ? accepted.review.record?.bound_diff_hash : undefined);
 		}
 		assert.deepEqual(await readFile(reviewPath(fixture.root)), finalizedBytes);
 	} finally {
@@ -503,10 +712,13 @@ test("review v2: Unicode byte-canonical worker paths survive segmented finalizat
 		});
 		assert.equal(second.ok, true, second.ok ? "" : JSON.stringify(second.error));
 		if (!second.ok) return;
-		assert.equal(second.finalized, true);
+		assert.equal(second.finalized, false);
 		assert.deepEqual(second.review.record?.checked_paths, workerPaths);
 		assert.deepEqual(second.review.record?.displayed_paths, workerPaths);
 		assert.deepEqual(second.review.record?.remaining_paths, []);
+		assert.deepEqual(second.review.record?.fully_presented_paths, workerPaths);
+		const accepted = await acceptPresentedReview(fixture, second.review.record!.bound_diff_hash, 6);
+		assert.equal(accepted.ok, true, accepted.ok ? "" : JSON.stringify(accepted.error));
 		const strict = await readDelegationReviewV2(fixture.root, ID);
 		assert.equal(strict.ok, true, strict.ok ? "" : JSON.stringify(strict.error));
 		if (strict.ok) {
@@ -588,6 +800,9 @@ test("review v2: every review fault point fails without strict-readable REVIEWED
 	for (const point of DELEGATION_REVIEW_STORAGE_FAULT_POINTS) {
 		const fixture = await setupReviewFixture();
 		try {
+			const presented = await reviewDelegationV2({ projectRoot: fixture.root, delegationId: ID, exec: spawnExec, now: at(4) });
+			assert.equal(presented.ok, true, presented.ok ? "" : JSON.stringify(presented.error));
+			if (!presented.ok || presented.review.record === undefined) continue;
 			let tripped = false;
 			const adapter = createNodeDelegationTransactionStorageAdapter((actual, bytes) => {
 				if (actual !== point || tripped) return bytes === undefined ? undefined : Uint8Array.from(bytes);
@@ -595,9 +810,7 @@ test("review v2: every review fault point fails without strict-readable REVIEWED
 				if (actual.endsWith(".read") && bytes !== undefined) return Buffer.from("{", "utf8");
 				throw new Error(`injected ${actual}`);
 			});
-			const result = await reviewDelegationV2({
-				projectRoot: fixture.root, delegationId: ID, exec: spawnExec, now: at(4), storage: { adapter },
-			});
+			const result = await acceptPresentedReview(fixture, presented.review.record.bound_diff_hash, 5, { adapter });
 			assert.equal(tripped, true, point);
 			assert.equal(result.ok, false, point);
 			const state = await readDelegationTransactionV2(fixture.root, ID);
@@ -620,8 +833,7 @@ test("review v2: missing or tampered final review invalidates strict REVIEWED re
 	for (const mode of ["missing", "tampered"] as const) {
 		const fixture = await setupReviewFixture();
 		try {
-			const result = await reviewDelegationV2({ projectRoot: fixture.root, delegationId: ID, exec: spawnExec, now: at(4) });
-			assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
+			await presentAndAcceptReview(fixture);
 			if (mode === "missing") await unlink(reviewPath(fixture.root));
 			else await writeFile(reviewPath(fixture.root), "{}\n");
 			const strict = await readDelegationCommittedGenerationV2(fixture.root, ID);

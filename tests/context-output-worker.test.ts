@@ -29,7 +29,10 @@ import {
 	WORKER_PROJECT_ROOT_ENV,
 	WORKER_ROLE_ENV,
 } from "../extensions/workbench-runtime/core/worker-policy.ts";
-import { WORKER_SPEND_PROFILE_ENV } from "../extensions/workbench-runtime/core/worker-spend.ts";
+import {
+	WORKER_SPEND_PROFILE_ENV,
+	WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE,
+} from "../extensions/workbench-runtime/core/worker-spend.ts";
 import {
 	createOutputControlTelemetry,
 	serializeOutputControlTelemetry,
@@ -110,10 +113,12 @@ test("worker child env retires low by enforcing the extended soft-turn boundary"
 		},
 	};
 	for (let turn = 0; turn < 63; turn += 1) await emitRuntimeEvent(stub, "message_end", event, ctx);
-	assert.equal(stub.sentMessages.length, 0, "retired low does not steer at its historical 8-turn threshold");
+	const spendSteers = () => stub.sentMessages.filter(({ message }) =>
+		(message as { customType?: unknown }).customType === WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE);
+	assert.equal(spendSteers().length, 0, "retired low does not spend-steer at its historical 8-turn threshold");
 	await emitRuntimeEvent(stub, "message_end", event, ctx);
-	assert.equal(stub.sentMessages.length, 1, "extended soft threshold steers at turn 64");
-	const message = stub.sentMessages[0]!.message as { content?: unknown; details?: Record<string, unknown> };
+	assert.equal(spendSteers().length, 1, "extended soft threshold steers at turn 64");
+	const message = spendSteers()[0]!.message as { content?: unknown; details?: Record<string, unknown> };
 	assert.match(String(message.content), /profile extended/);
 	assert.equal(message.details?.profile, "extended");
 });

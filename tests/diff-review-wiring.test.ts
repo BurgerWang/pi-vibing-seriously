@@ -162,6 +162,9 @@ interface ReviewDetails {
 	displayed_count: number;
 	remaining_count: number;
 	coverage_complete: boolean;
+	presentation_complete: boolean;
+	semantic_review: "required" | "accepted" | "not_required";
+	semantic_risk: "low" | "medium" | "high";
 	review_record: string;
 	next_include_paths: string[];
 	patch_truncated: boolean;
@@ -378,7 +381,7 @@ function reviewTool(stub: StubAPI & ExtensionAPI): ReviewTool {
 // Registered model-tool surface: coverage-gated lifecycle
 // --------------------------------------------------------------------------
 
-test("registered review tool: repeated coverage-gated calls drive PENDING_REVIEW → REVIEWED with merged segments, durable review.json, coverage details, no tool/order/schema change", async () => {
+test("registered legacy review tool merges scope/integrity segments but keeps non-zero work PENDING for strict-v2 repair", async () => {
 	await withTempDir(async (root) => {
 		const { id, afterHash } = await setupDelegation(root, async (d) => {
 			for (const name of ["a.ts", "b.ts", "c.ts"]) {
@@ -422,7 +425,7 @@ test("registered review tool: repeated coverage-gated calls drive PENDING_REVIEW
 		assert.ok(r1Text.split("\n").length <= 40, `review exceeded requested 40-line cap:\n${r1Text}`);
 		assert.ok(Buffer.byteLength(r1Text, "utf8") <= 32_768, `fallback exceeded 32 KiB policy cap: ${Buffer.byteLength(r1Text, "utf8")}`);
 		assert.ok(r1Text.includes(`full=${d1.review_record}`), r1Text);
-		assert.ok(r1Text.includes("bounded summary is not acceptance evidence"), r1Text);
+		assert.ok(r1Text.includes("packet is not semantic acceptance or Gate authority"), r1Text);
 		assert.match(r1Text, /(?:^|\n)--- src\/a\.ts /, "coverage advances only when the selected patch entry is in final content");
 
 		// Segment 2: include_paths merges coverage on the same hash.
@@ -440,12 +443,15 @@ test("registered review tool: repeated coverage-gated calls drive PENDING_REVIEW
 		assert.deepEqual(disk2.displayed_paths, ["src/a.ts", "src/b.ts"]);
 		assert.deepEqual(disk2.remaining_paths, ["src/c.ts"]);
 
-		// Segment 3: complete coverage → REVIEWED (scope PASS + coverage complete).
+		// Segment 3: complete presentation remains PENDING because legacy-v1
+		// evidence cannot be upgraded into the new durable semantic acceptance.
 		const r3 = await review.execute("call-3", { delegation_id: id, include_paths: ["src/c.ts"], max_lines: 40 }, undefined, undefined, trustedCtx(root) as never);
 		const d3 = reviewDetails(r3);
 		assert.equal(d3.verdict, "PASS");
-		assert.equal(d3.review_status, "REVIEWED");
+		assert.equal(d3.review_status, "PENDING_REVIEW");
 		assert.equal(d3.coverage_complete, true);
+		assert.equal(d3.presentation_complete, true);
+		assert.equal(d3.semantic_review, "required");
 		assert.equal(d3.violation_count, 0);
 		assert.equal(d3.displayed_count, 3);
 		assert.equal(d3.remaining_count, 0);
@@ -456,14 +462,14 @@ test("registered review tool: repeated coverage-gated calls drive PENDING_REVIEW
 		assert.ok(r3Text.split("\n").length <= 40, `review exceeded requested 40-line cap:\n${r3Text}`);
 		assert.ok(Buffer.byteLength(r3Text, "utf8") <= 32_768, `fallback exceeded 32 KiB policy cap: ${Buffer.byteLength(r3Text, "utf8")}`);
 		assert.ok(r3Text.includes(`full=${d3.review_record}`), r3Text);
-		assert.ok(r3Text.includes("bounded summary is not acceptance evidence"), r3Text);
-		assert.match(r3Text, /(?:^|\n)--- src\/c\.ts /, "the final path is visibly reviewed before REVIEWED binds");
+		assert.ok(r3Text.includes("packet is not semantic acceptance or Gate authority"), r3Text);
+		assert.match(r3Text, /(?:^|\n)--- src\/c\.ts /, "the final path is visibly presented before the legacy flow remains pending");
 
-		// The persisted delegation state binds REVIEWED to the current hash.
+		// The legacy session mirror stays blocking and carries no accepted hash.
 		const entry = lastDelegationStateEntry(stub);
 		assert.equal(entry.latestId, id);
-		assert.equal(entry.status, "REVIEWED");
-		assert.equal(entry.reviewedDiffHash, afterHash);
+		assert.equal(entry.status, "PENDING_REVIEW");
+		assert.equal(entry.reviewedDiffHash, undefined);
 		assert.equal(entry.currentDiffHash, afterHash);
 		assert.equal(entry.blockedWriteAttempts, 0);
 
@@ -484,7 +490,7 @@ test("registered review tool: repeated coverage-gated calls drive PENDING_REVIEW
 	});
 });
 
-test("registered review tool: a real 16-call turn uses each exact 4 KiB reservation before rendering, and only final-content patch entries advance coverage to REVIEWED", async () => {
+test("registered legacy review tool: a real 16-call turn uses each exact 4 KiB reservation and never upgrades complete coverage to semantic acceptance", async () => {
 	await withTempDir(async (root) => {
 		const paths = ["src/a.ts", "src/b.ts", "src/c.ts"];
 		const { id, afterHash } = await setupDelegation(root, async (dir) => {
@@ -556,7 +562,7 @@ test("registered review tool: a real 16-call turn uses each exact 4 KiB reservat
 			assert.equal(details.displayed_count, visibleCount);
 			assert.equal(details.remaining_count, paths.length - visibleCount);
 			assert.equal(details.coverage_complete, index === selected.length - 1);
-			assert.equal(details.review_status, index === selected.length - 1 ? "REVIEWED" : "PENDING_REVIEW");
+			assert.equal(details.review_status, "PENDING_REVIEW");
 			const persisted = await durableReview(root, details);
 			assert.deepEqual(persisted.displayed_paths, paths.slice(0, visibleCount));
 		}
@@ -617,7 +623,7 @@ test("registered review tool: hidden out-of-scope path always FAILs; a scope FAI
 		const onDisk = await durableReview(root, details);
 		assert.deepEqual(onDisk.violations.map((violation) => violation.path), ["forbidden.ts"]);
 		assert.deepEqual(onDisk.remaining_paths, ["forbidden.ts"]);
-		assert.ok(toolText(result).includes("verdict    : FAIL"), toolText(result));
+		assert.ok(toolText(result).includes("scope check: FAIL"), toolText(result));
 
 		// The persisted state is demoted: PENDING_REVIEW, reviewed hash cleared.
 		const entry = lastDelegationStateEntry(stub);
@@ -627,7 +633,7 @@ test("registered review tool: hidden out-of-scope path always FAILs; a scope FAI
 	});
 });
 
-test("registered review tool: a hash change resets coverage and turns REVIEWED STALE; fresh complete coverage re-binds REVIEWED; same-hash complete rerender keeps the binding", async () => {
+test("registered legacy review tool: a hash change resets coverage while unaccepted work remains PENDING", async () => {
 	await withTempDir(async (root) => {
 		const { id, afterHash } = await setupDelegation(root, async (d) => {
 			await writeFile(join(d, "src", "a.ts"), "a1\n", "utf8");
@@ -638,10 +644,10 @@ test("registered review tool: a hash change resets coverage and turns REVIEWED S
 		await fireSessionStart(stub, root, pendingStateEntry(id, afterHash));
 		const review = reviewTool(stub);
 
-		// Complete review → REVIEWED bound to the after hash.
+		// Complete legacy scope presentation remains PENDING (no semantic marker).
 		const r1 = await review.execute("call-1", { delegation_id: id }, undefined, undefined, trustedCtx(root) as never);
 		const d1 = reviewDetails(r1);
-		assert.equal(d1.review_status, "REVIEWED");
+		assert.equal(d1.review_status, "PENDING_REVIEW");
 		assert.equal(d1.coverage_complete, true);
 		assert.equal(d1.bound_diff_hash, afterHash);
 		assert.equal(d1.violation_count, 0);
@@ -654,13 +660,13 @@ test("registered review tool: a hash change resets coverage and turns REVIEWED S
 		assert.deepEqual(disk1.displayed_paths, ["src/a.ts", "src/b.ts"]);
 		assert.deepEqual(disk1.remaining_paths, []);
 
-		// The diff changes after REVIEWED (commander edit).
+		// The diff changes before semantic acceptance (commander edit).
 		await writeFile(join(root, "src", "b.ts"), "b2 — commander edit\n", "utf8");
 
-		// A narrowed rerender: hash change → STALE, coverage RESET.
+		// A narrowed rerender: hash change keeps PENDING and resets coverage.
 		const r2 = await review.execute("call-2", { delegation_id: id, include_paths: ["src/a.ts"] }, undefined, undefined, trustedCtx(root) as never);
 		const d2 = reviewDetails(r2);
-		assert.equal(d2.review_status, "STALE", "a diff change after REVIEWED turns the delegation STALE");
+		assert.equal(d2.review_status, "PENDING_REVIEW", "unaccepted legacy work remains pending on a new binding");
 		assert.equal(d2.coverage_complete, false);
 		assert.equal(d2.violation_count, 0);
 		assert.equal(d2.displayed_count, 1);
@@ -671,14 +677,14 @@ test("registered review tool: a hash change resets coverage and turns REVIEWED S
 		const disk2 = await durableReview(root, d2);
 		assert.deepEqual(disk2.displayed_paths, ["src/a.ts"]);
 		assert.deepEqual(disk2.remaining_paths, ["src/b.ts"]);
-		const staleEntry = lastDelegationStateEntry(stub);
-		assert.equal(staleEntry.status, "STALE");
-		assert.equal(staleEntry.reviewedDiffHash, afterHash, "the reviewed hash keeps the diff that was actually reviewed");
+		const pendingEntry = lastDelegationStateEntry(stub);
+		assert.equal(pendingEntry.status, "PENDING_REVIEW");
+		assert.equal(pendingEntry.reviewedDiffHash, undefined);
 
-		// A full render under the new hash completes coverage → REVIEWED again.
+		// A full render under the new hash completes presentation but remains pending.
 		const r3 = await review.execute("call-3", { delegation_id: id }, undefined, undefined, trustedCtx(root) as never);
 		const d3 = reviewDetails(r3);
-		assert.equal(d3.review_status, "REVIEWED");
+		assert.equal(d3.review_status, "PENDING_REVIEW");
 		assert.equal(d3.coverage_complete, true);
 		assert.equal(d3.bound_diff_hash, d2.bound_diff_hash);
 		assert.equal(d3.violation_count, 0);
@@ -690,14 +696,14 @@ test("registered review tool: a hash change resets coverage and turns REVIEWED S
 		assert.deepEqual(disk3.displayed_paths, ["src/a.ts", "src/b.ts"]);
 		assert.deepEqual(disk3.remaining_paths, []);
 		const rebound = lastDelegationStateEntry(stub);
-		assert.equal(rebound.status, "REVIEWED");
-		assert.equal(rebound.reviewedDiffHash, d3.bound_diff_hash);
+		assert.equal(rebound.status, "PENDING_REVIEW");
+		assert.equal(rebound.reviewedDiffHash, undefined);
 		assert.equal(rebound.currentDiffHash, d3.bound_diff_hash);
 
-		// A same-hash complete PASS rerender keeps the valid REVIEWED binding.
+		// A same-hash complete PASS rerender keeps the blocking pending binding.
 		const r4 = await review.execute("call-4", { delegation_id: id, include_paths: ["src/a.ts"] }, undefined, undefined, trustedCtx(root) as never);
 		const d4 = reviewDetails(r4);
-		assert.equal(d4.review_status, "REVIEWED", "same-hash complete PASS rerender keeps REVIEWED");
+		assert.equal(d4.review_status, "PENDING_REVIEW", "legacy evidence never becomes semantic acceptance");
 		assert.equal(d4.coverage_complete, true, "same-hash merge keeps complete coverage");
 		assert.equal(d4.bound_diff_hash, d3.bound_diff_hash);
 		assert.equal(d4.displayed_count, 2);
@@ -787,10 +793,11 @@ test("registered review tool: a repeated same-hash PASS with incomplete coverage
 		assert.equal(entry.reviewedDiffHash, undefined, "the reviewed hash is cleared fail-closed");
 		assert.equal(entry.currentDiffHash, afterHash, "the current diff hash is kept");
 
-		// Rendering every path completes coverage → REVIEWED re-binds.
+		// Rendering every path completes legacy presentation but cannot create
+		// the strict-v2 semantic provenance required for REVIEWED.
 		const full = await review.execute("call-2", { delegation_id: id }, undefined, undefined, trustedCtx(root) as never);
 		const fullDetails = reviewDetails(full);
-		assert.equal(fullDetails.review_status, "REVIEWED", "fresh complete coverage re-binds REVIEWED after the demotion");
+		assert.equal(fullDetails.review_status, "PENDING_REVIEW", "legacy complete coverage remains blocking");
 		assert.equal(fullDetails.coverage_complete, true);
 		assert.equal(fullDetails.displayed_count, 2);
 		assert.equal(fullDetails.remaining_count, 0);
@@ -802,7 +809,7 @@ test("registered review tool: a repeated same-hash PASS with incomplete coverage
 	});
 });
 
-test("registered review tool: Phase 5 — a single >32 KiB regular JSON renders as a durable compact entry (one-call PASS → REVIEWED, honest durable patch_paths stat, no schema/order/parameter change)", async () => {
+test("registered legacy review tool: a >32 KiB JSON yields complete high-risk compact evidence but remains PENDING without strict-v2 acceptance", async () => {
 	await withTempDir(async (root) => {
 		// One regular JSON LARGER than the default global review byte cap
 		// (COMPACT_MIN_BYTES = 32 KiB), multi-line with distinct head/tail
@@ -824,14 +831,15 @@ test("registered review tool: Phase 5 — a single >32 KiB regular JSON renders 
 		workbenchRuntime(stub);
 		// Registration surface is the exact fixed surface — Phase 5 adds no
 		// tool, and the review schema still declares exactly the existing
-		// four parameters (no compact/generated parameter).
+		// six parameters: the two additive semantic-accept fields are not
+		// compact/generated controls and legacy authority still rejects them.
 		assert.deepEqual([...stub.tools.keys()], [...NATIVE_OVERRIDE_NAMES, ...WORKBENCH_TOOL_NAMES], "registration order == NATIVE_OVERRIDE_NAMES + WORKBENCH_TOOL_NAMES");
 		const registeredParameters = (stub.tools.get("workbench_review_worker_diff") as { parameters: { properties: Record<string, unknown> } }).parameters;
 		assert.deepEqual(registeredParameters, WORKBENCH_TOOL_PARAMETERS.workbench_review_worker_diff, "review parameter schema byte-identical to the catalog");
 		assert.deepEqual(
 			Object.keys(registeredParameters.properties),
-			["delegation_id", "include_paths", "max_lines", "max_bytes"],
-			"the review schema declares exactly the existing four parameters — no compact/generated parameter was added",
+			["delegation_id", "include_paths", "max_lines", "max_bytes", "semantic_decision", "expected_bound_diff_hash"],
+			"the review schema adds only the bound semantic-decision pair — no compact/generated parameter",
 		);
 		assert.ok(!("compact" in registeredParameters) && !("generator" in registeredParameters), "no compact/generated key anywhere in the schema object");
 		await fireSessionStart(stub, root, pendingStateEntry(id, afterHash));
@@ -844,8 +852,11 @@ test("registered review tool: Phase 5 — a single >32 KiB regular JSON renders 
 		const d1 = reviewDetails(r1);
 		assert.equal(d1.ok, true);
 		assert.equal(d1.verdict, "PASS");
-		assert.equal(d1.review_status, "REVIEWED");
+		assert.equal(d1.review_status, "PENDING_REVIEW");
 		assert.equal(d1.coverage_complete, true, "the single compact entry is complete displayed-path coverage");
+		assert.equal(d1.presentation_complete, true, "strict compact facts form a complete bounded evidence packet");
+		assert.equal(d1.semantic_review, "required");
+		assert.equal(d1.semantic_risk, "high");
 		assert.equal(d1.violation_count, 0);
 		assert.equal(d1.checked_count, 1);
 		assert.equal(d1.displayed_count, 1);
@@ -856,6 +867,8 @@ test("registered review tool: Phase 5 — a single >32 KiB regular JSON renders 
 		assert.equal(d1.review_record, `${CONFIG_DIR_NAME}/workbench/delegations/${id}/review.json`);
 		assertNoFullReviewArrays(d1);
 		assert.ok(toolText(r1).includes("coverage   : COMPLETE"), toolText(r1));
+		assert.ok(toolText(r1).includes("evidence   : COMPLETE"), toolText(r1));
+		assert.ok(toolText(r1).includes("generator equality remains NOT_VERIFIED"), toolText(r1));
 		assert.ok(toolText(r1).includes("--- src/manifest.json (compact, truncated) ---"), toolText(r1));
 
 		// Durable review record: schema_version stays 1, the patch entry is
@@ -927,13 +940,13 @@ test("registered review tool: Phase 5 — a single >32 KiB regular JSON renders 
 			{ path: "src/manifest.json", source: "compact", bytes: Buffer.byteLength(entry.text, "utf8"), truncated: true },
 		]);
 
-		// Review writes/state behavior unchanged: the persisted delegation
-		// state binds REVIEWED to the current hash, and registration order,
+		// Review writes/state behavior remains blocking in legacy: the session
+		// carries no accepted hash, while registration order,
 		// the parameter object and the active tool set are untouched.
 		const state = lastDelegationStateEntry(stub);
 		assert.equal(state.latestId, id);
-		assert.equal(state.status, "REVIEWED");
-		assert.equal(state.reviewedDiffHash, afterHash);
+		assert.equal(state.status, "PENDING_REVIEW");
+		assert.equal(state.reviewedDiffHash, undefined);
 		assert.equal(state.currentDiffHash, afterHash);
 		assert.deepEqual([...stub.tools.keys()], [...NATIVE_OVERRIDE_NAMES, ...WORKBENCH_TOOL_NAMES], "registration order unchanged after execution");
 		assert.deepEqual(
@@ -964,11 +977,11 @@ test("registered review tool returns a whole bounded 500-path presentation with 
 		const text = toolText(result);
 		assert.ok(Buffer.byteLength(text, "utf8") <= 32_768, String(Buffer.byteLength(text, "utf8")));
 		assert.ok(text.split("\n").length <= 400, String(text.split("\n").length));
-		assert.match(text, /presentation: violations=500\/10\/490;/);
+		assert.match(text, /packet stats: violations=500\/10\/490;/);
 		assert.match(text, /patch=500\/\d+\/\d+; stats=500\/\d+\/\d+;/);
 		assert.equal((text.match(/^allowed    :/gm) ?? []).length, 1);
 		assert.doesNotMatch(text, /allowed-49\/[a]+\/\*\*.*allowed-49\//s, "allowed scope prose must not repeat per violation");
-		assert.match(text, /bounded summary is not acceptance evidence/);
+		assert.match(text, /scope\/integrity evidence is not semantic acceptance or Gate authority/);
 		assert.equal(reviewDetails(result).verdict, "FAIL");
 	});
 });

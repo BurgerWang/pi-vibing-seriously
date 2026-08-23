@@ -1,11 +1,13 @@
 /**
  * P7 delegation lifecycle state — pure decision logic, no Pi imports.
  *
- * Tracks the review lifecycle of the LATEST worker delegation:
+ * Tracks the acceptance lifecycle of the LATEST worker delegation.  The
+ * mechanical diff service supplies scope/integrity evidence; it does not by
+ * itself establish semantic code quality or Gate authority:
  *
  *   PENDING_REVIEW -> REVIEWED -> (current diff hash changes) -> STALE
  *         ^                                                         |
- *         +------------------ re-review (markReviewed) -------------+
+ *         +------------- bound semantic acceptance ----------------+
  *   REVIEWED -> PENDING_REVIEW (demoteReviewedToPending): a scope FAIL
  *   from a re-review of the SAME current diff invalidates a prior
  *   same-hash REVIEWED state fail-closed (reviewed hash cleared);
@@ -105,6 +107,14 @@ export function reviewBlockReason(state: DelegationState, target: "delegation" |
 export interface RecordDelegationInput {
 	id: string;
 	diffHash: string;
+	now: string;
+}
+
+export interface SemanticAcceptanceInput {
+	/** Must identify the exact latest delegation shown to Sol. */
+	delegationId: string;
+	/** Must equal the current scope/integrity packet's bound diff hash. */
+	expectedDiffHash: string;
 	now: string;
 }
 
@@ -239,6 +249,29 @@ export function markReviewed(state: DelegationState, now: string): DelegationTra
 		ok: true,
 		state: { ...state, status: "REVIEWED", reviewedDiffHash: state.currentDiffHash, updatedAt: now },
 	};
+}
+
+/**
+ * Record an explicit Sol semantic ACCEPT for the exact current diff.
+ *
+ * This is deliberately only a hash-bound session transition: it grants no
+ * Gate PASS and stores no model prose as evidence.  Callers must separately
+ * prove that a complete scope/integrity packet existed before the ACCEPT
+ * request and that the current model is the pinned Sol commander.
+ */
+export function markSemanticAccepted(
+	state: DelegationState,
+	input: SemanticAcceptanceInput,
+): DelegationTransitionResult {
+	const delegationId = input.delegationId.trim();
+	const expectedDiffHash = input.expectedDiffHash.trim();
+	if (state.latestId === undefined || delegationId !== state.latestId) {
+		return { ok: false, error: "semantic ACCEPT must identify the exact latest delegation" };
+	}
+	if (!expectedDiffHash || expectedDiffHash !== state.currentDiffHash) {
+		return { ok: false, error: "semantic ACCEPT hash does not match the current diff binding" };
+	}
+	return markReviewed(state, input.now);
 }
 
 /**
