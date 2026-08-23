@@ -42,6 +42,8 @@ const WORKER_FIRST_POLICY = "worker-first-strict";
 
 export interface CompactState {
 	mode: string;
+	/** Durable task objective, kept separate from the current task/phase labels. */
+	objective?: string;
 	task?: string;
 	phase?: string;
 	passedGates: string[];
@@ -51,6 +53,7 @@ export interface CompactState {
 	lastRecipe?: string;
 	modifiedFiles: string[];
 	evidencePaths: string[];
+	/** Durable next action after compaction. */
 	nextStep?: string;
 	doNotRetry: string[];
 	updatedAt: string;
@@ -124,6 +127,7 @@ export function mergeCompactState(base: CompactState, raw: unknown): CompactStat
 	const r = raw as Record<string, unknown>;
 	return {
 		mode: typeof r.mode === "string" ? r.mode : base.mode,
+		objective: cleanString(r.objective) ?? base.objective,
 		task: cleanString(r.task) ?? base.task,
 		phase: cleanString(r.phase) ?? base.phase,
 		passedGates: cleanList(r.passedGates, MAX_GATES),
@@ -159,13 +163,55 @@ export interface CompactStateEntry {
 
 /** Restore the latest persisted state entry; the last entry wins. */
 export function loadCompactStateFromEntries(entries: readonly CompactStateEntry[], fallbackMode: string): CompactState {
-	let state = emptyCompactState(fallbackMode);
+	let latest: unknown;
+	let found = false;
 	for (const entry of entries) {
 		if (entry.type !== "custom" || entry.customType !== COMPACT_STATE_ENTRY_TYPE) continue;
-		state = mergeCompactState(state, entry.data);
+		latest = entry.data;
+		found = true;
 	}
+	// A persisted entry is a complete snapshot. Sanitizing the newest snapshot
+	// against an empty state prevents fields from different historical records
+	// being combined into a state that never existed.
+	const state = found
+		? mergeCompactState(emptyCompactState(fallbackMode), latest)
+		: emptyCompactState(fallbackMode);
 	if (state.mode !== fallbackMode) state.mode = fallbackMode; // mode is authoritative from MODE_ENTRY_TYPE
 	return state;
+}
+
+export interface ReviewedWorkerChangedPathsInput {
+	reviewStatus?: unknown;
+	changedPaths?: unknown;
+}
+
+function cleanProjectRelativePosixPath(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const path = value.trim();
+	if (path.length === 0 || path.length > MAX_STRING_FIELD || path.startsWith("/")) return undefined;
+	if (path.includes("\\") || /[\u0000-\u001f\u007f]/u.test(path)) return undefined;
+	const segments = path.split("/");
+	if (segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")) return undefined;
+	return segments.join("/");
+}
+
+/**
+ * Return a bounded path-only summary for a worker diff after review. Pending,
+ * stale, rejected, or malformed review records intentionally disclose no paths.
+ */
+export function summarizeReviewedWorkerChangedPaths(input: ReviewedWorkerChangedPathsInput): string[] {
+	if (input.reviewStatus !== "REVIEWED" || !Array.isArray(input.changedPaths)) return [];
+	const result: string[] = [];
+	const seen = new Set<string>();
+	// Bound both the amount inspected and the amount returned.
+	for (const value of input.changedPaths.slice(0, MAX_MODIFIED_FILES * 4)) {
+		const path = cleanProjectRelativePosixPath(value);
+		if (!path || seen.has(path)) continue;
+		seen.add(path);
+		result.push(path);
+		if (result.length === MAX_MODIFIED_FILES) break;
+	}
+	return result;
 }
 
 /** Append an item to a bounded list, deduplicated, oldest dropped first. */
@@ -200,7 +246,8 @@ export function collectDoNotRetry(recent: readonly string[], cap = MAX_DO_NOT_RE
 /** Only supplement when there is real workbench state worth carrying over. */
 export function shouldSupplement(state: CompactState): boolean {
 	return Boolean(
-		state.task ||
+		state.objective ||
+			state.task ||
 			state.phase ||
 			state.lastRunId ||
 			state.nextStep ||
@@ -236,6 +283,7 @@ export function buildCompactNote(state: CompactState): string {
 		"workbench state (pi-dev-workbench)",
 		`mode: ${state.mode}`,
 	];
+	lines.push(...line("objective", state.objective));
 	lines.push(...line("task", state.task));
 	lines.push(...line("phase", state.phase));
 	// Compatibility facts: fixed Sol/Luna authority, temporary lease

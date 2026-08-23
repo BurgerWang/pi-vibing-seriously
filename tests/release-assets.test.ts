@@ -52,9 +52,16 @@ test("EXTENSION_VERSION stays in sync with package.json (version bump guard)", a
 });
 
 test("v0.10.0 release metadata, compatibility and control-plane docs stay synchronized", async () => {
-	const pkg = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8")) as { version: string; scripts: Record<string, string> };
+	const pkg = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8")) as {
+		version: string;
+		scripts: Record<string, string>;
+		devDependencies: Record<string, string>;
+	};
 	const compatibility = JSON.parse(await readFile(join(ROOT, "compatibility", "pi.json"), "utf8")) as {
 		package: { version: string };
+		pi: { tested_version: string; current_source_target: string };
+		current_source_dependencies: Record<string, string>;
+		current_source_runtime: { node: string; ci_node_target: string };
 	};
 	const readme = await readFile(join(ROOT, "README.md"), "utf8");
 	const changelog = await readFile(join(ROOT, "CHANGELOG.md"), "utf8");
@@ -63,6 +70,11 @@ test("v0.10.0 release metadata, compatibility and control-plane docs stay synchr
 	const stablePrefix = await readFile(join(ROOT, "docs", "cache", "stable-prefix-contract.md"), "utf8");
 	assert.equal(pkg.version, "0.10.0");
 	assert.equal(compatibility.package.version, pkg.version);
+	assert.equal(compatibility.pi.tested_version, "0.83.0", "released live baseline remains explicit");
+	assert.equal(compatibility.pi.current_source_target, pkg.devDependencies["@earendil-works/pi-coding-agent"]);
+	assert.equal(compatibility.current_source_dependencies["@earendil-works/pi-tui"], pkg.devDependencies["@earendil-works/pi-tui"]);
+	assert.match(compatibility.current_source_runtime.node, /^v\d+\.\d+\.\d+$/);
+	assert.match(compatibility.current_source_runtime.ci_node_target, /configuration only/i);
 	assert.match(readme, /pi-dev-workbench v0\.10\.0/);
 	assert.match(changelog, /## \[0\.10\.0\] — Context Output Control Plane/);
 	assert.match(controlPlane, /12,288 UTF-8 bytes/);
@@ -87,6 +99,19 @@ test("ctx1 release gate pins current base prerequisites and final evidence check
 		["ctx1.3", "recipe", ["context-output-stress"], true, true],
 		["ctx1.4", "manual", [], true, true],
 	]);
+});
+
+test("CI uses least privilege and immutable current action revisions", async () => {
+	const workflow = await readFile(join(ROOT, ".github", "workflows", "ci.yml"), "utf8");
+	assert.match(workflow, /permissions:\s*\n\s*contents: read/);
+	assert.match(workflow, /actions\/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7\.0\.1/);
+	assert.match(workflow, /persist-credentials: false/);
+	assert.match(workflow, /actions\/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7\.0\.0/);
+	assert.match(workflow, /node-version: 24\.x/);
+	assert.match(workflow, /npm ci/);
+	assert.match(workflow, /npm run check/);
+	const dependabot = await readFile(join(ROOT, ".github", "dependabot.yml"), "utf8");
+	assert.match(dependabot, /package-ecosystem: github-actions/);
 });
 
 test("banner.svg exists, is referenced by the README, and is renderer-safe", async () => {

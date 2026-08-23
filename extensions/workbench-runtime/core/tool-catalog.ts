@@ -173,7 +173,7 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 		gates: Type.String({ description: "Gate selector: a gate id (e.g. \"b0\"), comma-separated ids, or base|quant|all" }),
 		manual_evidence: Type.Optional(
 			Type.Record(Type.String(), Type.String(), {
-				description: "Manual evidence notes keyed by check id — recorded as manual evidence, never as machine verification",
+				description: "Advisory model notes keyed by check id. They may be used by read-only preflight but cannot satisfy a formal human manual check; only explicit user-command evidence can do that",
 			}),
 		),
 		// Phase 3B: explicit read-only preflight opt-in on the EXISTING tool.
@@ -255,6 +255,29 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 			Type.Union([Type.Literal("implementation"), Type.Literal("diagnosis")], {
 				description: "Delegation kind (default: implementation). diagnosis is strictly read-only and cannot edit or write project files.",
 				default: "implementation",
+			}),
+		),
+		plan_ref: Type.Optional(
+			Type.Object({
+				schema: Type.Literal("workbench-plan-ref-v1"),
+				plan_id: Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" }),
+				version: Type.String({ minLength: 1, maxLength: 64 }),
+				plan_path: Type.String({ minLength: 1, maxLength: 400 }),
+				plan_sha256: Type.String({ minLength: 64, maxLength: 64, pattern: "^[0-9a-f]{64}$" }),
+				candidate: Type.String({ minLength: 1, maxLength: 128 }),
+				status: Type.Union([
+					Type.Literal("NOT_STARTED"), Type.Literal("IN_PROGRESS"), Type.Literal("BLOCKED"), Type.Literal("EVIDENCED"),
+				]),
+				criteria: Type.Array(Type.Object({
+					id: Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$" }),
+					gate_id: Type.String({ minLength: 1, maxLength: 128, pattern: "^[A-Za-z][A-Za-z0-9._:-]{0,127}$" }),
+					check_ids: Type.Array(Type.String({ minLength: 1, maxLength: 200 }), { maxItems: 20 }),
+					evidence_paths: Type.Array(Type.String({ minLength: 1, maxLength: 400 }), { maxItems: 20 }),
+				}, { additionalProperties: false }), { minItems: 1, maxItems: 20 }),
+				next_action: Type.String({ minLength: 1, maxLength: 500 }),
+			}, {
+				additionalProperties: false,
+				description: "Optional immutable plan snapshot traceability. Current project bytes must match plan_sha256; it adds no scope, review, or Gate authority.",
 			}),
 		),
 	}),
@@ -346,11 +369,11 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 		name: "workbench_run_gate",
 		label: "Workbench run gate",
 		description:
-			"Run a gate selector (gate id, comma-separated ids, or base|quant|all) from the validation ladder. Only declared recipes run; the gate engine never trusts model prose — manual evidence supplied here is recorded with type \"manual\" and can never masquerade as machine verification. With preflight:true the SAME tool becomes READ-ONLY — it resolves the selector and reports exactly which required manual checks the supplied manual_evidence satisfies (provided/missing ids, readiness) and creates NO gate run, executes NO recipe, assigns NO gate status and returns NO run id; manual evidence stays manual in both modes.",
+			"Run a gate selector (gate id, comma-separated ids, or base|quant|all) from the validation ladder. Only declared recipes run. Model-supplied manual_evidence is advisory: it may populate read-only preflight readiness but can never satisfy a formal human manual check. Formal human evidence must arrive through the explicit user /q-gate command. With preflight:true the SAME tool becomes READ-ONLY and creates NO gate run, executes NO recipe, assigns NO gate status and returns NO run id.",
 		promptSnippet: "Run validation gates (base/quant ladder) for the project; preflight:true checks required manual evidence readiness read-only",
 		promptGuidelines: [
 			"Use workbench_list_gates or /q-gates to see the gates available for the current profile.",
-			"Manual evidence for manual checks must be passed as manual_evidence keyed by check id; it is recorded as type \"manual\" only.",
+			"manual_evidence on this model-callable tool is advisory only and never creates human authority; ask the user to invoke /q-gate with manual:<check-id>=<evidence> for formal human checks.",
 			"Phase 3B: pass preflight:true (or /q-gate <selector> --preflight) to check required manual-evidence readiness READ-ONLY before a formal run — it never creates a run, executes a recipe, assigns a gate status or returns a run id; omit it (or false) to run the gate formally.",
 		],
 	},
@@ -371,7 +394,7 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 		description: "List the validation gates available for the current project/profile with their latest persisted status.",
 		promptSnippet: "List available validation gates and their latest status",
 		promptGuidelines: [
-			"Use workbench_list_gates before running gates to see which gates the current profile loads (base b0-b5 always; quant q0-q5 only for quant-research profiles).",
+			"Use workbench_list_gates before running gates to see which gates the current profile loads (base b0-b6 always; quant q0-q5 only for quant-research profiles).",
 		],
 	},
 	workbench_compare_runs: {
@@ -434,6 +457,41 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 	},
 };
 
+/** Frozen v1 Gate-tool metadata and schema; repaired human provenance must not rewrite history. */
+const WORKBENCH_RUN_GATE_V1_METADATA = Object.freeze({
+	name: "workbench_run_gate",
+	label: "Workbench run gate",
+	description:
+		"Run a gate selector (gate id, comma-separated ids, or base|quant|all) from the validation ladder. Only declared recipes run; the gate engine never trusts model prose — manual evidence supplied here is recorded with type \"manual\" and can never masquerade as machine verification. With preflight:true the SAME tool becomes READ-ONLY — it resolves the selector and reports exactly which required manual checks the supplied manual_evidence satisfies (provided/missing ids, readiness) and creates NO gate run, executes NO recipe, assigns NO gate status and returns NO run id; manual evidence stays manual in both modes.",
+	promptSnippet: "Run validation gates (base/quant ladder) for the project; preflight:true checks required manual evidence readiness read-only",
+	promptGuidelines: Object.freeze([
+		"Use workbench_list_gates or /q-gates to see the gates available for the current profile.",
+		"Manual evidence for manual checks must be passed as manual_evidence keyed by check id; it is recorded as type \"manual\" only.",
+		"Phase 3B: pass preflight:true (or /q-gate <selector> --preflight) to check required manual-evidence readiness READ-ONLY before a formal run — it never creates a run, executes a recipe, assigns a gate status or returns a run id; omit it (or false) to run the gate formally.",
+	]),
+});
+
+const WORKBENCH_LIST_GATES_V1_METADATA = Object.freeze({
+	name: "workbench_list_gates",
+	label: "Workbench list gates",
+	description: "List the validation gates available for the current project/profile with their latest persisted status.",
+	promptSnippet: "List available validation gates and their latest status",
+	promptGuidelines: Object.freeze([
+		"Use workbench_list_gates before running gates to see which gates the current profile loads (base b0-b5 always; quant q0-q5 only for quant-research profiles).",
+	]),
+});
+
+const WORKBENCH_RUN_GATE_V1_PARAMETERS = Object.freeze({
+	...WORKBENCH_TOOL_PARAMETERS.workbench_run_gate,
+	properties: Object.freeze({
+		...WORKBENCH_TOOL_PARAMETERS.workbench_run_gate.properties,
+		manual_evidence: Object.freeze({
+			...WORKBENCH_TOOL_PARAMETERS.workbench_run_gate.properties.manual_evidence,
+			description: "Manual evidence notes keyed by check id — recorded as manual evidence, never as machine verification",
+		}),
+	}),
+});
+
 /** Metadata + parameter schema in the explicit registration order. */
 export function workbenchToolMetadataOrdered(): readonly (WorkbenchToolMeta & { parameters: unknown })[] {
 	return WORKBENCH_TOOL_NAMES.map((name) => ({
@@ -460,8 +518,22 @@ export function workbenchToolMetadataV1Ordered(): readonly (WorkbenchToolMeta & 
 						...WORKBENCH_REVIEW_WORKER_DIFF_V1_METADATA,
 						promptGuidelines: [...WORKBENCH_REVIEW_WORKER_DIFF_V1_METADATA.promptGuidelines],
 					}
-				: (WORKBENCH_TOOL_METADATA[name] as WorkbenchToolMeta)),
-		parameters: name === "workbench_delegate_worker" ? WORKBENCH_DELEGATE_WORKER_V1_PARAMETERS : WORKBENCH_TOOL_PARAMETERS[name],
+					: name === "workbench_run_gate"
+						? {
+							...WORKBENCH_RUN_GATE_V1_METADATA,
+							promptGuidelines: [...WORKBENCH_RUN_GATE_V1_METADATA.promptGuidelines],
+						}
+						: name === "workbench_list_gates"
+							? {
+								...WORKBENCH_LIST_GATES_V1_METADATA,
+								promptGuidelines: [...WORKBENCH_LIST_GATES_V1_METADATA.promptGuidelines],
+							}
+							: (WORKBENCH_TOOL_METADATA[name] as WorkbenchToolMeta)),
+		parameters: name === "workbench_delegate_worker"
+			? WORKBENCH_DELEGATE_WORKER_V1_PARAMETERS
+			: name === "workbench_run_gate"
+				? WORKBENCH_RUN_GATE_V1_PARAMETERS
+				: WORKBENCH_TOOL_PARAMETERS[name],
 	}));
 }
 

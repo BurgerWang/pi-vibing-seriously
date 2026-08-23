@@ -118,10 +118,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function exactFields(value: Record<string, unknown>, fields: readonly string[], optional?: string): boolean {
-	const expected = optional !== undefined && Object.prototype.hasOwnProperty.call(value, optional)
-		? [...fields, optional]
-		: [...fields];
+function exactFields(value: Record<string, unknown>, fields: readonly string[], optional: readonly string[] = []): boolean {
+	const expected = [...fields, ...optional.filter((field) => Object.prototype.hasOwnProperty.call(value, field))];
 	const actual = Object.keys(value).sort();
 	expected.sort();
 	return actual.length === expected.length && actual.every((field, index) => field === expected[index]);
@@ -212,7 +210,7 @@ function authorityFromGeneration(generation: DelegationCommittedGenerationV2): G
 		!(guardV2 ? validByteSortedPaths(after.changed_since_before) : validPaths(after.changed_since_before)) || !validPaths(after.reported_paths) ||
 		!isRecord(before.workspace_guard) || !isRecord(after.workspace_guard)) return undefined;
 	const contract = before.contract;
-	if (!isRecord(contract) || !exactFields(contract, CONTRACT_REQUIRED_FIELDS, "repair_of") ||
+	if (!isRecord(contract) || !exactFields(contract, CONTRACT_REQUIRED_FIELDS, ["repair_of", "plan_ref"]) ||
 		contract.task_kind !== state.task_kind || contract.contract_hash !== state.contract_hash ||
 		!sameJson(contract.allowed_paths, state.allowed_paths)) return undefined;
 	const { contract_hash: suppliedHash, ...contractPayload } = contract;

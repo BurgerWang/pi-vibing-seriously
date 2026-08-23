@@ -1,5 +1,10 @@
 # P5 Gate Report — Hardening, Compatibility, Documentation, Release Readiness
 
+> **Historical, non-authoritative record.** This report describes v0.6.0 at
+> its original candidate and does not establish current Gate freshness or
+> release authority. Its test counts and GO verdict must not be applied to the
+> current source tree.
+
 Milestone: P5 of pi-dev-workbench (v0.6.0). This report documents what was
 implemented, the audit findings, and the verification evidence. **No commit
 was made** (per the milestone instruction; the repository is left dirty for

@@ -105,6 +105,7 @@ export function registerGateTools<TIngress>(controller: GateToolsController<TIng
 					exec: controller.exec,
 					signal,
 					manualEvidence: params.manual_evidence ?? {},
+					manualEvidenceProvenance: "model-tool",
 					workerFirstFacts,
 					actorFacts: controller.getIdentity(),
 				});
@@ -227,7 +228,7 @@ export function registerGateTools<TIngress>(controller: GateToolsController<TIng
 				const gates = await loadGates(projectRoot);
 				const latest = await latestGateStatuses(projectRoot, gates.map((gate) => gate.id));
 				const presentation = renderGateListPresentation(gates, latest);
-				const statuses: Record<string, GateStatus> = {};
+				const statuses: Record<string, GateStatus | "UNKNOWN"> = {};
 				for (const gate of presentation.shownGates) {
 					let key = boundedInlineDetail(gate.id, 96) || "(unnamed)";
 					let suffix = 1;

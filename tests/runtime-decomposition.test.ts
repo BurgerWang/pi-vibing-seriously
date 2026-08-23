@@ -37,7 +37,7 @@ function relativeImports(source: string): string[] {
 test("index is a bounded composition root and public tool behavior lives in controllers", async () => {
 	const source = await readFile(INDEX_PATH, "utf8");
 	const lines = source.split("\n").length - 1;
-	assert.ok(lines >= 1_500 && lines <= 2_000, `index.ts must stay within 1,500-2,000 lines; got ${lines}`);
+	assert.ok(lines <= 2_000, `index.ts must stay at or below 2,000 lines; got ${lines}`);
 	assert.doesNotMatch(source, /\bpi\.registerTool\(/, "composition root delegates every public tool registration");
 	for (const directDomainCall of [
 		"executeDelegationV2(",

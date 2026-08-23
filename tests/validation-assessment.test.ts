@@ -495,9 +495,18 @@ test("prerequisite status change refuses with gate-state-mismatch", async () => 
 		const run1 = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec, manualEvidence: { "g1.1": "ok" }, actorFacts: SOL_FACTS });
 		assert.equal(run1.gates[0]!.status, "PASS");
 
-		const run2 = await runGates({ projectRoot: dir, selector: "g2", mode: "DEV", exec: spawnExec, manualEvidence: { "g2.1": "ok" }, actorFacts: SOL_FACTS });
-		assert.equal(run2.gates[0]!.status, "PASS");
-		assert.equal(run2.gates[0]!.prerequisite_status["g1"]!.status, "PASS");
+		const run2 = await runGates({
+			projectRoot: dir,
+			selector: "g2",
+			mode: "DEV",
+			exec: spawnExec,
+			manualEvidence: { "g1.1": "ok", "g2.1": "ok" },
+			actorFacts: SOL_FACTS,
+		});
+		assert.deepEqual(run2.gates.map((gate) => gate.id), ["g1", "g2"]);
+		assert.equal(run2.gates[1]!.status, "PASS");
+		assert.equal(run2.gates[1]!.prerequisite_status["g1"]!.status, "PASS");
+		assert.equal(run2.gates[1]!.prerequisite_status["g1"]!.source, "this-run");
 		const manifest2 = await readManifest(dir, run2.runId);
 		assert.ok(manifest2, "gate manifest must be readable");
 		assert.deepEqual(await assess(dir, manifest2), REUSABLE, "unchanged prerequisite state first");

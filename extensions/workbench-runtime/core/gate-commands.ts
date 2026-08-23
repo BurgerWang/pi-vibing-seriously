@@ -11,7 +11,6 @@ import type { ExecFn } from "./config.ts";
 import { reviewBlockReason, type DelegationState } from "./delegation-state.ts";
 import {
 	GateSetupError,
-	latestGateStatus,
 	loadGates,
 	preflightGateManualEvidence,
 	runGates,
@@ -21,6 +20,7 @@ import type { WorkbenchMode } from "./mode-policy.ts";
 import { displayRelative } from "./recipe-runner.ts";
 import {
 	buildRunReport,
+	latestGateStatuses,
 	readGateEvidenceView,
 	renderGateDefinitionPage,
 	resolveRunTarget,
@@ -143,6 +143,7 @@ export function registerGateCommands(controller: GateCommandController): void {
 					exec: controller.exec,
 					signal: ctx.signal,
 					manualEvidence,
+					manualEvidenceProvenance: "user-command",
 					workerFirstFacts,
 					actorFacts: controller.getActorFacts(),
 				});
@@ -174,9 +175,12 @@ export function registerGateCommands(controller: GateCommandController): void {
 					return;
 				}
 				const lines = [`${gates.length} gate(s) for this project:`];
+				const latest = await latestGateStatuses(projectRoot, gates.map((gate) => gate.id));
 				for (const gate of gates) {
-					const latest = await latestGateStatus(projectRoot, gate.id);
-					const status = latest ? `${latest.status} (run ${latest.run_id})` : "NOT_RUN (never run)";
+					const record = latest[gate.id];
+					const status = record
+						? `${record.status} (run ${record.run_id})${record.unavailable_reason ? ` — ${record.unavailable_reason}` : ""}`
+						: "NOT_RUN (never run)";
 					const prerequisites = gate.prerequisites.length > 0 ? ` needs: ${gate.prerequisites.join(",")}` : "";
 					lines.push(`  ${gate.id.padEnd(4)} ${status.padEnd(42)} ${gate.title}${prerequisites}`);
 				}
@@ -209,7 +213,7 @@ export function registerGateCommands(controller: GateCommandController): void {
 					controller.output(ctx, [`/q-gate-show: gate "${gateId}" not found. Available: ${known}`]);
 					return;
 				}
-				const latest = await latestGateStatus(projectRoot, gate.id);
+				const latest = (await latestGateStatuses(projectRoot, [gate.id]))[gate.id];
 				const page = renderGateDefinitionPage({
 					gate,
 					latestStatus: latest?.status,

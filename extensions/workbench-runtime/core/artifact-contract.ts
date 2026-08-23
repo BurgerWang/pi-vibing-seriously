@@ -227,7 +227,9 @@ const crypto = require("node:crypto");
     const after = await handle.stat({ bigint: true });
     if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeNs !== after.mtimeNs) process.exit(21);
     if (bytes !== expectedBytes || hash.digest("hex") !== expectedHash) process.exit(22);
-    process.stdout.write("OK");
+    // The probe is an authority boundary: emit its fixed acknowledgement
+    // synchronously so a fast child-process exit cannot drop buffered stdout.
+    require("node:fs").writeSync(1, "OK");
   } finally { await handle.close(); }
 })().catch(() => process.exit(23));`;
 

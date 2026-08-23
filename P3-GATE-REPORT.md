@@ -1,5 +1,10 @@
 # P3 Gate Report — Gate Engine, Evidence Artifacts, Quant Research Validation Ladder
 
+> **Historical, non-authoritative record.** This report describes v0.4.0 at
+> its original candidate and does not establish current Gate freshness or
+> release authority. Current runtime records and a validation assessment bound
+> to the current commit/config take precedence.
+
 Milestone: P3 of pi-dev-workbench (v0.4.0). This report documents what was
 implemented and the verification evidence. **No commit was made** (per the
 milestone instruction; the repository is left dirty for review).

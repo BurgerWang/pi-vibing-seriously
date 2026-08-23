@@ -11,6 +11,8 @@ import { test } from "node:test";
 
 import {
 	buildBenchmarkReport,
+	groupTelemetryByExtensionVersion,
+	MAX_RENDERED_VERSION_COHORTS,
 	normalizeReport,
 	parseCliArgs,
 	readActionCache,
@@ -21,6 +23,7 @@ import {
 	saveBenchmarkReport,
 	type BenchmarkReport,
 } from "../scripts/cache-benchmark.ts";
+import type { TelemetryRecord } from "../extensions/workbench-runtime/cache/cache-types.ts";
 import { spawnExec, withTempDir } from "./helpers.ts";
 
 /** One valid current telemetry record (schema 1.2). */
@@ -222,6 +225,20 @@ test("readRunManifests: exec and cache-hit manifests distinguished", async () =>
 	});
 });
 
+test("readRunManifests ignores gate indexes and non-run entries", async () => {
+	await withTempDir(async (root) => {
+		await makeProject(root);
+		const runs = join(root, ".pi", "workbench", "runs");
+		await mkdir(join(runs, ".gate-index"));
+		await writeFile(join(runs, ".gate-index", "marker.json"), "{}\n", "utf8");
+		await mkdir(join(runs, "not-a-run"));
+		await writeFile(join(runs, "README.txt"), "diagnostic\n", "utf8");
+		const result = await readRunManifests(root);
+		assert.equal(result.manifests.length, 2);
+		assert.equal(result.corrupt, 0);
+	});
+});
+
 test("readActionCache: records, corruption evidence, stale locks and sizes", async () => {
 	await withTempDir(async (root) => {
 		await makeProject(root);
@@ -239,6 +256,7 @@ test("buildBenchmarkReport: all required fields with correct aggregation", async
 	await withTempDir(async (root) => {
 		await makeProject(root);
 		const report = await buildBenchmarkReport({ projectRoot: root, scope: "project" });
+		assert.equal(report.schemaVersion, "1.1");
 		// Field presence: the P6-E contract list.
 		const expected: Array<keyof BenchmarkReport> = [
 			"requestCount",
@@ -265,7 +283,10 @@ test("buildBenchmarkReport: all required fields with correct aggregation", async
 			"recipeExecutions",
 			"recipeCacheHits",
 			"recipeCacheMisses",
+			"recipeCacheUnknown",
 			"recipeHitRatio",
+			"recipeCohorts",
+			"extensionVersionCohorts",
 			"localExecutionTimeAvoided",
 			"cacheStorageSize",
 			"corruptionCount",
@@ -285,8 +306,25 @@ test("buildBenchmarkReport: all required fields with correct aggregation", async
 		assert.equal(report.recipeExecutions, 2);
 		assert.equal(report.recipeCacheHits, 1);
 		assert.equal(report.recipeCacheMisses, 1);
+		assert.equal(report.recipeCacheUnknown, 0);
 		assert.equal(report.recipeHitRatio, 0.5);
 		assert.equal(report.localExecutionTimeAvoided, 30); // from the action record duration
+		assert.deepEqual(report.recipeCohorts.typecheck, {
+			executions: 2,
+			hits: 1,
+			misses: 1,
+			unknown: 0,
+			hitRatio: 0.5,
+			localExecutionTimeAvoided: 30,
+		});
+		assert.deepEqual(report.extensionVersionCohorts["0.8.0"], {
+			requestCount: 2,
+			uncachedInputTokens: 3000,
+			cacheReadTokens: 17000,
+			outputTokens: 300,
+			cacheHitRatio: null,
+			usageSemanticStatus: "verified",
+		});
 		assert.ok(report.cacheStorageSize > 0);
 		assert.ok(report.corruptionCount >= 3); // badkey + corrupt copy + bad telemetry line
 		assert.equal(report.fallbackCount, 1);
@@ -295,6 +333,45 @@ test("buildBenchmarkReport: all required fields with correct aggregation", async
 		assert.equal(report.truncatedTelemetryRecords, 0);
 		assert.equal(report.schema13Rows, 0);
 		assert.equal(report.observability, null, "legacy rows remain unobserved rather than zero-filled 1.3 facts");
+	});
+});
+
+test("unknown recipe sources are reported separately and excluded from the hit denominator", async () => {
+	await withTempDir(async (root) => {
+		await makeProject(root);
+		const runId = "20260802-100002-cccc";
+		const runDir = join(root, ".pi", "workbench", "runs", runId);
+		await mkdir(runDir);
+		await writeFile(join(runDir, "manifest.json"), JSON.stringify({ run_id: runId, recipe: "typecheck", duration_ms: 1 }), "utf8");
+		const report = await buildBenchmarkReport({ projectRoot: root, scope: "project" });
+		assert.equal(report.sources.runManifests, 3);
+		assert.equal(report.recipeExecutions, 2);
+		assert.equal(report.recipeCacheHits, 1);
+		assert.equal(report.recipeCacheMisses, 1);
+		assert.equal(report.recipeCacheUnknown, 1);
+		assert.equal(report.recipeHitRatio, 0.5);
+		assert.equal(report.recipeCohorts.typecheck?.unknown, 1);
+		assert.equal(report.recipeCohorts.typecheck?.executions, 2);
+	});
+});
+
+test("extension-version grouping is single-pass and human rendering is bounded", async () => {
+	const records = Array.from({ length: MAX_RENDERED_VERSION_COHORTS + 7 }, (_, index) =>
+		record({ extensionVersion: `v-${String(index).padStart(3, "0")}` }) as unknown as TelemetryRecord);
+	let visits = 0;
+	const grouped = groupTelemetryByExtensionVersion(records, () => { visits += 1; });
+	assert.equal(visits, records.length);
+	assert.equal(grouped.size, records.length);
+
+	await withTempDir(async (root) => {
+		const cache = join(root, ".pi", "workbench", "cache");
+		await mkdir(cache, { recursive: true });
+		await writeFile(join(cache, "telemetry.jsonl"), `${records.map((item) => JSON.stringify(item)).join("\n")}\n`, "utf8");
+		const report = await buildBenchmarkReport({ projectRoot: root, scope: "project" });
+		assert.equal(Object.keys(report.extensionVersionCohorts).length, records.length, "JSON retains every bounded-source cohort");
+		const lines = renderBenchmarkReport(report);
+		assert.equal(lines.filter((line) => line.startsWith("version cohort v-")).length, MAX_RENDERED_VERSION_COHORTS);
+		assert.ok(lines.some((line) => line === "version cohorts omitted: 7 (JSON retains all bounded-source cohorts)"));
 	});
 });
 
@@ -342,6 +419,7 @@ test("buildBenchmarkReport mirrors schema 1.3 observability without claiming fin
 		assert.deepEqual(report.observability?.wholeItemLcp, { eligibleRequests: 2, itemCount: 1, utf8Bytes: 9 });
 		const rendered = renderBenchmarkReport(report).join("\n");
 		assert.match(rendered, /local wire observation: requests=2 nonfinal=2 finalityCode=0/);
+		assert.match(rendered, /actor cohorts\s+: unknown=0 commander=1 worker=1/);
 		assert.ok(!rendered.includes("verified wire"));
 	});
 });
@@ -436,6 +514,7 @@ test("renderBenchmarkReport: human-readable lines carry the same facts, never se
 		assert.ok(lines.some((l) => l.includes("estimated avoided cost")));
 		assert.ok(lines.some((l) => l.includes("corruption")));
 		assert.ok(lines.some((l) => l.includes("data quality") && l.includes("PARTIAL")));
+		assert.ok(lines.some((l) => l.includes("version cohort caveat") && l.includes("not a source-commit identity")));
 		const joined = lines.join("\n");
 		assert.ok(!joined.includes("auth.json"));
 		assert.ok(!joined.includes("apiKey"));

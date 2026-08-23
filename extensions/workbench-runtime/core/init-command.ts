@@ -1,7 +1,6 @@
 /** Project bootstrap command controller. */
 
-import { access, mkdir, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { access } from "node:fs/promises";
 
 import {
 	CONFIG_DIR_NAME,
@@ -9,7 +8,8 @@ import {
 	type ExtensionCommandContext,
 } from "@earendil-works/pi-coding-agent";
 
-import { applyInit, planInit, renderInitPlan } from "./init.ts";
+import { applyInit, planInit, renderInitPlan, retainInitContentSnapshot } from "./init.ts";
+import { captureInitFileIdentity, safelyWriteInitFile, type InitFileIdentity } from "./init-safe-write.ts";
 import { INIT_PROFILES, isSupportedInitProfile } from "./templates.ts";
 
 export interface InitCommandController {
@@ -49,26 +49,47 @@ export function registerInitCommand(controller: InitCommandController): void {
 			controller.output(ctx, [...renderInitPlan(preview, CONFIG_DIR_NAME), ""]);
 
 			const overwrite = new Set<string>();
+			const overwriteIdentity = new Map<string, InitFileIdentity>();
 			if (ctx.hasUI) {
 				for (const entry of preview.entries) {
 					if (entry.action !== "skip") continue;
+					let identity: InitFileIdentity | undefined;
+					try {
+						identity = await captureInitFileIdentity(projectRoot, entry.path);
+					} catch {
+						// A declined overwrite remains a safe skip. If the user elects
+						// to overwrite, the missing identity below makes it fail closed.
+					}
 					const confirmed = await ctx.ui.confirm(
 						"Overwrite?",
-						`${CONFIG_DIR_NAME}/workbench/${entry.file} already exists. Overwrite it?`,
+						`${entry.file === "AGENTS.md" ? "AGENTS.md (project root)" : `${CONFIG_DIR_NAME}/workbench/${entry.file}`} already exists. Overwrite it?`,
 					);
-					if (confirmed) overwrite.add(entry.file);
+					if (confirmed) {
+						if (!identity) throw new Error(`q-init: ${entry.file} is not a safely bindable regular file`);
+						overwrite.add(entry.file);
+						overwriteIdentity.set(entry.path, identity);
+					}
 				}
 			}
 
-			const plan = await planInit(projectRoot, profile, {
+			const currentActions = await planInit(projectRoot, profile, {
 				exists,
 				confirmOverwrite: async (file) => overwrite.has(file),
 			});
+			// Refresh only create/skip/overwrite decisions after confirmation. The
+			// bytes shown in the preview stay authoritative even if package/stack
+			// detection changes while the user is deciding.
+			const plan = retainInitContentSnapshot(currentActions, preview);
 			await applyInit(plan, {
 				exists,
-				write: async (path, content) => {
-					await mkdir(dirname(path), { recursive: true });
-					await writeFile(path, content, "utf8");
+				write: async (path, content, action) => {
+					await safelyWriteInitFile({
+						projectRoot,
+						path,
+						content,
+						action,
+						...(action === "overwrite" ? { expectedIdentity: overwriteIdentity.get(path) } : {}),
+					});
 				},
 			});
 

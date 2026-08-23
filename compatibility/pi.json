@@ -17,6 +17,8 @@
 	"pi": {
 		"package": "@earendil-works/pi-coding-agent",
 		"tested_version": "0.83.0",
+		"current_source_target": "0.84.2",
+		"current_source_verification": "pinned devDependency plus native typecheck and repository test suite; this is narrower than the historical 0.83.0 live TUI/print/json release qualification",
 		"peer_spec": "*",
 		"tested_modes": [
 			"tui",
@@ -45,6 +47,18 @@
 		"typescript": "5.9.x",
 		"tsx": "4.23.x",
 		"yaml": "2.9.x"
+	},
+	"current_source_dependencies": {
+		"@earendil-works/pi-coding-agent": "0.84.2",
+		"@earendil-works/pi-tui": "0.84.2"
+	},
+	"current_source_runtime": {
+		"node": "v26.7.0",
+		"npm": "12.0.2",
+		"os": "CachyOS Linux (Arch-based)",
+		"kernel": "7.1.8-1-cachyos",
+		"arch": "x86_64",
+		"ci_node_target": "24.x (workflow configuration only until CI executes)"
 	},
 	"verification": {
 		"typecheck": "npm run typecheck",

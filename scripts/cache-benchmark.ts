@@ -52,6 +52,8 @@ import {
 } from "../extensions/workbench-runtime/cache/cache-store.ts";
 import { LOCK_STALE_MS } from "../extensions/workbench-runtime/cache/action-types.ts";
 import type { TelemetryRecord } from "../extensions/workbench-runtime/cache/cache-types.ts";
+import { readJsonFileBounded } from "../extensions/workbench-runtime/core/bounded-file-io.ts";
+import { isValidRunId, RUN_JSON_INPUT_MAX_BYTES } from "../extensions/workbench-runtime/core/runs.ts";
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -133,16 +135,23 @@ export async function readRunManifests(projectRoot: string): Promise<RunReadResu
 	let corrupt = 0;
 	let names: string[] = [];
 	try {
-		names = await readdir(dir);
+		names = (await readdir(dir, { withFileTypes: true }))
+			.filter((entry) => entry.isDirectory() && isValidRunId(entry.name))
+			.map((entry) => entry.name);
 	} catch {
 		return { manifests, corrupt };
 	}
 	for (const name of names.sort()) {
 		try {
-			const raw = JSON.parse(await readFile(join(dir, name, "manifest.json"), "utf8")) as Record<string, unknown>;
+			const read = await readJsonFileBounded<Record<string, unknown>>(join(dir, name, "manifest.json"), RUN_JSON_INPUT_MAX_BYTES);
+			if (!read.ok || read.value.value.run_id !== name) {
+				corrupt += 1;
+				continue;
+			}
+			const raw = read.value.value;
 			const source = raw.execution_source === "cache" ? "cache" : raw.execution_source === "exec" ? "exec" : "unknown";
 			manifests.push({
-				runId: typeof raw.run_id === "string" ? raw.run_id : name,
+			runId: name,
 				recipe: typeof raw.recipe === "string" ? raw.recipe : "?",
 				executionSource: source,
 				actionKey: typeof raw.action_key === "string" ? raw.action_key : null,
@@ -337,7 +346,8 @@ export interface CostMapEntry {
 }
 
 export interface BenchmarkReport {
-	schemaVersion: "1.0";
+	/** 1.1 adds extension-version and project-lifetime recipe cohorts. */
+	schemaVersion: "1.1";
 	generatedAt: string;
 	scope: "session" | "project";
 	timeRange: { from: string | null; to: string | null };
@@ -374,7 +384,31 @@ export interface BenchmarkReport {
 	recipeExecutions: number;
 	recipeCacheHits: number;
 	recipeCacheMisses: number;
+	/** Manifests without an explicit exec/cache source; excluded from the ratio. */
+	recipeCacheUnknown: number;
 	recipeHitRatio: number | null;
+	/**
+	 * Project-lifetime action-cache cohorts. Run manifests do not carry a
+	 * session id, so these facts deliberately remain project-scoped even when
+	 * the prompt-telemetry report is filtered to one session.
+	 */
+	recipeCohorts: Record<string, {
+		executions: number;
+		hits: number;
+		misses: number;
+		unknown: number;
+		hitRatio: number | null;
+		localExecutionTimeAvoided: number;
+	}>;
+	/** Prompt-usage cohorts derived from the same filtered telemetry rows. */
+	extensionVersionCohorts: Record<string, {
+		requestCount: number;
+		uncachedInputTokens: number;
+		cacheReadTokens: number;
+		outputTokens: number;
+		cacheHitRatio: number | null;
+		usageSemanticStatus: "verified" | "partial" | "unverified" | null;
+	}>;
 	/** Seconds of local execution avoided by action-cache hits. */
 	localExecutionTimeAvoided: number;
 	/** Bytes on disk under .pi/workbench/cache/ (actions+index+locks+tmp+telemetry+reports). */
@@ -393,6 +427,21 @@ export interface BenchmarkInput {
 	since?: string;
 	until?: string;
 	costMap?: Record<string, CostMapEntry>;
+}
+
+/** Single-pass grouping used by the bounded version-cohort aggregator. */
+export function groupTelemetryByExtensionVersion(
+	records: readonly TelemetryRecord[],
+	onRecord?: (record: TelemetryRecord) => void,
+): Map<string, TelemetryRecord[]> {
+	const grouped = new Map<string, TelemetryRecord[]>();
+	for (const record of records) {
+		onRecord?.(record);
+		const cohort = grouped.get(record.extensionVersion);
+		if (cohort) cohort.push(record);
+		else grouped.set(record.extensionVersion, [record]);
+	}
+	return grouped;
 }
 
 /** Build the benchmark report from local evidence only. */
@@ -423,24 +472,68 @@ export async function buildBenchmarkReport(input: BenchmarkInput): Promise<Bench
 
 	// Recipe cache dimensions from run manifests + action records.
 	const hits = runs.manifests.filter((m) => m.executionSource === "cache");
-	const misses = runs.manifests.filter((m) => m.executionSource !== "cache");
-	let avoidedMs = 0;
-	for (const hit of hits) {
-		// Preferred: the action record's original execution duration.
+	const misses = runs.manifests.filter((m) => m.executionSource === "exec");
+	const unknown = runs.manifests.filter((m) => m.executionSource === "unknown");
+	const runById = new Map(runs.manifests.map((manifest) => [manifest.runId, manifest]));
+	const avoidedDurationMs = (hit: typeof hits[number]): number => {
 		const byKey = hit.actionKey ? actionCache.durationsByKey.get(hit.actionKey) : undefined;
-		if (byKey !== undefined) {
-			avoidedMs += byKey;
-			continue;
+		if (byKey !== undefined) return Math.max(0, byKey);
+		const sourceDuration = hit.reusedFromRunId ? runById.get(hit.reusedFromRunId)?.durationMs : undefined;
+		return sourceDuration === undefined || sourceDuration === null ? 0 : Math.max(0, sourceDuration);
+	};
+	let avoidedMs = 0;
+	const recipeCohorts = Object.create(null) as BenchmarkReport["recipeCohorts"];
+	for (const hit of hits) {
+		avoidedMs += avoidedDurationMs(hit);
+	}
+	for (const manifest of runs.manifests) {
+		const cohort = recipeCohorts[manifest.recipe] ?? {
+			executions: 0,
+			hits: 0,
+			misses: 0,
+			unknown: 0,
+			hitRatio: null,
+			localExecutionTimeAvoided: 0,
+		};
+		if (manifest.executionSource === "cache") {
+			cohort.executions += 1;
+			cohort.hits += 1;
+			cohort.localExecutionTimeAvoided += avoidedDurationMs(manifest) / 1000;
+		} else if (manifest.executionSource === "exec") {
+			cohort.executions += 1;
+			cohort.misses += 1;
+		} else {
+			cohort.unknown += 1;
 		}
-		// Fallback: the exec run manifest that the hit reuses.
-		if (hit.reusedFromRunId) {
-			const source = runs.manifests.find((m) => m.runId === hit.reusedFromRunId);
-			if (source?.durationMs !== undefined && source?.durationMs !== null) avoidedMs += source.durationMs;
-		}
+		cohort.hitRatio = cohort.executions > 0 ? cohort.hits / cohort.executions : null;
+		recipeCohorts[manifest.recipe] = cohort;
+	}
+
+	const extensionVersionCohorts = Object.create(null) as BenchmarkReport["extensionVersionCohorts"];
+	const versionGroups = groupTelemetryByExtensionVersion(records);
+	for (const version of [...versionGroups.keys()].sort()) {
+		const cohortReport = buildCacheReport(
+			versionGroups.get(version)!,
+			scope,
+			rateLookup,
+			{
+				skippedRecords: telemetry.skipped,
+				sourceIncomplete: telemetry.sourceIncomplete,
+				truncatedRecords: telemetry.truncatedRecords,
+			},
+		);
+		extensionVersionCohorts[version] = {
+			requestCount: cohortReport.requestCount,
+			uncachedInputTokens: cohortReport.totals.input,
+			cacheReadTokens: cohortReport.totals.cacheRead,
+			outputTokens: cohortReport.totals.output,
+			cacheHitRatio: cohortReport.hitRatio,
+			usageSemanticStatus: cohortReport.semanticStatus,
+		};
 	}
 
 	return {
-		schemaVersion: "1.0",
+		schemaVersion: "1.1",
 		generatedAt: new Date().toISOString(),
 		scope,
 		timeRange: { from, to },
@@ -473,10 +566,13 @@ export async function buildBenchmarkReport(input: BenchmarkInput): Promise<Bench
 		thinkingChanges: report.changeCounts.thinking,
 		reloads: report.changeCounts.reload,
 		compactions: report.changeCounts.compaction,
-		recipeExecutions: runs.manifests.length,
+		recipeExecutions: hits.length + misses.length,
 		recipeCacheHits: hits.length,
 		recipeCacheMisses: misses.length,
+		recipeCacheUnknown: unknown.length,
 		recipeHitRatio: hits.length + misses.length > 0 ? hits.length / (hits.length + misses.length) : null,
+		recipeCohorts,
+		extensionVersionCohorts,
 		localExecutionTimeAvoided: avoidedMs / 1000,
 		cacheStorageSize: actionCache.totalBytes,
 		corruptionCount: actionCache.corruptQuarantined + telemetry.skipped + runs.corrupt,
@@ -490,6 +586,9 @@ export async function buildBenchmarkReport(input: BenchmarkInput): Promise<Bench
 // ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
+
+export const MAX_RENDERED_VERSION_COHORTS = 20 as const;
+export const MAX_RENDERED_RECIPE_COHORTS = 50 as const;
 
 function pct(value: number | null): string {
 	if (value === null) return "n/a";
@@ -537,7 +636,9 @@ export function renderBenchmarkReport(report: BenchmarkReport): string[] {
 		`history projection: segment seals=${report.historyProjectionSegmentSeals} epoch transitions=${report.historyProjectionEpochTransitions}`,
 		`explicit breakpoints: applied=${report.explicitBreakpointAppliedRequests} verified requests=${report.explicitBreakpointVerifiedUsage.requestCount} input=${report.explicitBreakpointVerifiedUsage.input} cacheRead=${report.explicitBreakpointVerifiedUsage.cacheRead} cacheWrite=${report.explicitBreakpointVerifiedUsage.cacheWrite} ratio=${pct(report.explicitBreakpointVerifiedUsage.hitRatio)} (provider usage; cacheRead=0 is not a failure)`,
 		`changes         : mode=${report.modeChanges} model=${report.modelChanges} thinking=${report.thinkingChanges} reload=${report.reloads} compaction=${report.compactions}`,
-		`recipes         : executed=${report.recipeExecutions} hits=${report.recipeCacheHits} misses=${report.recipeCacheMisses} hit=${pct(report.recipeHitRatio)}`,
+		`recipes         : executed=${report.recipeExecutions} hits=${report.recipeCacheHits} misses=${report.recipeCacheMisses} unknown=${report.recipeCacheUnknown} hit=${pct(report.recipeHitRatio)}`,
+		`recipe cohort scope: project lifetime (run manifests have no session id)`,
+		`version cohort caveat: extension version is not a source-commit identity`,
 		`local time avoided: ${seconds(report.localExecutionTimeAvoided)}`,
 		`cache storage   : ${bytes(report.cacheStorageSize)}`,
 		`corruption      : ${report.corruptionCount}`,
@@ -546,6 +647,24 @@ export function renderBenchmarkReport(report: BenchmarkReport): string[] {
 		`data quality    : ${qualityLabel}; bounded oldest omitted=${report.truncatedTelemetryRecords}`,
 		`run manifests   : ${report.sources.runManifests} (action records: ${report.sources.actionRecords})`,
 	];
+	const versionCohorts = Object.entries(report.extensionVersionCohorts).sort(([left], [right]) => left.localeCompare(right));
+	for (const [version, cohort] of versionCohorts.slice(0, MAX_RENDERED_VERSION_COHORTS)) {
+		lines.push(
+			`version cohort ${version}: requests=${cohort.requestCount} hit=${pct(cohort.cacheHitRatio)} input=${cohort.uncachedInputTokens} cacheRead=${cohort.cacheReadTokens} output=${cohort.outputTokens} semantics=${cohort.usageSemanticStatus ?? "unverified"}`,
+		);
+	}
+	if (versionCohorts.length > MAX_RENDERED_VERSION_COHORTS) {
+		lines.push(`version cohorts omitted: ${versionCohorts.length - MAX_RENDERED_VERSION_COHORTS} (JSON retains all bounded-source cohorts)`);
+	}
+	const recipeCohorts = Object.entries(report.recipeCohorts).sort(([left], [right]) => left.localeCompare(right));
+	for (const [recipe, cohort] of recipeCohorts.slice(0, MAX_RENDERED_RECIPE_COHORTS)) {
+		lines.push(
+			`recipe cohort ${recipe}: executed=${cohort.executions} hits=${cohort.hits} misses=${cohort.misses} unknown=${cohort.unknown} hit=${pct(cohort.hitRatio)} localTimeAvoided=${seconds(cohort.localExecutionTimeAvoided)}`,
+		);
+	}
+	if (recipeCohorts.length > MAX_RENDERED_RECIPE_COHORTS) {
+		lines.push(`recipe cohorts omitted: ${recipeCohorts.length - MAX_RENDERED_RECIPE_COHORTS} (JSON retains all bounded-source cohorts)`);
+	}
 	const observed = report.observability;
 	lines.push(`schema 1.3      : rows=${report.schema13Rows} observed=${observed === null ? 0 : 1}`);
 	if (observed !== null) {

@@ -5,8 +5,10 @@ short path from zero to a gated workbench project.
 
 ## 1. Install the package
 
-Requirements: Node.js and npm (tested: Node v24.13.0 / npm 11.18.0), Pi
-(tested: 0.83.0). See [compatibility.md](compatibility.md).
+Requirements: Node.js, npm, and Pi. The released v0.10.0 live baseline used
+Node v24.13.0 / npm 11.18.0 / Pi 0.83.0; current unreleased source and tests
+pin Pi 0.84.2, while a new live TUI/print/JSON release matrix is still pending.
+See [compatibility.md](compatibility.md) for the separated evidence scopes.
 
 ```bash
 npm install --ignore-scripts   # devDependencies (TS, tsx, pi types) + yaml runtime dep
@@ -29,6 +31,24 @@ files — including an existing `AGENTS.md` — are never overwritten by default
 (overwrites require per-file confirmation, skipped entirely in print/json
 modes). The `hft`, `market-making`, `lob`, and `execution-engine` profiles
 are rejected by design.
+
+The apply step binds every overwrite confirmation to the same bounded regular
+file identity and content digest, rejects leaf symlinks, and creates new files
+exclusively. Parent directories are revalidated as real in-project directories
+before and after the write. Standard Node path APIs cannot provide Linux
+`openat2(RESOLVE_BENEATH)` semantics against a privileged process that swaps an
+ancestor directory concurrently; do not run `/q-init` while another process is
+mutating the project directory tree.
+
+For `generic`, initialization detects the repository's top-level stack and
+only emits observable, project-declared entry points: Node recipes come from
+scripts present in `package.json` and must still be reviewed before first use;
+Go uses `-mod=readonly`; Rust requires a committed lockfile and uses `--locked`.
+Conflicting Node lockfiles, unknown stacks, Python projects without a
+project-declared test command, and Rust projects without a lockfile remain
+explicitly `NOT_CONFIGURED` with `recipes: []`—edit that file rather than
+inheriting fictional commands. The preview names the selected preset, and
+apply writes that exact content snapshot.
 
 **Then exit Pi, re-enter the project, and approve project trust.** Config is
 only read and recipes only run under trust.

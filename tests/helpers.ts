@@ -32,19 +32,28 @@ export function spawnExec(
 		let stdout = "";
 		let stderr = "";
 		let killed = false;
+		let settled = false;
 		proc.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
 		proc.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
 		const kill = (): void => {
+			if (settled) return;
 			killed = true;
 			proc.kill("SIGTERM");
 		};
-		if (options?.timeout !== undefined) setTimeout(kill, options.timeout);
+		const timeout = options?.timeout !== undefined ? setTimeout(kill, options.timeout) : undefined;
 		if (options?.signal) {
 			if (options.signal.aborted) kill();
 			else options.signal.addEventListener("abort", kill, { once: true });
 		}
-		proc.on("close", (code) => resolve({ stdout, stderr, code: code ?? 0, killed }));
-		proc.on("error", () => resolve({ stdout, stderr, code: 1, killed }));
+		const finish = (result: ExecResultLike): void => {
+			if (settled) return;
+			settled = true;
+			if (timeout) clearTimeout(timeout);
+			options?.signal?.removeEventListener("abort", kill);
+			resolve(result);
+		};
+		proc.on("close", (code) => finish({ stdout, stderr, code: code ?? 0, killed }));
+		proc.on("error", () => finish({ stdout, stderr, code: 1, killed }));
 	});
 }
 

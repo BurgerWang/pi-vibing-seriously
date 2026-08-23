@@ -152,12 +152,19 @@ export function gateSchemaHash(profile: string | undefined, projectGatesRaw: rea
 function normalizeGateForHash(gate: Gate): unknown {
 	return {
 		id: gate.id,
+		title: gate.title,
+		description: gate.description,
+		profiles: gate.profiles,
 		prerequisites: gate.prerequisites,
 		required: gate.required,
 		blocking: gate.blocking,
 		evidence: gate.evidence,
+		acceptance: gate.acceptance,
+		source: gate.source,
 		checks: gate.checks.map((c) => ({
 			id: c.id,
+			title: c.title,
+			description: c.description,
 			kind: c.kind,
 			required: c.required,
 			blocking: c.blocking,
@@ -165,14 +172,18 @@ function normalizeGateForHash(gate: Gate): unknown {
 			recipes: c.recipes,
 			path: c.path,
 			any_of: c.any_of,
+			file_root: c.file_root,
 			artifact_recipe: c.artifact_recipe,
 			artifact_glob: c.artifact_glob,
 			json_file: c.json_file,
 			json_path: c.json_path,
+			json_equals: c.json_equals,
 			json_any_of_paths: c.json_any_of_paths,
 			numeric_min: c.numeric_min,
 			numeric_max: c.numeric_max,
+			manual_prompt: c.manual_prompt,
 			schema_name: c.schema_name,
+			worker_first: c.worker_first,
 		})),
 	};
 }

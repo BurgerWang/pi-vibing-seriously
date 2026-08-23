@@ -46,7 +46,8 @@ Reload the initialized project, approve project trust, then work normally:
 
 ```text
 /q-mode-dev
-/q-run typecheck
+workbench_project_inspect   # see the exact recipes generated/detected
+/q-run check:typecheck     # example: only when q-init found that package script
 workbench_delegate_worker   # normal bounded implementation path
 /q-mode-verify
 /q-gate base               # final evidence pass when risk requires it

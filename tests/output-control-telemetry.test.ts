@@ -361,9 +361,23 @@ test("restore chooses the latest cumulative entry and a malformed matching entry
 	assert.equal(restored.restoreFromEntries([entry(second.snapshot()), {
 		type: "custom",
 		customType: OUTPUT_CONTROL_TELEMETRY_ENTRY_TYPE,
-		data: { bad: "secret" },
+		data: { role: "worker", bad: "secret" },
 	}]), false);
 	assert.equal(restored.snapshot().totals.toolResults, 0);
+
+	const malformedOtherRole = {
+		type: "custom",
+		customType: OUTPUT_CONTROL_TELEMETRY_ENTRY_TYPE,
+		data: { role: "commander", bad: "secret" },
+	};
+	assert.equal(restored.restoreFromEntries([entry(first.snapshot()), malformedOtherRole]), true, "other-role telemetry is skipped");
+	assert.deepEqual(restored.snapshot(), first.snapshot());
+	assert.equal(restored.restoreFromEntries([{
+		type: "custom",
+		customType: OUTPUT_CONTROL_TELEMETRY_ENTRY_TYPE,
+		data: { role: "worker", bad: "older malformed" },
+	}, entry(second.snapshot())]), true, "a later valid same-role snapshot supersedes malformed history");
+	assert.deepEqual(restored.snapshot(), second.snapshot());
 });
 
 test("status text and JSON are deterministic, bounded, and include every fixed per-tool row", () => {

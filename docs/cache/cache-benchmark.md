@@ -9,6 +9,10 @@ Schema-1.3/P0–P2 fields described below are Unreleased source behavior. No
 deployment, tag, package publication, `/reload`, live qualification, or
 benchmark result is claimed.
 
+The offline report envelope is schema `1.1`: it adds extension-version and
+recipe cohorts without changing telemetry schema `1.3` or creating new
+telemetry records.
+
 ## Commands
 
 | Command | npm script | What it does |
@@ -73,6 +77,7 @@ equal in-Pi numbers.
 | `observability.correlationCounts` | Counts of `unwired`, `exact`, `multipleOrStale`, and `missing`. Non-exact rows are unknown-actor rows with no projection facts and cannot support actor/cohort conclusions. |
 | `observability.wholeItemLcp` | Eligible exact-correlated local observations plus whole-item LCP item and UTF-8 byte totals. The local observation has `finalityCode=0`; no final-wire or partial-item/token claim is made. |
 | `observability.actorCohorts` | Separate `unknown`, `commander`, and `worker` usage cohorts. Commander and worker must be evaluated separately. |
+| `extensionVersionCohorts` | Prompt-usage cohorts grouped in one pass by the record's exact extension version after the requested session/time filters. Each cohort retains its own semantic-status and hit ratio; unlike-version totals are never presented as a current-version improvement. A package version is not a source-commit identity, so an uncommitted/current-HEAD benefit still requires a fresh canary. Human output is bounded to 20 version rows with an omitted count; JSON retains all cohorts from the bounded telemetry window. |
 | `observability.projectionCohorts` | Separate `segmentSeal` and `epochTransition` usage cohorts with numeric event/cause and hard-overflow counts. |
 | `usageSemanticStatus` | Worst status across records: `verified` (api kind verified + internally consistent numbers), `partial` (structure ok, api kind unverified), `unverified` (invalid/missing usage). Never guessed. |
 | `providerReportedCost` | Σ `usage.cost` — Pi's `usage.cost.total`, the cost fact from the provider's own billing fields. |
@@ -85,10 +90,12 @@ equal in-Pi numbers.
 | `explicitBreakpointVerifiedUsage` | Numeric `{ requestCount, input, cacheRead, cacheWrite, hitRatio }` for the applied-request subset. Sums include only exact eligible public `openai` + `openai-responses` + `gpt-5.6*` records with `usageSemanticStatus === "verified"` **and** `messageStatus === "ok"`; an errored request remains in `explicitBreakpointAppliedRequests` but contributes no verified usage. `hitRatio` is `cacheRead / (input + cacheRead)` and is `null` when there is no verified applied request, the denominator is zero, or the observation is incomplete, including intentionally truncated bounded windows. This stricter subset does not change the overall bounded-window ratio above. |
 | `modeChanges` / `modelChanges` / `thinkingChanges` | Adjacent-record transitions of `workbenchMode` / `model` / `thinkingLevel`. |
 | `reloads` / `compactions` | Records with `inferredInvalidationReason` PACKAGE_RELOADED / COMPACTION. |
-| `recipeExecutions` | Run manifests found under `.pi/workbench/runs/` (each manifest = one recipe invocation, exec or cache-hit materialization). |
+| `recipeExecutions` | Run manifests with an explicit `execution_source` of `exec` or `cache`. Unknown/legacy source rows are reported separately and excluded from the hit-ratio denominator. Non-run entries such as `.gate-index` are ignored. |
 | `recipeCacheHits` | Manifests with `execution_source: "cache"` (a validated action-cache hit that skipped execution). |
-| `recipeCacheMisses` | Manifests with `execution_source: "exec"` (actually executed). |
+| `recipeCacheMisses` | Manifests with `execution_source: "exec"` (actually executed); unknown source is never relabeled as a miss. |
+| `recipeCacheUnknown` | Valid run manifests without an explicit `exec`/`cache` source. Counted for data quality, excluded from `recipeExecutions` and `recipeHitRatio`. |
 | `recipeHitRatio` | `hits / (hits + misses)`; `null` when no runs exist. |
+| `recipeCohorts` | Project-lifetime action-cache executions/hits/misses/unknown count, hit ratio, and avoided local execution time grouped by exact recipe. Run manifests have no session id, so this scope stays explicitly project-lifetime even when prompt telemetry is session-filtered. Human output is bounded (50 recipe rows); JSON retains every cohort admitted by the bounded sources. |
 | `localExecutionTimeAvoided` | Σ, over cache-hit manifests, of the **original execution duration**: the action record's `durationMs` (matched by `action_key`), falling back to the exec manifest's `duration_ms` (matched by `reused_from_run_id`). In seconds. |
 | `cacheStorageSize` | Total on-disk bytes of `.pi/workbench/cache/` (actions + cas + locks + tmp + cache-index + telemetry + reports) — bounded by rotation and prune rules. |
 | `corruptionCount` | Quarantined action records (`tmp/corrupt-*`), action files with schema/key mismatches, CAS quarantine files, unparseable run manifests, and skipped telemetry lines. Corruption is always treated as a miss — never a wrong answer. |

@@ -35,7 +35,9 @@ import {
 	manualEvidenceHash,
 	parseValidationEvidenceBlock,
 	prerequisiteStatusHash,
+	sourceAuthorityHash,
 	unavailableEvidenceBlock,
+	validationEvidenceSourceEligible,
 	VALIDATION_REFUSAL_REASONS,
 	workerFirstFactsHash,
 	type TrustedWorkbenchConfigFileDigest,
@@ -48,7 +50,8 @@ import type { RecipeMutationFacts } from "../extensions/workbench-runtime/core/w
 import type { WorkerFirstGateFacts } from "../extensions/workbench-runtime/core/gate-schema.ts";
 import { KNOWN_LOCKFILES } from "../extensions/workbench-runtime/cache/action-types.ts";
 import { computeDiffHash } from "../extensions/workbench-runtime/core/delegation-ledger.ts";
-import { canonicalHash, sha256Hex } from "../extensions/workbench-runtime/cache/canonical-hash.ts";
+import { canonicalHash, NonSerializableValueError, sha256Hex } from "../extensions/workbench-runtime/cache/canonical-hash.ts";
+import { gateSchemaHash } from "../extensions/workbench-runtime/cache/action-key.ts";
 import { spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
 
 const SOL: RecipeMutationFacts = { role: undefined, provider: "openai-codex", model: "gpt-5.6-sol" };
@@ -198,6 +201,48 @@ test("exact same state compares reusable (recipe + gate), including JSON round-t
 		const gateBlock = await captureGate(dir);
 		const gateCurrent = await currentForGate(dir);
 		assert.equal(evaluateValidationReuse(gateBlock, gateCurrent).reusable, true);
+	});
+});
+
+test("gate plan targets round-trip strictly and bind hash, mapped Gates, and coverage", async () => {
+	await withTempDir(async (dir) => {
+		await setupGitProject(dir);
+		const planReference = {
+			plan_reference_hash: "d".repeat(64),
+			required_gate_ids: ["g1", "g2"],
+			coverage: "FULL" as const,
+		};
+		const block = await captureGate(dir, { planReference });
+		const persisted = JSON.parse(JSON.stringify(block)) as ValidationEvidenceBlock;
+		const parsed = parseValidationEvidenceBlock(persisted);
+		assert.equal(parsed.ok, true);
+		if (parsed.ok && parsed.block.binding?.target.kind === "gate") {
+			assert.deepEqual(parsed.block.binding.target.plan_reference, planReference);
+		}
+
+		const current = await currentForGate(dir, {
+			target: buildGateValidationTarget("g1,g2", ["g2", "g1"], ["g1", "g2"], planReference),
+		});
+		assert.equal(evaluateValidationReuse(block, current).reusable, true);
+		assert.deepEqual(
+			evaluateValidationReuse(block, await currentForGate(dir)).reasons,
+			["target-mismatch"],
+			"a plan-bound target cannot reuse a historical no-plan target",
+		);
+
+		const extra = JSON.parse(JSON.stringify(block)) as any;
+		extra.binding.target.plan_reference.extra = true;
+		assert.equal(parseValidationEvidenceBlock(extra).ok, false, "unknown nested plan target fields fail closed");
+
+		const unsorted = JSON.parse(JSON.stringify(block)) as any;
+		unsorted.binding.target.plan_reference.required_gate_ids = ["g2", "g1"];
+		assert.equal(parseValidationEvidenceBlock(unsorted).ok, false, "persisted mapped Gate ids must be sorted and unique");
+
+		const tamperedHash = JSON.parse(JSON.stringify(block)) as ValidationEvidenceBlock;
+		if (tamperedHash.binding?.target.kind === "gate" && tamperedHash.binding.target.plan_reference) {
+			tamperedHash.binding.target.plan_reference.plan_reference_hash = "e".repeat(64);
+		}
+		assert.deepEqual(evaluateValidationReuse(tamperedHash, current).reasons, ["target-mismatch"]);
 	});
 });
 
@@ -727,6 +772,61 @@ test("prerequisite-status hash drops sources/run ids and is order-independent", 
 	assert.notEqual(prerequisiteStatusHash({ g1: "PASS" }), prerequisiteStatusHash({ g1: "PASS", g2: "PASS" }));
 	// Non-status values (e.g. a run-id-bearing source) never enter the hash.
 	assert.equal(prerequisiteStatusHash({ g1: "PASS", g2: "run:20260101-120000-abcd" }), prerequisiteStatusHash({ g1: "PASS" }));
+});
+
+test("source-authority hash is order-independent and binds run, validation digest and freshness", () => {
+	const a = "artifact:g1.1:producer";
+	const b = "artifact:g1.2:other";
+	const sourceA = `20260823-120000-abcd:${"a".repeat(64)}:current`;
+	const sourceB = `20260823-120001-efgh:${"b".repeat(64)}:immutable-snapshot`;
+	assert.equal(sourceAuthorityHash({ [a]: sourceA, [b]: sourceB }), sourceAuthorityHash({ [b]: sourceB, [a]: sourceA }));
+	assert.notEqual(sourceAuthorityHash({ [a]: sourceA }), sourceAuthorityHash({ [a]: sourceA.replace("abcd", "wxyz") }));
+	assert.notEqual(sourceAuthorityHash({ [a]: sourceA }), sourceAuthorityHash({ [a]: sourceA.replace(/a{64}/, "c".repeat(64)) }));
+	assert.notEqual(sourceAuthorityHash({ [a]: sourceA }), sourceAuthorityHash({ [a]: sourceA.replace("current", "immutable-snapshot") }));
+});
+
+test("artifact source eligibility binds the exact recipe and invocation identity", async () => {
+	await withTempDir(async (dir) => {
+		await setupGitProject(dir);
+		const recipe = await captureRecipe(dir);
+		assert.equal(validationEvidenceSourceEligible(recipe, { recipe: "hello", argvHash: TARGET_INVOCATION }), true);
+		assert.equal(validationEvidenceSourceEligible(recipe, { recipe: "other", argvHash: TARGET_INVOCATION }), false);
+		assert.equal(validationEvidenceSourceEligible(recipe, { recipe: "hello", argvHash: "f".repeat(64) }), false);
+
+		const gate = await captureGate(dir);
+		assert.equal(
+			validationEvidenceSourceEligible(gate, { recipe: "hello", argvHash: TARGET_INVOCATION }),
+			false,
+			"a successful Gate binding cannot be relabeled as producer authority",
+		);
+	});
+});
+
+test("gate schema hash binds worker-first assertions and JSON equality semantics", () => {
+	const workerGate = (workerFirst: string) => [{
+		id: "worker-authority",
+		checks: [{ id: "worker-authority.1", kind: "worker-first", worker_first: workerFirst }],
+	}];
+	assert.notEqual(
+		gateSchemaHash("generic", workerGate("strict-policy-active")),
+		gateSchemaHash("generic", workerGate("no-pending-review")),
+		"changing only the machine assertion must invalidate the canonical gate definition",
+	);
+
+	const jsonGate = (equals: unknown) => [{
+		id: "json-authority",
+		checks: [{ id: "json-authority.1", kind: "json", file: "result.json", path: "status", equals }],
+	}];
+	assert.notEqual(
+		gateSchemaHash("generic", jsonGate({ state: "ready", version: 1 })),
+		gateSchemaHash("generic", jsonGate({ state: "ready", version: 2 })),
+		"changing only the deep-equality assertion must invalidate the canonical gate definition",
+	);
+	assert.throws(
+		() => gateSchemaHash("generic", jsonGate(new Map([["state", "ready"]]))),
+		NonSerializableValueError,
+		"non-JSON equality assertions must fail closed instead of being omitted or string-coerced",
+	);
 });
 
 test("actor-facts hash is bounded to role/provider/model ids", () => {

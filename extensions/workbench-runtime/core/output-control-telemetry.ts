@@ -655,22 +655,33 @@ export class OutputControlTelemetryAccumulator {
 	/** Restore the latest cumulative entry; a malformed matching entry fails closed. */
 	restoreFromEntries(entries: readonly unknown[]): boolean {
 		let latest: OutputControlTelemetrySnapshot | undefined;
+		let foundMatchingRole = false;
 		try {
 			for (const entry of entries) {
 				const customType = ownDataValue(entry, "customType");
 				if (!customType.ok || customType.value !== OUTPUT_CONTROL_TELEMETRY_ENTRY_TYPE) continue;
+				// Role is the routing key. Telemetry for another role is independent,
+				// even when the rest of that payload is malformed. An entry whose role
+				// cannot be read safely cannot be attributed to this accumulator.
+				const data = ownDataValue(entry, "data");
+				if (!data.ok) continue;
+				const rawRole = ownDataValue(data.value, "role");
+				if (!rawRole.ok || rawRole.value !== this.role) continue;
+				foundMatchingRole = true;
 				const parsed = parseOutputControlTelemetryEntry(entry);
-				if (!parsed || parsed.role !== this.role) {
-					this.reset();
-					return false;
-				}
+				// Keep scanning: only the latest entry for this role is authoritative.
+				// A later valid snapshot supersedes an earlier malformed one.
 				latest = parsed;
 			}
 		} catch {
 			this.reset();
 			return false;
 		}
-		if (!latest) return false;
+		if (!foundMatchingRole) return false;
+		if (!latest) {
+			this.reset();
+			return false;
+		}
 		this.load(latest);
 		return true;
 	}

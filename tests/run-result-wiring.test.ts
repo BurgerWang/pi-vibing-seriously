@@ -202,13 +202,14 @@ async function setupProject(root: string, recipesYaml: string): Promise<void> {
 
 /** 250 noise lines + a raw marker — exceeds the default 200-line tail cap. */
 const GREEN_JS = [
-	'console.log("RAW-SUCCESS-MARKER-42");',
-	'for (let i = 1; i <= 250; i++) console.log("noise-line-" + i);',
+	'const { writeSync } = require("node:fs");',
+	'writeSync(1, "RAW-SUCCESS-MARKER-42\\n");',
+	'for (let i = 1; i <= 250; i++) writeSync(1, "noise-line-" + i + "\\n");',
 ].join("\n");
 
 const GREEN_RECIPES = 'recipes:\n  - name: green\n    command: ["node", "green.js"]\n';
 
-const FAIL_JS = ['console.error("TypeError: boom at fail.js:1");', "process.exit(1);"].join("\n");
+const FAIL_JS = ['require("node:fs").writeSync(2, "TypeError: boom at fail.js:1\\n");', "process.exit(1);"].join("\n");
 
 const FAIL_RECIPES = 'recipes:\n  - name: fail\n    command: ["node", "fail.js"]\n';
 
@@ -608,14 +609,14 @@ const SOL_MODEL = { provider: "openai-codex", id: "gpt-5.6-sol" };
  * Five stdout lines keep tail-boundary assertions observable.
  */
 const COUNTER_JS = [
-	'const { readFileSync, writeFileSync } = require("node:fs");',
+	'const { readFileSync, writeFileSync, writeSync } = require("node:fs");',
 	"// accepts the argv secret (process.argv[2]) but never prints or persists it",
 	"const secret = process.argv[2];",
 	'if (!secret || secret.length < 4) process.exit(2);',
 	'const path = ".pi/counter.txt";',
 	'writeFileSync(path, String(Number(readFileSync(path, "utf8")) + 1), "utf8");',
-	'console.log("RAW-STDOUT-MARKER-42");',
-	'for (let i = 1; i <= 4; i++) console.log("counter-noise-" + i);',
+	'writeSync(1, "RAW-STDOUT-MARKER-42\\n");',
+	'for (let i = 1; i <= 4; i++) writeSync(1, "counter-noise-" + i + "\\n");',
 ].join("\n");
 
 /** Declared recipe: mutation: artifacts, one declared write, one argv secret param. */
@@ -864,7 +865,7 @@ test("P4b fresh-Sol recipe run: REUSABLE in text+details across all four include
 	});
 });
 
-test("P4b fresh-Sol manual gate run: one registered PASS, REUSABLE in default text+details, privacy-safe, full tree/runs/stub invariance", async () => {
+test("model-callable gate tool cannot turn its own manual note into human authority", async () => {
 	await withTempDir(async (root) => {
 		// fixtures: project config (no recipes needed) + a manual gate whose ONLY
 		// required check (g1.1) needs human evidence + `.pi/` gitignored
@@ -882,8 +883,8 @@ test("P4b fresh-Sol manual gate run: one registered PASS, REUSABLE in default te
 		workbenchRuntime(stub);
 		await fireSolSession(stub, root);
 
-		// exactly ONE explicit invocation of the registered gate tool: selector
-		// g1 + the distinctive manual evidence for its required check g1.1
+		// The model tool may carry an advisory note, but it is not a user
+		// attestation and therefore cannot satisfy the human check.
 		const gateTool = stub.tools.get("workbench_run_gate") as unknown as GateTool;
 		assert.ok(gateTool, "workbench_run_gate registered");
 		const gateResult = await gateTool.execute(
@@ -893,12 +894,12 @@ test("P4b fresh-Sol manual gate run: one registered PASS, REUSABLE in default te
 			undefined,
 			trustedCtx(root) as never,
 		);
-		assert.equal(gateResult.details.status, "PASS", toolText(gateResult));
-		assert.equal(gateResult.details.ok, true, toolText(gateResult));
+		assert.equal(gateResult.details.status, "NOT_RUN", toolText(gateResult));
+		assert.equal(gateResult.details.ok, false, toolText(gateResult));
 		const gateSummary = gateResult.details.gates as Array<{ id: string; status: string }>;
 		assert.equal(gateSummary.length, 1, toolText(gateResult));
 		assert.equal(gateSummary[0]!.id, "g1", toolText(gateResult));
-		assert.equal(gateSummary[0]!.status, "PASS", toolText(gateResult));
+		assert.equal(gateSummary[0]!.status, "NOT_RUN", toolText(gateResult));
 		const counts = gateResult.details.counts as {
 			pass: number;
 			fail: number;
@@ -908,13 +909,14 @@ test("P4b fresh-Sol manual gate run: one registered PASS, REUSABLE in default te
 			shown: number;
 			omitted: number;
 		};
-		assert.deepEqual(counts, { pass: 1, fail: 0, blocked: 0, not_run: 0, total: 1, shown: 1, omitted: 0 }, toolText(gateResult));
+		assert.deepEqual(counts, { pass: 0, fail: 0, blocked: 0, not_run: 1, total: 1, shown: 1, omitted: 0 }, toolText(gateResult));
 
 		const runDir = await singleRunDir(root);
 		const runId = basename(runDir);
 		assert.equal(gateResult.details.run_id, runId, "the gate tool's run_id is the single persisted run record");
 
-		// the persisted evidence is a successful, complete, SOL-owned gate binding
+		// The run remains complete and Sol-owned, but its outcome is explicitly
+		// unsuccessful and therefore can never be reused as PASS authority.
 		const persisted = JSON.parse(await readFile(join(runDir, "manifest.json"), "utf8")) as {
 			argv?: string[];
 			validation_evidence?: {
@@ -928,7 +930,7 @@ test("P4b fresh-Sol manual gate run: one registered PASS, REUSABLE in default te
 		};
 		assert.equal(persisted.validation_evidence?.binding?.kind, "gate");
 		assert.equal(persisted.validation_evidence?.binding?.owner, "sol");
-		assert.equal(persisted.validation_evidence?.binding?.outcome?.successful, true);
+		assert.equal(persisted.validation_evidence?.binding?.outcome?.successful, false);
 		assert.equal(persisted.validation_evidence?.binding?.outcome?.complete, true);
 		assert.equal(persisted.validation_evidence?.binding?.target?.kind, "gate");
 		assert.equal(persisted.validation_evidence?.binding?.target?.selector, "g1");
@@ -948,7 +950,9 @@ test("P4b fresh-Sol manual gate run: one registered PASS, REUSABLE in default te
 
 		// exactly ONE registered read: the default bounded summary
 		const result = await readRun.execute("call-2", { run_id: runId }, undefined, undefined, trustedCtx(root) as never);
-		const text = assertReusableResult(result, "gate summary");
+		const text = toolText(result);
+		assert.ok(text.split("\n").includes("validation : RERUN_REQUIRED — unsuccessful-source"), text);
+		assert.deepEqual(result.details.validation, { status: "RERUN_REQUIRED", reasons: ["unsuccessful-source"] });
 		assertWithinCaps(text, SUMMARY_MAX_BYTES, SUMMARY_MAX_LINES);
 		// ordered layers + the exact REUSABLE verdict line
 		const lines = text.split("\n");
@@ -956,11 +960,11 @@ test("P4b fresh-Sol manual gate run: one registered PASS, REUSABLE in default te
 		const idxEvidence = lines.findIndex((l) => l === "--- evidence ---");
 		const idxPersisted = lines.findIndex((l) => l === "--- persisted ---");
 		assert.ok(idxSummary >= 0 && idxEvidence > idxSummary && idxPersisted > idxEvidence, text);
-		assert.ok(lines.includes("validation : REUSABLE"), text);
+		assert.ok(lines.includes("validation : RERUN_REQUIRED — unsuccessful-source"), text);
 		assert.ok(lines.some((l) => l.startsWith(`run_id     : ${runId}`)), text);
 		assert.ok(lines.some((l) => l.startsWith("recipe     : gate")), text);
-		assert.ok(lines.some((l) => l.startsWith("status     : OK")), text);
-		assert.ok(lines.some((l) => l.startsWith("exit code  : 0")), text);
+		assert.ok(lines.some((l) => l.startsWith("status     : FAILED")), text);
+		assert.ok(lines.some((l) => l.startsWith("exit code  : 1")), text);
 		assert.ok(lines.some((l) => l.startsWith(`run dir    : ${CONFIG_DIR_NAME}/workbench/runs/${runId}`)), text);
 		// privacy: the manual secret, unavailable prose, argv/cwd metadata and
 		// worker-first facts never leave the default summary — and raw gate
@@ -982,14 +986,14 @@ test("P4b fresh-Sol manual gate run: one registered PASS, REUSABLE in default te
 		assert.equal(result.details.run_id, runId);
 		assert.equal(result.details.recipe, "gate");
 		assert.equal(result.details.kind, "gate");
-		assert.equal(result.details.status, "OK");
-		assert.equal(result.details.exit_code, 0);
+		assert.equal(result.details.status, "FAILED");
+		assert.equal(result.details.exit_code, 1);
 		assert.equal(result.details.profile, "generic");
 		assert.equal(result.details.mode, "DEV");
 		assert.equal(result.details.git_commit, committedHead);
 		assert.equal(result.details.git_dirty, false);
 		assert.deepEqual(result.details.artifact_paths, ["gates.json", "evidence.json", "summary.json"]);
-		assert.deepEqual(result.details.validation, { status: "REUSABLE", reasons: [] });
+		assert.deepEqual(result.details.validation, { status: "RERUN_REQUIRED", reasons: ["unsuccessful-source"] });
 		const detailsJson = JSON.stringify(result.details);
 		assert.ok(!detailsJson.includes(MANUAL_SECRET), "structured details expose the manual secret");
 

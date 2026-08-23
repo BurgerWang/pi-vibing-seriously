@@ -213,6 +213,33 @@ entries (`workbench-delegation-state`, `workbench-write-lease`) — durable
 across compaction and session replacement — and restore fail-closed on
 `session_start`.
 
+Optional delegation `plan_ref` input is traceability, never authority. Its
+strict nested shape is canonical-hash-bound into the existing v2 contract;
+the referenced regular file must remain inside the project after realpath
+resolution, fit the fixed 1 MiB read ceiling, and match the supplied SHA-256
+both before transaction work and immediately before worker launch. Unsafe
+paths, proxies, unknown fields, concurrent-change detection, and digest drift
+fail closed. The reference adds no allowed path, review verdict, evidence
+status, or Gate PASS.
+
+Plan continuity also fails closed: after the latest strict committed
+delegation carries a plan reference, a successor cannot omit it to erase the
+binding. It must explicitly retain the current reference or supply another
+strict, current reference; no plan status string (including `EVIDENCED`)
+releases the obligation. This uses the immutable delegation chain directly
+and creates no writable active-plan state.
+
+Gate execution never trusts the injected plan facts by themselves. Immediately
+before run allocation it strict-reads the latest committed contract and repeats
+the bounded contained-byte verification; drift, unsafe paths, unreadable data,
+invalid generations, or a fact mismatch setup-fail and produce no reusable
+authority. Final `base`/`all` selection must cover every mapped Gate (`base`
+cannot close a quant mapping), and every mapped Gate must be `PASS`. Focused
+selectors may return development feedback but persist `PARTIAL`, unsuccessful
+validation authority. The validation target binds the plan-reference hash,
+sorted mapped Gate ids and coverage; read-time assessment re-verifies current
+bytes and coverage. None of these checks can promote a Gate result.
+
 B6 (Development Safety; legacy P7 machine kind `worker-first`) is a
 machine-backed universal base gate: the runtime injects bounded safety facts
 into every gate run — development policy active, zero unauthorized high-risk writes (or hard denial
@@ -590,6 +617,15 @@ there is meaningful state) a hidden, bounded note — task, mode, gates, last
 run, evidence paths, next step, do-not-retry — via
 `pi.sendMessage(..., { deliverAs: "nextTurn" })` and a durable custom entry.
 No run logs are ever written into the session context.
+
+Compact-attempt records are append-only. A successful native compact, a known
+cancellation, and an extension fallback callback are terminalized immediately;
+Pi 0.84.2 exposes no extension event for an otherwise unobserved native
+provider failure, so that orphan `started` record is terminalized exactly once
+at the next `session_before_compact` or `session_start`. Synchronous terminal
+observation for that one path is `BLOCKED_BY_PI_0_84_2_PUBLIC_API`. If Pi has
+already started native overflow compaction, failure or cancellation produces a
+handoff and the workbench does not launch a second automatic compact.
 
 Inside a delegated worker process the same event is cancelled
 (`{ cancel: true }`) so a worker never silently continues through lossy
