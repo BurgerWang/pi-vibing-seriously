@@ -166,6 +166,41 @@ provenance only, never a resume:
   architecture/scope decision → bounded implementation; `repair_of` is
   never a substitute for that path.
 
+### Plan traceability reference (`plan_ref`)
+
+`plan_ref` is an optional strict snapshot embedded in the same delegation-v2
+contract, not a second plan state machine. It carries a stable plan id/version,
+project-relative `plan_path`, SHA-256 of the exact current bytes, candidate and
+status labels, sorted criterion-to-Gate mappings, and a bounded next action.
+The runtime rejects unknown fields, proxies, unsafe paths, over-bound files,
+and digest drift before transaction work, then repeats the current-byte check
+immediately before worker launch. The committed contract hash therefore binds
+the exact snapshot. Historical contracts without `plan_ref`, `repair_of`
+alone, `plan_ref` alone, and both optional fields together remain distinct,
+strictly readable shapes. A plan reference adds no write scope, worker power,
+review result, evidence result, or Gate PASS authority.
+
+Once the latest strict committed delegation carries `plan_ref`, a successor
+must carry an explicit current `plan_ref` as well (the same snapshot or an
+explicitly supplied new one). Omitting the field is rejected before a new
+transaction is allocated; an `EVIDENCED` status label alone cannot close or
+discard it. This continuity rule reads the existing immutable delegation chain
+and does not introduce an active-plan mirror or lifecycle.
+
+Before every Gate run, the runtime strict-reads that latest committed contract
+and re-verifies the referenced current bytes. Drift, an unsafe/unreadable file,
+an invalid generation, or mismatched injected facts setup-fails before a Gate
+attempt is allocated. `base` and `all` are the only final plan selectors and
+must include every mapped Gate; a quant Gate mapped by the plan therefore
+requires `all` (or another future final selector that proves full coverage),
+not `base`. A focused selector may still run for development feedback, but its
+binding records `PARTIAL` coverage and is deliberately non-reusable. Full
+coverage records the plan-reference hash plus sorted required Gate ids, and
+every mapped Gate must itself be `PASS`; the plan can never upgrade a Gate
+result. Read-time validation assessment rechecks both the current plan bytes
+and selector coverage before returning `REUSABLE`. Historical no-plan runs
+remain compatible when no current delegation plan exists.
+
 ## One writing worker per worktree
 
 The delegation tool executes sequentially and a worker can never delegate,
@@ -188,7 +223,11 @@ One invocation:
 2. validates the structured task contract and resolves the public
    `task_kind`: omission preserves compatibility by resolving to
    `implementation`; Stage 1 enables only `implementation` and `diagnosis`,
-   while `mechanical` (or any unknown value) fails closed;
+   while `mechanical` (or any unknown value) fails closed. If `plan_ref` is
+   present, it also binds the contained current plan bytes before any
+   transaction work and repeats that check immediately before child launch;
+   if the latest strict committed delegation already carries a plan, omission
+   from the successor is refused before transaction allocation;
 3. refreshes the delegation review state against its versioned binding and
    refuses to start while review authority is pending, invalid, unpublished,
    recovery-required, or non-final. If the exact latest mirror is `STALE` but
@@ -904,6 +943,22 @@ path-by-path `include_paths` re-reviews (max 50 paths per call).
   "verification": ["Run the unit-test recipe"],
   "budget_profile": "extended",
   "repair_of": "20260101-120000-abcd",
+  "plan_ref": {
+    "schema": "workbench-plan-ref-v1",
+    "plan_id": "parser-change-plan",
+    "version": "1.0",
+    "plan_path": "docs/plans/parser-change.md",
+    "plan_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate": "CURRENT_WORKTREE",
+    "status": "IN_PROGRESS",
+    "criteria": [{
+      "id": "C1",
+      "gate_id": "b1",
+      "check_ids": ["b1.1"],
+      "evidence_paths": ["tests/parser.test.ts"]
+    }],
+    "next_action": "complete and verify the bounded parser change"
+  },
   "timeout_seconds": 1800
 }
 ```
@@ -932,6 +987,17 @@ never falls back. This check precedes any new v2 transaction or child launch,
 and the fresh worker inherits no prior report/session/scope/contract — the
 pointer adds no path/scope/authority. Ordinary delegations omit it entirely;
 unknown root causes still use bounded diagnosis, then a Sol decision.
+
+`plan_ref` is optional traceability only (see Plan traceability reference
+above). Its `plan_path` must resolve to a bounded regular file within the
+project and its `plan_sha256` must match current bytes. It is included in the
+canonical delegation contract hash but never converts plan prose or a plan
+status into acceptance, review, evidence, or Gate authority. After one appears
+in the latest strict chain, every successor must explicitly retain or replace
+it; omission never silently clears the plan. Formal Gate authority additionally
+requires current-byte verification, `base`/`all` full mapped-Gate coverage and
+`PASS` for every mapped Gate. Focused Gate runs persist partial, unsuccessful
+validation bindings and cannot become `REUSABLE` authority.
 
 Path rules are deliberately simple:
 
@@ -1014,9 +1080,11 @@ returned as nested tool usage and the child workbench can continue using the
 existing content-free hash-and-numeric cache telemetry.
 
 The later current-only safe-default and segmented-delivery update changes
-the current static delegate schema/metadata fingerprint once more. Frozen v1
-catalog/hash evidence remains unchanged; after reload, the new current-mode
-fingerprint is deterministic and cache telemetry semantics are unchanged.
+the current static delegate schema/metadata fingerprint once more, and the
+optional strict `plan_ref` adds the current framework-reliability transition.
+Frozen v1 catalog/hash evidence remains unchanged; after reload, the new
+current-mode fingerprint is deterministic and cache telemetry semantics are
+unchanged.
 
 NRO N1/N2 (Commander Native Tool Optimization,
 `docs/plans/commander-native-tool-optimization.md`) adds the three fixed

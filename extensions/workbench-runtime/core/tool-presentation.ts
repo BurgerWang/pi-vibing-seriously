@@ -96,7 +96,7 @@ export function boundedGateDetails(
 
 export function renderGateListPresentation(
 	gates: readonly Gate[],
-	statuses: Readonly<Record<string, { status: GateStatus; run_id: string }>>,
+	statuses: Readonly<Record<string, { status: GateStatus | "UNKNOWN"; run_id: string; unavailable_reason?: string }>>,
 ): { text: string; shownGates: Gate[] } {
 	const maximum = Math.min(gates.length, 24);
 	for (let shown = maximum; shown >= 0; shown -= 1) {
@@ -105,7 +105,9 @@ export function renderGateListPresentation(
 			`${gates.length} gate(s) for this project; shown=${shown}; omitted=${gates.length - shown}:`,
 			...selected.map((gate) => {
 				const latest = statuses[gate.id];
-				const status = latest ? `${latest.status} (run ${boundedInlineDetail(latest.run_id, 96)})` : "NOT_RUN (never run)";
+				const status = latest
+					? `${latest.status} (run ${boundedInlineDetail(latest.run_id, 96)})${latest.unavailable_reason ? ` reason=${boundedInlineDetail(latest.unavailable_reason, 192)}` : ""}`
+					: "NOT_RUN (never run)";
 				const prereqs = gate.prerequisites.length > 0 ? boundedInlineDetail(gate.prerequisites.join(","), 256) : "(none)";
 				return `  ${boundedInlineDetail(gate.id, 96)} ${status} ${boundedInlineDetail(gate.title, 256)} prereqs=${prereqs}`;
 			}),

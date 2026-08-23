@@ -46,7 +46,7 @@ const ASSERTED_START_RE = /\b(?:started|launched|created|called)\b|已(?:按要�
 const PLANNED_EXECUTION_RE = /\b(?:will|can|could|should|may|might|plan(?:ned)?\s+to|need\s+to|ready\s+to|going\s+to)\b.{0,32}\b(?:start|launch|execute|create|call)\b|(?:下一步|计划|准备|打算|可以|需要).{0,24}(?:启动|执行|创建|调用|改用)/iu;
 const DISTRIBUTIVE_CLAIM_RE = /\b(?:all|both|each|these|those)\b|(?:两|三|四|五|六|七|八|九|十|多)次|(?:全部|都|分别|上述|这些)/iu;
 const INLINE_CODE_RE = /`([^`\r\n]*)`/gu;
-const RUN_ONLY_LABEL_RE = /\b(?:run|recipe|tests?)\b|(?:完整\s*)?G1|测试|验证/iu;
+const RUN_ONLY_LABEL_RE = /\b(?:run|recipe|tests?|pytest|mypy|compileall|loader|targeted|focused|audit|checks?|diff|gate(?:[-_ ]?profile)?|typecheck|lint)\b|(?:完整\s*)?G1|测试|验证|审计/iu;
 const DELEGATION_LABEL_RE = /\b(?:delegation(?:s)?|worker(?:s)?|latest|authority)\b|delegation[_ ]?id|委派|工作线程/iu;
 const MAX_CLAIM_IDS = 32;
 
@@ -89,6 +89,7 @@ export interface DelegationClaimTurnEvidence {
 	readonly successfulResults: number;
 	readonly resultIds: readonly string[];
 	readonly startedIds: readonly string[];
+	readonly observedStatusIds: readonly string[];
 }
 
 export interface DelegationClaimValidation {
@@ -162,16 +163,15 @@ function inspectWorkbenchRunClaims(text: string): {
 } {
 	const ids: string[] = [];
 	const expected: Record<string, "SUCCESS" | "FAILURE" | undefined> = {};
-	let fence: "`" | "~" | undefined;
 	for (const rawLine of text.split(/\r?\n/u)) {
 		const trimmed = rawLine.trim();
 		const marker = trimmed.match(/^(`{3,}|~{3,})/u)?.[1]?.[0] as "`" | "~" | undefined;
-		if (marker !== undefined) {
-			if (fence === undefined) fence = marker;
-			else if (fence === marker) fence = undefined;
-			continue;
-		}
-		if (fence !== undefined || /^\s*>/u.test(rawLine) || /^["'“‘].*["'”’]$/u.test(trimmed)) continue;
+		if (marker !== undefined) continue;
+		// A fenced block can be the assistant's authoritative handoff/evidence
+		// format. Explicitly labelled run ids inside it must still bind to a
+		// committed run. Delegation transcript claims remain excluded by
+		// claimClauses(), and blockquotes/fully quoted lines remain quotations.
+		if (/^\s*>/u.test(rawLine) || /^["'“‘].*["'”’]$/u.test(trimmed)) continue;
 		const visible = rawLine.replace(INLINE_CODE_RE, (_whole, inline: string) => inline);
 		for (const segment of visible.split(/[.;；。!?！？]+/u)) {
 			if (!RUN_ONLY_LABEL_RE.test(segment) || DELEGATION_LABEL_RE.test(segment)) continue;
@@ -270,7 +270,7 @@ function strictLegacyStatus(ledger: DelegationLedger, id: string): DelegationCla
 		: "LEGACY_FAILED";
 }
 
-/** Inspect only affirmative, unquoted visible clauses; reasoning and quoted logs are never execution evidence. */
+/** Inspect affirmative prose plus explicitly labelled run evidence; quoted delegation logs remain non-authoritative. */
 export function inspectDelegationClaims(message: unknown): DelegationClaimInspection | undefined {
 	const text = assistantText(message);
 	if (text === undefined || text.length === 0) return undefined;
@@ -398,6 +398,24 @@ function authorityProvesWorkerStart(authority: DelegationClaimAuthority): boolea
 	return authority.status !== "PREPARED" && authority.status !== "ABORTED";
 }
 
+function freshStatusObservationProvesSuccess(
+	inspection: DelegationClaimInspection,
+	turn: DelegationClaimTurnEvidence,
+	authorityById: ReadonlyMap<string, DelegationClaimAuthority>,
+): boolean {
+	// A status query can authorize a retrospective summary of the latest durable
+	// worker, but it must never rescue a failed delegation attempt in this run.
+	if (turn.attemptedCalls !== 0 || turn.observedStatusIds.length === 0) return false;
+	const observed = new Set(turn.observedStatusIds);
+	const claimed = inspection.ids.length > 0 ? inspection.ids : [...observed];
+	if (claimed.length === 0 || claimed.some((id) => !observed.has(id))) return false;
+	return claimed.every((id) => {
+		const authority = authorityById.get(id);
+		return authority !== undefined
+			&& authoritySatisfiesStatus(authority, { status: "SUCCESS", source: "transaction" });
+	});
+}
+
 /** Pure verdict: current-turn observations never replace strict on-disk authority. */
 export function validateDelegationClaims(
 	inspection: DelegationClaimInspection,
@@ -425,6 +443,7 @@ export function validateDelegationClaims(
 			return { ok: false, code: "run_status_mismatch" };
 		}
 	}
+	const observedDurableSuccess = freshStatusObservationProvesSuccess(inspection, turn, authorityById);
 	if (inspection.recentClaim && inspection.workerStartClaim) {
 		const started = new Set(turn.startedIds);
 		if (started.size === 0) return { ok: false, code: "missing_started_authority" };
@@ -440,8 +459,10 @@ export function validateDelegationClaims(
 	}
 	if (inspection.recentClaim && inspection.successClaim) {
 		const successful = new Set(turn.resultIds);
-		if (turn.successfulResults === 0) return { ok: false, code: "missing_success_result" };
-		if (inspection.sameRunStartIds.some((id) => !successful.has(id))) {
+		if (turn.successfulResults === 0 && !observedDurableSuccess) {
+			return { ok: false, code: "missing_success_result" };
+		}
+		if (!observedDurableSuccess && inspection.sameRunStartIds.some((id) => !successful.has(id))) {
 			return { ok: false, code: "missing_success_result" };
 		}
 	}
@@ -450,7 +471,10 @@ export function validateDelegationClaims(
 	}
 	if (inspection.successClaim && inspection.ids.length === 0) {
 		if (inspection.recentClaim) {
-			if (turn.successfulResults === 0) return { ok: false, code: "missing_success_result" };
+			if (turn.successfulResults === 0) {
+				if (!observedDurableSuccess) return { ok: false, code: "missing_success_result" };
+				return { ok: true };
+			}
 			const resultAuthorities = turn.startedIds
 				.map((id) => authorityById.get(id))
 				.filter((authority): authority is DelegationClaimAuthority => authority !== undefined);
@@ -510,12 +534,14 @@ export interface DelegationClaimGuardController {
 export function registerDelegationClaimGuard(controller: DelegationClaimGuardController): void {
 	const attemptedCallIds = new Set<string>();
 	const successfulResultIds = new Set<string>();
+	const observedStatusIds = new Set<string>();
 	let baselineLatestId: string | undefined;
 	let baselineCaptured = false;
 
 	const resetTurn = (): void => {
 		attemptedCallIds.clear();
 		successfulResultIds.clear();
+		observedStatusIds.clear();
 		baselineLatestId = controller.getDelegationState().latestId;
 		baselineCaptured = true;
 	};
@@ -525,6 +551,17 @@ export function registerDelegationClaimGuard(controller: DelegationClaimGuardCon
 	// result remains available to the final assistant message in the same run.
 	controller.pi.on("agent_start", resetTurn);
 	controller.pi.on("tool_execution_end", (event) => {
+		if (event.toolName === "workbench_delegation_status") {
+			if (event.isError) return;
+			const result = ownDataValue(event, "result");
+			const details = ownDataValue(result, "details");
+			if (ownDataValue(details, "git_refresh") !== "fresh") return;
+			const latestId = controller.getDelegationState().latestId;
+			if (typeof latestId === "string" && DELEGATION_TRANSACTION_ID_RE.test(latestId)) {
+				observedStatusIds.add(latestId);
+			}
+			return;
+		}
 		if (event.toolName !== "workbench_delegate_worker" || event.isError) return;
 		const result = ownDataValue(event, "result");
 		const details = ownDataValue(result, "details");
@@ -621,6 +658,7 @@ export function registerDelegationClaimGuard(controller: DelegationClaimGuardCon
 			successfulResults: successfulResultIds.size,
 			resultIds: [...successfulResultIds],
 			startedIds: [...startedIds],
+			observedStatusIds: [...observedStatusIds],
 		}, authorities, runAuthorities);
 		return verdict.ok ? undefined : { message: replacementMessage(message, verdict.code ?? "missing_authority") as never };
 	});

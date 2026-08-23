@@ -184,9 +184,9 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 	assert.equal(a.toolOrderHash, canonicalHash(VERIFY_TOOLS), "order hash = canonical hash of the explicit MODE_TOOLS order");
 });
 
-test("v0.10.0 public tool surface has the intentional canonical transition hash", () => {
+test("v0.10.0 public tool surface has the intentional framework-reliability transition hash", () => {
 	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
-	const currentHash = "9e7394a7eb8e1c9960baee532fabd9f2c13d248329bcfde0696c73cc67550559";
+	const currentHash = "5eb0e3071371603325924d731e0ecda3c4a919f9f166f9dd5b1204011e8646de";
 	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
 	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the documented 0.10.0 hash");
 });
@@ -452,6 +452,20 @@ test("workbench_delegate_worker metadata is static and defaults to one-call deli
 		["implementation", "diagnosis"],
 		"task_kind is the exact closed implementation|diagnosis union; mechanical is not public",
 	);
+	const planRefSchema = delegateParameters.properties.plan_ref as typeof delegateParameters.properties[string] & {
+		additionalProperties?: boolean;
+		properties: {
+			schema: { const?: unknown };
+			criteria: { minItems?: number; maxItems?: number; items: { additionalProperties?: boolean } };
+		};
+	};
+	assert.ok(planRefSchema, "plan_ref is present in the current serialized parameter schema");
+	assert.ok(!(delegateParameters.required ?? []).includes("plan_ref"), "plan_ref stays optional for historical callers");
+	assert.equal(planRefSchema.additionalProperties, false, "plan_ref rejects unknown top-level fields");
+	assert.equal(planRefSchema.properties.schema.const, "workbench-plan-ref-v1");
+	assert.equal(planRefSchema.properties.criteria.minItems, 1);
+	assert.equal(planRefSchema.properties.criteria.maxItems, 20);
+	assert.equal(planRefSchema.properties.criteria.items.additionalProperties, false, "plan criteria reject unknown fields");
 	assert.equal(
 		canonicalHash(WORKBENCH_DELEGATE_WORKER_V1_PARAMETERS),
 		"dc1db21e3590c7f57cfa88f042052964a92d495116966747918d72f2018176a7",
@@ -459,8 +473,8 @@ test("workbench_delegate_worker metadata is static and defaults to one-call deli
 	);
 	assert.equal(
 		canonicalHash(WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker),
-		"df77eaa04f473d50a754a216c8b67d9822ce8a5d084f80dc7ad49d335cdb9302",
-		"current delegate parameter schema hash is machine-pinned after turn-only termination retirement",
+		"1ccb80c82baf4475a9de1f0445317b502ccc006b9c85d9e005ded0bdec79d61f",
+		"current delegate parameter schema hash is machine-pinned after optional plan_ref traceability",
 	);
 });
 
@@ -661,8 +675,8 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.equal(
 		canonicalHash(workbenchToolMetadataOrdered()),
-		"62a498d58b54f1352ec0d241364fd01f1cba7a759ffadb593f5f839952002b7c",
-		"current public catalog hash is machine-pinned after crash-safe execution-owner guidance",
+		"404d3da83ba6e0d057c3d3a5a2dd6198e15c7b75d63cb8458ce8b7f29f35deb3",
+		"current public catalog hash is machine-pinned after the combined framework-reliability changes",
 	);
 });
 

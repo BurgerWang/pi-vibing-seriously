@@ -77,7 +77,11 @@ test("every template recipe passes the strict schema", async () => {
 		assert.ok(recipesYaml, "recipes.yaml present");
 		const parsed = parseRecipesDocument(parseYaml(recipesYaml));
 		assert.deepEqual(parsed.errors, [], `${profile}: template recipes must be schema-valid`);
-		assert.ok(parsed.recipes.length >= 1, `${profile}: at least one recipe`);
+		if (profile === "generic") {
+			assert.deepEqual(parsed.recipes, [], "the static generic fallback is explicitly unconfigured; q-init generates detected recipes");
+		} else {
+			assert.ok(parsed.recipes.length >= 1, `${profile}: at least one recipe`);
+		}
 		for (const recipe of parsed.recipes) {
 			assert.ok(Array.isArray(recipe.command), "command is an argv array");
 			assert.ok(recipe.command.length > 0);
@@ -88,15 +92,13 @@ test("every template recipe passes the strict schema", async () => {
 });
 
 test("template recipes declare mutation none/artifacts consistently with their writes", async () => {
-	// Generic: write-free checks declare mutation none; build (artifacts only)
-	// declares mutation artifacts. (parseRecipesDocument sorts by name.)
+	// Generic's static package asset is a safe NOT_CONFIGURED fallback. The
+	// q-init adapter replaces it with a stack-detected immutable plan snapshot.
 	const genericYaml = (await getInitTemplate("generic")).files["recipes.yaml"];
 	assert.ok(genericYaml, "recipes.yaml present");
 	const generic = parseRecipesDocument(parseYaml(genericYaml));
-	assert.deepEqual(
-		generic.recipes.map((r) => [r.name, r.mutation]),
-		[["build", "artifacts"], ["test", "none"], ["typecheck", "none"]],
-	);
+	assert.deepEqual(generic.recipes, []);
+	assert.match(genericYaml, /NOT_CONFIGURED/);
 	// Quant templates: every data/feature/backtest/walk-forward recipe writes
 	// ONLY data/result/artifact files, so each one declares mutation artifacts
 	// (never source — the scripts never mutate project source code).

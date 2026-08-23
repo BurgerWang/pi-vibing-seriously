@@ -1,9 +1,10 @@
 /**
  * Built-in workbench gate catalog — the default validation ladder.
  *
- * Base gates B0-B5 apply to every profile; quant gates Q0-Q5 only load for
+ * Base gates B0-B6 apply to every profile; quant gates Q0-Q5 only load for
  * quant-research profiles (see effectiveGates in gate-schema.ts). A project's
- * gates.yaml REPLACES any built-in gate by id and can add new gates.
+ * gates.yaml can replace non-reserved built-ins and add gates; the canonical
+ * machine-backed B6 safety gate is reserved and cannot be replaced.
  *
  * Conventions used by the default checks (documented in README):
  *   - recipe names: check:format, check:lint, check:typecheck, check:static,

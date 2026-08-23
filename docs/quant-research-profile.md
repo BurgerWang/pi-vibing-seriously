@@ -61,7 +61,7 @@ workbench **validates** this contract — it never computes strategy metrics:
 
 | Gate | Verifies |
 | ---- | -------- |
-| B0-B5 (base, every profile) | project readiness → static quality → unit correctness → integration correctness → output contract → reproducibility & handoff |
+| B0-B6 (base, every profile) | project readiness → static quality → unit correctness → integration correctness → output contract → reproducibility/handoff → machine-backed development safety |
 | Q0 | Research contract (`research/contract.json`) |
 | Q1 | Market data integrity (point-in-time, survivorship, adjustments, timestamps) |
 | Q2 | Backtest semantics (leakage, costs, benchmark alignment, rebalance semantics) |

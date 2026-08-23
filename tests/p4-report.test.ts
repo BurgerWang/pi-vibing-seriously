@@ -8,7 +8,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -19,9 +19,16 @@ import { runRecipe } from "../extensions/workbench-runtime/core/recipe-runner.ts
 import {
 	buildRunReport,
 	latestGateRunSummary,
+	latestGateStatuses,
 	readGateFileRecord,
 	resolveRunTarget,
 } from "../extensions/workbench-runtime/core/report.ts";
+import {
+	clearGateRunCandidateCacheForTests,
+	GATE_ATTEMPT_INDEX_DIR,
+	latestRunAttemptForRecipe,
+	registerGateRunAttemptIndex,
+} from "../extensions/workbench-runtime/core/runs.ts";
 import { makeValidQuantResult, withTempDir, writeConfigFile } from "./helpers.ts";
 
 const RECIPES_YAML = `
@@ -224,6 +231,431 @@ test("latestGateRunSummary returns null when no gate run exists", async () => {
 		await setupRecipeProject(dir);
 		await runRecipeAt(dir, "2026-08-01T00:00:00.000Z");
 		assert.equal(await latestGateRunSummary(dir), null);
+	});
+});
+
+test("latest gate summary and statuses survive more than fifty newer non-gate runs", async () => {
+	await withTempDir(async (dir) => {
+		await setupRecipeProject(dir);
+		await writeConfigFile(
+			dir,
+			"gates.yaml",
+			"gates:\n  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Config, kind: config }\n",
+		);
+		const gateRunId = await runGateAt(dir, "2026-08-01T00:00:00.000Z");
+		for (let index = 1; index <= 60; index += 1) {
+			await runRecipeAt(dir, new Date(Date.parse("2026-08-01T00:00:00.000Z") + index * 1_000).toISOString());
+		}
+		await rm(join(dir, CONFIG_DIR_NAME, "workbench", "runs", GATE_ATTEMPT_INDEX_DIR), { recursive: true, force: true });
+		clearGateRunCandidateCacheForTests(dir);
+		const summary = await latestGateRunSummary(dir);
+		assert.equal(summary?.run_id, gateRunId);
+		assert.equal(summary?.record_state, "AVAILABLE");
+		let repeatedManifestProbes = 0;
+		assert.deepEqual(await latestGateStatuses(dir, ["g1"], {
+			onManifestProbe: () => { repeatedManifestProbes += 1; },
+		}), {
+			g1: { status: "PASS", run_id: gateRunId },
+		});
+		assert.equal(repeatedManifestProbes, 0, "the old-repository catalog is reused instead of reparsing history");
+	});
+});
+
+test("immutable gate-attempt index keeps repeated refresh reads bounded with more than one thousand runs", async () => {
+	await withTempDir(async (dir) => {
+		await setupRecipeProject(dir);
+		await writeConfigFile(
+			dir,
+			"gates.yaml",
+			"gates:\n  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Config, kind: config }\n",
+		);
+		const gateRunId = await runGateAt(dir, "2026-08-01T00:00:00.000Z");
+		const registration = await registerGateRunAttemptIndex(
+			dir,
+			gateRunId,
+			new Date("2026-08-01T00:00:00.000Z"),
+			new Date("2026-08-01T00:00:01.000Z"),
+		);
+		assert.ok(registration.ok || registration.reason === "already_registered");
+		const runsRoot = join(dir, CONFIG_DIR_NAME, "workbench", "runs");
+		for (let index = 0; index < 1_001; index += 1) {
+			const date = new Date(Date.parse("2026-08-02T00:00:00.000Z") + index * 1_000);
+			const stamp = date.toISOString().replace(/[-:]/g, "").slice(0, 15).replace("T", "-");
+			const runId = `${stamp}-${index.toString(36).padStart(4, "0")}`;
+			const runDir = join(runsRoot, runId);
+			await mkdir(runDir);
+			await writeFile(join(runDir, "manifest.json"), JSON.stringify({ schema_version: 1, run_id: runId, recipe: "test" }), "utf8");
+		}
+		clearGateRunCandidateCacheForTests(dir);
+		let catalogManifestReads = 0;
+		let sourceIdentityProbes = 0;
+		let candidateValidations = 0;
+		const summary = await latestGateRunSummary(dir, {
+			onManifestProbe: () => { catalogManifestReads += 1; },
+			onSourceIdentityProbe: (_runId, source) => { if (source === "manifest") sourceIdentityProbes += 1; },
+			onCandidateValidation: () => { candidateValidations += 1; },
+		});
+		assert.equal(summary?.run_id, gateRunId);
+		const identityProbesAfterFirstRefresh = sourceIdentityProbes;
+		const repeated = await latestGateRunSummary(dir, {
+			onManifestProbe: () => { catalogManifestReads += 1; },
+			onSourceIdentityProbe: (_runId, source) => { if (source === "manifest") sourceIdentityProbes += 1; },
+			onCandidateValidation: () => { candidateValidations += 1; },
+		});
+		assert.equal(repeated?.run_id, gateRunId);
+		assert.equal(catalogManifestReads, 1_001, "the first mixed-history check classifies each unmarked directory once");
+		assert.equal(
+			sourceIdentityProbes - identityProbesAfterFirstRefresh,
+			1_001,
+			"repeat refresh performs one cheap identity probe per cached manifest without reparsing it",
+		);
+		assert.equal(candidateValidations, 2, "each refresh strictly revalidates only the single indexed gate");
+	});
+});
+
+test("a corrupt newest gate record becomes UNKNOWN/BLOCKED instead of falling back to an older PASS", async () => {
+	await withTempDir(async (dir) => {
+		await setupRecipeProject(dir);
+		await writeConfigFile(
+			dir,
+			"gates.yaml",
+			"gates:\n  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Config, kind: config }\n",
+		);
+		const older = await runGateAt(dir, "2026-08-01T00:00:00.000Z");
+		const olderRegistration = await registerGateRunAttemptIndex(dir, older, new Date("2026-08-01T00:00:00.000Z"));
+		assert.ok(olderRegistration.ok || olderRegistration.reason === "already_registered");
+		const newest = await runGateAt(dir, "2026-08-02T00:00:00.000Z");
+		const newestRegistration = await registerGateRunAttemptIndex(dir, newest, new Date("2026-08-02T00:00:00.000Z"));
+		assert.ok(newestRegistration.ok || newestRegistration.reason === "already_registered");
+		await rm(join(dir, CONFIG_DIR_NAME, "workbench", "runs", newest, "gates.json"));
+		clearGateRunCandidateCacheForTests(dir);
+		const summary = await latestGateRunSummary(dir);
+		assert.equal(summary?.run_id, newest);
+		assert.equal(summary?.record_state, "UNAVAILABLE");
+		assert.equal(summary?.status, "BLOCKED");
+		assert.match(summary?.blocking_reason ?? "", /older status not used/);
+		const latest = await latestGateStatuses(dir, ["g1"]);
+		assert.equal(latest.g1?.run_id, newest);
+		assert.equal(latest.g1?.status, "UNKNOWN");
+		assert.match(latest.g1?.unavailable_reason ?? "", /committed run identity unavailable/);
+	});
+});
+
+test("a crash marker registered before transaction creation blocks an older PASS", async () => {
+	await withTempDir(async (dir) => {
+		await setupRecipeProject(dir);
+		await writeConfigFile(
+			dir,
+			"gates.yaml",
+			"gates:\n  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Config, kind: config }\n",
+		);
+		await runGateAt(dir, "2026-08-01T00:00:00.000Z");
+		const crashedRunId = "20260802-000000-crsh";
+		const registered = await registerGateRunAttemptIndex(
+			dir,
+			crashedRunId,
+			new Date("2026-08-02T00:00:00.000Z"),
+		);
+		assert.equal(registered.ok, true);
+		clearGateRunCandidateCacheForTests(dir);
+		const summary = await latestGateRunSummary(dir);
+		assert.equal(summary?.run_id, crashedRunId);
+		assert.equal(summary?.record_state, "UNAVAILABLE");
+		assert.equal(summary?.status, "BLOCKED");
+		assert.equal((await latestGateStatuses(dir, ["g1"])).g1?.status, "UNKNOWN");
+	});
+});
+
+test("a corrupt or oversized newest attempt marker is UNKNOWN even when the target run is intact", async () => {
+	await withTempDir(async (dir) => {
+		await setupRecipeProject(dir);
+		await writeConfigFile(
+			dir,
+			"gates.yaml",
+			"gates:\n  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Config, kind: config }\n",
+		);
+		const runId = await runGateAt(dir, "2026-08-01T00:00:00.000Z");
+		const markerPath = join(dir, CONFIG_DIR_NAME, "workbench", "runs", GATE_ATTEMPT_INDEX_DIR, `${runId}.json`);
+		await writeFile(markerPath, "{not-json", "utf8");
+		clearGateRunCandidateCacheForTests(dir);
+		assert.equal((await latestGateRunSummary(dir))?.record_state, "UNAVAILABLE");
+		assert.equal((await latestGateStatuses(dir, ["g1"])).g1?.status, "UNKNOWN");
+		await writeFile(markerPath, "x".repeat(4_097), "utf8");
+		clearGateRunCandidateCacheForTests(dir);
+		assert.equal((await latestGateRunSummary(dir))?.record_state, "UNAVAILABLE");
+		assert.equal((await latestGateStatuses(dir, ["g1"])).g1?.status, "UNKNOWN");
+	});
+});
+
+test("a cached valid marker becomes invalid after in-place corruption and never exposes an older PASS", async () => {
+	await withTempDir(async (dir) => {
+		await setupRecipeProject(dir);
+		await writeConfigFile(
+			dir,
+			"gates.yaml",
+			"gates:\n  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Config, kind: config }\n",
+		);
+		const older = await runGateAt(dir, "2026-08-01T00:00:00.000Z");
+		const newer = await runGateAt(dir, "2026-08-02T00:00:00.000Z");
+		clearGateRunCandidateCacheForTests(dir);
+		let markerIdentityProbes = 0;
+		const hooks = {
+			onSourceIdentityProbe: (_runId: string, source: string): void => {
+				if (source === "gate-marker") markerIdentityProbes += 1;
+			},
+		};
+		const initial = (await latestGateStatuses(dir, ["g1"], hooks)).g1;
+		assert.equal(initial?.run_id, newer);
+		assert.equal(initial?.status, "PASS");
+		assert.equal(markerIdentityProbes, 4, "first read binds two identities around each marker read");
+
+		await writeFile(
+			join(dir, CONFIG_DIR_NAME, "workbench", "runs", GATE_ATTEMPT_INDEX_DIR, `${newer}.json`),
+			"{not-json",
+			"utf8",
+		);
+		const probesBeforeCorruptRefresh = markerIdentityProbes;
+		const corrupted = (await latestGateStatuses(dir, ["g1"], hooks)).g1;
+		assert.equal(corrupted?.run_id, newer);
+		assert.notEqual(corrupted?.run_id, older);
+		assert.equal(corrupted?.status, "UNKNOWN");
+		assert.equal(
+			markerIdentityProbes - probesBeforeCorruptRefresh,
+			3,
+			"the unchanged marker gets one probe while the changed marker is checked before and after reread",
+		);
+		const probesBeforeStableRefresh = markerIdentityProbes;
+		assert.equal((await latestGateStatuses(dir, ["g1"], hooks)).g1?.status, "UNKNOWN");
+		assert.equal(
+			markerIdentityProbes - probesBeforeStableRefresh,
+			2,
+			"stable cached marker classifications use one cheap identity probe per marker",
+		);
+	});
+});
+
+test("gate marker registration fails closed when index directory sync fails after publication", async () => {
+	await withTempDir(async (dir) => {
+		await setupRecipeProject(dir);
+		const runId = "20260802-000000-sync";
+		const markerPath = join(dir, CONFIG_DIR_NAME, "workbench", "runs", GATE_ATTEMPT_INDEX_DIR, `${runId}.json`);
+		let syncCalls = 0;
+		const result = await registerGateRunAttemptIndex(
+			dir,
+			runId,
+			new Date("2026-08-02T00:00:00.000Z"),
+			new Date("2026-08-02T00:00:01.000Z"),
+			{
+				syncDirectory: async (directory) => {
+					syncCalls += 1;
+					assert.equal(directory, join(dir, CONFIG_DIR_NAME, "workbench", "runs", GATE_ATTEMPT_INDEX_DIR));
+					assert.equal(JSON.parse(await readFile(markerPath, "utf8")).run_id, runId, "marker is linked and strictly readable before directory sync");
+					throw new Error("injected directory sync failure");
+				},
+			},
+		);
+		assert.deepEqual(result, { ok: false, reason: "index_unavailable" });
+		assert.equal(syncCalls, 1);
+		assert.equal(JSON.parse(await readFile(markerPath, "utf8")).run_id, runId, "visible marker does not upgrade the failed registration result");
+	});
+});
+
+test("same-second immutable markers use exact start time and ignore a stale mutable pointer", async () => {
+	await withTempDir(async (dir) => {
+		await setupRecipeProject(dir);
+		await writeConfigFile(
+			dir,
+			"gates.yaml",
+			"gates:\n  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Config, kind: config }\n",
+		);
+		const originalRandom = Math.random;
+		let older: string;
+		let newer: string;
+		try {
+			Math.random = () => 0.99;
+			older = await runGateAt(dir, "2026-08-01T00:00:00.100Z");
+			Math.random = () => 0;
+			newer = await runGateAt(dir, "2026-08-01T00:00:00.900Z");
+		} finally {
+			Math.random = originalRandom;
+		}
+		assert.ok(older > newer, "fixture forces the newer run to have the lexically smaller random suffix");
+		await writeFile(
+			join(dir, CONFIG_DIR_NAME, "workbench", "runs", ".latest-gate.json"),
+			JSON.stringify({ schema_version: 1, recipe: "gate", run_id: older, written_at: "2026-08-01T00:00:01.000Z" }),
+			"utf8",
+		);
+		clearGateRunCandidateCacheForTests(dir);
+		assert.equal((await latestGateRunSummary(dir))?.run_id, newer);
+		assert.equal((await latestGateStatuses(dir, ["g1"])).g1?.run_id, newer);
+	});
+});
+
+test("a newer unmarked FAIL outranks an older marked PASS and repeated refresh reuses classification", async () => {
+	await withTempDir(async (dir) => {
+		await setupRecipeProject(dir);
+		await writeConfigFile(
+			dir,
+			"gates.yaml",
+			"gates:\n  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Config, kind: config }\n",
+		);
+		const older = await runGateAt(dir, "2026-08-01T00:00:00.000Z");
+		await writeConfigFile(
+			dir,
+			"gates.yaml",
+			"gates:\n  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Missing, kind: file, path: missing.txt }\n",
+		);
+		const newerResult = await runGates({
+			projectRoot: dir,
+			selector: "g1",
+			mode: "DEV",
+			exec: fakeExec(),
+			now: () => new Date("2026-08-02T00:00:00.000Z"),
+		});
+		assert.equal(newerResult.status, "FAIL");
+		await rm(join(dir, CONFIG_DIR_NAME, "workbench", "runs", GATE_ATTEMPT_INDEX_DIR, `${newerResult.runId}.json`));
+		clearGateRunCandidateCacheForTests(dir);
+		const summary = await latestGateRunSummary(dir);
+		assert.equal(summary?.run_id, newerResult.runId);
+		assert.equal(summary?.status, "FAIL");
+		assert.notEqual(summary?.run_id, older);
+		assert.equal((await latestGateStatuses(dir, ["g1"])).g1?.run_id, newerResult.runId);
+		let repeatedProbes = 0;
+		assert.equal((await latestGateRunSummary(dir, {
+			onManifestProbe: () => { repeatedProbes += 1; },
+		}))?.run_id, newerResult.runId);
+		assert.equal(repeatedProbes, 0, "repeat refresh does not reclassify mixed history");
+	});
+});
+
+test("a newer unmarked corrupt gate is UNKNOWN and never falls back to an older marked PASS", async () => {
+	await withTempDir(async (dir) => {
+		await setupRecipeProject(dir);
+		await writeConfigFile(
+			dir,
+			"gates.yaml",
+			"gates:\n  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Config, kind: config }\n",
+		);
+		await runGateAt(dir, "2026-08-01T00:00:00.000Z");
+		const newer = await runGateAt(dir, "2026-08-02T00:00:00.000Z");
+		await rm(join(dir, CONFIG_DIR_NAME, "workbench", "runs", GATE_ATTEMPT_INDEX_DIR, `${newer}.json`));
+		await writeFile(join(dir, CONFIG_DIR_NAME, "workbench", "runs", newer, "gates.json"), "{not-json", "utf8");
+		clearGateRunCandidateCacheForTests(dir);
+		const summary = await latestGateRunSummary(dir);
+		assert.equal(summary?.run_id, newer);
+		assert.equal(summary?.record_state, "UNAVAILABLE");
+		assert.equal(summary?.status, "BLOCKED");
+		const status = (await latestGateStatuses(dir, ["g1"])).g1;
+		assert.equal(status?.run_id, newer);
+		assert.equal(status?.status, "UNKNOWN");
+		let repeatedProbes = 0;
+		assert.equal((await latestGateRunSummary(dir, {
+			onManifestProbe: () => { repeatedProbes += 1; },
+		}))?.run_id, newer);
+		assert.equal(repeatedProbes, 0);
+	});
+});
+
+test("recipe-filtered latest-attempt lookup caches unrelated history and fails closed on a new corrupt attempt", async () => {
+	await withTempDir(async (dir) => {
+		await setupRecipeProject(dir);
+		const runsRoot = join(dir, CONFIG_DIR_NAME, "workbench", "runs");
+		await mkdir(runsRoot, { recursive: true });
+		const oldRunId = "20260801-000000-old1";
+		const oldRunDir = join(runsRoot, oldRunId);
+		await mkdir(oldRunDir);
+		await writeFile(join(oldRunDir, "manifest.json"), JSON.stringify({ schema_version: 1, run_id: oldRunId, recipe: "test" }), "utf8");
+		for (let index = 0; index < 1_001; index += 1) {
+			const date = new Date(Date.parse("2026-08-02T00:00:00.000Z") + index * 1_000);
+			const stamp = date.toISOString().replace(/[-:]/g, "").slice(0, 15).replace("T", "-");
+			const runId = `${stamp}-${index.toString(36).padStart(4, "0")}`;
+			const runDir = join(runsRoot, runId);
+			await mkdir(runDir);
+			await writeFile(join(runDir, "manifest.json"), JSON.stringify({ schema_version: 1, run_id: runId, recipe: "other" }), "utf8");
+		}
+		clearGateRunCandidateCacheForTests(dir);
+		let probes = 0;
+		const hooks = { onManifestProbe: (): void => { probes += 1; } };
+		const first = await latestRunAttemptForRecipe(dir, "test", hooks);
+		assert.equal(first.state, "FOUND");
+		assert.equal(first.state === "FOUND" ? first.run_id : null, oldRunId);
+		const afterFirst = probes;
+		assert.equal(afterFirst, 1_002);
+		const repeated = await latestRunAttemptForRecipe(dir, "test", hooks);
+		assert.equal(repeated.state, "FOUND");
+		assert.equal(probes, afterFirst, "a repeated lookup reuses classification and re-reads only the selected candidate");
+
+		const corruptRunId = "20260803-000000-bad1";
+		const corruptRunDir = join(runsRoot, corruptRunId);
+		await mkdir(corruptRunDir);
+		await writeFile(join(corruptRunDir, "manifest.json"), "{not-json", "utf8");
+		await writeFile(join(corruptRunDir, "command.json"), JSON.stringify({ recipe: "test" }), "utf8");
+		const corrupt = await latestRunAttemptForRecipe(dir, "test", hooks);
+		assert.deepEqual(corrupt, { state: "CORRUPT", run_id: corruptRunId, reason: "manifest_unavailable" });
+		assert.equal(probes, afterFirst + 1, "only the newly added directory is classified after the cache snapshot");
+	});
+});
+
+test("recipe classification cache revalidates source identity and cannot hide same-directory tampering", async () => {
+	await withTempDir(async (dir) => {
+		await setupRecipeProject(dir);
+		const runsRoot = join(dir, CONFIG_DIR_NAME, "workbench", "runs");
+		await mkdir(runsRoot, { recursive: true });
+		const oldRunId = "20260801-000000-old1";
+		const newerRunId = "20260802-000000-new1";
+		await mkdir(join(runsRoot, oldRunId));
+		await mkdir(join(runsRoot, newerRunId));
+		await writeFile(
+			join(runsRoot, oldRunId, "manifest.json"),
+			JSON.stringify({ schema_version: 1, run_id: oldRunId, recipe: "test" }),
+			"utf8",
+		);
+		const otherManifest = JSON.stringify({ schema_version: 1, run_id: newerRunId, recipe: "other" });
+		await writeFile(join(runsRoot, newerRunId, "manifest.json"), otherManifest, "utf8");
+
+		clearGateRunCandidateCacheForTests(dir);
+		let manifestProbes = 0;
+		let identityProbes = 0;
+		const hooks = {
+			onManifestProbe: (): void => { manifestProbes += 1; },
+			onSourceIdentityProbe: (): void => { identityProbes += 1; },
+		};
+		const primed = await latestRunAttemptForRecipe(dir, "test", hooks);
+		assert.equal(primed.state, "FOUND");
+		assert.equal(primed.state === "FOUND" ? primed.run_id : null, oldRunId);
+		const readsAfterPrime = manifestProbes;
+		const identitiesAfterPrime = identityProbes;
+		const unchanged = await latestRunAttemptForRecipe(dir, "test", hooks);
+		assert.equal(unchanged.state, "FOUND");
+		assert.equal(unchanged.state === "FOUND" ? unchanged.run_id : null, oldRunId);
+		assert.equal(manifestProbes, readsAfterPrime, "unchanged classifications are not parsed again");
+		assert.ok(identityProbes > identitiesAfterPrime, "unchanged classifications are guarded by cheap identity probes");
+
+		await writeFile(
+			join(runsRoot, newerRunId, "manifest.json"),
+			JSON.stringify({ schema_version: 1, run_id: newerRunId, recipe: "test" }),
+			"utf8",
+		);
+		const retargeted = await latestRunAttemptForRecipe(dir, "test", hooks);
+		assert.equal(retargeted.state, "FOUND");
+		assert.equal(retargeted.run_id, newerRunId, "other-to-target mutation invalidates the negative recipe cache");
+		assert.equal(manifestProbes, readsAfterPrime + 1, "only the changed directory is reclassified");
+
+		await writeFile(join(runsRoot, newerRunId, "manifest.json"), otherManifest, "utf8");
+		const recachedOther = await latestRunAttemptForRecipe(dir, "test", hooks);
+		assert.equal(recachedOther.state, "FOUND");
+		assert.equal(recachedOther.state === "FOUND" ? recachedOther.run_id : null, oldRunId);
+		const readsAfterOtherWasRecached = manifestProbes;
+		await writeFile(join(runsRoot, newerRunId, "manifest.json"), "{not-json", "utf8");
+		const corrupted = await latestRunAttemptForRecipe(dir, "test", hooks);
+		assert.deepEqual(corrupted, { state: "CORRUPT", run_id: newerRunId, reason: "manifest_unavailable" });
+		assert.equal(manifestProbes, readsAfterOtherWasRecached + 1, "changed corrupt source is reclassified once");
+		const readsAfterCorrupt = manifestProbes;
+		assert.deepEqual(
+			await latestRunAttemptForRecipe(dir, "test", hooks),
+			{ state: "CORRUPT", run_id: newerRunId, reason: "manifest_unavailable" },
+		);
+		assert.equal(manifestProbes, readsAfterCorrupt, "stable corrupt obstruction also avoids repeated manifest classification");
 	});
 });
 

@@ -15,6 +15,8 @@ import {
 	type DelegationState,
 } from "./delegation-state.ts";
 import { normalizeDelegationBoundedTaskContractV2 } from "./delegation-transaction-artifacts.ts";
+import { readDelegationPlanContractAuthority } from "./delegation-plan-reference.ts";
+import { verifyCurrentPlanReference } from "./plan-reference.ts";
 import type { readRecoverableUnpublishedDelegationV2 } from "./delegation-project-authority.ts";
 import type { readDelegationCommittedGenerationV2 } from "./delegation-transaction-storage.ts";
 import { WORKBENCH_TOOL_METADATA, WORKBENCH_TOOL_PARAMETERS } from "./tool-catalog.ts";
@@ -89,9 +91,14 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					...(params.timeout_seconds === undefined ? {} : { timeout_seconds: params.timeout_seconds }),
 					...(params.budget_profile === undefined ? {} : { budget_profile: params.budget_profile }),
 					...(params.repair_of === undefined ? {} : { repair_of: params.repair_of }),
+					...(params.plan_ref === undefined ? {} : { plan_ref: params.plan_ref }),
 				});
 				if (!contract.ok) throw new Error(`workbench_delegate_worker: ${contract.error.code}`);
 				const projectRoot = await controller.projectRootFor(ctx);
+				if (contract.value.plan_ref !== undefined) {
+					const currentPlan = await verifyCurrentPlanReference(projectRoot, contract.value.plan_ref);
+					if (!currentPlan.ok) throw new Error(`workbench_delegate_worker: plan_ref ${currentPlan.error.code}`);
+				}
 				await controller.reconcileProjectAuthority(projectRoot, controller.services.now().toISOString());
 				const projectBlock = controller.getProjectAuthorityBlockReason("delegation");
 				if (projectBlock) throw new Error(`workbench_delegate_worker: ${projectBlock}`);
@@ -157,6 +164,19 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 				if (v2RepairAuthority?.kind === "unpublished" && !exactBlockingRepair) {
 					throw new Error(`workbench_delegate_worker: repair_of ${v2RepairAuthority.id} is not the latest blocking delegation`);
 				}
+				// Continuity is anchored only in a strict committed generation. An
+				// exact recoverable unpublished repair has no such generation yet and
+				// follows its existing dedicated authority path above. Every ordinary
+				// successor must preserve (or explicitly replace) a proven latest plan.
+				if (!(v2RepairAuthority?.kind === "unpublished" && exactBlockingRepair)) {
+					const priorPlan = await readDelegationPlanContractAuthority(projectRoot, currentState.latestId);
+					if (priorPlan.status === "blocked") {
+						throw new Error(`workbench_delegate_worker: latest plan_ref authority is ${priorPlan.reason}`);
+					}
+					if (priorPlan.status === "present" && contract.value.plan_ref === undefined) {
+						throw new Error("workbench_delegate_worker: plan_ref is required because the latest strict committed delegation carries one");
+					}
+				}
 
 				const delegationId = controller.services.makeDelegationId(controller.services.now());
 				const execution = await controller.services.executeDelegation({
@@ -173,6 +193,10 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					exec: controller.exec,
 					clock: () => controller.services.now().toISOString(),
 					onPrepared: async (_transaction, preparedBefore) => {
+						if (contract.value.plan_ref !== undefined) {
+							const currentPlan = await verifyCurrentPlanReference(projectRoot, contract.value.plan_ref);
+							if (!currentPlan.ok) throw new Error(`plan_ref ${currentPlan.error.code} before worker launch`);
+						}
 						if (v2RepairAuthority?.kind === "unpublished") {
 							const revalidated = await controller.services.readRecoverableUnpublished(projectRoot, v2RepairAuthority.id);
 							if (!revalidated.ok) throw new Error("recoverable repair authority changed before worker launch");

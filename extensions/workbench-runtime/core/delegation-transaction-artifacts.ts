@@ -63,6 +63,11 @@ import {
 import { validateWorkspaceGuard, type WorkspaceGuardRecord } from "./workspace-guard.ts";
 import { validateWorkerWriteJournalRecord, type WorkerWriteJournalRecord } from "./write-journal.ts";
 import {
+	normalizePlanReference,
+	parsePlanReference,
+	type PlanReferenceV1,
+} from "./plan-reference.ts";
+import {
 	workerSpendBand,
 	workerSpendDimensionFlags,
 	workerSpendReasons,
@@ -91,7 +96,7 @@ const NORMALIZABLE_TASK_CONTRACT_REQUIRED_FIELDS = [
 	"allowed_paths",
 	"acceptance_criteria",
 ] as const;
-const NORMALIZABLE_TASK_CONTRACT_OPTIONAL_FIELDS = ["verification", "timeout_seconds", "budget_profile", "repair_of"] as const;
+const NORMALIZABLE_TASK_CONTRACT_OPTIONAL_FIELDS = ["verification", "timeout_seconds", "budget_profile", "repair_of", "plan_ref"] as const;
 const DELEGATION_DELTA_MISSING_STATUS_V2 = "__MISSING_STATUS_V2__";
 const DELEGATION_DELTA_MISSING_DIGEST_V2 = "__MISSING_DIGEST_V2__";
 
@@ -104,6 +109,7 @@ export interface DelegationBoundedTaskContractPayloadV2 {
 	timeout_seconds: number;
 	budget_profile: WorkerSpendProfile;
 	repair_of?: string;
+	plan_ref?: PlanReferenceV1;
 }
 
 export interface DelegationBoundedTaskContractBindingV2 extends DelegationBoundedTaskContractPayloadV2 {
@@ -164,10 +170,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function exactFields(value: Record<string, unknown>, required: readonly string[], optional?: string): boolean {
-	const expected = optional !== undefined && Object.prototype.hasOwnProperty.call(value, optional)
-		? [...required, optional]
-		: [...required];
+function exactFields(value: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []): boolean {
+	const expected = [...required, ...optional.filter((field) => Object.prototype.hasOwnProperty.call(value, field))];
 	const actual = Object.keys(value).sort();
 	expected.sort();
 	return actual.length === expected.length && actual.every((field, index) => field === expected[index]);
@@ -209,11 +213,12 @@ function cloneContractPayload(payload: DelegationBoundedTaskContractPayloadV2): 
 		timeout_seconds: payload.timeout_seconds,
 		budget_profile: payload.budget_profile,
 		...(payload.repair_of === undefined ? {} : { repair_of: payload.repair_of }),
+		...(payload.plan_ref === undefined ? {} : { plan_ref: structuredClone(payload.plan_ref) }),
 	};
 }
 
 function parseContractPayload(raw: unknown): DelegationArtifactResult<DelegationBoundedTaskContractPayloadV2> {
-	if (!isRecord(raw) || !exactFields(raw, TASK_CONTRACT_FIELDS, "repair_of")) {
+	if (!isRecord(raw) || !exactFields(raw, TASK_CONTRACT_FIELDS, ["repair_of", "plan_ref"])) {
 		return fail("invalid_contract", "delegation v2 task contract must have the exact normalized field set");
 	}
 	if (raw.task_kind !== "implementation" && raw.task_kind !== "diagnosis") {
@@ -242,7 +247,14 @@ function parseContractPayload(raw: unknown): DelegationArtifactResult<Delegation
 		(typeof raw.repair_of !== "string" || !DELEGATION_TRANSACTION_ID_RE.test(raw.repair_of))) {
 		return fail("invalid_contract", "delegation v2 repair pointer is invalid");
 	}
-	return { ok: true, value: cloneContractPayload(raw as unknown as DelegationBoundedTaskContractPayloadV2) };
+	if (Object.prototype.hasOwnProperty.call(raw, "plan_ref") && parsePlanReference(raw.plan_ref) === undefined) {
+		return fail("invalid_contract", "delegation v2 plan reference is invalid");
+	}
+	const value = raw as unknown as DelegationBoundedTaskContractPayloadV2;
+	return { ok: true, value: cloneContractPayload({
+		...value,
+		...(value.plan_ref === undefined ? {} : { plan_ref: parsePlanReference(value.plan_ref)! }),
+	}) };
 }
 
 /** Validate an already-normalized payload and bind its deterministic hash. */
@@ -321,6 +333,10 @@ export function normalizeDelegationBoundedTaskContractV2(
 	if (raw.repair_of !== undefined && (typeof raw.repair_of !== "string" || !DELEGATION_TRANSACTION_ID_RE.test(raw.repair_of))) {
 		return fail("invalid_contract", "delegation v2 public repair pointer is invalid");
 	}
+	const plan_ref = raw.plan_ref === undefined ? undefined : normalizePlanReference(raw.plan_ref);
+	if (raw.plan_ref !== undefined && plan_ref === undefined) {
+		return fail("invalid_contract", "delegation v2 public plan reference is invalid");
+	}
 	return bindDelegationBoundedTaskContractV2({
 		task_kind: raw.task_kind,
 		task,
@@ -330,6 +346,7 @@ export function normalizeDelegationBoundedTaskContractV2(
 		timeout_seconds: timeout_seconds as number,
 		budget_profile: budget_profile as WorkerSpendProfile,
 		...(raw.repair_of === undefined ? {} : { repair_of: raw.repair_of }),
+		...(plan_ref === undefined ? {} : { plan_ref }),
 	});
 }
 

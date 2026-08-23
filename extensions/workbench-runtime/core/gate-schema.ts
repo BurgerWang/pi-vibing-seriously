@@ -125,6 +125,16 @@ export interface WorkerFirstGateFacts {
 	leaseMaxCalls: number | null;
 	/** True when this gate run was initiated by the approved Sol commander. */
 	gateRunInitiatedByCommander: boolean | null;
+	/**
+	 * Optional current delegation plan identity. These fields are omitted for
+	 * historical/no-plan chains so their existing worker-facts hash remains
+	 * compatible. They are derived only from a strict committed v2 contract.
+	 */
+	planReferenceHash?: string;
+	requiredGateIds?: string[];
+	planReferenceCurrent?: boolean;
+	/** Fixed machine reason; never plan prose or file content. */
+	planReferenceBlockedReason?: string;
 }
 
 export interface GateCheck {
@@ -232,8 +242,13 @@ function asStringArray(value: unknown, label: string, errors: string[]): string[
 	return out;
 }
 
-function asBoolean(value: unknown, fallback: boolean): boolean {
-	return value === undefined ? fallback : value === true;
+function asBoolean(value: unknown, fallback: boolean, label: string, errors: string[]): boolean {
+	if (value === undefined) return fallback;
+	if (typeof value !== "boolean") {
+		errors.push(`${label} must be a boolean`);
+		return fallback;
+	}
+	return value;
 }
 
 function asFiniteNumber(value: unknown, label: string, errors: string[]): number | undefined {
@@ -376,6 +391,8 @@ export function parseCheck(raw: unknown, gateId: string, index: number): { check
 
 	const checkId = id ?? `${gateId}.${index + 1}`;
 	const title = asString(raw.title, `${label}: "title"`, errors) ?? checkId;
+	const required = asBoolean(raw.required, true, `${label}: "required"`, errors);
+	const blocking = asBoolean(raw.blocking, true, `${label}: "blocking"`, errors);
 
 	if (errors.length > 0) return { errors };
 
@@ -383,8 +400,8 @@ export function parseCheck(raw: unknown, gateId: string, index: number): { check
 		id: checkId,
 		title,
 		description: typeof raw.description === "string" ? raw.description : "",
-		required: asBoolean(raw.required, true),
-		blocking: asBoolean(raw.blocking, true),
+		required,
+		blocking,
 		kind,
 		recipe,
 		recipes: recipes.length > 0 ? recipes : undefined,
@@ -438,8 +455,8 @@ export function parseGate(raw: unknown, index: number): { gate?: Gate; errors: s
 	const prerequisites = asStringArray(raw.prerequisites, `gate "${id}": "prerequisites"`, errors);
 	const evidence = asStringArray(raw.evidence, `gate "${id}": "evidence"`, errors);
 	const acceptance = asString(raw.acceptance, `gate "${id}": "acceptance"`, errors) ?? "";
-	const required = asBoolean(raw.required, true);
-	const blocking = asBoolean(raw.blocking, true);
+	const required = asBoolean(raw.required, true, `gate "${id}": "required"`, errors);
+	const blocking = asBoolean(raw.blocking, true, `gate "${id}": "blocking"`, errors);
 
 	const checks: GateCheck[] = [];
 	const checksRaw = raw.checks;
@@ -522,7 +539,10 @@ export function parseGatesDocument(doc: unknown): GateParseResult {
 
 /**
  * Merge the project's gates.yaml definitions with the built-in catalog.
- * A project gate with a built-in id REPLACES the built-in entirely;
+ * A project gate with a built-in id REPLACES the built-in entirely, except
+ * for the reserved machine-backed B6 safety gate. B6 cannot be overridden:
+ * silently weakening universal development-safety checks would manufacture
+ * authority, so callers must surface the thrown setup error fail-closed.
  * catalog gates not mentioned in the yaml are kept; new ids are added.
  * Then filter by the project profile:
  *   - gates with an explicit `profiles` list only load for those profiles
@@ -533,7 +553,12 @@ export function parseGatesDocument(doc: unknown): GateParseResult {
 export function effectiveGates(profile: string | undefined, catalog: readonly Gate[], projectGates: readonly Gate[]): Gate[] {
 	const byId = new Map<string, Gate>();
 	for (const gate of catalog) byId.set(gate.id, gate);
-	for (const gate of projectGates) byId.set(gate.id, gate);
+	for (const gate of projectGates) {
+		if (gate.id === "b6" && byId.get("b6")?.source === "catalog") {
+			throw new Error('gate "b6" is reserved and cannot override the built-in development-safety gate');
+		}
+		byId.set(gate.id, gate);
+	}
 
 	const profileName = profile ?? "";
 	const isQuantProfile = QUANT_PROFILES.includes(profileName);
@@ -564,8 +589,12 @@ export function resolveSelector(selector: string, gates: readonly Gate[]): strin
 }
 
 /**
- * Topological order by prerequisites (stable: input order wins among
- * independents). Throws on cycles.
+ * Topological prerequisite closure (stable: input order wins among
+ * independents). Every reachable prerequisite is included in the returned
+ * order, even when the selector named only the dependent. This prevents a
+ * fresh dependent run from inheriting point-in-time PASS text from an older
+ * prerequisite run without re-evaluating that prerequisite in the same
+ * authority transaction. Throws on cycles.
  */
 export function orderGates(ids: readonly string[], gates: readonly Gate[]): string[] {
 	const byId = new Map(gates.map((g) => [g.id, g]));
@@ -579,11 +608,15 @@ export function orderGates(ids: readonly string[], gates: readonly Gate[]): stri
 		}
 		visited.set(id, 0);
 		const gate = byId.get(id);
-		if (gate) {
-			for (const prereq of gate.prerequisites) visit(prereq, [...chain, id]);
+		if (!gate) {
+			const dependent = chain[chain.length - 1];
+			throw new Error(dependent
+				? `gate "${dependent}" references unknown prerequisite "${id}"`
+				: `unknown gate "${id}"`);
 		}
+		for (const prereq of gate.prerequisites) visit(prereq, [...chain, id]);
 		visited.set(id, 1);
-		if (ids.includes(id)) out.push(id);
+		out.push(id);
 	};
 	for (const id of ids) visit(id, []);
 	return out;

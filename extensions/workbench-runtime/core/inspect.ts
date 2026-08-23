@@ -61,6 +61,24 @@ const LOCKFILE_PM: readonly { file: string; pm: string; language: string }[] = [
 	{ file: "go.sum", pm: "go modules", language: "Go" },
 ];
 
+/** Deterministic top-level stack detection shared by inspection and q-init. */
+export function detectStacksFromTopLevel(topLevelNames: readonly string[]): DetectedStack[] {
+	const topLevel = [...topLevelNames].sort();
+	const stacks: DetectedStack[] = [];
+	for (const detector of STACK_DETECTORS) {
+		const matched = detector.files.filter((file) =>
+			file.includes("*") ? topLevel.some((name) => name.endsWith(file.slice(1))) : topLevel.includes(file));
+		if (matched.length === 0) continue;
+		const lockfile = LOCKFILE_PM.find((entry) => entry.language === detector.language && topLevel.includes(entry.file));
+		stacks.push({
+			language: detector.language,
+			package_manager: lockfile?.pm ?? null,
+			evidence: matched,
+		});
+	}
+	return stacks;
+}
+
 export async function inspectProject(projectRoot: string, options: { trusted: boolean; exec: ExecFn }): Promise<ProjectInspectResult> {
 	const config = await loadProjectConfig(projectRoot, { trusted: options.trusted });
 	// P8: stack detection reads ONLY the effective project root's top level
@@ -76,17 +94,7 @@ export async function inspectProject(projectRoot: string, options: { trusted: bo
 		topLevel = [];
 	}
 
-	const stacks: DetectedStack[] = [];
-	for (const detector of STACK_DETECTORS) {
-		const matched = detector.files.filter((f) => f.includes("*") ? topLevel.some((name) => name.endsWith(f.slice(1))) : topLevel.includes(f));
-		if (matched.length === 0) continue;
-		const lockfile = LOCKFILE_PM.find((l) => l.language === detector.language && topLevel.includes(l.file));
-		stacks.push({
-			language: detector.language,
-			package_manager: lockfile?.pm ?? null,
-			evidence: matched,
-		});
-	}
+	const stacks = detectStacksFromTopLevel(topLevel);
 
 	let commit: string | null = null;
 	let dirty = false;

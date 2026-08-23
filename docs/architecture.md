@@ -16,11 +16,13 @@ How pi-dev-workbench is built, and why. Companion docs:
    one short-lived, isolated Pi worker loop for a bounded implementation task;
    it is pinned, role-guarded, non-recursive, abortable, and torn down when the
    tool call finishes. See [worker-delegation.md](worker-delegation.md).
-2. **Pure logic in `core/`, wiring in `index.ts`.** Everything decision-like
-   (mode policy, path guard, command guard, redaction, containment, gate
-   semantics, reports, comparisons, compaction notes) is a pure module with
-   no Pi imports, so it is unit-testable with plain `node:test`. `index.ts`
-   is the only file that touches the Pi API.
+2. **Domain logic plus a thin controller/adapter layer.** Decision modules
+   (mode policy, path guard, command guard, redaction, containment, Gate
+   semantics, reports, comparisons and compaction state) remain plain,
+   injected and directly testable. Pi-facing command/event/tool controllers
+   also live under `core/`; they may import Pi types and APIs, but keep runtime
+   registration and presentation out of the domain modules. `index.ts` is the
+   composition root, not the only Pi-touching source file.
 3. **Two enforcement layers.** Layer 1: `pi.setActiveTools()` per mode.
    Layer 2: the `pi.on("tool_call")` hard guard, which still blocks even if
    something re-enables a tool.
@@ -33,15 +35,16 @@ How pi-dev-workbench is built, and why. Companion docs:
 
 ```
 extensions/workbench-runtime/
-├── index.ts                 # the only Pi-touching file: commands, tools,
-│                            # events, status/widget wiring, guard wiring
+├── index.ts                 # composition root: constructs shared state and
+│                            # connects Pi events to controllers/adapters
 ├── schemas/quant-result.schema.json   # quant output contract (validated, never computed)
 ├── ui/tool-renderers.ts     # P4 TUI renderers (theme-colored Text components)
 ├── worker/
 │   ├── runner.ts            # short-lived pinned Pi worker child process + JSON event/usage capture
 │   └── path-scope.ts        # realpath/symlink enforcement for parent-approved worker writes
 └── cache/                   # P6-A prompt-cache telemetry (content-free hashes + numbers)
-    ├── cache-types.ts       # record schema (1.1), usage semantics (verified api kinds)
+    ├── cache-types.ts       # current record schema 1.3 + strict legacy readers;
+    │                        #   usage semantics and actor/projection quality facts
     ├── canonical-hash.ts    # deterministic SHA-256 canonicalization
     ├── prompt-fingerprint.ts# system prompt / tool / payload digests (no text kept)
     ├── invalidation-classifier.ts  # inferred invalidation reasons (incl. UNEXPECTED_DRIFT)
@@ -56,6 +59,8 @@ extensions/workbench-runtime/
     ├── quant-cache-validate.ts  # P6-D /q-cache-validate service + renderer
     └── quant-cache-lineage.ts   # P6-D /q-cache-lineage service + renderer
 └── core/
+    ├── *-controller.ts      # Pi-facing command/tool/event adapters; injected
+    │                        # services keep domain behavior independently testable
     ├── mode-policy.ts       # AUDIT/DEV/VERIFY tool sets; combined tool_call check
     ├── worker-policy.ts     # commander/model/role/path contract for controlled delegation;
     │                        #   Phase 3: fail-closed budget_profile validation/resolution
@@ -102,6 +107,9 @@ extensions/workbench-runtime/
     ├── path-guard.ts        # lexical + realpath containment for recipe paths
     ├── redact.ts            # secret-name/value detection and redaction
     ├── compact.ts           # P5 compaction supplement state + bounded note builder
+    ├── compact-lifecycle.ts # append-only compact attempt lifecycle; eventual
+    │                        #   reconciliation where Pi exposes no failure event
+    ├── compact-overflow.ts  # narrow, single-shot overflow recovery decision
     ├── compact-preflight.ts # Unreleased: content-free Pi-preparation summary
     │                        #   capacity estimator (allow/warn/block/unknown)
     ├── milestone-handoff.ts # P5 user-only milestone session handoff: explicit
@@ -119,7 +127,12 @@ extensions/workbench-runtime/
     │                        #   safe project_dir → effective project root resolution (P8)
     ├── recipe-schema.ts     # strict recipe validation, argv construction
     ├── recipe-runner.ts     # the single execution service (tools + commands)
-    ├── runs.ts              # run ids, manifests, bounded log reads
+    ├── runs.ts              # run ids, manifests, bounded log reads, immutable
+    │                        #   Gate-attempt markers + identity-checked catalog
+    ├── plan-reference.ts    # strict bounded plan_ref schema, current-byte hash
+    │                        #   verification and criterion-to-Gate coverage
+    ├── delegation-plan-reference.ts # read-only projection from the existing
+    │                        #   committed delegation authority into Gate facts
     ├── validation-evidence.ts # P4a durable validation binding: COMPLETE
     │                        #   content diff hashing (streamed, bounded
     │                        #   memory), strict lstat-based lock/config
@@ -165,7 +178,8 @@ extensions/workbench-runtime/
     │                        #   eviction, and the read-only recovery tool (no
     │                        #   WebSocket or any other transport)
     ├── templates.ts         # generic / stock-selection / market-timing templates
-    ├── init.ts              # /q-init planning + application
+    ├── init.ts              # /q-init stack-aware planning + content snapshot
+    ├── init-safe-write.ts   # exclusive/no-follow create and identity-bound overwrite
     └── inspect.ts           # project inspection service
 ```
 
@@ -187,8 +201,9 @@ every tool call  →  checkToolCall(mode, tool, input)           (layer 2)
 
 ```
 GPT-5.6 Sol parent in DEV
-  → workbench_delegate_worker(task, allowed_paths, acceptance_criteria)
+  → workbench_delegate_worker(task, allowed_paths, acceptance_criteria[, plan_ref])
   → trust + commander identity check
+  → optional plan_ref: strict project-contained current-byte SHA-256 binding
   → P7: real-git diff refresh + review gate (PENDING_REVIEW blocks;
        STALE blocks unless exact strict v2 FINAL/PASS authority permits a
        fresh successor after live revalidation; VERIFY always stays blocked)
@@ -328,11 +343,16 @@ workbench_run_recipe / /q-run
 ```
 /q-gate / workbench_run_gate
   → runGates(): resolve selector → load gates (built-in catalog + gates.yaml)
+  → strict-read latest delegation-v2 plan_ref + re-verify current bounded bytes
+    → blocked/drifted/unsafe/unreadable/mismatched facts: setup-fail before run allocation
+    → base/all final selectors: every mapped Gate must exist and be selected
+    → focused selector: development feedback only, validation coverage PARTIAL
   → resolve prerequisites (current run first, then latest persisted run)
   → per check kind: config | recipe | artifact | file | json | numeric
                     | schema | manual | worker-first (B6)
   → evidence.json per check (manual evidence is type "manual" only)
-  → gates.json + summary.json per run; exit 0 iff PASS
+  → every mapped Gate must PASS for full plan authority
+  → gates.json + summary.json per run; exit 0 iff selected Gate outcome PASS
 ```
 
 B6 (Development Safety; legacy P7 machine kind `worker-first`) is
@@ -1080,10 +1100,14 @@ non-reusable, never a fabricated binding). A binding carries:
 - `gate_state_hash` — the effective gate schema for recipe bindings; for
   gate bindings the schema plus hashed manual evidence, bounded
   worker-first/actor facts and prerequisite statuses (gateId → status
-  only — no timestamps, no run ids, no sources)
+  only — no timestamps, no run ids, no sources); optional plan facts in the
+  worker-first projection are also hash-bound without changing historical
+  no-plan hashes
 - `profile`, `mode`, `owner` (source actor: `sol` | `worker` | `other` |
   `unknown`), `target` (recipe: name + definition hash + invocation hash
-  + normalized cwd; gate: selector + sorted requested/effective gate ids)
+  + normalized cwd; gate: selector + sorted requested/effective gate ids,
+  plus optional plan-reference hash + sorted mapped Gate ids +
+  `FULL`/`PARTIAL` coverage)
   and terminal `outcome` facts (`successful`, `complete`, `source`)
 
 **Exact invalidation.** Reuse (`evaluateValidationReuse`) is a pure exact
@@ -1158,6 +1182,13 @@ as `corrupt-binding`; raw argv is never read, re-derived, or rendered; a
 removed recipe is `target-mismatch`). Gate runs: the current
 selector/requested/effective target is reconstructed from the CURRENT
 effective catalog (removed gates / selector drift are `target-mismatch`)
+and, when the current latest strict delegation carries `plan_ref`, the
+referenced bytes are freshly re-verified and the current mapped-Gate coverage
+is reconstructed. Drift or unavailable/unsafe plan bytes is a
+`collection-failure`; missing mapped Gates or changed final-selector coverage
+fails closed; a focused target remains `PARTIAL` and its source outcome is
+unsuccessful, so it can never assess `REUSABLE`. Historical targets without a
+plan remain compatible only while there is no current delegation plan,
 and the persisted source artifacts (gates.json + evidence.json) are
 STRICTLY validated by `readPersistedGateRunFacts` — both must carry the
 exact gate schema version and run id, agree with each other AND with the

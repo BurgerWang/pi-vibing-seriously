@@ -88,8 +88,18 @@ import {
 	MAX_MODIFIED_FILES,
 	pushBounded,
 	shouldSupplement,
+	summarizeReviewedWorkerChangedPaths,
 	type CompactState,
 } from "./core/compact.ts";
+import {
+	COMPACT_ATTEMPT_ENTRY_TYPE,
+	finishCompactAttempt,
+	parseCompactAttemptState,
+	startCompactAttempt,
+	type CompactAttemptState,
+	type CompactAttemptTerminalStatus,
+} from "./core/compact-lifecycle.ts";
+import { decideCompactOverflowRecovery } from "./core/compact-overflow.ts";
 import { evaluateCompactSummaryPreflight } from "./core/compact-preflight.ts";
 import {
 	createCacheTelemetry,
@@ -104,6 +114,7 @@ import {
 	readRecoverableUnpublishedDelegationV2,
 	readDelegationAuthorityObservationV2 as readDelegationAuthorityObservation,
 } from "./core/delegation-project-authority.ts";
+import { buildDelegationWorkerFirstGateFacts } from "./core/delegation-plan-reference.ts";
 import {
 	resolveToolOutputPolicy,
 } from "./core/output-policy.ts";
@@ -253,6 +264,9 @@ function rememberRunOutcome(toolName: string, details: Record<string, unknown>):
 export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	const streamingControl = streamingControlledApi(runtimePi);
 	const pi = streamingControl.api;
+	compactState = emptyCompactState("DEV");
+	recentOutcomes = [];
+	lastCompactNote = undefined;
 	let mode: WorkbenchMode = "DEV";
 	let writeLease: WriteLease | undefined;
 	/**
@@ -459,6 +473,99 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		appendEntry: (customType, data) => pi.appendEntry(customType, data),
 	});
 
+	// ------------------------------------------------ compact continuity v2
+
+	let compactAttempt: CompactAttemptState | undefined;
+	let compactAttemptSerial = 0;
+	const terminalCompactAttemptIds = new Set<string>();
+	let pendingRetryCompactNote: { content: string; updatedAt: string } | undefined;
+	let retryCompactNoteReady = false;
+	let workbenchOverflowCompactRequested = false;
+	let overflowRecoveryAttempted = false;
+	let overflowFollowUpPending = false;
+	let pendingOverflowRecoveryContext: ExtensionContext | undefined;
+	// True only when Pi's own post-agent overflow path reached
+	// session_before_compact for the currently pending recovery. Once native Pi
+	// has started an attempt, the workbench must never schedule a second compact.
+	let nativeOverflowCompactStarted = false;
+
+	function appendCompactAttempt(value: CompactAttemptState): void {
+		try {
+			pi.appendEntry(COMPACT_ATTEMPT_ENTRY_TYPE, value);
+		} catch {
+			// The in-memory transition remains monotonic for this runtime.
+		}
+	}
+
+	function beginCompactAttempt(
+		reason: "manual" | "threshold" | "overflow",
+		willRetry: boolean,
+	): CompactAttemptState {
+		if (compactAttempt?.status === "started") finishActiveCompactAttempt("failed");
+		const now = new Date();
+		const owner = workbenchOverflowCompactRequested ? "workbench-overflow-recovery" : "pi-native";
+		workbenchOverflowCompactRequested = false;
+		compactAttempt = startCompactAttempt({
+			attemptId: `compact-${now.getTime()}-${++compactAttemptSerial}`,
+			startedAt: now.toISOString(),
+			reason,
+			owner,
+			willRetry,
+		});
+		appendCompactAttempt(compactAttempt);
+		return compactAttempt;
+	}
+
+	function finishActiveCompactAttempt(status: CompactAttemptTerminalStatus): CompactAttemptState | undefined {
+		if (!compactAttempt || terminalCompactAttemptIds.has(compactAttempt.attemptId)) return undefined;
+		const terminal = finishCompactAttempt(compactAttempt, status, new Date().toISOString());
+		if (!terminal) return undefined;
+		compactAttempt = terminal;
+		terminalCompactAttemptIds.add(terminal.attemptId);
+		appendCompactAttempt(terminal);
+		return terminal;
+	}
+
+	function latestCompactAttempt(entries: readonly unknown[]): CompactAttemptState | undefined {
+		let latest: unknown;
+		let found = false;
+		for (const entry of entries) {
+			if (ownDataValue(entry, "type") !== "custom" || ownDataValue(entry, "customType") !== COMPACT_ATTEMPT_ENTRY_TYPE) continue;
+			latest = ownDataValue(entry, "data");
+			found = true;
+		}
+		return found ? parseCompactAttemptState(latest) : undefined;
+	}
+
+	function reconcileCompactAttempt(entries: readonly unknown[], sessionReason: string): void {
+		const restored = latestCompactAttempt(entries);
+		if (!restored) return;
+		if (terminalCompactAttemptIds.has(restored.attemptId)) return;
+		compactAttempt = restored;
+		if (restored.status !== "started") {
+			terminalCompactAttemptIds.add(restored.attemptId);
+			return;
+		}
+		finishActiveCompactAttempt(sessionReason === "startup" ? "failed" : "cancelled");
+	}
+
+	function persistCompactState(): void {
+		try {
+			pi.appendEntry(COMPACT_STATE_ENTRY_TYPE, compactState);
+		} catch {
+			// non-interactive context: the in-memory state is still valid
+		}
+	}
+
+	function requireMilestoneHandoff(ctx: ExtensionContext, reason: string): void {
+		compactState.nextStep = "/q-milestone-handoff <next step> before continuing";
+		touchCompactState();
+		persistCompactState();
+		const notice = `${reason} Automatic context recovery stops here; use /q-milestone-handoff <next step>.`;
+		if (ctx.hasUI) ctx.ui.notify(notice, "warning");
+		else console.warn(notice);
+	}
+
 	// ------------------------------------------------------------------ state
 
 	/** Persist the commander write lease and refresh its compact mirror. */
@@ -531,50 +638,17 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		});
 		const policy = defaultWritePolicy(currentModelFacts.provider, currentModelFacts.model);
 		const leaseNow = leaseStatus(writeLease, now);
-		let reviewBlock = delegationSession.projectAuthorityBlockReason("verify") ?? reviewBlockReason(state, "verify");
-		let reviewVerdict: "PASS" | "FAIL" | null = null;
-		let reviewViolationCount: number | null = null;
-		if (state.latestId !== undefined && reviewBlock === undefined) {
-			const authority = await readDelegationAuthorityObservation(projectRoot, state.latestId);
-			if (authority.kind === "invalid-v2") {
-				reviewBlock = `delegation ${state.latestId} v2 authority is ${authority.code}; verification fails closed`;
-			} else if (authority.kind === "legacy") {
-				if (authority.review) {
-					reviewVerdict = authority.review.verdict;
-					reviewViolationCount = authority.review.violations.length;
-				}
-			} else if (authority.review && authority.finalized) {
-				reviewVerdict = authority.review.verdict;
-				reviewViolationCount = authority.review.violations.length;
-			} else if (authority.review) {
-				reviewBlock = `delegation ${state.latestId} v2 review authority is provisional`;
-			} else if (authority.transactionVerdict !== null) {
-				reviewVerdict = authority.transactionVerdict;
-				reviewViolationCount = authority.transactionVerdict === "PASS" ? 0 : 1;
-			} else {
-				reviewBlock = `delegation ${state.latestId} v2 review authority is not finalized`;
-			}
-		}
-		return {
-			schema_version: 1,
-			blockedReason: reviewBlock,
-			actor,
-			writePolicy: policy ?? null,
-			commanderWritesDenied: actor === "sol-commander" ? leaseNow !== "active" : null,
-			blockedCommanderWriteAttempts: state.blockedWriteAttempts,
-			hasDelegation: state.latestId !== undefined,
-			latestDelegationId: state.latestId ?? null,
-			reviewStatus: state.latestId !== undefined ? state.status : null,
-			currentDiffHash: injectedCurrentDiffHash,
-			reviewedDiffHash: state.reviewedDiffHash ?? null,
-			reviewVerdict,
-			reviewViolationCount,
-			leaseStatus: leaseNow,
-			leaseReason: writeLease?.reason ?? null,
-			leaseCallsUsed: writeLease?.callsUsed ?? 0,
-			leaseMaxCalls: writeLease?.maxCalls ?? 0,
-			gateRunInitiatedByCommander: actor === "sol-commander",
-		};
+		return buildDelegationWorkerFirstGateFacts({
+			projectRoot, state, currentDiffHash: injectedCurrentDiffHash,
+			reviewBlock: delegationSession.projectAuthorityBlockReason("verify") ?? reviewBlockReason(state, "verify"),
+			runtime: {
+				actor, writePolicy: policy ?? null,
+				commanderWritesDenied: actor === "sol-commander" ? leaseNow !== "active" : null,
+				leaseStatus: leaseNow, leaseReason: writeLease?.reason ?? null,
+				leaseCallsUsed: writeLease?.callsUsed ?? 0, leaseMaxCalls: writeLease?.maxCalls ?? 0,
+				gateRunInitiatedByCommander: actor === "sol-commander",
+			},
+		});
 	}
 
 	/** Mutating gate path: refresh and persist the current authority binding. */
@@ -942,9 +1016,17 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		// /reload all reach this handler via session_start); /new starts a
 		// fresh session file, so it falls back to the DEV default.
 		const entries = ctx.sessionManager.getEntries();
+		pendingRetryCompactNote = undefined;
+		retryCompactNoteReady = false;
+		workbenchOverflowCompactRequested = false;
+		overflowRecoveryAttempted = false;
+		overflowFollowUpPending = false;
+		pendingOverflowRecoveryContext = undefined;
+		nativeOverflowCompactStarted = false;
 		latestHistoryProjectionBoundaryMarkers = [];
 		mode = loadModeFromEntries(entries);
 		compactState = loadCompactStateFromEntries(entries, mode);
+		reconcileCompactAttempt(entries, event.reason);
 		// P7: restore the delegation review lifecycle and the commander write
 		// lease from the same custom entries (they survive compaction and
 		// every session-replacement path). The lease is policy-bound: a
@@ -1009,7 +1091,14 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		void refreshWidget(ctx); // a previously failed gate keeps the widget visible
 	});
 
-	pi.on("session_compact", () => {
+	pi.on("session_compact", (event) => {
+		finishActiveCompactAttempt("completed");
+		cacheTelemetry.observeCompaction();
+		if (event.reason === "overflow" && event.willRetry) {
+			pendingOverflowRecoveryContext = undefined;
+			nativeOverflowCompactStarted = false;
+		}
+		retryCompactNoteReady = event.willRetry && pendingRetryCompactNote !== undefined;
 		transientState.resetTrustedIngressAuthorities();
 		resetHistoryProjection();
 		persistHistoryProjectionState();
@@ -1032,11 +1121,20 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	// above the model window. This is an engineering guard, not a tokenizer proof.
 	// The workbench never replaces Pi's summary.
 	pi.on("session_before_compact", (event, ctx) => {
+		pendingRetryCompactNote = undefined;
+		retryCompactNoteReady = false;
+		if (event.reason === "overflow" && pendingOverflowRecoveryContext !== undefined) {
+			nativeOverflowCompactStarted = true;
+		}
+		beginCompactAttempt(event.reason, event.willRetry);
 		// Worker role only: a delegated worker must never silently continue
 		// through lossy compaction — cancel it and let the runner's pinned
 		// budget policy decide the outcome. This check must remain before any
 		// access to event.preparation.
-		if (workerRoleContext.role === "worker") return { cancel: true };
+		if (workerRoleContext.role === "worker") {
+			finishActiveCompactAttempt("cancelled");
+			return { cancel: true };
+		}
 
 		const preflight = evaluateCompactSummaryPreflight({
 			preparation: event.preparation,
@@ -1047,6 +1145,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			const notice = `Commander compaction blocked by summary-capacity preflight: summary request envelope ${preflight.worstRequestEnvelopeTokens}/${preflight.contextWindowTokens} tokens. No summary provider call was made. Use /q-milestone-handoff <next step>.`;
 			if (ctx.hasUI) ctx.ui.notify(notice, "warning");
 			else console.warn(notice);
+			finishActiveCompactAttempt("cancelled");
 			return { cancel: true };
 		}
 		if (preflight.verdict === "warn") {
@@ -1054,16 +1153,20 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			if (ctx.hasUI) ctx.ui.notify(notice, "warning");
 			else console.warn(notice);
 		}
-		cacheTelemetry.observeCompaction();
-		if (!shouldSupplement(compactState)) return undefined;
+		if (!shouldSupplement(compactState)) {
+			pendingRetryCompactNote = undefined;
+			return undefined;
+		}
 		const note = buildCompactNote(compactState);
+		persistCompactState();
+		if (event.willRetry) {
+			pendingRetryCompactNote = { content: note, updatedAt: compactState.updatedAt };
+			retryCompactNoteReady = false;
+			return undefined;
+		}
+		pendingRetryCompactNote = undefined;
 		if (note === lastCompactNote) return undefined;
 		lastCompactNote = note;
-		try {
-			pi.appendEntry(COMPACT_STATE_ENTRY_TYPE, compactState);
-		} catch {
-			// non-interactive context: the in-memory state is still valid
-		}
 		try {
 			pi.sendMessage(
 				{
@@ -1133,12 +1236,71 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		syncLeaseLock();
 		// P7 slice 3: keep the compaction mirror fresh at every turn start.
 		refreshCompactP7Facts();
-		widgetTask = fitToWidth(event.prompt.trim().replace(/\s+/g, " ").slice(0, 120), 96) || "active task";
+		const promptTask = fitToWidth(event.prompt.trim().replace(/\s+/g, " ").slice(0, 120), 96);
+		widgetTask = promptTask || "active task";
 		widgetPhase = "planning";
 		compactState.task = widgetTask;
 		compactState.phase = "planning";
+		if (!overflowFollowUpPending && promptTask) {
+			compactState.objective = promptTask;
+			compactState.nextStep = `continue "${promptTask}"`;
+		}
+		overflowFollowUpPending = false;
 		touchCompactState();
 		void refreshWidget(ctx);
+		if (retryCompactNoteReady && pendingRetryCompactNote) {
+			const note = pendingRetryCompactNote;
+			pendingRetryCompactNote = undefined;
+			retryCompactNoteReady = false;
+			return {
+				message: {
+					customType: COMPACT_NOTE_MESSAGE_TYPE,
+					content: note.content,
+					display: false,
+					details: { updated_at: note.updatedAt },
+				},
+			};
+		}
+		return undefined;
+	});
+
+	pi.on("agent_end", (event, ctx) => {
+		let assistant: unknown;
+		for (let index = event.messages.length - 1; index >= 0 && index >= event.messages.length - 256; index -= 1) {
+			const candidate = event.messages[index];
+			if (ownDataValue(candidate, "role") === "assistant") {
+				assistant = candidate;
+				break;
+			}
+		}
+		const stopReason = ownDataValue(assistant, "stopReason");
+		if (stopReason !== "error") {
+			if (stopReason === "stop") {
+				overflowRecoveryAttempted = false;
+				pendingOverflowRecoveryContext = undefined;
+				nativeOverflowCompactStarted = false;
+			}
+			return;
+		}
+		const errorMessage = ownDataValue(assistant, "errorMessage");
+		if (typeof errorMessage !== "string") return;
+		const decision = decideCompactOverflowRecovery(errorMessage, overflowRecoveryAttempted);
+		if (!decision.classification) return;
+		if (!decision.recover) {
+			pendingOverflowRecoveryContext = undefined;
+			nativeOverflowCompactStarted = false;
+			requireMilestoneHandoff(ctx, "A second explicit context overflow was detected.");
+			return;
+		}
+		overflowRecoveryAttempted = decision.recoveryAttempted;
+		compactState.nextStep = "compact once, then continue the preserved objective";
+		touchCompactState();
+		persistCompactState();
+		// Pi 0.84.2 runs its native overflow recovery immediately after
+		// agent_end. Defer the workbench fallback until agent_settled so
+		// ctx.compact() cannot deadlock on waitForIdle or race a native compact.
+		pendingOverflowRecoveryContext = ctx;
+		nativeOverflowCompactStarted = false;
 	});
 
 	pi.on("agent_settled", async (_event, ctx) => {
@@ -1148,6 +1310,54 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		compactState.phase = undefined;
 		touchCompactState();
 		void refreshWidget(ctx);
+
+		const recoveryCtx = pendingOverflowRecoveryContext;
+		if (!recoveryCtx) return;
+		pendingOverflowRecoveryContext = undefined;
+		if (nativeOverflowCompactStarted) {
+			nativeOverflowCompactStarted = false;
+			finishActiveCompactAttempt("failed");
+			requireMilestoneHandoff(recoveryCtx, "Pi's native overflow compact started but did not complete; no second automatic compact will be attempted.");
+			return;
+		}
+		workbenchOverflowCompactRequested = true;
+		let callbackFinished = false;
+		try {
+			recoveryCtx.compact({
+				customInstructions: "Preserve the durable workbench objective and next action as bounded pointers.",
+				onComplete: () => {
+					if (callbackFinished) return;
+					callbackFinished = true;
+					compactState.nextStep = compactState.objective
+						? `continue "${compactState.objective}"`
+						: "continue the preserved objective";
+					touchCompactState();
+					persistCompactState();
+					overflowFollowUpPending = true;
+					try {
+						pi.sendMessage({
+							customType: COMPACT_NOTE_MESSAGE_TYPE,
+							content: `${buildCompactNote(compactState)}\ncontext recovery: one compact completed; continue now. On another overflow, stop and use /q-milestone-handoff.`,
+							display: false,
+							details: { recovery: "context-window-overflow", attempt: "one" },
+						}, { deliverAs: "followUp", triggerTurn: true });
+					} catch {
+						requireMilestoneHandoff(recoveryCtx, "The compact succeeded but its continuation could not be queued.");
+					}
+				},
+				onError: () => {
+					if (callbackFinished) return;
+					callbackFinished = true;
+					workbenchOverflowCompactRequested = false;
+					finishActiveCompactAttempt("failed");
+					requireMilestoneHandoff(recoveryCtx, "The one automatic compact attempt failed.");
+				},
+			});
+		} catch {
+			workbenchOverflowCompactRequested = false;
+			finishActiveCompactAttempt("failed");
+			requireMilestoneHandoff(recoveryCtx, "The one automatic compact attempt could not start.");
+		}
 	});
 
 	pi.on("tool_execution_start", async (event, ctx) => {
@@ -1165,6 +1375,14 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		const details = (event.result as { details?: unknown } | undefined)?.details;
 		if (details && typeof details === "object" && !Array.isArray(details)) {
 			const record = details as Record<string, unknown>;
+			if (event.toolName === "workbench_delegate_worker") {
+				for (const path of summarizeReviewedWorkerChangedPaths({
+					reviewStatus: record.review_status,
+					changedPaths: record.changed_paths,
+				})) {
+					compactState.modifiedFiles = pushBounded(compactState.modifiedFiles, path, MAX_MODIFIED_FILES);
+				}
+			}
 			const runId = typeof record.run_id === "string" ? record.run_id : undefined;
 			if (runId) {
 				compactState.lastRunId = runId;

@@ -1,9 +1,10 @@
 # Workbench gates (P3: enforced by the Gate Engine).
 #
-# The built-in base gates B0-B5 load automatically for EVERY profile:
+# The built-in base gates B0-B6 load automatically for EVERY profile:
 #   b0 Project Readiness            b3 Integration Correctness
 #   b1 Static Quality               b4 Output Contract
 #   b2 Unit Correctness             b5 Reproducibility and Handoff
+#   b6 Development Safety (reserved, machine-backed)
 #
 # The engine's built-in checks use convention recipe names:
 #   check:format / check:lint / check:typecheck / check:static
@@ -13,11 +14,12 @@
 # checks: they only PASS with explicit manual evidence (recorded as type
 # "manual" in evidence.json — never from model prose).
 #
-# Declare additional gates or REPLACE built-in gates by id here, e.g.:
+# Declare additional gates or replace non-reserved built-ins by id, e.g.:
 #   gates:
 #     - id: b1
 #       title: Static Quality
 #       checks:
 #         - { id: b1.1, title: Format, kind: recipe, recipe: check:format }
-# A project gate with a built-in id replaces the built-in entirely.
+# B6 is reserved: project configuration cannot replace, remove or weaken its
+# canonical machine-backed checks.
 gates: []

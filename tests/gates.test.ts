@@ -7,7 +7,7 @@
  * loading for quant profiles, generic not enforcing quant gates, failed
  * folds not filtered, evidence path escapes, gate result persistence, and
  * independent run ids — plus recipe checks, manual evidence marking,
- * non-blocking prerequisites, persisted prerequisite resolution, config
+ * non-blocking prerequisites, same-run prerequisite closure, config
  * checks and yaml catalog overrides — plus P8 nested projects: file/json/
  * numeric/schema checks against the effective root while the built-in b0.4
  * workbench-config existence check stays repository-root anchored via
@@ -36,17 +36,22 @@ import {
 	type CheckContext,
 } from "../extensions/workbench-runtime/core/gate-engine.ts";
 import { readGateFileRecord } from "../extensions/workbench-runtime/core/report.ts";
-import { readManifest } from "../extensions/workbench-runtime/core/runs.ts";
+import {
+	clearGateRunCandidateCacheForTests,
+	GATE_ATTEMPT_INDEX_DIR,
+	readManifest,
+} from "../extensions/workbench-runtime/core/runs.ts";
 import type { ValidationEvidenceBlock } from "../extensions/workbench-runtime/core/validation-evidence.ts";
 import { gateStateHash } from "../extensions/workbench-runtime/core/validation-evidence.ts";
 import type { ExecFn } from "../extensions/workbench-runtime/core/config.ts";
 import { BASE_GATES } from "../extensions/workbench-runtime/core/gate-catalog.ts";
 import { runRecipe } from "../extensions/workbench-runtime/core/recipe-runner.ts";
-import type { GateCheck, WorkerFirstGateFacts } from "../extensions/workbench-runtime/core/gate-schema.ts";
+import { parseGate, type GateCheck, type WorkerFirstGateFacts } from "../extensions/workbench-runtime/core/gate-schema.ts";
 import { makeValidQuantResult, spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
 import { canonicalHash, sha256Hex } from "../extensions/workbench-runtime/cache/canonical-hash.ts";
 
 const CONFIG_CHECK = "      - { id: g1.1, title: Config, kind: config }";
+const SOL_FACTS = { role: undefined, provider: "openai-codex", model: "gpt-5.6-sol" };
 
 async function setupProject(dir: string, options: { profile?: string; gatesYaml?: string; recipesYaml?: string } = {}): Promise<void> {
 	const profile = options.profile ?? "generic";
@@ -148,6 +153,24 @@ test("optional NOT_RUN checks do not block PASS but are recorded as warnings", a
 	});
 });
 
+test("an explicitly selected optional gate FAILs the invocation and cannot create reusable authority", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(
+				`  - id: optional-gate\n    title: Optional\n    required: false\n    checks:\n      - { id: optional.1, title: Missing, kind: file, path: missing.txt }`,
+			),
+		});
+		await gitBacked(dir);
+		const result = await runGates({ projectRoot: dir, selector: "optional-gate", mode: "DEV", exec: spawnExec, actorFacts: SOL_FACTS });
+		assert.equal(result.gates[0]!.required, false);
+		assert.equal(result.gates[0]!.status, "FAIL");
+		assert.equal(result.status, "FAIL");
+		assert.equal(result.ok, false);
+		const manifest = (await readRunFile(result.runDir, "manifest.json")) as { validation_evidence: ValidationEvidenceBlock };
+		assert.equal(manifest.validation_evidence.binding?.outcome.successful, false);
+	});
+});
+
 test("a non-blocking prerequisite FAIL does not block dependents", async () => {
 	await withTempDir(async (dir) => {
 		await setupProject(dir, {
@@ -165,7 +188,7 @@ test("a non-blocking prerequisite FAIL does not block dependents", async () => {
 	});
 });
 
-test("prerequisites resolve from prior persisted gate runs", async () => {
+test("a dependent selector executes its full prerequisite closure in the same authority transaction", async () => {
 	await withTempDir(async (dir) => {
 		await setupProject(dir, {
 			gatesYaml: gatesYaml(
@@ -179,13 +202,29 @@ test("prerequisites resolve from prior persisted gate runs", async () => {
 		assert.equal(first.gates[0]!.status, "PASS");
 
 		const second = await runGates({ projectRoot: dir, selector: "g2", mode: "DEV", exec: spawnExec });
-		assert.equal(second.gates[0]!.status, "PASS", "g2 must resolve g1's PASS from the persisted run");
-		assert.ok(second.gates[0]!.prerequisite_status["g1"]!.source.startsWith("run:"));
-		assert.equal(second.gates[0]!.prerequisite_status["g1"]!.status, "PASS");
+		assert.deepEqual(second.gates.map((gate) => gate.id), ["g1", "g2"]);
+		assert.equal(second.gates[1]!.status, "PASS");
+		assert.equal(second.gates[1]!.prerequisite_status["g1"]!.source, "this-run");
+		assert.equal(second.gates[1]!.prerequisite_status["g1"]!.status, "PASS");
 
 		const latest = await latestGateStatus(dir, "g1");
 		assert.equal(latest?.status, "PASS");
-		assert.equal(latest?.run_id, first.runId);
+		assert.equal(latest?.run_id, second.runId, "the closure rerun, not the older PASS, owns current prerequisite authority");
+	});
+});
+
+test("an unknown prerequisite setup-fails before allocating a gate attempt", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(
+				`  - id: g2\n    title: G2\n    prerequisites: [removed-gate]\n    checks:\n${CONFIG_CHECK}`,
+			),
+		});
+		await assert.rejects(
+			runGates({ projectRoot: dir, selector: "g2", mode: "DEV", exec: spawnExec }),
+			(error: unknown) => error instanceof GateSetupError && /unknown prerequisite "removed-gate"/.test(error.message),
+		);
+		await assert.rejects(readdir(join(dir, ".pi", "workbench", "runs")), { code: "ENOENT" });
 	});
 });
 
@@ -461,7 +500,17 @@ test("manual evidence is explicitly marked as type manual", async () => {
 		const evidenceJson = (await readRunFile(result.runDir, "evidence.json")) as { checks: Record<string, { evidence: { type: string; provided_by: string }[] }> };
 		const evidence = evidenceJson.checks["g1.1"]!.evidence;
 		assert.equal(evidence[0]!.type, "manual");
-		assert.equal(evidence[0]!.provided_by, "manual-input");
+		assert.equal(evidence[0]!.provided_by, "user-command");
+
+		const manifest = await readManifest(dir, result.runId);
+		assert.ok(manifest);
+		evidence[0]!.provided_by = "manual-input";
+		await writeFile(join(result.runDir, "evidence.json"), JSON.stringify(evidenceJson), "utf8");
+		assert.equal(
+			await readPersistedGateRunFacts(dir, result.runId, manifest),
+			null,
+			"legacy/untrusted provenance cannot reconstruct reusable human evidence",
+		);
 	});
 });
 
@@ -504,6 +553,7 @@ test("artifact checks use persisted run records, never model claims", async () =
 				'  - name: producer',
 				'    command: ["node", "-e", "require(\\"fs\\").mkdirSync(\\"out\\", { recursive: true }); require(\\"fs\\").writeFileSync(\\"out/result.json\\", \\"{}\\")"]',
 				'    writes: ["out/"]',
+				"    mutation: artifacts",
 				'    artifacts: [{ path: "out/*.json", required: true, min_bytes: 1, freshness: current }]',
 				"",
 			].join("\n"),
@@ -511,14 +561,93 @@ test("artifact checks use persisted run records, never model claims", async () =
 				`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Output produced, kind: artifact, artifact_recipe: producer, glob: "out/*.json" }`,
 			),
 		});
+		await gitBacked(dir);
 		const before = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
 		assert.equal(before.gates[0]!.status, "FAIL", "no run of the recipe exists yet — must fail, not pass");
 
-		const recipe = await runRecipe({ projectRoot: dir, recipeName: "producer", mode: "DEV", exec: spawnExec });
+		const recipe = await runRecipe({ projectRoot: dir, recipeName: "producer", mode: "DEV", exec: spawnExec, actorFacts: SOL_FACTS });
 		assert.equal(recipe.ok, true);
 		const after = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
-		assert.equal(after.gates[0]!.status, "PASS");
+		assert.equal(after.gates[0]!.status, "PASS", after.gates[0]!.checks[0]!.failure_reason ?? "");
 		assert.equal(after.gates[0]!.checks[0]!.evidence[0]!.run_id, recipe.record?.run_id);
+	});
+});
+
+test("current artifact checks reject a producer whose validation authority is stale", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			recipesYaml: [
+				"recipes:",
+				"  - name: producer",
+				'    command: ["node", "-e", "require(\\"fs\\").mkdirSync(\\"out\\", { recursive: true }); require(\\"fs\\").writeFileSync(\\"out/result.json\\", \\"{}\\")"]',
+				"    writes: [out/]",
+				"    mutation: artifacts",
+				'    artifacts: [{ path: "out/*.json", required: true, min_bytes: 1, freshness: current }]',
+				"",
+			].join("\n"),
+			gatesYaml: gatesYaml(`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Output, kind: artifact, artifact_recipe: producer }`),
+		});
+		await gitBacked(dir);
+		const producer = await runRecipe({ projectRoot: dir, recipeName: "producer", mode: "DEV", exec: spawnExec, actorFacts: SOL_FACTS });
+		assert.equal(producer.ok, true, producer.error ?? "");
+		assert.equal((await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec })).status, "PASS");
+
+		await spawnExec("git", ["add", "out/result.json"], { cwd: dir });
+		await spawnExec("git", ["commit", "-qm", "record output"], { cwd: dir });
+		const stale = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
+		assert.equal(stale.status, "FAIL");
+		assert.match(stale.gates[0]!.checks[0]!.failure_reason ?? "", /not current reusable authority/);
+		assert.match(stale.gates[0]!.checks[0]!.evidence[0]!.detail, /commit-mismatch|diff-mismatch/);
+	});
+});
+
+test("artifact authority binds the exact producer run identity even when validation facts are otherwise equal", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			recipesYaml: [
+				"recipes:",
+				"  - name: producer",
+				'    command: ["node", "-e", "require(\\"fs\\").mkdirSync(\\"out\\", { recursive: true }); require(\\"fs\\").writeFileSync(\\"out/result.json\\", \\"{}\\")"]',
+				"    writes: [out/]",
+				"    mutation: artifacts",
+				'    artifacts: [{ path: "out/*.json", required: true, min_bytes: 1, freshness: current }]',
+				"",
+			].join("\n"),
+			gatesYaml: gatesYaml(`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Output, kind: artifact, artifact_recipe: producer }`),
+		});
+		await gitBacked(dir);
+		const firstSource = await runRecipe({
+			projectRoot: dir,
+			recipeName: "producer",
+			mode: "DEV",
+			exec: spawnExec,
+			actorFacts: SOL_FACTS,
+			now: () => new Date("2098-01-01T00:00:00.000Z"),
+		});
+		assert.equal(firstSource.ok, true, firstSource.error ?? "");
+		const firstGate = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec, actorFacts: SOL_FACTS });
+		assert.equal(firstGate.status, "PASS");
+
+		const secondSource = await runRecipe({
+			projectRoot: dir,
+			recipeName: "producer",
+			mode: "DEV",
+			exec: spawnExec,
+			actorFacts: SOL_FACTS,
+			now: () => new Date("2098-01-01T00:00:01.000Z"),
+		});
+		assert.equal(secondSource.ok, true, secondSource.error ?? "");
+		const secondGate = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec, actorFacts: SOL_FACTS });
+		assert.equal(secondGate.status, "PASS");
+
+		const firstManifest = (await readRunFile(firstGate.runDir, "manifest.json")) as { validation_evidence: ValidationEvidenceBlock };
+		const secondManifest = (await readRunFile(secondGate.runDir, "manifest.json")) as { validation_evidence: ValidationEvidenceBlock };
+		assert.notEqual(firstSource.record?.run_id, secondSource.record?.run_id);
+		assert.notEqual(
+			firstManifest.validation_evidence.binding?.gate_state_hash,
+			secondManifest.validation_evidence.binding?.gate_state_hash,
+			"source run identity is part of the privacy-safe gate-state hash",
+		);
 	});
 });
 
@@ -674,6 +803,66 @@ test("invalid gates.yaml aborts the run with a setup error", async () => {
 			runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec }),
 			(error) => error instanceof GateSetupError && error.message.includes("kind"),
 		);
+	});
+});
+
+test("required/blocking accept literal booleans only and malformed flags allocate no run", async () => {
+	for (const invalid of ["true", "yes", 1, null, [], {}]) {
+		const parsed = parseGate({
+			id: "g1",
+			title: "G1",
+			required: invalid,
+			blocking: invalid,
+			checks: [{ id: "g1.1", title: "C", kind: "config", required: invalid, blocking: invalid }],
+		}, 0);
+		assert.equal(parsed.gate, undefined, `invalid boolean-like value must reject: ${JSON.stringify(invalid)}`);
+		assert.ok(parsed.errors.some((error) => error.includes("must be a boolean")));
+	}
+
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(`  - id: g1\n    title: G1\n    required: "true"\n    checks:\n${CONFIG_CHECK}`),
+		});
+		await assert.rejects(
+			runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec }),
+			(error) => error instanceof GateSetupError && error.message.includes('"required" must be a boolean'),
+		);
+		await assert.rejects(readdir(join(dir, ".pi", "workbench", "runs")), { code: "ENOENT" });
+	});
+});
+
+test("project configuration cannot replace or downgrade the reserved built-in B6", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(`  - id: b6\n    title: Fake safety\n    checks:\n      - { id: fake.1, title: Config only, kind: config }`),
+		});
+		await assert.rejects(
+			runGates({ projectRoot: dir, selector: "b6", mode: "DEV", exec: spawnExec }),
+			(error) => error instanceof GateSetupError && error.message.includes('gate "b6" is reserved'),
+		);
+		await assert.rejects(readdir(join(dir, ".pi", "workbench", "runs")), { code: "ENOENT" });
+	});
+});
+
+test("model-tool notes cannot satisfy a human manual check", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Human audit, kind: manual, prompt: "audit" }`),
+		});
+		const result = await runGates({
+			projectRoot: dir,
+			selector: "g1",
+			mode: "DEV",
+			exec: spawnExec,
+			manualEvidence: { "g1.1": "the model says a human approved" },
+			manualEvidenceProvenance: "model-tool",
+			actorFacts: SOL_FACTS,
+		});
+		assert.equal(result.status, "NOT_RUN");
+		assert.equal(result.ok, false);
+		assert.equal(result.gates[0]!.checks[0]!.evidence.length, 0);
+		const evidence = JSON.stringify(await readRunFile(result.runDir, "evidence.json"));
+		assert.ok(!evidence.includes("the model says"), "advisory model text is not persisted as human evidence");
 	});
 });
 
@@ -892,6 +1081,29 @@ test("repeated runs produce independent run ids", async () => {
 	});
 });
 
+test("latest gate status rejects a marker whose start identity contradicts the committed manifest", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(
+				`  - id: g1\n    title: G1\n    checks:\n${CONFIG_CHECK}`,
+			),
+		});
+		const result = await runGates({
+			projectRoot: dir,
+			selector: "g1",
+			mode: "DEV",
+			exec: spawnExec,
+			now: () => new Date("2026-08-23T12:00:00.000Z"),
+		});
+		const markerPath = join(dir, ".pi", "workbench", "runs", GATE_ATTEMPT_INDEX_DIR, `${result.runId}.json`);
+		const marker = JSON.parse(await readFile(markerPath, "utf8")) as Record<string, unknown>;
+		marker.started_at = "2026-08-23T11:59:59.000Z";
+		await writeFile(markerPath, JSON.stringify(marker), "utf8");
+		clearGateRunCandidateCacheForTests(dir);
+		assert.equal(await latestGateStatus(dir, "g1"), null, "marker/manifest start mismatch is UNKNOWN, never PASS");
+	});
+});
+
 test("persisted gate/evidence authority readers preflight size/type before allocation and fail closed on corruption", async () => {
 	await withTempDir(async (dir) => {
 		await setupProject(dir, {
@@ -964,8 +1176,9 @@ test("large check/path volume fails closed before writing unreadable gate author
 		);
 
 		const runRoot = join(dir, ".pi", "workbench", "runs");
-		const runIds = await readdir(runRoot);
+		const runIds = (await readdir(runRoot)).filter((name) => name !== ".gate-index");
 		assert.equal(runIds.length, 1, "evaluation may allocate one private run directory before final authority compilation");
+		assert.equal((await readdir(join(runRoot, ".gate-index"))).length, 1, "the pre-evaluation attempt marker remains as fail-closed UNKNOWN authority");
 		const files = await readdir(join(runRoot, runIds[0]!));
 		assert.ok(files.includes("artifacts"));
 		assert.ok(!files.includes("gates.json"), "oversized complete gates facts are never silently truncated or persisted unreadably");
@@ -1426,8 +1639,9 @@ test("recipe execution and artifact checks stay repository-root based with proje
 			"gates.yaml",
 			gatesYaml(`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Output, kind: artifact, artifact_recipe: producer }`),
 		);
+		await gitBacked(dir);
 		// The recipe executes at the REPO root (recipe cwd semantics unchanged).
-		const recipe = await runRecipe({ projectRoot: dir, recipeName: "producer", mode: "DEV", exec: spawnExec });
+		const recipe = await runRecipe({ projectRoot: dir, recipeName: "producer", mode: "DEV", exec: spawnExec, actorFacts: SOL_FACTS });
 		assert.equal(recipe.ok, true, recipe.error ?? "");
 		assert.equal(recipe.record?.cwd, dir, "recipe cwd stays at the repository root");
 		const manifest = (await readRunFile(recipe.runDir!, "manifest.json")) as Record<string, unknown>;
@@ -1435,7 +1649,7 @@ test("recipe execution and artifact checks stay repository-root based with proje
 
 		// The artifact check reads the run record at the repo root and passes.
 		const gate = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
-		assert.equal(gate.gates[0]!.status, "PASS", gate.gates[0]!.failure_reason ?? "");
+		assert.equal(gate.gates[0]!.status, "PASS", gate.gates[0]!.checks[0]!.failure_reason ?? gate.gates[0]!.failure_reason ?? "");
 	});
 });
 
@@ -1600,7 +1814,6 @@ test("built-in b0.4 is the only catalog check with internal repository-root meta
 // P4a: gate validation-evidence wiring
 // ---------------------------------------------------------------------------
 
-const SOL_FACTS = { role: undefined, provider: "openai-codex", model: "gpt-5.6-sol" };
 const WORKER_FACTS = { role: "worker", provider: "deepseek", model: "deepseek-v4-flash" };
 
 /** Git-init the temp project (the .pi config dir stays ignored). */
@@ -1684,7 +1897,8 @@ test("P4a: gate validation_evidence carries no manual text, raw worker facts, or
 			),
 		});
 		await gitBacked(dir);
-		// Persist g1's PASS so g2's prerequisite source embeds its run id.
+		// Persist an older g1 PASS; selecting g2 must nevertheless rerun g1 in
+		// the same transaction instead of inheriting this source.
 		const first = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
 		assert.equal(first.gates[0]!.status, "PASS");
 		const runId = first.runId;
@@ -1712,13 +1926,13 @@ test("P4a: gate validation_evidence carries no manual text, raw worker facts, or
 			}),
 			actorFacts: SOL_FACTS,
 		});
-		assert.equal(result.gates[0]!.prerequisite_status["g1"]!.source, `run:${runId}`, "the prerequisite source embeds the run id");
+		assert.equal(result.gates[1]!.prerequisite_status["g1"]!.source, "this-run");
 		const manifest = (await readRunFile(result.runDir, "manifest.json")) as { validation_evidence: ValidationEvidenceBlock };
 		const evidenceJson = JSON.stringify(manifest.validation_evidence);
 		assert.ok(!evidenceJson.includes(manualText), "manual evidence text never persists in the block");
 		assert.ok(!evidenceJson.includes(blockedText), "raw worker-first facts never persist in the block");
 		assert.ok(!evidenceJson.includes(delegationId), "raw delegation ids never persist in the block");
-		assert.ok(!evidenceJson.includes(runId), "prerequisite run ids/sources never persist in the block");
+		assert.ok(!evidenceJson.includes(runId), "older prerequisite run ids never persist in the block");
 		assert.ok(!evidenceJson.includes("run:"), "sources never persist in the block");
 	});
 });
@@ -1822,6 +2036,35 @@ test("preflight reports required manual checks in deterministic effective order 
 		assert.deepEqual(optionalOnly.required_manual_checks, []);
 		assert.deepEqual(optionalOnly.missing_required_ids, []);
 		assert.equal(optionalOnly.manual_evidence_ready, true, "optional manual checks never make readiness false");
+	});
+});
+
+test("preflight includes required manual evidence from the full prerequisite closure", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(
+				[
+					`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Prerequisite audit, kind: manual, prompt: "audit prerequisite" }`,
+					`  - id: g2\n    title: G2\n    prerequisites: [g1]\n    checks:\n${CONFIG_CHECK}`,
+				].join("\n"),
+			),
+		});
+
+		const missing = await preflightGateManualEvidence({ projectRoot: dir, selector: "g2" });
+		assert.deepEqual(missing.requested, ["g2"], "requested remains the selector expansion, not the closure");
+		assert.deepEqual(missing.required_manual_checks, [
+			{ gate_id: "g1", check_id: "g1.1", prompt: "audit prerequisite", provided: false },
+		]);
+		assert.deepEqual(missing.missing_required_ids, ["g1.1"]);
+		assert.equal(missing.manual_evidence_ready, false);
+
+		const ready = await preflightGateManualEvidence({
+			projectRoot: dir,
+			selector: "g2",
+			manualEvidence: { "g1.1": "confirmed by user" },
+		});
+		assert.deepEqual(ready.provided_required_ids, ["g1.1"]);
+		assert.equal(ready.manual_evidence_ready, true);
 	});
 });
 
@@ -1974,7 +2217,7 @@ test("formal runs after preflight keep NOT_RUN/PASS and type-manual persistence 
 		};
 		const evidence = evidenceJson.checks["g1.1"]!.evidence;
 		assert.equal(evidence[0]!.type, "manual");
-		assert.equal(evidence[0]!.provided_by, "manual-input");
+		assert.equal(evidence[0]!.provided_by, "user-command");
 		assert.equal(evidence[0]!.detail, "audit performed", "the persisted note is the trimmed note");
 
 		// Even with persisted runs present, the preflight still reads no latest

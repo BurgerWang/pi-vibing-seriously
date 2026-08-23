@@ -23,7 +23,16 @@ import type { Gate, GateStatus } from "./gate-schema.ts";
 import { runStatusLabel } from "./format.ts";
 import { validateQuantResult, type QuantResultValidation } from "./quant-result.ts";
 import { displayRelative } from "./recipe-runner.ts";
-import { isValidRunId, listRuns, readManifest, type RunRecord } from "./runs.ts";
+import {
+	isValidRunId,
+	iterateGateRunCandidates,
+	listRuns,
+	readCommittedManifest,
+	readManifest,
+	type GateRunCandidate,
+	type GateRunCandidateHooks,
+	type RunRecord,
+} from "./runs.ts";
 import { DEFAULT_RESULT_MAX_BYTES, DEFAULT_RESULT_MAX_LINES, clampWholeResultText } from "./output-policy.ts";
 
 export const GATE_RECORD_MAX_BYTES = 1_048_576 as const;
@@ -81,6 +90,7 @@ export type GateFileRecordRead =
 export interface GateRunSummary {
 	run_id: string;
 	status: GateStatus;
+	record_state: "AVAILABLE" | "UNAVAILABLE";
 	requested: string[];
 	profile: string | undefined;
 	counts: { pass: number; fail: number; blocked: number; not_run: number };
@@ -89,12 +99,25 @@ export interface GateRunSummary {
 	blocking_reason: string | null;
 }
 
+export type LatestGateStatusView = GateStatus | "UNKNOWN";
+
+export interface LatestGateStatusRecord {
+	status: LatestGateStatusView;
+	run_id: string;
+	unavailable_reason?: string;
+}
+
+export interface LatestGateQueryHooks extends GateRunCandidateHooks {
+	/** Test/diagnostic hook: a candidate is undergoing strict authority validation. */
+	onCandidateValidation?(runId: string): void;
+}
+
 export type GateReadInclude = "summary" | "failures" | "checks";
 
 export interface GateReadPageDetails {
 	run_id?: string;
 	gate_id?: string;
-	latest_status?: GateStatus;
+	latest_status?: LatestGateStatusView;
 	latest_run?: string | null;
 	include: GateReadInclude;
 	shown_count: number;
@@ -228,35 +251,85 @@ export async function readGateFileRecord(projectRoot: string, runId: string): Pr
 	return result.ok ? result.record : null;
 }
 
-/** Summary of the newest valid gate run. */
-export async function latestGateRunSummary(projectRoot: string): Promise<GateRunSummary | null> {
-	const runs = await listRuns(projectRoot, 10);
-	for (const run of runs) {
-		if (run.recipe !== "gate") continue;
-		const record = await readGateFileRecord(projectRoot, run.run_id);
-		if (!record) continue;
-		const gates = record.gates;
-		const counts = {
-			pass: gates.filter((gate) => gate.status === "PASS").length,
-			fail: gates.filter((gate) => gate.status === "FAIL").length,
-			blocked: gates.filter((gate) => gate.status === "BLOCKED").length,
-			not_run: gates.filter((gate) => gate.status === "NOT_RUN").length,
-		};
-		let worst: { id: string; status: GateStatus } | null = null;
-		for (const gate of gates) {
-			if (!worst || GATE_STATUS_ORDER[gate.status] > GATE_STATUS_ORDER[worst.status]) worst = { id: gate.id, status: gate.status };
-		}
-		const worstGate = worst ? gates.find((gate) => gate.id === worst.id) : undefined;
-		return {
-			run_id: run.run_id,
-			status: counts.fail > 0 ? "FAIL" : counts.blocked > 0 ? "BLOCKED" : counts.not_run > 0 ? "NOT_RUN" : "PASS",
-			requested: record.requested,
-			profile: record.profile,
-			counts,
-			gates: gates.map(({ checks: _checks, ...gate }) => gate),
-			worst_gate: worst,
-			blocking_reason: worstGate?.blocked_reason ?? worstGate?.failure_reason ?? null,
-		};
+type StrictGateCandidateRead =
+	| { ok: true; record: GateFileRecord }
+	| { ok: false; reason: string };
+
+async function readStrictGateCandidate(
+	projectRoot: string,
+	runId: string,
+	hooks?: LatestGateQueryHooks,
+	source?: GateRunCandidate["source"],
+	indexedStartedAt?: string,
+): Promise<StrictGateCandidateRead> {
+	hooks?.onCandidateValidation?.(runId);
+	if (source === "marker-invalid") return { ok: false, reason: "gate attempt marker unavailable or invalid" };
+	const manifest = await readCommittedManifest(projectRoot, runId);
+	if (!manifest) return { ok: false, reason: "committed run identity unavailable" };
+	if (manifest.recipe !== "gate") return { ok: false, reason: "indexed run is not a gate run" };
+	if (source === "marker" && indexedStartedAt !== undefined && manifest.started_at !== indexedStartedAt) {
+		return { ok: false, reason: "gate attempt marker start identity mismatch" };
+	}
+	const record = await readGateFileRecordWithReason(projectRoot, runId);
+	if (!record.ok) return { ok: false, reason: record.reason };
+	return { ok: true, record: record.record };
+}
+
+function summarizeGateRecord(record: GateFileRecord): GateRunSummary {
+	const gates = record.gates;
+	const counts = {
+		pass: gates.filter((gate) => gate.status === "PASS").length,
+		fail: gates.filter((gate) => gate.status === "FAIL").length,
+		blocked: gates.filter((gate) => gate.status === "BLOCKED").length,
+		not_run: gates.filter((gate) => gate.status === "NOT_RUN").length,
+	};
+	let worst: { id: string; status: GateStatus } | null = null;
+	for (const gate of gates) {
+		if (!worst || GATE_STATUS_ORDER[gate.status] > GATE_STATUS_ORDER[worst.status]) worst = { id: gate.id, status: gate.status };
+	}
+	const worstGate = worst ? gates.find((gate) => gate.id === worst.id) : undefined;
+	return {
+		run_id: record.run_id,
+		status: counts.fail > 0 ? "FAIL" : counts.blocked > 0 ? "BLOCKED" : counts.not_run > 0 ? "NOT_RUN" : "PASS",
+		record_state: "AVAILABLE",
+		requested: record.requested,
+		profile: record.profile,
+		counts,
+		gates: gates.map(({ checks: _checks, ...gate }) => gate),
+		worst_gate: worst,
+		blocking_reason: worstGate?.blocked_reason ?? worstGate?.failure_reason ?? null,
+	};
+}
+
+function unavailableGateSummary(runId: string, reason: string): GateRunSummary {
+	return {
+		run_id: runId,
+		status: "BLOCKED",
+		record_state: "UNAVAILABLE",
+		requested: [],
+		profile: undefined,
+		counts: { pass: 0, fail: 0, blocked: 0, not_run: 0 },
+		gates: [],
+		worst_gate: { id: "record", status: "BLOCKED" },
+		blocking_reason: `latest gate run unavailable: ${reason}; older status not used`,
+	};
+}
+
+/**
+ * Summary of the newest gate run. Immutable pre-execution attempt markers
+ * make the normal read independent of unrelated run-history size; old
+ * repositories fall back to the cached lazy catalog. A damaged newest
+ * candidate is surfaced as BLOCKED and never skipped for an older PASS.
+ */
+export async function latestGateRunSummary(
+	projectRoot: string,
+	hooks?: LatestGateQueryHooks,
+): Promise<GateRunSummary | null> {
+	for await (const candidate of iterateGateRunCandidates(projectRoot, { hooks })) {
+		const read = await readStrictGateCandidate(projectRoot, candidate.run_id, hooks, candidate.source, candidate.started_at);
+		return read.ok
+			? summarizeGateRecord(read.record)
+			: unavailableGateSummary(candidate.run_id, read.reason);
 	}
 	return null;
 }
@@ -268,19 +341,32 @@ export async function latestGateRunSummary(projectRoot: string): Promise<GateRun
 export async function latestGateStatuses(
 	projectRoot: string,
 	gateIds: readonly string[],
-): Promise<Record<string, { status: GateStatus; run_id: string }>> {
+	hooks?: LatestGateQueryHooks,
+): Promise<Record<string, LatestGateStatusRecord>> {
 	const wanted = new Set(gateIds);
-	const found: Record<string, { status: GateStatus; run_id: string }> = {};
+	const found: Record<string, LatestGateStatusRecord> = {};
 	if (wanted.size === 0) return found;
-	for (const run of await listRuns(projectRoot, 50)) {
-		if (run.recipe !== "gate") continue;
-		const read = await readGateFileRecordWithReason(projectRoot, run.run_id);
-		if (!read.ok) continue;
-		for (const gate of read.record.gates) {
-			if (!wanted.has(gate.id) || Object.prototype.hasOwnProperty.call(found, gate.id)) continue;
-			found[gate.id] = { status: gate.status, run_id: run.run_id };
-			if (Object.keys(found).length === wanted.size) return found;
+	const markUnavailable = (runId: string, reason: string): void => {
+		for (const gateId of wanted) {
+			if (!Object.prototype.hasOwnProperty.call(found, gateId)) {
+				found[gateId] = { status: "UNKNOWN", run_id: runId, unavailable_reason: reason };
+			}
 		}
+	};
+	const accept = (record: GateFileRecord): boolean => {
+		for (const gate of record.gates) {
+			if (!wanted.has(gate.id) || Object.prototype.hasOwnProperty.call(found, gate.id)) continue;
+			found[gate.id] = { status: gate.status, run_id: record.run_id };
+		}
+		return Object.keys(found).length === wanted.size;
+	};
+	for await (const candidate of iterateGateRunCandidates(projectRoot, { hooks })) {
+		const read = await readStrictGateCandidate(projectRoot, candidate.run_id, hooks, candidate.source, candidate.started_at);
+		if (!read.ok) {
+			markUnavailable(candidate.run_id, read.reason);
+			return found;
+		}
+		if (accept(read.record)) return found;
 	}
 	return found;
 }
@@ -614,7 +700,7 @@ function gateDefinitionSnapshot(gate: Gate): FileSourceSnapshot {
 /** Bounded gate-definition view; checks are available only through include=checks paging. */
 export function renderGateDefinitionPage(input: {
 	gate: Gate;
-	latestStatus?: GateStatus;
+	latestStatus?: LatestGateStatusView;
 	latestRunId?: string;
 	include?: GateReadInclude;
 	cursor?: string;

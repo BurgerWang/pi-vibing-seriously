@@ -8,7 +8,8 @@
  * Never stores API keys, tokens, or full environment values in these records.
  */
 
-import { open, readdir } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { link, lstat, mkdir, open, readdir, unlink } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import { join } from "node:path";
 
@@ -39,6 +40,10 @@ export const RUN_SCHEMA_VERSION = 1;
 export const RUN_MANIFEST_SCHEMA_VERSION_V2 = 2;
 /** Run JSON is metadata, never an unbounded model-input channel. */
 export const RUN_JSON_INPUT_MAX_BYTES = 1_048_576 as const;
+
+export const GATE_ATTEMPT_INDEX_SCHEMA_VERSION = 1 as const;
+export const GATE_ATTEMPT_INDEX_DIR = ".gate-index" as const;
+export const GATE_ATTEMPT_INDEX_MAX_BYTES = 4_096 as const;
 
 export const RUN_ID_RE = /^\d{8}-\d{6}-[A-Za-z0-9]{4}$/;
 
@@ -140,6 +145,640 @@ export interface RunRecord {
 	artifact_manifest_path?: "artifact-manifest.json";
 }
 
+export interface GateRunCandidate {
+	run_id: string;
+	source: "marker" | "marker-invalid" | "hint" | "manifest" | "command" | "commit-inventory" | "classification-uncertain";
+	/** Exact manifest start time when readable; absent candidates sort conservatively within the same second. */
+	started_at?: string;
+}
+
+export interface GateAttemptIndexRecord {
+	schema_version: 1;
+	recipe: "gate";
+	run_id: string;
+	started_at: string;
+	registered_at: string;
+}
+
+export type GateAttemptIndexRegistration =
+	| { ok: true; path: string }
+	| { ok: false; reason: "invalid_input" | "already_registered" | "index_unavailable" };
+
+export interface GateAttemptIndexRegistrationHooks {
+	/** Test hook; production uses an actual directory fsync. */
+	syncDirectory?(directory: string): Promise<void>;
+}
+
+export interface GateRunCandidateHooks {
+	/** Test/diagnostic hook: a previously unseen manifest is being classified. */
+	onManifestProbe?(runId: string): void;
+	/** Test/diagnostic hook: a corrupt/unreadable manifest needs its commit inventory classified. */
+	onCommitInventoryProbe?(runId: string): void;
+	/** Test/diagnostic hook: a cached classification is being checked without parsing its contents. */
+	onSourceIdentityProbe?(runId: string, source: RunIdentityProbeSource): void;
+}
+
+export type RunCatalogSource = "manifest" | "command" | "commit-inventory";
+export type RunIdentityProbeSource = RunCatalogSource | "gate-marker";
+
+type RunCatalogSourceIdentity =
+	| {
+		kind: "regular" | "non-regular";
+		dev: string;
+		ino: string;
+		size: string;
+		mtimeNs: string;
+		ctimeNs: string;
+	}
+	| { kind: "missing" }
+	| { kind: "unavailable" };
+
+interface RunCatalogEntry {
+	recipe?: string;
+	startedAt?: string;
+	source?: RunCatalogSource;
+	/** Every source which could have determined this classification. */
+	sourceIdentities: Partial<Record<RunCatalogSource, RunCatalogSourceIdentity>>;
+	/** A changed source became unreadable, so the candidate must obstruct every recipe. */
+	uncertain?: boolean;
+}
+
+interface RunCatalog {
+	entries: Map<string, RunCatalogEntry>;
+}
+
+interface GateAttemptMarkerCatalogEntry {
+	record: GateAttemptIndexRecord | null;
+	identity: RunCatalogSourceIdentity;
+}
+
+const runCatalogs = new Map<string, RunCatalog>();
+const gateAttemptMarkerCatalogs = new Map<string, Map<string, GateAttemptMarkerCatalogEntry>>();
+
+function gateAttemptIndexDirectory(projectRoot: string): string {
+	return join(runsDir(projectRoot), GATE_ATTEMPT_INDEX_DIR);
+}
+
+function gateAttemptIndexPath(projectRoot: string, runId: string): string {
+	return join(gateAttemptIndexDirectory(projectRoot), `${runId}.json`);
+}
+
+async function syncGateAttemptIndexDirectory(directory: string): Promise<void> {
+	const handle = await open(directory, "r");
+	try {
+		await handle.sync();
+	} finally {
+		await handle.close();
+	}
+}
+
+function parseGateAttemptIndexRecord(value: unknown, runId: string): GateAttemptIndexRecord | null {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+	const raw = value as Record<string, unknown>;
+	if (Object.keys(raw).sort().join(",") !== "recipe,registered_at,run_id,schema_version,started_at") return null;
+	if (
+		raw.schema_version !== GATE_ATTEMPT_INDEX_SCHEMA_VERSION
+		|| raw.recipe !== "gate"
+		|| raw.run_id !== runId
+		|| typeof raw.started_at !== "string"
+		|| !Number.isFinite(Date.parse(raw.started_at))
+		|| typeof raw.registered_at !== "string"
+		|| !Number.isFinite(Date.parse(raw.registered_at))
+	) return null;
+	return {
+		schema_version: GATE_ATTEMPT_INDEX_SCHEMA_VERSION,
+		recipe: "gate",
+		run_id: runId,
+		started_at: raw.started_at,
+		registered_at: raw.registered_at,
+	};
+}
+
+/**
+ * Register an immutable gate-attempt marker before transaction creation or
+ * check evaluation. A crash after registration therefore leaves an explicit
+ * newest UNKNOWN candidate instead of exposing an older PASS. The final path
+ * is installed with an atomic hard link from a fully synced temporary file.
+ */
+export async function registerGateRunAttemptIndex(
+	projectRoot: string,
+	runId: string,
+	startedAt: Date,
+	registeredAt = new Date(),
+	hooks: GateAttemptIndexRegistrationHooks = {},
+): Promise<GateAttemptIndexRegistration> {
+	if (
+		!isValidRunId(runId)
+		|| !Number.isFinite(startedAt.getTime())
+		|| !Number.isFinite(registeredAt.getTime())
+	) return { ok: false, reason: "invalid_input" };
+	const directory = gateAttemptIndexDirectory(projectRoot);
+	try {
+		await mkdir(directory, { recursive: true, mode: 0o700 });
+	} catch {
+		return { ok: false, reason: "index_unavailable" };
+	}
+	const record: GateAttemptIndexRecord = {
+		schema_version: GATE_ATTEMPT_INDEX_SCHEMA_VERSION,
+		recipe: "gate",
+		run_id: runId,
+		started_at: startedAt.toISOString(),
+		registered_at: registeredAt.toISOString(),
+	};
+	const bytes = Buffer.from(`${JSON.stringify(record, null, 2)}\n`, "utf8");
+	if (bytes.length > GATE_ATTEMPT_INDEX_MAX_BYTES) return { ok: false, reason: "invalid_input" };
+	const finalPath = gateAttemptIndexPath(projectRoot, runId);
+	const tempPath = join(directory, `.${runId}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`);
+	let linked = false;
+	try {
+		const handle = await open(tempPath, "wx", 0o600);
+		try {
+			await handle.writeFile(bytes);
+			await handle.sync();
+		} finally {
+			await handle.close();
+		}
+		try {
+			await link(tempPath, finalPath);
+			linked = true;
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "EEXIST") return { ok: false, reason: "already_registered" };
+			return { ok: false, reason: "index_unavailable" };
+		}
+		const reread = await readJsonFileBounded<unknown>(finalPath, GATE_ATTEMPT_INDEX_MAX_BYTES);
+		if (!reread.ok || !parseGateAttemptIndexRecord(reread.value.value, runId)) {
+			return { ok: false, reason: "index_unavailable" };
+		}
+		// Best-effort durable publication on Linux/filesystems which support
+		// directory fsync. Failure is fail-closed for the caller even though the
+		// hard-linked marker may already be visible; this is not a cross-platform
+		// guarantee against every power-loss/filesystem behavior.
+		await (hooks.syncDirectory ?? syncGateAttemptIndexDirectory)(directory);
+		return { ok: true, path: finalPath };
+	} catch {
+		return { ok: false, reason: "index_unavailable" };
+	} finally {
+		await unlink(tempPath).catch(() => {});
+		if (!linked) gateAttemptMarkerCatalogs.get(projectRoot)?.delete(runId);
+	}
+}
+
+async function listGateAttemptMarkers(
+	projectRoot: string,
+	hooks?: GateRunCandidateHooks,
+): Promise<Array<{ run_id: string; record: GateAttemptIndexRecord | null }>> {
+	let entries: Dirent[];
+	try {
+		entries = await readdir(gateAttemptIndexDirectory(projectRoot), { withFileTypes: true });
+	} catch {
+		entries = [];
+	}
+	const ids = entries
+		// A same-name symlink/directory is still a marker candidate, but strict
+		// lstat validation below classifies it as invalid instead of hiding it.
+		.filter((entry) => entry.name.endsWith(".json") && isValidRunId(entry.name.slice(0, -5)))
+		.map((entry) => entry.name.slice(0, -5));
+	let catalog = gateAttemptMarkerCatalogs.get(projectRoot);
+	if (!catalog) {
+		catalog = new Map();
+		gateAttemptMarkerCatalogs.set(projectRoot, catalog);
+	}
+	const markers: Array<{ run_id: string; record: GateAttemptIndexRecord | null }> = [];
+	// A marker observed by this process cannot disappear back into an older
+	// PASS. Preserve cached ids when the file or index directory is removed and
+	// surface them as marker-invalid.
+	for (const runId of new Set([...ids, ...catalog.keys()])) {
+		let identity = await gateAttemptMarkerIdentity(projectRoot, runId, hooks);
+		const cached = catalog.get(runId);
+		let record: GateAttemptIndexRecord | null;
+		if (
+			cached
+			&& identity.kind === "regular"
+			&& cached.identity.kind === "regular"
+			&& sameRunCatalogSourceIdentity(cached.identity, identity)
+		) {
+			record = cached.record;
+		} else if (identity.kind === "regular") {
+			const read = await readJsonFileBounded<unknown>(gateAttemptIndexPath(projectRoot, runId), GATE_ATTEMPT_INDEX_MAX_BYTES);
+			const identityAfter = await gateAttemptMarkerIdentity(projectRoot, runId, hooks);
+			record = read.ok
+				&& identityAfter.kind === "regular"
+				&& sameRunCatalogSourceIdentity(identity, identityAfter)
+				? parseGateAttemptIndexRecord(read.value.value, runId)
+				: null;
+			identity = identityAfter;
+		} else {
+			record = null;
+		}
+		catalog.set(runId, { record, identity });
+		markers.push({ run_id: runId, record });
+	}
+	markers.sort((a, b) => {
+		const aSecond = a.run_id.slice(0, 15);
+		const bSecond = b.run_id.slice(0, 15);
+		if (aSecond !== bSecond) return bSecond.localeCompare(aSecond);
+		// Within one second, a corrupt marker is conservatively newest. It may
+		// represent a crash and must not be skipped for an older PASS.
+		if ((a.record === null) !== (b.record === null)) return a.record === null ? -1 : 1;
+		if (a.record && b.record && a.record.started_at !== b.record.started_at) {
+			return a.record.started_at < b.record.started_at ? 1 : -1;
+		}
+		return b.run_id.localeCompare(a.run_id);
+	});
+	return markers;
+}
+
+function commitInventoryAdvertisesGate(value: unknown, runId: string): boolean {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const raw = value as Record<string, unknown>;
+	if (raw.schema_version !== 2 || raw.run_id !== runId || !Array.isArray(raw.files)) return false;
+	return raw.files.some((candidate) => {
+		if (typeof candidate !== "object" || candidate === null || Array.isArray(candidate)) return false;
+		return (candidate as Record<string, unknown>).path === "gates.json";
+	});
+}
+
+function commandAdvertisesRecipe(value: unknown): string | undefined {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+	const recipe = (value as Record<string, unknown>).recipe;
+	return typeof recipe === "string" && recipe.length > 0 && recipe.length <= 256 ? recipe : undefined;
+}
+
+function runCatalogSourcePath(projectRoot: string, runId: string, source: RunCatalogSource): string {
+	const directory = runDirFor(projectRoot, runId);
+	switch (source) {
+		case "manifest": return join(directory, "manifest.json");
+		case "command": return join(directory, "command.json");
+		case "commit-inventory": return join(directory, "run-commit.json");
+	}
+}
+
+async function cachedFileIdentity(
+	path: string,
+	runId: string,
+	source: RunIdentityProbeSource,
+	hooks?: GateRunCandidateHooks,
+): Promise<RunCatalogSourceIdentity> {
+	hooks?.onSourceIdentityProbe?.(runId, source);
+	try {
+		const stats = await lstat(path, { bigint: true });
+		return {
+			kind: stats.isFile() ? "regular" : "non-regular",
+			dev: stats.dev.toString(10),
+			ino: stats.ino.toString(10),
+			size: stats.size.toString(10),
+			mtimeNs: stats.mtimeNs.toString(10),
+			ctimeNs: stats.ctimeNs.toString(10),
+		};
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ENOENT"
+			? { kind: "missing" }
+			: { kind: "unavailable" };
+	}
+}
+
+async function runCatalogSourceIdentity(
+	projectRoot: string,
+	runId: string,
+	source: RunCatalogSource,
+	hooks?: GateRunCandidateHooks,
+): Promise<RunCatalogSourceIdentity> {
+	return cachedFileIdentity(runCatalogSourcePath(projectRoot, runId, source), runId, source, hooks);
+}
+
+async function gateAttemptMarkerIdentity(
+	projectRoot: string,
+	runId: string,
+	hooks?: GateRunCandidateHooks,
+): Promise<RunCatalogSourceIdentity> {
+	return cachedFileIdentity(gateAttemptIndexPath(projectRoot, runId), runId, "gate-marker", hooks);
+}
+
+function sameRunCatalogSourceIdentity(a: RunCatalogSourceIdentity, b: RunCatalogSourceIdentity): boolean {
+	// Permission and transient I/O failures are never a reusable cache identity.
+	if (a.kind === "unavailable" || b.kind === "unavailable") return false;
+	if (a.kind !== b.kind) return false;
+	if (a.kind === "missing" || b.kind === "missing") return true;
+	return a.dev === b.dev
+		&& a.ino === b.ino
+		&& a.size === b.size
+		&& a.mtimeNs === b.mtimeNs
+		&& a.ctimeNs === b.ctimeNs;
+}
+
+async function changedRunCatalogSources(
+	projectRoot: string,
+	runId: string,
+	entry: RunCatalogEntry,
+	hooks?: GateRunCandidateHooks,
+): Promise<Set<RunCatalogSource>> {
+	const changed = new Set<RunCatalogSource>();
+	const sources = Object.keys(entry.sourceIdentities) as RunCatalogSource[];
+	if (sources.length === 0) changed.add("manifest");
+	for (const source of sources) {
+		const cached = entry.sourceIdentities[source];
+		if (!cached) {
+			changed.add(source);
+			continue;
+		}
+		const current = await runCatalogSourceIdentity(projectRoot, runId, source, hooks);
+		if (!sameRunCatalogSourceIdentity(cached, current)) changed.add(source);
+	}
+	return changed;
+}
+
+async function classifyRunCandidate(
+	projectRoot: string,
+	runId: string,
+	hooks?: GateRunCandidateHooks,
+): Promise<RunCatalogEntry> {
+	const manifestBefore = await runCatalogSourceIdentity(projectRoot, runId, "manifest", hooks);
+	hooks?.onManifestProbe?.(runId);
+	const manifest = manifestBefore.kind === "regular" ? await readManifest(projectRoot, runId) : null;
+	const manifestAfter = await runCatalogSourceIdentity(projectRoot, runId, "manifest", hooks);
+	if (!sameRunCatalogSourceIdentity(manifestBefore, manifestAfter)) {
+		return { sourceIdentities: { manifest: manifestAfter }, uncertain: true };
+	}
+	if (manifest) {
+		return {
+			recipe: manifest.recipe,
+			startedAt: typeof manifest.started_at === "string" && Number.isFinite(Date.parse(manifest.started_at))
+				? manifest.started_at
+				: undefined,
+			source: "manifest",
+			sourceIdentities: { manifest: manifestAfter },
+		};
+	}
+	hooks?.onCommitInventoryProbe?.(runId);
+	try {
+		const commandBefore = await runCatalogSourceIdentity(projectRoot, runId, "command", hooks);
+		const command = commandBefore.kind === "regular"
+			? await readJsonFileBounded<unknown>(join(runDirFor(projectRoot, runId), "command.json"), RUN_JSON_INPUT_MAX_BYTES)
+			: null;
+		const commandAfter = await runCatalogSourceIdentity(projectRoot, runId, "command", hooks);
+		if (!sameRunCatalogSourceIdentity(commandBefore, commandAfter)) {
+			return {
+				sourceIdentities: { manifest: manifestAfter, command: commandAfter },
+				uncertain: true,
+			};
+		}
+		const recipe = command?.ok ? commandAdvertisesRecipe(command.value.value) : undefined;
+		if (recipe) {
+			return {
+				recipe,
+				source: "command",
+				sourceIdentities: { manifest: manifestAfter, command: commandAfter },
+			};
+		}
+		const commitBefore = await runCatalogSourceIdentity(projectRoot, runId, "commit-inventory", hooks);
+		const read = commitBefore.kind === "regular"
+			? await readJsonFileBounded<unknown>(join(runDirFor(projectRoot, runId), "run-commit.json"), RUN_JSON_INPUT_MAX_BYTES)
+			: null;
+		const commitAfter = await runCatalogSourceIdentity(projectRoot, runId, "commit-inventory", hooks);
+		if (!sameRunCatalogSourceIdentity(commitBefore, commitAfter)) {
+			return {
+				sourceIdentities: {
+					manifest: manifestAfter,
+					command: commandAfter,
+					"commit-inventory": commitAfter,
+				},
+				uncertain: true,
+			};
+		}
+		if (read?.ok && commitInventoryAdvertisesGate(read.value.value, runId)) {
+			return {
+				recipe: "gate",
+				source: "commit-inventory",
+				sourceIdentities: {
+					manifest: manifestAfter,
+					command: commandAfter,
+					"commit-inventory": commitAfter,
+				},
+			};
+		}
+		return {
+			sourceIdentities: {
+				manifest: manifestAfter,
+				command: commandAfter,
+				"commit-inventory": commitAfter,
+			},
+		};
+	} catch {
+		// An unreadable diagnostic directory is not silently classified as a
+		// recipe. It remains conservative because this may be a changed newest
+		// attempt whose recipe identity can no longer be recovered.
+		return { sourceIdentities: { manifest: manifestAfter }, uncertain: true };
+	}
+}
+
+/**
+ * Lazily enumerate candidates for one recipe, newest first. Directory
+ * membership is cached per process, so an old repository is classified once
+ * rather than on every status/widget/authority refresh. Classification is a
+ * lookup optimization only; consumers must re-read the yielded attempt.
+ *
+ * `includeRunIds` inserts a valid hint even when its directory is missing so
+ * a damaged newest run becomes an explicit obstruction instead of allowing a
+ * fallback to an older PASS.
+ */
+export async function* iterateRunAttemptCandidatesByRecipe(
+	projectRoot: string,
+	recipe: string,
+	options: {
+		includeRunIds?: readonly string[];
+		excludeRunIds?: readonly string[];
+		hooks?: GateRunCandidateHooks;
+	} = {},
+): AsyncGenerator<GateRunCandidate> {
+	if (recipe.length === 0 || recipe.length > 256) return;
+	let entries: Dirent[];
+	try {
+		entries = await readdir(runsDir(projectRoot), { withFileTypes: true });
+	} catch {
+		entries = [];
+	}
+	const actualIds = entries
+		.filter((entry) => entry.isDirectory() && isValidRunId(entry.name))
+		.map((entry) => entry.name);
+	const actual = new Set(actualIds);
+	const included = new Set((options.includeRunIds ?? []).filter(isValidRunId));
+	const excluded = new Set((options.excludeRunIds ?? []).filter(isValidRunId));
+	const ids = [...new Set([...actualIds, ...included])]
+		.filter((runId) => !excluded.has(runId))
+		.sort((a, b) => b.localeCompare(a));
+	let catalog = runCatalogs.get(projectRoot);
+	if (!catalog) {
+		catalog = { entries: new Map() };
+		runCatalogs.set(projectRoot, catalog);
+	}
+	for (const cached of [...catalog.entries.keys()]) {
+		if (!actual.has(cached)) catalog.entries.delete(cached);
+	}
+	for (let offset = 0; offset < ids.length;) {
+		const second = ids[offset]!.slice(0, 15);
+		const group: Array<GateRunCandidate & { hinted: boolean }> = [];
+		while (offset < ids.length && ids[offset]!.slice(0, 15) === second) {
+			const runId = ids[offset++]!;
+			if (included.has(runId) && !actual.has(runId)) {
+				group.push({ run_id: runId, source: "hint", hinted: true });
+				continue;
+			}
+			let classification = catalog.entries.get(runId);
+			let changedSources = new Set<RunCatalogSource>();
+			if (classification) {
+				changedSources = await changedRunCatalogSources(projectRoot, runId, classification, options.hooks);
+			}
+			if (!classification || changedSources.size > 0) {
+				classification = await classifyRunCandidate(projectRoot, runId, options.hooks);
+				if (
+					changedSources.size > 0
+					&& (
+						classification.recipe === undefined
+						|| (changedSources.has("manifest") && classification.source !== "manifest")
+					)
+				) {
+					classification.uncertain = true;
+				}
+				catalog.entries.set(runId, classification);
+			}
+			if (classification.recipe === recipe || classification.uncertain) {
+				group.push({
+					run_id: runId,
+					source: classification.uncertain ? "classification-uncertain" : (classification.source ?? "manifest"),
+					started_at: classification.startedAt,
+					hinted: included.has(runId),
+				});
+			} else if (included.has(runId)) {
+				// A hint that no longer names the recipe is still surfaced as an
+				// obstruction; it can never authorize an older successful attempt.
+				group.push({ run_id: runId, source: "hint", hinted: true });
+			}
+		}
+		group.sort((a, b) => {
+			if (a.hinted !== b.hinted) return a.hinted ? -1 : 1;
+			if (a.started_at && b.started_at && a.started_at !== b.started_at) return a.started_at < b.started_at ? 1 : -1;
+			// A same-second candidate whose manifest timestamp is unavailable
+			// may be the newest corrupt attempt; conservatively inspect it first.
+			if (a.started_at !== b.started_at) return a.started_at ? 1 : -1;
+			return b.run_id.localeCompare(a.run_id);
+		});
+		for (const { hinted: _hinted, ...candidate } of group) {
+			yield candidate;
+		}
+	}
+}
+
+/** Gate-specialized compatibility wrapper around the recipe iterator. */
+function newestGateCandidateFirst(a: GateRunCandidate, b: GateRunCandidate): number {
+	const aSecond = a.run_id.slice(0, 15);
+	const bSecond = b.run_id.slice(0, 15);
+	if (aSecond !== bSecond) return bSecond.localeCompare(aSecond);
+	const aUnknown = a.source === "marker-invalid" || a.started_at === undefined;
+	const bUnknown = b.source === "marker-invalid" || b.started_at === undefined;
+	if (aUnknown !== bUnknown) return aUnknown ? -1 : 1;
+	if (a.started_at && b.started_at && a.started_at !== b.started_at) {
+		return a.started_at < b.started_at ? 1 : -1;
+	}
+	return b.run_id.localeCompare(a.run_id);
+}
+
+export async function* iterateGateRunCandidates(
+	projectRoot: string,
+	options: {
+		includeRunIds?: readonly string[];
+		excludeRunIds?: readonly string[];
+		hooks?: GateRunCandidateHooks;
+	} = {},
+): AsyncGenerator<GateRunCandidate> {
+	const excluded = new Set((options.excludeRunIds ?? []).filter(isValidRunId));
+	const markers = await listGateAttemptMarkers(projectRoot, options.hooks);
+	const markerIds = new Set<string>();
+	const markerCandidates: GateRunCandidate[] = [];
+	for (const marker of markers) {
+		markerIds.add(marker.run_id);
+		if (!excluded.has(marker.run_id)) {
+			markerCandidates.push({
+				run_id: marker.run_id,
+				source: marker.record ? "marker" : "marker-invalid",
+				started_at: marker.record?.started_at,
+			});
+		}
+	}
+	markerCandidates.sort(newestGateCandidateFirst);
+
+	// Markers are an optimization, never freshness authority. Merge them with
+	// every unmarked same-recipe candidate so a deleted marker, version switch,
+	// or interrupted upgrade cannot make an older indexed PASS hide a newer
+	// diagnostic FAIL/corruption. The generic side caches directory
+	// classification, so repeated refreshes revalidate candidates without
+	// reparsing unrelated manifests.
+	const unmarked = iterateRunAttemptCandidatesByRecipe(projectRoot, "gate", {
+		includeRunIds: markers.length === 0 ? options.includeRunIds : undefined,
+		excludeRunIds: [...excluded, ...markerIds],
+		hooks: options.hooks,
+	});
+	let markerOffset = 0;
+	let unmarkedNext = await unmarked.next();
+	while (markerOffset < markerCandidates.length || !unmarkedNext.done) {
+		const marker = markerCandidates[markerOffset];
+		if (marker && (unmarkedNext.done || newestGateCandidateFirst(marker, unmarkedNext.value) <= 0)) {
+			yield marker;
+			markerOffset += 1;
+			continue;
+		}
+		if (!unmarkedNext.done) {
+			yield unmarkedNext.value;
+			unmarkedNext = await unmarked.next();
+		}
+	}
+}
+
+export type LatestRunAttemptForRecipe =
+	| { state: "FOUND"; run_id: string; manifest: RunRecord }
+	| { state: "CORRUPT"; run_id: string; reason: "manifest_unavailable" | "run_identity_mismatch" | "recipe_identity_mismatch" }
+	| { state: "NOT_FOUND" };
+
+/**
+ * Resolve the newest diagnostic attempt for one recipe. The selected
+ * candidate is re-read every time; a damaged newest same-recipe attempt is an
+ * explicit CORRUPT result and never permits fallback to an older success.
+ */
+export async function latestRunAttemptForRecipe(
+	projectRoot: string,
+	recipe: string,
+	hooks?: GateRunCandidateHooks,
+): Promise<LatestRunAttemptForRecipe> {
+	for await (const candidate of iterateRunAttemptCandidatesByRecipe(projectRoot, recipe, { hooks })) {
+		const identityBefore = await runCatalogSourceIdentity(projectRoot, candidate.run_id, "manifest", hooks);
+		if (identityBefore.kind !== "regular") {
+			return { state: "CORRUPT", run_id: candidate.run_id, reason: "manifest_unavailable" };
+		}
+		const manifest = await readManifest(projectRoot, candidate.run_id);
+		if (!manifest) return { state: "CORRUPT", run_id: candidate.run_id, reason: "manifest_unavailable" };
+		const identityAfter = await runCatalogSourceIdentity(projectRoot, candidate.run_id, "manifest", hooks);
+		if (identityAfter.kind !== "regular" || !sameRunCatalogSourceIdentity(identityBefore, identityAfter)) {
+			return { state: "CORRUPT", run_id: candidate.run_id, reason: "manifest_unavailable" };
+		}
+		if (manifest.run_id !== candidate.run_id) {
+			return { state: "CORRUPT", run_id: candidate.run_id, reason: "run_identity_mismatch" };
+		}
+		if (manifest.recipe !== recipe) return { state: "CORRUPT", run_id: candidate.run_id, reason: "recipe_identity_mismatch" };
+		return { state: "FOUND", run_id: candidate.run_id, manifest };
+	}
+	return { state: "NOT_FOUND" };
+}
+
+/** Test-only cache reset; production freshness still strictly revalidates candidates. */
+export function clearGateRunCandidateCacheForTests(projectRoot?: string): void {
+	if (projectRoot === undefined) {
+		runCatalogs.clear();
+		gateAttemptMarkerCatalogs.clear();
+	} else {
+		runCatalogs.delete(projectRoot);
+		gateAttemptMarkerCatalogs.delete(projectRoot);
+	}
+}
+
 export async function readManifest(projectRoot: string, runId: string): Promise<RunRecord | null> {
 	const dir = runDirFor(projectRoot, runId);
 	try {
@@ -215,26 +854,55 @@ export async function readSummary(projectRoot: string, runId: string): Promise<R
 	}
 }
 
-/**
- * Diagnostic inventory of readable run attempts, newest first. This may
- * include an uncommitted v2 manifest so callers can explain a failed attempt;
- * it must never be used as success authority.
- */
-export async function listRunAttempts(projectRoot: string, limit = 10): Promise<RunRecord[]> {
+async function listRunDirectoryIds(projectRoot: string): Promise<string[]> {
 	let entries: Dirent[];
 	try {
 		entries = await readdir(runsDir(projectRoot), { withFileTypes: true });
 	} catch {
 		return [];
 	}
-	const records: RunRecord[] = [];
-	for (const entry of entries) {
-		if (!entry.isDirectory() || !isValidRunId(entry.name)) continue;
-		const manifest = await readManifest(projectRoot, entry.name);
-		if (manifest?.run_id === entry.name) records.push(manifest);
+	// makeRunId's fixed-width prefix is the start second. Callers open only one
+	// same-second group at a time, then use exact manifest timestamps inside it.
+	return entries
+		.filter((entry) => entry.isDirectory() && isValidRunId(entry.name))
+		.map((entry) => entry.name)
+		.sort((a, b) => b.localeCompare(a));
+}
+
+function sameSecondGroups(runIds: readonly string[]): string[][] {
+	const groups: string[][] = [];
+	for (const runId of runIds) {
+		const prior = groups.at(-1);
+		if (prior && prior[0]!.slice(0, 15) === runId.slice(0, 15)) prior.push(runId);
+		else groups.push([runId]);
 	}
-	records.sort((a, b) => (a.started_at < b.started_at ? 1 : a.started_at > b.started_at ? -1 : a.run_id < b.run_id ? 1 : -1));
-	return records.slice(0, limit);
+	return groups;
+}
+
+function newestRunRecordFirst(a: RunRecord, b: RunRecord): number {
+	if (a.started_at !== b.started_at) return a.started_at < b.started_at ? 1 : -1;
+	return b.run_id.localeCompare(a.run_id);
+}
+
+/**
+ * Diagnostic inventory of readable run attempts, newest first. This may
+ * include an uncommitted v2 manifest so callers can explain a failed attempt;
+ * it must never be used as success authority.
+ */
+export async function listRunAttempts(projectRoot: string, limit = 10): Promise<RunRecord[]> {
+	if (!Number.isFinite(limit) || limit <= 0) return [];
+	const records: RunRecord[] = [];
+	for (const group of sameSecondGroups(await listRunDirectoryIds(projectRoot))) {
+		const candidates: RunRecord[] = [];
+		for (const runId of group) {
+			const manifest = await readManifest(projectRoot, runId);
+			if (manifest?.run_id === runId) candidates.push(manifest);
+		}
+		candidates.sort(newestRunRecordFirst);
+		records.push(...candidates.slice(0, limit - records.length));
+		if (records.length >= limit) break;
+	}
+	return records;
 }
 
 /**
@@ -243,15 +911,22 @@ export async function listRunAttempts(projectRoot: string, limit = 10): Promise<
  * is listed only after its complete directory identity verifies.
  */
 export async function listRuns(projectRoot: string, limit = 10): Promise<RunRecord[]> {
-	const attempts = await listRunAttempts(projectRoot, Number.MAX_SAFE_INTEGER);
+	if (!Number.isFinite(limit) || limit <= 0) return [];
 	const records: RunRecord[] = [];
-	for (const attempt of attempts) {
-		if (attempt.run_transaction_schema_version === 2) {
-			const committed = await readCommittedManifest(projectRoot, attempt.run_id);
-			if (committed) records.push(committed);
-		} else {
-			records.push(attempt);
+	for (const group of sameSecondGroups(await listRunDirectoryIds(projectRoot))) {
+		const candidates: RunRecord[] = [];
+		for (const runId of group) {
+			const attempt = await readManifest(projectRoot, runId);
+			if (!attempt || attempt.run_id !== runId) continue;
+			if (attempt.run_transaction_schema_version === 2) {
+				const committed = await readCommittedManifest(projectRoot, attempt.run_id);
+				if (committed) candidates.push(committed);
+			} else {
+				candidates.push(attempt);
+			}
 		}
+		candidates.sort(newestRunRecordFirst);
+		records.push(...candidates.slice(0, limit - records.length));
 		if (records.length >= limit) break;
 	}
 	return records;
@@ -259,20 +934,19 @@ export async function listRuns(projectRoot: string, limit = 10): Promise<RunReco
 
 /** List only atomically committed v2 runs. Partial and legacy runs are excluded. */
 export async function listCommittedRuns(projectRoot: string, limit = 10): Promise<RunRecord[]> {
-	let entries: Dirent[];
-	try {
-		entries = await readdir(runsDir(projectRoot), { withFileTypes: true });
-	} catch {
-		return [];
-	}
+	if (!Number.isFinite(limit) || limit <= 0) return [];
 	const records: RunRecord[] = [];
-	for (const entry of entries) {
-		if (!entry.isDirectory() || !isValidRunId(entry.name)) continue;
-		const manifest = await readCommittedManifest(projectRoot, entry.name);
-		if (manifest) records.push(manifest);
+	for (const group of sameSecondGroups(await listRunDirectoryIds(projectRoot))) {
+		const candidates: RunRecord[] = [];
+		for (const runId of group) {
+			const manifest = await readCommittedManifest(projectRoot, runId);
+			if (manifest) candidates.push(manifest);
+		}
+		candidates.sort(newestRunRecordFirst);
+		records.push(...candidates.slice(0, limit - records.length));
+		if (records.length >= limit) break;
 	}
-	records.sort((a, b) => (a.started_at < b.started_at ? 1 : a.started_at > b.started_at ? -1 : a.run_id < b.run_id ? 1 : -1));
-	return records.slice(0, limit);
+	return records;
 }
 
 export interface LogSnippetOptions {

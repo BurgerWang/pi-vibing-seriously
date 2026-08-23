@@ -22,6 +22,7 @@ import {
 	mergeCompactState,
 	pushBounded,
 	shouldSupplement,
+	summarizeReviewedWorkerChangedPaths,
 } from "../extensions/workbench-runtime/core/compact.ts";
 
 function state(overrides: Record<string, unknown> = {}): ReturnType<typeof emptyCompactState> {
@@ -105,14 +106,37 @@ test("mergeCompactState sanitizes the P7 worker-first fields (typed, bounded, fa
 
 test("loadCompactStateFromEntries restores the P7 worker-first fields", () => {
 	const entries = [
-		{ type: "custom", customType: COMPACT_STATE_ENTRY_TYPE, data: { mode: "DEV", lastDelegationId: "20260801-120000-abcd", pendingDelegationReview: true, blockedCommanderWriteAttempts: 7 } },
-		{ type: "custom", customType: COMPACT_STATE_ENTRY_TYPE, data: { mode: "DEV", lastDelegationId: "20260802-120000-abcd", reviewedDiffHash: "c".repeat(64), blockedCommanderWriteAttempts: 9 } },
+		{ type: "custom", customType: COMPACT_STATE_ENTRY_TYPE, data: { mode: "DEV", task: "stale task", failedGates: ["stale-gate"], lastDelegationId: "20260801-120000-abcd", pendingDelegationReview: true, blockedCommanderWriteAttempts: 7 } },
+		{ type: "custom", customType: COMPACT_STATE_ENTRY_TYPE, data: { mode: "DEV", objective: "finish compact continuity", nextStep: "wire the pure helpers", lastDelegationId: "20260802-120000-abcd", reviewedDiffHash: "c".repeat(64), blockedCommanderWriteAttempts: 9 } },
 	];
 	const s = loadCompactStateFromEntries(entries, "DEV");
 	assert.equal(s.lastDelegationId, "20260802-120000-abcd", "later entries win");
 	assert.equal(s.reviewedDiffHash, "c".repeat(64));
 	assert.equal(s.blockedCommanderWriteAttempts, 9);
+	assert.equal(s.objective, "finish compact continuity");
+	assert.equal(s.nextStep, "wire the pure helpers");
+	assert.equal(s.task, undefined, "older scalar fields cannot leak into the latest snapshot");
+	assert.deepEqual(s.failedGates, [], "older list fields cannot leak into the latest snapshot");
+	assert.equal(s.pendingDelegationReview, undefined, "review status is not mixed across snapshots");
 	assert.equal(s.mode, "DEV");
+});
+
+test("reviewed worker changed paths are status-gated, deduplicated and bounded", () => {
+	const changedPaths = Array.from({ length: 30 }, (_, index) => `src/file-${index}.ts`);
+	assert.deepEqual(summarizeReviewedWorkerChangedPaths({ reviewStatus: "PENDING_REVIEW", changedPaths }), []);
+	assert.deepEqual(summarizeReviewedWorkerChangedPaths({ reviewStatus: "STALE", changedPaths }), []);
+	assert.deepEqual(summarizeReviewedWorkerChangedPaths({ reviewStatus: "REVIEWED", changedPaths: "src/nope.ts" }), []);
+	assert.deepEqual(summarizeReviewedWorkerChangedPaths({
+		reviewStatus: "REVIEWED",
+		changedPaths: ["/etc/passwd", "../escape", "src/../escape", "./src/a.ts", "src\\a.ts", "src/\0secret", "src//a.ts"],
+	}), [], "only normalized POSIX project-relative paths are accepted");
+	const reviewed = summarizeReviewedWorkerChangedPaths({
+		reviewStatus: "REVIEWED",
+		changedPaths: [" src/a.ts ", "src/a.ts", ...changedPaths],
+	});
+	assert.equal(reviewed[0], "src/a.ts");
+	assert.equal(reviewed.length, 20);
+	assert.equal(new Set(reviewed).size, reviewed.length);
 });
 
 test("loadCompactStateFromEntries restores the latest persisted entry", () => {
@@ -175,6 +199,7 @@ test("collectDoNotRetry flags repeated identical failures only", () => {
 
 test("shouldSupplement requires real content", () => {
 	assert.equal(shouldSupplement(emptyCompactState("DEV")), false);
+	assert.equal(shouldSupplement(state({ objective: "ship continuity" })), true);
 	assert.equal(shouldSupplement(state({ task: "t" })), true);
 	assert.equal(shouldSupplement(state({ phase: "running workbench_run_gate" })), true);
 	assert.equal(shouldSupplement(state({ lastRunId: "20260101-120000-abcd" })), true);
@@ -193,6 +218,7 @@ test("shouldSupplement requires real content", () => {
 
 test("buildCompactNote is bounded, ASCII, and contains pointers only", () => {
 	const s = state({
+		objective: "Preserve compact continuity",
 		task: "Implement P5 hardening",
 		phase: "finished workbench_run_gate",
 		lastRunId: "20260801-120000-abcd",
@@ -211,6 +237,7 @@ test("buildCompactNote is bounded, ASCII, and contains pointers only", () => {
 	assert.ok(note.split("\n").length <= MAX_NOTE_LINES, "line cap");
 	assert.ok(note.length <= MAX_NOTE_CHARS, "char cap");
 	assert.ok(note.includes("mode: DEV"));
+	assert.ok(note.includes("objective: Preserve compact continuity"));
 	assert.ok(note.includes("Implement P5 hardening"));
 	assert.ok(note.includes("20260801-120000-abcd"));
 	assert.ok(note.includes("q3 (run 20260801-120000-abcd)"));

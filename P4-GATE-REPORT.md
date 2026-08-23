@@ -1,5 +1,10 @@
 # P4 Gate Report — Pi-native TUI Status, Run Reports, and Run Comparison
 
+> **Historical, non-authoritative record.** This report describes v0.5.0 at
+> its original candidate and does not establish current Gate freshness or
+> release authority. Current runtime records and a validation assessment bound
+> to the current commit/config take precedence.
+
 Milestone: P4 of pi-dev-workbench (v0.5.0). This report documents what was
 implemented and the verification evidence. **No commit was made** (per the
 milestone instruction; the repository is left dirty for review).

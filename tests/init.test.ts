@@ -10,8 +10,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { access, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { parse as parseYaml } from "yaml";
 
-import { AGENTS_ENTRY_FILE, applyInit, planInit, renderInitPlan, type InitPlanEntry } from "../extensions/workbench-runtime/core/init.ts";
+import { AGENTS_ENTRY_FILE, applyInit, planInit, renderInitPlan, retainInitContentSnapshot, type InitPlanEntry } from "../extensions/workbench-runtime/core/init.ts";
 import { isSupportedInitProfile, UNSUPPORTED_PROFILES } from "../extensions/workbench-runtime/core/templates.ts";
 import { withTempDir } from "./helpers.ts";
 
@@ -180,5 +181,96 @@ test("the plan marks an existing AGENTS.md as skipped in the display", async () 
 		const lines = renderInitPlan(plan, ".pi");
 		assert.ok(lines.some((l) => l.includes("Already exists — will NOT overwrite")));
 		assert.ok(lines.some((l) => l.includes("AGENTS.md (project root)")));
+	});
+});
+
+test("generic q-init emits only package scripts that actually exist", async () => {
+	await withTempDir(async (dir) => {
+		await writeFile(join(dir, "package.json"), JSON.stringify({ scripts: { typecheck: "tsc --noEmit", test: "node --test" } }), "utf8");
+		await writeFile(join(dir, "package-lock.json"), "{}\n", "utf8");
+		const plan = await planInit(dir, "generic", { exists, confirmOverwrite: async () => false });
+		assert.equal(plan.recipePreset, "javascript-typescript/npm");
+		const recipes = plan.contents["recipes.yaml"] ?? "";
+		assert.match(recipes, /name: check:typecheck/);
+		assert.match(recipes, /name: test:unit/);
+		assert.doesNotMatch(recipes, /name: check:lint/);
+		assert.doesNotMatch(recipes, /npm run build/);
+	});
+});
+
+test("generic q-init fails closed when multiple package-manager lockfiles conflict", async () => {
+	await withTempDir(async (dir) => {
+		await writeFile(join(dir, "package.json"), JSON.stringify({ scripts: { test: "node --test" } }), "utf8");
+		await writeFile(join(dir, "package-lock.json"), "{}\n", "utf8");
+		await writeFile(join(dir, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n", "utf8");
+		const plan = await planInit(dir, "generic", { exists, confirmOverwrite: async () => false });
+		assert.equal(plan.recipePreset, "javascript-typescript/not-configured-ambiguous-package-manager");
+		assert.match(plan.contents["recipes.yaml"] ?? "", /NOT_CONFIGURED/);
+		assert.match(plan.contents["recipes.yaml"] ?? "", /recipes: \[\]/);
+		assert.doesNotMatch(plan.contents["recipes.yaml"] ?? "", /npm run|pnpm run/);
+	});
+});
+
+test("q-init rechecks file actions but applies the exact recipe bytes shown in preview", async () => {
+	await withTempDir(async (dir) => {
+		await writeFile(join(dir, "package.json"), JSON.stringify({ scripts: { typecheck: "tsc --noEmit" } }), "utf8");
+		const preview = await planInit(dir, "generic", { exists, confirmOverwrite: async () => false });
+		await writeFile(join(dir, "package.json"), JSON.stringify({ scripts: { test: "node --test" } }), "utf8");
+		const currentActions = await planInit(dir, "generic", { exists, confirmOverwrite: async () => false });
+		const applyPlan = retainInitContentSnapshot(currentActions, preview);
+		assert.match(applyPlan.contents["recipes.yaml"] ?? "", /name: check:typecheck/);
+		assert.doesNotMatch(applyPlan.contents["recipes.yaml"] ?? "", /name: test:unit/);
+		assert.notEqual(currentActions.contents["recipes.yaml"], applyPlan.contents["recipes.yaml"]);
+	});
+});
+
+test("generic q-init never promotes lint into whitespace validation authority", async () => {
+	await withTempDir(async (dir) => {
+		await writeFile(join(dir, "package.json"), JSON.stringify({ scripts: { lint: "eslint ." } }), "utf8");
+		const plan = await planInit(dir, "generic", { exists, confirmOverwrite: async () => false });
+		const parsed = parseYaml(plan.contents["recipes.yaml"] ?? "") as { recipes?: Array<{ name?: string; validation_components?: string[] }> };
+		const lint = parsed.recipes?.find((entry) => entry.name === "check:lint");
+		assert.deepEqual(lint?.validation_components, []);
+	});
+});
+
+test("generic q-init produces Go presets and never injects npm into non-Node projects", async () => {
+	await withTempDir(async (dir) => {
+		await writeFile(join(dir, "go.mod"), "module example.test/project\n\ngo 1.24\n", "utf8");
+		const plan = await planInit(dir, "generic", { exists, confirmOverwrite: async () => false });
+		assert.equal(plan.recipePreset, "go");
+		const recipes = plan.contents["recipes.yaml"] ?? "";
+		assert.match(recipes, /command:\s*\n\s*- go\s*\n\s*- vet/);
+		assert.match(recipes, /name: test:unit/);
+		assert.doesNotMatch(recipes, /npm/);
+	});
+});
+
+test("generic q-init leaves unsupported conventions explicitly NOT_CONFIGURED", async () => {
+	await withTempDir(async (dir) => {
+		await writeFile(join(dir, "pyproject.toml"), "[project]\nname='example'\n", "utf8");
+		const plan = await planInit(dir, "generic", { exists, confirmOverwrite: async () => false });
+		assert.match(plan.recipePreset, /python\/not-configured/i);
+		const recipes = plan.contents["recipes.yaml"] ?? "";
+		assert.match(recipes, /NOT_CONFIGURED/);
+		assert.match(recipes, /recipes: \[\]/);
+		assert.doesNotMatch(recipes, /npm/);
+	});
+});
+
+test("generic q-init requires a Rust lockfile and never inventories target as evidence", async () => {
+	await withTempDir(async (dir) => {
+		await writeFile(join(dir, "Cargo.toml"), "[package]\nname='example'\nversion='0.1.0'\n", "utf8");
+		const missingLock = await planInit(dir, "generic", { exists, confirmOverwrite: async () => false });
+		assert.equal(missingLock.recipePreset, "rust/not-configured-no-lockfile");
+		assert.match(missingLock.contents["recipes.yaml"] ?? "", /NOT_CONFIGURED/);
+
+		await writeFile(join(dir, "Cargo.lock"), "# generated fixture\n", "utf8");
+		const locked = await planInit(dir, "generic", { exists, confirmOverwrite: async () => false });
+		assert.equal(locked.recipePreset, "rust");
+		const recipes = locked.contents["recipes.yaml"] ?? "";
+		assert.match(recipes, /--locked/);
+		assert.match(recipes, /writes:\s*\n\s*- target\/\*\*/);
+		assert.match(recipes, /artifacts: \[\]/);
 	});
 });

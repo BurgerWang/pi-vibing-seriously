@@ -225,11 +225,11 @@ test("governance v1 freezes schema constants, public tool input/output categorie
 	assert.ok(v1Delegate);
 	assert.deepEqual(
 		Object.keys(currentDelegate.properties),
-		[...Object.keys(v1Delegate.properties), "task_kind"],
-		"current delegate input evolves from v1 only by appending task_kind",
+		[...Object.keys(v1Delegate.properties), "task_kind", "plan_ref"],
+		"current delegate input evolves from v1 only by appending task_kind and plan_ref",
 	);
 	assert.deepEqual(currentDelegate.required, v1Delegate.required, "task_kind remains optional and cannot rewrite v1 required fields");
-	const { task_kind: _taskKind, budget_profile: currentBudgetProfile, ...currentStableProperties } = currentDelegate.properties;
+	const { task_kind: _taskKind, plan_ref: _planRef, budget_profile: currentBudgetProfile, ...currentStableProperties } = currentDelegate.properties;
 	const { budget_profile: v1BudgetProfile, ...v1StableProperties } = v1Delegate.properties;
 	assert.equal(canonicalHash(currentStableProperties), canonicalHash(v1StableProperties), "non-budget governance-v1 delegate properties stay exact");
 	assert.notEqual(canonicalHash(currentBudgetProfile), canonicalHash(v1BudgetProfile), "current budget description may identify the Luna policy without rewriting the frozen v1 catalog");
@@ -363,7 +363,7 @@ test("governance v1 run fixtures expose current identity-validation defect witho
 	}
 });
 
-test("governance v1 gate fixtures strictly reconstruct only a complete identity-consistent authority set", async () => {
+test("governance v1 gate fixtures remain historical and legacy manual provenance cannot regain authority", async () => {
 	const inventory = await readJson<Inventory>(join(FIXTURES, "inventory.json"));
 	for (const scenario of inventory.authority_types.gate!.scenarios) {
 		await withTempDir(async (projectRoot) => {
@@ -374,12 +374,8 @@ test("governance v1 gate fixtures strictly reconstruct only a complete identity-
 			const manifest = await readManifest(projectRoot, id);
 			assert.ok(manifest, `${scenario.case} carries a parseable v1 manifest so artifact reconstruction is isolated`);
 			const facts = await readPersistedGateRunFacts(projectRoot, id, manifest as RunRecord);
-			assert.equal(facts !== null, scenario.case === "valid", scenario.case);
+			assert.equal(facts, null, `${scenario.case} cannot satisfy the repaired strict provenance reader`);
 			assert.equal(scenario.gate_eligible, scenario.case === "valid" ? "conditional" : false);
-			if (facts) {
-				assert.deepEqual(facts.requested, ["b0"]);
-				assert.deepEqual(facts.manualEvidence, { "b0.fixture": "reviewed fixture" });
-			}
 			assert.deepEqual(await treeFingerprint(projectRoot), before, `${scenario.case} gate reader must be read-only`);
 		});
 	}

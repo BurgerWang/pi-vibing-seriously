@@ -2080,7 +2080,8 @@ test("session restore ignores hostile telemetry, status text/json stay bounded a
 	});
 	const entries: unknown[] = [
 		{ type: "custom", customType: OUTPUT_CONTROL_TELEMETRY_ENTRY_TYPE, data: serializeOutputControlTelemetry(prior.snapshot()) },
-		{ type: "custom", customType: OUTPUT_CONTROL_TELEMETRY_ENTRY_TYPE, data: { schema: secret, args: secret, cursor: secret } },
+		{ type: "custom", customType: OUTPUT_CONTROL_TELEMETRY_ENTRY_TYPE, data: { role: "commander", schema: secret, args: secret, cursor: secret } },
+		{ type: "custom", customType: OUTPUT_CONTROL_TELEMETRY_ENTRY_TYPE, data: { role: "other", schema: secret, args: secret, cursor: secret } },
 	];
 	const outputs: string[] = [];
 	const base = trustedCtx(process.cwd(), "output-telemetry-restore") as ExtensionContext;
@@ -2101,7 +2102,7 @@ test("session restore ignores hostile telemetry, status text/json stay bounded a
 		assert.ok(Buffer.byteLength(rendered, "utf8") <= OUTPUT_CONTROL_STATUS_MAX_BYTES);
 		assert.doesNotMatch(rendered, new RegExp(secret));
 	}
-	assert.match(outputs[0]!, /tool_results=0/, "malformed latest matching entry resets restored observations fail closed");
+	assert.match(outputs[0]!, /tool_results=0/, "other-role malformed telemetry is skipped; latest same-role malformed resets fail closed");
 	const json = JSON.parse(outputs[1]!) as Record<string, unknown>;
 	assert.equal(json.schema, "workbench-output-control-telemetry-v1");
 	assert.equal((json.totals as Record<string, unknown>).toolResults, 0);

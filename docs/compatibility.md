@@ -1,8 +1,9 @@
 # Compatibility
 
-Tested-environment matrix for **pi-dev-workbench v0.10.0 (Context Output Control Plane)**. Only
-environments that were actually exercised are listed; no untested
-compatibility is claimed. The machine-readable copy lives in
+Historical released matrix for **pi-dev-workbench v0.10.0 (Context Output Control Plane)**
+plus the narrower current unreleased source/test target.
+Rows label those scopes separately; no untested compatibility is claimed. The
+machine-readable copy lives in
 [`compatibility/pi.json`](../compatibility/pi.json).
 
 ## Unreleased pinned-worker qualification
@@ -265,6 +266,39 @@ delegation ledger is finished (manifest status `finished` with a non-null
 launched, inspects only those id/status/after facts, and the fresh worker
 inherits no prior report/session/scope/contract — `repair_of` adds no
 path/scope/authority.
+
+## Tool-schema fingerprint transition (framework reliability — optional `plan_ref`)
+
+The current `workbench_delegate_worker` surface adds one optional, strictly
+nested `plan_ref` object to the existing delegation-v2 contract. Historical
+calls and committed generations without it remain readable and are never
+rewritten. When supplied, the runtime normalizes and hash-binds the exact plan
+snapshot, resolves `plan_path` within the project realpath boundary, and checks
+the bounded current file bytes against `plan_sha256` both before transaction
+work and again immediately before worker launch. It adds no paths, worker
+authority, review result, or Gate PASS authority.
+
+Historical committed contracts and Gate validation targets with no
+`plan_ref` remain strict-readable. For a live chain, however, once the latest
+strict committed contract carries a plan, a successor omission is rejected
+before transaction allocation; the caller must explicitly retain that plan or
+provide another current strict reference. Gate validation adds an optional
+nested target component containing the plan-reference hash, sorted required
+Gate ids and `FULL`/`PARTIAL` selector coverage. `base`/`all` are the final
+selectors and must cover all mappings (`base` fails closed for a mapped quant
+Gate); focused runs remain readable development feedback but persist an
+unsuccessful partial binding. Current-state assessment rechecks plan bytes and
+coverage, so drift never reuses an older PASS. These are additive no-plan
+reader semantics; no existing no-plan record is rewritten.
+
+This additive field intentionally changes the delegate schema fingerprint
+once. The current delegate parameter-schema hash is
+`1ccb80c82baf4475a9de1f0445317b502ccc006b9c85d9e005ded0bdec79d61f` and
+the combined current unreleased framework-reliability public tool-surface
+hash (including the stricter Gate evidence wording) is
+`5eb0e3071371603325924d731e0ecda3c4a919f9f166f9dd5b1204011e8646de`.
+Repeated same-mode builds remain deterministic; the separately retained
+governance-v1 schema hash does not change.
 
 ## Commander Token Optimization Slice A (P0 + P1) — additive compatibility
 
@@ -604,11 +638,14 @@ compatible:
 
 | Component | Version | How it was exercised |
 | --------- | ------- | -------------------- |
-| Pi (`@earendil-works/pi-coding-agent`) | **0.83.0** | `npm run typecheck`/`npm test` against the pinned devDependency; live `pi -a -p` print-mode smoke runs; `pi --mode json -a -p` JSON-mode smoke runs; extension direct-load tests (stub API); live controlled-worker smoke spawned `deepseek/deepseek-v4-flash:max`, verified the JSON-event provider/model, performed two read-only tool turns, returned nested usage, exited 0, and left git status unchanged. The P7 worker-first write authority, lease commands, delegation ledger and review lifecycle are exercised by the unit-test suite (write-authority, lease-command, delegation-ledger, delegation-state, diff-review, worker-policy, worker-runner, inventory, package-content tests — 717 tests total, full check `npm run check` passed 717/717); the P7 release slice adds the focused worker-first contract tests (q-build, the implementation-workflow skill, and both project AGENTS templates must encode the seven worker-first rules) and the release-asset version-consistency tests. No new live-smoke claim is made for P7. |
-| Pi TUI (`@earendil-works/pi-tui`) | **0.83.0** | Status/widget/renderer components compiled and rendered through pi-tui's `Text` in unit tests (`tests/p4-*.test.ts`). A full interactive TUI session was not automated (see Limitations). |
-| Node.js | **v24.13.0** | All test runs and smoke runs. |
-| npm | **11.18.0** | `npm install`, `npm run typecheck/test/check`. |
-| OS / kernel | **CachyOS Linux (Arch-based), kernel 7.1.5-1-cachyos, x86_64** | All runs above. |
+| Pi released live baseline (`@earendil-works/pi-coding-agent`) | **0.83.0** | Historical v0.10.0 live `pi -a -p` print-mode and `pi --mode json -a -p` JSON-mode smoke runs; extension direct-load tests; the historical controlled-worker smoke used `deepseek/deepseek-v4-flash:max`. This row is retained release evidence, not the current devDependency. |
+| Pi current source/test target (`@earendil-works/pi-coding-agent`) | **0.84.2** | Pinned current devDependency; native TypeScript compatibility plus repository tests and source-level lifecycle/API checks. This does not inherit the 0.83.0 live TUI/print/json matrix. |
+| Pi TUI released live baseline (`@earendil-works/pi-tui`) | **0.83.0** | Historical status/widget/renderer component qualification for v0.10.0; a full interactive TUI session was not automated. |
+| Pi TUI current source/test target (`@earendil-works/pi-tui`) | **0.84.2** | Pinned current devDependency and current component/test compilation; no new automated interactive TUI qualification is claimed. |
+| Node.js released live baseline | **v24.13.0** | Historical v0.10.0 tests and smoke runs. |
+| Node.js current local source verification | **v26.7.0** | This unreleased repair's local typecheck/test execution; CI is configured for Node 24.x but configuration is not a CI PASS claim. |
+| npm released/current local | **11.18.0 / 12.0.2** | Historical release execution / this unreleased repair's local execution. |
+| OS / kernel released/current local | **CachyOS Linux, 7.1.5-1-cachyos / 7.1.8-1-cachyos, x86_64** | Historical release environment / current local source verification environment. |
 | typebox | **1.3.7** (peer, pinned in devDependencies) | Tool parameter schemas at registration and typecheck. |
 | yaml | **2.9.x** (runtime dependency) | Config loading (`project.yaml`, `recipes.yaml`, `gates.yaml`, `profiles.yaml`). |
 | TypeScript / tsx | **5.9.x / 4.23.x** (dev) | `tsc --noEmit` and the `node:test` runner; `npm run cache:report` / `npm run cache:doctor` run the P6-E benchmark CLI through tsx. |
@@ -662,8 +699,11 @@ path (custom entries are read on every `session_start`):
 ## Version policy
 
 - `peerDependencies` declare `"*"` for Pi packages because Pi bundles them at
-  runtime; the versions actually tested are pinned in `devDependencies`
-  (0.83.0). This package is tested against 0.83.0 **only**.
+  runtime. The released v0.10.0 live qualification baseline remains Pi/pi-tui
+  0.83.0. Current source pins Pi/pi-tui 0.84.2 and is verified by native
+  typecheck/repository tests plus the explicitly listed source audits and
+  worker availability smoke; it has not inherited the older release's full
+  interactive TUI/print/json qualification.
 - If you run a different Pi/Node/npm version and it works, that is a data
   point for a future release — update `compatibility/pi.json` and this file
   with the new tested row instead of silently widening claims.
@@ -681,7 +721,9 @@ path (custom entries are read on every `session_start`):
   covered by pure parsing/renderer tests and command-handler unit tests, not
   by an automated interactive-terminal session.
 - Windows and macOS are untested; the path policy uses POSIX path semantics.
-- Older Pi releases are untested; 0.83.0 is the only verified baseline.
+- The only released live-mode baseline is 0.83.0. Pi 0.84.2 is the current
+  source/test target; its full interactive TUI/print/json release matrix is
+  still not claimed.
 - The P6 benchmark corpus is single-provider/single-model/single-mode
   (DEV) development work; it is not evidence of long-term savings — see
   [docs/cache/P6_BENCHMARK_REPORT.md](../docs/cache/P6_BENCHMARK_REPORT.md)

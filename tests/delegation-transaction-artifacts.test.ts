@@ -48,6 +48,21 @@ function payload(kind: DelegationTaskKind = "implementation"): DelegationBounded
 	};
 }
 
+function planRef(overrides: Record<string, unknown> = {}) {
+	return {
+		schema: "workbench-plan-ref-v1",
+		plan_id: "delegation-v2-plan",
+		version: "1.0",
+		plan_path: "docs/plans/delegation-v2.md",
+		plan_sha256: "a".repeat(64),
+		candidate: "CURRENT_WORKTREE",
+		status: "IN_PROGRESS",
+		criteria: [{ id: "C1", gate_id: "b1", check_ids: ["b1.1"], evidence_paths: ["tests/delegation-transaction-artifacts.test.ts"] }],
+		next_action: "complete the bounded delegation",
+		...overrides,
+	};
+}
+
 const BEFORE: GitFacts = {
 	gitHead: HEAD,
 	gitDirty: false,
@@ -365,7 +380,7 @@ test("artifact v2: diagnosis binds zero actual writes and a generation-local rep
 	assert.equal(result.value.workerSummary.report_path.endsWith("worker-report.md"), true);
 });
 
-test("artifact v2: canonical contract hashing preserves array order and omits absent repair_of", () => {
+test("artifact v2: canonical contract hashing preserves array order and omits absent optional traceability", () => {
 	const ordinary = bindDelegationBoundedTaskContractV2(payload());
 	const same = bindDelegationBoundedTaskContractV2(structuredClone(payload()));
 	const reorderedPayload = payload();
@@ -377,11 +392,49 @@ test("artifact v2: canonical contract hashing preserves array order and omits ab
 	assert.equal(ordinary.ok, true);
 	assert.deepEqual(ordinary, same);
 	assert.equal(Object.prototype.hasOwnProperty.call(ordinary.ok && ordinary.value, "repair_of"), false);
+	assert.equal(Object.prototype.hasOwnProperty.call(ordinary.ok && ordinary.value, "plan_ref"), false);
 	assert.equal(reordered.ok && reversed.ok && reordered.value.contract_hash !== reversed.value.contract_hash, true);
 	assert.equal(bindDelegationBoundedTaskContractV2({ ...payload(), repair_of: undefined }).ok, false);
 	assert.equal(bindDelegationBoundedTaskContractV2({ ...payload(), task_kind: "mechanical" }).ok, false);
 	assert.equal(bindDelegationBoundedTaskContractV2({ ...payload(), allowed_paths: ["z/**", "a/**"] }).ok, false);
 	assert.equal(bindDelegationBoundedTaskContractV2({ ...payload(), allowed_paths: ["src/**", "src/**"] }).ok, false);
+});
+
+test("artifact v2: plan_ref is strictly cloned and hash-bound with repair_of independently or together", () => {
+	const base = bindDelegationBoundedTaskContractV2(payload());
+	const planOnly = bindDelegationBoundedTaskContractV2({ ...payload(), plan_ref: planRef() });
+	const repairOnly = bindDelegationBoundedTaskContractV2({ ...payload(), repair_of: "20260817-170000-rp01" });
+	const both = bindDelegationBoundedTaskContractV2({
+		...payload(),
+		repair_of: "20260817-170000-rp01",
+		plan_ref: planRef(),
+	});
+	assert.equal(base.ok && planOnly.ok && repairOnly.ok && both.ok, true);
+	if (!base.ok || !planOnly.ok || !repairOnly.ok || !both.ok) return;
+	assert.notEqual(planOnly.value.contract_hash, base.value.contract_hash);
+	assert.notEqual(both.value.contract_hash, planOnly.value.contract_hash);
+	assert.notEqual(both.value.contract_hash, repairOnly.value.contract_hash);
+	assert.equal(both.value.repair_of, "20260817-170000-rp01");
+	assert.equal(both.value.plan_ref?.plan_id, "delegation-v2-plan");
+
+	const tampered = bindDelegationBoundedTaskContractV2({
+		...payload(),
+		plan_ref: planRef({ next_action: "a different bounded action" }),
+	});
+	assert.equal(tampered.ok, true);
+	if (tampered.ok) assert.notEqual(tampered.value.contract_hash, planOnly.value.contract_hash);
+
+	const callerPlan = planRef();
+	const normalized = normalizeDelegationBoundedTaskContractV2({ ...payload(), plan_ref: callerPlan });
+	assert.equal(normalized.ok, true);
+	if (normalized.ok) {
+		(callerPlan.criteria as Array<Record<string, unknown>>)[0]!.id = "MUTATED";
+		assert.equal(normalized.value.plan_ref?.criteria[0]?.id, "C1");
+	}
+	assert.equal(bindDelegationBoundedTaskContractV2({ ...payload(), plan_ref: undefined }).ok, false);
+	assert.equal(normalizeDelegationBoundedTaskContractV2({ ...payload(), plan_ref: new Proxy(planRef(), {}) }).ok, false);
+	assert.equal(normalizeDelegationBoundedTaskContractV2({ ...payload(), plan_ref: planRef({ extra: true }) }).ok, false);
+	assert.equal(normalizeDelegationBoundedTaskContractV2({ ...payload(), plan_ref: planRef({ plan_path: "../escape.md" }) }).ok, false);
 });
 
 test("artifact v2: historical low contract hashes remain reproducible but cannot create a new committed artifact", () => {

@@ -63,19 +63,27 @@ import { loadProjectConfig, type ExecFn } from "./config.ts";
 import { latestGateStatus, loadGates, readPersistedGateRunFacts } from "./gate-engine.ts";
 import { orderGates, resolveSelector } from "./gate-schema.ts";
 import type { WorkerFirstGateFacts } from "./gate-schema.ts";
+import {
+	readCurrentDelegationPlanAuthority,
+	type CurrentDelegationPlanAuthority,
+} from "./delegation-plan-reference.ts";
 import type { WorkbenchMode } from "./mode-policy.ts";
 import type { Recipe } from "./recipe-schema.ts";
-import { readCommittedManifest, runDirFor, type RunRecord } from "./runs.ts";
-import { ARTIFACT_MANIFEST_FILE } from "./artifact-contract.ts";
+import { latestRunAttemptForRecipe, readCommittedManifest, runDirFor, type RunRecord } from "./runs.ts";
+import { ARTIFACT_MANIFEST_FILE, validateCommittedArtifactsV2 } from "./artifact-contract.ts";
 import { RUN_COMMIT_FILE } from "./run-transaction.ts";
 import {
 	buildGateValidationTarget,
 	buildRecipeValidationTarget,
+	assessRecipeSourceValidation,
 	collectValidationCurrentState,
 	evaluateValidationReuse,
 	parseValidationEvidenceBlock,
+	validationEvidenceIdentity,
+	validationEvidenceSourceEligible,
 	VALIDATION_EVIDENCE_SCHEMA_VERSION,
 	type GateValidationTarget,
+	type GatePlanValidationFacts,
 	type RecipeValidationTarget,
 	type ValidationBinding,
 	type ValidationEvidenceBlock,
@@ -171,21 +179,45 @@ class GateTargetUnavailableError extends Error {
  * filtering included). A gate that no longer exists in the current
  * catalog — requested or effective — cannot be reproduced: target-mismatch.
  */
-async function currentGateTarget(projectRoot: string, bindingTarget: GateValidationTarget): Promise<{
+async function currentGateTarget(
+	projectRoot: string,
+	bindingTarget: GateValidationTarget,
+	planAuthority: CurrentDelegationPlanAuthority,
+): Promise<{
 	target: GateValidationTarget;
 }> {
+	if (planAuthority.status === "blocked") {
+		throw new Error(`current delegation plan authority is blocked: ${planAuthority.reason}`);
+	}
 	const gates = await loadGates(projectRoot);
 	const requested = resolveSelector(bindingTarget.selector, gates);
 	const known = new Set(gates.map((g) => g.id));
 	const unknownRequested = requested.filter((id) => !known.has(id));
 	const unknownEffective = bindingTarget.effective_gates.filter((id) => !known.has(id));
-	if (unknownRequested.length > 0 || unknownEffective.length > 0) {
+	const unavailablePlanGates = planAuthority.status === "current"
+		? planAuthority.requiredGateIds.filter((id) => !known.has(id))
+		: [];
+	if (unknownRequested.length > 0 || unknownEffective.length > 0 || unavailablePlanGates.length > 0) {
 		// A removed gate (or a profile that no longer loads it) makes the
 		// source target irreproducible — fail closed, never reuse.
 		throw new GateTargetUnavailableError();
 	}
 	const effective = orderGates(requested, gates);
-	return { target: buildGateValidationTarget(bindingTarget.selector, requested, effective) };
+	let planReference: GatePlanValidationFacts | undefined;
+	if (planAuthority.status === "current") {
+		const requiredGateIds = [...planAuthority.requiredGateIds].sort();
+		const effectiveSet = new Set(effective);
+		const fullyCovered = requiredGateIds.every((id) => effectiveSet.has(id));
+		const selector = bindingTarget.selector.trim();
+		const finalSelector = selector === "base" || selector === "all";
+		if (finalSelector && !fullyCovered) throw new GateTargetUnavailableError();
+		planReference = {
+			plan_reference_hash: planAuthority.planReferenceHash,
+			required_gate_ids: requiredGateIds,
+			coverage: finalSelector && fullyCovered ? "FULL" : "PARTIAL",
+		};
+	}
+	return { target: buildGateValidationTarget(bindingTarget.selector, requested, effective, planReference) };
 }
 
 /**
@@ -200,6 +232,99 @@ async function currentPrerequisiteStatus(projectRoot: string, prerequisiteIds: r
 	for (const prereqId of prerequisiteIds) {
 		const current = await latestGateStatus(projectRoot, prereqId);
 		out[prereqId] = current?.status ?? "NOT_RUN";
+	}
+	return out;
+}
+
+/**
+ * Re-resolve artifact authority edges exactly as a fresh artifact check
+ * would: newest same-recipe attempt owns the answer, its committed identity
+ * must parse, and its validation binding must remain currently REUSABLE.
+ * Failure becomes a deterministic non-matching marker, never an old PASS.
+ */
+async function currentArtifactSourceAuthority(
+	projectRoot: string,
+	profile: string | undefined,
+	mode: WorkbenchMode,
+	exec: ExecFn,
+	projectGates: readonly unknown[],
+	recipes: readonly Recipe[],
+	artifactExternalRoots: Readonly<Record<string, string>>,
+	sources: readonly {
+		checkId: string;
+		recipe: string;
+		runId: string;
+		authorityDigest: string;
+		freshness: "current" | "immutable-snapshot";
+	}[],
+): Promise<Record<string, string>> {
+	const out: Record<string, string> = {};
+	for (const source of sources) {
+		const key = `artifact:${source.checkId}:${source.recipe}`;
+		if (source.freshness === "immutable-snapshot") {
+			const manifest = await readCommittedManifest(projectRoot, source.runId);
+			const digest = manifest ? validationEvidenceIdentity(manifest.validation_evidence) : null;
+			if (
+				!manifest
+				|| manifest.recipe !== source.recipe
+				|| digest !== source.authorityDigest
+				|| !validationEvidenceSourceEligible(manifest.validation_evidence, { recipe: source.recipe, argvHash: manifest.argv_hash })
+			) {
+				out[key] = "unavailable:immutable-source-identity";
+				continue;
+			}
+			const artifacts = await validateCommittedArtifactsV2(
+				projectRoot,
+				runDirFor(projectRoot, source.runId),
+				source.runId,
+				{ authorizedExternalRoots: artifactExternalRoots, exec },
+			);
+			out[key] = artifacts.ok
+				? `${source.runId}:${digest}:immutable-snapshot`
+				: `unavailable:immutable-${artifacts.code}`;
+			continue;
+		}
+		const attempt = await latestRunAttemptForRecipe(projectRoot, source.recipe);
+		if (attempt.state === "NOT_FOUND") {
+			out[key] = "unavailable:no-run";
+			continue;
+		}
+		if (attempt.state === "CORRUPT") {
+			out[key] = "unavailable:corrupt-latest";
+			continue;
+		}
+		const manifest = await readCommittedManifest(projectRoot, attempt.run_id);
+		if (!manifest) {
+			out[key] = "unavailable:corrupt-latest";
+			continue;
+		}
+		const digest = validationEvidenceIdentity(manifest.validation_evidence);
+		if (
+			manifest.recipe !== source.recipe
+			|| !digest
+			|| !validationEvidenceSourceEligible(manifest.validation_evidence, { recipe: source.recipe, argvHash: manifest.argv_hash })
+		) {
+			out[key] = "unavailable:missing-binding";
+			continue;
+		}
+		const recipe = recipes.find((candidate) => candidate.name === source.recipe);
+		if (!recipe || manifest.recipe === "gate") {
+			out[key] = "unavailable:source-recipe-missing";
+			continue;
+		}
+		const assessment = await assessRecipeSourceValidation({
+			projectRoot,
+			profile,
+			mode,
+			exec,
+			projectGates,
+			recipe,
+			argvHash: manifest.argv_hash,
+			validationEvidence: manifest.validation_evidence,
+		});
+		out[key] = assessment.reusable
+			? `${manifest.run_id}:${digest}:current`
+			: `unavailable:${assessment.reasons.join(",") || "not-reusable"}`;
 	}
 	return out;
 }
@@ -263,7 +388,11 @@ async function assessRunValidationInner(input: AssessRunValidationInput): Promis
 
 	if (binding.kind === "gate") {
 		const sourceTarget = gateTarget(binding);
-		const rebuilt = await currentGateTarget(input.projectRoot, sourceTarget);
+		const planAuthority = await readCurrentDelegationPlanAuthority(
+			input.projectRoot,
+			input.workerFirstFacts?.latestDelegationId,
+		);
+		const rebuilt = await currentGateTarget(input.projectRoot, sourceTarget, planAuthority);
 		target = rebuilt.target;
 
 		// Recover ONLY the source run's manual evidence needed to reproduce
@@ -289,6 +418,16 @@ async function assessRunValidationInner(input: AssessRunValidationInput): Promis
 			workerFirstFacts: input.workerFirstFacts,
 			actorFacts: input.actorFacts,
 			prerequisiteStatus: await currentPrerequisiteStatus(input.projectRoot, prerequisiteIds),
+			sourceAuthority: await currentArtifactSourceAuthority(
+				input.projectRoot,
+				config.profile,
+				input.mode,
+				input.exec,
+				config.gates,
+				config.recipes,
+				config.artifactExternalRoots,
+				sourceFacts.artifactSources,
+			),
 		};
 	} else {
 		const sourceTarget = recipeTarget(binding);

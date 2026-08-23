@@ -198,31 +198,33 @@ async function setupProject(root: string, recipesYaml?: string, gatesYaml?: stri
 
 /** A successful recipe with a raw marker, 60 noise lines and the Node spec-reporter block. */
 const GREEN_JS = [
-	'console.log("RAW-SUCCESS-MARKER-42");',
-	'for (let i = 1; i <= 60; i++) console.log("noise-line-" + i);',
-	'console.log("ℹ tests 3");',
-	'console.log("ℹ pass 3");',
-	'console.log("ℹ fail 0");',
-	'console.log("ℹ cancelled 0");',
-	'console.log("ℹ skipped 0");',
-	'console.log("ℹ todo 0");',
-	'console.log("ℹ duration_ms 12.5");',
+	'const { writeSync } = require("node:fs");',
+	'writeSync(1, "RAW-SUCCESS-MARKER-42\\n");',
+	'for (let i = 1; i <= 60; i++) writeSync(1, "noise-line-" + i + "\\n");',
+	'writeSync(1, "ℹ tests 3\\n");',
+	'writeSync(1, "ℹ pass 3\\n");',
+	'writeSync(1, "ℹ fail 0\\n");',
+	'writeSync(1, "ℹ cancelled 0\\n");',
+	'writeSync(1, "ℹ skipped 0\\n");',
+	'writeSync(1, "ℹ todo 0\\n");',
+	'writeSync(1, "ℹ duration_ms 12.5\\n");',
 ].join("\n");
 
 const GREEN_RECIPES = 'recipes:\n  - name: green\n    command: ["node", "green.js"]\n';
 
 /** A failing recipe: two spec-reporter failure lines, the totals block, a stderr root cause, exit 1. */
 const FAIL_JS = [
-	'console.log("✖ failing-test-alpha (1ms)");',
-	'console.log("✖ failing-test-beta (1ms)");',
-	'console.log("ℹ tests 2");',
-	'console.log("ℹ pass 0");',
-	'console.log("ℹ fail 2");',
-	'console.log("ℹ cancelled 0");',
-	'console.log("ℹ skipped 0");',
-	'console.log("ℹ todo 0");',
-	'console.log("ℹ duration_ms 4.5");',
-	'console.error("TypeError: boom at fail.js:1");',
+	'const { writeSync } = require("node:fs");',
+	'writeSync(1, "✖ failing-test-alpha (1ms)\\n");',
+	'writeSync(1, "✖ failing-test-beta (1ms)\\n");',
+	'writeSync(1, "ℹ tests 2\\n");',
+	'writeSync(1, "ℹ pass 0\\n");',
+	'writeSync(1, "ℹ fail 2\\n");',
+	'writeSync(1, "ℹ cancelled 0\\n");',
+	'writeSync(1, "ℹ skipped 0\\n");',
+	'writeSync(1, "ℹ todo 0\\n");',
+	'writeSync(1, "ℹ duration_ms 4.5\\n");',
+	'writeSync(2, "TypeError: boom at fail.js:1\\n");',
 	"process.exit(1);",
 ].join("\n");
 

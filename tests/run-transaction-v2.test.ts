@@ -25,6 +25,7 @@ function recipesYaml(command: string, artifact: string): string {
 		"  - name: producer",
 		`    command: ${command}`,
 		"    writes: [out/]",
+		"    mutation: artifacts",
 		`    artifacts: [${artifact}]`,
 		"",
 	].join("\n");
@@ -35,6 +36,7 @@ const SNAPSHOT_REQUIRED = '{ path: "out/*.json", required: true, min_count: 1, m
 const PRODUCE = '["node", "-e", "require(\\"fs\\").mkdirSync(\\"out\\",{recursive:true});require(\\"fs\\").writeFileSync(\\"out/result.json\\",\\"one\\")"]';
 const NO_OUTPUT = '["node", "-e", "process.exit(0)"]';
 const FAIL = '["node", "-e", "process.exit(3)"]';
+const SOL_FACTS = { role: undefined, provider: "openai-codex", model: "gpt-5.6-sol" };
 
 async function setup(dir: string, command = PRODUCE, artifact = CURRENT_REQUIRED): Promise<void> {
 	await writeConfigFile(dir, "project.yaml", "name: run-v2\nprofile: generic\n");
@@ -51,6 +53,16 @@ async function setup(dir: string, command = PRODUCE, artifact = CURRENT_REQUIRED
 			"",
 		].join("\n"),
 	);
+}
+
+/** Git-backed authority fixture; run records remain outside current-state hashes. */
+async function gitBacked(dir: string): Promise<void> {
+	await writeFile(join(dir, ".gitignore"), ".pi/\n", "utf8");
+	await spawnExec("git", ["init", "-q"], { cwd: dir });
+	await spawnExec("git", ["config", "user.email", "t@t"], { cwd: dir });
+	await spawnExec("git", ["config", "user.name", "t"], { cwd: dir });
+	await spawnExec("git", ["add", "-A"], { cwd: dir });
+	await spawnExec("git", ["commit", "-qm", "init"], { cwd: dir });
 }
 
 async function writeMinimalRunPayload(directory: string, runId: string, marker: string): Promise<void> {
@@ -132,7 +144,7 @@ test("partial visible directories and post-commit mutation are never consumable"
 test("new v2 manifests are rejected by the frozen v1 discriminator", async () => {
 	await withTempDir(async (dir) => {
 		await setup(dir);
-		const run = await runRecipe({ projectRoot: dir, recipeName: "producer", mode: "DEV", exec: spawnExec });
+		const run = await runRecipe({ projectRoot: dir, recipeName: "producer", mode: "DEV", exec: spawnExec, actorFacts: SOL_FACTS });
 		assert.equal(run.ok, true, run.error ?? "");
 		const raw = JSON.parse(await readFile(join(run.runDir!, "manifest.json"), "utf8")) as Record<string, unknown>;
 		const frozenV1ReaderWouldAccept = raw.schema_version === RUN_SCHEMA_VERSION;
@@ -191,9 +203,11 @@ test("legacy v1 remains read-only while ambiguous and unknown manifests fail clo
 test("current artifacts are rehashed at gate time", async () => {
 	await withTempDir(async (dir) => {
 		await setup(dir);
-		const run = await runRecipe({ projectRoot: dir, recipeName: "producer", mode: "DEV", exec: spawnExec });
+		await gitBacked(dir);
+		const run = await runRecipe({ projectRoot: dir, recipeName: "producer", mode: "DEV", exec: spawnExec, actorFacts: SOL_FACTS });
 		assert.equal(run.ok, true, run.error ?? "");
-		assert.equal((await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec })).status, "PASS");
+		const initialGate = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
+		assert.equal(initialGate.status, "PASS", initialGate.gates[0]?.checks[0]?.failure_reason ?? "initial artifact gate failed");
 		await writeFile(join(dir, "out", "result.json"), "two", "utf8");
 		const changed = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
 		assert.equal(changed.status, "FAIL");
@@ -211,11 +225,13 @@ test("current artifacts are rehashed at gate time", async () => {
 test("immutable snapshot authority survives source deletion and detects snapshot corruption", async () => {
 	await withTempDir(async (dir) => {
 		await setup(dir, PRODUCE, SNAPSHOT_REQUIRED);
-		const run = await runRecipe({ projectRoot: dir, recipeName: "producer", mode: "DEV", exec: spawnExec });
+		await gitBacked(dir);
+		const run = await runRecipe({ projectRoot: dir, recipeName: "producer", mode: "DEV", exec: spawnExec, actorFacts: SOL_FACTS });
 		assert.equal(run.ok, true, run.error ?? "");
 		const artifactManifest = JSON.parse(await readFile(join(run.runDir!, "artifact-manifest.json"), "utf8")) as { artifacts: Array<{ snapshot_path: string }> };
 		await import("node:fs/promises").then(({ unlink }) => unlink(join(dir, "out", "result.json")));
-		assert.equal((await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec })).status, "PASS");
+		const snapshotGate = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
+		assert.equal(snapshotGate.status, "PASS", snapshotGate.gates[0]?.checks[0]?.failure_reason ?? "immutable artifact gate failed");
 		await writeFile(join(run.runDir!, artifactManifest.artifacts[0]!.snapshot_path), "corrupt", "utf8");
 		const corrupt = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
 		assert.equal(corrupt.status, "FAIL");
@@ -264,6 +280,52 @@ test("a newer partial same-recipe run blocks instead of falling back to an older
 		assert.equal(gate.status, "FAIL");
 		assert.match(gate.gates[0]!.checks[0]!.failure_reason ?? "", /failed committed identity verification/);
 		assert.match(gate.gates[0]!.checks[0]!.failure_reason ?? "", /20991231-235959-newr/);
+	});
+});
+
+test("a newer forged v1 manifest cannot redirect artifact authority to an older committed success", async () => {
+	await withTempDir(async (dir) => {
+		await setup(dir);
+		await gitBacked(dir);
+		const success = await runRecipe({
+			projectRoot: dir,
+			recipeName: "producer",
+			mode: "DEV",
+			exec: spawnExec,
+			actorFacts: SOL_FACTS,
+		});
+		assert.equal(success.ok, true, success.error ?? "");
+		const initialGate = await runGates({
+			projectRoot: dir,
+			selector: "g1",
+			mode: "DEV",
+			exec: spawnExec,
+			actorFacts: SOL_FACTS,
+		});
+		assert.equal(initialGate.status, "PASS", initialGate.gates[0]?.checks[0]?.failure_reason ?? "");
+
+		const forgedDirectoryId = "20991231-235959-fake";
+		const forgedDirectory = join(dir, CONFIG_DIR_NAME, "workbench", "runs", forgedDirectoryId);
+		await mkdir(forgedDirectory, { recursive: true });
+		const forgedManifest = JSON.parse(await readFile(join(success.runDir!, "manifest.json"), "utf8")) as Record<string, unknown>;
+		forgedManifest.schema_version = 1;
+		forgedManifest.run_id = success.record!.run_id;
+		delete forgedManifest.run_transaction_schema_version;
+		delete forgedManifest.run_outcome;
+		delete forgedManifest.artifact_manifest_path;
+		await writeFile(join(forgedDirectory, "manifest.json"), JSON.stringify(forgedManifest), "utf8");
+
+		const attacked = await runGates({
+			projectRoot: dir,
+			selector: "g1",
+			mode: "DEV",
+			exec: spawnExec,
+			actorFacts: SOL_FACTS,
+		});
+		assert.equal(attacked.status, "FAIL", "the old committed artifact authority must not be followed");
+		assert.match(attacked.gates[0]!.checks[0]!.failure_reason ?? "", new RegExp(forgedDirectoryId));
+		assert.equal(attacked.gates[0]!.checks[0]!.evidence[0]!.run_id, forgedDirectoryId);
+		assert.equal(attacked.gates[0]!.checks[0]!.evidence[0]!.detail, "run_identity_mismatch");
 	});
 });
 
@@ -323,15 +385,6 @@ test("authorized external artifacts require explicit config and an independent p
 					"",
 				].join("\n"),
 			);
-			let probes = 0;
-			const exec: ExecFn = async (command, args, options) => {
-				if (command === process.execPath && args[0] === "-e") probes += 1;
-				return spawnExec(command, args, options);
-			};
-			const result = await runRecipe({ projectRoot, recipeName: "external", mode: "DEV", exec });
-			assert.equal(result.ok, true, result.error ?? "");
-			assert.equal(probes, 1, "the external artifact is re-opened by exactly one separate probe process");
-			assert.deepEqual(result.record?.artifact_paths, ["external:warehouse/result.json"]);
 			await writeConfigFile(projectRoot, "gates.yaml", [
 				"gates:",
 				"  - id: g1",
@@ -340,6 +393,16 @@ test("authorized external artifacts require explicit config and an independent p
 				"      - { id: g1.1, title: output, kind: artifact, artifact_recipe: external, glob: 'external:warehouse/*.json' }",
 				"",
 			].join("\n"));
+			await gitBacked(projectRoot);
+			let probes = 0;
+			const exec: ExecFn = async (command, args, options) => {
+				if (command === process.execPath && args[0] === "-e") probes += 1;
+				return spawnExec(command, args, options);
+			};
+			const result = await runRecipe({ projectRoot, recipeName: "external", mode: "DEV", exec, actorFacts: SOL_FACTS });
+			assert.equal(result.ok, true, result.error ?? "");
+			assert.equal(probes, 1, "the external artifact is re-opened by exactly one separate probe process");
+			assert.deepEqual(result.record?.artifact_paths, ["external:warehouse/result.json"]);
 			assert.equal((await runGates({ projectRoot, selector: "g1", mode: "DEV", exec })).status, "PASS");
 			assert.equal(probes, 2, "gate consumption performs a fresh independent probe");
 			await writeFile(join(externalRoot, "result.json"), "changed", "utf8");

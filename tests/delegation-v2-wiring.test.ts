@@ -1,6 +1,7 @@
 /** S1.1 public workbench_delegate_worker wiring through delegation-v2. */
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { cp, mkdir, readFile, readdir, utimes, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
@@ -463,6 +464,87 @@ test("public delegate rejects retired low before transaction persistence or chil
 			/invalid_contract/,
 		);
 		assert.deepEqual(await delegationDirectories(root), [], "low is rejected before any transaction directory exists");
+	});
+});
+
+test("public delegate verifies current plan bytes before persistence and binds valid plan_ref into v2", async () => {
+	await withTempDir(async (root) => {
+		await initializeProject(root);
+		const planPath = "docs/plans/current.md";
+		const planBytes = "# Current delegation plan\n";
+		await mkdir(dirname(join(root, planPath)), { recursive: true });
+		await writeFile(join(root, planPath), planBytes, "utf8");
+		const planRef = {
+			schema: "workbench-plan-ref-v1",
+			plan_id: "delegation-v2-current-plan",
+			version: "1.0",
+			plan_path: planPath,
+			plan_sha256: createHash("sha256").update(planBytes).digest("hex"),
+			candidate: "CURRENT_WORKTREE",
+			status: "IN_PROGRESS",
+			criteria: [{ id: "C1", gate_id: "b1", check_ids: ["b1.1"], evidence_paths: ["tests/delegation-v2-wiring.test.ts"] }],
+			next_action: "execute the bounded diagnosis",
+		};
+		const stub = commanderRuntime();
+		const tool = delegateTool(stub);
+		const ctx = commanderContext(root, "plan-ref-current");
+
+		await writeFile(join(root, planPath), "# Drifted delegation plan\n", "utf8");
+		await assert.rejects(
+			tool.execute("plan-ref-drift", delegateParams({ task_kind: "diagnosis", plan_ref: planRef }), undefined, undefined, ctx),
+			/plan_ref digest_mismatch/,
+		);
+		assert.deepEqual(await delegationDirectories(root), [], "drift is rejected before any transaction directory exists");
+
+		await writeFile(join(root, planPath), planBytes, "utf8");
+		const script = await writeFakeWorker(root, {});
+		const result = await withFakeWorker(script, () => tool.execute(
+			"plan-ref-valid",
+			delegateParams({ task_kind: "diagnosis", plan_ref: planRef }),
+			undefined,
+			undefined,
+			ctx,
+		));
+		const committed = await readDelegationCommittedGenerationV2(root, delegationId(result));
+		assert.equal(committed.ok, true, committed.ok ? "" : committed.error.code);
+		if (!committed.ok) return;
+		const before = committed.value.records["before.json"] as Record<string, unknown>;
+		const contract = before.contract as Record<string, unknown>;
+		assert.equal((contract.plan_ref as Record<string, unknown>).plan_sha256, planRef.plan_sha256);
+		assert.equal(contract.contract_hash, committed.value.state.contract_hash);
+
+		const beforeContinuation = await delegationDirectories(root);
+		await assert.rejects(
+			tool.execute(
+				"plan-ref-omitted-successor",
+				delegateParams({ task_kind: "diagnosis" }),
+				undefined,
+				undefined,
+				ctx,
+			),
+			/latest strict committed delegation carries one/,
+			"a current strict plan cannot disappear through an omitted successor field",
+		);
+		assert.deepEqual(
+			await delegationDirectories(root),
+			beforeContinuation,
+			"continuity rejection happens before a successor transaction is allocated",
+		);
+
+		const successor = await withFakeWorker(script, () => tool.execute(
+			"plan-ref-explicit-successor",
+			delegateParams({ task_kind: "diagnosis", plan_ref: planRef }),
+			undefined,
+			undefined,
+			ctx,
+		));
+		const successorCommitted = await readDelegationCommittedGenerationV2(root, delegationId(successor));
+		assert.equal(successorCommitted.ok, true, successorCommitted.ok ? "" : successorCommitted.error.code);
+		if (successorCommitted.ok) {
+			const successorBefore = successorCommitted.value.records["before.json"] as Record<string, unknown>;
+			const successorContract = successorBefore.contract as Record<string, unknown>;
+			assert.deepEqual(successorContract.plan_ref, contract.plan_ref, "an explicit same plan remains contract-bound");
+		}
 	});
 });
 

@@ -133,6 +133,15 @@ export interface GateValidationTarget {
 	requested_gates: string[];
 	/** sorted effective gate ids actually evaluated in this run. */
 	effective_gates: string[];
+	/** Optional strict delegation-plan identity and selector coverage. */
+	plan_reference?: GatePlanValidationFacts;
+}
+
+export interface GatePlanValidationFacts {
+	plan_reference_hash: string;
+	required_gate_ids: string[];
+	/** FULL is reserved for base/all with every mapped Gate selected. */
+	coverage: "FULL" | "PARTIAL";
 }
 
 export type ValidationTarget = RecipeValidationTarget | GateValidationTarget;
@@ -331,12 +340,29 @@ function isRecipeTarget(value: unknown): value is RecipeValidationTarget {
 function isGateTarget(value: unknown): value is GateValidationTarget {
 	if (!isRecord(value)) return false;
 	const keys = Object.keys(value);
-	if (keys.length !== 4 || !keys.includes("kind")) return false;
+	if ((keys.length !== 4 && keys.length !== 5) || !keys.includes("kind") ||
+		keys.some((key) => !["kind", "selector", "requested_gates", "effective_gates", "plan_reference"].includes(key))) return false;
+	const plan = value.plan_reference;
+	const planGateIds = isRecord(plan) && Array.isArray(plan.required_gate_ids)
+		? plan.required_gate_ids
+		: undefined;
+	const planValid = plan === undefined || (
+		isRecord(plan) &&
+		Object.keys(plan).length === 3 &&
+		Object.keys(plan).every((key) => ["plan_reference_hash", "required_gate_ids", "coverage"].includes(key)) &&
+		isSha256(plan.plan_reference_hash) &&
+		planGateIds !== undefined &&
+		isStringArray(planGateIds, MAX_ID_CHARS) &&
+		planGateIds.length > 0 &&
+		planGateIds.every((id, index) => index === 0 || planGateIds[index - 1]! < id) &&
+		(plan.coverage === "FULL" || plan.coverage === "PARTIAL")
+	);
 	return (
 		value.kind === "gate" &&
 		isBoundedString(value.selector, MAX_ID_CHARS) &&
 		isStringArray(value.requested_gates, MAX_ID_CHARS) &&
-		isStringArray(value.effective_gates, MAX_ID_CHARS)
+		isStringArray(value.effective_gates, MAX_ID_CHARS) &&
+		planValid
 	);
 }
 
@@ -432,6 +458,42 @@ export function parseValidationEvidenceBlock(raw: unknown): ParseValidationEvide
 	};
 }
 
+/**
+ * Stable privacy-safe identity of one complete, parseable validation block.
+ * Authority edges persist only this digest; malformed/unavailable bindings
+ * have no identity and therefore can never satisfy a dependent check.
+ */
+export function validationEvidenceIdentity(raw: unknown): string | null {
+	const parsed = parseValidationEvidenceBlock(raw);
+	if (!parsed.ok || parsed.block.binding === null) return null;
+	return canonicalHash(parsed.block);
+}
+
+/**
+ * Source-time eligibility independent of later project drift. When an
+ * expected recipe identity is supplied, the binding must also be the exact
+ * recipe/invocation represented by the producer manifest; a successful Gate
+ * binding or another recipe's binding can never authorize its artifacts.
+ */
+export function validationEvidenceSourceEligible(
+	raw: unknown,
+	expected?: { recipe: string; argvHash: unknown },
+): boolean {
+	const parsed = parseValidationEvidenceBlock(raw);
+	const binding = parsed.ok ? parsed.block.binding : null;
+	if (!(binding !== null
+		&& binding.owner === "sol"
+		&& binding.outcome.successful
+		&& binding.outcome.complete)) return false;
+	if (!expected) return true;
+	return typeof expected.argvHash === "string"
+		&& isSha256(expected.argvHash)
+		&& binding.kind === "recipe"
+		&& binding.target.kind === "recipe"
+		&& binding.target.name === expected.recipe
+		&& binding.target.invocation_hash === expected.argvHash;
+}
+
 // ---------------------------------------------------------------------------
 // Gate-state hashing (bounded, privacy-safe)
 // ---------------------------------------------------------------------------
@@ -465,6 +527,8 @@ export function manualEvidenceHash(manualEvidence: Readonly<Record<string, strin
  */
 export function workerFirstFactsHash(facts: WorkerFirstGateFacts | undefined): string {
 	if (!facts) return canonicalHash({ worker: null });
+	const carriesPlanFacts = facts.planReferenceHash !== undefined || facts.requiredGateIds !== undefined ||
+		facts.planReferenceCurrent !== undefined || facts.planReferenceBlockedReason !== undefined;
 	return canonicalHash({
 		worker: {
 			schema_version: facts.schema_version,
@@ -484,6 +548,14 @@ export function workerFirstFactsHash(facts: WorkerFirstGateFacts | undefined): s
 			leaseCallsUsed: facts.leaseCallsUsed,
 			leaseMaxCalls: facts.leaseMaxCalls,
 			gateRunInitiatedByCommander: facts.gateRunInitiatedByCommander,
+			...(carriesPlanFacts ? {
+				plan: {
+					planReferenceHash: facts.planReferenceHash ?? null,
+					requiredGateIds: [...new Set(facts.requiredGateIds ?? [])].sort(),
+					planReferenceCurrent: facts.planReferenceCurrent ?? null,
+					planReferenceBlockedReason: facts.planReferenceBlockedReason ?? null,
+				},
+			} : {}),
 		},
 	});
 }
@@ -515,7 +587,20 @@ export function prerequisiteStatusHash(prerequisiteStatus: Readonly<Record<strin
 	return canonicalHash({ prerequisites: entries });
 }
 
-/** Full gate-state hash: schema + hashed manual evidence + bounded worker/actor facts + prerequisite statuses. */
+/**
+ * External authority-edge identities (for example an artifact-producing
+ * recipe run). Values are already fixed-size validation-binding digests plus
+ * bounded run identity; hashing keeps them out of the public binding while
+ * making replacement/staleness an exact gate-state mismatch.
+ */
+export function sourceAuthorityHash(sourceAuthority: Readonly<Record<string, string>>): string {
+	const entries = Object.entries(sourceAuthority)
+		.filter(([key, value]) => key.length > 0 && key.length <= 500 && value.length > 0 && value.length <= 500)
+		.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+	return canonicalHash({ sources: entries });
+}
+
+/** Full gate-state hash: schema + evidence/facts + prerequisite and authority-edge identities. */
 export function gateStateHash(input: {
 	profile: string | undefined;
 	projectGates: readonly unknown[];
@@ -523,6 +608,7 @@ export function gateStateHash(input: {
 	workerFirstFacts?: WorkerFirstGateFacts;
 	actorFacts?: RecipeMutationFacts;
 	prerequisiteStatus: Readonly<Record<string, string>>;
+	sourceAuthority?: Readonly<Record<string, string>>;
 }): string {
 	return canonicalHash({
 		schema: effectiveGateSchemaHash(input.profile, input.projectGates),
@@ -530,6 +616,7 @@ export function gateStateHash(input: {
 		worker: workerFirstFactsHash(input.workerFirstFacts),
 		actor: actorFactsHash(input.actorFacts),
 		prerequisites: prerequisiteStatusHash(input.prerequisiteStatus),
+		sources: sourceAuthorityHash(input.sourceAuthority ?? {}),
 	});
 }
 
@@ -569,12 +656,24 @@ export function buildRecipeValidationTarget(recipe: Recipe, invocationHash: stri
 	};
 }
 
-export function buildGateValidationTarget(selector: string, requestedGates: readonly string[], effectiveGates: readonly string[]): GateValidationTarget {
+export function buildGateValidationTarget(
+	selector: string,
+	requestedGates: readonly string[],
+	effectiveGates: readonly string[],
+	planReference?: Readonly<GatePlanValidationFacts>,
+): GateValidationTarget {
 	return {
 		kind: "gate",
 		selector,
 		requested_gates: [...new Set(requestedGates)].sort(),
 		effective_gates: [...new Set(effectiveGates)].sort(),
+		...(planReference === undefined ? {} : {
+			plan_reference: {
+				plan_reference_hash: planReference.plan_reference_hash,
+				required_gate_ids: [...new Set(planReference.required_gate_ids)].sort(),
+				coverage: planReference.coverage,
+			},
+		}),
 	};
 }
 
@@ -897,7 +996,11 @@ export interface CaptureGateValidationInput {
 	workerFirstFacts?: WorkerFirstGateFacts;
 	/** gateId → status only (sources/run ids are dropped by the hash). */
 	prerequisiteStatus: Readonly<Record<string, string>>;
+	/** External source authority identities used by evaluated checks. */
+	sourceAuthority?: Readonly<Record<string, string>>;
 	actorFacts?: RecipeMutationFacts;
+	/** Strict current plan identity and selector coverage; omitted for historical/no-plan chains. */
+	planReference?: Readonly<GatePlanValidationFacts>;
 	/** overall gate PASS. */
 	successful: boolean;
 }
@@ -930,11 +1033,12 @@ export async function captureGateValidationEvidence(input: CaptureGateValidation
 				workerFirstFacts: input.workerFirstFacts,
 				actorFacts: input.actorFacts,
 				prerequisiteStatus: input.prerequisiteStatus,
+				sourceAuthority: input.sourceAuthority,
 			}),
 			...(input.profile !== undefined ? { profile: input.profile } : {}),
 			mode: input.mode,
 			owner: ownerFromActorFacts(input.actorFacts),
-			target: buildGateValidationTarget(input.selector, input.requestedGates, input.effectiveGates),
+			target: buildGateValidationTarget(input.selector, input.requestedGates, input.effectiveGates, input.planReference),
 			outcome: { successful: input.successful, complete: true, source: "gate" },
 		};
 		return { ok: true, block: { schema_version: VALIDATION_EVIDENCE_SCHEMA_VERSION, binding, unavailable_reason: null } };
@@ -960,6 +1064,7 @@ export interface CollectValidationCurrentStateInput {
 		workerFirstFacts?: WorkerFirstGateFacts;
 		actorFacts?: RecipeMutationFacts;
 		prerequisiteStatus: Readonly<Record<string, string>>;
+		sourceAuthority?: Readonly<Record<string, string>>;
 	};
 }
 
@@ -995,6 +1100,7 @@ export async function collectValidationCurrentState(input: CollectValidationCurr
 						workerFirstFacts: input.gateState.workerFirstFacts,
 						actorFacts: input.gateState.actorFacts,
 						prerequisiteStatus: input.gateState.prerequisiteStatus,
+						sourceAuthority: input.gateState.sourceAuthority,
 					})
 				: effectiveGateSchemaHash(input.profile, input.projectGates);
 		return {
@@ -1012,6 +1118,37 @@ export async function collectValidationCurrentState(input: CollectValidationCurr
 	} catch (error) {
 		return failed(`validation state collection failed: ${String((error as Error).message ?? error)}`);
 	}
+}
+
+/**
+ * Strict current-state assessment for a recipe source consumed by another
+ * authority edge (for example a Gate artifact check). This deliberately
+ * lives below validation-assessment.ts so gate-engine can call it without an
+ * ESM import cycle. It applies the same parser, exact current-state collector
+ * and reuse comparator as the Commander-facing assessment.
+ */
+export async function assessRecipeSourceValidation(input: {
+	projectRoot: string;
+	profile: string | undefined;
+	mode: WorkbenchMode;
+	exec: ExecFn;
+	projectGates: readonly unknown[];
+	recipe: Recipe;
+	argvHash: unknown;
+	validationEvidence: unknown;
+}): Promise<ValidationReuseVerdict> {
+	if (typeof input.argvHash !== "string" || !isSha256(input.argvHash)) {
+		return { reusable: false, reasons: ["corrupt-binding"] };
+	}
+	const current = await collectValidationCurrentState({
+		projectRoot: input.projectRoot,
+		profile: input.profile,
+		mode: input.mode,
+		exec: input.exec,
+		projectGates: input.projectGates,
+		target: buildRecipeValidationTarget(input.recipe, input.argvHash, input.projectRoot),
+	});
+	return evaluateValidationReuse(input.validationEvidence, current);
 }
 
 // ---------------------------------------------------------------------------
@@ -1041,7 +1178,16 @@ function sameTarget(a: ValidationTarget, b: ValidationTarget): boolean {
 		);
 	}
 	if (b.kind !== "gate") return false;
+	const aPlan = a.plan_reference;
+	const bPlan = b.plan_reference;
+	const samePlan = aPlan === undefined || bPlan === undefined
+		? aPlan === bPlan
+		: aPlan.plan_reference_hash === bPlan.plan_reference_hash &&
+			aPlan.coverage === bPlan.coverage &&
+			aPlan.required_gate_ids.length === bPlan.required_gate_ids.length &&
+			aPlan.required_gate_ids.every((id, index) => id === bPlan.required_gate_ids[index]);
 	return (
+		samePlan &&
 		a.selector === b.selector &&
 		a.requested_gates.length === b.requested_gates.length &&
 		a.effective_gates.length === b.effective_gates.length &&

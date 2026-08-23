@@ -109,6 +109,7 @@ async function setupReviewFixture(
 	paths = ["src/a.ts"],
 	preDirtyPath?: string,
 	writeOrder: readonly string[] = paths,
+	withPlanReference = false,
 ): Promise<ReviewFixture> {
 	const root = await mkdtemp(join(tmpdir(), "delegation-review-v2-"));
 	await git(root, ["init"]);
@@ -132,6 +133,20 @@ async function setupReviewFixture(
 		verification: ["inspect the exact worker diff"],
 		timeout_seconds: 600,
 		budget_profile: "standard",
+		...(withPlanReference ? {
+			repair_of: "20260817-160000-rp01",
+			plan_ref: {
+				schema: "workbench-plan-ref-v1",
+				plan_id: "review-v2-plan",
+				version: "1.0",
+				plan_path: "docs/plans/review-v2.md",
+				plan_sha256: "a".repeat(64),
+				candidate: "CURRENT_WORKTREE",
+				status: "EVIDENCED",
+				criteria: [{ id: "C1", gate_id: "b1", check_ids: ["b1.1"], evidence_paths: ["tests/delegation-review-v2.test.ts"] }],
+				next_action: "strictly review the persisted delegation",
+			},
+		} : {}),
 	});
 	assert.equal(contract.ok, true);
 	if (!contract.ok) throw new Error("contract setup failed");
@@ -228,6 +243,29 @@ test("review v2 fixture: reverse journal order builds, commits, and strict-reads
 		assert.deepEqual(Object.keys(after.path_digests), ["src/a.ts", "src/b.ts"]);
 		const strict = await readDelegationCommittedGenerationV2(fixture.root, ID);
 		assert.equal(strict.ok, true, strict.ok ? "" : JSON.stringify(strict.error));
+	} finally {
+		await cleanup(fixture);
+	}
+});
+
+test("review v2: plan_ref and repair_of coexist in the committed contract and strict review rebinds both", async () => {
+	const fixture = await setupReviewFixture(["src/a.ts"], undefined, ["src/a.ts"], true);
+	try {
+		const strict = await readDelegationCommittedGenerationV2(fixture.root, ID);
+		assert.equal(strict.ok, true, strict.ok ? "" : strict.error.code);
+		if (!strict.ok) return;
+		const before = strict.value.records["before.json"] as Record<string, unknown>;
+		const contract = before.contract as Record<string, unknown>;
+		assert.equal((contract.plan_ref as Record<string, unknown>).plan_id, "review-v2-plan");
+		assert.equal(contract.repair_of, "20260817-160000-rp01");
+		const reviewed = await reviewDelegationV2({
+			projectRoot: fixture.root,
+			delegationId: ID,
+			exec: spawnExec,
+			includePaths: ["src/a.ts"],
+			now: at(4),
+		});
+		assert.equal(reviewed.ok, true, reviewed.ok ? "" : JSON.stringify(reviewed.error));
 	} finally {
 		await cleanup(fixture);
 	}

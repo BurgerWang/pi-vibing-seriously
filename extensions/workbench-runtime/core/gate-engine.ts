@@ -8,8 +8,8 @@
  * Status model (spec §3): PASS | FAIL | BLOCKED | NOT_RUN.
  *   - a required check that is NOT_RUN can never make a gate PASS
  *   - a non-PASS outcome of a blocking prerequisite BLOCKs dependents
- *     (prerequisite status resolves from the current run first, then from
- *     the most recent persisted gate run, then NOT_RUN)
+ *     (the complete prerequisite closure executes in the same run, so a
+ *     historical gate result can never satisfy current-run authority)
  *   - warnings never upgrade a status; a check with no verified assertion
  *     is NOT_RUN or FAIL, never PASS
  *   - numeric constraints are only evaluated against structured artifacts
@@ -48,17 +48,30 @@ import { realpathContained } from "./path-guard.ts";
 import { runRecipe } from "./recipe-runner.ts";
 import type { Recipe } from "./recipe-schema.ts";
 import { recipeMutationBlockReason, type RecipeMutationFacts } from "./worker-policy.ts";
-import { listRunAttempts, makeRunId, readCommittedManifest, RUN_MANIFEST_SCHEMA_VERSION_V2, type RunRecord } from "./runs.ts";
+import {
+	iterateGateRunCandidates,
+	latestRunAttemptForRecipe,
+	makeRunId,
+	readCommittedManifest,
+	registerGateRunAttemptIndex,
+	RUN_MANIFEST_SCHEMA_VERSION_V2,
+	type RunRecord,
+} from "./runs.ts";
 import type { WorkbenchMode } from "./mode-policy.ts";
 import { truncateTail } from "@earendil-works/pi-coding-agent";
 import {
+	assessRecipeSourceValidation,
 	captureGateValidationEvidence,
 	unavailableEvidenceBlock,
+	validationEvidenceIdentity,
+	validationEvidenceSourceEligible,
 	type TrustedWorkbenchConfigFileDigest,
 } from "./validation-evidence.ts";
 import { readJsonFileBounded, readUtf8FileBounded, type BoundedFileIoHooks } from "./bounded-file-io.ts";
 import { validateCommittedArtifactsV2 } from "./artifact-contract.ts";
 import { beginRunTransaction, commitRunTransaction } from "./run-transaction.ts";
+import { readCurrentDelegationPlanAuthority, type CurrentDelegationPlanAuthority } from "./delegation-plan-reference.ts";
+import type { GatePlanValidationFacts } from "./validation-evidence.ts";
 
 export const GATE_SCHEMA_VERSION = 1;
 /** Persisted gate/evidence records are authority inputs, never unbounded JSON channels. */
@@ -107,7 +120,7 @@ export function persistedManualEvidence(evidenceByCheck: Readonly<Record<string,
 	const out: Record<string, string> = {};
 	for (const [checkId, check] of Object.entries(evidenceByCheck)) {
 		for (const entry of check.evidence) {
-			if (entry.type !== "manual" || entry.check_id !== checkId) continue;
+			if (entry.type !== "manual" || entry.check_id !== checkId || entry.provided_by !== "user-command") continue;
 			const note = entry.detail.trim();
 			if (note.length > 0) out[checkId] = note;
 		}
@@ -139,6 +152,9 @@ export interface EvidenceEntry {
 	paths?: string[];
 	check_id?: string;
 	provided_by?: string;
+	/** SHA-256 identity of the source validation binding for authority edges. */
+	authority_digest?: string;
+	authority_freshness?: "current" | "immutable-snapshot";
 	errors?: string[];
 	warnings?: string[];
 	artifact_path?: string;
@@ -188,6 +204,12 @@ export interface RunGatesInput {
 	signal?: AbortSignal;
 	now?: () => Date;
 	manualEvidence?: Record<string, string>;
+	/**
+	 * Provenance of manual evidence. Only the user-command path may satisfy a
+	 * human check. Model-tool notes remain advisory and evaluate NOT_RUN.
+	 * Direct programmatic callers retain the historical trusted-user default.
+	 */
+	manualEvidenceProvenance?: "user-command" | "model-tool";
 	/**
 	 * P7: bounded worker-first compliance facts injected by the runtime.
 	 * Missing facts make every worker-first check NOT_RUN (never PASS).
@@ -307,11 +329,13 @@ async function loadGateSelectionConfig(
 		trusted: true,
 		parsedGatesDocument: { value: yaml.doc },
 	});
-	return {
-		config,
-		gates: effectiveGates(config.profile, GATE_CATALOG, parsed.gates),
-		trustedConfigFileDigest: yaml.trustedConfigFileDigest,
-	};
+	let gates: Gate[];
+	try {
+		gates = effectiveGates(config.profile, GATE_CATALOG, parsed.gates);
+	} catch (error) {
+		throw new GateSetupError((error as Error).message);
+	}
+	return { config, gates, trustedConfigFileDigest: yaml.trustedConfigFileDigest };
 }
 
 export async function loadGates(projectRoot: string, hooks?: GateConfigReadHooks): Promise<Gate[]> {
@@ -329,7 +353,7 @@ interface GateSelection {
 	trustedConfigFileDigest: TrustedWorkbenchConfigFileDigest;
 	/** Selector-expanded requested gate ids, in selector order. */
 	requestedIds: string[];
-	/** Requested gate ids in prerequisite (topological) execution order. */
+	/** Complete prerequisite closure in topological execution order. */
 	ordered: string[];
 }
 
@@ -369,6 +393,75 @@ async function selectGates(projectRoot: string, selector: string, hooks?: GateCo
 	return { config, gates, trustedConfigFileDigest, requestedIds, ordered };
 }
 
+function carriesInjectedPlanFacts(facts: WorkerFirstGateFacts | undefined): boolean {
+	return facts?.planReferenceHash !== undefined || facts?.requiredGateIds !== undefined ||
+		facts?.planReferenceCurrent !== undefined || facts?.planReferenceBlockedReason !== undefined;
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+	return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function isFinalPlanSelector(selector: string): boolean {
+	const token = selector.trim();
+	return token === "base" || token === "all";
+}
+
+interface GatePlanRunAuthority {
+	authority: CurrentDelegationPlanAuthority;
+	validation?: GatePlanValidationFacts;
+}
+
+/**
+ * Re-read and verify the immutable delegation plan immediately before a Gate
+ * run is allocated. The bounded injected facts must exactly match the strict
+ * contract projection; model input and plan prose are never consulted.
+ */
+async function resolveGatePlanRunAuthority(
+	projectRoot: string,
+	selector: string,
+	gates: readonly Gate[],
+	effectiveGateIds: readonly string[],
+	facts: WorkerFirstGateFacts | undefined,
+): Promise<GatePlanRunAuthority> {
+	const authority = await readCurrentDelegationPlanAuthority(projectRoot, facts?.latestDelegationId);
+	if (authority.status === "blocked") {
+		throw new GateSetupError(`PLAN_REFERENCE_BLOCKED:${authority.reason}`);
+	}
+	if (authority.status === "absent") {
+		if (carriesInjectedPlanFacts(facts)) throw new GateSetupError("PLAN_REFERENCE_FACTS_MISMATCH");
+		return { authority };
+	}
+	const expectedGates = [...authority.requiredGateIds].sort();
+	const injectedGates = [...new Set(facts?.requiredGateIds ?? [])].sort();
+	if (facts?.planReferenceHash !== authority.planReferenceHash || facts.planReferenceCurrent !== true ||
+		facts.planReferenceBlockedReason !== undefined || !sameStrings(injectedGates, expectedGates)) {
+		throw new GateSetupError("PLAN_REFERENCE_FACTS_MISMATCH");
+	}
+	const known = new Set(gates.map((gate) => gate.id));
+	const unavailable = expectedGates.filter((gateId) => !known.has(gateId));
+	if (unavailable.length > 0) {
+		throw new GateSetupError(`PLAN_REFERENCE_GATE_UNAVAILABLE:${unavailable.join(",")}`);
+	}
+	const effective = new Set(effectiveGateIds);
+	const unselected = expectedGates.filter((gateId) => !effective.has(gateId));
+	const finalSelector = isFinalPlanSelector(selector);
+	if (finalSelector && unselected.length > 0) {
+		const quantMapped = unselected.some((gateId) => QUANT_GATE_ID_RE.test(gateId));
+		throw new GateSetupError(
+			`PLAN_REFERENCE_SELECTOR_INCOMPLETE:${unselected.join(",")}${quantMapped ? ":use-all-for-quant-plan-gates" : ""}`,
+		);
+	}
+	return {
+		authority,
+		validation: {
+			plan_reference_hash: authority.planReferenceHash,
+			required_gate_ids: expectedGates,
+			coverage: finalSelector && unselected.length === 0 ? "FULL" : "PARTIAL",
+		},
+	};
+}
+
 // ---------------------------------------------------------------------------
 // Phase 3A: pure/read-only manual-evidence preflight
 // ---------------------------------------------------------------------------
@@ -389,7 +482,8 @@ export interface PreflightManualEvidenceResult {
 	requested: string[];
 	profile: string | undefined;
 	/**
-	 * Required (kind=manual && required) checks of the requested gates, in
+	 * Required (kind=manual && required) checks of the effective prerequisite
+	 * closure, in
 	 * deterministic effective gate/check order (gates sorted by id, checks in
 	 * declaration order). Optional manual checks are excluded.
 	 */
@@ -398,7 +492,7 @@ export interface PreflightManualEvidenceResult {
 	provided_required_ids: string[];
 	/** Required manual check ids with no satisfying evidence. */
 	missing_required_ids: string[];
-	/** True iff every required manual check of the requested gates is provided. */
+	/** True iff every required manual check of the effective prerequisite closure is provided. */
 	manual_evidence_ready: boolean;
 }
 
@@ -422,15 +516,15 @@ export async function preflightGateManualEvidence(input: {
 	selector: string;
 	manualEvidence?: Record<string, string>;
 }): Promise<PreflightManualEvidenceResult> {
-	const { config, gates, requestedIds } = await selectGates(input.projectRoot, input.selector);
+	const { config, gates, requestedIds, ordered } = await selectGates(input.projectRoot, input.selector);
 	const trimmed = trimmedManualEvidence(input.manualEvidence);
-	const requestedSet = new Set(requestedIds);
+	const effectiveSet = new Set(ordered);
 
 	const requiredChecks: RequiredManualCheckFacts[] = [];
 	const providedRequiredIds: string[] = [];
 	const missingRequiredIds: string[] = [];
 	for (const gate of gates) {
-		if (!requestedSet.has(gate.id)) continue;
+		if (!effectiveSet.has(gate.id)) continue;
 		for (const check of gate.checks) {
 			if (check.kind !== "manual" || !check.required) continue;
 			const provided = trimmed[check.id] !== undefined;
@@ -469,6 +563,14 @@ export interface PersistedGateRunFacts {
 	gates: Array<{ id: string; prerequisiteStatus: Record<string, GateStatus> }>;
 	/** check id → manual note, recovered from evidence.json type "manual" entries. */
 	manualEvidence: Record<string, string>;
+	/** External artifact authority edges recovered from persisted evidence. */
+	artifactSources: Array<{
+		checkId: string;
+		recipe: string;
+		runId: string;
+		authorityDigest: string;
+		freshness: "current" | "immutable-snapshot";
+	}>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -626,6 +728,7 @@ export async function readPersistedGateRunFacts(
 		// trimmed exactly like trimmedManualEvidence at capture time. Raw
 		// notes are hashed by the caller and never rendered.
 		const manualEvidence: Record<string, string> = {};
+		const artifactSources: PersistedGateRunFacts["artifactSources"] = [];
 		for (const [key, rawCheck] of Object.entries(checks)) {
 			if (!isRecord(rawCheck)) return null;
 			const checkId = rawCheck.check_id;
@@ -640,31 +743,51 @@ export async function readPersistedGateRunFacts(
 				// check_id is malformed source evidence.
 				if (entry.type === "manual") {
 					if (entry.check_id !== checkId) return null;
+					if (entry.provided_by !== "user-command") return null;
 					if (typeof entry.detail !== "string" || entry.detail.length > MAX_MANUAL_NOTE_CHARS) return null;
 					const note = entry.detail.trim();
 					if (note.length > 0) manualEvidence[checkId] = note;
+				} else if (entry.type === "artifact") {
+					if (entry.check_id !== undefined && entry.check_id !== checkId) return null;
+					if (typeof entry.recipe !== "string" || entry.recipe.length === 0 || entry.recipe.length > 200) return null;
+					if (typeof entry.run_id !== "string" || entry.run_id.length === 0 || entry.run_id.length > 200) return null;
+					if (typeof entry.authority_digest !== "string" || !/^[0-9a-f]{64}$/.test(entry.authority_digest)) return null;
+					if (entry.authority_freshness !== "current" && entry.authority_freshness !== "immutable-snapshot") return null;
+					artifactSources.push({
+						checkId,
+						recipe: entry.recipe,
+						runId: entry.run_id,
+						authorityDigest: entry.authority_digest,
+						freshness: entry.authority_freshness,
+					});
 				} else if (entry.check_id !== undefined && entry.check_id !== checkId) {
 					return null;
 				}
 			}
 		}
-		return { requested: gatesRaw.requested, gates, manualEvidence };
+		return { requested: gatesRaw.requested, gates, manualEvidence, artifactSources };
 	} catch {
 		return null;
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Latest persisted gate status (prerequisite resolution)
+// Latest persisted gate status (history and presentation compatibility)
 // ---------------------------------------------------------------------------
 
 interface PersistedGateStatusRecord {
 	gates: Array<{ id: string; status: GateStatus }>;
 }
 
-async function readGatesFile(projectRoot: string, runId: string, hooks?: BoundedFileIoHooks): Promise<PersistedGateStatusRecord | null> {
+async function readGatesFile(
+	projectRoot: string,
+	runId: string,
+	hooks?: BoundedFileIoHooks,
+	indexedStartedAt?: string,
+): Promise<PersistedGateStatusRecord | null> {
 	const manifest = await readCommittedManifest(projectRoot, runId);
 	if (!manifest || manifest.recipe !== "gate") return null;
+	if (indexedStartedAt !== undefined && manifest.started_at !== indexedStartedAt) return null;
 	try {
 		const read = await readJsonFileBounded(join(runsDir(projectRoot), runId, "gates.json"), GATE_AUTHORITY_RECORD_MAX_BYTES, hooks);
 		if (!read.ok || !isRecord(read.value.value)) return null;
@@ -684,15 +807,19 @@ async function readGatesFile(projectRoot: string, runId: string, hooks?: Bounded
 
 /** Most recent persisted status of a gate, if any. */
 export async function latestGateStatus(projectRoot: string, gateId: string, hooks?: BoundedFileIoHooks): Promise<{ status: GateStatus; run_id: string } | null> {
-	const runs = await listRunAttempts(projectRoot, 50);
-	for (const run of runs) {
-		if (run.recipe !== "gate") continue;
-		const record = await readGatesFile(projectRoot, run.run_id, hooks);
+	for await (const candidate of iterateGateRunCandidates(projectRoot)) {
+		if (candidate.source === "marker-invalid") return null;
+		const record = await readGatesFile(
+			projectRoot,
+			candidate.run_id,
+			hooks,
+			candidate.source === "marker" ? candidate.started_at : undefined,
+		);
 		// A newer gate run that advertises itself through a readable manifest
 		// but is partial/corrupt must not make us fall back to older optimism.
 		if (!record) return null;
 		const gate = record.gates.find((g) => g.id === gateId);
-		if (gate) return { status: gate.status, run_id: run.run_id };
+		if (gate) return { status: gate.status, run_id: candidate.run_id };
 	}
 	return null;
 }
@@ -717,12 +844,15 @@ export interface CheckContext {
 	configIssues: ConfigIssue[];
 	/** Recipes from the same project-config load used by gate selection. */
 	recipes: readonly Recipe[];
+	/** Raw project gate declarations from the same trusted config snapshot. */
+	projectGates: readonly unknown[];
 	profile: string | undefined;
 	mode: WorkbenchMode;
 	exec: ExecFn;
 	signal?: AbortSignal;
 	now: () => Date;
 	manualEvidence: Record<string, string>;
+	manualEvidenceProvenance: "user-command" | "model-tool";
 	/** P7: injected worker-first compliance facts (undefined => NOT_RUN checks). */
 	workerFirstFacts?: WorkerFirstGateFacts;
 	/** P7: actor facts for the shared recipe mutation decision in recipe checks. */
@@ -1040,14 +1170,20 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 				// attempt owns the decision even when its transaction is partial or
 				// corrupt; strict verification below then fails it closed instead of
 				// silently falling back to an older success.
-				const runs = await listRunAttempts(ctx.projectRoot, 50);
-				const run = runs.find((r) => r.recipe === recipeName);
-				if (!run) {
+				const attempt = await latestRunAttemptForRecipe(ctx.projectRoot, recipeName);
+				if (attempt.state === "NOT_FOUND") {
 					fail(`no run of recipe "${recipeName}" found`, [
 						{ type: "config", source: ".pi/workbench/recipes.yaml", detail: `no persisted run of "${recipeName}"` },
 					]);
 					break;
 				}
+				if (attempt.state === "CORRUPT") {
+					fail(`run ${attempt.run_id} of "${recipeName}" failed diagnostic identity verification`, [
+						{ type: "artifact", run_id: attempt.run_id, recipe: recipeName, detail: attempt.reason },
+					]);
+					break;
+				}
+				const run = attempt.manifest;
 				const strictRun = await readCommittedManifest(ctx.projectRoot, run.run_id);
 				if (!strictRun) {
 					fail(`run ${run.run_id} of "${recipeName}" failed committed identity verification`, [
@@ -1061,6 +1197,22 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 					]);
 					break;
 				}
+				// A committed artifact transaction is necessary but not sufficient:
+				// the producer must carry a complete successful Sol-owned validation
+				// binding. Current artifacts additionally require that binding to match
+				// today's commit/diff/config/dependency/recipe state; immutable
+				// snapshots intentionally retain their copied-content semantics.
+				const authorityDigest = validationEvidenceIdentity(strictRun.validation_evidence);
+				if (
+					strictRun.recipe !== recipeName
+					|| !authorityDigest
+					|| !validationEvidenceSourceEligible(strictRun.validation_evidence, { recipe: recipeName, argvHash: strictRun.argv_hash })
+				) {
+					fail(`run ${strictRun.run_id} of "${recipeName}" has no usable validation authority`, [
+						{ type: "artifact", run_id: strictRun.run_id, recipe: recipeName, paths: strictRun.artifact_paths, detail: "validation binding is missing, malformed, incomplete, unsuccessful, or not Sol-owned" },
+					]);
+					break;
+				}
 				const currentArtifacts = await validateCommittedArtifactsV2(ctx.projectRoot, join(runsDir(ctx.projectRoot), run.run_id), run.run_id, { authorizedExternalRoots: ctx.artifactExternalRoots, exec: ctx.exec });
 				if (!currentArtifacts.ok) {
 					fail(`run ${run.run_id} of "${recipeName}" has invalid artifact authority (${currentArtifacts.code})`, [
@@ -1068,22 +1220,62 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 					]);
 					break;
 				}
-				const authorityPaths = currentArtifacts.manifest.artifacts.map((artifact) => artifact.root === "project" ? artifact.path : `external:${artifact.external_root}/${artifact.path}`);
-				const matched = check.artifact_glob
-					? authorityPaths.filter((path) => matchesGlob(path, check.artifact_glob as string))
-					: authorityPaths;
-				if (matched.length === 0) {
+				const authorityArtifacts = currentArtifacts.manifest.artifacts.map((artifact) => ({
+					artifact,
+					path: artifact.root === "project" ? artifact.path : `external:${artifact.external_root}/${artifact.path}`,
+				}));
+				const matchedArtifacts = check.artifact_glob
+					? authorityArtifacts.filter(({ path }) => matchesGlob(path, check.artifact_glob as string))
+					: authorityArtifacts;
+				if (matchedArtifacts.length === 0) {
 					fail(`run ${run.run_id} of "${recipeName}" produced no matching artifacts${check.artifact_glob ? ` (glob: ${check.artifact_glob})` : ""}`, [
 						{ type: "artifact", run_id: run.run_id, recipe: recipeName, paths: run.artifact_paths, detail: "no matching artifacts" },
 					]);
 					break;
 				}
+				const authorityFreshness = matchedArtifacts.some(({ artifact }) => artifact.freshness === "current")
+					? "current"
+					: "immutable-snapshot";
+				if (authorityFreshness === "current") {
+					const sourceRecipe = ctx.recipes.find((candidate) => candidate.name === recipeName);
+					if (!sourceRecipe) {
+						fail(`artifact source recipe "${recipeName}" is not currently declared`, [
+							{ type: "artifact", run_id: strictRun.run_id, recipe: recipeName, paths: strictRun.artifact_paths, detail: "source recipe missing from current trusted config" },
+						]);
+						break;
+					}
+					const sourceAssessment = await assessRecipeSourceValidation({
+						projectRoot: ctx.projectRoot,
+						profile: ctx.profile,
+						mode: ctx.mode,
+						exec: ctx.exec,
+						projectGates: ctx.projectGates,
+						recipe: sourceRecipe,
+						argvHash: strictRun.argv_hash,
+						validationEvidence: strictRun.validation_evidence,
+					});
+					if (!sourceAssessment.reusable) {
+						fail(`run ${strictRun.run_id} of "${recipeName}" is not current reusable authority`, [
+							{
+								type: "artifact",
+								run_id: strictRun.run_id,
+								recipe: recipeName,
+								paths: strictRun.artifact_paths,
+								detail: `source validation refused: ${sourceAssessment.reasons.join(",") || "unknown"}`,
+							},
+						]);
+						break;
+					}
+				}
+				const matched = matchedArtifacts.map(({ path }) => path);
 				pass([
 					{
 						type: "artifact",
 						run_id: run.run_id,
 						recipe: recipeName,
 						paths: matched,
+						authority_digest: authorityDigest,
+						authority_freshness: authorityFreshness,
 						detail: `run ${run.run_id} artifacts: ${matched.join(", ")}`,
 					},
 				]);
@@ -1212,17 +1404,21 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 
 			case "manual": {
 				const note = ctx.manualEvidence[check.id];
-				if (note === undefined || note.trim().length === 0) {
+				if (note === undefined || note.trim().length === 0 || ctx.manualEvidenceProvenance !== "user-command") {
 					entry.status = "NOT_RUN";
 					entry.failure_reason = null;
-					ctx.log(`    ${check.id} NOT_RUN — manual evidence required (${check.manual_prompt ?? "see gates.yaml"})`);
+					ctx.log(
+						ctx.manualEvidenceProvenance === "model-tool" && note !== undefined
+							? `    ${check.id} NOT_RUN — model-tool notes cannot satisfy a human manual check`
+							: `    ${check.id} NOT_RUN — manual evidence required (${check.manual_prompt ?? "see gates.yaml"})`,
+					);
 					break;
 				}
 				pass([
 					{
 						type: "manual",
 						check_id: check.id,
-						provided_by: "manual-input",
+						provided_by: "user-command",
 						detail: note.trim(),
 					},
 				]);
@@ -1405,16 +1601,11 @@ async function evaluateGate(
 		const prereqGate = effective.find((g) => g.id === prereqId);
 		const blocking = prereqGate ? prereqGate.blocking : true;
 		const inRunEntry = inRun.get(prereqId);
-		let status: GateStatus;
-		let source: string;
-		if (inRunEntry) {
-			status = inRunEntry.status;
-			source = "this-run";
-		} else {
-			const persisted = await latestGateStatus(ctx.projectRoot, prereqId);
-			status = persisted?.status ?? "NOT_RUN";
-			source = persisted ? `run:${persisted.run_id}` : "no-prior-run";
-		}
+		// Selection topologically closes every prerequisite. Missing same-run
+		// state is therefore an internal/authority failure, never permission to
+		// inherit a historical PASS from a different transaction.
+		const status: GateStatus = inRunEntry?.status ?? "NOT_RUN";
+		const source = inRunEntry ? "this-run" : "missing-this-run";
 		prerequisite_status[prereqId] = { status, source };
 		if (status !== "PASS" && blocking) {
 			blocked_reason = `prerequisite ${prereqId} is ${status} (${source})`;
@@ -1511,8 +1702,11 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 	const startedAt = now();
 
 	const { config, gates, trustedConfigFileDigest, requestedIds, ordered } = await selectGates(projectRoot, selector, input.gateConfigReadHooks);
+	const planRunAuthority = await resolveGatePlanRunAuthority(projectRoot, selector, gates, ordered, input.workerFirstFacts);
 
 	const runId = makeRunId(startedAt);
+	const registered = await registerGateRunAttemptIndex(projectRoot, runId, startedAt);
+	if (!registered.ok) throw new GateSetupError("GATE_ATTEMPT_INDEX_FAILED");
 	const transaction = await beginRunTransaction(projectRoot, runId);
 	const runDir = transaction.finalDir;
 	const writeDir = transaction.stagingDir;
@@ -1543,12 +1737,14 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 		runDir: writeDir,
 		configIssues: config.issues,
 		recipes: config.recipes,
+		projectGates: config.gates,
 		profile: config.profile,
 		mode,
 		exec,
 		signal: input.signal,
 		now,
 		manualEvidence: trimmedManual,
+		manualEvidenceProvenance: input.manualEvidenceProvenance ?? "user-command",
 		workerFirstFacts: input.workerFirstFacts,
 		actorFacts: input.actorFacts,
 		artifactExternalRoots: config.artifactExternalRoots,
@@ -1567,13 +1763,28 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 	}
 
 	let overall: GateStatus = "PASS";
+	const requestedSet = new Set(requestedIds);
 	for (const entry of gateEntries) {
-		if (entry.required) overall = worstStatus(overall, entry.status);
+		// Every selector-expanded gate is part of this invocation's explicit
+		// outcome, even when the declaration marks it optional in a broader
+		// ladder. Dependency-closure gates affect the invocation when required;
+		// their blocking semantics already govern their dependents.
+		if (requestedSet.has(entry.id) || entry.required) overall = worstStatus(overall, entry.status);
+	}
+	const planMappedStatuses = planRunAuthority.validation === undefined
+		? []
+		: planRunAuthority.validation.required_gate_ids.map((gateId) => inRun.get(gateId)?.status ?? "NOT_RUN");
+	const planMappedPass = planMappedStatuses.every((status) => status === "PASS");
+	if (planRunAuthority.validation?.coverage === "FULL") {
+		for (const status of planMappedStatuses) overall = worstStatus(overall, status);
 	}
 	const finishedAt = now();
 	const durationMs = Math.max(0, finishedAt.getTime() - startedAt.getTime());
 	const ok = overall === "PASS";
 
+	if (planRunAuthority.validation !== undefined) {
+		logLines.push(`plan coverage: ${planRunAuthority.validation.coverage} (${planRunAuthority.validation.required_gate_ids.join(", ")})`);
+	}
 	logLines.push("", `overall: ${overall}${ok ? "" : " (not a pass)"}`);
 	const stdoutFull = logLines.join("\n") + "\n";
 
@@ -1622,9 +1833,16 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 	// (explicitly non-reusable). Prerequisite status facts are reduced to
 	// gateId → status: sources (which embed run ids) never enter the hash.
 	const prerequisiteStatus: Record<string, string> = {};
+	const sourceAuthority: Record<string, string> = {};
 	for (const entry of gateEntries) {
 		for (const [gateId, facts] of Object.entries(entry.prerequisite_status)) {
 			prerequisiteStatus[gateId] = facts.status;
+		}
+		for (const check of entry.checks) {
+			for (const evidence of check.evidence) {
+				if (evidence.type !== "artifact" || !evidence.run_id || !evidence.recipe || !evidence.authority_digest) continue;
+				sourceAuthority[`artifact:${check.check_id}:${evidence.recipe}`] = `${evidence.run_id}:${evidence.authority_digest}:${evidence.authority_freshness ?? "current"}`;
+			}
 		}
 	}
 	const gateEvidence = await captureGateValidationEvidence({
@@ -1640,8 +1858,11 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 		manualEvidence: persistedManual,
 		workerFirstFacts: input.workerFirstFacts,
 		prerequisiteStatus,
+		sourceAuthority,
 		actorFacts: input.actorFacts,
-		successful: ok,
+		planReference: planRunAuthority.validation,
+		successful: ok && (planRunAuthority.validation === undefined ||
+			(planRunAuthority.validation.coverage === "FULL" && planMappedPass)),
 	});
 
 	const manifest = {
@@ -1721,7 +1942,6 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 	} catch {
 		throw new GateSetupError("RUN_RECORD_COMMIT_FAILED");
 	}
-
 	return { ok, status: overall, runId, runDir, gates: gateEntries, requested: requestedIds, profile: config.profile };
 }
 

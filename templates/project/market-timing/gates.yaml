@@ -5,6 +5,7 @@
 #     b0 Project Readiness            b3 Integration Correctness
 #     b1 Static Quality               b4 Output Contract
 #     b2 Unit Correctness             b5 Reproducibility and Handoff
+#     b6 Development Safety (reserved, machine-backed)
 #   quant gates (quant profiles only):
 #     q0 Research Contract            q3 Experiment Integrity
 #     q1 Market Data Integrity        q4 Out-of-Sample Robustness
@@ -35,12 +36,13 @@
 # Cache hits never bypass Q0-Q5: every gate re-validates every run, cached
 # or not.
 #
-# Override built-in gates by id or add new gates here, e.g.:
+# Replace non-reserved built-ins by id or add new gates here, e.g.:
 #   gates:
 #     - id: q4
 #       title: Out-of-Sample Robustness
 #       checks:
 #         - { id: q4.2, title: Multi-fold OOS, kind: numeric,
 #             file: results/quant-result.json, path: folds.length, min: 3 }
-# A project gate with a built-in id replaces the built-in entirely.
+# B6 is reserved: project configuration cannot replace, remove or weaken its
+# canonical machine-backed checks.
 gates: []

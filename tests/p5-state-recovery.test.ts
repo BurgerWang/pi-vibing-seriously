@@ -21,6 +21,11 @@ import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionContext, type Extensi
 
 import workbenchRuntime from "../extensions/workbench-runtime/index.ts";
 import { COMPACT_NOTE_MESSAGE_TYPE, COMPACT_STATE_ENTRY_TYPE, type CompactState } from "../extensions/workbench-runtime/core/compact.ts";
+import {
+	COMPACT_ATTEMPT_ENTRY_TYPE,
+	parseCompactAttemptState,
+	startCompactAttempt,
+} from "../extensions/workbench-runtime/core/compact-lifecycle.ts";
 import { MODE_ENTRY_TYPE } from "../extensions/workbench-runtime/core/state.ts";
 import {
 	WORKER_ALLOWED_PATHS_ENV,
@@ -226,7 +231,7 @@ before(() => {
 test("extension registers the expected lifecycle events", () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
-	for (const event of ["session_start", "session_before_compact", "before_agent_start", "agent_settled", "tool_execution_start", "tool_execution_end", "tool_call"]) {
+	for (const event of ["session_start", "session_before_compact", "session_compact", "before_agent_start", "agent_end", "agent_settled", "tool_execution_start", "tool_execution_end", "tool_call"]) {
 		assert.ok(stub.events.has(event) && (stub.events.get(event)?.length ?? 0) > 0, `event ${event} registered`);
 	}
 });
@@ -284,7 +289,10 @@ test("session_before_compact stays silent when there is nothing to supplement", 
 	const compact = stub.events.get("session_before_compact");
 	await compact![0]!({ type: "session_before_compact", preparation: {}, branchEntries: [], reason: "threshold", willRetry: false, signal: new AbortController().signal } as never, fakeCtx([]) as never);
 	assert.equal(stub.messages.length, 0, "no note without meaningful state");
-	assert.equal(stub.appendEntryCalls.length, 0);
+	assert.equal(stub.appendEntryCalls.some((call) => call.customType === COMPACT_STATE_ENTRY_TYPE), false);
+	const attempts = stub.appendEntryCalls.filter((call) => call.customType === COMPACT_ATTEMPT_ENTRY_TYPE);
+	assert.equal(attempts.length, 1, "the started lifecycle is persisted even without a supplement");
+	assert.equal(parseCompactAttemptState(attempts[0]!.data)?.status, "started");
 });
 
 test("compaction notes are deduplicated", async () => {
@@ -310,8 +318,17 @@ test("allowed Commander preflight preserves compaction and its supplement", asyn
 	const compact = stub.events.get("session_before_compact");
 	const result = await compact![0]!({ type: "session_before_compact", preparation: compactPreparation("small"), branchEntries: [], reason: "threshold", willRetry: true, signal: new AbortController().signal } as never, compactCtx(stub, []) as never);
 	assert.equal(result, undefined, "allowed Commander compaction continues");
-	assert.ok(stub.messages.length > 0, "the commander supplement note is still sent");
-	assert.equal(stub.messages[0]?.customType, COMPACT_NOTE_MESSAGE_TYPE);
+	assert.equal(stub.messages.length, 0, "willRetry does not defer the note to a future user turn");
+	const sessionCompact = stub.events.get("session_compact")![0]!;
+	await sessionCompact({ type: "session_compact", compactionEntry: {}, fromExtension: false, reason: "threshold", willRetry: true } as never, compactCtx(stub, []) as never);
+	const immediate = await beforeStart![0]!({ type: "before_agent_start", prompt: "commander task", systemPrompt: "" } as never, fakeCtx([]) as never) as { message?: { customType?: string; display?: boolean; content?: string } } | undefined;
+	assert.equal(immediate?.message?.customType, COMPACT_NOTE_MESSAGE_TYPE);
+	assert.equal(immediate?.message?.display, false);
+	assert.match(immediate?.message?.content ?? "", /commander task/);
+	const statuses = stub.appendEntryCalls
+		.filter((call) => call.customType === COMPACT_ATTEMPT_ENTRY_TYPE)
+		.map((call) => parseCompactAttemptState(call.data)?.status);
+	assert.deepEqual(statuses, ["started", "completed"]);
 });
 
 test("near-capacity Commander preflight warns and preserves the native supplement path", async () => {
@@ -380,6 +397,243 @@ test("worker session_before_compact cancels compaction (never silently continues
 	// A second worker compaction event also cancels.
 	const again = await compact[0]!({ type: "session_before_compact", preparation: {}, branchEntries: [], reason: "overflow", willRetry: true, signal: new AbortController().signal } as never, fakeCtx([]) as never);
 	assert.deepEqual(again, { cancel: true });
+	const statuses = stub.appendEntryCalls
+		.filter((call) => call.customType === COMPACT_ATTEMPT_ENTRY_TYPE)
+		.map((call) => parseCompactAttemptState(call.data)?.status);
+	assert.deepEqual(statuses, ["started", "cancelled", "started", "cancelled"]);
+});
+
+test("session_start reconciles one unfinished compact attempt exactly once", async () => {
+	const stub = makeStub();
+	workbenchRuntime(stub);
+	const started = startCompactAttempt({
+		attemptId: "compact-reconcile-1",
+		startedAt: "2020-01-01T00:00:00.000Z",
+		reason: "threshold",
+		owner: "pi-native",
+		willRetry: false,
+	});
+	const entries = [entry(COMPACT_ATTEMPT_ENTRY_TYPE, started)];
+	const sessionStart = stub.events.get("session_start")![0]!;
+	await sessionStart({ type: "session_start", reason: "startup" } as never, fakeCtx(entries) as never);
+	await sessionStart({ type: "session_start", reason: "startup" } as never, fakeCtx(entries) as never);
+	const terminals = stub.appendEntryCalls
+		.filter((call) => call.customType === COMPACT_ATTEMPT_ENTRY_TYPE)
+		.map((call) => parseCompactAttemptState(call.data))
+		.filter((value) => value?.status === "failed");
+	assert.equal(terminals.length, 1, "a stale started entry cannot create duplicate terminals");
+	assert.equal(terminals[0]?.resultCode, "compact_failed");
+});
+
+test("a new compact attempt fails an overlapping started attempt before replacing it", async () => {
+	const stub = makeStub();
+	workbenchRuntime(stub);
+	const compact = stub.events.get("session_before_compact")![0]!;
+	const ctx = fakeCtx([]);
+	await compact({ type: "session_before_compact", preparation: {}, branchEntries: [], reason: "threshold", willRetry: false, signal: new AbortController().signal } as never, ctx as never);
+	await compact({ type: "session_before_compact", preparation: {}, branchEntries: [], reason: "manual", willRetry: false, signal: new AbortController().signal } as never, ctx as never);
+	const attempts = stub.appendEntryCalls
+		.filter((call) => call.customType === COMPACT_ATTEMPT_ENTRY_TYPE)
+		.map((call) => parseCompactAttemptState(call.data));
+	assert.deepEqual(attempts.map((attempt) => attempt?.status), ["started", "failed", "started"]);
+	assert.equal(attempts[0]?.attemptId, attempts[1]?.attemptId, "the orphan is terminalized under its original id");
+	assert.notEqual(attempts[1]?.attemptId, attempts[2]?.attemptId, "the replacement receives a fresh id");
+});
+
+test("a cancelled later compact clears an unconsumed retry note", async () => {
+	const stub = makeStub();
+	workbenchRuntime(stub);
+	const beforeStart = stub.events.get("before_agent_start")![0]!;
+	const ctx = compactCtx(stub, []);
+	await beforeStart({ type: "before_agent_start", prompt: "old retry objective", systemPrompt: "" } as never, ctx as never);
+	await stub.events.get("session_before_compact")![0]!({
+		type: "session_before_compact", preparation: compactPreparation("small"), branchEntries: [], reason: "threshold", willRetry: true,
+		signal: new AbortController().signal,
+	} as never, ctx as never);
+	await stub.events.get("session_compact")![0]!({
+		type: "session_compact", compactionEntry: {}, fromExtension: false, reason: "threshold", willRetry: true,
+	} as never, ctx as never);
+	const cancelled = await stub.events.get("session_before_compact")![0]!({
+		type: "session_before_compact",
+		preparation: compactPreparation("x".repeat(674_179), "p".repeat(51_071)),
+		branchEntries: [], reason: "manual", willRetry: false, signal: new AbortController().signal,
+	} as never, ctx as never);
+	assert.deepEqual(cancelled, { cancel: true });
+	const next = await beforeStart({ type: "before_agent_start", prompt: "new user turn", systemPrompt: "" } as never, ctx as never) as { message?: unknown } | undefined;
+	assert.equal(next?.message, undefined, "the cancelled attempt cannot leak the prior retry note");
+});
+
+test("objective survives agent_settled and only REVIEWED delegate paths enter compact state", async () => {
+	const stub = makeStub();
+	workbenchRuntime(stub);
+	const ctx = fakeCtx([]);
+	const beforeStart = stub.events.get("before_agent_start")![0]!;
+	await beforeStart({ type: "before_agent_start", prompt: "finish the durable objective", systemPrompt: "" } as never, ctx as never);
+	await stub.events.get("agent_settled")![0]!({ type: "agent_settled" } as never, ctx as never);
+	const toolEnd = stub.events.get("tool_execution_end")![0]!;
+	await toolEnd({
+		type: "tool_execution_end",
+		toolCallId: "delegate-pending",
+		toolName: "workbench_delegate_worker",
+		result: { details: { review_status: "PENDING_REVIEW", changed_paths: ["src/pending.ts"] } },
+		isError: false,
+	} as never, ctx as never);
+	await toolEnd({
+		type: "tool_execution_end",
+		toolCallId: "delegate-reviewed",
+		toolName: "workbench_delegate_worker",
+		result: { details: { review_status: "REVIEWED", changed_paths: ["src/reviewed.ts", "../escape.ts", "/absolute.ts"] } },
+		isError: false,
+	} as never, ctx as never);
+	await stub.events.get("session_before_compact")![0]!({
+		type: "session_before_compact", preparation: {}, branchEntries: [], reason: "manual", willRetry: false,
+		signal: new AbortController().signal,
+	} as never, ctx as never);
+	const persisted = [...stub.appendEntryCalls].reverse().find((call) => call.customType === COMPACT_STATE_ENTRY_TYPE)?.data as CompactState;
+	assert.equal(persisted.objective, "finish the durable objective");
+	assert.equal(persisted.nextStep, 'continue "finish the durable objective"');
+	assert.deepEqual(persisted.modifiedFiles, ["src/reviewed.ts"]);
+	assert.doesNotMatch(stub.messages.at(-1)?.content ?? "", /pending\.ts|escape\.ts|absolute\.ts/);
+});
+
+test("native overflow completion suppresses manual fallback and returns its note on the immediate retry", async () => {
+	const stub = makeStub();
+	workbenchRuntime(stub);
+	let manualCompactCalls = 0;
+	const ctx = fakeCtx([], {
+		compact: () => { manualCompactCalls += 1; },
+	});
+	await stub.events.get("before_agent_start")![0]!({ type: "before_agent_start", prompt: "preserve overflow objective", systemPrompt: "" } as never, ctx as never);
+	await stub.events.get("agent_end")![0]!({
+		type: "agent_end",
+		messages: [{ role: "assistant", stopReason: "error", errorMessage: "maximum context length is 128,000 tokens" }],
+	} as never, ctx as never);
+	await stub.events.get("session_before_compact")![0]!({
+		type: "session_before_compact", preparation: {}, branchEntries: [], reason: "overflow", willRetry: true,
+		signal: new AbortController().signal,
+	} as never, ctx as never);
+	await stub.events.get("session_compact")![0]!({
+		type: "session_compact", compactionEntry: {}, fromExtension: false, reason: "overflow", willRetry: true,
+	} as never, ctx as never);
+	await stub.events.get("agent_settled")![0]!({ type: "agent_settled" } as never, ctx as never);
+	assert.equal(manualCompactCalls, 0, "native success clears the pending fallback before agent_settled");
+	const retry = await stub.events.get("before_agent_start")![0]!({
+		type: "before_agent_start", prompt: "preserve overflow objective", systemPrompt: "",
+	} as never, ctx as never) as { message?: { display?: boolean; content?: string } } | undefined;
+	assert.equal(retry?.message?.display, false);
+	assert.match(retry?.message?.content ?? "", /preserve overflow objective/);
+});
+
+test("a started but unsuccessful native overflow compact hands off without a second automatic compact", async () => {
+	const stub = makeStub();
+	workbenchRuntime(stub);
+	let manualCompactCalls = 0;
+	const ctx = fakeCtx([], {
+		hasUI: true,
+		compact: () => { manualCompactCalls += 1; },
+		ui: {
+			setStatus: () => {}, setWidget: () => {}, confirm: async () => false,
+			notify: (message: string, level?: string) => stub.notifications.push({ message, level }),
+		} as unknown as ExtensionContext["ui"],
+	});
+	await stub.events.get("before_agent_start")![0]!({ type: "before_agent_start", prompt: "native failure objective", systemPrompt: "" } as never, ctx as never);
+	await stub.events.get("agent_end")![0]!({
+		type: "agent_end",
+		messages: [{ role: "assistant", stopReason: "error", errorMessage: "maximum context length is 128,000 tokens" }],
+	} as never, ctx as never);
+	await stub.events.get("session_before_compact")![0]!({
+		type: "session_before_compact", preparation: {}, branchEntries: [], reason: "overflow", willRetry: true,
+		signal: new AbortController().signal,
+	} as never, ctx as never);
+	// No session_compact event: Pi started its native attempt, but it did not
+	// complete. The workbench must hand off instead of making attempt number two.
+	await stub.events.get("agent_settled")![0]!({ type: "agent_settled" } as never, ctx as never);
+	assert.equal(manualCompactCalls, 0);
+	assert.match(stub.notifications.at(-1)?.message ?? "", /no second automatic compact/i);
+	assert.match(stub.notifications.at(-1)?.message ?? "", /q-milestone-handoff/);
+	const persisted = [...stub.appendEntryCalls].reverse().find((call) => call.customType === COMPACT_STATE_ENTRY_TYPE)?.data as CompactState;
+	assert.equal(persisted.objective, "native failure objective");
+	assert.match(persisted.nextStep ?? "", /q-milestone-handoff/);
+});
+
+test("unrecovered explicit overflow schedules one idle compact and one hidden followUp", async () => {
+	const stub = makeStub();
+	workbenchRuntime(stub);
+	const compactOptions: Array<NonNullable<Parameters<ExtensionContext["compact"]>[0]>> = [];
+	const ctx = fakeCtx([], {
+		hasUI: true,
+		compact: (options) => { compactOptions.push(options ?? {}); },
+		ui: {
+			setStatus: () => {}, setWidget: () => {}, confirm: async () => false,
+			notify: (message: string, level?: string) => stub.notifications.push({ message, level }),
+		} as unknown as ExtensionContext["ui"],
+	});
+	await stub.events.get("before_agent_start")![0]!({ type: "before_agent_start", prompt: "fallback objective", systemPrompt: "" } as never, ctx as never);
+	const overflowEvent = {
+		type: "agent_end",
+		messages: [{ role: "assistant", stopReason: "error", errorMessage: "maximum context length is 128,000 tokens" }],
+	};
+	await stub.events.get("agent_end")![0]!(overflowEvent as never, ctx as never);
+	assert.equal(compactOptions.length, 0, "agent_end never waits on or starts compact while Pi is active");
+	await stub.events.get("agent_settled")![0]!({ type: "agent_settled" } as never, ctx as never);
+	await stub.events.get("agent_settled")![0]!({ type: "agent_settled" } as never, ctx as never);
+	assert.equal(compactOptions.length, 1, "the idle fallback is one-shot");
+	await stub.events.get("session_before_compact")![0]!({
+		type: "session_before_compact", preparation: {}, branchEntries: [], reason: "manual", willRetry: false,
+		signal: new AbortController().signal,
+	} as never, ctx as never);
+	await stub.events.get("session_compact")![0]!({
+		type: "session_compact", compactionEntry: {}, fromExtension: false, reason: "manual", willRetry: false,
+	} as never, ctx as never);
+	compactOptions[0]!.onComplete?.({} as never);
+	assert.ok(stub.messages.some((message) => (
+		message.display === false
+		&& (message.options as { deliverAs?: unknown; triggerTurn?: unknown } | undefined)?.deliverAs === "followUp"
+		&& (message.options as { deliverAs?: unknown; triggerTurn?: unknown } | undefined)?.triggerTurn === true
+	)), "successful fallback queues exactly one hidden followUp continuation");
+	await stub.events.get("agent_end")![0]!(overflowEvent as never, ctx as never);
+	assert.match(stub.notifications.at(-1)?.message ?? "", /q-milestone-handoff/);
+});
+
+test("failed idle overflow fallback preserves state, gives handoff, and never retries again", async () => {
+	const stub = makeStub();
+	workbenchRuntime(stub);
+	const options: Array<NonNullable<Parameters<ExtensionContext["compact"]>[0]>> = [];
+	const ctx = fakeCtx([], {
+		hasUI: true,
+		compact: (value) => { options.push(value ?? {}); },
+		ui: {
+			setStatus: () => {}, setWidget: () => {}, confirm: async () => false,
+			notify: (message: string, level?: string) => stub.notifications.push({ message, level }),
+		} as unknown as ExtensionContext["ui"],
+	});
+	await stub.events.get("before_agent_start")![0]!({ type: "before_agent_start", prompt: "preserve failed fallback", systemPrompt: "" } as never, ctx as never);
+	const overflow = { type: "agent_end", messages: [{ role: "assistant", stopReason: "error", errorMessage: "maximum context length is 128,000 tokens" }] };
+	await stub.events.get("agent_end")![0]!(overflow as never, ctx as never);
+	await stub.events.get("agent_settled")![0]!({ type: "agent_settled" } as never, ctx as never);
+	assert.equal(options.length, 1);
+	options[0]!.onError?.(new Error("provider detail must not be rendered"));
+	assert.match(stub.notifications.at(-1)?.message ?? "", /q-milestone-handoff/);
+	assert.doesNotMatch(stub.notifications.at(-1)?.message ?? "", /provider detail/);
+	const persisted = [...stub.appendEntryCalls].reverse().find((call) => call.customType === COMPACT_STATE_ENTRY_TYPE)?.data as CompactState;
+	assert.equal(persisted.objective, "preserve failed fallback");
+	assert.match(persisted.nextStep ?? "", /q-milestone-handoff/);
+	await stub.events.get("agent_end")![0]!(overflow as never, ctx as never);
+	await stub.events.get("agent_settled")![0]!({ type: "agent_settled" } as never, ctx as never);
+	assert.equal(options.length, 1, "failure and the second overflow cannot schedule another compact");
+});
+
+test("installed Pi 0.84.2 completes native post-run compaction before agent_settled", async () => {
+	const source = await readFile(join(process.cwd(), "node_modules/@earendil-works/pi-coding-agent/dist/core/agent-session.js"), "utf8");
+	const runStart = source.indexOf("async _runAgentPrompt(messages)");
+	const runEnd = source.indexOf("async _handlePostAgentRun()", runStart);
+	const runBody = source.slice(runStart, runEnd);
+	assert.match(runBody, /while \(await this\._handlePostAgentRun\(\)\)[\s\S]*finally[\s\S]*await this\._emitAgentSettled\(\)/);
+	const postStart = runEnd;
+	const postEnd = source.indexOf("async prompt(text, options)", postStart);
+	const postBody = source.slice(postStart, postEnd);
+	assert.match(postBody, /await this\._checkCompaction\(msg\)/);
+	assert.ok(postBody.indexOf("await this._checkCompaction(msg)") < postBody.indexOf("return this.agent.hasQueuedMessages()"));
 });
 
 function assistantUsage(totalTokens: number, overrides: Record<string, unknown> = {}): Record<string, unknown> {
