@@ -46,7 +46,7 @@ const ASSERTED_START_RE = /\b(?:started|launched|created|called)\b|已(?:按要�
 const PLANNED_EXECUTION_RE = /\b(?:will|can|could|should|may|might|plan(?:ned)?\s+to|need\s+to|ready\s+to|going\s+to)\b.{0,32}\b(?:start|launch|execute|create|call)\b|(?:下一步|计划|准备|打算|可以|需要).{0,24}(?:启动|执行|创建|调用|改用)/iu;
 const DISTRIBUTIVE_CLAIM_RE = /\b(?:all|both|each|these|those)\b|(?:两|三|四|五|六|七|八|九|十|多)次|(?:全部|都|分别|上述|这些)/iu;
 const INLINE_CODE_RE = /`([^`\r\n]*)`/gu;
-const RUN_ONLY_LABEL_RE = /\b(?:run|recipe|tests?)\b|(?:完整\s*)?G1|测试|验证/iu;
+const RUN_ONLY_LABEL_RE = /\b(?:run|recipe|tests?|pytest|mypy|compileall|loader|targeted|focused|audit|checks?|diff|gate(?:[-_ ]?profile)?|typecheck|lint)\b|(?:完整\s*)?G1|测试|验证|审计/iu;
 const DELEGATION_LABEL_RE = /\b(?:delegation(?:s)?|worker(?:s)?|latest|authority)\b|delegation[_ ]?id|委派|工作线程/iu;
 const MAX_CLAIM_IDS = 32;
 
@@ -163,16 +163,15 @@ function inspectWorkbenchRunClaims(text: string): {
 } {
 	const ids: string[] = [];
 	const expected: Record<string, "SUCCESS" | "FAILURE" | undefined> = {};
-	let fence: "`" | "~" | undefined;
 	for (const rawLine of text.split(/\r?\n/u)) {
 		const trimmed = rawLine.trim();
 		const marker = trimmed.match(/^(`{3,}|~{3,})/u)?.[1]?.[0] as "`" | "~" | undefined;
-		if (marker !== undefined) {
-			if (fence === undefined) fence = marker;
-			else if (fence === marker) fence = undefined;
-			continue;
-		}
-		if (fence !== undefined || /^\s*>/u.test(rawLine) || /^["'“‘].*["'”’]$/u.test(trimmed)) continue;
+		if (marker !== undefined) continue;
+		// A fenced block can be the assistant's authoritative handoff/evidence
+		// format. Explicitly labelled run ids inside it must still bind to a
+		// committed run. Delegation transcript claims remain excluded by
+		// claimClauses(), and blockquotes/fully quoted lines remain quotations.
+		if (/^\s*>/u.test(rawLine) || /^["'“‘].*["'”’]$/u.test(trimmed)) continue;
 		const visible = rawLine.replace(INLINE_CODE_RE, (_whole, inline: string) => inline);
 		for (const segment of visible.split(/[.;；。!?！？]+/u)) {
 			if (!RUN_ONLY_LABEL_RE.test(segment) || DELEGATION_LABEL_RE.test(segment)) continue;
@@ -271,7 +270,7 @@ function strictLegacyStatus(ledger: DelegationLedger, id: string): DelegationCla
 		: "LEGACY_FAILED";
 }
 
-/** Inspect only affirmative, unquoted visible clauses; reasoning and quoted logs are never execution evidence. */
+/** Inspect affirmative prose plus explicitly labelled run evidence; quoted delegation logs remain non-authoritative. */
 export function inspectDelegationClaims(message: unknown): DelegationClaimInspection | undefined {
 	const text = assistantText(message);
 	if (text === undefined || text.length === 0) return undefined;

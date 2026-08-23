@@ -116,6 +116,46 @@ test("run-only completion claims require a committed run with the claimed outcom
 	);
 });
 
+test("fenced handoff run evidence requires committed authority for every claimed check", () => {
+	const runIds = [
+		"20260823-112731-wdaz",
+		"20260823-122154-p9qg",
+		"20260823-131537-80lv",
+		"20260823-132136-79z4",
+		"20260823-133228-pwiv",
+		"20260823-140524-ixw2",
+		"20260823-193040-7koy",
+	] as const;
+	const inspection = inspectDelegationClaims(assistant([
+		"### Phase B Exit evidence",
+		"```text",
+		`mypy PASS: ${runIds[0]}`,
+		`targeted 2326 passed: ${runIds[1]}`,
+		`compileall PASS: ${runIds[2]}`,
+		`loader supporting PASS: ${runIds[3]}`,
+		`git-diff-check PASS: ${runIds[4]}`,
+		`post-Map diff PASS: ${runIds[5]}`,
+		`gate-profile audit PASS: ${runIds[6]}`,
+		"```",
+	].join("\n")));
+	assert.ok(inspection);
+	assert.deepEqual(inspection.ids, [], "fenced run ids are not delegation ids");
+	assert.deepEqual(inspection.runIds, [...runIds]);
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(), [], []),
+		{ ok: false, code: "missing_run_authority" },
+	);
+	assert.deepEqual(
+		validateDelegationClaims(
+			inspection,
+			evidence(),
+			[],
+			runIds.map((id) => ({ id, outcome: "SUCCESS" as const })),
+		),
+		{ ok: true },
+	);
+});
+
 test("the earlier fabricated delegation_id report is also an execution claim", () => {
 	const inspection = inspectDelegationClaims(assistant([
 		"继续推进时发现新的 delegation 没有形成实际 transaction。",
