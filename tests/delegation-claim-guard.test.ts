@@ -483,6 +483,27 @@ test("generic new execution and success claims require durable same-turn authori
 	);
 });
 
+test("a claimed current-turn delegate attempt requires an actual tool call", () => {
+	const inspection = inspectDelegationClaims(assistant([
+		"已再次调用，但 worker 请求仍被静默丢弃：",
+		"- 未生成 delegation ID",
+		"- 项目文件未被 worker 修改",
+	].join("\n")));
+	assert.ok(inspection);
+	assert.equal(inspection.workerAttemptClaim, true);
+	assert.equal(inspection.workerStartClaim, false);
+	assert.equal(inspection.recentClaim, true);
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(), []),
+		{ ok: false, code: "missing_attempt_authority" },
+	);
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(1), []),
+		{ ok: true },
+		"a real failed tool call may be reported as an attempt without claiming a worker start",
+	);
+});
+
 test("retrospective worker success binds to strict latest authority without a new same-run call", () => {
 	const inspection = inspectDelegationClaims(assistant(
 		"Read-only diagnosis: the prior delegation worker completed successfully; the review now reports review_conflict.",
@@ -702,6 +723,22 @@ test("a failed delegate tool attempt cannot be reported as a started worker", as
 	});
 	const replacement = (results.find((value) => value !== undefined) as { message: Record<string, unknown> }).message;
 	assert.ok(finalText(replacement).includes("reason: missing_started_authority"));
+});
+
+test("controller rejects a silent-drop diagnosis when no delegate tool call occurred", async () => {
+	const state = stub();
+	register(state, () => undefined);
+	await emit(state, "agent_start", { type: "agent_start" });
+	const results = await emit(state, "message_end", {
+		type: "message_end",
+		message: assistant([
+			"已再次调用，但 worker 请求仍被静默丢弃：",
+			"- 未生成 delegation ID",
+			"- latest 仍是旧的 STALE",
+		].join("\n")),
+	});
+	const replacement = (results.find((value) => value !== undefined) as { message: Record<string, unknown> }).message;
+	assert.ok(finalText(replacement).includes("reason: missing_attempt_authority"));
 });
 
 test("legacy fallback accepts only internally consistent schema-v1 authority", async () => {

@@ -53,6 +53,17 @@ workbench_delegate_worker   # normal bounded implementation path
 /q-gate base               # final evidence pass when risk requires it
 ```
 
+After updating or reinstalling the package, run `/reload` before starting a
+new conversation. `/new` resets conversation history but does not reload the
+workbench extension code already held by the Pi process.
+
+Execution summaries are checked against machine evidence. In particular, the
+assistant may report a current-turn worker attempt only when that turn actually
+called `workbench_delegate_worker`; delegation status and completion claims
+must match durable workbench authority. If the claim guard rejects a summary,
+run `workbench_delegation_status`, follow its persisted next action, and avoid
+treating the rejected prose as evidence.
+
 ## The product workflow
 
 | Mode | Use it for | Write behavior |

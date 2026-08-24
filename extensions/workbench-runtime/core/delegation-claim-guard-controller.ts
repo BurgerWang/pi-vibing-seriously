@@ -40,9 +40,10 @@ const SUCCESS_WORD_RE = /\b(?:SUCCESS(?:FUL(?:LY)?)?|SUCCEEDED|REVIEWED|FINISHED
 const NEGATED_WORD_RE = /\b(?:(?:did|does|is|was|were|has|have)\s+not|didn't|doesn't|isn't|wasn't|weren't|hasn't|haven't|never)\s+(?:start|launch|execute|create|complete|find|exist|succeed|review|finish|fail|started|launched|executed|created|completed|found|successful|reviewed|finished|failed)\b|\bno\s+delegation\b|不存在|不是|并非|未创建|未启动|未执行|没有(?:启动|执行|创建|形成)|虚构/i;
 const NEGATED_CLAIM_SCAN_RE = /\b(?:(?:did|does|is|was|were|has|have)\s+not|didn't|doesn't|isn't|wasn't|weren't|hasn't|haven't|never|not)\s+(?:start|launch|execute|create|complete|find|exist|succeed|review|finish|fail|started|launched|executed|created|completed|found|successful|reviewed|finished|failed)\b|\bno\s+delegation\b|不存在|不是|并非|未创建|未启动|未执行|未完成|没有(?:启动|执行|创建|形成|完成)|并未(?:启动|执行|创建|完成)|虚构/gi;
 const BLOCKED_EXECUTION_SCAN_RE = /(?:\b(?:starting|launching|creating)\b.{0,120}\bdelegation\b.{0,120}\bis blocked\b|(?:启动|开始|创建).{0,80}(?:委派|worker|工作线程).{0,80}(?:被阻止|被拦截|已阻止|无法启动))/gis;
-const RECENT_WORD_RE = /\b(?:new|fresh|this\s+(?:turn|attempt|delegation)|just)\b|本次|刚刚|刚才|全新(?:的)?|新(?:的)?\s*(?:delegation|worker|工作线程|委派)|已按要求/i;
+const RECENT_WORD_RE = /\b(?:new|fresh|this\s+(?:turn|attempt|delegation)|just)\b|本次|刚刚|刚才|再次|重新|全新(?:的)?|新(?:的)?\s*(?:delegation|worker|工作线程|委派)|已按要求/i;
 const START_WORD_RE = /\b(?:start(?:ed)?|launch(?:ed)?|creat(?:e|ed)|call(?:ed)?)\b|启动|创建|调用|改用/i;
-const ASSERTED_START_RE = /\b(?:started|launched|created|called)\b|已(?:按要求)?(?:启动|创建|调用|改用)|(?:启动|创建|调用|改用)了/iu;
+const ASSERTED_START_RE = /\b(?:started|launched|created)\b|已(?:按要求)?(?:启动|创建|改用)|(?:启动|创建|改用)了/iu;
+const ASSERTED_ATTEMPT_RE = /\b(?:attempted|called|retried)\b|已(?:按要求)?(?:再次|重新)?(?:调用|尝试)|(?:再次|重新)?(?:调用|尝试)了/iu;
 const PLANNED_EXECUTION_RE = /\b(?:will|can|could|should|may|might|plan(?:ned)?\s+to|need\s+to|ready\s+to|going\s+to)\b.{0,32}\b(?:start|launch|execute|create|call)\b|(?:下一步|计划|准备|打算|可以|需要).{0,24}(?:启动|执行|创建|调用|改用)/iu;
 const DISTRIBUTIVE_CLAIM_RE = /\b(?:all|both|each|these|those)\b|(?:两|三|四|五|六|七|八|九|十|多)次|(?:全部|都|分别|上述|这些)/iu;
 const INLINE_CODE_RE = /`([^`\r\n]*)`/gu;
@@ -82,6 +83,7 @@ export interface DelegationClaimInspection {
 	readonly expectedStatuses: Readonly<Record<string, readonly DelegationClaimExpectedStatus[]>>;
 	readonly sameRunStartIds: readonly string[];
 	readonly executionClaim: boolean;
+	readonly workerAttemptClaim: boolean;
 	readonly workerStartClaim: boolean;
 	readonly successClaim: boolean;
 	readonly recentClaim: boolean;
@@ -100,7 +102,7 @@ export interface DelegationClaimTurnEvidence {
 
 export interface DelegationClaimValidation {
 	readonly ok: boolean;
-	readonly code?: "claim_overflow" | "ambiguous_status_binding" | "missing_authority" | "status_mismatch" | "missing_started_authority" | "missing_success_result" | "missing_run_authority" | "run_status_mismatch";
+	readonly code?: "claim_overflow" | "ambiguous_status_binding" | "missing_authority" | "status_mismatch" | "missing_attempt_authority" | "missing_started_authority" | "missing_success_result" | "missing_run_authority" | "run_status_mismatch";
 }
 
 function assistantText(message: unknown): string | undefined {
@@ -342,6 +344,7 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 		readonly distributive: boolean;
 	}> = [];
 	let executionClaim = false;
+	let workerAttemptClaim = false;
 	let workerStartClaim = false;
 	let successClaim = false;
 	let recentClaim = false;
@@ -364,11 +367,13 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 		const clauseExecution = hasDelegationSubject && !plannedExecution && EXECUTION_WORD_RE.test(affirmativeClause);
 		const clauseSuccess = hasDelegationSubject && !plannedExecution
 			&& (SUCCESS_WORD_RE.test(affirmativeClause) || REVIEW_PASS_FINAL_RE.test(affirmativeClause));
+		const clauseAttempt = clauseExecution && ASSERTED_ATTEMPT_RE.test(affirmativeClause);
 		const clauseStart = clauseExecution && ASSERTED_START_RE.test(affirmativeClause);
-		const clauseRecent = (clauseStart || clauseSuccess)
+		const clauseRecent = (clauseAttempt || clauseStart || clauseSuccess)
 			&& RECENT_WORD_RE.test(affirmativeClause)
-			&& (START_WORD_RE.test(affirmativeClause) || clauseSuccess);
+			&& (START_WORD_RE.test(affirmativeClause) || clauseAttempt || clauseSuccess);
 		executionClaim ||= clauseExecution;
+		workerAttemptClaim ||= clauseAttempt;
 		workerStartClaim ||= clauseStart;
 		successClaim ||= clauseSuccess;
 		recentClaim ||= clauseRecent;
@@ -419,6 +424,7 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 		expectedStatuses: Object.fromEntries(ids.map((id) => [id, expectedStatuses.get(id) ?? []])),
 		sameRunStartIds: boundSameRunStartIds,
 		executionClaim,
+		workerAttemptClaim,
 		workerStartClaim,
 		successClaim,
 		recentClaim,
@@ -499,6 +505,9 @@ export function validateDelegationClaims(
 		}
 	}
 	const observedDurableSuccess = freshStatusObservationProvesSuccess(inspection, turn, authorityById);
+	if (inspection.recentClaim && inspection.workerAttemptClaim && turn.attemptedCalls === 0) {
+		return { ok: false, code: "missing_attempt_authority" };
+	}
 	if (inspection.recentClaim && inspection.workerStartClaim) {
 		const started = new Set(turn.startedIds);
 		if (started.size === 0) return { ok: false, code: "missing_started_authority" };
