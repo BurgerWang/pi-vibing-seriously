@@ -618,6 +618,11 @@ function isStringArray(value: unknown): value is string[] {
 	return Array.isArray(value) && value.length <= 500 && value.every((item) => typeof item === "string" && item.length <= 200);
 }
 
+function isBoundedStrings(value: unknown, maxItems: number, maxChars: number): value is string[] {
+	return Array.isArray(value) && value.length <= maxItems
+		&& value.every((item) => typeof item === "string" && item.length <= maxChars);
+}
+
 /** Deterministic sorted-set identity of a string array (order-insensitive, duplicate-insensitive). */
 function sortedSetIdentity(values: readonly string[]): string {
 	return [...new Set(values)].sort().join("\u0000");
@@ -654,26 +659,23 @@ function isOptionalProfile(value: unknown): value is string | undefined {
  *     trimmedManualEvidence at capture time. Raw notes are hashed by the
  *     caller and never rendered.
  */
-export async function readPersistedGateRunFacts(
-	projectRoot: string,
+export function validatePersistedGateRunRecords(
 	runId: string,
-	manifest: Pick<RunRecord, "run_id" | "recipe" | "profile" | "mode">,
-	hooks?: { gates?: BoundedFileIoHooks; evidence?: BoundedFileIoHooks },
-): Promise<PersistedGateRunFacts | null> {
-	const dir = join(runsDir(projectRoot), runId);
+	manifest: RunRecord,
+	gatesValue: unknown,
+	evidenceValue: unknown,
+): PersistedGateRunFacts | null {
 	try {
-		const gatesRead = await readJsonFileBounded(join(dir, "gates.json"), GATE_AUTHORITY_RECORD_MAX_BYTES, hooks?.gates);
-		if (!gatesRead.ok) return null;
-		const evidenceRead = await readJsonFileBounded(join(dir, "evidence.json"), GATE_AUTHORITY_RECORD_MAX_BYTES, hooks?.evidence);
-		if (!evidenceRead.ok) return null;
-		const gatesRaw = gatesRead.value.value;
-		const evidenceRaw = evidenceRead.value.value;
+		const gatesRaw = gatesValue;
+		const evidenceRaw = evidenceValue;
 		if (!isRecord(gatesRaw) || !isRecord(evidenceRaw)) return null;
 		if (gatesRaw.schema_version !== GATE_SCHEMA_VERSION || gatesRaw.run_id !== runId) return null;
 		// Strict evidence schema identity: a missing or foreign
 		// schema_version on the evidence artifact is never accepted.
 		if (evidenceRaw.schema_version !== GATE_SCHEMA_VERSION || evidenceRaw.run_id !== runId) return null;
 		if (!isStringArray(gatesRaw.requested) || !isStringArray(evidenceRaw.requested)) return null;
+		if (gatesRaw.requested.length === 0 || new Set(gatesRaw.requested).size !== gatesRaw.requested.length) return null;
+		if (evidenceRaw.requested.length === 0 || new Set(evidenceRaw.requested).size !== evidenceRaw.requested.length) return null;
 		// Contradictory requested sets between the two persisted artifacts
 		// cannot be faithfully reconstructed.
 		if (sortedSetIdentity(gatesRaw.requested) !== sortedSetIdentity(evidenceRaw.requested)) return null;
@@ -683,39 +685,110 @@ export async function readPersistedGateRunFacts(
 		if (!isOptionalProfile(gatesRaw.profile) || !isOptionalProfile(evidenceRaw.profile)) return null;
 		if ((gatesRaw.profile ?? undefined) !== (evidenceRaw.profile ?? undefined)) return null;
 		if (manifest.profile !== (gatesRaw.profile ?? undefined)) return null;
-		if (typeof gatesRaw.mode !== "string" || typeof evidenceRaw.mode !== "string") return null;
+		if (typeof gatesRaw.mode !== "string" || gatesRaw.mode.length === 0 || gatesRaw.mode.length > 200
+			|| typeof evidenceRaw.mode !== "string" || evidenceRaw.mode.length === 0 || evidenceRaw.mode.length > 200) return null;
 		if (gatesRaw.mode !== evidenceRaw.mode || manifest.mode !== gatesRaw.mode) return null;
 		// Manifest identity: the run must be a gate run of the same id.
 		if (manifest.recipe !== "gate" || manifest.run_id !== runId) return null;
-		if (!Array.isArray(gatesRaw.gates)) return null;
+		if (!Array.isArray(gatesRaw.gates) || gatesRaw.gates.length === 0 || gatesRaw.gates.length > 500) return null;
 
 		const gates: PersistedGateRunFacts["gates"] = [];
+		const gateIds = new Set<string>();
 		const knownCheckIds = new Set<string>();
+		const checkRecords = new Map<string, Record<string, unknown>>();
+		const authoritativeGates: GateRunEntry[] = [];
+		const priorGateFacts = new Map<string, { status: GateStatus; blocking: boolean }>();
 		for (const rawGate of gatesRaw.gates) {
 			if (!isRecord(rawGate) || typeof rawGate.id !== "string" || rawGate.id.length === 0 || rawGate.id.length > 200) return null;
+			if (gateIds.has(rawGate.id)) return null;
+			gateIds.add(rawGate.id);
+			if (typeof rawGate.title !== "string" || typeof rawGate.description !== "string"
+				|| typeof rawGate.status !== "string" || !GATE_STATUSES.includes(rawGate.status as GateStatus)
+				|| typeof rawGate.required !== "boolean" || typeof rawGate.blocking !== "boolean"
+				|| !isStringArray(rawGate.prerequisites)
+				|| !(rawGate.failure_reason === null || typeof rawGate.failure_reason === "string")
+				|| !(rawGate.blocked_reason === null || typeof rawGate.blocked_reason === "string")
+				|| !isBoundedStrings(rawGate.warnings, 500, 4_096)
+				|| !isBoundedStrings(rawGate.evidence_paths, 10_000, 4_096)
+				|| !isBoundedStrings(rawGate.declared_evidence, 500, 4_096)
+				|| typeof rawGate.started_at !== "string" || !Number.isFinite(Date.parse(rawGate.started_at))
+				|| typeof rawGate.finished_at !== "string" || !Number.isFinite(Date.parse(rawGate.finished_at))
+				|| typeof rawGate.duration_ms !== "number" || !Number.isSafeInteger(rawGate.duration_ms) || rawGate.duration_ms < 0
+			) return null;
+			if (rawGate.duration_ms !== Math.max(0, Date.parse(rawGate.finished_at) - Date.parse(rawGate.started_at))) return null;
+			const prerequisiteIds = rawGate.prerequisites as string[];
+			if (new Set(prerequisiteIds).size !== prerequisiteIds.length || prerequisiteIds.some((id) =>
+				typeof id !== "string" || id.length === 0 || id.length > 200 || id === rawGate.id)) return null;
 			const prerequisiteStatus: Record<string, GateStatus> = {};
 			const rawPrereq = rawGate.prerequisite_status;
+			if (!isRecord(rawPrereq)) return null;
+			const expectedPrerequisiteIds: string[] = [];
+			let firstBlockingPrerequisite: { id: string; status: GateStatus } | undefined;
+			for (const prerequisiteId of prerequisiteIds) {
+				const prior = priorGateFacts.get(prerequisiteId);
+				if (prior === undefined) return null;
+				expectedPrerequisiteIds.push(prerequisiteId);
+				if (prior.status !== "PASS" && prior.blocking) {
+					firstBlockingPrerequisite = { id: prerequisiteId, status: prior.status };
+					break;
+				}
+			}
+			const persistedPrerequisiteIds = Object.keys(rawPrereq);
+			if (persistedPrerequisiteIds.length !== expectedPrerequisiteIds.length ||
+				persistedPrerequisiteIds.some((id, index) => id !== expectedPrerequisiteIds[index])) return null;
 			if (rawPrereq !== undefined && rawPrereq !== null) {
-				if (!isRecord(rawPrereq)) return null;
 				for (const [prereqId, facts] of Object.entries(rawPrereq)) {
 					if (!isRecord(facts)) return null;
 					const status = facts.status;
 					if (typeof status !== "string" || !GATE_STATUSES.includes(status as GateStatus)) return null;
+					const prior = priorGateFacts.get(prereqId);
+					if (facts.source !== "this-run" || prior === undefined || prior.status !== status) return null;
 					prerequisiteStatus[prereqId] = status as GateStatus;
 				}
 			}
 			// Gate/check shapes: every gate entry carries its checks array;
 			// each check must be a record with a bounded non-empty id.
 			const rawChecks = rawGate.checks;
-			if (!Array.isArray(rawChecks)) return null;
+			if (!Array.isArray(rawChecks) || rawChecks.length > 500) return null;
+			const parsedChecks: CheckRunEntry[] = [];
 			for (const rawCheck of rawChecks) {
 				if (!isRecord(rawCheck)) return null;
 				const checkId = rawCheck.check_id;
 				if (typeof checkId !== "string" || checkId.length === 0 || checkId.length > 200) return null;
+				if (rawCheck.gate_id !== rawGate.id
+					|| typeof rawCheck.status !== "string" || !GATE_STATUSES.includes(rawCheck.status as GateStatus)
+					|| typeof rawCheck.kind !== "string" || rawCheck.kind.length === 0 || rawCheck.kind.length > 200
+					|| typeof rawCheck.required !== "boolean" || typeof rawCheck.blocking !== "boolean"
+					|| !Array.isArray(rawCheck.evidence)
+					|| !(rawCheck.failure_reason === null || typeof rawCheck.failure_reason === "string")
+					|| !(rawCheck.blocked_reason === null || typeof rawCheck.blocked_reason === "string")
+					|| !isBoundedStrings(rawCheck.warnings, 500, 4_096)
+					|| typeof rawCheck.started_at !== "string" || !Number.isFinite(Date.parse(rawCheck.started_at))
+					|| typeof rawCheck.finished_at !== "string" || !Number.isFinite(Date.parse(rawCheck.finished_at))
+					|| typeof rawCheck.duration_ms !== "number" || !Number.isSafeInteger(rawCheck.duration_ms) || rawCheck.duration_ms < 0
+				) return null;
+				if (rawCheck.duration_ms !== Math.max(0, Date.parse(rawCheck.finished_at) - Date.parse(rawCheck.started_at))) return null;
+				if (rawCheck.status === "PASS" && (rawCheck.failure_reason !== null || rawCheck.blocked_reason !== null)) return null;
+				if (rawCheck.status === "FAIL" && (typeof rawCheck.failure_reason !== "string" || rawCheck.failure_reason.length === 0)) return null;
+				if (rawCheck.status === "BLOCKED" && (typeof rawCheck.blocked_reason !== "string" || rawCheck.blocked_reason.length === 0)) return null;
 				knownCheckIds.add(checkId);
+				checkRecords.set(checkId, rawCheck);
+				parsedChecks.push(rawCheck as unknown as CheckRunEntry);
 			}
+			const blockedByPrerequisite = rawChecks.length === 0 && rawGate.status === "BLOCKED";
+			if (blockedByPrerequisite) {
+				if (firstBlockingPrerequisite === undefined || rawGate.failure_reason !== null ||
+					rawGate.blocked_reason !== `prerequisite ${firstBlockingPrerequisite.id} is ${firstBlockingPrerequisite.status} (this-run)`) return null;
+			} else {
+				if (firstBlockingPrerequisite !== undefined) return null;
+				const derived = gateStatusFromChecks(parsedChecks);
+				if (rawGate.status !== derived.status || rawGate.failure_reason !== derived.failure_reason || rawGate.blocked_reason !== derived.blocked_reason) return null;
+			}
+			authoritativeGates.push(rawGate as unknown as GateRunEntry);
 			gates.push({ id: rawGate.id, prerequisiteStatus });
+			priorGateFacts.set(rawGate.id, { status: rawGate.status as GateStatus, blocking: rawGate.blocking });
 		}
+		if (gatesRaw.requested.some((id) => !gateIds.has(id))) return null;
 
 		// Evidence check shapes: the checks map must be a record whose keys
 		// EXACTLY equal the gate entries' check-id set — extra (foreign) or
@@ -734,6 +807,7 @@ export async function readPersistedGateRunFacts(
 			const checkId = rawCheck.check_id;
 			if (typeof checkId !== "string" || checkId.length === 0 || checkId.length > 200 || checkId !== key) return null;
 			if (!knownCheckIds.has(checkId)) return null;
+			if (!isDeepStrictEqual(rawCheck, checkRecords.get(checkId))) return null;
 			const evidence = rawCheck.evidence;
 			if (!Array.isArray(evidence)) return null;
 			for (const entry of evidence) {
@@ -751,21 +825,53 @@ export async function readPersistedGateRunFacts(
 					if (entry.check_id !== undefined && entry.check_id !== checkId) return null;
 					if (typeof entry.recipe !== "string" || entry.recipe.length === 0 || entry.recipe.length > 200) return null;
 					if (typeof entry.run_id !== "string" || entry.run_id.length === 0 || entry.run_id.length > 200) return null;
-					if (typeof entry.authority_digest !== "string" || !/^[0-9a-f]{64}$/.test(entry.authority_digest)) return null;
-					if (entry.authority_freshness !== "current" && entry.authority_freshness !== "immutable-snapshot") return null;
-					artifactSources.push({
-						checkId,
-						recipe: entry.recipe,
-						runId: entry.run_id,
-						authorityDigest: entry.authority_digest,
-						freshness: entry.authority_freshness,
-					});
+					const completeAuthority = typeof entry.authority_digest === "string" && /^[0-9a-f]{64}$/.test(entry.authority_digest)
+						&& (entry.authority_freshness === "current" || entry.authority_freshness === "immutable-snapshot");
+					// A failed artifact check may truthfully retain only diagnostic
+					// source identity.  PASS is authority-bearing and therefore must
+					// carry the complete digest/freshness edge.
+					if (!completeAuthority && rawCheck.status === "PASS") return null;
+					if (completeAuthority) {
+						artifactSources.push({
+							checkId,
+							recipe: entry.recipe,
+							runId: entry.run_id,
+							authorityDigest: entry.authority_digest as string,
+							freshness: entry.authority_freshness as "current" | "immutable-snapshot",
+						});
+					}
 				} else if (entry.check_id !== undefined && entry.check_id !== checkId) {
 					return null;
 				}
 			}
 		}
+		let overall: GateStatus = "PASS";
+		const requested = new Set(gatesRaw.requested);
+		for (const gate of authoritativeGates) {
+			if (requested.has(gate.id) || gate.required) overall = worstStatus(overall, gate.status);
+		}
+		const successful = overall === "PASS";
+		if (successful !== (manifest.run_outcome === "SUCCESS")) return null;
+		if (successful !== (manifest.exit_code !== null && manifest.expected_exit_codes.includes(manifest.exit_code))) return null;
 		return { requested: gatesRaw.requested, gates, manualEvidence, artifactSources };
+	} catch {
+		return null;
+	}
+}
+
+export async function readPersistedGateRunFacts(
+	projectRoot: string,
+	runId: string,
+	manifest: RunRecord,
+	hooks?: { gates?: BoundedFileIoHooks; evidence?: BoundedFileIoHooks },
+): Promise<PersistedGateRunFacts | null> {
+	const dir = join(runsDir(projectRoot), runId);
+	try {
+		const gatesRead = await readJsonFileBounded(join(dir, "gates.json"), GATE_AUTHORITY_RECORD_MAX_BYTES, hooks?.gates);
+		if (!gatesRead.ok) return null;
+		const evidenceRead = await readJsonFileBounded(join(dir, "evidence.json"), GATE_AUTHORITY_RECORD_MAX_BYTES, hooks?.evidence);
+		if (!evidenceRead.ok) return null;
+		return validatePersistedGateRunRecords(runId, manifest, gatesRead.value.value, evidenceRead.value.value);
 	} catch {
 		return null;
 	}
@@ -788,6 +894,7 @@ async function readGatesFile(
 	const manifest = await readCommittedManifest(projectRoot, runId);
 	if (!manifest || manifest.recipe !== "gate") return null;
 	if (indexedStartedAt !== undefined && manifest.started_at !== indexedStartedAt) return null;
+	if (!await readPersistedGateRunFacts(projectRoot, runId, manifest, { gates: hooks })) return null;
 	try {
 		const read = await readJsonFileBounded(join(runsDir(projectRoot), runId, "gates.json"), GATE_AUTHORITY_RECORD_MAX_BYTES, hooks);
 		if (!read.ok || !isRecord(read.value.value)) return null;
@@ -799,6 +906,7 @@ async function readGatesFile(
 			if (typeof candidate.status !== "string" || !GATE_STATUSES.includes(candidate.status as GateStatus)) return null;
 			gates.push({ id: candidate.id, status: candidate.status as GateStatus });
 		}
+		if (!await readCommittedManifest(projectRoot, runId)) return null;
 		return { gates };
 	} catch {
 		return null;

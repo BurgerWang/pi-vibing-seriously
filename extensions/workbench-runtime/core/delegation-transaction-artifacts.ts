@@ -84,6 +84,10 @@ import {
 	WORKER_CONTRACT_EXTENDED_REASON_MAX_CHARS,
 	WORKER_CONTRACT_SOFT_MAX_BYTES,
 } from "./worker-contract.ts";
+import {
+	validateSemanticReviewEnvelopeV1,
+	type SemanticReviewEnvelopeV1,
+} from "./semantic-review-envelope.ts";
 
 const ACCEPTANCE_ITEM_MAX_CHARS = 1_000;
 const VERIFICATION_ITEM_MAX_CHARS = 500;
@@ -137,6 +141,7 @@ export type DelegationArtifactErrorCode =
 	| "binding_conflict"
 	| "invalid_facts"
 	| "invalid_report"
+	| "review_envelope_exceeded"
 	| "record_too_large";
 
 export interface DelegationArtifactError {
@@ -158,6 +163,8 @@ export interface BuildDelegationCommittedArtifactsV2Input {
 	worker: LedgerWorkerFacts;
 	reportText: string;
 	secrets?: readonly string[];
+	/** Required for every non-zero implementation generation written by the current runtime. */
+	reviewEnvelope?: SemanticReviewEnvelopeV1;
 }
 
 export interface BuiltDelegationCommittedArtifactsV2 {
@@ -710,6 +717,13 @@ function buildDelegationCommittedArtifactsUnchecked(
 	if (!changedPaths.every((path, index) => index === 0 || byteCompare(changedPaths[index - 1]!, path) < 0)) {
 		return fail("invalid_facts", "delegation worker delta paths are not in canonical byte order");
 	}
+	const pendingReviewCandidate = transaction.task_kind === "implementation" && changedPaths.length > 0 &&
+		transaction.postcondition_reasons.length === 0 && transaction.terminal_outcome.terminal_facts_complete &&
+		transaction.terminal_outcome.scope_complete;
+	if (pendingReviewCandidate &&
+		(!validateSemanticReviewEnvelopeV1(input.reviewEnvelope) || input.reviewEnvelope.path_count !== changedPaths.length)) {
+		return fail("review_envelope_exceeded", "delegation semantic review cannot be closed inside the versioned capacity envelope");
+	}
 	const beforeOrAfterPaths = new Set([
 		...lifecycle.prepared.before_guard.entries.map((entry) => entry.path),
 		...lifecycle.after_guard.entries.map((entry) => entry.path),
@@ -843,6 +857,7 @@ function buildDelegationCommittedArtifactsUnchecked(
 			budget: structuredClone(budget),
 			report_summary: truncateUtf8(report.persisted_text, MAX_AFTER_SUMMARY_CHARS),
 			review_status: "PENDING_REVIEW",
+			...(pendingReviewCandidate ? { review_envelope: structuredClone(input.reviewEnvelope!) } : {}),
 		},
 		"before.json": {
 			schema_version: 2,

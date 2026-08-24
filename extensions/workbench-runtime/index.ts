@@ -60,7 +60,8 @@ import {
 import { join } from "node:path";
 import { runStatusLabel, fitToWidth } from "./core/format.ts";
 import { buildStatusLine } from "./core/status.ts";
-import { buildCostBreakdown, costStatusSegment } from "./core/cost-breakdown.ts";
+import { costStatusSegment } from "./core/cost-breakdown.ts";
+import { RuntimeCostBreakdownCache } from "./core/runtime-cost-breakdown-cache.ts";
 import {
 	advisoryStatusSegment,
 	contextOutputAdvisoryStatusSegment,
@@ -231,37 +232,24 @@ type RuntimeOutputContent = Array<OutputTextContent | OutputImageContent>;
 /** Secret env values scrubbed from every ledger/review artifact. */
 const secrets = collectSecretValues(process.env);
 
-// ------------------------------------------------------------- P5 state
-
-/** Workbench facts carried across compaction and session replacement (P5). */
-let compactState: CompactState = emptyCompactState("DEV");
-/** Recent run-outcome signatures (newest last) for repeated-failure notes. */
-let recentOutcomes: string[] = [];
-/** The last supplement note sent, to avoid duplicates. */
-let lastCompactNote: string | undefined;
-
-function touchCompactState(): void {
-	compactState.updatedAt = new Date().toISOString();
-}
-
-function rememberRunOutcome(toolName: string, details: Record<string, unknown>): void {
-	if (toolName === "workbench_run_gate") {
-		const status = typeof details.status === "string" ? details.status : "UNKNOWN";
-		recentOutcomes.push(`gate:${status}`);
-	} else if (toolName === "workbench_run_recipe") {
-		const recipe = typeof details.recipe === "string" ? details.recipe : "?";
-		recentOutcomes.push(details.ok === true ? `recipe:${recipe}:ok` : `recipe:${recipe}:exit:${String(details.exit_code ?? "?")}`);
-	}
-	recentOutcomes = recentOutcomes.slice(-12);
-	compactState.doNotRetry = collectDoNotRetry(recentOutcomes, MAX_DO_NOT_RETRY);
-}
-
 export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	const streamingControl = streamingControlledApi(runtimePi);
 	const pi = streamingControl.api;
-	compactState = emptyCompactState("DEV");
-	recentOutcomes = [];
-	lastCompactNote = undefined;
+	let compactState: CompactState = emptyCompactState("DEV");
+	let recentOutcomes: string[] = [];
+	let lastCompactNote: string | undefined;
+	const uiRefreshSerial = { status: 0, widget: 0 };
+	const runtimeCostBreakdown = new RuntimeCostBreakdownCache();
+	function touchCompactState(): void { compactState.updatedAt = new Date().toISOString(); }
+	function rememberRunOutcome(toolName: string, details: Record<string, unknown>): void {
+		if (toolName === "workbench_run_gate") recentOutcomes.push(`gate:${typeof details.status === "string" ? details.status : "UNKNOWN"}`);
+		else if (toolName === "workbench_run_recipe") {
+			const recipe = typeof details.recipe === "string" ? details.recipe : "?";
+			recentOutcomes.push(details.ok === true ? `recipe:${recipe}:ok` : `recipe:${recipe}:exit:${String(details.exit_code ?? "?")}`);
+		}
+		recentOutcomes = recentOutcomes.slice(-12);
+		compactState.doNotRetry = collectDoNotRetry(recentOutcomes, MAX_DO_NOT_RETRY);
+	}
 	let mode: WorkbenchMode = "DEV";
 	let writeLease: WriteLease | undefined;
 	/**
@@ -564,13 +552,13 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 
 	// ------------------------------------------------------------------ state
 
-	/** Persist the commander write lease and refresh its compact mirror. */
-	function persistLease(): void {
+	function persistLease(): boolean {
 		refreshCompactP7Facts();
 		try {
 			pi.appendEntry(LEASE_STATE_ENTRY_TYPE, writeLease ? serializeLease(writeLease) : undefined);
+			return true;
 		} catch {
-			// non-interactive context: the in-memory lease is still authoritative
+			return false;
 		}
 	}
 
@@ -686,6 +674,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 
 	/** Refresh the bounded status line from persisted project/session facts. */
 	async function refreshStatus(ctx: ExtensionContext, pendingMessage?: unknown): Promise<void> {
+		const refreshSerial = ++uiRefreshSerial.status;
 		// No status bar exists in print/json modes; skip silently.
 		if (ctx.mode === "print" || ctx.mode === "json") return;
 		let line = statusText(mode);
@@ -693,14 +682,20 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		try {
 			if (ctx.isProjectTrusted()) {
 				const projectRoot = await projectRootFor(ctx);
-				latestRepairStatus = delegationProjectIssueRepairStatusV1(delegationSession.getProjectAuthorityIssue()) ?? await readDelegationRepairStatusV1(projectRoot, delegationSession.getState(), execFn);
+				if (refreshSerial !== uiRefreshSerial.status) return;
+				const repairStatus = delegationProjectIssueRepairStatusV1(delegationSession.getProjectAuthorityIssue()) ?? await readDelegationRepairStatusV1(projectRoot, delegationSession.getState(), execFn);
+				if (refreshSerial !== uiRefreshSerial.status) return;
+				latestRepairStatus = repairStatus;
 				refreshCompactP7Facts();
 				const config = await loadProjectConfig(projectRoot, { trusted: true });
+				if (refreshSerial !== uiRefreshSerial.status) return;
 				advisoryConfig = config.commanderAdvisory;
 				cacheTelemetry.setEnabled(config.cacheTelemetry);
 				cacheTelemetry.setProjectRoot(projectRoot);
 				const gate = await latestGateRunSummary(projectRoot);
+				if (refreshSerial !== uiRefreshSerial.status) return;
 				const runs = await listRuns(projectRoot, 1);
+				if (refreshSerial !== uiRefreshSerial.status) return;
 				const latestRun = runs[0];
 				line = buildStatusLine({
 					mode,
@@ -714,9 +709,10 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		} catch {
 			// keep the mode-only fallback line
 		}
+		if (refreshSerial !== uiRefreshSerial.status) return;
 		const cacheSegment = cacheTelemetry.statusSegment();
 		if (cacheSegment) line = line ? `${line} | ${cacheSegment}` : cacheSegment;
-		const breakdown = buildCostBreakdown(ctx.sessionManager.getEntries(), pendingMessage);
+		const breakdown = runtimeCostBreakdown.read(ctx.sessionManager.getEntries(), pendingMessage);
 		const costSegment = costStatusSegment(breakdown);
 		if (costSegment) line = line ? `${line} | ${costSegment}` : costSegment;
 		const advisorySegment = advisoryStatusSegment(evaluateAdvisory(breakdown, advisoryConfig));
@@ -747,7 +743,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		if (hasPendingReview(delegationState) || hasStaleReview(delegationState)) {
 			line = line ? `${line} | WF:REVIEW` : "WF:REVIEW";
 		}
-		ctx.ui.setStatus(STATUS_KEY, line);
+		if (refreshSerial === uiRefreshSerial.status) ctx.ui.setStatus(STATUS_KEY, line);
 	}
 
 	/** P6-A: keep the telemetry enable flag in sync with project.yaml (opt-out). */
@@ -810,7 +806,9 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	 */
 	async function refreshWidget(ctx: ExtensionContext): Promise<void> {
 		if (!ctx.hasUI) return;
+		const refreshSerial = ++uiRefreshSerial.widget;
 		const state = await collectWidgetState(ctx);
+		if (refreshSerial !== uiRefreshSerial.widget) return;
 		const action = widgetAction(state, ctx.hasUI);
 		if (action === "show") {
 			ctx.ui.setWidget(WIDGET_KEY, buildWidgetLines(state, { width: 96 }));
@@ -1032,11 +1030,9 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		mode = loadModeFromEntries(entries);
 		compactState = loadCompactStateFromEntries(entries, mode);
 		reconcileCompactAttempt(entries, event.reason);
-		// P7: restore the delegation review lifecycle and the commander write
-		// lease from the same custom entries (they survive compaction and
-		// every session-replacement path). The lease is policy-bound: a
-		// restored lease is revoked when the current actor/model or mode no
-		// longer qualifies.
+		// Restore delegation state. A confirmed write lease never crosses a
+		// session_start boundary without a fresh user grant: this also prevents a
+		// failed append from reviving an older active entry on reload.
 		delegationSession.restore(entries);
 		writeLease = loadLeaseFromEntries(entries);
 		const selectedThinking = ctx.thinkingLevel ?? pi.getThinkingLevel();
@@ -1062,7 +1058,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				mode,
 				provider: currentModelFacts.provider,
 				model: currentModelFacts.model,
-			});
+			}) ?? (leaseStatus(writeLease, now) === "active" ? "session restoration requires a fresh write lease" : undefined);
 			if (reason) {
 				writeLease = revokeLease(writeLease, reason, now);
 				persistLease();

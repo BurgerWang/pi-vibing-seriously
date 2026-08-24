@@ -179,7 +179,7 @@ extensions/workbench-runtime/
     │                        #   WebSocket or any other transport)
     ├── templates.ts         # generic / stock-selection / market-timing templates
     ├── init.ts              # /q-init stack-aware planning + content snapshot
-    ├── init-safe-write.ts   # exclusive/no-follow create and identity-bound overwrite
+    ├── init-safe-write.ts   # durable sibling-temp publish; no-clobber create + identity-bound atomic overwrite
     └── inspect.ts           # project inspection service
 ```
 
@@ -679,6 +679,12 @@ to the existing session/tool refreshes). Pi 0.84.2 persists the finished
 message after extension handlers, so the event message is included as a
 pending fact exactly once; identity/timestamp deduplication prevents double
 counting if persistence ordering changes in a future compatible Pi version.
+The runtime wraps this pure reference reducer in a session-local append-only
+cache: each footer refresh folds only newly appended entries, while a shorter
+or identity-divergent tail triggers a full rebuild. Persisted message
+identity/timestamp facts are indexed incrementally, so pending-message
+deduplication stays equivalent to the reference full scan without making a
+long session quadratic.
 
 `/q-cost-status` prints the exact commander, worker, other and total amounts
 (plus token totals) and the per-model commander breakdown. It reads session
@@ -1535,8 +1541,8 @@ run/cache/gate/delegation artifacts or execution counts.
   cleared; pending/stale stay safely blocking); deterministic rendered
   displayed/remaining counts, bounded next include_paths guidance (max
   50 paths AND ≤ 1024 UTF-8 bytes, complete paths only with an exact
-  omitted count), an additive per-path page cursor/stream SHA-256 plus bounded
-  contiguous range/hash receipts for ordinary sources up to 4 MiB (advanced
+  omitted count), an additive per-path page cursor/stream SHA-256 plus an
+  O(paths) recomputable prefix receipt and latest range/hash for ordinary sources up to 4 MiB (advanced
   only after the complete page is visible and rebuilt against current source
   authority before ACCEPT), the
   review-complete fact and the durable

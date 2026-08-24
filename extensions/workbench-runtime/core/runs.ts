@@ -42,8 +42,12 @@ export const RUN_MANIFEST_SCHEMA_VERSION_V2 = 2;
 export const RUN_JSON_INPUT_MAX_BYTES = 1_048_576 as const;
 
 export const GATE_ATTEMPT_INDEX_SCHEMA_VERSION = 1 as const;
+export const GATE_ATTEMPT_INDEX_SCHEMA_VERSION_V2 = 2 as const;
 export const GATE_ATTEMPT_INDEX_DIR = ".gate-index" as const;
 export const GATE_ATTEMPT_INDEX_MAX_BYTES = 4_096 as const;
+export const GATE_ATTEMPT_ORDER_SCHEMA_VERSION = 1 as const;
+export const GATE_ATTEMPT_ORDER_DIR = ".gate-attempt-order" as const;
+export const GATE_ATTEMPT_ORDER_MAX_BYTES = 4_096 as const;
 
 export const RUN_ID_RE = /^\d{8}-\d{6}-[A-Za-z0-9]{4}$/;
 
@@ -145,17 +149,122 @@ export interface RunRecord {
 	artifact_manifest_path?: "artifact-manifest.json";
 }
 
+function plainRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function boundedString(value: unknown, maxBytes: number, allowEmpty = false): value is string {
+	return typeof value === "string"
+		&& (allowEmpty || value.length > 0)
+		&& Buffer.byteLength(value, "utf8") <= maxBytes
+		&& !/[\u0000]/.test(value);
+}
+
+function boundedStringArray(value: unknown, maxItems: number, maxItemBytes: number): value is string[] {
+	return Array.isArray(value)
+		&& value.length <= maxItems
+		&& value.every((entry) => boundedString(entry, maxItemBytes, true));
+}
+
+function finiteIso(value: unknown): value is string {
+	return typeof value === "string" && value.length <= 64 && Number.isFinite(Date.parse(value));
+}
+
+function integerArray(value: unknown, maxItems: number): value is number[] {
+	return Array.isArray(value)
+		&& value.length > 0
+		&& value.length <= maxItems
+		&& value.every((entry) => typeof entry === "number" && Number.isInteger(entry));
+}
+
+/**
+ * One shared semantic parser for every committed v2 manifest.  Diagnostic
+ * readers intentionally remain looser so they can explain partial attempts;
+ * no v2 record is allowed to become execution/Gate authority unless it passes
+ * this complete shape and terminal-outcome contract.
+ */
+export function parseCommittedRunManifestV2(value: unknown, runId: string): RunRecord | null {
+	if (!plainRecord(value) || !isValidRunId(runId)) return null;
+	if (value.schema_version !== RUN_MANIFEST_SCHEMA_VERSION_V2
+		|| value.run_transaction_schema_version !== 2
+		|| value.run_id !== runId
+		|| !boundedString(value.recipe, 256)
+		|| !(value.profile === undefined || boundedString(value.profile, 256))
+		|| !finiteIso(value.started_at)
+		|| !finiteIso(value.finished_at)
+		|| typeof value.duration_ms !== "number"
+		|| !Number.isSafeInteger(value.duration_ms)
+		|| value.duration_ms < 0
+		|| !boundedString(value.cwd, 32_768)
+		|| !boundedStringArray(value.argv, 4_096, 65_536)
+		|| !(value.exit_code === null || (typeof value.exit_code === "number" && Number.isInteger(value.exit_code)))
+		|| typeof value.timed_out !== "boolean"
+		|| typeof value.cancelled !== "boolean"
+		|| !(value.git_commit === null || boundedString(value.git_commit, 256))
+		|| typeof value.git_dirty !== "boolean"
+		|| !boundedStringArray(value.artifact_paths, 10_000, 4_096)
+		|| typeof value.stdout_truncated !== "boolean"
+		|| typeof value.stderr_truncated !== "boolean"
+		|| !boundedString(value.mode, 128)
+		|| !integerArray(value.expected_exit_codes, 256)
+		|| !boundedStringArray(value.declared_writes, 10_000, 4_096)
+		|| !boundedStringArray(value.environment_names, 10_000, 1_024)
+		|| !Array.isArray(value.validation_components)
+		|| value.validation_components.length > 3
+		|| value.validation_components.some((entry) => entry !== "typecheck" && entry !== "unit-test" && entry !== "whitespace")
+		|| (value.cache_request_mode !== "default" && value.cache_request_mode !== "no-cache" && value.cache_request_mode !== "refresh-cache")
+		|| (value.run_outcome !== "SUCCESS" && value.run_outcome !== "PROCESS_FAILED" && value.run_outcome !== "ARTIFACT_FAILED")
+	) return null;
+
+	if (new Set(value.expected_exit_codes).size !== value.expected_exit_codes.length) return null;
+	if (new Set(value.validation_components).size !== value.validation_components.length) return null;
+	if (value.timed_out && value.cancelled) return null;
+	const expectedDuration = Math.max(0, Date.parse(value.finished_at) - Date.parse(value.started_at));
+	if (value.duration_ms !== expectedDuration) return null;
+	const processSucceeded = value.exit_code !== null
+		&& value.expected_exit_codes.includes(value.exit_code)
+		&& !value.timed_out
+		&& !value.cancelled;
+	if (value.run_outcome === "PROCESS_FAILED" ? processSucceeded : !processSucceeded) return null;
+
+	if (!(value.execution_source === undefined || value.execution_source === "exec" || value.execution_source === "cache")) return null;
+	if (!(value.action_key === undefined || boundedString(value.action_key, 256))) return null;
+	if (!(value.argv_hash === undefined || (typeof value.argv_hash === "string" && /^[0-9a-f]{64}$/.test(value.argv_hash)))) return null;
+	if (!(value.reused_from_run_id === undefined || (typeof value.reused_from_run_id === "string" && isValidRunId(value.reused_from_run_id)))) return null;
+	if (!(value.cache_created_at === undefined || finiteIso(value.cache_created_at))) return null;
+	if (!(value.cache_validated_at === undefined || finiteIso(value.cache_validated_at))) return null;
+	if (!(value.evidence_paths === undefined || boundedStringArray(value.evidence_paths, 10_000, 4_096))) return null;
+	if (!(value.artifact_manifest_path === undefined || value.artifact_manifest_path === "artifact-manifest.json")) return null;
+	if (!(value.validation_evidence === undefined || plainRecord(value.validation_evidence))) return null;
+	if (!(value.artifact_validation === undefined || plainRecord(value.artifact_validation))) return null;
+	if (!(value.quant_contract === undefined || plainRecord(value.quant_contract))) return null;
+
+	return value as unknown as RunRecord;
+}
+
 export interface GateRunCandidate {
 	run_id: string;
 	source: "marker" | "marker-invalid" | "hint" | "manifest" | "command" | "commit-inventory" | "classification-uncertain";
 	/** Exact manifest start time when readable; absent candidates sort conservatively within the same second. */
 	started_at?: string;
+	/** Durable ordering for current-version attempts; independent of wall time. */
+	attempt_sequence?: number;
 }
 
 export interface GateAttemptIndexRecord {
+	schema_version: 1 | 2;
+	recipe: "gate";
+	run_id: string;
+	started_at: string;
+	registered_at: string;
+	attempt_sequence?: number;
+}
+
+export interface GateAttemptOrderRecord {
 	schema_version: 1;
 	recipe: "gate";
 	run_id: string;
+	attempt_sequence: number;
 	started_at: string;
 	registered_at: string;
 }
@@ -223,6 +332,14 @@ function gateAttemptIndexPath(projectRoot: string, runId: string): string {
 	return join(gateAttemptIndexDirectory(projectRoot), `${runId}.json`);
 }
 
+function gateAttemptOrderDirectory(projectRoot: string): string {
+	return join(runsDir(projectRoot), GATE_ATTEMPT_ORDER_DIR);
+}
+
+function gateAttemptOrderFileName(sequence: number): string {
+	return `${String(sequence).padStart(16, "0")}.json`;
+}
+
 async function syncGateAttemptIndexDirectory(directory: string): Promise<void> {
 	const handle = await open(directory, "r");
 	try {
@@ -235,23 +352,118 @@ async function syncGateAttemptIndexDirectory(directory: string): Promise<void> {
 function parseGateAttemptIndexRecord(value: unknown, runId: string): GateAttemptIndexRecord | null {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
 	const raw = value as Record<string, unknown>;
-	if (Object.keys(raw).sort().join(",") !== "recipe,registered_at,run_id,schema_version,started_at") return null;
+	const version = raw.schema_version;
+	const expectedKeys = version === GATE_ATTEMPT_INDEX_SCHEMA_VERSION_V2
+		? "attempt_sequence,recipe,registered_at,run_id,schema_version,started_at"
+		: "recipe,registered_at,run_id,schema_version,started_at";
+	if (Object.keys(raw).sort().join(",") !== expectedKeys) return null;
 	if (
-		raw.schema_version !== GATE_ATTEMPT_INDEX_SCHEMA_VERSION
+		(version !== GATE_ATTEMPT_INDEX_SCHEMA_VERSION && version !== GATE_ATTEMPT_INDEX_SCHEMA_VERSION_V2)
 		|| raw.recipe !== "gate"
 		|| raw.run_id !== runId
 		|| typeof raw.started_at !== "string"
 		|| !Number.isFinite(Date.parse(raw.started_at))
 		|| typeof raw.registered_at !== "string"
 		|| !Number.isFinite(Date.parse(raw.registered_at))
+		|| (version === GATE_ATTEMPT_INDEX_SCHEMA_VERSION_V2
+			&& (typeof raw.attempt_sequence !== "number" || !Number.isSafeInteger(raw.attempt_sequence) || raw.attempt_sequence <= 0))
 	) return null;
 	return {
-		schema_version: GATE_ATTEMPT_INDEX_SCHEMA_VERSION,
+		schema_version: version,
 		recipe: "gate",
 		run_id: runId,
 		started_at: raw.started_at,
 		registered_at: raw.registered_at,
+		...(version === GATE_ATTEMPT_INDEX_SCHEMA_VERSION_V2 ? { attempt_sequence: raw.attempt_sequence as number } : {}),
 	};
+}
+
+function parseGateAttemptOrderRecord(value: unknown, sequence: number, runId: string): GateAttemptOrderRecord | null {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+	const raw = value as Record<string, unknown>;
+	if (Object.keys(raw).sort().join(",") !== "attempt_sequence,recipe,registered_at,run_id,schema_version,started_at") return null;
+	if (raw.schema_version !== GATE_ATTEMPT_ORDER_SCHEMA_VERSION || raw.recipe !== "gate"
+		|| raw.run_id !== runId || raw.attempt_sequence !== sequence
+		|| typeof raw.started_at !== "string" || !Number.isFinite(Date.parse(raw.started_at))
+		|| typeof raw.registered_at !== "string" || !Number.isFinite(Date.parse(raw.registered_at))) return null;
+	return {
+		schema_version: GATE_ATTEMPT_ORDER_SCHEMA_VERSION,
+		recipe: "gate",
+		run_id: runId,
+		attempt_sequence: sequence,
+		started_at: raw.started_at,
+		registered_at: raw.registered_at,
+	};
+}
+
+function parseGateAttemptOrderFileName(name: string): { sequence: number } | null {
+	const match = /^(\d{16})\.json$/.exec(name);
+	if (!match) return null;
+	const sequence = Number(match[1]);
+	return Number.isSafeInteger(sequence) && sequence > 0 ? { sequence } : null;
+}
+
+async function allocateGateAttemptOrder(
+	projectRoot: string,
+	runId: string,
+	startedAt: Date,
+	registeredAt: Date,
+): Promise<GateAttemptOrderRecord | null> {
+	const directory = gateAttemptOrderDirectory(projectRoot);
+	try {
+		await mkdir(directory, { recursive: true, mode: 0o700 });
+	} catch {
+		return null;
+	}
+	let entries: Dirent[];
+	try {
+		entries = await readdir(directory, { withFileTypes: true });
+	} catch {
+		return null;
+	}
+	let sequence = 0;
+	for (const entry of entries) {
+		const parsed = parseGateAttemptOrderFileName(entry.name);
+		if (parsed && parsed.sequence > sequence) sequence = parsed.sequence;
+	}
+	for (let attempt = 0; attempt < 1_024 && sequence < Number.MAX_SAFE_INTEGER; attempt += 1) {
+		sequence += 1;
+		const record: GateAttemptOrderRecord = {
+			schema_version: GATE_ATTEMPT_ORDER_SCHEMA_VERSION,
+			recipe: "gate",
+			run_id: runId,
+			attempt_sequence: sequence,
+			started_at: startedAt.toISOString(),
+			registered_at: registeredAt.toISOString(),
+		};
+		const bytes = Buffer.from(`${JSON.stringify(record, null, 2)}\n`, "utf8");
+		if (bytes.length > GATE_ATTEMPT_ORDER_MAX_BYTES) return null;
+		const path = join(directory, gateAttemptOrderFileName(sequence));
+		let handle;
+		try {
+			handle = await open(path, "wx", 0o600);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "EEXIST") continue;
+			return null;
+		}
+		try {
+			await handle.writeFile(bytes);
+			await handle.sync();
+		} catch {
+			await handle.close().catch(() => {});
+			return null;
+		}
+		await handle.close().catch(() => {});
+		const reread = await readJsonFileBounded<unknown>(path, GATE_ATTEMPT_ORDER_MAX_BYTES);
+		if (!reread.ok || !parseGateAttemptOrderRecord(reread.value.value, sequence, runId)) return null;
+		try {
+			await syncGateAttemptIndexDirectory(directory);
+		} catch {
+			return null;
+		}
+		return record;
+	}
+	return null;
 }
 
 /**
@@ -278,16 +490,25 @@ export async function registerGateRunAttemptIndex(
 	} catch {
 		return { ok: false, reason: "index_unavailable" };
 	}
+	const finalPath = gateAttemptIndexPath(projectRoot, runId);
+	try {
+		await lstat(finalPath);
+		return { ok: false, reason: "already_registered" };
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") return { ok: false, reason: "index_unavailable" };
+	}
+	const order = await allocateGateAttemptOrder(projectRoot, runId, startedAt, registeredAt);
+	if (!order) return { ok: false, reason: "index_unavailable" };
 	const record: GateAttemptIndexRecord = {
-		schema_version: GATE_ATTEMPT_INDEX_SCHEMA_VERSION,
+		schema_version: GATE_ATTEMPT_INDEX_SCHEMA_VERSION_V2,
 		recipe: "gate",
 		run_id: runId,
 		started_at: startedAt.toISOString(),
 		registered_at: registeredAt.toISOString(),
+		attempt_sequence: order.attempt_sequence,
 	};
 	const bytes = Buffer.from(`${JSON.stringify(record, null, 2)}\n`, "utf8");
 	if (bytes.length > GATE_ATTEMPT_INDEX_MAX_BYTES) return { ok: false, reason: "invalid_input" };
-	const finalPath = gateAttemptIndexPath(projectRoot, runId);
 	const tempPath = join(directory, `.${runId}.${process.pid}.${randomBytes(8).toString("hex")}.tmp`);
 	let linked = false;
 	try {
@@ -386,6 +607,36 @@ async function listGateAttemptMarkers(
 		return b.run_id.localeCompare(a.run_id);
 	});
 	return markers;
+}
+
+async function listGateAttemptOrderClaims(
+	projectRoot: string,
+): Promise<Array<{ sequence: number; record: GateAttemptOrderRecord | null }>> {
+	let entries: Dirent[];
+	try {
+		entries = await readdir(gateAttemptOrderDirectory(projectRoot), { withFileTypes: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		// A current-version order ledger which cannot be enumerated is never
+		// treated as proof that no newer attempt exists.  Throwing lets the
+		// authority-facing caller fail closed instead of selecting old PASS.
+		throw new Error("GATE_ATTEMPT_ORDER_UNAVAILABLE");
+	}
+	const claims: Array<{ sequence: number; record: GateAttemptOrderRecord | null }> = [];
+	for (const entry of entries) {
+		const identity = parseGateAttemptOrderFileName(entry.name);
+		if (!identity) continue;
+		let record: GateAttemptOrderRecord | null = null;
+		if (entry.isFile()) {
+			const read = await readJsonFileBounded<unknown>(join(gateAttemptOrderDirectory(projectRoot), entry.name), GATE_ATTEMPT_ORDER_MAX_BYTES);
+			if (read.ok && plainRecord(read.value.value) && typeof read.value.value.run_id === "string" && isValidRunId(read.value.value.run_id)) {
+				record = parseGateAttemptOrderRecord(read.value.value, identity.sequence, read.value.value.run_id);
+			}
+		}
+		claims.push({ sequence: identity.sequence, record });
+	}
+	claims.sort((a, b) => b.sequence - a.sequence);
+	return claims;
 }
 
 function commitInventoryAdvertisesGate(value: unknown, runId: string): boolean {
@@ -691,20 +942,51 @@ export async function* iterateGateRunCandidates(
 	} = {},
 ): AsyncGenerator<GateRunCandidate> {
 	const excluded = new Set((options.excludeRunIds ?? []).filter(isValidRunId));
+	const orderClaims = await listGateAttemptOrderClaims(projectRoot);
 	const markers = await listGateAttemptMarkers(projectRoot, options.hooks);
+	const markerById = new Map(markers.map((marker) => [marker.run_id, marker]));
+	const resolvedClaims = orderClaims.map((claim) => {
+		const matchingMarkers = markers.filter((marker) => marker.record?.attempt_sequence === claim.sequence);
+		const runId = claim.record?.run_id ?? matchingMarkers[0]?.run_id
+			?? `00010101-000000-${claim.sequence.toString(36).slice(-4).padStart(4, "0")}`;
+		return { ...claim, run_id: runId, matchingMarkers };
+	});
+	const orderedIds = new Set(resolvedClaims.map((claim) => claim.run_id));
 	const markerIds = new Set<string>();
 	const markerCandidates: GateRunCandidate[] = [];
 	for (const marker of markers) {
 		markerIds.add(marker.run_id);
-		if (!excluded.has(marker.run_id)) {
+		if (!orderedIds.has(marker.run_id) && !excluded.has(marker.run_id)) {
 			markerCandidates.push({
 				run_id: marker.run_id,
-				source: marker.record ? "marker" : "marker-invalid",
+				source: marker.record?.schema_version === GATE_ATTEMPT_INDEX_SCHEMA_VERSION ? "marker" : "marker-invalid",
 				started_at: marker.record?.started_at,
 			});
 		}
 	}
 	markerCandidates.sort(newestGateCandidateFirst);
+
+	// Every current-version registration first publishes one immutable sequence
+	// claim.  Sequence order is the freshness authority; wall time and the run
+	// id are identity facts only.  A missing compatibility marker is recoverable
+	// from the claim after restart, while a present-but-invalid/mismatched marker
+	// remains a fail-closed obstruction.
+	for (const claim of resolvedClaims) {
+		if (excluded.has(claim.run_id)) continue;
+		const marker = markerById.get(claim.run_id);
+		const markerMatches = marker === undefined || (
+			marker.record !== null
+			&& marker.record.schema_version === GATE_ATTEMPT_INDEX_SCHEMA_VERSION_V2
+			&& marker.record.attempt_sequence === claim.sequence
+			&& marker.record.started_at === claim.record?.started_at
+		);
+		yield {
+			run_id: claim.run_id,
+			source: claim.record !== null && claim.matchingMarkers.length <= 1 && markerMatches ? "marker" : "marker-invalid",
+			started_at: claim.record?.started_at,
+			attempt_sequence: claim.sequence,
+		};
+	}
 
 	// Markers are an optimization, never freshness authority. Merge them with
 	// every unmarked same-recipe candidate so a deleted marker, version switch,
@@ -713,8 +995,8 @@ export async function* iterateGateRunCandidates(
 	// classification, so repeated refreshes revalidate candidates without
 	// reparsing unrelated manifests.
 	const unmarked = iterateRunAttemptCandidatesByRecipe(projectRoot, "gate", {
-		includeRunIds: markers.length === 0 ? options.includeRunIds : undefined,
-		excludeRunIds: [...excluded, ...markerIds],
+		includeRunIds: markers.length === 0 && orderClaims.length === 0 ? options.includeRunIds : undefined,
+		excludeRunIds: [...excluded, ...markerIds, ...orderedIds],
 		hooks: options.hooks,
 	});
 	let markerOffset = 0;
@@ -844,28 +1126,13 @@ export async function isPureLegacyRunForDiagnostic(projectRoot: string, runId: s
 	return await v2RunMarkerState(projectRoot, runId) === "absent";
 }
 
-function minimallyValidRunRecord(value: RunRecord, runId: string): boolean {
-	return value.schema_version === RUN_MANIFEST_SCHEMA_VERSION_V2 &&
-		value.run_id === runId &&
-		typeof value.recipe === "string" && value.recipe.length > 0 &&
-		typeof value.started_at === "string" && Number.isFinite(Date.parse(value.started_at)) &&
-		typeof value.finished_at === "string" && Number.isFinite(Date.parse(value.finished_at)) &&
-		typeof value.duration_ms === "number" && Number.isFinite(value.duration_ms) && value.duration_ms >= 0 &&
-		(value.exit_code === null || (typeof value.exit_code === "number" && Number.isInteger(value.exit_code))) &&
-		typeof value.timed_out === "boolean" &&
-		typeof value.cancelled === "boolean" &&
-		Array.isArray(value.artifact_paths) && value.artifact_paths.every((path) => typeof path === "string");
-}
-
 /** Strict authority read: requires an atomically committed v2 run directory. */
 export async function readCommittedManifest(projectRoot: string, runId: string): Promise<RunRecord | null> {
 	const { readCommittedRunTransaction } = await import("./run-transaction.ts");
 	const transaction = await readCommittedRunTransaction(projectRoot, runId);
 	if (!transaction.ok) return null;
 	const manifest = await readManifest(projectRoot, runId);
-	if (!manifest || !minimallyValidRunRecord(manifest, runId) || manifest.run_transaction_schema_version !== 2) return null;
-	if (manifest.run_outcome !== "SUCCESS" && manifest.run_outcome !== "PROCESS_FAILED" && manifest.run_outcome !== "ARTIFACT_FAILED") return null;
-	return manifest;
+	return parseCommittedRunManifestV2(manifest, runId);
 }
 
 export interface RunSummaryRecord {

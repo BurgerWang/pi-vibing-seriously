@@ -19,10 +19,12 @@
  *   - only allow-listed version queries run (argv, shell=false, timeout,
  *     truncated output); a failed query is an explicit "unknown" component,
  *     never silently ignored
- *   - fingerprint failures (symlink escape, limits) refuse the cache
+ *   - fingerprint failures (any symlink, limits, incomplete scan) refuse the cache
  */
 
-import { readFile, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { constants } from "node:fs";
+import { lstat, open } from "node:fs/promises";
 import { join, relative, resolve, sep } from "node:path";
 import os from "node:os";
 
@@ -30,7 +32,7 @@ import { GATE_CATALOG } from "../core/gate-catalog.ts";
 import { effectiveGates, parseGatesDocument, type Gate } from "../core/gate-schema.ts";
 import { loadProjectConfig, type ExecFn } from "../core/config.ts";
 import type { Recipe } from "../core/recipe-schema.ts";
-import { canonicalHash, sha256Hex, sha256HexBytes } from "./canonical-hash.ts";
+import { canonicalHash, sha256Hex } from "./canonical-hash.ts";
 import { fingerprintInputs, FingerprintError } from "./action-fingerprint.ts";
 import { resolveQuantContract } from "./quant-files.ts";
 import {
@@ -48,6 +50,105 @@ import {
 } from "./action-types.ts";
 
 export const WORKBENCH_CONFIG_FILES = ["project.yaml", "recipes.yaml", "gates.yaml", "profiles.yaml"] as const;
+export const WORKBENCH_CONFIG_HASH_MAX_BYTES = 4 * 1024 * 1024;
+const LOCKFILE_HASH_MAX_BYTES = 64 * 1024 * 1024;
+
+function errnoCode(error: unknown): string | undefined {
+	return typeof error === "object" && error !== null
+		? (error as NodeJS.ErrnoException).code
+		: undefined;
+}
+
+type BoundedHashResult =
+	| { status: "missing" | "not-a-file" | "too-large" }
+	| { status: "ok"; hash: string };
+
+interface DirectoryIdentity {
+	path: string;
+	dev: number;
+	ino: number;
+}
+
+async function inspectSafeAncestors(trustedRoot: string, path: string, label: string): Promise<DirectoryIdentity[] | null> {
+	const rel = relative(resolve(trustedRoot), resolve(path));
+	if (rel === ".." || rel.startsWith(`..${sep}`)) throw new FingerprintError(`${label} escapes the trusted project root`);
+	const components = rel.split(sep).slice(0, -1);
+	const identities: DirectoryIdentity[] = [];
+	let current = resolve(trustedRoot);
+	for (const component of components) {
+		current = join(current, component);
+		let stats;
+		try { stats = await lstat(current); }
+		catch (error) {
+			if (errnoCode(error) === "ENOENT") return null;
+			throw new FingerprintError(`${label} ancestor cannot be inspected: ${(error as Error).message}`);
+		}
+		if (stats.isSymbolicLink()) throw new FingerprintError(`${label} ancestor is a symlink — cache refused without following it`);
+		if (!stats.isDirectory()) throw new FingerprintError(`${label} ancestor is not a directory`);
+		identities.push({ path: current, dev: stats.dev, ino: stats.ino });
+	}
+	return identities;
+}
+
+async function ancestorsUnchanged(identities: readonly DirectoryIdentity[]): Promise<boolean> {
+	for (const identity of identities) {
+		try {
+			const stats = await lstat(identity.path);
+			if (!stats.isDirectory() || stats.isSymbolicLink() || stats.dev !== identity.dev || stats.ino !== identity.ino) return false;
+		} catch {
+			return false;
+		}
+	}
+	return true;
+}
+
+/** Stable single-descriptor hash; never follows a symlink or reads past the initial fstat size. */
+async function hashRegularFileBounded(path: string, maxBytes: number, label: string, trustedRoot: string): Promise<BoundedHashResult> {
+	const ancestors = await inspectSafeAncestors(trustedRoot, path, label);
+	if (ancestors === null) return { status: "missing" };
+	let lexical;
+	try { lexical = await lstat(path); }
+	catch (error) {
+		if (errnoCode(error) === "ENOENT") return { status: "missing" };
+		throw new FingerprintError(`${label} cannot be inspected: ${(error as Error).message}`);
+	}
+	if (lexical.isSymbolicLink()) throw new FingerprintError(`${label} is a symlink — cache refused without following it`);
+	if (!lexical.isFile()) return { status: "not-a-file" };
+	const noFollow = typeof constants.O_NOFOLLOW === "number" ? constants.O_NOFOLLOW : 0;
+	let handle;
+	try { handle = await open(path, constants.O_RDONLY | noFollow); }
+	catch (error) {
+		if (errnoCode(error) === "ENOENT") return { status: "missing" };
+		throw new FingerprintError(`${label} cannot be read: ${(error as Error).message}`);
+	}
+	try {
+		const initial = await handle.stat();
+		if (!initial.isFile()) return { status: "not-a-file" };
+		if (initial.dev !== lexical.dev || initial.ino !== lexical.ino) throw new FingerprintError(`${label} changed identity before hashing`);
+		if (initial.size > maxBytes) return { status: "too-large" };
+		const hash = createHash("sha256");
+		if (initial.size > 0) {
+			await new Promise<void>((resolvePromise, reject) => {
+				const stream = handle.createReadStream({ autoClose: false, start: 0, end: initial.size - 1 });
+				stream.on("data", (chunk: string | Buffer) => hash.update(chunk));
+				stream.on("end", resolvePromise);
+				stream.on("error", reject);
+			});
+		}
+		const final = await handle.stat();
+		let pathNow;
+		try { pathNow = await lstat(path); }
+		catch { throw new FingerprintError(`${label} changed path identity during hashing`); }
+		if (initial.dev !== final.dev || initial.ino !== final.ino || initial.size !== final.size || initial.mtimeMs !== final.mtimeMs
+			|| pathNow.isSymbolicLink() || pathNow.dev !== initial.dev || pathNow.ino !== initial.ino) {
+			throw new FingerprintError(`${label} changed identity or contents during hashing`);
+		}
+		if (!(await ancestorsUnchanged(ancestors))) throw new FingerprintError(`${label} ancestor changed during hashing`);
+		return { status: "ok", hash: hash.digest("hex") };
+	} finally {
+		await handle.close().catch(() => {});
+	}
+}
 
 /** Normalized definition hash: everything about the recipe that affects its
  * execution semantics, excluding the cache block (hashed separately). */
@@ -110,21 +211,9 @@ export function declaredEnvironmentHash(names: readonly string[], env: Readonly<
 export async function lockfileHashes(projectRoot: string): Promise<Record<string, string>> {
 	const out: Record<string, string> = {};
 	for (const name of KNOWN_LOCKFILES) {
-		const path = join(projectRoot, name);
-		try {
-			const info = await stat(path);
-			if (!info.isFile()) {
-				out[name] = "not-a-file";
-				continue;
-			}
-			if (info.size > 64 * 1024 * 1024) {
-				out[name] = "too-large";
-				continue;
-			}
-			out[name] = sha256HexBytes(await readFile(path));
-		} catch {
-			out[name] = "missing";
-		}
+		const result = await hashRegularFileBounded(join(projectRoot, name), LOCKFILE_HASH_MAX_BYTES, `lockfile "${name}"`, projectRoot);
+		if (result.status === "too-large") throw new FingerprintError(`lockfile "${name}" exceeds the ${LOCKFILE_HASH_MAX_BYTES}-byte hash limit`);
+		out[name] = result.status === "ok" ? result.hash : result.status;
 	}
 	return out;
 }
@@ -133,11 +222,15 @@ export async function lockfileHashes(projectRoot: string): Promise<Record<string
 export async function workbenchConfigHash(projectRoot: string): Promise<string> {
 	const parts: Record<string, string> = {};
 	for (const file of WORKBENCH_CONFIG_FILES) {
-		try {
-			parts[file] = sha256HexBytes(await readFile(join(projectRoot, ".pi", "workbench", file)));
-		} catch {
-			parts[file] = "missing";
-		}
+		const result = await hashRegularFileBounded(
+			join(projectRoot, ".pi", "workbench", file),
+			WORKBENCH_CONFIG_HASH_MAX_BYTES,
+			`workbench config "${file}"`,
+			projectRoot,
+		);
+		if (result.status === "not-a-file") throw new FingerprintError(`workbench config "${file}" is not a regular file`);
+		if (result.status === "too-large") throw new FingerprintError(`workbench config "${file}" exceeds the ${WORKBENCH_CONFIG_HASH_MAX_BYTES}-byte hash limit`);
+		parts[file] = result.status === "ok" ? result.hash : "missing";
 	}
 	return canonicalHash(parts);
 }

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -10,6 +10,7 @@ import {
 	formatWorkerCacheSummary,
 	runPinnedWorker,
 	workerCacheHitRatio,
+	workerRunFailure,
 	WORKER_DIAGNOSIS_SYSTEM_PROMPT,
 	WORKER_SYSTEM_PROMPT,
 	type PiInvocation,
@@ -121,6 +122,52 @@ test("runner consumes JSON events, pins model identity, and aggregates usage", a
 		assert.deepEqual(result.spendSoftReached, { turns: false, totalTokens: false, outputTokens: false });
 		assert.deepEqual(result.spendHardExceeded, { turns: false, totalTokens: false, outputTokens: false });
 		assert.strictEqual(result.writeJournalObservation, EMPTY_WORKER_WRITE_JOURNAL_RUNTIME_OBSERVATION);
+	});
+});
+
+test("runner rejects a newline-terminated oversized JSON event before later output can mask it", async () => {
+	await withFakeWorker(
+		`process.stdout.write(JSON.stringify({type:"noise",payload:"x".repeat(${2 * 1024 * 1024})})+"\\n"); process.stdout.write(${JSON.stringify(`${assistantEvent()}\n`)});`,
+		async (invocation, dir) => {
+			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+			assert.match(result.errorMessage ?? "", /JSON event exceeded/);
+			assert.equal(result.output, "", "later assistant output cannot overwrite the stream failure");
+			assert.throws(() => assertWorkerSucceeded(result));
+		},
+	);
+});
+
+test("runner does not accept a tool-use assistant message as the terminal report", async () => {
+	const nonterminal = assistantEvent({ content: [{ type: "text", text: "working" }], stopReason: "toolUse" });
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${nonterminal}\n`)});`, async (invocation, dir) => {
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		assert.deepEqual(workerRunFailure(result), {
+			code: "FINAL_OUTPUT_MISSING",
+			message: "Pinned worker exited before a terminal assistant response",
+		});
+	});
+});
+
+test("runner kills background descendants when the pinned worker exits", { skip: process.platform === "win32" }, async () => {
+	const final = assistantEvent();
+	await withFakeWorker(`
+		import { spawn } from "node:child_process";
+		const marker = process.env.WORKER_BACKGROUND_MARKER;
+		spawn(process.execPath, ["-e", "setTimeout(() => require('node:fs').writeFileSync(process.argv[1], 'late'), 400)", marker], { stdio: "ignore" }).unref();
+		process.stdout.write(${JSON.stringify(`${final}\n`)});
+	`, async (invocation, dir) => {
+		const marker = join(dir, "late-background-write.txt");
+		const previous = process.env.WORKER_BACKGROUND_MARKER;
+		process.env.WORKER_BACKGROUND_MARKER = marker;
+		try {
+			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+			assertWorkerSucceeded(result);
+			await new Promise((resolve) => setTimeout(resolve, 650));
+			await assert.rejects(access(marker), "background descendant must not write after worker exit");
+		} finally {
+			if (previous === undefined) delete process.env.WORKER_BACKGROUND_MARKER;
+			else process.env.WORKER_BACKGROUND_MARKER = previous;
+		}
 	});
 });
 

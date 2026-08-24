@@ -216,6 +216,49 @@ function entryContainsMessage(entry: unknown, pendingMessage: unknown): boolean 
 	return pending.timestamp !== undefined && stored.timestamp === pending.timestamp && stored.role === pending.role;
 }
 
+/** Add two independently aggregated, disjoint entry windows without rescanning either window. */
+export function mergeCostBreakdowns(left: CostBreakdown, right: CostBreakdown): CostBreakdown {
+	const totals = (a: CostTotals, b: CostTotals): CostTotals => ({
+		cost: a.cost + b.cost,
+		tokens: a.tokens + b.tokens,
+		input: a.input + b.input,
+		output: a.output + b.output,
+		cacheRead: a.cacheRead + b.cacheRead,
+		cacheWrite: a.cacheWrite + b.cacheWrite,
+	});
+	const commander = totals(left.commander, right.commander);
+	const worker = totals(left.worker, right.worker);
+	const other = totals(left.other, right.other);
+	const modelMap = new Map<string, ModelCostEntry>();
+	for (const item of [...left.commanderByModel, ...right.commanderByModel]) {
+		const prior = modelMap.get(item.key);
+		modelMap.set(item.key, prior
+			? { key: item.key, cost: prior.cost + item.cost, tokens: prior.tokens + item.tokens }
+			: { ...item });
+	}
+	const toolMap = new Map<string, ToolTextBytesEntry>();
+	for (const item of [...left.toolTextBytes, ...right.toolTextBytes]) {
+		const prior = toolMap.get(item.toolName);
+		toolMap.set(item.toolName, prior
+			? { toolName: item.toolName, count: prior.count + item.count, textBytes: prior.textBytes + item.textBytes }
+			: { ...item });
+	}
+	return {
+		commander,
+		worker,
+		other,
+		total: totals(totals(commander, worker), other),
+		commanderByModel: [...modelMap.values()]
+			.filter((item) => item.cost > 0 || item.tokens > 0)
+			.sort((a, b) => b.cost - a.cost),
+		commanderRequests: left.commanderRequests + right.commanderRequests,
+		compactions: left.compactions + right.compactions,
+		toolTextBytes: [...toolMap.values()].sort((a, b) => a.toolName < b.toolName ? -1 : a.toolName > b.toolName ? 1 : 0),
+		toolResultEntries: left.toolResultEntries + right.toolResultEntries,
+		toolTextBytesTotal: left.toolTextBytesTotal + right.toolTextBytesTotal,
+	};
+}
+
 /**
  * Build the split cost breakdown over session entries. Accepts any input
  * (defensive): malformed entries contribute zero and never throw. An optional

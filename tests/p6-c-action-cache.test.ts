@@ -18,7 +18,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdir, open, readFile, readdir, writeFile } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { before, test } from "node:test";
 
@@ -27,6 +27,7 @@ import { runGates } from "../extensions/workbench-runtime/core/gate-engine.ts";
 import {
 	ACTION_RECORD_MAX_BYTES,
 	CACHE_INDEX_MAX_BYTES,
+	ActionCacheIndexRebuildError,
 	LOCK_RECORD_MAX_BYTES,
 	ActionCacheStore,
 } from "../extensions/workbench-runtime/cache/action-store.ts";
@@ -479,6 +480,22 @@ test("refusal: symlink escape input -> cache refused, execution proceeds", async
 	});
 });
 
+test("refusal: project-local symlink input also refuses and never creates a reusable record", async () => {
+	await withTempDir(async (root) => {
+		await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"]) });
+		const { symlink } = await import("node:fs/promises");
+		await symlink("a.ts", join(root, "src", "alias.ts"));
+		const exec = fakeExec();
+		const first = await run(root, exec);
+		const second = await run(root, exec);
+		assert.equal(first.cache?.status, "refused");
+		assert.equal(second.cache?.status, "refused");
+		assert.match(first.cache?.reason ?? "", /symlink.*not cacheable.*without following/i);
+		assert.equal(exec.recipeCalls, 2, "refused fingerprints can never become a later cache hit");
+		assert.equal(await countActionRecords(root), 0);
+	});
+});
+
 test("refusal: cache write failure degrades to a normal run (write-failed)", async () => {
 	await withTempDir(async (root) => {
 		await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"]) });
@@ -587,6 +604,371 @@ test("store: stale lock is recovered", async () => {
 	});
 });
 
+test("store: different action keys serialize cache-index RMW and preserve both entries", async () => {
+	await withTempDir(async (root) => {
+		await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"]) });
+		const exec = fakeExec();
+		await run(root, exec);
+		const seedStore = new ActionCacheStore(root);
+		const seedIndex = await seedStore.readIndex();
+		const seed = (await seedStore.readRecord(seedIndex.entries[0]!.key)).record;
+		assert.ok(seed);
+		await seedStore.clear("all");
+
+		let firstEnteredResolve!: () => void;
+		const firstEntered = new Promise<void>((resolve) => { firstEnteredResolve = resolve; });
+		let releaseFirst!: () => void;
+		const firstBlocked = new Promise<void>((resolve) => { releaseFirst = resolve; });
+		let secondEntered = false;
+		const firstStore = new ActionCacheStore(root, {
+			indexMutationHooks: { afterAcquire: async () => { firstEnteredResolve(); await firstBlocked; } },
+		});
+		const secondStore = new ActionCacheStore(root, {
+			indexMutationHooks: { afterAcquire: () => { secondEntered = true; } },
+		});
+		const firstRecord = { ...seed, actionKey: "1".repeat(64), recipe: "first" };
+		const secondRecord = { ...seed, actionKey: "2".repeat(64), recipe: "second" };
+
+		const firstWrite = firstStore.writeRecord(firstRecord);
+		await firstEntered;
+		const secondWrite = secondStore.writeRecord(secondRecord);
+		await new Promise((resolve) => setTimeout(resolve, 75));
+		assert.equal(secondEntered, false, "a different key cannot enter index RMW while the first mutation owns the global mutex");
+		releaseFirst();
+		assert.deepEqual(await Promise.all([firstWrite, secondWrite]), [{ ok: true }, { ok: true }]);
+
+		const finalIndex = await seedStore.readIndex();
+		assert.deepEqual(finalIndex.entries.map((entry) => entry.key).sort(), [firstRecord.actionKey, secondRecord.actionKey]);
+		assert.deepEqual(await seedStore.stats(), {
+			entries: 2,
+			totalBytes: finalIndex.entries.reduce((sum, entry) => sum + entry.sizeBytes, 0),
+			perRecipe: {
+				first: { entries: 1, bytes: finalIndex.entries.find((entry) => entry.recipe === "first")!.sizeBytes },
+				second: { entries: 1, bytes: finalIndex.entries.find((entry) => entry.recipe === "second")!.sizeBytes },
+			},
+		});
+	});
+});
+
+test("store: cache-index write is accepted only after strict readback", async () => {
+	await withTempDir(async (root) => {
+		await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"]) });
+		const exec = fakeExec();
+		await run(root, exec);
+		const seedStore = new ActionCacheStore(root);
+		const seedIndex = await seedStore.readIndex();
+		const seed = (await seedStore.readRecord(seedIndex.entries[0]!.key)).record;
+		assert.ok(seed);
+		await seedStore.clear("all");
+
+		const key = "3".repeat(64);
+		let faulted = false;
+		const faultedStore = new ActionCacheStore(root, {
+			indexMutationHooks: {
+				afterWriteBeforeVerify: async () => {
+					if (faulted) return;
+					faulted = true;
+					await writeFile(seedStore.indexPath(), "{corrupted-after-rename", "utf8");
+				},
+			},
+		});
+		const result = await faultedStore.writeRecord({ ...seed, actionKey: key, recipe: "faulted" });
+		assert.equal(result.ok, false);
+		assert.match(result.error ?? "", /strict write verification failed/);
+		assert.deepEqual(await faultedStore.readRecord(key), { record: null, corrupt: false }, "failed readback rolls back the published record");
+		assert.deepEqual((await seedStore.readIndex()).entries, [], "the next bounded read repairs the corrupted index from rolled-back actions");
+	});
+});
+
+test("store: cache-index mutex recovers only a stable dead owner and preserves a live owner", async () => {
+	await withTempDir(async (root) => {
+		const bootId = "11111111-1111-4111-8111-111111111111";
+		const processStartTicks = "200";
+		const identityOptions = {
+			isProcessAlive: (pid: number) => pid === process.pid,
+			readBootId: async () => bootId,
+			readProcessStartTicks: async (pid: number) => pid === process.pid ? processStartTicks : null,
+		};
+		const locks = join(cacheDir(root), "locks");
+		await mkdir(locks, { recursive: true });
+		const recovering = new ActionCacheStore(root, { lockStaleMs: 10, indexLockWaitMs: 500, ...identityOptions });
+		await writeFile(recovering.indexLockPath(), JSON.stringify({
+			token: "dead-index-owner",
+			ownerPid: 999999,
+			createdAt: new Date(Date.now() - 10_000).toISOString(),
+			kind: "cache-index",
+		}), "utf8");
+		assert.deepEqual((await recovering.rebuildIndex()).entries, [], "dead owner is atomically claimed and recovered");
+
+		await writeFile(recovering.indexLockPath(), JSON.stringify({
+			token: "live-index-owner",
+			ownerPid: process.pid,
+			bootId,
+			processStartTicks,
+			createdAt: new Date(Date.now() - 10_000).toISOString(),
+			kind: "cache-index",
+		}), "utf8");
+		const blocked = new ActionCacheStore(root, { lockStaleMs: 10, indexLockWaitMs: 50, ...identityOptions });
+		await assert.rejects(blocked.rebuildIndex(), /cache index mutation lock wait timed out/);
+		const persisted = JSON.parse(await readFile(blocked.indexLockPath(), "utf8")) as { token?: unknown };
+		assert.equal(persisted.token, "live-index-owner", "live index owner is never removed based on age");
+	});
+});
+
+test("store: cache locks bind liveness to boot id and process start ticks, not PID alone", async () => {
+	await withTempDir(async (root) => {
+		const bootId = "11111111-1111-4111-8111-111111111111";
+		const otherBootId = "22222222-2222-4222-8222-222222222222";
+		const currentStartTicks = "200";
+		const options = {
+			lockStaleMs: 10,
+			lockWaitMs: 60,
+			indexLockWaitMs: 60,
+			isProcessAlive: (pid: number) => pid === process.pid,
+			readBootId: async () => bootId,
+			readProcessStartTicks: async (pid: number) => pid === process.pid ? currentStartTicks : null,
+		};
+		const store = new ActionCacheStore(root, options);
+		await mkdir(join(cacheDir(root), "locks"), { recursive: true });
+		const oldCreatedAt = new Date(Date.now() - 10_000).toISOString();
+
+		await writeFile(store.indexLockPath(), JSON.stringify({
+			token: "reused-pid-index", ownerPid: process.pid, bootId,
+			processStartTicks: "100", createdAt: oldCreatedAt, kind: "cache-index",
+		}), "utf8");
+		assert.deepEqual((await store.rebuildIndex()).entries, [], "same PID with different start ticks is a dead prior process");
+
+		const bootMismatchKey = "6".repeat(64);
+		await writeFile(store.lockPath(bootMismatchKey), JSON.stringify({
+			key: bootMismatchKey, token: "prior-boot", ownerPid: process.pid,
+			bootId: otherBootId, processStartTicks: currentStartTicks, createdAt: oldCreatedAt,
+		}), "utf8");
+		const afterBootMismatch = await store.acquireLock(bootMismatchKey);
+		assert.ok(afterBootMismatch, "same PID/start ticks from another boot is recoverable");
+		await afterBootMismatch!.release();
+
+		const liveKey = "7".repeat(64);
+		await writeFile(store.lockPath(liveKey), JSON.stringify({
+			key: liveKey, token: "exact-live-owner", ownerPid: process.pid,
+			bootId, processStartTicks: currentStartTicks, createdAt: oldCreatedAt,
+		}), "utf8");
+		assert.equal(await store.acquireLock(liveKey), null, "exact boot/start identity is never recovered based on age");
+		const livePayload = JSON.parse(await readFile(store.lockPath(liveKey), "utf8")) as { token?: unknown };
+		assert.equal(livePayload.token, "exact-live-owner");
+	});
+});
+
+test("store: unavailable process-instance identity fails closed for global and per-key locks", async () => {
+	await withTempDir(async (root) => {
+		const unavailable = new ActionCacheStore(root, {
+			lockStaleMs: 10,
+			lockWaitMs: 30,
+			indexLockWaitMs: 30,
+			isProcessAlive: () => true,
+			readBootId: async () => null,
+			readProcessStartTicks: async () => null,
+		});
+		await mkdir(join(cacheDir(root), "locks"), { recursive: true });
+		const key = "a".repeat(64);
+		const existing = JSON.stringify({
+			key, token: "unproven-owner", ownerPid: process.pid,
+			bootId: "11111111-1111-4111-8111-111111111111", processStartTicks: "100",
+			createdAt: new Date(Date.now() - 10_000).toISOString(),
+		});
+		await writeFile(unavailable.lockPath(key), existing, "utf8");
+		assert.equal(await unavailable.acquireLock(key), null);
+		assert.equal(await readFile(unavailable.lockPath(key), "utf8"), existing, "unproven per-key owner is untouched");
+
+		await writeFile(unavailable.indexLockPath(), JSON.stringify({
+			token: "unproven-index-owner", ownerPid: process.pid,
+			bootId: "11111111-1111-4111-8111-111111111111", processStartTicks: "100",
+			createdAt: new Date(Date.now() - 10_000).toISOString(), kind: "cache-index",
+		}), "utf8");
+		await assert.rejects(unavailable.rebuildIndex(), /owner process identity is unavailable/);
+		assert.equal((await lstat(unavailable.indexLockPath())).isFile(), true, "unproven global owner is untouched");
+	});
+});
+
+test("store: legacy empty/truncated fixed locks recover after the stale grace without partial publication", async () => {
+	await withTempDir(async (root) => {
+		const store = new ActionCacheStore(root, { lockStaleMs: 10, lockWaitMs: 500, indexLockWaitMs: 500 });
+		await mkdir(join(cacheDir(root), "locks"), { recursive: true });
+		const old = new Date(Date.now() - 10_000);
+
+		await writeFile(store.indexLockPath(), "", "utf8");
+		await utimes(store.indexLockPath(), old, old);
+		assert.deepEqual((await store.rebuildIndex()).entries, [], "empty index-lock crash residue is safely recovered");
+
+		const key = "8".repeat(64);
+		await writeFile(store.lockPath(key), "{", "utf8");
+		await utimes(store.lockPath(key), old, old);
+		const acquired = await store.acquireLock(key);
+		assert.ok(acquired, "truncated per-key lock crash residue is safely recovered");
+		await acquired!.release();
+		assert.deepEqual(await readdir(join(cacheDir(root), "locks")), [], "fixed and owner/claim names are removed after release");
+	});
+});
+
+test("store: static index symlinks and symlinked cache ancestors are never followed", async () => {
+	await withTempDir(async (root) => {
+		const store = new ActionCacheStore(root);
+		await mkdir(cacheDir(root), { recursive: true });
+		const external = join(root, "external-index.json");
+		const externalPayload = `${JSON.stringify({
+			schemaVersion: 1,
+			entries: [{
+				key: "7".repeat(64), recipe: "external", createdAt: new Date().toISOString(),
+				lastUsedAt: new Date().toISOString(), sizeBytes: 1, success: true, mode: "result-only",
+			}],
+		}, null, 2)}\n`;
+		await writeFile(external, externalPayload, "utf8");
+		await symlink(external, store.indexPath());
+		assert.deepEqual((await store.readIndex()).entries, [], "index leaf symlink is rebuilt locally, not trusted");
+		assert.equal(await readFile(external, "utf8"), externalPayload, "external symlink target is untouched");
+	});
+	await withTempDir(async (root) => {
+		await mkdir(join(root, ".pi", "workbench"), { recursive: true });
+		const externalCache = join(root, "external-cache");
+		await mkdir(externalCache);
+		await symlink(externalCache, cacheDir(root));
+		const store = new ActionCacheStore(root, { indexLockWaitMs: 50 });
+		await assert.rejects(store.readIndex(), /cache directory component is unsafe/);
+		assert.deepEqual(await readdir(externalCache), [], "unsafe ancestor target is never populated");
+	});
+});
+
+test("store: a valid index without membership makes an orphan record a miss until rebuild", async () => {
+	await withTempDir(async (root) => {
+		await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"]) });
+		const exec = fakeExec();
+		await run(root, exec);
+		const store = new ActionCacheStore(root);
+		const original = await store.readIndex();
+		assert.equal(original.entries.length, 1);
+		await writeFile(store.indexPath(), `${JSON.stringify({ schemaVersion: 1, entries: [] }, null, 2)}\n`, "utf8");
+		const rerun = await run(root, exec);
+		assert.equal(rerun.cache?.status, "miss", "unindexed record is not lookup-visible");
+		assert.equal(exec.recipeCalls, 2, "orphan record cannot suppress execution");
+	});
+});
+
+test("store: record publication is serialized with clear and prune", async () => {
+	for (const maintenance of ["clear", "prune"] as const) {
+		await withTempDir(async (root) => {
+			await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"]) });
+			await run(root, fakeExec());
+			const seedStore = new ActionCacheStore(root);
+			const seedIndex = await seedStore.readIndex();
+			const seed = (await seedStore.readRecord(seedIndex.entries[0]!.key)).record;
+			assert.ok(seed);
+			await seedStore.clear("all");
+
+			let publishedResolve!: () => void;
+			const published = new Promise<void>((resolve) => { publishedResolve = resolve; });
+			let continueResolve!: () => void;
+			const continueWrite = new Promise<void>((resolve) => { continueResolve = resolve; });
+			const writer = new ActionCacheStore(root, {
+				indexMutationHooks: { afterRecordPublishBeforeIndex: async () => { publishedResolve(); await continueWrite; } },
+			});
+			const record = { ...seed, actionKey: (maintenance === "clear" ? "4" : "5").repeat(64), recipe: maintenance };
+			const writePromise = writer.writeRecord(record);
+			await published;
+			const maintainer = new ActionCacheStore(root);
+			let maintenanceFinished = false;
+			const maintenancePromise = (maintenance === "clear"
+				? maintainer.clear("all")
+				: maintainer.prune({ apply: true, maxBytes: 0 }))
+				.finally(() => { maintenanceFinished = true; });
+			await new Promise((resolve) => setTimeout(resolve, 75));
+			assert.equal(maintenanceFinished, false, `${maintenance} cannot pass an in-flight record/index transaction`);
+			continueResolve();
+			assert.deepEqual(await writePromise, { ok: true });
+			await maintenancePromise;
+			assert.deepEqual((await seedStore.readIndex()).entries, []);
+			assert.deepEqual(await seedStore.readRecord(record.actionKey), { record: null, corrupt: false });
+		});
+	}
+});
+
+test("store: clear/prune report record deletion failure and retain index authority", async () => {
+	for (const maintenance of ["clear", "prune"] as const) {
+		await withTempDir(async (root) => {
+			await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"]) });
+			await run(root, fakeExec());
+			const store = new ActionCacheStore(root);
+			const index = await store.readIndex();
+			const entry = index.entries[0]!;
+			await rm(store.actionPath(entry.key));
+			await mkdir(store.actionPath(entry.key));
+			await writeFile(join(store.actionPath(entry.key), "blocking-child"), "x", "utf8");
+			if (maintenance === "clear") {
+				await assert.rejects(store.clear("all"), /could not remove every selected record/);
+			} else {
+				await assert.rejects(store.prune({ apply: true, maxBytes: 0 }), /could not remove every selected record/);
+			}
+			assert.equal((await store.readIndex()).entries.some((candidate) => candidate.key === entry.key), true);
+		});
+	}
+});
+
+test("store: stale-lock recovery never deletes an intervening fresh owner", async () => {
+	await withTempDir(async (root) => {
+		const bootId = "11111111-1111-4111-8111-111111111111";
+		const processStartTicks = "200";
+		const identityOptions = {
+			isProcessAlive: (pid: number) => pid === process.pid,
+			readBootId: async () => bootId,
+			readProcessStartTicks: async (pid: number) => pid === process.pid ? processStartTicks : null,
+		};
+		const key = "9".repeat(64);
+		const path = join(cacheDir(root), "locks", `${key}.lock`);
+		await mkdir(join(cacheDir(root), "locks"), { recursive: true });
+		await writeFile(path, JSON.stringify({ key, token: "stale", ownerPid: 999999, createdAt: new Date(Date.now() - 10_000).toISOString() }), "utf8");
+		let replaced = false;
+		let thirdOwnerAcquiredWhileFreshOwnerPresent = false;
+		const store = new ActionCacheStore(root, {
+			lockStaleMs: 10,
+			lockWaitMs: 120,
+			...identityOptions,
+			afterStaleLockObserved: async () => {
+				if (replaced) return;
+				replaced = true;
+				await rm(path, { force: true });
+				await writeFile(path, JSON.stringify({
+					key, token: "fresh", ownerPid: process.pid, bootId, processStartTicks, createdAt: new Date().toISOString(),
+				}), "utf8");
+				const third = await new ActionCacheStore(root, { lockWaitMs: 50, ...identityOptions }).acquireLock(key);
+				thirdOwnerAcquiredWhileFreshOwnerPresent = third !== null;
+				await third?.release();
+			},
+		});
+		assert.equal(await store.acquireLock(key), null, "the intervening live owner remains authoritative");
+		assert.equal(thirdOwnerAcquiredWhileFreshOwnerPresent, false, "a third contender never observes an acquisition gap");
+		const persisted = JSON.parse(await readFile(path, "utf8")) as { token?: unknown };
+		assert.equal(persisted.token, "fresh", "identity/token mismatch restores the captured replacement instead of deleting it");
+	});
+});
+
+test("store: a post-execution persistence failure releases the live cache lock", async () => {
+	await withTempDir(async (root) => {
+		await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"]) });
+		const base = fakeExec();
+		const exec = (async (command: string, args: string[], options?: Parameters<ExecFn>[2]) => {
+			const result = await base(command, args, options);
+			if (command === "hello-cli") {
+				const runsRoot = join(root, CONFIG, "workbench", "runs");
+				const staging = (await readdir(runsRoot)).find((name) => name.includes(".staging-"));
+				assert.ok(staging, "the run transaction staging directory exists during execution");
+				await rm(join(runsRoot, staging), { recursive: true, force: true });
+			}
+			return result;
+		}) as ExecFn;
+
+		await assert.rejects(run(root, exec), /ENOENT|no such file/i);
+		assert.deepEqual(await readdir(join(cacheDir(root), "locks")), [], "finally releases the lock after the persistence exception");
+	});
+});
+
 test("store: corrupted action JSON is a miss and is quarantined", async () => {
 	await withTempDir(async (root) => {
 		await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"]) });
@@ -604,6 +986,27 @@ test("store: corrupted action JSON is a miss and is quarantined", async () => {
 		const outcome = await run(root, exec);
 		assert.equal(outcome.cache?.status, "miss");
 		assert.equal(exec.recipeCalls, 2, "corruption -> miss -> executes");
+	});
+});
+
+test("store: valid JSON with a damaged required field becomes a miss and re-executes", async () => {
+	await withTempDir(async (root) => {
+		await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"]) });
+		const exec = fakeExec();
+		await run(root, exec);
+		const store = new ActionCacheStore(root);
+		const index = await store.readIndex();
+		const key = index.entries[0]!.key;
+		const path = store.actionPath(key);
+		const record = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+		record.toolchainVersions = null;
+		await writeFile(path, JSON.stringify(record), "utf8");
+
+		const result = await run(root, exec);
+		assert.equal(result.cache?.status, "miss");
+		assert.equal(exec.recipeCalls, 2, "damaged record is quarantined and the recipe executes normally");
+		const quarantine = await readdir(join(cacheDir(root), "tmp"));
+		assert.ok(quarantine.some((name) => name.startsWith("corrupt-")), "valid-JSON schema damage is quarantined");
 	});
 });
 
@@ -631,20 +1034,28 @@ test("store: oversized and non-regular authority records are rejected before all
 		assert.deepEqual(await store.readRecord(directoryKey), { record: null, corrupt: true });
 		assert.deepEqual(allocations, [], "non-regular action record is rejected before allocation");
 
+		const symlinkKey = "f".repeat(64);
+		const symlinkTarget = join(root, "outside-record.json");
+		await writeFile(symlinkTarget, JSON.stringify({ actionKey: symlinkKey }), "utf8");
+		const { symlink } = await import("node:fs/promises");
+		await symlink(symlinkTarget, store.actionPath(symlinkKey));
+		assert.deepEqual(await store.readRecord(symlinkKey), { record: null, corrupt: true });
+		assert.deepEqual(allocations, [], "action-record symlinks are rejected without reading their targets");
+
 		const indexHandle = await open(store.indexPath(), "w");
 		try { await indexHandle.truncate(CACHE_INDEX_MAX_BYTES + 1); }
 		finally { await indexHandle.close(); }
 		const rebuilt = await store.readIndex();
 		assert.deepEqual(rebuilt.entries, [], "oversized index fails closed to a bounded rebuild");
-		assert.deepEqual(allocations, [], "oversized index is rejected before allocation");
+		assert.ok(allocations.every((bytes) => bytes <= LOCK_RECORD_MAX_BYTES), "oversized index itself is rejected before allocation; only bounded mutex/readback records allocate");
 
 		await mkdir(join(cacheDir(root), "locks"), { recursive: true });
 		const lockKey = "d".repeat(64);
 		const lockHandle = await open(store.lockPath(lockKey), "w");
 		try { await lockHandle.truncate(LOCK_RECORD_MAX_BYTES + 1); }
 		finally { await lockHandle.close(); }
-		assert.equal(await store.hasFreshLock(lockKey), false, "oversized lock fails closed as not fresh");
-		assert.deepEqual(allocations, [], "oversized lock is rejected before allocation");
+		assert.equal(await store.hasFreshLock(lockKey), true, "oversized lock fails closed as occupied and is never deleted");
+		assert.ok(allocations.every((bytes) => bytes <= LOCK_RECORD_MAX_BYTES), "all index/lock verification allocations stay under the lock-record cap");
 	});
 });
 
@@ -664,8 +1075,45 @@ test("store: index rebuild skips oversized action records without allocating the
 		try { await handle.truncate(ACTION_RECORD_MAX_BYTES + 1); }
 		finally { await handle.close(); }
 		assert.deepEqual((await store.rebuildIndex()).entries, []);
-		assert.deepEqual(allocations, []);
-		assert.deepEqual(reads, []);
+		assert.ok(allocations.every((bytes) => bytes <= LOCK_RECORD_MAX_BYTES), "the oversized action record itself is never allocated");
+		assert.ok(reads.every((bytes) => bytes <= LOCK_RECORD_MAX_BYTES), "only bounded index-lock/index verification reads occur");
+	});
+});
+
+test("store: index rebuild refuses incomplete entry and total-byte scans", async () => {
+	await withTempDir(async (root) => {
+		const actions = join(cacheDir(root), "actions");
+		await mkdir(actions, { recursive: true });
+		await writeFile(join(actions, "foreign-a"), "x", "utf8");
+		await writeFile(join(actions, "foreign-b"), "x", "utf8");
+		const entryBounded = new ActionCacheStore(root, { indexRebuildMaxEntries: 1 });
+		await assert.rejects(
+			entryBounded.rebuildIndex(),
+			(error: unknown) => error instanceof ActionCacheIndexRebuildError && /entry scan limit/.test(error.message),
+			"an entry-overflow is an explicit refusal, never a truncated empty index",
+		);
+
+		await rm(actions, { recursive: true, force: true });
+		await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"]) });
+		const exec = fakeExec();
+		await run(root, exec);
+		const byteBounded = new ActionCacheStore(root, { indexRebuildMaxBytes: 1 });
+		await assert.rejects(
+			byteBounded.rebuildIndex(),
+			(error: unknown) => error instanceof ActionCacheIndexRebuildError && /record scan limit/.test(error.message),
+			"a byte-overflow is an explicit refusal, never a partial index",
+		);
+	});
+});
+
+test("store: index rebuild refuses an actions-directory symlink without following it", async () => {
+	await withTempDir(async (root) => {
+		const external = join(root, "external-actions");
+		await mkdir(external, { recursive: true });
+		await mkdir(cacheDir(root), { recursive: true });
+		const { symlink } = await import("node:fs/promises");
+		await symlink(external, join(cacheDir(root), "actions"));
+		await assert.rejects(new ActionCacheStore(root).rebuildIndex(), /not a real directory/);
 	});
 });
 
@@ -679,6 +1127,26 @@ test("store: corrupted index is rebuilt from actions/", async () => {
 		const index = await store.readIndex();
 		assert.equal(index.entries.length, 1, "index rebuilt from the actions directory");
 		assert.equal(index.schemaVersion, 1);
+	});
+});
+
+test("store: structurally valid JSON with unsafe index fields is rebuilt, never trusted", async () => {
+	await withTempDir(async (root) => {
+		await mkdir(cacheDir(root), { recursive: true });
+		await writeFile(join(cacheDir(root), "cache-index.json"), JSON.stringify({
+			schemaVersion: 1,
+			entries: [{
+				key: "a".repeat(64),
+				recipe: "hello",
+				createdAt: "2026-01-01T00:00:00.000Z",
+				lastUsedAt: "2026-01-01T00:00:00.000Z",
+				sizeBytes: Number.MAX_SAFE_INTEGER,
+				success: true,
+				mode: "result-only",
+			}],
+		}), "utf8");
+		const index = await new ActionCacheStore(root).readIndex();
+		assert.deepEqual(index.entries, [], "malicious size accounting cannot survive the strict parser");
 	});
 });
 

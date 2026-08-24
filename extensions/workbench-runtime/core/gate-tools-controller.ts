@@ -16,7 +16,7 @@ import {
 	renderGateDefinitionPage,
 } from "./report.ts";
 import { renderGatePreflightLines, type GatePreflightToolDetails } from "./render.ts";
-import { isValidRunId, readManifest } from "./runs.ts";
+import { isPureLegacyRunForDiagnostic, isValidRunId, readCommittedManifest, readManifest } from "./runs.ts";
 import { WORKBENCH_TOOL_METADATA, WORKBENCH_TOOL_PARAMETERS } from "./tool-catalog.ts";
 import { boundedGateDetails, fixedToolFailure, renderGateListPresentation } from "./tool-presentation.ts";
 import { buildTrustedRecoveryAuthority } from "./trusted-recovery-authority.ts";
@@ -160,7 +160,18 @@ export function registerGateTools<TIngress>(controller: GateToolsController<TIng
 					if (!isValidRunId(runId)) return fixedToolFailure("workbench_read_gate", "invalid_run_id");
 					const manifest = await readManifest(projectRoot, runId);
 					if (!manifest) return fixedToolFailure("workbench_read_gate", "run_not_found");
-					if (manifest.recipe !== "gate") return fixedToolFailure("workbench_read_gate", "not_a_gate_run");
+					const committedV2 = await readCommittedManifest(projectRoot, runId);
+					const pureLegacyDiagnostic = committedV2 === null
+						&& await isPureLegacyRunForDiagnostic(projectRoot, runId);
+					// A loose manifest which merely looks like schema v1 is not enough
+					// to enter the diagnostic compatibility path. Any mixed v2 marker,
+					// invalid transaction identity, or concurrent marker appearance must
+					// remain fail-closed instead of being downgraded to "legacy".
+					if (committedV2 === null && !pureLegacyDiagnostic) {
+						return fixedToolFailure("workbench_read_gate", "committed_run_identity_unavailable");
+					}
+					const authoritativeManifest = committedV2 ?? manifest;
+					if (authoritativeManifest.recipe !== "gate") return fixedToolFailure("workbench_read_gate", "not_a_gate_run");
 					const page = await readGateRunPage({
 						projectRoot,
 						runId,
@@ -168,6 +179,7 @@ export function registerGateTools<TIngress>(controller: GateToolsController<TIng
 						cursor: params.cursor,
 						maxBytes: maxOutputBytes,
 						maxLines: params.max_lines,
+						requireCommittedAuthority: committedV2 !== null,
 					});
 					if (!page.ok) return fixedToolFailure("workbench_read_gate", page.code, page.details.source_path);
 					if (page.details.next_cursor) controller.rememberTrustedGateContinuation(toolCallId, page.details.next_cursor);
@@ -175,7 +187,7 @@ export function registerGateTools<TIngress>(controller: GateToolsController<TIng
 						content: [{ type: "text" as const, text: boundedCommandText(page.text, maxOutputBytes, 320) }],
 						details: page.details,
 					};
-					const authority = await buildTrustedRecoveryAuthority({
+					const authority = committedV2 === null ? undefined : await buildTrustedRecoveryAuthority({
 						projectRoot,
 						sourceKind: "run_id_gate_page",
 						toolCallId,

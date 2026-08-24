@@ -256,6 +256,57 @@ test("negative audit mentions remain readable while status mismatches fail", () 
 	);
 });
 
+test("mixed negation cannot erase an affirmative success claim in the same sentence", () => {
+	const english = inspectDelegationClaims(assistant(
+		`delegation ${REAL_ID} did not fail, but completed successfully.`,
+	));
+	assert.ok(english);
+	assert.equal(english.negativeOnly, false);
+	assert.deepEqual(english.ids, [REAL_ID]);
+	assert.deepEqual(english.expectedStatuses[REAL_ID], [{ status: "SUCCESS", source: "unspecified" }]);
+	assert.deepEqual(validateDelegationClaims(english, evidence(), []), { ok: false, code: "missing_authority" });
+	assert.deepEqual(
+		validateDelegationClaims(english, evidence(), [{ id: REAL_ID, status: "REVIEWED" }]),
+		{ ok: true },
+	);
+
+	const chinese = inspectDelegationClaims(assistant(
+		`委派 ${REAL_ID} 不是失败，而是成功完成。`,
+	));
+	assert.ok(chinese);
+	assert.equal(chinese.negativeOnly, false);
+	assert.deepEqual(chinese.ids, [REAL_ID]);
+	assert.deepEqual(validateDelegationClaims(chinese, evidence(), []), { ok: false, code: "missing_authority" });
+});
+
+test("FINAL review claims bind to session REVIEWED authority", () => {
+	const inspection = inspectDelegationClaims(assistant(
+		`delegation ${REAL_ID}: review v2 PASS (FINAL)`,
+	));
+	assert.ok(inspection);
+	assert.deepEqual(inspection.ids, [REAL_ID]);
+	assert.deepEqual(inspection.expectedStatuses[REAL_ID], [{ status: "REVIEWED", source: "session" }]);
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(), [{ id: REAL_ID, status: "REVIEWED", sessionStatus: "PENDING_REVIEW" }]),
+		{ ok: false, code: "status_mismatch" },
+	);
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(), [{ id: REAL_ID, status: "REVIEWED", sessionStatus: "REVIEWED" }]),
+		{ ok: true },
+	);
+});
+
+test("build and workflow ids do not become delegation claims", () => {
+	assert.equal(
+		inspectDelegationClaims(assistant(`build ${FAKE_IDS[0]} FINISHED`)),
+		undefined,
+	);
+	assert.equal(
+		inspectDelegationClaims(assistant(`workflow ${FAKE_IDS[1]} SUCCESS`)),
+		undefined,
+	);
+});
+
 test("quoted evidence, code blocks, and negated clauses cannot fabricate authority", () => {
 	const inspection = inspectDelegationClaims(assistant([
 		"Rejected transcript:",

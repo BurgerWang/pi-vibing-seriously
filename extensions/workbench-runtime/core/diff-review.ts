@@ -115,6 +115,7 @@ import { join, resolve } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import { truncateUtf8 } from "../worker/handoff.ts";
+import { canonicalHash } from "../cache/canonical-hash.ts";
 
 import {
 	changedSinceBefore,
@@ -140,12 +141,22 @@ import {
 	type ReviewRelevanceBindingV2,
 	type ReviewRelevanceProjectionV2,
 } from "./review-relevance-v2.ts";
+import {
+	SEMANTIC_REVIEW_ENVELOPE_MAX_AGGREGATE_BYTES_V1,
+	SEMANTIC_REVIEW_ENVELOPE_MAX_RECORD_BYTES_V1,
+	SEMANTIC_REVIEW_ENVELOPE_MAX_STREAM_BYTES_V1,
+	buildSemanticReviewEnvelopeV1,
+	estimateSemanticReviewRecordBytesV1,
+	type SemanticReviewEnvelopeErrorCodeV1,
+	type SemanticReviewEnvelopeV1,
+	type SemanticReviewStreamDescriptorV1,
+} from "./semantic-review-envelope.ts";
 
 export const REVIEW_SCHEMA_VERSION = 1;
 export const DEFAULT_REVIEW_MAX_LINES = 400;
 export const DEFAULT_REVIEW_MAX_BYTES = 32 * 1024;
 /** Fixed pre-allocation cap for the authoritative persisted review record. */
-export const REVIEW_RECORD_MAX_BYTES = 1_048_576 as const;
+export const REVIEW_RECORD_MAX_BYTES = SEMANTIC_REVIEW_ENVELOPE_MAX_RECORD_BYTES_V1;
 export const REVIEW_ERROR_MAX_BYTES = 8 * 1024;
 export const MAX_REVIEW_PATCH_PATHS = 50;
 export const MAX_REVIEW_NOTES = 10;
@@ -165,13 +176,13 @@ export const REVIEW_PATH_STATS_MAX_LINES = 60;
  * continuation paging.  The stream is never persisted in full: only the
  * currently visible page plus a hash-bound contiguous byte cursor is kept.
  */
-export const REVIEW_PAGE_SOURCE_MAX_BYTES = MAX_DIGEST_BYTES;
+export const REVIEW_PAGE_SOURCE_MAX_BYTES = SEMANTIC_REVIEW_ENVELOPE_MAX_STREAM_BYTES_V1;
 /** One durable presentation proof per checked worker path. */
 export const REVIEW_PRESENTATION_PROGRESS_MAX_ITEMS = 500;
-/** Bound the cumulative receipt chain stored for one path. */
+/** Legacy read-only bound; new records keep one tail segment plus O(1) receipt state. */
 export const REVIEW_PRESENTATION_SEGMENT_MAX_ITEMS = 4_096;
 /** Bound total source bytes revalidated before semantic ACCEPT. */
-export const REVIEW_PRESENTATION_VALIDATION_MAX_BYTES = 64 * 1024 * 1024;
+export const REVIEW_PRESENTATION_VALIDATION_MAX_BYTES = SEMANTIC_REVIEW_ENVELOPE_MAX_AGGREGATE_BYTES_V1;
 /** Space reserved inside the patch section for the title and fail-closed marker. */
 const REVIEW_PAGE_ENVELOPE_RESERVE_BYTES = 1_152;
 const REVIEW_PAGE_ENVELOPE_RESERVE_LINES = 4;
@@ -380,6 +391,10 @@ export interface ReviewPresentationProgress {
 	total_bytes: number;
 	/** Contiguous page receipts from byte zero through next_byte. */
 	segments: ReviewPresentationSegment[];
+	/** O(paths) v1 accumulator. New writes retain only the latest segment. */
+	page_count?: number;
+	/** SHA-256 of the exact authoritative stream prefix [0,next_byte). */
+	receipt_sha256?: string;
 }
 
 export interface ReviewPresentationSegment {
@@ -475,6 +490,8 @@ export interface ReviewRecord {
 	diff_identity_kind?: typeof REVIEW_RELEVANCE_KIND_V2;
 	relevance_binding?: ReviewRelevanceBindingV2;
 	relevance_projection?: ReviewRelevanceProjectionV2;
+	/** Commit-time proof that this PENDING review lies inside the closure envelope. */
+	review_envelope?: SemanticReviewEnvelopeV1;
 }
 
 export type SemanticReviewRisk = "low" | "medium" | "high";
@@ -577,6 +594,7 @@ export interface ReviewAuthorityFacts {
 	drift_paths?: readonly string[];
 	relevance_binding?: ReviewRelevanceBindingV2;
 	relevance_projection?: ReviewRelevanceProjectionV2;
+	review_envelope?: SemanticReviewEnvelopeV1;
 }
 
 export interface ReviewFromAuthorityInput extends ReviewInput {
@@ -1180,11 +1198,13 @@ async function patchEntryFor(
 			if (totalBytes > 0 && startByte < totalBytes) {
 				const page = slicePresentationPage(stream.text, startByte, pageRequest.maxBytes, pageRequest.maxLines);
 				if (page !== null) {
+					const encoded = Buffer.from(stream.text, "utf8");
 					return {
 						path,
 						source: stream.source,
 						text: page.text,
 						perPathTruncated: page.endByte < page.totalBytes || startByte > 0,
+						prefixReceiptSha256: createHash("sha256").update(encoded.subarray(0, page.endByte)).digest("hex"),
 						page: {
 							stream_sha256: stream.streamSha256,
 							start_byte: startByte,
@@ -1197,6 +1217,118 @@ async function patchEntryFor(
 		}
 	}
 	return patchTextFor(projectRoot, path, exec, secrets, maxBytes).then((entry) => ({ path, ...entry, perPathTruncated: entry.truncated }));
+}
+
+export type SemanticReviewEnvelopePreflightFailureCode =
+	| SemanticReviewEnvelopeErrorCodeV1
+	| "presentation_unavailable";
+
+export type SemanticReviewEnvelopePreflightResult =
+	| { ok: true; value: SemanticReviewEnvelopeV1 }
+	| { ok: false; code: SemanticReviewEnvelopePreflightFailureCode };
+
+function projectedPageCount(text: string): number | undefined {
+	const bytes = Buffer.byteLength(text, "utf8");
+	if (bytes === 0) return 0;
+	let lines = 1;
+	for (let index = 0; index < text.length; index += 1) if (text.charCodeAt(index) === 10) lines += 1;
+	const pages = Math.max(
+		Math.ceil(bytes / REVIEW_PAGE_BODY_MAX_BYTES),
+		Math.ceil(lines / REVIEW_PAGE_BODY_MAX_LINES),
+	);
+	return Number.isSafeInteger(pages) && pages > 0 ? pages : undefined;
+}
+
+/**
+ * Compute the exact current presentation-stream admission proof before a
+ * generation is published PENDING_REVIEW.  The same compact/full-stream
+ * constructors are used by review itself, so oversize, aggregate and record
+ * capacity failures become explicit pre-publication recovery instead of a
+ * permanently uncloseable PENDING transaction.
+ */
+export async function preflightSemanticReviewEnvelopeV1(input: {
+	projectRoot: string;
+	workerPaths: readonly string[];
+	allowedPaths: readonly string[];
+	afterDigests: Readonly<Record<string, string>>;
+	pathStatuses: Readonly<Record<string, string>>;
+	relevanceProjection: ReviewRelevanceProjectionV2;
+	relevanceProjectionHash: string;
+	exec: ExecFn;
+	secrets?: readonly string[];
+}): Promise<SemanticReviewEnvelopePreflightResult> {
+	try {
+		const workerPaths = [...input.workerPaths];
+		if (workerPaths.length > REVIEW_PRESENTATION_PROGRESS_MAX_ITEMS ||
+			workerPaths.some((path, index) => index > 0 && Buffer.from(workerPaths[index - 1]!, "utf8").compare(Buffer.from(path, "utf8")) >= 0)) {
+			return { ok: false, code: "invalid_input" };
+		}
+		const streams: SemanticReviewStreamDescriptorV1[] = [];
+		const secrets = input.secrets ?? [];
+		for (const path of workerPaths) {
+			if (!(await isWorkerPathAllowedRealpath(input.projectRoot, path, input.allowedPaths))) {
+				return { ok: false, code: "presentation_unavailable" };
+			}
+			let source: SemanticReviewStreamDescriptorV1["source"];
+			let text: string;
+			if (isCompactEligiblePath(path)) {
+				const compact = await compactFactsFor(
+					input.projectRoot,
+					path,
+					secrets,
+					input.afterDigests,
+					input.pathStatuses[path] ?? "",
+				);
+				if (compact !== null) {
+					source = "compact";
+					text = renderCompactFacts(compact);
+				} else {
+					const stream = await pageablePatchStreamFor(input.projectRoot, path, input.exec, secrets);
+					if (stream === null) return { ok: false, code: "stream_limit_exceeded" };
+					source = stream.source;
+					text = stream.text;
+				}
+			} else {
+				const stream = await pageablePatchStreamFor(input.projectRoot, path, input.exec, secrets);
+				if (stream === null) {
+					const deleted = !(path in input.afterDigests) && (input.pathStatuses[path] ?? "").includes("D");
+					if (!deleted) return { ok: false, code: "stream_limit_exceeded" };
+					source = "deleted";
+					text = "(deleted or unreadable)";
+				} else {
+					source = stream.source;
+					text = stream.text;
+				}
+			}
+			const streamBytes = Buffer.byteLength(text, "utf8");
+			if (streamBytes > REVIEW_PAGE_SOURCE_MAX_BYTES) return { ok: false, code: "stream_limit_exceeded" };
+			const pageCount = source === "compact" || source === "deleted"
+				? (streamBytes === 0 ? 0 : 1)
+				: projectedPageCount(text);
+			if (pageCount === undefined) return { ok: false, code: "invalid_input" };
+			streams.push({
+				path,
+				source,
+				stream_bytes: streamBytes,
+				stream_sha256: createHash("sha256").update(text, "utf8").digest("hex"),
+				page_count: pageCount,
+			});
+		}
+		const projectedBytes = estimateSemanticReviewRecordBytesV1({
+			worker_paths: workerPaths,
+			allowed_paths: input.allowedPaths,
+			streams,
+			relevance_projection: input.relevanceProjection,
+		});
+		if (projectedBytes === undefined) return { ok: false, code: "invalid_input" };
+		return buildSemanticReviewEnvelopeV1({
+			streams,
+			projected_review_record_bytes: projectedBytes,
+			relevance_projection_hash: input.relevanceProjectionHash,
+		});
+	} catch {
+		return { ok: false, code: "presentation_unavailable" };
+	}
 }
 
 /**
@@ -1216,6 +1348,8 @@ interface RawPatchEntry {
 	/** Phase 5: additive structured compact facts (source === "compact"). */
 	compact?: ReviewCompactFacts;
 	page?: ReviewPatchPage;
+	/** Ephemeral, recomputable prefix proof used only when this page is visible. */
+	prefixReceiptSha256?: string;
 }
 
 /**
@@ -1415,17 +1549,34 @@ function normalizedPresentationProgress(record: ReviewRecord): ReviewPresentatio
 			!Number.isSafeInteger(item.total_bytes) || item.total_bytes < 0 ||
 			item.total_bytes > REVIEW_PAGE_SOURCE_MAX_BYTES || item.next_byte > item.total_bytes ||
 			((item.source === "deleted" || item.source === "compact" || item.source === "withheld") && item.next_byte !== item.total_bytes)) return [];
-		if (!Array.isArray(item.segments) || item.segments.length > REVIEW_PRESENTATION_SEGMENT_MAX_ITEMS) return [];
-		let segmentCursor = 0;
-		for (const segment of item.segments) {
-			if (typeof segment !== "object" || segment === null || Array.isArray(segment) ||
-				!Number.isSafeInteger(segment.start_byte) || segment.start_byte !== segmentCursor ||
-				!Number.isSafeInteger(segment.end_byte) || segment.end_byte <= segment.start_byte || segment.end_byte > item.total_bytes ||
-				typeof segment.page_sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(segment.page_sha256)) return [];
-			segmentCursor = segment.end_byte;
+		const hasPageCount = Object.prototype.hasOwnProperty.call(item, "page_count");
+		const hasReceipt = Object.prototype.hasOwnProperty.call(item, "receipt_sha256");
+		if (hasPageCount !== hasReceipt || !Array.isArray(item.segments)) return [];
+		if (hasPageCount) {
+			if (!Number.isSafeInteger(item.page_count) || item.page_count! < 0 ||
+				item.page_count! > item.next_byte ||
+				typeof item.receipt_sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(item.receipt_sha256) ||
+				item.segments.length > 1 || (item.next_byte === 0) !== (item.page_count === 0) ||
+				(item.next_byte === 0) !== (item.segments.length === 0)) return [];
+			const segment = item.segments[0];
+			if (segment !== undefined && (typeof segment !== "object" || segment === null || Array.isArray(segment) ||
+				!Number.isSafeInteger(segment.start_byte) || segment.start_byte < 0 ||
+				!Number.isSafeInteger(segment.end_byte) || segment.end_byte !== item.next_byte ||
+				segment.end_byte <= segment.start_byte || segment.end_byte > item.total_bytes ||
+				typeof segment.page_sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(segment.page_sha256))) return [];
+		} else {
+			if (item.segments.length > REVIEW_PRESENTATION_SEGMENT_MAX_ITEMS) return [];
+			let segmentCursor = 0;
+			for (const segment of item.segments) {
+				if (typeof segment !== "object" || segment === null || Array.isArray(segment) ||
+					!Number.isSafeInteger(segment.start_byte) || segment.start_byte !== segmentCursor ||
+					!Number.isSafeInteger(segment.end_byte) || segment.end_byte <= segment.start_byte || segment.end_byte > item.total_bytes ||
+					typeof segment.page_sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(segment.page_sha256)) return [];
+				segmentCursor = segment.end_byte;
+			}
+			if (segmentCursor !== item.next_byte || (item.total_bytes === 0 && item.segments.length !== 0) ||
+				(item.total_bytes > 0 && item.next_byte > 0 && item.segments.length === 0)) return [];
 		}
-		if (segmentCursor !== item.next_byte || (item.total_bytes === 0 && item.segments.length !== 0) ||
-			(item.total_bytes > 0 && item.next_byte > 0 && item.segments.length === 0)) return [];
 		seen.add(item.path);
 		normalized.push({ ...item, segments: item.segments.map((segment) => ({ ...segment })) });
 	}
@@ -1450,6 +1601,7 @@ function mergeReviewPresentationProgress(
 	workerPaths: readonly string[],
 	prior: readonly ReviewPresentationProgress[],
 	fullyVisibleEntries: readonly ReviewPatchEntry[],
+	prefixReceipts: ReadonlyMap<string, string>,
 ): ReviewPresentationProgress[] {
 	const byPath = new Map(prior.map((item) => [item.path, { ...item }]));
 	for (const entry of fullyVisibleEntries) {
@@ -1458,17 +1610,21 @@ function mergeReviewPresentationProgress(
 			if (!isCompleteReviewPresentationEntry(entry)) continue;
 			const bytes = Buffer.byteLength(entry.text, "utf8");
 			if (bytes > REVIEW_PAGE_SOURCE_MAX_BYTES) continue;
+			const segment = bytes === 0 ? undefined : {
+				start_byte: 0,
+				end_byte: bytes,
+				page_sha256: createHash("sha256").update(entry.text, "utf8").digest("hex"),
+			};
+			const streamHash = createHash("sha256").update(entry.text, "utf8").digest("hex");
 			byPath.set(entry.path, {
 				path: entry.path,
 				source: entry.source,
-				stream_sha256: createHash("sha256").update(entry.text, "utf8").digest("hex"),
+				stream_sha256: streamHash,
 				next_byte: bytes,
 				total_bytes: bytes,
-				segments: bytes === 0 ? [] : [{
-					start_byte: 0,
-					end_byte: bytes,
-					page_sha256: createHash("sha256").update(entry.text, "utf8").digest("hex"),
-				}],
+				segments: segment === undefined ? [] : [segment],
+				page_count: segment === undefined ? 0 : 1,
+				receipt_sha256: streamHash,
 			});
 			continue;
 		}
@@ -1480,19 +1636,26 @@ function mergeReviewPresentationProgress(
 			existing.stream_sha256 === page.stream_sha256 && existing.total_bytes === page.total_bytes;
 		const expectedStart = sameStream ? existing.next_byte : 0;
 		if (page.start_byte !== expectedStart || page.end_byte <= page.start_byte || page.end_byte > page.total_bytes) continue;
-		const priorSegments = sameStream ? existing.segments : [];
-		if (priorSegments.length >= REVIEW_PRESENTATION_SEGMENT_MAX_ITEMS) continue;
+		const priorPageCount = sameStream
+			? existing.page_count ?? existing.segments.length
+			: 0;
+		if (!Number.isSafeInteger(priorPageCount) || priorPageCount >= Number.MAX_SAFE_INTEGER) continue;
+		const prefixReceipt = prefixReceipts.get(entry.path);
+		if (prefixReceipt === undefined || !/^[0-9a-f]{64}$/u.test(prefixReceipt)) continue;
+		const segment = {
+			start_byte: page.start_byte,
+			end_byte: page.end_byte,
+			page_sha256: createHash("sha256").update(entry.text, "utf8").digest("hex"),
+		};
 		byPath.set(entry.path, {
 			path: entry.path,
 			source: entry.source,
 			stream_sha256: page.stream_sha256,
 			next_byte: page.end_byte,
 			total_bytes: page.total_bytes,
-			segments: [...priorSegments.map((segment) => ({ ...segment })), {
-				start_byte: page.start_byte,
-				end_byte: page.end_byte,
-				page_sha256: createHash("sha256").update(entry.text, "utf8").digest("hex"),
-			}],
+			segments: [segment],
+			page_count: priorPageCount + 1,
+			receipt_sha256: prefixReceipt,
 		});
 	}
 	return workerPaths.flatMap((path) => {
@@ -1528,6 +1691,7 @@ export async function validateReviewPresentationAgainstAuthority(
 		const secrets = input.secrets ?? [];
 		let validatedBytes = 0;
 		const actualByPath = new Map<string, { source: ReviewPatchEntry["source"]; text: string; hash: string; total: number }>();
+		const envelopeStreams: SemanticReviewStreamDescriptorV1[] = [];
 		for (const item of progress) {
 			let source: ReviewPatchEntry["source"];
 			let text: string;
@@ -1562,9 +1726,22 @@ export async function validateReviewPresentationAgainstAuthority(
 				total !== item.total_bytes || createHash("sha256").update(text, "utf8").digest("hex") !== item.stream_sha256) return false;
 			actualByPath.set(item.path, { source, text, hash: item.stream_sha256, total });
 			const actualBytes = Buffer.from(text, "utf8");
+			if (item.receipt_sha256 !== undefined &&
+				createHash("sha256").update(actualBytes.subarray(0, item.next_byte)).digest("hex") !== item.receipt_sha256) return false;
 			for (const segment of item.segments) {
 				if (createHash("sha256").update(actualBytes.subarray(segment.start_byte, segment.end_byte)).digest("hex") !== segment.page_sha256) return false;
 			}
+			const pageCount = source === "compact" || source === "deleted"
+				? (total === 0 ? 0 : 1)
+				: projectedPageCount(text);
+			if (pageCount === undefined) return false;
+			envelopeStreams.push({
+				path: item.path,
+				source,
+				stream_bytes: total,
+				stream_sha256: item.stream_sha256,
+				page_count: pageCount,
+			});
 		}
 		for (const entry of input.record.patch) {
 			const actual = actualByPath.get(entry.path);
@@ -1577,6 +1754,26 @@ export async function validateReviewPresentationAgainstAuthority(
 			} else if (isCompleteReviewPresentationEntry(entry) && entry.text !== actual.text) {
 				return false;
 			}
+		}
+		const authorityEnvelope = input.authority.review_envelope;
+		const recordEnvelope = input.record.review_envelope;
+		if ((authorityEnvelope === undefined) !== (recordEnvelope === undefined)) return false;
+		if (authorityEnvelope !== undefined) {
+			if (input.authority.relevance_projection === undefined || input.authority.relevance_binding === undefined ||
+				canonicalHash(authorityEnvelope) !== canonicalHash(recordEnvelope)) return false;
+			const projectedBytes = estimateSemanticReviewRecordBytesV1({
+				worker_paths: checked,
+				allowed_paths: input.authority.allowed_paths,
+				streams: envelopeStreams,
+				relevance_projection: input.authority.relevance_projection,
+			});
+			if (projectedBytes === undefined) return false;
+			const rebuilt = buildSemanticReviewEnvelopeV1({
+				streams: envelopeStreams,
+				projected_review_record_bytes: projectedBytes,
+				relevance_projection_hash: input.authority.relevance_binding.projection_hash,
+			});
+			if (!rebuilt.ok || canonicalHash(rebuilt.value) !== canonicalHash(authorityEnvelope)) return false;
 		}
 		return true;
 	} catch {
@@ -1843,6 +2040,7 @@ async function reviewDelegationInner(
 			diff_identity_kind: REVIEW_RELEVANCE_KIND_V2,
 			relevance_binding: structuredClone(authority.relevance_binding!),
 			relevance_projection: structuredClone(authority.relevance_projection!),
+			...(authority.review_envelope === undefined ? {} : { review_envelope: structuredClone(authority.review_envelope) }),
 		} : {}),
 	};
 
@@ -1872,10 +2070,13 @@ async function reviewDelegationInner(
 	// content advance this call; prior same-hash durable coverage still
 	// merges normally (legacy records infer it from their persisted patch).
 	const coverage = mergeReviewCoverage(workerPaths, patch.map((entry) => entry.path), priorReview, boundDiffHash);
+	const prefixReceipts = new Map(rawEntries.flatMap((entry) =>
+		entry.prefixReceiptSha256 === undefined ? [] : [[entry.path, entry.prefixReceiptSha256] as const]));
 	const presentationProgress = mergeReviewPresentationProgress(
 		workerPaths,
 		priorProgress,
 		patch.filter((entry) => fullyVisibleSet.has(entry.path)),
+		prefixReceipts,
 	);
 	const completedPagedPaths = presentationProgress
 		.filter((item) => item.next_byte === item.total_bytes)

@@ -18,7 +18,12 @@ import {
 	type FileSourceSnapshot,
 } from "./continuation-cursor.ts";
 import { runsDir } from "./config.ts";
-import { GATE_SCHEMA_VERSION } from "./gate-engine.ts";
+import {
+	GATE_AUTHORITY_RECORD_MAX_BYTES,
+	GATE_SCHEMA_VERSION,
+	readPersistedGateRunFacts,
+	validatePersistedGateRunRecords,
+} from "./gate-engine.ts";
 import type { Gate, GateStatus } from "./gate-schema.ts";
 import { runStatusLabel } from "./format.ts";
 import { validateQuantResult, type QuantResultValidation } from "./quant-result.ts";
@@ -126,6 +131,7 @@ export interface GateReadPageDetails {
 	remaining_count: number;
 	next_cursor?: string;
 	source_path: string;
+	authority_kind?: "committed-v2" | "diagnostic";
 }
 
 export type GateReadPageResult =
@@ -282,6 +288,12 @@ async function readStrictGateCandidate(
 	}
 	const record = await readGateFileRecordWithReason(projectRoot, runId);
 	if (!record.ok) return { ok: false, reason: record.reason };
+	if (!await readPersistedGateRunFacts(projectRoot, runId, manifest)) {
+		return { ok: false, reason: "gate authority semantics invalid" };
+	}
+	if (!await readCommittedManifest(projectRoot, runId)) {
+		return { ok: false, reason: "committed run identity changed during gate authority read" };
+	}
 	return { ok: true, record: record.record };
 }
 
@@ -399,7 +411,7 @@ interface GateEvidenceCheck {
 
 export type GateEvidenceViewResult =
 	| { ok: true; text: string; sourcePath: string; checkCount: number; shownCount: number }
-	| { ok: false; code: "gate_evidence_unavailable" | "source_oversized" | "source_not_regular" | "invalid_record"; text: string; sourcePath: string };
+	| { ok: false; code: "gate_evidence_unavailable" | "source_oversized" | "source_not_regular" | "invalid_record" | "committed_run_identity_unavailable"; text: string; sourcePath: string };
 
 function parseEvidenceChecks(value: unknown, runId: string): GateEvidenceCheck[] | undefined {
 	if (!isRecord(value) || value.schema_version !== GATE_SCHEMA_VERSION || value.run_id !== runId) return undefined;
@@ -428,7 +440,7 @@ function gateEvidenceUnavailableCode(code: BoundedFileErrorCode): "gate_evidence
 }
 
 function fixedEvidenceFailure(
-	code: "gate_evidence_unavailable" | "source_oversized" | "source_not_regular" | "invalid_record",
+	code: "gate_evidence_unavailable" | "source_oversized" | "source_not_regular" | "invalid_record" | "committed_run_identity_unavailable",
 	sourcePath: string,
 ): GateEvidenceViewResult {
 	const text = clampWholeResultText(
@@ -439,11 +451,37 @@ function fixedEvidenceFailure(
 }
 
 /** Same-open bounded evidence.json reader with a strict schema and whole-result clamp. */
-export async function readGateEvidenceView(projectRoot: string, runId: string, hooks?: BoundedFileIoHooks): Promise<GateEvidenceViewResult> {
+export async function readGateEvidenceView(
+	projectRoot: string,
+	runId: string,
+	hooks?: BoundedFileIoHooks,
+	options: { requireCommittedAuthority?: boolean } = {},
+): Promise<GateEvidenceViewResult> {
 	const sourcePath = displayRelative(projectRoot, join(runsDir(projectRoot), runId, "evidence.json"));
 	if (!isValidRunId(runId)) return fixedEvidenceFailure("invalid_record", sourcePath);
+	const manifest = options.requireCommittedAuthority === true
+		? await readCommittedManifest(projectRoot, runId)
+		: null;
+	if (options.requireCommittedAuthority === true && (!manifest || manifest.recipe !== "gate")) {
+		return fixedEvidenceFailure("committed_run_identity_unavailable", sourcePath);
+	}
 	const read = await readJsonFileBounded(join(runsDir(projectRoot), runId, "evidence.json"), GATE_EVIDENCE_RECORD_MAX_BYTES, hooks);
 	if (!read.ok) return fixedEvidenceFailure(gateEvidenceUnavailableCode(read.error.code), sourcePath);
+	if (manifest) {
+		const gatesRead = await readJsonFileBounded(
+			join(runsDir(projectRoot), runId, "gates.json"),
+			GATE_AUTHORITY_RECORD_MAX_BYTES,
+		);
+		if (!gatesRead.ok || !validatePersistedGateRunRecords(runId, manifest, gatesRead.value.value, read.value.value)) {
+			return fixedEvidenceFailure("invalid_record", sourcePath);
+		}
+		// The final inventory verification covers both exact files read above;
+		// an in-place change can never turn their diagnostic contents into v2
+		// authority after the initial transaction check.
+		if (!await readCommittedManifest(projectRoot, runId)) {
+			return fixedEvidenceFailure("committed_run_identity_unavailable", sourcePath);
+		}
+	}
 	const checks = parseEvidenceChecks(read.value.value, runId);
 	if (!checks) return fixedEvidenceFailure("invalid_record", sourcePath);
 
@@ -641,13 +679,23 @@ export async function readGateRunPage(input: {
 	/** Internal exact turn allocation; not part of the public tool schema. */
 	maxBytes?: number;
 	maxLines?: number;
+	/** Authority-bearing tool reads require a complete committed v2 identity. */
+	requireCommittedAuthority?: boolean;
 }): Promise<GateReadPageResult> {
 	const include = normalizedInclude(input.include ?? "failures");
 	const maxBytes = normalizedMaxBytes(input.maxBytes);
 	const maxLines = normalizedMaxLines(input.maxLines);
 	if (!include || maxBytes === undefined || maxLines === undefined) return fixedPageFailure("invalid_pagination");
+	if (input.requireCommittedAuthority === true) {
+		const manifest = await readCommittedManifest(input.projectRoot, input.runId);
+		if (!manifest || manifest.recipe !== "gate") return fixedPageFailure("committed_run_identity_unavailable");
+		if (!await readPersistedGateRunFacts(input.projectRoot, input.runId, manifest)) return fixedPageFailure("invalid_record");
+	}
 	const read = await readGateFileRecordWithReason(input.projectRoot, input.runId);
 	if (!read.ok) return fixedPageFailure(read.code);
+	if (input.requireCommittedAuthority === true && !await readCommittedManifest(input.projectRoot, input.runId)) {
+		return fixedPageFailure("committed_run_identity_changed");
+	}
 	const sourceIdResult = computeFileSourceId("gate-read", `gate-run:${input.runId}:${include}`);
 	if (!sourceIdResult.ok) return fixedPageFailure(sourceIdResult.error.code, read.sourcePath);
 	const rows = runRows(read.record, include);
@@ -685,6 +733,7 @@ export async function readGateRunPage(input: {
 			remaining_count: page.remaining,
 			...(page.nextCursor ? { next_cursor: page.nextCursor } : {}),
 			source_path: read.sourcePath,
+			authority_kind: input.requireCommittedAuthority === true ? "committed-v2" : "diagnostic",
 		},
 	};
 }

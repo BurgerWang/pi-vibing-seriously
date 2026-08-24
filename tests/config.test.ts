@@ -13,6 +13,7 @@ import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import {
 	findProjectRoot,
+	ConfigFileReadError,
 	loadProjectConfig,
 	resolveEffectiveProjectRoot,
 	UntrustedProjectError,
@@ -81,6 +82,25 @@ test("missing config files produce an empty configuration without errors", async
 		assert.equal(config.profile, undefined);
 		assert.equal(config.recipes.length, 0);
 		assert.deepEqual(config.issues, []);
+	});
+});
+
+test("only ENOENT is optional; present non-regular or invalid UTF-8 config fails closed", async () => {
+	await withTempDir(async (dir) => {
+		const configDir = workbenchDir(dir);
+		await mkdir(join(configDir, "project.yaml"), { recursive: true });
+		await assert.rejects(
+			loadProjectConfig(dir, { trusted: true }),
+			(error) => error instanceof ConfigFileReadError && error.message.includes("not a regular file"),
+		);
+	});
+	await withTempDir(async (dir) => {
+		await mkdir(workbenchDir(dir), { recursive: true });
+		await writeFile(join(workbenchDir(dir), "project.yaml"), Buffer.from([0xff, 0xfe, 0xfd]));
+		await assert.rejects(
+			loadProjectConfig(dir, { trusted: true }),
+			(error) => error instanceof ConfigFileReadError && error.message.includes("invalid_utf8"),
+		);
 	});
 });
 

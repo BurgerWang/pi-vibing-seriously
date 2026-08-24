@@ -668,7 +668,7 @@ test("/q-run-show clamps a hostile but preflight-valid manifest and retains its 
 	});
 });
 
-test("/q-evidence uses the strict reader and clamps the entire hostile evidence presentation", async () => {
+test("/q-evidence requires committed v2 evidence identity and rejects post-commit replacement", async () => {
 	await withTempDir(async (root) => {
 		await setupProject(root, undefined, GATES_FAIL_YAML);
 		const stub = makeStub();
@@ -703,11 +703,7 @@ test("/q-evidence uses the strict reader and clamps the entire hostile evidence 
 		await command.handler(runId, ctx as never);
 		const text = ctx.notifyLines.join("\n");
 		assertWithinCaps(text, COMMAND_OUTPUT_MAX_BYTES, COMMAND_OUTPUT_MAX_LINES);
-		const display = text.match(/display: shown=(\d+) omitted=(\d+) max_evidence_items_per_check=4/);
-		assert.ok(display, text);
-		assert.equal(Number(display![1]) + Number(display![2]), 200, "shown + omitted is exact after fitting the whole result");
-		assert.ok(Number(display![1]) > 0 && Number(display![1]) < 200, "the bounded view makes progress and explicitly omits the rest");
-		assert.match(text, new RegExp(`full record: \\.pi/workbench/runs/${runId}/evidence\\.json`));
-		assert.doesNotMatch(text, /workbench-output truncated/, "semantic fitting precedes the shared whole-result defense");
+		assert.match(text, /committed run identity unavailable/);
+		assert.doesNotMatch(text, /display: shown=/, "uncommitted replacement content is never rendered diagnostically as v2 evidence");
 	});
 });

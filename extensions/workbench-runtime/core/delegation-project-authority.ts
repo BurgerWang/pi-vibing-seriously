@@ -142,6 +142,7 @@ const RECOVERABLE_ARTIFACT_FAILURE_REASONS = new Set([
 	"committed artifact construction failed: binding_conflict",
 	"committed artifact construction failed: invalid_facts",
 	"committed artifact construction failed: invalid_report",
+	"committed artifact construction failed: review_envelope_exceeded",
 	"committed artifact construction failed: record_too_large",
 	"committed artifact construction failed: internal_error",
 ]);

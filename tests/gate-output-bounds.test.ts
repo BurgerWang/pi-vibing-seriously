@@ -206,6 +206,20 @@ test("500-gate/check records page without loss and reject replay against changed
 	});
 });
 
+test("authority-bearing explicit Gate reads reject uncommitted v2-like artifacts", async () => {
+	await withTempDir(async (root) => {
+		await writeGateRecord(root, RUN_ID, gateRecord());
+		const strict = await readGateRunPage({
+			projectRoot: root,
+			runId: RUN_ID,
+			include: "summary",
+			requireCommittedAuthority: true,
+		});
+		assert.equal(strict.ok, false);
+		if (!strict.ok) assert.equal(strict.code, "committed_run_identity_unavailable");
+	});
+});
+
 test("500-check gate definitions use the same bounded, strict cursor protocol", () => {
 	const gate: Gate = {
 		id: "g500",

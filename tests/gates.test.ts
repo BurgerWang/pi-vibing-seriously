@@ -33,17 +33,19 @@ import {
 	preflightGateManualEvidence,
 	readPersistedGateRunFacts,
 	runGates,
+	validatePersistedGateRunRecords,
 	type CheckContext,
 } from "../extensions/workbench-runtime/core/gate-engine.ts";
 import { readGateFileRecord } from "../extensions/workbench-runtime/core/report.ts";
 import {
 	clearGateRunCandidateCacheForTests,
 	GATE_ATTEMPT_INDEX_DIR,
+	GATE_ATTEMPT_ORDER_DIR,
 	readManifest,
 } from "../extensions/workbench-runtime/core/runs.ts";
 import type { ValidationEvidenceBlock } from "../extensions/workbench-runtime/core/validation-evidence.ts";
 import { gateStateHash } from "../extensions/workbench-runtime/core/validation-evidence.ts";
-import type { ExecFn } from "../extensions/workbench-runtime/core/config.ts";
+import { workbenchDir, type ExecFn } from "../extensions/workbench-runtime/core/config.ts";
 import { BASE_GATES } from "../extensions/workbench-runtime/core/gate-catalog.ts";
 import { runRecipe } from "../extensions/workbench-runtime/core/recipe-runner.ts";
 import { parseGate, type GateCheck, type WorkerFirstGateFacts } from "../extensions/workbench-runtime/core/gate-schema.ts";
@@ -697,6 +699,19 @@ test("quant gates load only for quant profiles", async () => {
 	});
 });
 
+test("an unreadable/non-regular project profile fails Gate selection instead of silently dropping profile gates", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, { profile: "quant-research/stock-selection" });
+		assert.equal((await loadGates(dir)).filter((gate) => gate.id.startsWith("q")).length, 6);
+		const projectPath = join(workbenchDir(dir), "project.yaml");
+		await rm(projectPath);
+		await mkdir(projectPath);
+		await assert.rejects(loadGates(dir), /workbench configuration unavailable/);
+		const runsRoot = join(workbenchDir(dir), "runs");
+		assert.deepEqual(await readdir(runsRoot).catch(() => []), [], "selection fails before allocating a Gate attempt");
+	});
+});
+
 test("generic profiles do not enforce quant gates (running all)", async () => {
 	await withTempDir(async (dir) => {
 		await setupProject(dir, { profile: "generic" });
@@ -1120,6 +1135,67 @@ test("latest gate status rejects a marker whose start identity contradicts the c
 	});
 });
 
+test("shared Gate authority semantics reject empty coverage and outcome/check contradictions", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, { gatesYaml: gatesYaml(`  - id: g1\n    title: G1\n    checks:\n${CONFIG_CHECK}`) });
+		const result = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec });
+		const manifest = await readManifest(dir, result.runId);
+		assert.ok(manifest);
+		const gates = await readRunFile(result.runDir, "gates.json");
+		const evidence = await readRunFile(result.runDir, "evidence.json");
+		assert.ok(validatePersistedGateRunRecords(result.runId, manifest!, gates, evidence));
+
+		const empty = structuredClone(gates);
+		empty.gates = [];
+		assert.equal(validatePersistedGateRunRecords(result.runId, manifest!, empty, evidence), null);
+
+		const uncovered = structuredClone(gates);
+		uncovered.requested = ["g1", "ghost"];
+		const uncoveredEvidence = structuredClone(evidence);
+		uncoveredEvidence.requested = ["g1", "ghost"];
+		assert.equal(validatePersistedGateRunRecords(result.runId, manifest!, uncovered, uncoveredEvidence), null);
+
+		const contradictoryManifest = { ...manifest!, run_outcome: "PROCESS_FAILED" as const, exit_code: 1 };
+		assert.equal(validatePersistedGateRunRecords(result.runId, contradictoryManifest, gates, evidence), null);
+
+		const contradictoryGate = structuredClone(gates) as { gates: Array<Record<string, unknown>> };
+		contradictoryGate.gates[0]!.status = "FAIL";
+		assert.equal(validatePersistedGateRunRecords(result.runId, manifest!, contradictoryGate, evidence), null);
+	});
+});
+
+test("persisted Gate prerequisites are unique and exactly reproduce earlier same-run status", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir, {
+			gatesYaml: gatesYaml(
+				`  - id: g1\n    title: G1\n    checks:\n${CONFIG_CHECK}\n  - id: g2\n    title: G2\n    prerequisites: [g1]\n    checks:\n      - { id: g2.1, title: Config, kind: config }`,
+			),
+		});
+		const result = await runGates({ projectRoot: dir, selector: "g2", mode: "DEV", exec: spawnExec });
+		const manifest = await readManifest(dir, result.runId);
+		assert.ok(manifest);
+		const gates = await readRunFile(result.runDir, "gates.json") as { gates: Array<Record<string, unknown>> };
+		const evidence = await readRunFile(result.runDir, "evidence.json");
+		assert.ok(validatePersistedGateRunRecords(result.runId, manifest!, gates, evidence));
+
+		const missing = structuredClone(gates);
+		missing.gates[1]!.prerequisite_status = {};
+		assert.equal(validatePersistedGateRunRecords(result.runId, manifest!, missing, evidence), null);
+
+		const duplicate = structuredClone(gates);
+		duplicate.gates[1]!.prerequisites = ["g1", "g1"];
+		assert.equal(validatePersistedGateRunRecords(result.runId, manifest!, duplicate, evidence), null);
+
+		const mismatch = structuredClone(gates);
+		(mismatch.gates[1]!.prerequisite_status as Record<string, Record<string, unknown>>).g1!.status = "FAIL";
+		assert.equal(validatePersistedGateRunRecords(result.runId, manifest!, mismatch, evidence), null);
+
+		const foreignSource = structuredClone(gates);
+		(foreignSource.gates[1]!.prerequisite_status as Record<string, Record<string, unknown>>).g1!.source = "missing-this-run";
+		assert.equal(validatePersistedGateRunRecords(result.runId, manifest!, foreignSource, evidence), null);
+	});
+});
+
 test("persisted gate/evidence authority readers preflight size/type before allocation and fail closed on corruption", async () => {
 	await withTempDir(async (dir) => {
 		await setupProject(dir, {
@@ -1192,9 +1268,10 @@ test("large check/path volume fails closed before writing unreadable gate author
 		);
 
 		const runRoot = join(dir, ".pi", "workbench", "runs");
-		const runIds = (await readdir(runRoot)).filter((name) => name !== ".gate-index");
+		const runIds = (await readdir(runRoot)).filter((name) => name !== GATE_ATTEMPT_INDEX_DIR && name !== GATE_ATTEMPT_ORDER_DIR);
 		assert.equal(runIds.length, 1, "evaluation may allocate one private run directory before final authority compilation");
 		assert.equal((await readdir(join(runRoot, ".gate-index"))).length, 1, "the pre-evaluation attempt marker remains as fail-closed UNKNOWN authority");
+		assert.equal((await readdir(join(runRoot, GATE_ATTEMPT_ORDER_DIR))).length, 1, "the durable sequence claim also remains fail-closed");
 		const files = await readdir(join(runRoot, runIds[0]!));
 		assert.ok(files.includes("artifacts"));
 		assert.ok(!files.includes("gates.json"), "oversized complete gates facts are never silently truncated or persisted unreadably");

@@ -9,15 +9,15 @@
  */
 
 import assert from "node:assert/strict";
-import { chmod, mkdir, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, rename, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 import { parse as parseYaml } from "yaml";
 
 import { parseRecipesDocument, type Recipe } from "../extensions/workbench-runtime/core/recipe-schema.ts";
-import { computeActionKey } from "../extensions/workbench-runtime/cache/action-key.ts";
+import { computeActionKey, WORKBENCH_CONFIG_HASH_MAX_BYTES } from "../extensions/workbench-runtime/cache/action-key.ts";
 import { fingerprintInputs, FingerprintError } from "../extensions/workbench-runtime/cache/action-fingerprint.ts";
-import { parseCachePolicy, MAX_INPUT_DEPTH } from "../extensions/workbench-runtime/cache/action-types.ts";
+import { MAX_INPUT_DEPTH, MAX_INPUT_ENTRIES, MAX_INPUT_FILE_BYTES, parseCachePolicy } from "../extensions/workbench-runtime/cache/action-types.ts";
 import type { ExecFn } from "../extensions/workbench-runtime/core/config.ts";
 import { withTempDir } from "./helpers.ts";
 
@@ -146,24 +146,47 @@ test("fingerprint: directory recursion (nested change) and stable sort", async (
 	});
 });
 
-test("fingerprint: project-local symlink records target + content hash", async () => {
+test("fingerprint: project-local symlinks refuse without reading their targets", async () => {
 	await withTempDir(async (dir) => {
 		await writeInputs(dir, { "data/real.txt": "target content" });
 		await symlink("real.txt", join(dir, "data", "link.txt"));
-		const one = await fingerprintInputs(dir, ["data/**"]);
-		// The directory entry carries the recursive Merkle hash (which includes
-		// the symlink's link target + target content hash).
-		assert.ok(one.entries.some((e) => e.p === "data" && e.t === "dir"));
-		// A direct pattern match exposes the symlink entry itself.
-		const direct = await fingerprintInputs(dir, ["data/link.txt"]);
-		assert.equal(direct.entries[0]?.t, "symlink");
-		assert.equal(direct.facts.symlinks, 1);
-		// Changing the TARGET content changes the symlink entry hash and the merkle hash.
-		await writeFile(join(dir, "data", "real.txt"), "other content", "utf8");
-		const two = await fingerprintInputs(dir, ["data/**"]);
-		assert.notEqual(one.merkleHash, two.merkleHash);
-		const directTwo = await fingerprintInputs(dir, ["data/link.txt"]);
-		assert.notEqual(direct.merkleHash, directTwo.merkleHash);
+		await assert.rejects(fingerprintInputs(dir, ["data/**"]), /symlink.*(?:not cacheable|cache refused).*without following/i);
+		await assert.rejects(fingerprintInputs(dir, ["data/link.txt"]), /symlink.*(?:not cacheable|cache refused).*without following/i);
+		await symlink("data", join(dir, "linked-data"));
+		await assert.rejects(fingerprintInputs(dir, ["linked-data/real.txt"]), /contains a symlink.*without following/i);
+	});
+});
+
+test("fingerprint: wildcard symlink prefix is rejected before target traversal", async () => {
+	await withTempDir(async (dir) => {
+		await writeInputs(dir, { "external/deep/value.txt": "outside traversal" });
+		await symlink("external", join(dir, "linked-tree"));
+		await assert.rejects(
+			fingerprintInputs(dir, ["linked-tree/**/*.txt"]),
+			/contains a symlink.*without following|symlink.*glob discovery refused without following/i,
+		);
+	});
+});
+
+test("fingerprint: atomic path replacement cannot bypass single-fd size and identity checks", async () => {
+	await withTempDir(async (dir) => {
+		await writeInputs(dir, { "src/value.txt": "small stable input" });
+		const replacement = join(dir, "replacement.bin");
+		const handle = await open(replacement, "w");
+		try { await handle.truncate(MAX_INPUT_FILE_BYTES + 1); }
+		finally { await handle.close(); }
+		let replaced = false;
+		await assert.rejects(
+			fingerprintInputs(dir, ["src/value.txt"], {
+				afterFileOpenStat: async (path) => {
+					if (replaced) return;
+					replaced = true;
+					await rename(replacement, path);
+				},
+			}),
+			/changed identity or contents during hashing/,
+			"hashing remains bounded to the original descriptor and then rejects the replaced pathname",
+		);
 	});
 });
 
@@ -194,6 +217,28 @@ test("fingerprint: protected secret inputs are never read (refused marker)", asy
 		// The secret CONTENT must not influence the hash.
 		const fp2 = await fingerprintInputs(dir, [".env"]);
 		assert.equal(fp.merkleHash, fp2.merkleHash);
+	});
+});
+
+test("fingerprint: unified entry budget counts directories and protected markers", async () => {
+	await withTempDir(async (dir) => {
+		const protectedDir = join(dir, "inputs");
+		await mkdir(protectedDir, { recursive: true });
+		const batchSize = 250;
+		for (let start = 0; start < MAX_INPUT_ENTRIES - 1; start += batchSize) {
+			const end = Math.min(start + batchSize, MAX_INPUT_ENTRIES - 1);
+			await Promise.all(Array.from({ length: end - start }, (_, offset) =>
+				writeFile(join(protectedDir, `secrets.${start + offset}`), "never read", "utf8")));
+		}
+		const exact = await fingerprintInputs(dir, ["inputs"]);
+		assert.equal(exact.facts.protectedRefused, MAX_INPUT_ENTRIES - 1, "root directory plus protected children exactly fills the unified budget");
+
+		await writeFile(join(protectedDir, `secrets.${MAX_INPUT_ENTRIES - 1}`), "never read", "utf8");
+		await assert.rejects(
+			fingerprintInputs(dir, ["inputs"]),
+			new RegExp(`${MAX_INPUT_ENTRIES}-entry limit`),
+			"one more non-file entry refuses the cache instead of producing a truncated Merkle hash",
+		);
 	});
 });
 
@@ -353,6 +398,83 @@ test("action key: lockfile change -> different key", async () => {
 		assert.ok(one.ok && two.ok);
 		assert.notEqual(one.key.components.lockfileHashes["package-lock.json"], two.key.components.lockfileHashes["package-lock.json"]);
 		assert.notEqual(one.key.key, two.key.key);
+	});
+});
+
+test("action key: unreadable lockfile refuses cache instead of aliasing the missing marker", async () => {
+	await withTempDir(async (dir) => {
+		await writeInputs(dir, { "src/a.ts": "x", "Cargo.lock": "version = 4\n" });
+		const recipe = recipeFromYaml("t", baseRecipeYaml(["src/**/*.ts"]));
+		await chmod(join(dir, "Cargo.lock"), 0o000);
+		const result = await keyFor(dir, recipe, fakeExec({ ...GIT_RESPONSES }));
+		assert.equal(result.ok, false);
+		if (!result.ok) assert.match(result.reason, /lockfile "Cargo\.lock" cannot be read/);
+	});
+});
+
+test("action key: unreadable workbench config refuses cache instead of aliasing the missing marker", async () => {
+	await withTempDir(async (dir) => {
+		await writeInputs(dir, { "src/a.ts": "x" });
+		await mkdir(join(dir, ".pi", "workbench"), { recursive: true });
+		const projectConfig = join(dir, ".pi", "workbench", "project.yaml");
+		await writeFile(projectConfig, "name: demo\n", "utf8");
+		await chmod(projectConfig, 0o000);
+		const recipe = recipeFromYaml("t", baseRecipeYaml(["src/**/*.ts"]));
+		const result = await keyFor(dir, recipe, fakeExec({ ...GIT_RESPONSES }));
+		assert.equal(result.ok, false);
+		if (!result.ok) assert.match(result.reason, /workbench config "project\.yaml" cannot be read/);
+	});
+});
+
+test("action key: lockfile/config symlinks and oversized config refuse without target reads", async () => {
+	await withTempDir(async (dir) => {
+		await writeInputs(dir, { "src/a.ts": "x", "real-Cargo.lock": "version = 4\n" });
+		await symlink("real-Cargo.lock", join(dir, "Cargo.lock"));
+		const recipe = recipeFromYaml("t", baseRecipeYaml(["src/**/*.ts"]));
+		const lockResult = await keyFor(dir, recipe, fakeExec({ ...GIT_RESPONSES }));
+		assert.equal(lockResult.ok, false);
+		if (!lockResult.ok) assert.match(lockResult.reason, /lockfile "Cargo\.lock" is a symlink/);
+	});
+	await withTempDir(async (dir) => {
+		await writeInputs(dir, { "src/a.ts": "x", "config-source.yaml": "name: demo\n" });
+		await mkdir(join(dir, ".pi", "workbench"), { recursive: true });
+		await symlink(join(dir, "config-source.yaml"), join(dir, ".pi", "workbench", "project.yaml"));
+		const recipe = recipeFromYaml("t", baseRecipeYaml(["src/**/*.ts"]));
+		const symlinkResult = await keyFor(dir, recipe, fakeExec({ ...GIT_RESPONSES }));
+		assert.equal(symlinkResult.ok, false);
+		if (!symlinkResult.ok) assert.match(symlinkResult.reason, /workbench config "project\.yaml" is a symlink/);
+
+		// Replace the symlink itself, not its target.
+		const { rm } = await import("node:fs/promises");
+		await rm(join(dir, ".pi", "workbench", "project.yaml"), { force: true });
+		const oversized = await open(join(dir, ".pi", "workbench", "project.yaml"), "w");
+		try { await oversized.truncate(WORKBENCH_CONFIG_HASH_MAX_BYTES + 1); }
+		finally { await oversized.close(); }
+		const oversizedResult = await keyFor(dir, recipe, fakeExec({ ...GIT_RESPONSES }));
+		assert.equal(oversizedResult.ok, false);
+		if (!oversizedResult.ok) assert.match(oversizedResult.reason, /exceeds the .* hash limit/);
+	});
+	await withTempDir(async (dir) => {
+		await writeInputs(dir, {
+			"src/a.ts": "x",
+			"external-workbench/project.yaml": "name: external\n",
+		});
+		await mkdir(join(dir, ".pi"), { recursive: true });
+		await symlink(join(dir, "external-workbench"), join(dir, ".pi", "workbench"));
+		const recipe = recipeFromYaml("t", baseRecipeYaml(["src/**/*.ts"]));
+		const ancestorResult = await keyFor(dir, recipe, fakeExec({ ...GIT_RESPONSES }));
+		assert.equal(ancestorResult.ok, false);
+		if (!ancestorResult.ok) assert.match(ancestorResult.reason, /workbench config .* ancestor is a symlink/);
+	});
+	await withTempDir(async (dir) => {
+		await writeInputs(dir, { "src/a.ts": "x" });
+		const oversized = await open(join(dir, "Cargo.lock"), "w");
+		try { await oversized.truncate(64 * 1024 * 1024 + 1); }
+		finally { await oversized.close(); }
+		const recipe = recipeFromYaml("t", baseRecipeYaml(["src/**/*.ts"]));
+		const oversizedResult = await keyFor(dir, recipe, fakeExec({ ...GIT_RESPONSES }));
+		assert.equal(oversizedResult.ok, false);
+		if (!oversizedResult.ok) assert.match(oversizedResult.reason, /lockfile "Cargo\.lock" exceeds the .* hash limit/);
 	});
 });
 

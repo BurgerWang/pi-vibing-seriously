@@ -362,15 +362,15 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 	let lock: LockHandle | null = null;
 	if (plan.active && computed?.ok) {
 		lock = await store.acquireLock(computed.key.key);
-		if (lock && cacheMode !== "refresh-cache") {
+	}
+	try {
+		if (lock && computed?.ok && cacheMode !== "refresh-cache") {
 			// Re-check under the lock: a concurrent run may have finished.
 			const hit = await tryHit(computed.key);
 			if (hit) {
-				await lock.release().catch(() => {});
 				return hitResult(hit, computed.key.key, "reused result written by a concurrent run (double-checked lock)");
 			}
 		}
-	}
 
 	// ------------------------------------------------------------------ exec
 	const runId = makeRunId(startedAt);
@@ -378,7 +378,6 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 	try {
 		transaction = await beginRunTransaction(projectRoot, runId);
 	} catch (error) {
-		if (lock) await lock.release().catch(() => {});
 		return { ok: false, error: `RUN_RECORD_COMMIT_FAILED: ${(error as Error).message}` };
 	}
 	const runDir = transaction.finalDir;
@@ -405,7 +404,6 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 	} catch (error) {
 		// Spawn failure: persist what we know so the run is not lost, then
 		// surface the error to the caller.
-		if (lock) await lock.release().catch(() => {});
 		const failedAt = now();
 		const redactedArgv = redactText(argv.join("\u0000"), secrets).split("\u0000").map(redactArgvEntry);
 		const record: RunRecord = {
@@ -648,8 +646,6 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		}
 	}
 
-	if (lock) await lock.release().catch(() => {});
-
 	// P4a: capture the validation binding for the exec terminal path and
 	// patch the persisted + returned manifest (never alters the outcome).
 	const patched = await captureAndPatchRunManifest({
@@ -682,6 +678,9 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		runDir,
 		cache: cacheStatus,
 	};
+	} finally {
+		if (lock) await lock.release().catch(() => {});
+	}
 }
 
 /** Project-relative form of a path for display (keeps messages portable). */

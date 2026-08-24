@@ -71,10 +71,7 @@ import {
 	serializeDelegationState,
 } from "../extensions/workbench-runtime/core/delegation-state.ts";
 import {
-	confirmLease,
-	issueLease,
 	LEASE_STATE_ENTRY_TYPE,
-	serializeLease,
 	STRICT_SOL_DEV_ALLOWLIST,
 } from "../extensions/workbench-runtime/core/write-authority.ts";
 import { WORKER_ROLE_ENV } from "../extensions/workbench-runtime/core/worker-policy.ts";
@@ -180,6 +177,34 @@ async function solSession(stub: StubAPI, entries: StubAPI["entries"] = []): Prom
 	const handlers = stub.events.get("session_start");
 	assert.ok(handlers && handlers.length > 0);
 	await handlers[0]!({ type: "session_start", reason: "resume" } as never, fakeCtx(entries, { model: SOL_MODEL }) as never);
+}
+
+/** Run a user-only command in print mode and capture its visible output. */
+async function runPrintCommand(stub: StubAPI, name: string, args: string): Promise<string> {
+	const def = stub.commands.get(name) as { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> } | undefined;
+	assert.ok(def, `command ${name} registered`);
+	let output = "";
+	const original = console.log;
+	console.log = (message?: unknown) => {
+		output += `${String(message)}\n`;
+	};
+	try {
+		await def.handler(args, {
+			...fakeCtx(stub.entries, { model: SOL_MODEL }),
+			mode: "print",
+			hasUI: false,
+		} as unknown as ExtensionCommandContext);
+	} finally {
+		console.log = original;
+	}
+	return output;
+}
+
+function confirmationParts(output: string): { partA: string; partB: string } {
+	const partA = /confirmation part A: (\S+)/.exec(output)?.[1];
+	const partB = /confirmation part B: (\S+)/.exec(output)?.[1];
+	assert.ok(partA && partB, "the issue command returns both confirmation parts");
+	return { partA, partB };
 }
 
 // ---------------------------------------------------------------------------
@@ -962,20 +987,9 @@ test("successful handoff: idle wait, prepared record, parent link, setup entries
 test("the source lease never transfers: DEV source with an ACTIVE lease yields an exactly-locked target", async () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
-	// Source: DEV + approved Sol + a confirmed ACTIVE lease + delegation.
-	const recentNow = new Date(Date.now() - 60_000).toISOString();
-	const issued = issueLease({
-		id: "wl-milestone",
-		reason: "user-directed",
-		paths: ["src/**"],
-		confirmationTokenA: "MS-A-123",
-		confirmationTokenB: "MS-B-456",
-		maxCalls: 3,
-		now: recentNow,
-	});
-	if (!issued.ok) throw new Error(issued.error);
-	const confirmed = confirmLease(issued.lease, "MS-A-123", "MS-B-456", recentNow);
-	if (!confirmed.ok) throw new Error(confirmed.error);
+	// Source: DEV + approved Sol + delegation. An ACTIVE lease is deliberately
+	// issued in this live session: session_start must never revive an ACTIVE
+	// lease copied from durable history.
 	const recorded = recordDelegation(emptyDelegationState(), {
 		id: "20260801-120000-abcd",
 		diffHash: "a".repeat(64),
@@ -986,15 +1000,23 @@ test("the source lease never transfers: DEV source with an ACTIVE lease yields a
 		entry(MODE_ENTRY_TYPE, { mode: "DEV" }),
 		entry(COMPACT_STATE_ENTRY_TYPE, { mode: "DEV", task: "implement slice D" }),
 		entry(DELEGATION_STATE_ENTRY_TYPE, serializeDelegationState(recorded.state)),
-		entry(LEASE_STATE_ENTRY_TYPE, serializeLease(confirmed.lease)),
 	];
-	await solSession(stub, sourceEntries);
+	stub.entries.push(...sourceEntries);
+	await solSession(stub, stub.entries);
+	const issuedOutput = await runPrintCommand(
+		stub,
+		"q-commander-write-unlock",
+		"user-directed --paths src/** --calls 3 --minutes 10",
+	);
+	const { partA, partB } = confirmationParts(issuedOutput);
+	const confirmedOutput = await runPrintCommand(stub, "q-commander-write-unlock", `confirm ${partA} ${partB}`);
+	assert.match(confirmedOutput, /CONFIRMED/);
 	// The source lease is genuinely ACTIVE: edit/write are advertised.
 	assert.deepEqual(stub.activeTools, [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
 	assert.equal(await guardCall(stub, "edit", { path: "src/main.ts" }), undefined, "source lease authorizes writes");
 
 	const harness = makeHarness();
-	await runMilestoneCommand(stub, sourceEntries, harness, "implement the next slice");
+	await runMilestoneCommand(stub, stub.entries, harness, "implement the next slice");
 	assert.ok(harness.setupRan && harness.withSessionRan);
 	assert.ok(!harness.targetEntries.some((e) => e.customType === LEASE_STATE_ENTRY_TYPE), "no lease entry in the target");
 	assert.equal(harness.reloadCalls, 1);

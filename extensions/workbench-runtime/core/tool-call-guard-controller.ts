@@ -25,6 +25,7 @@ import {
 	consumeLeaseCall,
 	detectActorRole,
 	leaseStatus,
+	revokeLease,
 	type WriteLease,
 } from "./write-authority.ts";
 
@@ -44,14 +45,30 @@ export interface ToolCallGuardController {
 	workerWriteJournalRuntime: WorkerWriteJournalRuntime;
 	turnOutputBudget: TurnOutputBudgetState;
 	pendingReceiptHandles: Map<string, PendingReceiptHandle>;
-	persistLease(): void;
+	persistLease(): boolean | void;
 	applyModeTools(): void;
 	recordModifiedFile(path: string): void;
 }
 
 /** Register the single ordered tool_call guard. */
 export function registerToolCallGuard(controller: ToolCallGuardController): void {
+	let writeAuthorizationTail: Promise<void> = Promise.resolve();
+	let pendingReceiptReservations = 0;
+	const persistLease = (): boolean => {
+		try {
+			return controller.persistLease() !== false;
+		} catch {
+			return false;
+		}
+	};
 	controller.pi.on("tool_call", async (event, ctx) => {
+		let releaseWriteAuthorization: (() => void) | undefined;
+		if (event.toolName === "edit" || event.toolName === "write") {
+			const previous = writeAuthorizationTail;
+			writeAuthorizationTail = new Promise<void>((resolve) => { releaseWriteAuthorization = resolve; });
+			await previous;
+		}
+		try {
 		const streamingBoundaryReason = controller.toolCallBlockReason(event.toolName);
 		if (streamingBoundaryReason) return { block: true, reason: streamingBoundaryReason };
 		const workerRoleContext = controller.getWorkerRoleContext();
@@ -134,10 +151,11 @@ export function registerToolCallGuard(controller: ToolCallGuardController): void
 		}
 
 		if (workbenchToolRequiresReceipt(event.toolName)) {
-			if (controller.pendingReceiptHandles.size >= MAX_IN_FLIGHT_RECEIPTS) {
+			if (controller.pendingReceiptHandles.size + pendingReceiptReservations >= MAX_IN_FLIGHT_RECEIPTS) {
 				if (authorization.authorizationId) controller.turnOutputBudget.releaseAuthorization({ authorizationId: authorization.authorizationId });
 				return { block: true, reason: boundedGuardReason(capacityBlockReason()) };
 			}
+			pendingReceiptReservations += 1;
 			try {
 				const projectRoot = await controller.projectRootFor(ctx);
 				const begun = await beginReceipt({
@@ -155,6 +173,8 @@ export function registerToolCallGuard(controller: ToolCallGuardController): void
 			} catch {
 				if (authorization.authorizationId) controller.turnOutputBudget.releaseAuthorization({ authorizationId: authorization.authorizationId });
 				return { block: true, reason: boundedGuardReason("Tool result receipt storage unavailable") };
+			} finally {
+				pendingReceiptReservations -= 1;
 			}
 		}
 
@@ -165,11 +185,18 @@ export function registerToolCallGuard(controller: ToolCallGuardController): void
 			const lease = controller.getLease();
 			if (lease && leaseStatus(lease, now) === "active") {
 				const consumed = consumeLeaseCall(lease, event.toolName, path, now);
-				if (consumed.ok) {
-					controller.setLease(consumed.lease);
-					controller.persistLease();
-					if (leaseStatus(consumed.lease, now) !== "active") controller.applyModeTools();
+				if (!consumed.ok) {
+					if (authorization.authorizationId) controller.turnOutputBudget.releaseAuthorization({ authorizationId: authorization.authorizationId });
+					return { block: true, reason: boundedGuardReason(consumed.error) };
 				}
+				controller.setLease(consumed.lease);
+				if (!persistLease()) {
+					controller.setLease(revokeLease(consumed.lease, "lease persistence unavailable", now));
+					controller.applyModeTools();
+					if (authorization.authorizationId) controller.turnOutputBudget.releaseAuthorization({ authorizationId: authorization.authorizationId });
+					return { block: true, reason: boundedGuardReason("Commander write lease persistence unavailable; write authorization locked") };
+				}
+				if (leaseStatus(consumed.lease, now) !== "active") controller.applyModeTools();
 			}
 		}
 		if ((event.toolName === "edit" || event.toolName === "write") && event.input && typeof event.input === "object") {
@@ -177,5 +204,8 @@ export function registerToolCallGuard(controller: ToolCallGuardController): void
 			if (typeof path === "string" && path.length > 0) controller.recordModifiedFile(path);
 		}
 		return undefined;
+		} finally {
+			releaseWriteAuthorization?.();
+		}
 	});
 }

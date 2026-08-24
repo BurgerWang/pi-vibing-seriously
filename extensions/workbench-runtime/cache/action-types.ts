@@ -45,7 +45,15 @@ export const ARTIFACT_RESTORE_ENABLED = false;
 // Limits
 // ---------------------------------------------------------------------------
 
-export const MAX_INPUT_FILES = 5000;
+/**
+ * Unified discovery budget for a declared-input fingerprint. Every regular
+ * file, directory, protected marker, symlink encounter, and missing pattern
+ * consumes one entry. Keeping this broader than a file-only limit prevents a
+ * tree of empty directories or protected names from bypassing the bound.
+ */
+export const MAX_INPUT_ENTRIES = 5000;
+/** Backwards-compatible name; regular files are covered by the unified cap. */
+export const MAX_INPUT_FILES = MAX_INPUT_ENTRIES;
 export const MAX_INPUT_TOTAL_BYTES = 512 * 1024 * 1024;
 export const MAX_INPUT_FILE_BYTES = 64 * 1024 * 1024;
 export const MAX_INPUT_DEPTH = 64;

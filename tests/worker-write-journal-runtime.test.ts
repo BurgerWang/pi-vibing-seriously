@@ -471,6 +471,42 @@ test("missing, corrupt, thrown-storage, and identity failures poison with bounde
 });
 
 test("parallel writes serialize without poisoning; true mismatches and unbegun results still poison", async () => {
+	const racing = await fixture();
+	try {
+		await writeFile(join(racing.root, "a.txt"), "a", "utf8");
+		await writeFile(join(racing.root, "b.txt"), "b", "utf8");
+		let releaseRead!: () => void;
+		let signalRead!: () => void;
+		const readReleased = new Promise<void>((resolve) => { releaseRead = resolve; });
+		const readStarted = new Promise<void>((resolve) => { signalRead = resolve; });
+		const runtime = createWorkerWriteJournalRuntime(racing.context, {
+			appendTelemetry: (value) => racing.telemetry.push(structuredClone(value)),
+			readJournal: async (input) => {
+				signalRead();
+				await readReleased;
+				return readWorkerWriteJournal(input);
+			},
+		});
+		const first = runtime.beginToolCall({ toolCallId: "racing-first", toolName: "edit", path: "a.txt" });
+		await readStarted;
+		const second = await runtime.beginToolCall({ toolCallId: "racing-second", toolName: "write", path: "b.txt" });
+		assert.equal(!second.ok && second.code, "pending_conflict");
+		assert.deepEqual(runtime.inspectState(), { applicability: "active", poisoned: 0, pending: 0, revision: 0 });
+		releaseRead();
+		assert.equal((await first).ok, true);
+		assert.deepEqual(runtime.inspectState(), { applicability: "active", poisoned: 0, pending: 1, revision: 1 });
+		assert.equal((await runtime.completeToolResult({
+			toolCallId: "racing-second", toolName: "write", isError: true,
+		})).ok, true);
+		await writeFile(join(racing.root, "a.txt"), "aa", "utf8");
+		assert.equal((await runtime.completeToolResult({
+			toolCallId: "racing-first", toolName: "edit", isError: false,
+		})).ok, true);
+		assert.deepEqual(runtime.inspectState(), { applicability: "active", poisoned: 0, pending: 0, revision: 2 });
+	} finally {
+		await cleanup(racing);
+	}
+
 	const pending = await fixture();
 	try {
 		await writeFile(join(pending.root, "a.txt"), "a", "utf8");

@@ -77,16 +77,21 @@ dirty/clean state, or the recipe name alone.
 
 - paths are project-relative POSIX form; patterns are stable-sorted
 - regular files: streaming SHA-256 + executable bit (mtime is never used —
-  `touch` keeps the key)
+  `touch` keeps the key); size, hash, and final identity come from one
+  `O_NOFOLLOW` file descriptor and the pathname must still name that inode
 - directories: recursive Merkle hash over sorted children
-- symlinks: real path resolved; **escapes outside the project root refuse
-  the cache**; in-project symlinks record link target + target content hash
+- symlinks: **every symlink refuses the cache**, including project-local
+  links and links in ancestor path components; targets are never followed
+  or read by the fingerprint scanner; glob discovery uses the same bounded
+  `lstat`/`opendir` walker rather than a symlink-following filesystem glob
 - a pattern with **no matches is an explicit key component**
 - protected secret paths (`.env`, `*.pem`, `*.key`, `credentials.*`,
   `auth.json`, …) are **never read** — they enter the key as
   `{t: "protected", h: "refused"}` markers
-- limits: 5000 files, 512 MB total, 64 MB per file, depth 64 — overflows
-  fail closed (cache refused, normal execution)
+- limits: 5000 total discovered entries (files, directories, protected
+  markers, symlink encounters, and missing patterns), 512 MB total regular
+  file content, 64 MB per file, depth 64 — overflows fail closed (cache
+  refused, normal execution)
 
 ## Hit lifecycle
 
@@ -104,13 +109,30 @@ NOT_RUN` — there is no `PASS_CACHED`.
 
 ## Concurrency and corruption
 
-- double-checked per-key file lock (owner PID + createdAt); same-key
+- double-checked per-key file lock (owner PID + boot ID + process start
+  ticks + createdAt); same-key
   concurrent runs execute once or wait safely
-- stale locks (dead owner, or old + unknown owner) are broken
-- atomic writes: tmp + rename
+- lock owner JSON is completed and fsynced under a unique name before a
+  hard-link atomically publishes the fixed lock name; empty/truncated
+  legacy crash residue is recovered only after a stable stale observation
+- stale dead owners are removed through a token/inode owner claim while the
+  fixed name remains occupied, so a replacement owner is never moved aside;
+  PID reuse cannot make a dead owner look live because liveness requires the
+  same boot and process-start identity, and unavailable identity fails closed
+- action record publication and index commit are one index-mutex transaction;
+  lookup holds the same mutex and requires strict index membership, so an
+  orphan record from a crash cannot become a hit
+- every cache-index RMW (write, touch, prune, clear, rebuild) holds one
+  cross-process mutex; the committed index must pass an exact bounded
+  readback before acceptance. Dead owners are recovered only by stable
+  token+inode claim, while live owners are never removed based on age.
 - corrupted action JSON → quarantine + miss
-- corrupted index → rebuilt from `actions/`
+- corrupted index → rebuilt from `actions/` only when the entry/byte-bounded
+  scan is complete; overflow refuses the rebuild and never publishes a
+  partial index
 - CAS reads re-verify the SHA-256; mismatch → quarantine + miss
 - prune skips in-use entries and never touches `runs/` or evidence
+- clear/prune retain index authority and report failure when a selected
+  record cannot be deleted; they never silently claim removal
 
 See `docs/cache/cache-maintenance.md` for the on-disk layout and commands.

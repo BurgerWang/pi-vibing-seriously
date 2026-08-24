@@ -15,7 +15,8 @@
  * untrusted project is rejected before any file is read.
  */
 
-import { readFile, realpath, stat } from "node:fs/promises";
+import { lstat, realpath, stat } from "node:fs/promises";
+import type { BigIntStats } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { parse as parseYaml } from "yaml";
 
@@ -25,6 +26,7 @@ import { parseRecipesDocument, type Recipe } from "./recipe-schema.ts";
 import { DEFAULT_ACTION_CACHE_MAX_BYTES } from "../cache/action-types.ts";
 import { lexicalContain } from "./path-guard.ts";
 import { parseAdvisoryConfig, type AdvisoryConfig } from "./commander-advisory.ts";
+import { BOUNDED_FILE_MAX_BYTES, readUtf8FileBounded } from "./bounded-file-io.ts";
 
 export const WORKBENCH_DIR = "workbench";
 export const RUNS_DIR = "runs";
@@ -37,6 +39,20 @@ export class UntrustedProjectError extends Error {
 			`project ${projectRoot} is not trusted — workbench refuses to read or execute its configuration. Exit Pi, re-enter the project, and approve project trust first.`,
 		);
 		this.name = "UntrustedProjectError";
+	}
+}
+
+/**
+ * A present configuration path could not be read as one stable regular UTF-8
+ * file.  This is deliberately distinct from ENOENT: callers may treat a
+ * genuinely absent optional file as empty configuration, but must never turn
+ * permission, type, encoding, size, or concurrent-replacement failures into
+ * a silently smaller configuration.
+ */
+export class ConfigFileReadError extends Error {
+	constructor(path: string, reason: string) {
+		super(`workbench configuration unavailable: ${path} (${reason})`);
+		this.name = "ConfigFileReadError";
 	}
 }
 
@@ -136,12 +152,43 @@ export async function findProjectRoot(cwd: string, exec: ExecFn): Promise<string
 	return cwd;
 }
 
+function samePathIdentity(
+	stats: BigIntStats,
+	source: { dev?: number; ino?: number; fileSize: number; mtimeNs?: string },
+): boolean {
+	return stats.isFile()
+		&& source.dev !== undefined
+		&& source.ino !== undefined
+		&& Number(stats.dev) === source.dev
+		&& Number(stats.ino) === source.ino
+		&& Number(stats.size) === source.fileSize
+		&& (source.mtimeNs === undefined || stats.mtimeNs.toString(10) === source.mtimeNs);
+}
+
 async function readOptionalText(path: string): Promise<string | undefined> {
+	let before: BigIntStats;
 	try {
-		return await readFile(path, "utf8");
-	} catch {
-		return undefined;
+		before = await lstat(path, { bigint: true });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+		throw new ConfigFileReadError(path, "path metadata unavailable");
 	}
+	if (!before.isFile()) throw new ConfigFileReadError(path, "source is not a regular file");
+	const read = await readUtf8FileBounded(path, BOUNDED_FILE_MAX_BYTES);
+	if (!read.ok) throw new ConfigFileReadError(path, read.error.code);
+	if (!samePathIdentity(before, read.value.source)) {
+		throw new ConfigFileReadError(path, "source identity changed before read");
+	}
+	let after: BigIntStats;
+	try {
+		after = await lstat(path, { bigint: true });
+	} catch {
+		throw new ConfigFileReadError(path, "source identity changed after read");
+	}
+	if (!samePathIdentity(after, read.value.source)) {
+		throw new ConfigFileReadError(path, "source identity changed after read");
+	}
+	return read.value.text;
 }
 
 /**

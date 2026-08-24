@@ -357,10 +357,13 @@ for large regular SVG/JSON files are an additive presentation shape. Current
 ordinary single-path reviews may additionally carry `patch[].page` and
 `presentation_progress`: repeated calls resume a contiguous UTF-8 byte cursor
 only under the same bound-diff and redacted-stream hashes, up to 4 MiB, and
-only a fully visible page advances. Progress also carries a bounded contiguous
-page-receipt chain; either semantic decision rebuilds the current redacted
-streams and checks every range/hash/current-page slice. Historical records omit
-these fields and remain readable; unfinished paging, malformed cursors and
+only a fully visible page advances. Current writes use the additive O(paths)
+`page_count` / `receipt_sha256` accumulator (the latter is the recomputable
+SHA-256 of `[0,next_byte)`) and retain only the latest page range/hash.
+Historical full segment arrays remain strict-read compatible and
+are compacted on the next page. Either semantic decision rebuilds the current
+redacted streams and checks the exact stream and current-page slice. Historical
+records omit these fields and remain readable; unfinished paging, malformed cursors and
 historical partial presentations remain non-acceptable. The existing tool name, registration
 order, and mode placement are unchanged; `REPAIR` and `repair_reason` are
 additive current parameter-schema evolution. None of these fields grants Gate

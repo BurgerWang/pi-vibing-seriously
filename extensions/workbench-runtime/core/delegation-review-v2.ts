@@ -60,6 +60,10 @@ import {
 import type { ExecFn } from "./config.ts";
 import { isWorkerPathAllowedRealpath } from "../worker/path-scope.ts";
 import { COMMANDER_MODEL_ID, COMMANDER_PROVIDERS } from "./worker-policy.ts";
+import {
+	validateSemanticReviewEnvelopeV1,
+	type SemanticReviewEnvelopeV1,
+} from "./semantic-review-envelope.ts";
 
 const AFTER_FIELDS = [
 	"schema_version", "delegation_id", "recorded_at", "status", "exit_code", "pinned_identity",
@@ -68,6 +72,7 @@ const AFTER_FIELDS = [
 	"change_set_hash", "reported_paths", "usage", "budget", "report_summary", "review_status",
 ] as const;
 const AFTER_FIELDS_GUARD_V2 = [...AFTER_FIELDS, "diff_identity_kind"] as const;
+const AFTER_FIELDS_GUARD_V2_ENVELOPE = [...AFTER_FIELDS_GUARD_V2, "review_envelope"] as const;
 const BEFORE_FIELDS = [
 	"schema_version", "delegation_id", "recorded_at", "contract", "git_head", "git_dirty",
 	"diff_hash", "changed_paths", "path_statuses", "path_digests", "workspace_guard",
@@ -286,6 +291,7 @@ interface GenerationReviewAuthority {
 	authority: ReviewAuthorityFacts;
 	after_guard: WorkspaceGuardRecord;
 	change_set: ChangeSetRecord;
+	review_envelope?: SemanticReviewEnvelopeV1;
 }
 
 function authorityFromGeneration(generation: DelegationCommittedGenerationV2): GenerationReviewAuthority | undefined {
@@ -300,8 +306,9 @@ function authorityFromGeneration(generation: DelegationCommittedGenerationV2): G
 		!isRecord(identity) || !exactFields(identity, IDENTITY_FIELDS) || !isRecord(scope) || !exactFields(scope, SCOPE_FIELDS)) return undefined;
 	const guardV2 = before.diff_identity_kind === DELEGATION_WORKSPACE_DIFF_IDENTITY_KIND_V2 ||
 		after.diff_identity_kind === DELEGATION_WORKSPACE_DIFF_IDENTITY_KIND_V2;
+	const envelopeTagged = guardV2 && Object.prototype.hasOwnProperty.call(after, "review_envelope");
 	if (guardV2
-		? (!exactFields(before, BEFORE_FIELDS_GUARD_V2) || !exactFields(after, AFTER_FIELDS_GUARD_V2)
+		? (!exactFields(before, BEFORE_FIELDS_GUARD_V2) || !exactFields(after, envelopeTagged ? AFTER_FIELDS_GUARD_V2_ENVELOPE : AFTER_FIELDS_GUARD_V2)
 			|| before.diff_identity_kind !== DELEGATION_WORKSPACE_DIFF_IDENTITY_KIND_V2
 			|| after.diff_identity_kind !== DELEGATION_WORKSPACE_DIFF_IDENTITY_KIND_V2)
 		: (!exactFields(before, BEFORE_FIELDS) || !exactFields(after, AFTER_FIELDS))) return undefined;
@@ -335,7 +342,9 @@ function authorityFromGeneration(generation: DelegationCommittedGenerationV2): G
 		afterFacts = validAfterGitRecord(after);
 		if (beforeFacts === undefined) return undefined;
 	}
-	if (afterFacts === undefined || !sameJson(after.changed_paths, state.terminal_outcome.changed_paths)) return undefined;
+	if (afterFacts === undefined || !sameJson(after.changed_paths, state.terminal_outcome.changed_paths) ||
+		(envelopeTagged && (!validateSemanticReviewEnvelopeV1(after.review_envelope) ||
+			after.review_envelope.path_count !== (after.changed_paths as string[]).length))) return undefined;
 	if (identity.schema_version !== 2 || identity.delegation_id !== state.delegation_id || identity.task_kind !== state.task_kind ||
 		identity.contract_hash !== state.contract_hash || identity.generation !== state.generation ||
 		identity.revision !== state.committed_proof.revision || !sameJson(identity.worker_identity, state.worker_identity)) return undefined;
@@ -350,6 +359,7 @@ function authorityFromGeneration(generation: DelegationCommittedGenerationV2): G
 		kind: guardV2 ? "guard-v2" : "legacy-v2",
 		after_guard: afterGuard,
 		change_set: changeSet,
+		...(envelopeTagged ? { review_envelope: structuredClone(after.review_envelope as SemanticReviewEnvelopeV1) } : {}),
 		authority: {
 			delegation_id: state.delegation_id,
 			allowed_paths: [...state.allowed_paths],
@@ -357,6 +367,7 @@ function authorityFromGeneration(generation: DelegationCommittedGenerationV2): G
 			recorded_after_hash: after.diff_hash as string,
 			after: afterFacts,
 			reported_paths: [...(after.reported_paths as string[])],
+			...(envelopeTagged ? { review_envelope: structuredClone(after.review_envelope as SemanticReviewEnvelopeV1) } : {}),
 		},
 	};
 }
@@ -768,6 +779,13 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 			return fail("review_conflict", `delegation relevance review failed closed (${relevance.error.code})`, {
 				transaction: state,
 				...(bindingHash === undefined ? {} : { binding_hash: bindingHash }),
+			});
+		}
+		if (authorityInfo.review_envelope !== undefined &&
+			authorityInfo.review_envelope.relevance_projection_hash !== relevance.value.binding.projection_hash) {
+			return fail("review_conflict", "delegation semantic-review envelope no longer matches the current relevance projection", {
+				transaction: state,
+				binding_hash: relevance.value.binding.projection_hash,
 			});
 		}
 		const authority = authorityWithRelevance(authorityInfo.authority, relevance.value);

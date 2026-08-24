@@ -635,6 +635,9 @@ export function workerRunFailure(result: WorkerRunResult): WorkerRunFailure | un
 			message: result.errorMessage ?? `Pinned worker stopped with ${result.stopReason}`,
 		};
 	}
+	if (result.stopReason === "toolUse") {
+		return { code: "FINAL_OUTPUT_MISSING", message: "Pinned worker exited before a terminal assistant response" };
+	}
 	if (result.provider !== WORKER_PROVIDER || result.model !== WORKER_MODEL_ID) {
 		return {
 			code: "PROVIDER_RESPONSE_UNVERIFIED",
@@ -734,20 +737,37 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 			const child = spawn(invocation.command, args, {
 				cwd: options.projectRoot,
 				shell: false,
+				detached: process.platform !== "win32",
 				stdio: ["ignore", "pipe", "pipe"],
 				env: childEnvironment(options.projectRoot, options.contract.allowedPaths, spendProfile, taskKind, runtimeIdentity),
 			});
 			let stdoutBuffer = "";
 			let stderrBuffer = "";
 			let settled = false;
+			let terminating = false;
+			let streamInvalid = false;
 			let killTimer: NodeJS.Timeout | undefined;
+			const signalProcessTree = (value: NodeJS.Signals): void => {
+				try {
+					if (process.platform !== "win32" && typeof child.pid === "number") process.kill(-child.pid, value);
+					else child.kill(value);
+				} catch {
+					try { child.kill(value); } catch { /* process already exited */ }
+				}
+			};
 
 			const terminate = (reason: "abort" | "timeout" | "error") => {
 				if (reason === "abort") result.aborted = true;
 				else if (reason === "timeout") result.timedOut = true;
-				child.kill("SIGTERM");
+				if (terminating) return;
+				terminating = true;
+				signalProcessTree("SIGTERM");
 				killTimer = setTimeout(() => {
-					if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+					// On POSIX the group can outlive its leader, so do not gate the
+					// final signal on the leader's exitCode.
+					if (process.platform !== "win32" || (child.exitCode === null && child.signalCode === null)) {
+						signalProcessTree("SIGKILL");
+					}
 				}, KILL_GRACE_MS);
 				killTimer.unref();
 			};
@@ -772,6 +792,12 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 
 			const processLine = (line: string) => {
 				if (!line.trim()) return;
+				if (Buffer.byteLength(line, "utf8") > MAX_JSON_LINE_BYTES) {
+					streamInvalid = true;
+					result.errorMessage = `Worker JSON event exceeded ${MAX_JSON_LINE_BYTES} bytes`;
+					terminate("error");
+					return;
+				}
 				let event: { type?: unknown; message?: unknown; reason?: unknown; entry?: unknown };
 				try {
 					event = JSON.parse(line) as { type?: unknown; message?: unknown; reason?: unknown; entry?: unknown };
@@ -889,15 +915,20 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 			};
 
 			child.stdout.on("data", (chunk: Buffer | string) => {
+				if (streamInvalid) return;
 				stdoutBuffer += chunk.toString();
 				if (Buffer.byteLength(stdoutBuffer, "utf8") > MAX_JSON_LINE_BYTES && !stdoutBuffer.includes("\n")) {
+					streamInvalid = true;
 					result.errorMessage = `Worker JSON event exceeded ${MAX_JSON_LINE_BYTES} bytes`;
 					terminate("error");
 					return;
 				}
 				const lines = stdoutBuffer.split("\n");
 				stdoutBuffer = lines.pop() ?? "";
-				for (const line of lines) processLine(line);
+				for (const line of lines) {
+					processLine(line);
+					if (streamInvalid) break;
+				}
 			});
 			child.stderr.on("data", (chunk: Buffer | string) => {
 				stderrBuffer += chunk.toString();
@@ -910,8 +941,15 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 				result.exitCode = 1;
 				finish();
 			});
+			child.on("exit", () => {
+				// A successful worker process may still have spawned background
+				// descendants. They have no authority after the pinned worker exits.
+				if (process.platform !== "win32" && typeof child.pid === "number") {
+					try { process.kill(-child.pid, "SIGKILL"); } catch { /* group already empty */ }
+				}
+			});
 			child.on("close", (code) => {
-				if (stdoutBuffer.trim()) processLine(stdoutBuffer);
+				if (!streamInvalid && stdoutBuffer.trim()) processLine(stdoutBuffer);
 				result.exitCode = code ?? 1;
 				finish();
 			});

@@ -34,11 +34,17 @@ are rejected by design.
 
 The apply step binds every overwrite confirmation to the same bounded regular
 file identity and content digest, rejects leaf symlinks, and creates new files
-exclusively. Parent directories are revalidated as real in-project directories
-before and after the write. Standard Node path APIs cannot provide Linux
+exclusively. New bytes are written and fsynced in a no-follow sibling temporary
+first; create publishes with a no-clobber hard link, overwrite revalidates the
+confirmed bytes/inode/metadata and then atomically renames, and the parent
+directory is synced. A failure therefore leaves no target/complete old bytes,
+or a complete new target, never a partially truncated file. Parent directories
+are revalidated as real in-project directories before and after the write.
+Standard Node path APIs cannot provide Linux
 `openat2(RESOLVE_BENEATH)` semantics against a privileged process that swaps an
-ancestor directory concurrently; do not run `/q-init` while another process is
-mutating the project directory tree.
+ancestor directory concurrently, nor a portable compare-and-swap rename in the
+last identity-check-to-rename interval; do not run `/q-init` while another
+process is mutating the project directory tree.
 
 For `generic`, initialization detects the repository's top-level stack and
 only emits observable, project-declared entry points: Node recipes come from

@@ -39,7 +39,12 @@ import type {
 	DelegationWorkerIdentity,
 } from "../extensions/workbench-runtime/core/delegation-transaction.ts";
 import { delegationCommitMarker } from "../extensions/workbench-runtime/core/delegation-transaction.ts";
-import { REVIEW_PAGE_SOURCE_MAX_BYTES, type ReviewPresentationProgress } from "../extensions/workbench-runtime/core/diff-review.ts";
+import {
+	REVIEW_PAGE_SOURCE_MAX_BYTES,
+	preflightSemanticReviewEnvelopeV1,
+	type ReviewPresentationProgress,
+} from "../extensions/workbench-runtime/core/diff-review.ts";
+import { collectReviewRelevanceV2 } from "../extensions/workbench-runtime/core/review-relevance-v2.ts";
 import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { beginWriteJournalOperation, completeWriteJournalOperation } from "../extensions/workbench-runtime/core/write-journal.ts";
 import { spawnExec } from "./helpers.ts";
@@ -228,9 +233,24 @@ async function setupReviewFixture(
 	assert.equal(committing.ok, true);
 	if (!committing.ok) throw new Error("commit begin failed");
 	const report = `## Completed\n- changed fixture files\n## Files Changed\n${workerPaths.map((path) => `- ${path}`).join("\n")}\n## Verification\n- facts\n## Remaining Risks\n- none\n`;
+	const relevance = await collectReviewRelevanceV2({
+		project_root: root, delegation_id: ID, contract_hash: contract.value.contract_hash,
+		after_guard: lifecycle.value.after_guard, change_set: lifecycle.value.change_set, exec: spawnExec,
+	});
+	assert.equal(relevance.ok, true);
+	if (!relevance.ok) throw new Error("review relevance setup failed");
+	const envelope = await preflightSemanticReviewEnvelopeV1({
+		projectRoot: root, workerPaths, allowedPaths: contract.value.allowed_paths,
+		afterDigests: workspace.value.after.pathDigests, pathStatuses: workspace.value.after.pathStatuses,
+		relevanceProjection: relevance.value.projection, relevanceProjectionHash: relevance.value.binding.projection_hash,
+		exec: spawnExec,
+	});
+	assert.equal(envelope.ok, true, envelope.ok ? "" : envelope.code);
+	if (!envelope.ok) throw new Error("review envelope setup failed");
 	const built = buildDelegationCommittedArtifactsV2({
 		transaction: committing.value, contract: contract.value, before: workspace.value.before, after: workspace.value.after,
 		changeSetLifecycle: lifecycle.value, worker: workerFacts(report, withExtendedReason ? "extended" : "standard"), reportText: report,
+		reviewEnvelope: envelope.value,
 	});
 	assert.equal(built.ok, true);
 	if (!built.ok) throw new Error("artifact build failed");
@@ -831,22 +851,26 @@ test("review v2: provisional presentation fields cannot forge page completion or
 		assert.equal(mismatchedLength.ok, false, "declared page bytes must equal the visible UTF-8 body bytes");
 		if (!mismatchedLength.ok) assert.equal(mismatchedLength.error.code, "invalid_record");
 
-		// A structurally contiguous chain still cannot jump to a fabricated tail:
-		// ACCEPT rebuilds the real stream and checks every segment plus the exact
-		// visible slice against current authority.
+		// A structurally valid O(paths) accumulator still cannot jump to a real
+		// tail: ACCEPT rebuilds the authoritative [0,next_byte) prefix receipt,
+		// so even an exact visible tail cannot replace all preceding pages.
 		const forgedTail = structuredClone(original);
 		const tailEntry = forgedTail.review.patch[0];
 		const tailPage = tailEntry.page;
 		const visibleBytes = Buffer.byteLength(tailEntry.text, "utf8");
 		const tailStart = tailPage.total_bytes - visibleBytes;
+		const expectedDiff = await spawnExec("git", ["diff", "--", "src/large.py"], { cwd: fixture.root });
+		assert.equal(expectedDiff.code, 0, expectedDiff.stderr);
+		tailEntry.text = Buffer.from(expectedDiff.stdout, "utf8").subarray(tailStart).toString("utf8");
 		tailPage.start_byte = tailStart;
 		tailPage.end_byte = tailPage.total_bytes;
 		tailEntry.truncated = true;
 		forgedTail.review.presentation_progress[0].next_byte = tailPage.total_bytes;
 		forgedTail.review.presentation_progress[0].segments = [
-			{ start_byte: 0, end_byte: tailStart, page_sha256: "f".repeat(64) },
 			{ start_byte: tailStart, end_byte: tailPage.total_bytes, page_sha256: createHash("sha256").update(tailEntry.text, "utf8").digest("hex") },
 		];
+		forgedTail.review.presentation_progress[0].page_count = 2;
+		forgedTail.review.presentation_progress[0].receipt_sha256 = "f".repeat(64);
 		forgedTail.review.fully_presented_paths = ["src/large.py"];
 		forgedTail.review.presentation_remaining_paths = [];
 		forgedTail.review.presentation_complete = true;
@@ -917,6 +941,7 @@ test("review v2: historical untagged schema1 authority is full-diff replay-only 
 		before.path_digests = {};
 		before.diff_hash = computeDiffHash(before.changed_paths, before.path_digests, before.path_statuses);
 		delete after.diff_identity_kind;
+		delete after.review_envelope;
 		after.path_digests = { ...current.pathDigests };
 		after.diff_hash = legacyHash;
 		await writeFile(beforePath, `${JSON.stringify(before, null, 2)}\n`);
@@ -940,6 +965,7 @@ test("review v2: historical untagged schema1 authority is full-diff replay-only 
 		delete artifact.review.diff_identity_kind;
 		delete artifact.review.relevance_binding;
 		delete artifact.review.relevance_projection;
+		delete artifact.review.review_envelope;
 		delete artifact.review.fully_presented_paths;
 		delete artifact.review.presentation_remaining_paths;
 		delete artifact.review.presentation_complete;

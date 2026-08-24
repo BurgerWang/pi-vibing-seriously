@@ -300,6 +300,10 @@ One invocation:
 
 There is no persistent worker process. The child inherits the user's OS
 permissions and provider authentication, just like any other Pi process.
+On POSIX it runs as a dedicated process group. The runner terminates that
+whole group on abort, timeout, invalid output, and after the pinned leader
+exits normally, preventing an unawaited background descendant from outliving
+the delegation and performing late writes.
 
 ## Fixed Sol -> Luna write authority (current; legacy id P7)
 
@@ -340,7 +344,11 @@ Consequences for the commander workflow:
   status or compact summaries.
 - Expiry (30 min), exhaustion (10 calls) and revocation (leaving DEV, model/
   provider change, session end, or `/q-commander-write-lock`) restore the
-  locked 15-tool Sol surface. The footer
+  locked 15-tool Sol surface. Concurrent edit/write requests consume the
+  bounded call count serially, and a consume is authorized only after its
+  updated lease entry is durably appended. A reload/session replacement never
+  reactivates a previously confirmed lease; a fresh human grant is required.
+  The footer
   shows `WF:LEASE <used>/<max>` while an active confirmed lease exists and
   `WF:LOCKED` otherwise; `WF:REVIEW` is
   appended independently while a delegation review is pending or stale.
@@ -478,8 +486,9 @@ PENDING_REVIEW → REVIEWED → (versioned binding conflicts) → STALE
   drifted, or mismatched acceptance fails closed. A truncated ordinary-source
   path is not accepted as a summary: repeating that single `include_path`
   advances a persisted contiguous UTF-8 byte cursor bound to the unchanged
-  diff and complete redacted-stream SHA-256, and only fully visible pages
-  advance presentation completeness.
+  diff and complete redacted-stream SHA-256. Current records keep an
+  O(paths) authoritative-prefix receipt plus the latest page range; only fully visible
+  pages advance presentation completeness.
   If the complete packet is semantically wrong, Sol instead supplies
   `semantic_decision=REPAIR`, the same exact `expected_bound_diff_hash`, and a
   bounded non-empty `repair_reason`. The runtime atomically publishes an
@@ -1067,8 +1076,18 @@ delivery alone is `semantic_review: not_required`.
 
 Ordinary source entries must be fully rendered across one or more segments;
 single-path segments automatically continue across bounded pages up to the
-fixed 4 MiB pageable-stream ceiling. Content above that ceiling remains
-explicitly incomplete rather than being summarized as source review.
+fixed 4 MiB pageable-stream ceiling. Current tagged-v2 delivery proves a
+versioned `semantic-review-envelope-v1` before publishing the immutable
+generation: at most 500 presentation paths, 4 MiB per ordinary stream,
+64 MiB across all streams, and a conservatively projected review record no
+larger than 1 MiB. The envelope also binds the current W/D/S relevance
+projection and exact presentation-stream set. Page evidence is an O(paths)
+cumulative receipt (page count, recomputable `[0,next_byte)` prefix hash, and only the latest
+range/hash), so 4097 or more short-line pages cannot exhaust the review
+record. Content or proof above any limit is refused before `PENDING_REVIEW`:
+the transaction becomes the existing strictly recoverable unpublished
+`RECOVERY_REQUIRED` shape and exposes the exact `repair_of=<id>` route; it is
+never left as an uncloseable pending review.
 For sufficiently large current regular `.svg` and `.json` files, a strict
 bounded compact packet (status, size, digest binding, head/tail previews and
 explicit `generator_equality: NOT_VERIFIED`) may satisfy presentation

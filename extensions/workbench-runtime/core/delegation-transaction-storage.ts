@@ -66,6 +66,7 @@ import {
 	validateReviewRelevanceBindingV2,
 	validateReviewRelevanceProjectionV2,
 } from "./review-relevance-v2.ts";
+import { validateSemanticReviewEnvelopeV1 } from "./semantic-review-envelope.ts";
 import { validateChangeSet, type ChangeSetRecord } from "./change-set.ts";
 import { validateWorkspaceGuard, type WorkspaceGuardRecord } from "./workspace-guard.ts";
 import {
@@ -509,6 +510,7 @@ const AFTER_RECORD_FIELDS = [
 	"reported_paths", "usage", "budget", "report_summary", "review_status",
 ] as const;
 const AFTER_RECORD_FIELDS_GUARD_V2 = [...AFTER_RECORD_FIELDS, "diff_identity_kind"] as const;
+const AFTER_RECORD_FIELDS_GUARD_V2_ENVELOPE = [...AFTER_RECORD_FIELDS_GUARD_V2, "review_envelope"] as const;
 const REVIEW_ARTIFACT_FIELDS = [
 	"schema_version", "delegation_id", "task_kind", "contract_hash", "worker_identity",
 	"generation", "transaction_revision", "reviewed_at", "review",
@@ -710,7 +712,12 @@ function validReviewPresentationProgress(value: unknown): value is ReviewPresent
 	if (!Array.isArray(value) || value.length > REVIEW_PRESENTATION_PROGRESS_MAX_ITEMS) return false;
 	let previous = "";
 	for (const item of value) {
-		if (!isRecord(item) || !exactFields(item, ["path", "source", "stream_sha256", "next_byte", "total_bytes", "segments"]) ||
+		if (!isRecord(item)) return false;
+		const accumulated = Object.prototype.hasOwnProperty.call(item, "page_count") ||
+			Object.prototype.hasOwnProperty.call(item, "receipt_sha256");
+		if (!exactFields(item, accumulated
+			? ["path", "source", "stream_sha256", "next_byte", "total_bytes", "segments", "page_count", "receipt_sha256"]
+			: ["path", "source", "stream_sha256", "next_byte", "total_bytes", "segments"]) ||
 			!isStrictReviewPath(item.path) || !["git-diff", "file-content", "deleted", "compact", "withheld"].includes(String(item.source)) ||
 			typeof item.stream_sha256 !== "string" || !DELEGATION_TRANSACTION_HASH_RE.test(item.stream_sha256) ||
 			!Number.isSafeInteger(item.next_byte) || Number(item.next_byte) < 0 ||
@@ -718,18 +725,33 @@ function validReviewPresentationProgress(value: unknown): value is ReviewPresent
 			Number(item.total_bytes) > REVIEW_PAGE_SOURCE_MAX_BYTES || Number(item.next_byte) > Number(item.total_bytes) ||
 			(!["git-diff", "file-content"].includes(String(item.source)) && item.next_byte !== item.total_bytes) ||
 			(previous !== "" && byteCompare(previous, item.path) >= 0)) return false;
-		if (!Array.isArray(item.segments) || item.segments.length > REVIEW_PRESENTATION_SEGMENT_MAX_ITEMS) return false;
-		let segmentCursor = 0;
-		for (const segment of item.segments) {
-			if (!isRecord(segment) || !exactFields(segment, ["start_byte", "end_byte", "page_sha256"]) ||
-				!Number.isSafeInteger(segment.start_byte) || Number(segment.start_byte) !== segmentCursor ||
-				!Number.isSafeInteger(segment.end_byte) || Number(segment.end_byte) <= Number(segment.start_byte) ||
-				Number(segment.end_byte) > Number(item.total_bytes) ||
-				typeof segment.page_sha256 !== "string" || !DELEGATION_TRANSACTION_HASH_RE.test(segment.page_sha256)) return false;
-			segmentCursor = Number(segment.end_byte);
+		if (!Array.isArray(item.segments)) return false;
+		if (accumulated) {
+			if (!Number.isSafeInteger(item.page_count) || Number(item.page_count) < 0 ||
+				Number(item.page_count) > Number(item.next_byte) ||
+				typeof item.receipt_sha256 !== "string" || !DELEGATION_TRANSACTION_HASH_RE.test(item.receipt_sha256) ||
+				item.segments.length > 1 || (Number(item.next_byte) === 0) !== (Number(item.page_count) === 0) ||
+				(Number(item.next_byte) === 0) !== (item.segments.length === 0)) return false;
+			const segment = item.segments[0];
+			if (segment !== undefined && (!isRecord(segment) || !exactFields(segment, ["start_byte", "end_byte", "page_sha256"]) ||
+				!Number.isSafeInteger(segment.start_byte) || Number(segment.start_byte) < 0 ||
+				!Number.isSafeInteger(segment.end_byte) || Number(segment.end_byte) !== Number(item.next_byte) ||
+				Number(segment.end_byte) <= Number(segment.start_byte) || Number(segment.end_byte) > Number(item.total_bytes) ||
+				typeof segment.page_sha256 !== "string" || !DELEGATION_TRANSACTION_HASH_RE.test(segment.page_sha256))) return false;
+		} else {
+			if (item.segments.length > REVIEW_PRESENTATION_SEGMENT_MAX_ITEMS) return false;
+			let segmentCursor = 0;
+			for (const segment of item.segments) {
+				if (!isRecord(segment) || !exactFields(segment, ["start_byte", "end_byte", "page_sha256"]) ||
+					!Number.isSafeInteger(segment.start_byte) || Number(segment.start_byte) !== segmentCursor ||
+					!Number.isSafeInteger(segment.end_byte) || Number(segment.end_byte) <= Number(segment.start_byte) ||
+					Number(segment.end_byte) > Number(item.total_bytes) ||
+					typeof segment.page_sha256 !== "string" || !DELEGATION_TRANSACTION_HASH_RE.test(segment.page_sha256)) return false;
+				segmentCursor = Number(segment.end_byte);
+			}
+			if (segmentCursor !== item.next_byte || (item.total_bytes === 0 && item.segments.length !== 0) ||
+				(Number(item.total_bytes) > 0 && Number(item.next_byte) > 0 && item.segments.length === 0)) return false;
 		}
-		if (segmentCursor !== item.next_byte || (item.total_bytes === 0 && item.segments.length !== 0) ||
-			(Number(item.total_bytes) > 0 && Number(item.next_byte) > 0 && item.segments.length === 0)) return false;
 		previous = item.path;
 	}
 	return true;
@@ -743,13 +765,16 @@ function validReviewRecordForState(value: unknown, state: DelegationTransactionR
 	const hasPagination = REVIEW_PAGINATION_FIELDS.every((field) => Object.prototype.hasOwnProperty.call(value, field));
 	const hasSemantic = Object.prototype.hasOwnProperty.call(value, "semantic_review");
 	const hasAcceptance = Object.prototype.hasOwnProperty.call(value, "semantic_acceptance");
-	if (hasPartialPresentation || hasPresentation !== hasSemantic || (hasAcceptance && !hasSemantic) || (hasPagination && !hasPresentation)) return false;
+	const hasEnvelope = Object.prototype.hasOwnProperty.call(value, "review_envelope");
+	if (hasPartialPresentation || hasPresentation !== hasSemantic || (hasAcceptance && !hasSemantic) ||
+		(hasPagination && !hasPresentation) || (hasEnvelope && !relevanceV2)) return false;
 	const expectedFields: string[] = relevanceV2
 		? [...(hasAcceptance ? REVIEW_RECORD_FIELDS_RELEVANCE_V2_WITH_ACCEPTANCE
 			: hasPresentation ? REVIEW_RECORD_FIELDS_RELEVANCE_V2_WITH_PRESENTATION : REVIEW_RECORD_FIELDS_RELEVANCE_V2)]
 		: [...(hasAcceptance ? REVIEW_RECORD_FIELDS_WITH_ACCEPTANCE
 			: hasPresentation ? REVIEW_RECORD_FIELDS_WITH_PRESENTATION : REVIEW_RECORD_FIELDS)];
 	if (hasPagination) expectedFields.push(...REVIEW_PAGINATION_FIELDS);
+	if (hasEnvelope) expectedFields.push("review_envelope");
 	const fieldsValid = exactFields(value, expectedFields);
 	if (!fieldsValid) return false;
 	if ((value.schema_version !== 1 && !relevanceV2) || value.delegation_id !== state.delegation_id || !isCanonicalTime(value.reviewed_at) ||
@@ -784,6 +809,9 @@ function validReviewRecordForState(value: unknown, state: DelegationTransactionR
 		value.bound_diff_hash !== value.relevance_binding.projection_hash ||
 		value.relevance_projection.delegation_id !== state.delegation_id ||
 		value.relevance_projection.contract_hash !== state.contract_hash)) return false;
+	if (hasEnvelope && (!validateSemanticReviewEnvelopeV1(value.review_envelope) ||
+		value.review_envelope.relevance_projection_hash !== (value.relevance_binding as { projection_hash: string }).projection_hash ||
+		value.review_envelope.path_count !== (value.checked_paths as unknown[]).length)) return false;
 	if (!sameJson(value.allowed_paths, state.allowed_paths) || state.terminal_outcome === null ||
 		!sameJson(value.checked_paths, state.terminal_outcome.changed_paths)) return false;
 	if (!Array.isArray(value.violations) || value.violations.length > 10 || !value.violations.every((item) =>
@@ -1688,7 +1716,10 @@ function validateAfterRecord(
 ): boolean {
 	if (!isRecord(value) || !validateWorkspaceGuard(value.workspace_guard)) return false;
 	const tagged = value.diff_identity_kind === DELEGATION_WORKSPACE_DIFF_IDENTITY_KIND_V2;
-	if (!(tagged ? exactFields(value, AFTER_RECORD_FIELDS_GUARD_V2) : exactFields(value, AFTER_RECORD_FIELDS)) || (!tagged && !allowLegacyRead)) return false;
+	const envelopeTagged = tagged && Object.prototype.hasOwnProperty.call(value, "review_envelope");
+	if (!(tagged
+		? exactFields(value, envelopeTagged ? AFTER_RECORD_FIELDS_GUARD_V2_ENVELOPE : AFTER_RECORD_FIELDS_GUARD_V2)
+		: exactFields(value, AFTER_RECORD_FIELDS)) || (!tagged && !allowLegacyRead)) return false;
 	const guard = value.workspace_guard as WorkspaceGuardRecord;
 	const changedPaths = workerDeltaPaths(changeSet);
 	const fullPaths = guard.entries.map((entry) => entry.path);
@@ -1702,7 +1733,8 @@ function validateAfterRecord(
 		value.change_set_status === changeSet.status && value.worker_delta_hash === changeSet.worker_delta_hash &&
 		value.workspace_guard_hash === changeSet.workspace_guard_hash && value.change_set_hash === changeSet.change_set_hash &&
 		guard.workspace_guard_hash === changeSet.after_workspace_guard_hash;
-	if (!common) return false;
+	if (!common || (envelopeTagged && (!validateSemanticReviewEnvelopeV1(value.review_envelope) ||
+		value.review_envelope.path_count !== changedPaths.length))) return false;
 	if (!tagged) return allowLegacyRead &&
 		validateGuardDiagnostics(guard, value.git_head, value.git_dirty, value.path_statuses, value.path_digests) &&
 		value.diff_hash === computeDiffHash(fullPaths, value.path_digests as Record<string, string>, value.path_statuses as Record<string, string>);

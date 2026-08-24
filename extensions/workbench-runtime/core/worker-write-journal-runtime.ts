@@ -490,6 +490,7 @@ export function createWorkerWriteJournalRuntime(
 	const appendTelemetry = dependencies?.appendTelemetry;
 	let poisoned = parsed.applicability === "invalid_context" || typeof appendTelemetry !== "function";
 	let pending: PendingHandle | undefined;
+	let beginning = false;
 	const blockedParallelCalls = new Map<string, WorkerWriteJournalRuntimeTool>();
 	let revision = 0;
 
@@ -537,7 +538,7 @@ export function createWorkerWriteJournalRuntime(
 		if (poisoned) return failed("poisoned", tool);
 		const toolCallId = normalizeToolCallId(input?.toolCallId);
 		if (toolCallId === undefined) return failed("invalid_call_id", tool);
-		if (pending !== undefined) {
+		if (pending !== undefined || beginning) {
 			// Pi may issue independent edit/write calls in parallel. The journal is
 			// intentionally serial, so block only the later call and let the model
 			// retry it after the active call completes. No mutation happened for the
@@ -557,6 +558,8 @@ export function createWorkerWriteJournalRuntime(
 		});
 		if (operationId === undefined) return failed("invalid_call_id", tool);
 
+		beginning = true;
+		try {
 		let current: WriteJournalResult<WorkerWriteJournalRecord>;
 		try {
 			current = await readJournal({
@@ -607,6 +610,9 @@ export function createWorkerWriteJournalRuntime(
 			return { ok: false, code: "telemetry_failed", reason: WORKER_WRITE_JOURNAL_RUNTIME_BLOCK_REASON };
 		}
 		return { ok: true, action: "begun", revision, operation_id: operationId };
+		} finally {
+			beginning = false;
+		}
 	}
 
 	async function completeToolResult(

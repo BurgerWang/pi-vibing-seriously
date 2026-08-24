@@ -26,7 +26,7 @@ import {
 	resolveRunTarget,
 } from "./report.ts";
 import { buildGateParentSummary } from "./result-summary.ts";
-import { isValidRunId, readManifest } from "./runs.ts";
+import { isPureLegacyRunForDiagnostic, isValidRunId, readCommittedManifest, readManifest } from "./runs.ts";
 import { renderGatePreflightLines, type GatePreflightToolDetails } from "./render.ts";
 import type { RecipeMutationFacts } from "./worker-policy.ts";
 
@@ -248,12 +248,25 @@ export function registerGateCommands(controller: GateCommandController): void {
 				emit(`/q-evidence: run ${runId} not found`);
 				return;
 			}
-			if (manifest.recipe !== "gate") {
-				emit(`/q-evidence: run ${runId} is a recipe run (recipe "${boundedInlineDetail(manifest.recipe, 256)}") — it has no gate evidence`);
+			const committedV2 = await readCommittedManifest(projectRoot, runId);
+			const pureLegacyDiagnostic = committedV2 === null
+				&& await isPureLegacyRunForDiagnostic(projectRoot, runId);
+			if (committedV2 === null && !pureLegacyDiagnostic) {
+				emit("/q-evidence: committed run identity unavailable");
+				return;
+			}
+			const authoritativeManifest = committedV2 ?? manifest;
+			if (authoritativeManifest.recipe !== "gate") {
+				emit(`/q-evidence: run ${runId} is a recipe run (recipe "${boundedInlineDetail(authoritativeManifest.recipe, 256)}") — it has no gate evidence`);
 				return;
 			}
 			try {
-				const evidence = await readGateEvidenceView(projectRoot, runId);
+				const evidence = await readGateEvidenceView(
+					projectRoot,
+					runId,
+					undefined,
+					{ requireCommittedAuthority: committedV2 !== null },
+				);
 				emit(evidence.text);
 			} catch {
 				emit("/q-evidence: gate evidence unavailable");

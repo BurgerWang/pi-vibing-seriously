@@ -60,6 +60,8 @@ import {
 import { WORKER_SPEND_PROFILE_ENV } from "../extensions/workbench-runtime/core/worker-spend.ts";
 import { beginWriteJournalOperation, completeWriteJournalOperation } from "../extensions/workbench-runtime/core/write-journal.ts";
 import { spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
+import { collectReviewRelevanceV2 } from "../extensions/workbench-runtime/core/review-relevance-v2.ts";
+import { preflightSemanticReviewEnvelopeV1 } from "../extensions/workbench-runtime/core/diff-review.ts";
 
 const ID = "20260817-190000-rv2w";
 const NOW = "2026-01-01T00:00:00.000Z";
@@ -306,9 +308,23 @@ async function seedV2(
 	assert.equal(committing.ok, true);
 	if (!committing.ok) throw new Error("commit begin failed");
 	const report = `## Completed\n- done\n## Files Changed\n${changedPaths.map((path) => `- ${path}`).join("\n")}\n## Verification\n- facts\n## Remaining Risks\n- none\n`;
+	const relevance = await collectReviewRelevanceV2({
+		project_root: root, delegation_id: ID, contract_hash: contract.value.contract_hash,
+		after_guard: lifecycle.value.after_guard, change_set: lifecycle.value.change_set, exec: spawnExec,
+	});
+	assert.equal(relevance.ok, true);
+	if (!relevance.ok) throw new Error("review relevance setup failed");
+	const envelope = await preflightSemanticReviewEnvelopeV1({
+		projectRoot: root, workerPaths: changedPaths, allowedPaths: contract.value.allowed_paths,
+		afterDigests: workspace.value.after.pathDigests, pathStatuses: workspace.value.after.pathStatuses,
+		relevanceProjection: relevance.value.projection, relevanceProjectionHash: relevance.value.binding.projection_hash,
+		exec: spawnExec,
+	});
+	assert.equal(envelope.ok, true, envelope.ok ? "" : envelope.code);
+	if (!envelope.ok) throw new Error("review envelope setup failed");
 	const built = buildDelegationCommittedArtifactsV2({
 		transaction: committing.value, contract: contract.value, before: workspace.value.before, after: workspace.value.after,
-		changeSetLifecycle: lifecycle.value, worker: workerFacts(report), reportText: report,
+		changeSetLifecycle: lifecycle.value, worker: workerFacts(report), reportText: report, reviewEnvelope: envelope.value,
 	});
 	assert.equal(built.ok, true);
 	if (!built.ok) throw new Error("artifact build failed");

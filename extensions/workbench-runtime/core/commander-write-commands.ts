@@ -33,7 +33,7 @@ export interface CommanderWriteCommandController {
 	getLease(): WriteLease | undefined;
 	setLease(lease: WriteLease | undefined): void;
 	syncLease(now?: string): void;
-	persistLease(): void;
+	persistLease(): boolean | void;
 	applyModeTools(): void;
 	refreshStatus(ctx: ExtensionCommandContext): void | Promise<void>;
 	output(ctx: ExtensionCommandContext, lines: string[]): void;
@@ -43,6 +43,24 @@ export interface CommanderWriteCommandController {
 /** Register the three user-only temporary lease commands as one owned domain. */
 export function registerCommanderWriteCommands(controller: CommanderWriteCommandController): void {
 	const now = controller.now ?? (() => new Date().toISOString());
+	const persistLease = (): boolean => {
+		try {
+			return controller.persistLease() !== false;
+		} catch {
+			return false;
+		}
+	};
+	const persistOrLock = (lease: WriteLease, timestamp: string): boolean => {
+		controller.setLease(lease);
+		if (persistLease()) return true;
+		controller.setLease(revokeLease(lease, "lease persistence unavailable", timestamp));
+		persistLease();
+		controller.applyModeTools();
+		return false;
+	};
+	const persistenceFailure = (ctx: ExtensionCommandContext): void => {
+		controller.output(ctx, ["Commander write lease storage unavailable; write authorization remains locked"]);
+	};
 
 	controller.pi.registerCommand("q-write-policy", {
 		description:
@@ -113,8 +131,11 @@ export function registerCommanderWriteCommands(controller: CommanderWriteCommand
 					controller.output(ctx, [`/q-commander-write-unlock: ${confirmed.error} — the temporary lease remains inactive`]);
 					return;
 				}
-				controller.setLease(confirmed.lease);
-				controller.persistLease();
+				if (!persistOrLock(confirmed.lease, timestamp)) {
+					persistenceFailure(ctx);
+					void controller.refreshStatus(ctx);
+					return;
+				}
 				controller.applyModeTools();
 				controller.output(ctx, renderLeaseConfirmed(confirmed.lease, timestamp));
 				void controller.refreshStatus(ctx);
@@ -167,13 +188,19 @@ export function registerCommanderWriteCommands(controller: CommanderWriteCommand
 					controller.output(ctx, [`/q-commander-write-unlock: ${confirmed.error}`]);
 					return;
 				}
-				controller.setLease(confirmed.lease);
-				controller.persistLease();
+				if (!persistOrLock(confirmed.lease, timestamp)) {
+					persistenceFailure(ctx);
+					void controller.refreshStatus(ctx);
+					return;
+				}
 				controller.applyModeTools();
 				controller.output(ctx, renderLeaseConfirmed(confirmed.lease, timestamp));
 			} else {
-				controller.setLease(issued.lease);
-				controller.persistLease();
+				if (!persistOrLock(issued.lease, timestamp)) {
+					persistenceFailure(ctx);
+					void controller.refreshStatus(ctx);
+					return;
+				}
 				controller.applyModeTools();
 				controller.output(ctx, renderLeaseIssued(issued.lease, timestamp));
 			}
@@ -189,8 +216,7 @@ export function registerCommanderWriteCommands(controller: CommanderWriteCommand
 			let lease = controller.getLease();
 			if (lease) {
 				lease = revokeLease(lease, "user-directed lock via /q-commander-write-lock", timestamp);
-				controller.setLease(lease);
-				controller.persistLease();
+				if (!persistOrLock(lease, timestamp)) persistenceFailure(ctx);
 			}
 			controller.applyModeTools();
 			controller.output(ctx, [

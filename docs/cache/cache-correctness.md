@@ -46,12 +46,21 @@
 | condition | behavior |
 |---|---|
 | fingerprint limits exceeded | cache refused → normal execution |
-| symlink escapes project root | cache refused → normal execution |
+| lockfile exceeds its hash byte bound | cache refused; no shared `too-large` key marker |
+| any symlink is encountered | cache refused without following it → normal execution |
 | protected secret input matched | never read; `{t:"protected"}` key marker |
 | toolchain probe fails/times out | explicit `"unknown"` in the key → miss |
 | action record corrupted | quarantine → miss → normal execution |
 | CAS hash mismatch | quarantine → miss (restore is disabled anyway in v1) |
-| index corrupted | rebuilt from `actions/` |
+| index corrupted | rebuilt only from a complete bounded `actions/` scan |
+| index rebuild entry/byte bound exceeded | rebuild refused; no partial index published |
+| concurrent cache-index mutations | serialized by one cross-process mutex and exact write readback |
+| lock owner crashes during publication | fixed name was never published; complete owner inode is fsynced before hard-link publication |
+| stale lock races with replacement owner | token/inode owner claim while fixed remains occupied; replacement is never moved or unconditionally removed |
+| owner PID was reused | boot ID + process start ticks distinguish the dead prior process from the current PID instance |
+| process-instance identity cannot be read | fail closed; the lock is not removed or newly published |
+| record exists without index membership | lookup miss; only an explicit bounded rebuild can recover it |
+| clear/prune record deletion fails | operation reports failure and retains that index entry |
 | lock wait times out | proceed without lock (best-effort write) |
 | record write fails | run already succeeded → reported as `write-failed` |
 | maxAge expired | miss → normal execution |

@@ -156,7 +156,7 @@ export async function lookupValidated(ctx: ActionCacheContext, key: ActionKey): 
 			reason: "artifacts restore is disabled in this version — the recipe always executes",
 		};
 	}
-	const { record, corrupt } = await ctx.store.readRecord(key.key);
+	const { record, corrupt } = await ctx.store.readIndexedRecord(key.key);
 	if (corrupt) return { status: "corrupt", reason: "action record corrupted — treated as a miss" };
 	if (!record) return { status: "miss", reason: "no cached result for this action key" };
 

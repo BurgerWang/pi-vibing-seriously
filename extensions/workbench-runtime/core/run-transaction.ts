@@ -12,7 +12,7 @@ import { lstat, mkdir, open, readdir, readFile, rename } from "node:fs/promises"
 import { join, relative, sep } from "node:path";
 
 import { runsDir } from "./config.ts";
-import { isValidRunId } from "./runs.ts";
+import { isValidRunId, parseCommittedRunManifestV2, type RunRecord } from "./runs.ts";
 
 export const RUN_TRANSACTION_SCHEMA_VERSION = 2 as const;
 export const RUN_COMMIT_FILE = "run-commit.json" as const;
@@ -165,16 +165,31 @@ export async function commitRunTransaction(transaction: RunTransactionPaths, com
 	}
 	const manifestEntry = files.find((entry) => entry.path === "manifest.json")!;
 	if (manifestEntry.bytes <= 0 || manifestEntry.bytes > RUN_MANIFEST_MAX_BYTES) throw new Error("RUN_RECORD_COMMIT_FAILED: manifest size invalid");
+	let manifest: RunRecord;
 	try {
-		const manifest = JSON.parse(await readFile(join(transaction.stagingDir, "manifest.json"), "utf8")) as Record<string, unknown>;
-		if (
-			manifest.schema_version !== 2 ||
-			manifest.run_id !== transaction.runId ||
-			manifest.run_transaction_schema_version !== 2 ||
-			(manifest.run_outcome !== "SUCCESS" && manifest.run_outcome !== "PROCESS_FAILED" && manifest.run_outcome !== "ARTIFACT_FAILED")
-		) throw new Error("invalid");
+		const rawManifest = JSON.parse(await readFile(join(transaction.stagingDir, "manifest.json"), "utf8")) as unknown;
+		const parsed = parseCommittedRunManifestV2(rawManifest, transaction.runId);
+		if (!parsed) throw new Error("invalid");
+		manifest = parsed;
 	} catch {
 		throw new Error("RUN_RECORD_COMMIT_FAILED: manifest readback invalid");
+	}
+	if (manifest.recipe === "gate") {
+		const gatesEntry = files.find((entry) => entry.path === "gates.json");
+		const evidenceEntry = files.find((entry) => entry.path === "evidence.json");
+		const { GATE_AUTHORITY_RECORD_MAX_BYTES, validatePersistedGateRunRecords } = await import("./gate-engine.ts");
+		if (!gatesEntry || !evidenceEntry
+			|| gatesEntry.bytes <= 0 || gatesEntry.bytes > GATE_AUTHORITY_RECORD_MAX_BYTES
+			|| evidenceEntry.bytes <= 0 || evidenceEntry.bytes > GATE_AUTHORITY_RECORD_MAX_BYTES) {
+			throw new Error("RUN_RECORD_COMMIT_FAILED: gate authority files missing or oversized");
+		}
+		try {
+			const gates = JSON.parse(await readFile(join(transaction.stagingDir, "gates.json"), "utf8")) as unknown;
+			const evidence = JSON.parse(await readFile(join(transaction.stagingDir, "evidence.json"), "utf8")) as unknown;
+			if (!validatePersistedGateRunRecords(transaction.runId, manifest, gates, evidence)) throw new Error("invalid");
+		} catch {
+			throw new Error("RUN_RECORD_COMMIT_FAILED: gate authority readback invalid");
+		}
 	}
 	const record: RunCommitRecordV2 = {
 		schema_version: RUN_TRANSACTION_SCHEMA_VERSION,

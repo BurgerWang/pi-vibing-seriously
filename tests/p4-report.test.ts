@@ -8,7 +8,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -21,11 +21,13 @@ import {
 	latestGateRunSummary,
 	latestGateStatuses,
 	readGateFileRecord,
+	readGateRunPage,
 	resolveRunTarget,
 } from "../extensions/workbench-runtime/core/report.ts";
 import {
 	clearGateRunCandidateCacheForTests,
 	GATE_ATTEMPT_INDEX_DIR,
+	GATE_ATTEMPT_ORDER_DIR,
 	latestRunAttemptForRecipe,
 	registerGateRunAttemptIndex,
 } from "../extensions/workbench-runtime/core/runs.ts";
@@ -92,6 +94,7 @@ async function makeGateRunPureLegacyV1(dir: string, runId: string): Promise<void
 	await writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
 	await rm(join(runDir, "run-commit.json"));
 	await rm(join(runsRoot, GATE_ATTEMPT_INDEX_DIR, `${runId}.json`));
+	await rm(join(runsRoot, GATE_ATTEMPT_ORDER_DIR), { recursive: true, force: true });
 	clearGateRunCandidateCacheForTests(dir);
 }
 
@@ -183,6 +186,9 @@ test("gate run report lists per-gate statuses and failed checks", async () => {
 			"gates:\n  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Missing, kind: file, path: nope.txt }\n",
 		);
 		const result = await runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: fakeExec(), now: () => new Date("2026-08-01T00:00:00.000Z") });
+		const strictPage = await readGateRunPage({ projectRoot: dir, runId: result.runId, requireCommittedAuthority: true });
+		assert.equal(strictPage.ok, true);
+		if (strictPage.ok) assert.equal(strictPage.details.authority_kind, "committed-v2");
 		const lines = await buildRunReport(dir, result.runId);
 		const text = lines?.join("\n") ?? "";
 		assert.ok(text.includes("recipe    : gate (gate run)"));
@@ -378,11 +384,11 @@ test("immutable gate-attempt index keeps repeated refresh reads bounded with mor
 			onCandidateValidation: () => { candidateValidations += 1; },
 		});
 		assert.equal(repeated?.run_id, gateRunId);
-		assert.equal(catalogManifestReads, 1_001, "the first mixed-history check classifies each unmarked directory once");
+		assert.equal(catalogManifestReads, 0, "the durable sequence head avoids scanning unrelated unmarked history");
 		assert.equal(
 			sourceIdentityProbes - identityProbesAfterFirstRefresh,
-			1_001,
-			"repeat refresh performs one cheap identity probe per cached manifest without reparsing it",
+			0,
+			"repeat refresh remains independent of unrelated history size",
 		);
 		assert.equal(candidateValidations, 2, "each refresh strictly revalidates only the single indexed gate");
 	});
@@ -440,6 +446,27 @@ test("a crash marker registered before transaction creation blocks an older PASS
 		assert.equal(summary?.status, "BLOCKED");
 		assert.doesNotMatch(summary?.blocking_reason ?? "", /historical pre-transaction/);
 		assert.equal((await latestGateStatuses(dir, ["g1"])).g1?.status, "UNKNOWN");
+	});
+});
+
+test("concurrent Gate attempt registrations reserve distinct monotonic sequences", async () => {
+	await withTempDir(async (dir) => {
+		await setupRecipeProject(dir);
+		const ids = ["20260802-000000-rac1", "20260802-000000-rac2"] as const;
+		const results = await Promise.all(ids.map((runId) => registerGateRunAttemptIndex(
+			dir,
+			runId,
+			new Date("2026-08-02T00:00:00.000Z"),
+		)));
+		assert.ok(results.every((result) => result.ok));
+		const orderDir = join(dir, CONFIG_DIR_NAME, "workbench", "runs", GATE_ATTEMPT_ORDER_DIR);
+		const orderFiles = (await readdir(orderDir)).sort();
+		assert.deepEqual(orderFiles, ["0000000000000001.json", "0000000000000002.json"]);
+		const sequences = await Promise.all(ids.map(async (runId) => {
+			const marker = JSON.parse(await readFile(join(dir, CONFIG_DIR_NAME, "workbench", "runs", GATE_ATTEMPT_INDEX_DIR, `${runId}.json`), "utf8")) as { attempt_sequence: number };
+			return marker.attempt_sequence;
+		}));
+		assert.deepEqual([...sequences].sort((a, b) => a - b), [1, 2]);
 	});
 });
 
@@ -565,6 +592,48 @@ test("same-second immutable markers use exact start time and ignore a stale muta
 		clearGateRunCandidateCacheForTests(dir);
 		assert.equal((await latestGateRunSummary(dir))?.run_id, newer);
 		assert.equal((await latestGateStatuses(dir, ["g1"])).g1?.run_id, newer);
+	});
+});
+
+test("durable Gate attempt sequence outranks a wall-clock rollback", async () => {
+	await withTempDir(async (dir) => {
+		await setupRecipeProject(dir);
+		await writeConfigFile(
+			dir,
+			"gates.yaml",
+			"gates:\n  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Config, kind: config }\n",
+		);
+		const earlierSequence = await runGateAt(dir, "2026-08-02T00:00:00.000Z");
+		await writeConfigFile(
+			dir,
+			"gates.yaml",
+			"gates:\n  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Missing, kind: file, path: missing.txt }\n",
+		);
+		const laterSequence = await runGateAt(dir, "2026-08-01T00:00:00.000Z");
+		assert.ok(laterSequence < earlierSequence, "fixture rolls the wall-clock run id backwards");
+		clearGateRunCandidateCacheForTests(dir);
+		const latest = await latestGateRunSummary(dir);
+		assert.equal(latest?.run_id, laterSequence);
+		assert.equal(latest?.status, "FAIL");
+	});
+});
+
+test("durable Gate attempt sequence survives marker loss and an unavailable legacy index after restart", async () => {
+	await withTempDir(async (dir) => {
+		await setupRecipeProject(dir);
+		await writeConfigFile(
+			dir,
+			"gates.yaml",
+			"gates:\n  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Config, kind: config }\n",
+		);
+		const runId = await runGateAt(dir, "2026-08-03T00:00:00.000Z");
+		const index = join(dir, CONFIG_DIR_NAME, "workbench", "runs", GATE_ATTEMPT_INDEX_DIR);
+		await rm(join(index, `${runId}.json`));
+		await rm(index, { recursive: true });
+		await writeFile(index, "index unavailable", "utf8");
+		clearGateRunCandidateCacheForTests(dir);
+		assert.equal((await latestGateRunSummary(dir))?.run_id, runId);
+		assert.equal((await latestGateStatuses(dir, ["g1"])).g1?.status, "PASS");
 	});
 });
 

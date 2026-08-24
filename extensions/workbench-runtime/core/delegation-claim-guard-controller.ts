@@ -47,7 +47,9 @@ const PLANNED_EXECUTION_RE = /\b(?:will|can|could|should|may|might|plan(?:ned)?\
 const DISTRIBUTIVE_CLAIM_RE = /\b(?:all|both|each|these|those)\b|(?:两|三|四|五|六|七|八|九|十|多)次|(?:全部|都|分别|上述|这些)/iu;
 const INLINE_CODE_RE = /`([^`\r\n]*)`/gu;
 const RUN_ONLY_LABEL_RE = /\b(?:runs?|recipe|tests?|pytest|mypy|compileall|loader|targeted|focused|audit|checks?|diff|gate(?:[-_ ]?profile)?|typecheck|lint)\b|(?:完整\s*)?G1|测试|验证|审计/iu;
+const BUILD_ONLY_LABEL_RE = /\b(?:build|job|workflow|pipeline)\b|构建|流水线/iu;
 const DELEGATION_LABEL_RE = /\b(?:delegation(?:s)?|worker(?:s)?|latest|authority)\b|delegation[_ ]?id|委派|工作线程/iu;
+const REVIEW_PASS_FINAL_RE = /\breview(?:\s+v2)?\b.{0,24}\bPASS\b.{0,24}\bFINAL\b|审查.{0,24}(?:通过|PASS).{0,24}(?:最终|FINAL)/iu;
 const RUN_SUCCESS_OUTCOME_RE = /\b(?:PASS(?:ED)?|SUCCESS(?:FUL(?:LY)?)?|SUCCEEDED|OK)\b|\bexit(?:\s+code)?\s*[:=]?\s*0\b|成功(?:退出|完成)?/iu;
 const RUN_FAILURE_OUTCOME_RE = /\b(?:FAIL(?:ED)?|EXCEPTION|CANCELLED|TIMED\s+OUT)\b|\bexit(?:\s+code)?\s*[:=]?\s*[1-9]\d*\b|失败|超时|已取消/iu;
 const RUN_COMPLETION_RE = /\b(?:complet(?:e|ed)|finish(?:ed)?|return(?:ed)?|exit(?:ed)?|ended)\b|(?:已|本次|刚刚|刚才)?(?:完成|结束|返回|退出)|完整\s*G1/iu;
@@ -155,7 +157,11 @@ function claimClauses(text: string): string[] {
 				: [];
 			return [...ids, ...statuses].join(" ") || " ";
 		});
-		for (const part of withoutInlineCode.split(/[.;,，。；!?！？]+/u)) {
+		// Keep comma-linked contrast clauses together. A sentence such as
+		// `did not fail, but completed successfully` contains both a negated
+		// audit statement and an affirmative execution claim; splitting at the
+		// comma would detach the delegation id from the affirmative half.
+		for (const part of withoutInlineCode.split(/[.;。；!?！？]+/u)) {
 			const clause = part.trim();
 			if (clause.length > 0) clauses.push(clause);
 		}
@@ -181,6 +187,14 @@ function idHasNearestRunLabel(clause: string, idIndex: number): boolean {
 	if (runIndex < 0) return false;
 	const delegationIndex = lastLabelIndex(prefix, DELEGATION_LABEL_RE);
 	return runIndex > delegationIndex;
+}
+
+function idHasNearestNonDelegationLabel(clause: string, idIndex: number): boolean {
+	if (idHasNearestRunLabel(clause, idIndex)) return true;
+	const prefix = clause.slice(0, idIndex);
+	const buildIndex = lastLabelIndex(prefix, BUILD_ONLY_LABEL_RE);
+	if (buildIndex < 0) return false;
+	return buildIndex > lastLabelIndex(prefix, DELEGATION_LABEL_RE);
 }
 
 function inspectWorkbenchRunClaims(text: string): {
@@ -261,8 +275,12 @@ function addSemanticSuccess(
 	statuses: DelegationClaimExpectedStatus[],
 	text: string,
 ): DelegationClaimExpectedStatus[] {
-	if (!SUCCESS_WORD_RE.test(text) || statuses.some((status) => statusImpliesSuccess(status.status))) return statuses;
-	return [...statuses, { status: "SUCCESS", source: "unspecified" }];
+	let result = statuses;
+	if (REVIEW_PASS_FINAL_RE.test(text) && !result.some((status) => status.status === "REVIEWED" && status.source === "session")) {
+		result = [...result, { status: "REVIEWED", source: "session" }];
+	}
+	if (!SUCCESS_WORD_RE.test(text) || result.some((status) => statusImpliesSuccess(status.status))) return result;
+	return [...result, { status: "SUCCESS", source: "unspecified" }];
 }
 
 function strictLegacyStatus(ledger: DelegationLedger, id: string): DelegationClaimAuthorityStatus | undefined {
@@ -332,24 +350,24 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 	for (const rawClause of claimClauses(text)) {
 		const clause = rawClause.replace(BLOCKED_EXECUTION_SCAN_RE, " ");
 		const hasDelegationSubject = DELEGATION_WORD_RE.test(clause) || WORKER_WORD_RE.test(clause);
-		const negative = hasDelegationSubject && (
-			NEGATED_WORD_RE.test(clause)
-			|| new RegExp(NEGATED_CLAIM_SCAN_RE.source, "i").test(clause)
-		);
+		const affirmativeClause = clause.replace(new RegExp(NEGATED_CLAIM_SCAN_RE.source, "gi"), " ");
+		const negative = hasDelegationSubject && (NEGATED_WORD_RE.test(clause) || affirmativeClause !== clause);
 		if (negative) {
 			sawNegativeDelegation = true;
-			continue;
+			if (!EXECUTION_WORD_RE.test(affirmativeClause) && !SUCCESS_WORD_RE.test(affirmativeClause)
+				&& !REVIEW_PASS_FINAL_RE.test(affirmativeClause) && statusesIn(affirmativeClause).length === 0) continue;
 		}
-		const idMatches = [...clause.matchAll(new RegExp(DELEGATION_ID_SCAN_RE.source, "g"))]
-			.filter((match) => !idHasNearestRunLabel(clause, match.index ?? 0));
-		const plannedExecution = hasDelegationSubject && PLANNED_EXECUTION_RE.test(clause);
-		if (plannedExecution && idMatches.length === 0 && statusesIn(clause).length === 0) continue;
-		const clauseExecution = hasDelegationSubject && !plannedExecution && EXECUTION_WORD_RE.test(clause);
-		const clauseSuccess = hasDelegationSubject && !plannedExecution && SUCCESS_WORD_RE.test(clause);
-		const clauseStart = clauseExecution && ASSERTED_START_RE.test(clause);
+		const idMatches = [...affirmativeClause.matchAll(new RegExp(DELEGATION_ID_SCAN_RE.source, "g"))]
+			.filter((match) => !idHasNearestNonDelegationLabel(affirmativeClause, match.index ?? 0));
+		const plannedExecution = hasDelegationSubject && PLANNED_EXECUTION_RE.test(affirmativeClause);
+		if (plannedExecution && idMatches.length === 0 && statusesIn(affirmativeClause).length === 0) continue;
+		const clauseExecution = hasDelegationSubject && !plannedExecution && EXECUTION_WORD_RE.test(affirmativeClause);
+		const clauseSuccess = hasDelegationSubject && !plannedExecution
+			&& (SUCCESS_WORD_RE.test(affirmativeClause) || REVIEW_PASS_FINAL_RE.test(affirmativeClause));
+		const clauseStart = clauseExecution && ASSERTED_START_RE.test(affirmativeClause);
 		const clauseRecent = (clauseStart || clauseSuccess)
-			&& RECENT_WORD_RE.test(clause)
-			&& (START_WORD_RE.test(clause) || clauseSuccess);
+			&& RECENT_WORD_RE.test(affirmativeClause)
+			&& (START_WORD_RE.test(affirmativeClause) || clauseSuccess);
 		executionClaim ||= clauseExecution;
 		workerStartClaim ||= clauseStart;
 		successClaim ||= clauseSuccess;
@@ -362,22 +380,22 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 				idOrder.push(id);
 				expectedStatuses.set(id, []);
 			}
-			const nextIndex = idMatches[index + 1]?.index ?? clause.length;
-			const segment = clause.slice(index === 0 ? 0 : (match.index ?? 0), nextIndex);
+			const nextIndex = idMatches[index + 1]?.index ?? affirmativeClause.length;
+			const segment = affirmativeClause.slice(index === 0 ? 0 : (match.index ?? 0), nextIndex);
 			const statuses = addSemanticSuccess(statusesIn(segment), segment);
 			expectedStatuses.get(id)!.push(...statuses);
 			if (clauseRecent) sameRunStartIds.add(id);
 		}
-		if (idMatches.length > 1 && DISTRIBUTIVE_CLAIM_RE.test(clause)) {
-			const distributedStatuses = addSemanticSuccess(statusesIn(clause), clause);
+		if (idMatches.length > 1 && DISTRIBUTIVE_CLAIM_RE.test(affirmativeClause)) {
+			const distributedStatuses = addSemanticSuccess(statusesIn(affirmativeClause), affirmativeClause);
 			if (distributedStatuses.length > 0 && distributedStatuses.every((status) => statusImpliesSuccess(status.status))) {
 				for (const match of idMatches) expectedStatuses.get(match[0]!)!.push(...distributedStatuses);
 			}
 		}
 		if (idMatches.length === 0) {
-			const statuses = addSemanticSuccess(statusesIn(clause), clause);
+			const statuses = addSemanticSuccess(statusesIn(affirmativeClause), affirmativeClause);
 			if (statuses.length > 0 && (hasDelegationSubject || statuses.some((status) => status.source !== "unspecified"))) {
-				unboundStatusClaims.push({ statuses, distributive: DISTRIBUTIVE_CLAIM_RE.test(clause) });
+				unboundStatusClaims.push({ statuses, distributive: DISTRIBUTIVE_CLAIM_RE.test(affirmativeClause) });
 			}
 		}
 	}

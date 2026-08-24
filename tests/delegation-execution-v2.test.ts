@@ -36,6 +36,9 @@ import {
 	readDelegationCommittedGenerationV2,
 	readDelegationTransactionV2,
 } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
+import { readRecoverableUnpublishedDelegationV2 } from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
+import { readWorkerRepairCapsule } from "../extensions/workbench-runtime/core/worker-repair-authority.ts";
+import { SEMANTIC_REVIEW_ENVELOPE_MAX_STREAM_BYTES_V1 } from "../extensions/workbench-runtime/core/semantic-review-envelope.ts";
 import type { DelegationTaskKind } from "../extensions/workbench-runtime/core/delegation-transaction.ts";
 import type { ExecFn } from "../extensions/workbench-runtime/core/config.ts";
 import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtime/core/worker-policy.ts";
@@ -318,6 +321,54 @@ test("execution v2: implementation commits PENDING_REVIEW and strict reader retu
 		workerIdentity: executionInput.workerIdentity,
 		secrets: executionInput.secrets,
 	});
+});
+
+test("execution v2: an over-envelope delivery never enters PENDING and exposes strict repair_of recovery authority", async (t) => {
+	const projectRoot = await root(t);
+	const delegationId = id(51);
+	const path = "src/over-envelope.ts";
+	const report = completeReport([path]);
+	const executionInput = await input(projectRoot, delegationId, "implementation", after([path]), worker(report));
+	executionInput.runWorker = async () => {
+		const operationId = "c".repeat(64);
+		const begun = await beginWriteJournalOperation({
+			project_root: projectRoot, delegation_id: delegationId, contract_hash: executionInput.contract.contract_hash,
+			expected_revision: 0, operation_id: operationId, kind: "write", path,
+		});
+		assert.equal(begun.ok, true);
+		if (!begun.ok) throw new Error("journal begin failed");
+		await mkdir(dirname(join(projectRoot, path)), { recursive: true });
+		await writeFile(join(projectRoot, path), Buffer.alloc(SEMANTIC_REVIEW_ENVELOPE_MAX_STREAM_BYTES_V1 + 1, 0x78));
+		const completed = await completeWriteJournalOperation({
+			project_root: projectRoot, delegation_id: delegationId, contract_hash: executionInput.contract.contract_hash,
+			expected_revision: begun.value.revision, operation_id: operationId, kind: "write", path, outcome: "succeeded",
+		});
+		assert.equal(completed.ok, true);
+		if (!completed.ok) throw new Error("journal completion failed");
+		return worker(report, {
+			writeJournalObservation: Object.freeze({
+				state: "complete", tool: "write", outcome: "succeeded", code: "none", revision: completed.value.revision,
+			}),
+		});
+	};
+	const result = await executeDelegationV2(executionInput);
+	assert.equal(result.ok, false);
+	if (result.ok) return;
+	assert.equal(result.code, "artifact_failed");
+	assert.equal(result.artifact_error_code, "review_envelope_exceeded");
+	assert.equal(result.durable_state?.status, "RECOVERY_REQUIRED");
+	assert.equal(result.durable_state?.recovery_reason, "committed artifact construction failed: review_envelope_exceeded");
+	const committed = await readDelegationCommittedGenerationV2(projectRoot, delegationId);
+	assert.equal(committed.ok, false, "capacity refusal happens before immutable PENDING publication");
+	const recoverable = await readRecoverableUnpublishedDelegationV2(projectRoot, delegationId);
+	assert.equal(recoverable.ok, true, recoverable.ok ? "" : recoverable.error.code);
+	const capsule = await readWorkerRepairCapsule(projectRoot, delegationId);
+	assert.equal(capsule.ok, true, capsule.ok ? "" : capsule.code);
+	if (capsule.ok) {
+		assert.equal(capsule.capsule.repair_of, delegationId);
+		assert.equal(capsule.capsule.authority_kind, "v2_unpublished");
+		assert.deepEqual(capsule.capsule.changed_paths, [path]);
+	}
 });
 
 test("execution v2: execution-owner publication failure closes PREPARED before returning", async (t) => {

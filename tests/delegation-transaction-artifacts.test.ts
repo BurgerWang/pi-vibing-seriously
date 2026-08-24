@@ -3,7 +3,7 @@ import test from "node:test";
 
 import {
 	bindDelegationBoundedTaskContractV2,
-	buildDelegationCommittedArtifactsV2,
+	buildDelegationCommittedArtifactsV2 as buildDelegationCommittedArtifactsV2Raw,
 	computeDelegationDeltaHashV2,
 	deriveDelegationPersistedReportV2,
 	normalizeDelegationBoundedTaskContractV2,
@@ -27,10 +27,32 @@ import { deriveFinalizedDelegationWorkspaceFactsV2 } from "../extensions/workben
 import type { StreamingPathIdentity } from "../extensions/workbench-runtime/core/streaming-identity.ts";
 import { computeWorkspaceGuardHash, type WorkspaceGuardRecord } from "../extensions/workbench-runtime/core/workspace-guard.ts";
 import { computeWorkerWriteJournalHash, type WorkerWriteJournalRecord } from "../extensions/workbench-runtime/core/write-journal.ts";
+import { buildSemanticReviewEnvelopeV1 } from "../extensions/workbench-runtime/core/semantic-review-envelope.ts";
 
 const ID = "20260817-170000-abcd";
 const HEAD = "1".repeat(40);
 const IDENTITY = { provider: WORKER_PROVIDER, model: WORKER_MODEL_ID, worker_id: "artifact-worker" } as const;
+
+function buildDelegationCommittedArtifactsV2(
+	input: Parameters<typeof buildDelegationCommittedArtifactsV2Raw>[0],
+): ReturnType<typeof buildDelegationCommittedArtifactsV2Raw> {
+	if (input.transaction.task_kind !== "implementation" || input.changeSetLifecycle.change_set.worker_delta.length === 0 ||
+		input.reviewEnvelope !== undefined) return buildDelegationCommittedArtifactsV2Raw(input);
+	const streams = input.changeSetLifecycle.change_set.worker_delta.map((entry) => ({
+		path: entry.path,
+		source: "file-content" as const,
+		stream_bytes: entry.after.kind === "file" ? entry.after.byte_size : 24,
+		stream_sha256: entry.after.kind === "file" ? entry.after.sha256 : "d".repeat(64),
+		page_count: 1,
+	}));
+	const envelope = buildSemanticReviewEnvelopeV1({
+		streams,
+		projected_review_record_bytes: 256 * 1024,
+		relevance_projection_hash: "e".repeat(64),
+	});
+	if (!envelope.ok) return buildDelegationCommittedArtifactsV2Raw(input);
+	return buildDelegationCommittedArtifactsV2Raw({ ...input, reviewEnvelope: envelope.value });
+}
 
 function at(second: number): string {
 	return `2026-08-17T17:00:${String(second).padStart(2, "0")}.000Z`;
@@ -306,6 +328,9 @@ test("artifact v2: implementation builds deterministic exact records without mut
 	const { state, contract, changeSetLifecycle } = committing("implementation", true, facts);
 	const input = { transaction: state, contract: contract.value, ...artifactWorkspaceFacts(changeSetLifecycle), changeSetLifecycle, worker: worker(report), reportText: report };
 	const snapshot = structuredClone(input);
+	const missingEnvelope = buildDelegationCommittedArtifactsV2Raw(input);
+	assert.equal(missingEnvelope.ok, false, "a current non-zero implementation cannot publish PENDING without admission proof");
+	if (!missingEnvelope.ok) assert.equal(missingEnvelope.error.code, "review_envelope_exceeded");
 	const first = buildDelegationCommittedArtifactsV2(input);
 	const second = buildDelegationCommittedArtifactsV2(input);
 	assert.equal(first.ok, true);
@@ -328,6 +353,7 @@ test("artifact v2: implementation builds deterministic exact records without mut
 	assert.deepEqual(first.value.workerSummary.changed_paths, ["src/changed.ts"]);
 	assert.deepEqual(first.value.reportedPaths, ["src/changed.ts"]);
 	assert.equal(first.value.workerSummary.parse_warning, null);
+	assert.equal(Object.prototype.hasOwnProperty.call(first.value.records["after.json"], "review_envelope"), true);
 	const usage = first.value.records["usage.json"] as Record<string, unknown>;
 	assert.deepEqual(usage.spend, first.value.workerSummary.spend, "usage and summary share the same input-derived spend facts");
 	assert.deepEqual(usage.usage, first.value.workerSummary.usage);

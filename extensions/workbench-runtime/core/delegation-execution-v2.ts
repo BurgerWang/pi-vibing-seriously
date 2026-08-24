@@ -84,6 +84,9 @@ import {
 	type WorkerProgress,
 	type WorkerRunResult,
 } from "../worker/runner.ts";
+import { collectReviewRelevanceV2 } from "./review-relevance-v2.ts";
+import { preflightSemanticReviewEnvelopeV1 } from "./diff-review.ts";
+import type { SemanticReviewEnvelopeV1 } from "./semantic-review-envelope.ts";
 
 export type DelegationExecutionV2FailureCode =
 	| "invalid_input"
@@ -691,6 +694,43 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 	}
 	state = committing.value;
 
+	let reviewEnvelope: SemanticReviewEnvelopeV1 | undefined;
+	if (checked.contract.task_kind === "implementation" && changedPaths.length > 0 &&
+		state.postcondition_reasons.length === 0 && state.terminal_outcome?.terminal_facts_complete === true &&
+		state.terminal_outcome.scope_complete === true) {
+		const relevance = await collectReviewRelevanceV2({
+			project_root: checked.projectRoot,
+			delegation_id: checked.delegationId,
+			contract_hash: checked.contract.contract_hash,
+			after_guard: changeSetLifecycle.after_guard,
+			change_set: changeSetLifecycle.change_set,
+			exec: input.exec,
+		}).catch(() => undefined);
+		const envelope = relevance?.ok
+			? await preflightSemanticReviewEnvelopeV1({
+				projectRoot: checked.projectRoot,
+				workerPaths: changedPaths,
+				allowedPaths: checked.contract.allowed_paths,
+				afterDigests: after.pathDigests,
+				pathStatuses: after.pathStatuses,
+				relevanceProjection: relevance.value.projection,
+				relevanceProjectionHash: relevance.value.binding.projection_hash,
+				exec: input.exec,
+				secrets: checked.secrets,
+			})
+			: undefined;
+		if (envelope === undefined || !envelope.ok) {
+			state = await attemptRecovery(checked, state, input.clock, storageOptions,
+				"committed artifact construction failed: review_envelope_exceeded");
+			return failure("artifact_failed", checked, input, {
+				durable_state: state,
+				artifact_error_code: "review_envelope_exceeded",
+				after: cloneAfter(after),
+			});
+		}
+		reviewEnvelope = envelope.value;
+	}
+
 	let artifacts: ReturnType<typeof buildDelegationCommittedArtifactsV2>;
 	try {
 		const ledgerWorker = ledgerWorkerFacts(worker, succeeded, report.value.persisted_text, checked.secrets);
@@ -703,6 +743,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 			worker: ledgerWorker,
 			reportText: worker.reportText,
 			secrets: checked.secrets,
+			...(reviewEnvelope === undefined ? {} : { reviewEnvelope }),
 		});
 	} catch {
 		const artifactErrorCode = "internal_error" as const;

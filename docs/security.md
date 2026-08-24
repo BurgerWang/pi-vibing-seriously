@@ -94,7 +94,10 @@ Defense-in-depth controls:
   subtree; lexical plus realpath checks reject project escapes and symlink
   hops outside the approved subtree;
 - the tool executes sequentially, propagates abort, enforces a timeout, and
-  bounds stdout/stderr processing.
+  bounds stdout/stderr processing. On POSIX the pinned child owns a dedicated
+  process group; abort, timeout, invalid output, and even a normal leader exit
+  terminate remaining descendants so a background helper cannot write after
+  the delegation lifetime ends.
 
 ### Fixed Sol -> Luna write authority (current; legacy id P7)
 
@@ -128,7 +131,13 @@ status` and the footer show only `WF:LEASE used/max` / `WF:LOCKED` facts).
 Leases are revoked on leaving DEV, commander model/provider change, session
 end, explicit lock, and they expire (30 min) or exhaust (10 calls) —
 restoring the locked Sol surface. Invalid lease records fail closed for all
-direct commander edit/write paths.
+direct commander edit/write paths. Edit/write authorization is serialized per
+runtime, and the consumed-call state must be durably appended before the tool
+is allowed to proceed; append failure revokes the in-memory lease and locks the
+surface. A confirmed ACTIVE record is audit-restored but never reactivated by
+`session_start`: every replacement/reload requires a fresh user grant, so an
+older durable entry cannot revive authority after a failed consume/revoke
+append.
 
 ### Delegation ledger and review lifecycle (P7)
 
@@ -202,9 +211,11 @@ selected, repeated calls continue a contiguous UTF-8 byte cursor bound to the
 same current diff and complete redacted-stream SHA-256 (bounded at 4 MiB);
 only a page whose full title and body fit the final tool envelope advances the
 cursor. The provisional record carries a contiguous per-page receipt chain;
-before Sol ACCEPT, the runtime rebuilds every current redacted source/diff
-stream and checks its source, total, full-stream hash, every receipt range/hash,
-and the current visible page slice. Gaps, overlaps, stream changes, cut pages,
+current writes compact that history into one O(paths), authoritative-stream
+prefix receipt and the latest page range/hash. Before Sol ACCEPT, the runtime
+recomputes that prefix proof and rebuilds every
+current redacted source/diff stream and checks its source, total,
+full-stream hash, and the current visible page slice. Gaps, overlaps, stream changes, cut pages,
 self-asserted PENDING acceptance and malformed cursor facts fail closed, while
 a bound-hash or redacted-stream change resets progress. A sufficiently large current regular
 `.svg`/`.json` may instead carry strict bounded compact facts: status, size,

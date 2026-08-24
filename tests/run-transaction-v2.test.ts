@@ -70,6 +70,26 @@ async function writeMinimalRunPayload(directory: string, runId: string, marker: 
 		schema_version: 2,
 		run_id: runId,
 		recipe: "test",
+		profile: "generic",
+		started_at: "2026-08-20T19:15:00.000Z",
+		finished_at: "2026-08-20T19:15:00.001Z",
+		duration_ms: 1,
+		cwd: directory,
+		argv: ["test"],
+		exit_code: 0,
+		timed_out: false,
+		cancelled: false,
+		git_commit: null,
+		git_dirty: false,
+		artifact_paths: [],
+		stdout_truncated: false,
+		stderr_truncated: false,
+		mode: "DEV",
+		expected_exit_codes: [0],
+		declared_writes: [],
+		environment_names: [],
+		validation_components: [],
+		cache_request_mode: "no-cache",
 		run_transaction_schema_version: 2,
 		run_outcome: "SUCCESS",
 	}), "utf8");
@@ -338,6 +358,28 @@ test("rename failure cannot publish a committed run", async () => {
 		await writeFile(join(transaction.finalDir, "foreign"), "occupied", "utf8");
 		await assert.rejects(commitRunTransaction(transaction, new Date("2026-08-20T19:10:00.000Z")));
 		assert.equal((await readCommittedRunTransaction(dir, runId)).ok, false);
+	});
+});
+
+test("commit rejects incomplete v2 manifest shapes and terminal-outcome contradictions", async () => {
+	await withTempDir(async (dir) => {
+		const incompleteId = "20260820-191100-shap";
+		const incomplete = await beginRunTransaction(dir, incompleteId);
+		await writeMinimalRunPayload(incomplete.stagingDir, incompleteId, "shape");
+		const incompletePath = join(incomplete.stagingDir, "manifest.json");
+		const incompleteManifest = JSON.parse(await readFile(incompletePath, "utf8")) as Record<string, unknown>;
+		delete incompleteManifest.expected_exit_codes;
+		await writeFile(incompletePath, JSON.stringify(incompleteManifest), "utf8");
+		await assert.rejects(commitRunTransaction(incomplete, new Date("2026-08-20T19:11:00.000Z")), /manifest readback invalid/);
+
+		const contradictionId = "20260820-191101-outc";
+		const contradiction = await beginRunTransaction(dir, contradictionId);
+		await writeMinimalRunPayload(contradiction.stagingDir, contradictionId, "outcome");
+		const contradictionPath = join(contradiction.stagingDir, "manifest.json");
+		const contradictionManifest = JSON.parse(await readFile(contradictionPath, "utf8")) as Record<string, unknown>;
+		contradictionManifest.run_outcome = "PROCESS_FAILED";
+		await writeFile(contradictionPath, JSON.stringify(contradictionManifest), "utf8");
+		await assert.rejects(commitRunTransaction(contradiction, new Date("2026-08-20T19:11:01.000Z")), /manifest readback invalid/);
 	});
 });
 

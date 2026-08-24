@@ -2230,7 +2230,7 @@ test("planned mixed batches are role-bounded and completion order cannot change 
 	});
 });
 
-test("registered read_gate reconstructs every semantic row through exact 4 KiB turn reservations without downstream truncation or cursor skips", async () => {
+test("registered legacy diagnostic read_gate reconstructs every semantic row through exact 4 KiB turn reservations without downstream truncation or cursor skips", async () => {
 	type GateReadTool = {
 		execute: (
 			toolCallId: string,
@@ -2267,6 +2267,7 @@ test("registered read_gate reconstructs every semantic row through exact 4 KiB t
 			const raw = await tool.execute(id, params, undefined, undefined, ctx);
 			const rawText = textOf(raw.content);
 			assert.ok(bytes(rawText) <= 4_096, "execute renders inside this call's exact minimum reservation");
+			assert.equal(raw.details.authority_kind, "diagnostic", "schema-v1 Gate pages never become trusted v2 authority");
 			const final = await emitToolResult(stub, {
 				type: "tool_result", toolCallId: id, toolName: "workbench_read_gate", input: params,
 				content: raw.content, details: raw.details, isError: false,
@@ -2276,12 +2277,7 @@ test("registered read_gate reconstructs every semantic row through exact 4 KiB t
 			assert.doesNotMatch(finalText, /^\[workbench-tool-result-ingress v1\]/, "an already-bounded semantic page is never inflated by a recovery wrapper");
 			const details = final.details as Record<string, unknown>;
 			const envelope = details.output_envelope as Record<string, unknown>;
-			const ingress = details.ingress_projection as Record<string, unknown>;
-			assert.ok(ingress, "the byte-exact page still carries trusted durable-source metadata");
-			assert.equal(ingress.originalBytes, bytes(rawText));
-			assert.equal(ingress.projectedBytes, bytes(rawText));
-			assert.equal(ingress.bodyShownBytes, bytes(rawText));
-			assert.equal(ingress.omittedBytes, 0);
+			assert.equal(details.ingress_projection, undefined, "diagnostic legacy pages carry no trusted durable-source projection");
 			assert.equal(envelope.truncated, false);
 			assert.equal(envelope.shownTextBytes, bytes(finalText));
 			const rowKeys = finalText.split("\n").flatMap((line) => {
