@@ -11,7 +11,10 @@ import {
 	bindDelegationBoundedTaskContractV2,
 	type DelegationBoundedTaskContractBindingV2,
 } from "./delegation-transaction-artifacts.ts";
-import { readDelegationCommittedGenerationV2 } from "./delegation-transaction-storage.ts";
+import {
+	readDelegationCommittedGenerationV2,
+	readDelegationTransactionV2,
+} from "./delegation-transaction-storage.ts";
 import type { DelegationTransactionStatus } from "./delegation-transaction.ts";
 import {
 	readDelegationAuthorityObservationV2,
@@ -83,9 +86,18 @@ export async function readDelegationPlanContractAuthority(
 	if (delegationId === null || delegationId === undefined) return { status: "absent" };
 	const generation = await readDelegationCommittedGenerationV2(projectRoot, delegationId);
 	if (!generation.ok) {
-		return generation.error.code === "not_found"
-			? { status: "absent" }
-			: blocked("plan-generation-invalid");
+		if (generation.error.code === "not_found") return { status: "absent" };
+		// A strict before-worker ABORTED transaction deliberately has no
+		// committed generation. It is terminal and non-blocking, so it must not
+		// turn the advertised "start a fresh delegation" action into an
+		// impossible plan-generation-invalid loop. Repair lineage is excluded:
+		// its root owns separate, exact plan continuity.
+		const transaction = await readDelegationTransactionV2(projectRoot, delegationId);
+		if (transaction.ok && transaction.value.status === "ABORTED" &&
+			transaction.value.committed_proof === null && transaction.value.repair_lineage === undefined) {
+			return { status: "absent" };
+		}
+		return blocked("plan-generation-invalid");
 	}
 	const before = generation.value.records["before.json"];
 	if (before === null || typeof before !== "object" || Array.isArray(before)) return blocked("plan-contract-invalid");

@@ -1500,6 +1500,19 @@ test("a fresh session discovers durable ABORTED project authority without report
 		assert.match(resultText(status), /completion v2: FAIL/);
 		assert.match(resultText(status), /next action\s+: start a fresh delegation; the terminal before-worker transaction needs no review/);
 		assert.doesNotMatch(resultText(status), /INVALID|\(no delegation\)/);
+
+		const script = await writeFakeWorker(root, {});
+		const successor = await withFakeWorker(script, () => delegateTool(stub).execute(
+			"project-aborted-successor",
+			delegateParams({ task_kind: "diagnosis" }),
+			undefined,
+			undefined,
+			ctx,
+		));
+		assert.notEqual(delegationId(successor), id, "the advertised fresh-delegation action is actually executable");
+		const committed = await readDelegationCommittedGenerationV2(root, delegationId(successor));
+		assert.equal(committed.ok, true, committed.ok ? "" : committed.error.code);
+		if (committed.ok) assert.equal(committed.value.state.status, "FINISHED");
 	});
 });
 

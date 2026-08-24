@@ -65,6 +65,17 @@ type CurrentDelegationBinding =
 
 const DELEGATION_FAILURE_SUMMARY_MAX_BYTES = 2_048 as const;
 
+type PreparedCallbackStep =
+	| "verification_recheck"
+	| "plan_recheck"
+	| "repair_authority_recheck"
+	| "finalized_successor_recheck"
+	| "reviewed_binding_recheck"
+	| "session_transition"
+	| "session_persist"
+	| "start_lock_release"
+	| "progress_publish";
+
 type V2RepairAuthorityKind = "committed" | "unpublished" | "raw-lineage";
 
 interface V2RepairAuthority {
@@ -554,6 +565,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					}
 				}
 
+				let preparedCallbackStep: PreparedCallbackStep | undefined;
 				const execution = await controller.services.executeDelegation({
 					projectRoot,
 					delegationId,
@@ -572,16 +584,20 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					exec: controller.exec,
 					clock: () => controller.services.now().toISOString(),
 					onPrepared: async (_transaction, preparedBefore) => {
+						preparedCallbackStep = "verification_recheck";
 						await verifyRecipesBeforeLaunch();
 						if (contract.value.plan_ref !== undefined) {
+							preparedCallbackStep = "plan_recheck";
 							const currentPlan = await verifyCurrentPlanReference(projectRoot, contract.value.plan_ref);
 							if (!currentPlan.ok) throw new Error(`plan_ref ${currentPlan.error.code} before worker launch`);
 						}
 						if (v2RepairAuthority !== undefined) {
+							preparedCallbackStep = "repair_authority_recheck";
 							if (!await revalidateV2RepairAuthority()) {
 								throw new Error("repair authority or current binding changed before worker launch");
 							}
 						} else if (finalizedStaleSuccessorId !== undefined) {
+							preparedCallbackStep = "finalized_successor_recheck";
 							const revalidated = await controller.services.readCommittedGeneration(projectRoot, finalizedStaleSuccessorId);
 							const revalidatedReview = await readDelegationReviewV2(projectRoot, finalizedStaleSuccessorId);
 							if (!revalidated.ok || revalidated.value.state.status !== "REVIEWED" || !revalidatedReview.ok ||
@@ -589,6 +605,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 								throw new Error("finalized stale successor authority changed before worker launch");
 							}
 						} else if (reviewedPrelaunch !== undefined) {
+							preparedCallbackStep = "reviewed_binding_recheck";
 							const rebound = await controller.collectCurrentDelegationBinding(projectRoot, reviewedPrelaunch.id);
 							if (rebound.status !== "fresh" || rebound.hash !== reviewedPrelaunch.hash) {
 								throw new Error("reviewed delegation authority changed before worker launch");
@@ -599,6 +616,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 							diffHash: preparedBefore.diffHash,
 							now: startedAt,
 						};
+						preparedCallbackStep = "session_transition";
 						const recorded = exactBlockingRepair
 							? recordRepairDelegation(controller.getDelegationState(), recordInput, v2RepairAuthority!.id)
 							: finalizedStaleSuccessorId !== undefined
@@ -606,9 +624,12 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 								: recordDelegation(controller.getDelegationState(), recordInput);
 						if (!recorded.ok) throw new Error("delegation session mirror refused PREPARED");
 						controller.setDelegationState(recorded.state);
+						preparedCallbackStep = "session_persist";
 						controller.persistDelegationStateStrict(recorded.state);
+						preparedCallbackStep = "start_lock_release";
 						await releaseStartLock();
 						void controller.refreshStatus(ctx);
+						preparedCallbackStep = "progress_publish";
 						onUpdate?.({
 							content: [{ type: "text", text: `Pinned worker: 0 turn(s), model ${WORKER_MODEL_SELECTOR} | spend total 0 | output 0 | band ok` }],
 							details: {
@@ -687,6 +708,9 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					const artifactError = execution.artifact_error_code === undefined
 						? ""
 						: `; artifact_error=${execution.artifact_error_code}`;
+					const preparedStep = execution.code === "prepared_callback_failed" && preparedCallbackStep !== undefined
+						? `; prepared_step=${preparedCallbackStep}`
+						: "";
 					const workerFailure = execution.worker_failure_code === undefined
 						? ""
 						: `; worker_failure=${execution.worker_failure_code}`;
@@ -708,10 +732,10 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					const nextAction = status === "FAILED"
 						? `; next_action=call workbench_delegation_status, then call workbench_delegate_worker with repair_of=${delegationId}`
 						: "; next_action=call workbench_delegation_status";
-					const summary = `workbench_delegate_worker: delegation v2 ${execution.code}${artifactError}; delegation_id=${delegationId}; durable_status=${status}; postconditions=${reasons}${workerFailure}${workerReport}${changedPaths}${workerFacts}${nextAction}`;
+					const summary = `workbench_delegate_worker: delegation v2 ${execution.code}${artifactError}${preparedStep}; delegation_id=${delegationId}; durable_status=${status}; postconditions=${reasons}${workerFailure}${workerReport}${changedPaths}${workerFacts}${nextAction}`;
 					const boundedSummary = Buffer.byteLength(summary, "utf8") <= DELEGATION_FAILURE_SUMMARY_MAX_BYTES
 						? summary
-						: `workbench_delegate_worker: delegation v2 ${execution.code}; delegation_id=${delegationId}; durable_status=${status}; postconditions=summary_over_bound${workerReport}${changedPaths}${nextAction}`;
+						: `workbench_delegate_worker: delegation v2 ${execution.code}${preparedStep}; delegation_id=${delegationId}; durable_status=${status}; postconditions=summary_over_bound${workerReport}${changedPaths}${nextAction}`;
 					throw new Error(boundedSummary);
 				}
 				const result = execution.result;

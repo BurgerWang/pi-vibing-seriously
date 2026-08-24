@@ -474,7 +474,7 @@ test("delegate controller preflights recipe references before authority work and
 		await writeConfigFile(projectRoot, "recipes.yaml", recipeYaml("none"));
 		await assert.rejects(
 			tool.execute("delegate-recheck", params, undefined, undefined, context()),
-			/prepared_callback_failed/,
+			/prepared_callback_failed; prepared_step=verification_recheck/,
 		);
 		assert.equal(reconcileCalls, 3, "authority is recovered before the start lock, revalidated under it, and reconciled after abort");
 		assert.equal(executionCalls, 1);
