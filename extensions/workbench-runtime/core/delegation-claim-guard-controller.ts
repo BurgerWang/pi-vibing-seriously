@@ -22,12 +22,13 @@ import type { readCommittedManifest } from "./runs.ts";
 
 export const DELEGATION_CLAIM_GUARD_SCHEMA = "workbench-delegation-claim-guard-v1" as const;
 export const DELEGATION_CLAIM_GUARD_CODE = "UNVERIFIED_EXECUTION_CLAIM" as const;
+export const DELEGATION_CLAIM_BINDING_REVISION = "authority-resolved-v2" as const;
 export const DELEGATION_CLAIM_GUARD_TEXT = [
 	`[${DELEGATION_CLAIM_GUARD_SCHEMA}]`,
 	DELEGATION_CLAIM_GUARD_CODE,
 	"The assistant attempted to report delegation execution without matching machine authority.",
 	"No delegation id, status, or completion claim from the rejected message is accepted.",
-	"Query workbench_delegation_status and follow its persisted next action: review PENDING_REVIEW/STALE; delegate only when unblocked.",
+	"Follow the machine-specific next_action below; rejected prose is never authority.",
 ].join("\n");
 
 const DELEGATION_ID_SCAN_RE = /\b\d{8}-\d{6}-[A-Za-z0-9]{4}\b/g;
@@ -47,13 +48,14 @@ const ASSERTED_ATTEMPT_RE = /\b(?:attempted|called|retried)\b|已(?:按要求)?(
 const PLANNED_EXECUTION_RE = /\b(?:will|can|could|should|may|might|plan(?:ned)?\s+to|need\s+to|ready\s+to|going\s+to)\b.{0,32}\b(?:start|launch|execute|create|call)\b|(?:下一步|计划|准备|打算|可以|需要).{0,24}(?:启动|执行|创建|调用|改用)/iu;
 const DISTRIBUTIVE_CLAIM_RE = /\b(?:all|both|each|these|those)\b|(?:两|三|四|五|六|七|八|九|十|多)次|(?:全部|都|分别|上述|这些)/iu;
 const INLINE_CODE_RE = /`([^`\r\n]*)`/gu;
-const RUN_ONLY_LABEL_RE = /\b(?:runs?|recipe|tests?|pytest|mypy|compileall|loader|targeted|focused|audit|checks?|diff|gate(?:[-_ ]?profile)?|typecheck|lint)\b|(?:完整\s*)?G1|测试|验证|审计/iu;
+const RUN_ONLY_LABEL_RE = /\b(?:runs?|run[_ -]?ids?|recipe|tests?|pytest|mypy|compileall|loader|targeted|focused|audit|checks?|diff|gate(?:[-_ ]?profile)?|typecheck|lint)\b|(?:完整\s*)?G1|测试|验证|审计/iu;
+const RUN_SUFFIX_LABEL_RE = /^\s*(?:[:：]|[-–—]{1,2}|\(|\[)\s*`?(?:runs?|run[_ -]?ids?|recipe|tests?|pytest|mypy|compileall|loader|targeted|focused|audit|diff|gate(?:[-_ ]?profile)?|typecheck|lint|check:[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+)/iu;
 const BUILD_ONLY_LABEL_RE = /\b(?:build|job|workflow|pipeline)\b|构建|流水线/iu;
-const DELEGATION_LABEL_RE = /\b(?:delegation(?:s)?|worker(?:s)?|latest|authority)\b|delegation[_ ]?id|委派|工作线程/iu;
+const DELEGATION_LABEL_RE = /\b(?:delegation(?:s)?|worker(?:s)?|latest|delegation\s+authority|authority\s+v2|repair\s+(?:root|lineage)|lineage\s+root)\b|delegation[_ ]?id|委派|工作线程|修复根|修复链/iu;
 const LATEST_DELEGATION_LABEL_RE = /\blatest(?:\s+(?:delegation|authority))?(?:\s+id)?\s*[:=]?|最新(?:的)?\s*(?:delegation|authority|委派|工作线程)(?:\s*(?:id|编号))?\s*[:：=]?/iu;
 const REVIEW_PASS_FINAL_RE = /\breview(?:\s+v2)?\b.{0,24}\bPASS\b.{0,24}\bFINAL\b|审查.{0,24}(?:通过|PASS).{0,24}(?:最终|FINAL)/iu;
 const RUN_SUCCESS_OUTCOME_RE = /\b(?:PASS(?:ED)?|SUCCESS(?:FUL(?:LY)?)?|SUCCEEDED|OK)\b|\bexit(?:\s+code)?\s*[:=]?\s*0\b|成功(?:退出|完成)?/iu;
-const RUN_FAILURE_OUTCOME_RE = /\b(?:FAIL(?:ED)?|EXCEPTION|CANCELLED|TIMED\s+OUT)\b|\bexit(?:\s+code)?\s*[:=]?\s*[1-9]\d*\b|失败|超时|已取消/iu;
+const RUN_FAILURE_OUTCOME_RE = /\b(?:(?:PROCESS|ARTIFACT)[_ -]FAILED|FAIL(?:ED|URE)?|EXCEPTION|CANCELLED|TIMED[_ ]OUT)\b|\bexit(?:\s+code)?\s*[:=]?\s*[1-9]\d*\b|失败|超时|已取消/iu;
 const RUN_COMPLETION_RE = /\b(?:complet(?:e|ed)|finish(?:ed)?|return(?:ed)?|exit(?:ed)?|ended)\b|(?:已|本次|刚刚|刚才)?(?:完成|结束|返回|退出)|完整\s*G1/iu;
 const RUN_UNAVAILABLE_DIAGNOSTIC_RE = /\b(?:not\s+found|does\s+not\s+exist|missing|unavailable|uncommitted|invalid\s+(?:record|identity)|identity\s+unavailable)\b|不存在|未运行|未执行|不可用|未提交|无效(?:记录|身份)?|无法读取|虚构/iu;
 const MAX_CLAIM_IDS = 32;
@@ -80,8 +82,16 @@ export interface WorkbenchRunClaimAuthority {
 export interface DelegationClaimInspection {
 	readonly ids: readonly string[];
 	readonly runIds: readonly string[];
+	/** Strong lexical namespace claims. Weak/unlabelled ids may be resolved by exclusive durable authority. */
+	readonly explicitDelegationIds: readonly string[];
+	readonly explicitRunIds: readonly string[];
 	readonly expectedRunOutcomes: Readonly<Record<string, "SUCCESS" | "FAILURE" | undefined>>;
+	readonly candidateRunOutcomes: Readonly<Record<string, "SUCCESS" | "FAILURE" | undefined>>;
+	readonly conflictingRunOutcomeIds: readonly string[];
+	readonly directExpectedStatuses: Readonly<Record<string, readonly DelegationClaimExpectedStatus[]>>;
 	readonly expectedStatuses: Readonly<Record<string, readonly DelegationClaimExpectedStatus[]>>;
+	readonly unboundStatusClaims: readonly DelegationClaimUnboundStatus[];
+	readonly explicitlyLatestIds: readonly string[];
 	readonly sameRunStartIds: readonly string[];
 	readonly executionClaim: boolean;
 	readonly workerAttemptClaim: boolean;
@@ -91,6 +101,11 @@ export interface DelegationClaimInspection {
 	readonly negativeOnly: boolean;
 	readonly overflow: boolean;
 	readonly ambiguousStatusBinding: boolean;
+}
+
+export interface DelegationClaimUnboundStatus {
+	readonly statuses: readonly DelegationClaimExpectedStatus[];
+	readonly distributive: boolean;
 }
 
 export interface DelegationClaimTurnEvidence {
@@ -103,7 +118,7 @@ export interface DelegationClaimTurnEvidence {
 
 export interface DelegationClaimValidation {
 	readonly ok: boolean;
-	readonly code?: "claim_overflow" | "ambiguous_status_binding" | "missing_authority" | "status_mismatch" | "missing_attempt_authority" | "missing_started_authority" | "missing_success_result" | "missing_run_authority" | "run_status_mismatch";
+	readonly code?: "claim_overflow" | "ambiguous_authority_namespace" | "ambiguous_run_outcome" | "ambiguous_status_binding" | "missing_authority" | "status_mismatch" | "missing_attempt_authority" | "missing_started_authority" | "missing_success_result" | "missing_run_authority" | "run_status_mismatch";
 }
 
 function assistantText(message: unknown): string | undefined {
@@ -127,6 +142,7 @@ function assistantText(message: unknown): string | undefined {
 function claimClauses(text: string): string[] {
 	const clauses: string[] = [];
 	let fence: "`" | "~" | undefined;
+	let runSection = false;
 	for (const rawLine of text.split(/\r?\n/u)) {
 		const trimmed = rawLine.trim();
 		const marker = trimmed.match(/^(`{3,}|~{3,})/u)?.[1]?.[0] as "`" | "~" | undefined;
@@ -137,19 +153,24 @@ function claimClauses(text: string): string[] {
 		}
 		if (fence !== undefined || /^\s*>/u.test(rawLine)) continue;
 		if (/^["'“‘].*["'”’]$/u.test(trimmed)) continue;
+		const listItem = /^\s*(?:[-*+]|\d+[.)])\s+/u.test(rawLine);
+		if (runSectionHeading(trimmed)) runSection = true;
+		else if (trimmed.length > 0 && !listItem) runSection = false;
+		const contextualLine = runSection && listItem ? `run ${rawLine}` : rawLine;
 		// Markdown inline code is the normal presentation form for persisted ids.
 		// Preserve only canonical delegation-looking ids (and status tokens on a
 		// delegation-labelled line); discard commands and run-only ids. Fenced
 		// transcript/code evidence remains excluded above.
-		const withoutInlineCode = rawLine.replace(INLINE_CODE_RE, (_whole, inline: string, offset: number) => {
-			const prefix = rawLine.slice(0, offset);
+		const withoutInlineCode = contextualLine.replace(INLINE_CODE_RE, (whole: string, inline: string, offset: number) => {
+			const prefix = contextualLine.slice(0, offset);
 			const boundary = Math.max(
 				prefix.lastIndexOf("."), prefix.lastIndexOf(";"), prefix.lastIndexOf("。"), prefix.lastIndexOf("；"),
 				prefix.lastIndexOf("!"), prefix.lastIndexOf("?"), prefix.lastIndexOf("！"), prefix.lastIndexOf("？"),
 			);
 			const localLabel = prefix.slice(boundary + 1);
 			const contextPrefix = `${localLabel} `;
-			const contextualInline = `${contextPrefix}${inline}`;
+			const suffix = contextualLine.slice(offset + whole.length);
+			const contextualInline = `${contextPrefix}${inline} ${suffix}`;
 			const ids = [...inline.matchAll(new RegExp(DELEGATION_ID_SCAN_RE.source, "g"))]
 				.filter((match) => !idHasNearestRunLabel(contextualInline, contextPrefix.length + (match.index ?? 0)))
 				.map((match) => match[0]!);
@@ -178,6 +199,18 @@ function lastLabelIndex(text: string, pattern: RegExp): number {
 	return last;
 }
 
+function firstLabelIndex(text: string, pattern: RegExp): number {
+	return text.match(new RegExp(pattern.source, "iu"))?.index ?? -1;
+}
+
+function runSectionHeading(trimmed: string): boolean {
+	if (trimmed.length === 0 || new RegExp(DELEGATION_ID_SCAN_RE.source).test(trimmed)) return false;
+	const heading = /^#{1,6}\s+/u.test(trimmed)
+		|| /^\*\*[^*]+\*\*\s*:?[：]?\s*$/u.test(trimmed)
+		|| /^[^`]{1,120}[:：]\s*$/u.test(trimmed);
+	return heading && RUN_ONLY_LABEL_RE.test(trimmed) && !DELEGATION_LABEL_RE.test(trimmed);
+}
+
 /**
  * Run ids and delegation ids intentionally share the same canonical shape.
  * Bind each visible occurrence to the nearest explicit label before it:
@@ -187,9 +220,30 @@ function lastLabelIndex(text: string, pattern: RegExp): number {
 function idHasNearestRunLabel(clause: string, idIndex: number): boolean {
 	const prefix = clause.slice(0, idIndex);
 	const runIndex = lastLabelIndex(prefix, RUN_ONLY_LABEL_RE);
-	if (runIndex < 0) return false;
 	const delegationIndex = lastLabelIndex(prefix, DELEGATION_LABEL_RE);
-	return runIndex > delegationIndex;
+	if (runIndex >= 0) return runIndex > delegationIndex;
+	if (delegationIndex >= 0) return false;
+	// Machine summaries commonly put the immutable id before its recipe label:
+	// `ID — check:rust-test — SUCCESS`. Accept a bounded suffix label only when
+	// no preceding delegation label already owns the occurrence.
+	const suffix = clause.slice(idIndex + 20, idIndex + 180);
+	if (!RUN_SUFFIX_LABEL_RE.test(suffix)) return false;
+	const suffixRunIndex = firstLabelIndex(suffix, RUN_ONLY_LABEL_RE);
+	if (suffixRunIndex < 0) return false;
+	const suffixDelegationIndex = firstLabelIndex(suffix, DELEGATION_LABEL_RE);
+	return suffixDelegationIndex < 0 || suffixRunIndex < suffixDelegationIndex;
+}
+
+function idHasNearestDelegationLabel(clause: string, idIndex: number): boolean {
+	const prefix = clause.slice(0, idIndex);
+	const delegationIndex = lastLabelIndex(prefix, DELEGATION_LABEL_RE);
+	if (delegationIndex < 0) return false;
+	return delegationIndex >= lastLabelIndex(prefix, RUN_ONLY_LABEL_RE)
+		&& delegationIndex >= lastLabelIndex(prefix, BUILD_ONLY_LABEL_RE);
+}
+
+function statusIsDelegationOnly(status: DelegationClaimExpectedStatus): boolean {
+	return !["SUCCESS", "FAILED", "FINISHED"].includes(status.status);
 }
 
 function idHasNearestNonDelegationLabel(clause: string, idIndex: number): boolean {
@@ -210,23 +264,39 @@ function idHasLatestDelegationLabel(clause: string, idIndex: number): boolean {
 
 function inspectWorkbenchRunClaims(text: string): {
 	ids: string[];
+	candidateIds: string[];
 	expected: Record<string, "SUCCESS" | "FAILURE" | undefined>;
+	candidateExpected: Record<string, "SUCCESS" | "FAILURE" | undefined>;
+	conflictingIds: string[];
 	overflow: boolean;
 } {
 	const ids: string[] = [];
+	const candidateIds: string[] = [];
 	const expected: Record<string, "SUCCESS" | "FAILURE" | undefined> = {};
+	const candidateExpected: Record<string, "SUCCESS" | "FAILURE" | undefined> = {};
+	const conflictingIds = new Set<string>();
+	let fence: "`" | "~" | undefined;
+	let runSection = false;
 	for (const rawLine of text.split(/\r?\n/u)) {
 		const trimmed = rawLine.trim();
 		const marker = trimmed.match(/^(`{3,}|~{3,})/u)?.[1]?.[0] as "`" | "~" | undefined;
-		if (marker !== undefined) continue;
+		if (marker !== undefined) {
+			if (fence === undefined) fence = marker;
+			else if (fence === marker) fence = undefined;
+			continue;
+		}
+		const insideFence = fence !== undefined;
 		// A fenced block can be the assistant's authoritative handoff/evidence
 		// format. Explicitly labelled run ids inside it must still bind to a
 		// committed run. Delegation transcript claims remain excluded by
 		// claimClauses(), and blockquotes/fully quoted lines remain quotations.
 		if (/^\s*>/u.test(rawLine) || /^["'“‘].*["'”’]$/u.test(trimmed)) continue;
-		const visible = rawLine.replace(INLINE_CODE_RE, (_whole, inline: string) => inline);
+		const listItem = /^\s*(?:[-*+]|\d+[.)])\s+/u.test(rawLine);
+		if (runSectionHeading(trimmed)) runSection = true;
+		else if (trimmed.length > 0 && !listItem) runSection = false;
+		const contextualLine = runSection && listItem ? `run ${rawLine}` : rawLine;
+		const visible = contextualLine.replace(INLINE_CODE_RE, (_whole, inline: string) => inline);
 		for (const segment of visible.split(/[.;；。!?！？]+/u)) {
-			if (!RUN_ONLY_LABEL_RE.test(segment)) continue;
 			const success = RUN_SUCCESS_OUTCOME_RE.test(segment);
 			const failure = RUN_FAILURE_OUTCOME_RE.test(segment);
 			const completion = success || failure || RUN_COMPLETION_RE.test(segment);
@@ -235,21 +305,39 @@ function inspectWorkbenchRunClaims(text: string): {
 			// executed or completed. Positive/negative terminal outcome words still
 			// require strict committed-run authority even if other prose is noisy.
 			if (!completion || (RUN_UNAVAILABLE_DIAGNOSTIC_RE.test(segment) && !success && !failure)) continue;
-			const lineIds = [...segment.matchAll(new RegExp(DELEGATION_ID_SCAN_RE.source, "g"))]
-				.filter((match) => idHasNearestRunLabel(segment, match.index ?? 0))
-				.map((match) => match[0]!);
+			const allLineIds = [...segment.matchAll(new RegExp(DELEGATION_ID_SCAN_RE.source, "g"))];
 			const outcome = success
 				? "SUCCESS" as const
 				: failure
 					? "FAILURE" as const
 					: undefined;
+			for (const match of allLineIds) {
+				const id = match[0]!;
+				if (!insideFence && !BUILD_ONLY_LABEL_RE.test(segment) && !candidateIds.includes(id)) candidateIds.push(id);
+				if (outcome !== undefined && candidateExpected[id] !== undefined && candidateExpected[id] !== outcome) {
+					conflictingIds.add(id);
+				}
+				candidateExpected[id] = outcome ?? candidateExpected[id];
+			}
+			if (!RUN_ONLY_LABEL_RE.test(segment)) continue;
+			const lineIds = allLineIds
+				.filter((match) => idHasNearestRunLabel(segment, match.index ?? 0))
+				.map((match) => match[0]!);
 			for (const id of lineIds) {
 				if (!Object.hasOwn(expected, id)) ids.push(id);
+				if (outcome !== undefined && expected[id] !== undefined && expected[id] !== outcome) conflictingIds.add(id);
 				expected[id] = outcome ?? expected[id];
 			}
 		}
 	}
-	return { ids: ids.slice(0, MAX_CLAIM_IDS), expected, overflow: ids.length > MAX_CLAIM_IDS };
+	return {
+		ids: ids.slice(0, MAX_CLAIM_IDS),
+		candidateIds: candidateIds.slice(0, MAX_CLAIM_IDS),
+		expected,
+		candidateExpected,
+		conflictingIds: [...conflictingIds],
+		overflow: ids.length > MAX_CLAIM_IDS || candidateIds.length > MAX_CLAIM_IDS,
+	};
 }
 
 function statusSource(clause: string, status: string, statusIndex: number): DelegationClaimStatusSource {
@@ -344,15 +432,21 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 		&& new RegExp(STATUS_SCAN_RE.source, "i").test(text);
 	const hasWorkerExecutionPair = WORKER_WORD_RE.test(text)
 		&& (EXECUTION_WORD_RE.test(text) || SUCCESS_WORD_RE.test(text));
-	if (!DELEGATION_WORD_RE.test(text) && !WORKER_MACHINE_CLAIM_RE.test(text) && !hasWorkerExecutionPair && !hasIdStatusPair && runClaims.ids.length === 0 && !runClaims.overflow) return undefined;
+	if (
+		!DELEGATION_WORD_RE.test(text)
+		&& !WORKER_MACHINE_CLAIM_RE.test(text)
+		&& !hasWorkerExecutionPair
+		&& !hasIdStatusPair
+		&& runClaims.ids.length === 0
+		&& runClaims.candidateIds.length === 0
+		&& !runClaims.overflow
+	) return undefined;
 	const idOrder: string[] = [];
 	const expectedStatuses = new Map<string, DelegationClaimExpectedStatus[]>();
 	const explicitlyLatestIds = new Set<string>();
+	const explicitDelegationIds = new Set<string>();
 	const sameRunStartIds = new Set<string>();
-	const unboundStatusClaims: Array<{
-		readonly statuses: readonly DelegationClaimExpectedStatus[];
-		readonly distributive: boolean;
-	}> = [];
+	const unboundStatusClaims: DelegationClaimUnboundStatus[] = [];
 	let executionClaim = false;
 	let workerAttemptClaim = false;
 	let workerStartClaim = false;
@@ -399,6 +493,10 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 			const nextIndex = idMatches[index + 1]?.index ?? affirmativeClause.length;
 			const segment = affirmativeClause.slice(index === 0 ? 0 : (match.index ?? 0), nextIndex);
 			const statuses = addSemanticSuccess(statusesIn(segment), segment);
+			if (
+				idHasNearestDelegationLabel(affirmativeClause, match.index ?? 0)
+				|| statuses.some(statusIsDelegationOnly)
+			) explicitDelegationIds.add(id);
 			expectedStatuses.get(id)!.push(...statuses);
 			if (clauseRecent) sameRunStartIds.add(id);
 		}
@@ -415,10 +513,20 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 			}
 		}
 	}
+	for (const id of runClaims.candidateIds) {
+		if (idOrder.includes(id) || runClaims.ids.includes(id)) continue;
+		idOrder.push(id);
+		expectedStatuses.set(id, []);
+	}
 
-	const overflow = idOrder.length > MAX_CLAIM_IDS || runClaims.overflow;
-	const ids = idOrder.slice(0, MAX_CLAIM_IDS);
+	const allIdOrder = [...idOrder];
+	for (const id of runClaims.ids) if (!allIdOrder.includes(id)) allIdOrder.push(id);
+	const overflow = allIdOrder.length > MAX_CLAIM_IDS || runClaims.overflow;
+	const admittedIds = new Set(allIdOrder.slice(0, MAX_CLAIM_IDS));
+	const ids = idOrder.filter((id) => admittedIds.has(id));
+	const runIds = runClaims.ids.filter((id) => admittedIds.has(id));
 	const latestIds = [...explicitlyLatestIds].filter((id) => ids.includes(id));
+	const directExpectedStatuses = Object.fromEntries(ids.map((id) => [id, [...(expectedStatuses.get(id) ?? [])]]));
 	let ambiguousStatusBinding = false;
 	for (const claim of unboundStatusClaims) {
 		if (ids.length === 1) expectedStatuses.get(ids[0]!)!.push(...claim.statuses);
@@ -437,9 +545,16 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 	const boundSameRunStartIds = recentClaim ? ids : [...sameRunStartIds].filter((id) => ids.includes(id));
 	return {
 		ids,
-		runIds: runClaims.ids,
-		expectedRunOutcomes: Object.fromEntries(runClaims.ids.map((id) => [id, runClaims.expected[id]])),
+		runIds,
+		explicitDelegationIds: [...explicitDelegationIds].filter((id) => ids.includes(id)),
+		explicitRunIds: runIds,
+		expectedRunOutcomes: Object.fromEntries(runIds.map((id) => [id, runClaims.expected[id]])),
+		candidateRunOutcomes: Object.fromEntries(allIdOrder.map((id) => [id, runClaims.candidateExpected[id]])),
+		conflictingRunOutcomeIds: runClaims.conflictingIds.filter((id) => admittedIds.has(id)),
+		directExpectedStatuses,
 		expectedStatuses: Object.fromEntries(ids.map((id) => [id, expectedStatuses.get(id) ?? []])),
+		unboundStatusClaims,
+		explicitlyLatestIds: latestIds,
 		sameRunStartIds: boundSameRunStartIds,
 		executionClaim,
 		workerAttemptClaim,
@@ -478,7 +593,7 @@ function authorityProvesWorkerStart(authority: DelegationClaimAuthority): boolea
 }
 
 function freshStatusObservationProvesSuccess(
-	inspection: DelegationClaimInspection,
+	claimedDelegationIds: readonly string[],
 	turn: DelegationClaimTurnEvidence,
 	authorityById: ReadonlyMap<string, DelegationClaimAuthority>,
 ): boolean {
@@ -486,13 +601,97 @@ function freshStatusObservationProvesSuccess(
 	// worker, but it must never rescue a failed delegation attempt in this run.
 	if (turn.attemptedCalls !== 0 || turn.observedStatusIds.length === 0) return false;
 	const observed = new Set(turn.observedStatusIds);
-	const claimed = inspection.ids.length > 0 ? inspection.ids : [...observed];
+	const claimed = claimedDelegationIds.length > 0 ? claimedDelegationIds : [...observed];
 	if (claimed.length === 0 || claimed.some((id) => !observed.has(id))) return false;
 	return claimed.every((id) => {
 		const authority = authorityById.get(id);
 		return authority !== undefined
 			&& authoritySatisfiesStatus(authority, { status: "SUCCESS", source: "transaction" });
 	});
+}
+
+interface ResolvedClaimNamespaces {
+	readonly delegationIds: readonly string[];
+	readonly runIds: readonly string[];
+	readonly expectedStatuses: Readonly<Record<string, readonly DelegationClaimExpectedStatus[]>>;
+	readonly expectedRunOutcomes: Readonly<Record<string, "SUCCESS" | "FAILURE" | undefined>>;
+	readonly ambiguousNamespace: boolean;
+	readonly ambiguousStatusBinding: boolean;
+}
+
+/**
+ * The two durable namespaces intentionally share an id shape. Strong labels
+ * remain mandatory, but weak/unlabelled prose is resolved by exclusive strict
+ * authority rather than by another English/Chinese word-order heuristic.
+ */
+function resolveClaimNamespaces(
+	inspection: DelegationClaimInspection,
+	authorityById: ReadonlyMap<string, DelegationClaimAuthority>,
+	runAuthorityById: ReadonlyMap<string, WorkbenchRunClaimAuthority>,
+): ResolvedClaimNamespaces {
+	const lexicalDelegations = new Set(inspection.ids);
+	const lexicalRuns = new Set(inspection.runIds);
+	const explicitDelegations = new Set(inspection.explicitDelegationIds);
+	const explicitRuns = new Set(inspection.explicitRunIds);
+	const allIds = [...new Set([...inspection.ids, ...inspection.runIds])];
+	const delegationIds: string[] = [];
+	const runIds: string[] = [];
+	let ambiguousNamespace = false;
+
+	for (const id of allIds) {
+		const explicitDelegation = explicitDelegations.has(id);
+		const explicitRun = explicitRuns.has(id);
+		if (explicitDelegation) delegationIds.push(id);
+		if (explicitRun) runIds.push(id);
+		if (explicitDelegation || explicitRun) continue;
+
+		const hasDelegationAuthority = authorityById.has(id);
+		const hasRunAuthority = runAuthorityById.has(id);
+		if (hasDelegationAuthority && hasRunAuthority) {
+			ambiguousNamespace = true;
+			continue;
+		}
+		if (hasDelegationAuthority !== hasRunAuthority) {
+			(hasDelegationAuthority ? delegationIds : runIds).push(id);
+			continue;
+		}
+		const lexicalDelegation = lexicalDelegations.has(id);
+		const lexicalRun = lexicalRuns.has(id);
+		if (lexicalDelegation !== lexicalRun) {
+			(lexicalDelegation ? delegationIds : runIds).push(id);
+			continue;
+		}
+		ambiguousNamespace = true;
+	}
+
+	const expectedStatuses = new Map<string, DelegationClaimExpectedStatus[]>();
+	for (const id of delegationIds) expectedStatuses.set(id, [...(inspection.directExpectedStatuses[id] ?? [])]);
+	const latestIds = inspection.explicitlyLatestIds.filter((id) => expectedStatuses.has(id));
+	let ambiguousStatusBinding = false;
+	for (const claim of inspection.unboundStatusClaims) {
+		if (delegationIds.length === 1) expectedStatuses.get(delegationIds[0]!)!.push(...claim.statuses);
+		else if (delegationIds.length > 1 && claim.distributive) {
+			for (const id of delegationIds) expectedStatuses.get(id)!.push(...claim.statuses);
+		} else if (
+			delegationIds.length > 1
+			&& latestIds.length === 1
+			&& claim.statuses.every((status) => status.source !== "unspecified")
+		) {
+			expectedStatuses.get(latestIds[0]!)!.push(...claim.statuses);
+		} else if (delegationIds.length > 1) ambiguousStatusBinding = true;
+	}
+
+	return {
+		delegationIds,
+		runIds,
+		expectedStatuses: Object.fromEntries(expectedStatuses),
+		expectedRunOutcomes: Object.fromEntries(runIds.map((id) => [
+			id,
+			inspection.expectedRunOutcomes[id] ?? inspection.candidateRunOutcomes[id],
+		])),
+		ambiguousNamespace,
+		ambiguousStatusBinding,
+	};
 }
 
 /** Pure verdict: current-turn observations never replace strict on-disk authority. */
@@ -504,32 +703,38 @@ export function validateDelegationClaims(
 ): DelegationClaimValidation {
 	if (inspection.negativeOnly) return { ok: true };
 	if (inspection.overflow) return { ok: false, code: "claim_overflow" };
-	if (inspection.ambiguousStatusBinding) return { ok: false, code: "ambiguous_status_binding" };
 	const authorityById = new Map(authorities.map((authority) => [authority.id, authority]));
-	for (const id of inspection.ids) {
+	const runAuthorityById = new Map(runAuthorities.map((authority) => [authority.id, authority]));
+	const resolved = resolveClaimNamespaces(inspection, authorityById, runAuthorityById);
+	if (resolved.ambiguousNamespace) return { ok: false, code: "ambiguous_authority_namespace" };
+	if (resolved.runIds.some((id) => inspection.conflictingRunOutcomeIds.includes(id))) {
+		return { ok: false, code: "ambiguous_run_outcome" };
+	}
+	if (resolved.ambiguousStatusBinding) return { ok: false, code: "ambiguous_status_binding" };
+	for (const id of resolved.delegationIds) {
 		const authority = authorityById.get(id);
 		if (!authority) return { ok: false, code: "missing_authority" };
-		for (const expected of inspection.expectedStatuses[id] ?? []) {
+		for (const expected of resolved.expectedStatuses[id] ?? []) {
 			if (!authoritySatisfiesStatus(authority, expected)) return { ok: false, code: "status_mismatch" };
 		}
 	}
-	const runAuthorityById = new Map(runAuthorities.map((authority) => [authority.id, authority]));
-	for (const id of inspection.runIds) {
+	for (const id of resolved.runIds) {
 		const authority = runAuthorityById.get(id);
 		if (!authority) return { ok: false, code: "missing_run_authority" };
-		const expected = inspection.expectedRunOutcomes[id];
+		const expected = resolved.expectedRunOutcomes[id];
 		if (expected !== undefined && authority.outcome !== expected) {
 			return { ok: false, code: "run_status_mismatch" };
 		}
 	}
-	const observedDurableSuccess = freshStatusObservationProvesSuccess(inspection, turn, authorityById);
+	const observedDurableSuccess = freshStatusObservationProvesSuccess(resolved.delegationIds, turn, authorityById);
+	const sameRunStartIds = inspection.sameRunStartIds.filter((id) => resolved.delegationIds.includes(id));
 	if (inspection.recentClaim && inspection.workerAttemptClaim && turn.attemptedCalls === 0) {
 		return { ok: false, code: "missing_attempt_authority" };
 	}
 	if (inspection.recentClaim && inspection.workerStartClaim) {
 		const started = new Set(turn.startedIds);
 		if (started.size === 0) return { ok: false, code: "missing_started_authority" };
-		if (inspection.sameRunStartIds.some((id) => !started.has(id))) {
+		if (sameRunStartIds.some((id) => !started.has(id))) {
 			return { ok: false, code: "missing_started_authority" };
 		}
 		if (![...started].some((id) => {
@@ -544,14 +749,14 @@ export function validateDelegationClaims(
 		if (turn.successfulResults === 0 && !observedDurableSuccess) {
 			return { ok: false, code: "missing_success_result" };
 		}
-		if (!observedDurableSuccess && inspection.sameRunStartIds.some((id) => !successful.has(id))) {
+		if (!observedDurableSuccess && sameRunStartIds.some((id) => !successful.has(id))) {
 			return { ok: false, code: "missing_success_result" };
 		}
 	}
-	if (inspection.workerStartClaim && !inspection.recentClaim && inspection.ids.length === 0) {
+	if (inspection.workerStartClaim && !inspection.recentClaim && resolved.delegationIds.length === 0) {
 		if (!authorities.some(authorityProvesWorkerStart)) return { ok: false, code: "missing_authority" };
 	}
-	if (inspection.successClaim && inspection.ids.length === 0) {
+	if (inspection.successClaim && resolved.delegationIds.length === 0) {
 		if (inspection.recentClaim) {
 			if (turn.successfulResults === 0) {
 				if (!observedDurableSuccess) return { ok: false, code: "missing_success_result" };
@@ -578,6 +783,19 @@ function validToolCallId(value: unknown): string | undefined {
 	return typeof value === "string" && value.length > 0 && value.length <= 512 ? value : undefined;
 }
 
+function claimGuardNextAction(code: NonNullable<DelegationClaimValidation["code"]>): string {
+	if (code === "missing_run_authority" || code === "run_status_mismatch" || code === "ambiguous_run_outcome") {
+		return "query workbench_read_run for every stated run_id and report only its committed outcome";
+	}
+	if (code === "ambiguous_authority_namespace" || code === "ambiguous_status_binding") {
+		return "query workbench_delegation_status and workbench_read_run, then restate each fact with an explicit delegation_id or run_id label";
+	}
+	if (code === "missing_attempt_authority" || code === "missing_started_authority" || code === "missing_success_result") {
+		return "do not claim a current-turn worker attempt or completion; query workbench_delegation_status and follow its persisted next action";
+	}
+	return "query workbench_delegation_status and follow its persisted next action; review PENDING_REVIEW or STALE, and delegate only when unblocked";
+}
+
 function replacementMessage(
 	message: unknown,
 	code: NonNullable<DelegationClaimValidation["code"]>,
@@ -591,7 +809,10 @@ function replacementMessage(
 	const claimHash = sha256Hex(rejectedText);
 	return {
 		role: "assistant",
-		content: [{ type: "text", text: `${DELEGATION_CLAIM_GUARD_TEXT}\nreason: ${code}\nclaim_hash: ${claimHash}` }],
+		content: [{
+			type: "text",
+			text: `${DELEGATION_CLAIM_GUARD_TEXT}\nbinding_revision: ${DELEGATION_CLAIM_BINDING_REVISION}\nreason: ${code}\nnext_action: ${claimGuardNextAction(code)}\nclaim_hash: ${claimHash}`,
+		}],
 		...(typeof provider === "string" ? { provider } : {}),
 		...(typeof model === "string" ? { model } : {}),
 		...(typeof api === "string" ? { api } : {}),
@@ -699,7 +920,8 @@ export function registerDelegationClaimGuard(controller: DelegationClaimGuardCon
 				authorityIds.add(sessionState.latestId);
 			}
 			if (inspection.recentClaim || inspection.successClaim) for (const id of startedIds) authorityIds.add(id);
-			for (const id of authorityIds) {
+			const claimAuthorityIds = new Set([...authorityIds, ...inspection.runIds]);
+			for (const id of claimAuthorityIds) {
 				const current = await controller.readTransaction(projectRoot, id);
 				if (current.ok) {
 					if (["FINISHED", "PENDING_REVIEW", "REVIEWED", "FAILED"].includes(current.value.status)) {
@@ -711,20 +933,17 @@ export function registerDelegationClaimGuard(controller: DelegationClaimGuardCon
 						status: current.value.status,
 						...(sessionState.latestId === id ? { sessionStatus: sessionState.status } : {}),
 					});
-					continue;
+				} else if (current.error.code === "not_found") {
+					const legacy = await controller.readLegacyLedger(projectRoot, id);
+					const legacyStatus = legacy === null ? undefined : strictLegacyStatus(legacy, id);
+					if (legacyStatus !== undefined) {
+						authorities.push({
+							id,
+							status: legacyStatus,
+							...(sessionState.latestId === id ? { sessionStatus: sessionState.status } : {}),
+						});
+					}
 				}
-				if (current.error.code !== "not_found") continue;
-				const legacy = await controller.readLegacyLedger(projectRoot, id);
-				const legacyStatus = legacy === null ? undefined : strictLegacyStatus(legacy, id);
-				if (legacyStatus !== undefined) {
-					authorities.push({
-						id,
-						status: legacyStatus,
-						...(sessionState.latestId === id ? { sessionStatus: sessionState.status } : {}),
-					});
-				}
-			}
-			for (const id of inspection.runIds) {
 				const run = await controller.readCommittedRun(projectRoot, id);
 				if (run === null) continue;
 				runAuthorities.push({

@@ -116,6 +116,189 @@ test("run-only completion claims require a committed run with the claimed outcom
 	);
 });
 
+test("run ids before recipe labels and under run headings never become delegation ids", () => {
+	const suffixRun = "20260824-161713-eyl5";
+	const sectionRun = "20260824-161642-9as0";
+	const failureRun = "20260824-161231-ki6d";
+	const inspection = inspectDelegationClaims(assistant([
+		`- \`${suffixRun}\` — \`check:rust-test\` — outcome SUCCESS`,
+		"Verification Run IDs:",
+		`- \`${sectionRun}\`: SUCCESS`,
+		`- \`${failureRun}\` — \`recipe:check:static\` — outcome FAILURE`,
+	].join("\n")));
+	assert.ok(inspection);
+	assert.deepEqual(inspection.ids, []);
+	assert.deepEqual(inspection.runIds, [suffixRun, sectionRun, failureRun]);
+	assert.equal(inspection.expectedRunOutcomes[failureRun], "FAILURE");
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(), [], [
+			{ id: suffixRun, outcome: "SUCCESS" },
+			{ id: sectionRun, outcome: "SUCCESS" },
+			{ id: failureRun, outcome: "FAILURE" },
+		]),
+		{ ok: true },
+	);
+
+	const delegationWithTrailingTests = inspectDelegationClaims(assistant(
+		`delegation \`${REAL_ID}\` REVIEWED; tests passed`,
+	));
+	assert.ok(delegationWithTrailingTests);
+	assert.deepEqual(delegationWithTrailingTests.ids, [REAL_ID]);
+	assert.deepEqual(delegationWithTrailingTests.runIds, []);
+	assert.deepEqual(
+		validateDelegationClaims(delegationWithTrailingTests, evidence(), [{ id: REAL_ID, status: "REVIEWED" }]),
+		{ ok: true },
+	);
+
+	const repairRootWithTrailingVerification = inspectDelegationClaims(assistant(
+		`repair root \`${REAL_ID}\` remains PENDING_REVIEW; verification follows`,
+	));
+	assert.ok(repairRootWithTrailingVerification);
+	assert.deepEqual(repairRootWithTrailingVerification.ids, [REAL_ID]);
+	assert.deepEqual(repairRootWithTrailingVerification.runIds, []);
+
+	const unlabeledDelegationClaim = inspectDelegationClaims(assistant(
+		`\`${REAL_ID}\` REVIEWED; check the details below`,
+	));
+	assert.ok(unlabeledDelegationClaim);
+	assert.deepEqual(unlabeledDelegationClaim.ids, [REAL_ID]);
+	assert.deepEqual(unlabeledDelegationClaim.runIds, []);
+	assert.deepEqual(
+		validateDelegationClaims(unlabeledDelegationClaim, evidence(), []),
+		{ ok: false, code: "missing_authority" },
+		"an ordinary trailing verb cannot relabel a delegation-shaped claim as a run",
+	);
+});
+
+test("exclusive durable authority resolves weak id syntax without overriding explicit namespaces", () => {
+	const weakRun = "20260824-161713-eyl5";
+	for (const text of [
+		`${weakRun}: SUCCESS`,
+		`${weakRun} — SUCCESS`,
+		`Result ${weakRun} exit=0`,
+		`Evidence ${weakRun} completed successfully`,
+		`运行 ${weakRun} 成功`,
+	]) {
+		const inspection = inspectDelegationClaims(assistant(text));
+		assert.ok(inspection, text);
+		assert.deepEqual(
+			validateDelegationClaims(inspection, evidence(), [], [{ id: weakRun, outcome: "SUCCESS" }]),
+			{ ok: true },
+			text,
+		);
+		assert.deepEqual(
+			validateDelegationClaims(inspection, evidence(), [], [{ id: weakRun, outcome: "FAILURE" }]),
+			{ ok: false, code: "run_status_mismatch" },
+			`${text} still binds the claimed outcome`,
+		);
+	}
+
+	const explicitDelegation = inspectDelegationClaims(assistant(`delegation ${weakRun} SUCCESS`));
+	assert.ok(explicitDelegation);
+	assert.deepEqual(
+		validateDelegationClaims(explicitDelegation, evidence(), [], [{ id: weakRun, outcome: "SUCCESS" }]),
+		{ ok: false, code: "missing_authority" },
+		"run authority cannot rescue an explicitly labelled delegation claim",
+	);
+
+	const delegationStatus = inspectDelegationClaims(assistant(`${weakRun} REVIEWED`));
+	assert.ok(delegationStatus);
+	assert.deepEqual(
+		validateDelegationClaims(delegationStatus, evidence(), [], [{ id: weakRun, outcome: "SUCCESS" }]),
+		{ ok: false, code: "missing_authority" },
+		"a delegation-only status is a strong namespace claim even without a label",
+	);
+
+	const explicitRun = inspectDelegationClaims(assistant(`run ${REAL_ID} SUCCESS`));
+	assert.ok(explicitRun);
+	assert.deepEqual(
+		validateDelegationClaims(explicitRun, evidence(), [{ id: REAL_ID, status: "REVIEWED" }]),
+		{ ok: false, code: "missing_run_authority" },
+		"delegation authority cannot rescue an explicitly labelled run claim",
+	);
+
+	const namespaceCollision = inspectDelegationClaims(assistant(`${weakRun}: SUCCESS`));
+	assert.ok(namespaceCollision);
+	assert.deepEqual(
+		validateDelegationClaims(
+			namespaceCollision,
+			evidence(),
+			[{ id: weakRun, status: "REVIEWED" }],
+			[{ id: weakRun, outcome: "SUCCESS" }],
+		),
+		{ ok: false, code: "ambiguous_authority_namespace" },
+		"an actual cross-namespace id collision requires an explicit label",
+	);
+});
+
+test("weak run evidence cannot create a false multi-delegation status ambiguity", () => {
+	const latest = FAKE_IDS[0];
+	const repairRoot = FAKE_IDS[1];
+	const successRun = "20260824-161642-9as0";
+	const failureRun = "20260824-161231-ki6d";
+	const inspection = inspectDelegationClaims(assistant([
+		`latest delegation: ${latest}`,
+		`repair root: ${repairRoot}`,
+		"authority v2: transaction REVIEWED",
+		"session status: REVIEWED",
+		`${successRun}: SUCCESS`,
+		`${failureRun}: FAILURE`,
+	].join("\n")));
+	assert.ok(inspection);
+	assert.deepEqual(
+		validateDelegationClaims(
+			inspection,
+			evidence(),
+			[
+				{ id: latest, status: "REVIEWED", sessionStatus: "REVIEWED" },
+				{ id: repairRoot, status: "PENDING_REVIEW" },
+			],
+			[
+				{ id: successRun, outcome: "SUCCESS" },
+				{ id: failureRun, outcome: "FAILURE" },
+			],
+		),
+		{ ok: true },
+	);
+});
+
+test("run authority binding is invariant across normal summary layouts", () => {
+	const successId = "20260824-161713-eyl5";
+	const failureId = "20260824-161231-ki6d";
+	const cases = [
+		{ id: successId, outcome: "SUCCESS" as const, text: `run ${successId} SUCCESS` },
+		{ id: successId, outcome: "SUCCESS" as const, text: `run_id=${successId} outcome=SUCCESS` },
+		{ id: successId, outcome: "SUCCESS" as const, text: `committed run authority: ${successId} SUCCESS` },
+		{ id: successId, outcome: "SUCCESS" as const, text: `recipe:check:rust-test run:${successId} exit=0 OK` },
+		{ id: successId, outcome: "SUCCESS" as const, text: `\`${successId}\` — \`check:rust-test\` — SUCCESS` },
+		{ id: successId, outcome: "SUCCESS" as const, text: `Run IDs:\n- ${successId}: SUCCESS` },
+		{ id: successId, outcome: "SUCCESS" as const, text: `| run_id | outcome |\n| --- | --- |\n| ${successId} | SUCCESS |` },
+		{ id: failureId, outcome: "FAILURE" as const, text: `run ${failureId} FAILURE` },
+		{ id: failureId, outcome: "FAILURE" as const, text: `run_id=${failureId} outcome=PROCESS_FAILED` },
+		{ id: failureId, outcome: "FAILURE" as const, text: `${failureId} — recipe:check:static — exit=101 FAILED` },
+	];
+	for (const candidate of cases) {
+		const inspection = inspectDelegationClaims(assistant(candidate.text));
+		assert.ok(inspection, candidate.text);
+		assert.deepEqual(
+			validateDelegationClaims(inspection, evidence(), [], [{ id: candidate.id, outcome: candidate.outcome }]),
+			{ ok: true },
+			candidate.text,
+		);
+	}
+
+	const contradictory = inspectDelegationClaims(assistant([
+		`run ${successId} SUCCESS`,
+		`run ${successId} FAILURE`,
+	].join("\n")));
+	assert.ok(contradictory);
+	assert.deepEqual(
+		validateDelegationClaims(contradictory, evidence(), [], [{ id: successId, outcome: "SUCCESS" }]),
+		{ ok: false, code: "ambiguous_run_outcome" },
+		"contradictory prose never uses last-write-wins outcome binding",
+	);
+});
+
 test("plain status run ids are never reclassified as delegation ids", () => {
 	const committedRun = "20260823-200157-543x";
 	const unavailableLegacyGate = "20260816-173751-57p4";
@@ -433,6 +616,17 @@ test("claim id overflow fails closed instead of silently ignoring later ids", ()
 	assert.equal(inspection.overflow, true);
 	assert.equal(inspection.ids.length, 32);
 	assert.deepEqual(validateDelegationClaims(inspection, evidence(), []), { ok: false, code: "claim_overflow" });
+
+	const mixedDelegations = Array.from({ length: 17 }, (_, index) => `20260822-140000-D${String(index).padStart(3, "0")}`);
+	const mixedRuns = Array.from({ length: 17 }, (_, index) => `20260822-150000-R${String(index).padStart(3, "0")}`);
+	const mixed = inspectDelegationClaims(assistant([
+		...mixedDelegations.map((id) => `delegation ${id} REVIEWED`),
+		...mixedRuns.map((id) => `run ${id} SUCCESS`),
+	].join("\n")));
+	assert.ok(mixed);
+	assert.equal(mixed.overflow, true, "the 32-id ceiling covers both namespaces together");
+	assert.ok(mixed.ids.length + mixed.runIds.length <= 32);
+	assert.deepEqual(validateDelegationClaims(mixed, evidence(), [], []), { ok: false, code: "claim_overflow" });
 });
 
 test("future plans are not past-tense execution claims, and broad recent reports bind every listed id", () => {
@@ -656,7 +850,9 @@ test("controller replaces fabricated final prose and never repeats its ids", asy
 	const replacement = (results.find((value) => value !== undefined) as { message: Record<string, unknown> }).message;
 	const text = finalText(replacement);
 	assert.ok(text.includes(DELEGATION_CLAIM_GUARD_CODE));
+	assert.ok(text.includes("binding_revision: authority-resolved-v2"), "old loaded runtimes are distinguishable from the new binder");
 	assert.ok(text.includes("reason: missing_authority"), "the bounded machine reason makes future failures diagnosable");
+	assert.match(text, /next_action: query workbench_delegation_status/u);
 	assert.match(text, /claim_hash: [a-f0-9]{64}/u, "the rejected prose remains correlatable without retaining it verbatim");
 	assert.equal(text.includes(FAKE_IDS[0]), false, "the guard never reinforces a fabricated id");
 	assert.equal(finalText(message).includes(DELEGATION_CLAIM_GUARD_CODE), false, "caller message is immutable");
@@ -730,6 +926,42 @@ test("controller accepts a committed failed Gate report that cites its runs dire
 		"B0.2 is the only root failure; downstream gates are BLOCKED.",
 	].join("\n"));
 	assert.deepEqual(await emit(state, "message_end", { type: "message_end", message }), [undefined]);
+});
+
+test("controller resolves an unlabeled terminal id through exclusive committed run authority", async () => {
+	const state = stub();
+	const runId = "20260824-161713-eyl5";
+	register(
+		state,
+		() => undefined,
+		true,
+		undefined,
+		undefined,
+		(id) => id === runId ? "SUCCESS" : undefined,
+	);
+	await emit(state, "agent_start", { type: "agent_start" });
+	assert.deepEqual(
+		await emit(state, "message_end", {
+			type: "message_end",
+			message: assistant(`${runId}: SUCCESS`),
+		}),
+		[undefined],
+	);
+});
+
+test("run claim failures prescribe run evidence instead of delegation review", async () => {
+	const state = stub();
+	const runId = "20260824-161713-eyl5";
+	register(state, () => undefined);
+	await emit(state, "agent_start", { type: "agent_start" });
+	const results = await emit(state, "message_end", {
+		type: "message_end",
+		message: assistant(`run ${runId} SUCCESS`),
+	});
+	const replacement = (results.find((value) => value !== undefined) as { message: Record<string, unknown> }).message;
+	const text = finalText(replacement);
+	assert.match(text, /reason: missing_run_authority/u);
+	assert.match(text, /next_action: query workbench_read_run/u);
 });
 
 test("a failed delegate tool attempt cannot be reported as a started worker", async () => {

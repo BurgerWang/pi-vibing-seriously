@@ -61,8 +61,15 @@ Execution summaries are checked against machine evidence. In particular, the
 assistant may report a current-turn worker attempt only when that turn actually
 called `workbench_delegate_worker`; delegation status and completion claims
 must match durable workbench authority. If the claim guard rejects a summary,
-run `workbench_delegation_status`, follow its persisted next action, and avoid
-treating the rejected prose as evidence.
+follow its emitted `next_action` and avoid treating the rejected prose as
+evidence. Run-related failures direct you to `workbench_read_run`; delegation
+failures direct you to `workbench_delegation_status`. Explicit `delegation_id`
+and `run_id` labels are never interchangeable. For an otherwise unlabeled id,
+the guard resolves the shared id shape through exclusive strict on-disk run or
+delegation authority instead of relying only on prose word order. New guard
+messages include `binding_revision: authority-resolved-v2`; if that line is
+absent after updating, the Pi process still has older extension code loaded and
+must be `/reload`ed before starting the next conversation.
 
 ## The product workflow
 
