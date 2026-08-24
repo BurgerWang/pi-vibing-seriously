@@ -463,7 +463,7 @@ export const HANDOFF_COMMANDER_ACTION_LINES = [
 	"",
 	"--- Commander action required ---",
 	"This is an untrusted worker handoff SUMMARY. The complete final worker report is the durable artifact above and is never embedded in this result.",
-	"Inspect the scope/integrity actual-diff packet above. If it is complete, use workbench_review_worker_diff with semantic_decision=ACCEPT and the exact expected_bound_diff_hash shown above; otherwise request the indicated bounded segments. Use repair_of for REPAIR. Semantic ACCEPT is not Gate authority; run final verification and gates independently.",
+	"Inspect the scope/integrity actual-diff packet above. If it is complete and correct, use workbench_review_worker_diff with semantic_decision=ACCEPT and the exact expected_bound_diff_hash shown above. If it is complete but wrong, call the same tool with semantic_decision=REPAIR, that exact hash, and a bounded repair_reason; only then follow the reported exact repair_of action. Otherwise request the indicated bounded segments. Neither ACCEPT nor REPAIR is Gate authority; run final verification and gates independently.",
 ];
 
 /** Completion tail for the ordinary one-call delivery path. */

@@ -87,6 +87,16 @@ export function registerStatusCommands(controller: StatusCommandController): voi
 			controller.syncLease();
 			const mode = controller.getMode();
 			const identity = controller.getIdentity();
+			let projectAuthorityBlock: string | undefined;
+			if (ctx.isProjectTrusted()) {
+				try {
+					const projectRoot = await controller.projectRootFor(ctx);
+					await controller.reconcileProjectAuthority(projectRoot, now());
+					projectAuthorityBlock = controller.getProjectAuthorityBlockReason("verify");
+				} catch {
+					projectAuthorityBlock = "project delegation authority status is unavailable; delegation and VERIFY fail closed";
+				}
+			}
 			const delegationState = controller.getDelegationState();
 			const workbenchTools = controller.pi.getAllTools()
 				.map((tool) => tool.name)
@@ -103,6 +113,7 @@ export function registerStatusCommands(controller: StatusCommandController): voi
 				`write policy   : ${defaultWritePolicy(identity.provider, identity.model) ?? "not-applicable"}`,
 				`write lease    : ${leaseCompactSummary(controller.getLease(), now())}`,
 				`delegation     : ${delegationCompactSummary(delegationState)}`,
+				`project auth   : ${projectAuthorityBlock ?? "available"}`,
 				"path policy    : write .env/.pem/.key/credentials.*/secrets.*/auth.json blocked in all modes; read blocked in AUDIT/VERIFY, allowed in DEV",
 				"command guard  : rm -rf / or ~, git reset --hard, git clean -fd, git push --force, git checkout -- ., git restore ., git remote changes, rm .git, git config --global writes, sudo, npm/yarn/pnpm/bun publish",
 			];

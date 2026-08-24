@@ -17,6 +17,14 @@ import {
 	type ExecuteDelegationV2Input,
 } from "../extensions/workbench-runtime/core/delegation-execution-v2.ts";
 import {
+	abortPristinePreparedDelegationUnderStartLockV2,
+	RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2,
+} from "../extensions/workbench-runtime/core/delegation-execution-owner.ts";
+import {
+	acquireProjectDelegationStartLockV1,
+	releaseProjectDelegationStartLockV1,
+} from "../extensions/workbench-runtime/core/delegation-start-lock.ts";
+import {
 	computeDiffHash,
 	collectGitFacts,
 	collectAfterFacts,
@@ -310,6 +318,107 @@ test("execution v2: implementation commits PENDING_REVIEW and strict reader retu
 		workerIdentity: executionInput.workerIdentity,
 		secrets: executionInput.secrets,
 	});
+});
+
+test("execution v2: execution-owner publication failure closes PREPARED before returning", async (t) => {
+	const projectRoot = await root(t);
+	const delegationId = id(47);
+	const result = await executeDelegationV2(await input(
+		projectRoot,
+		delegationId,
+		"implementation",
+		after([]),
+		worker(completeReport([])),
+		{
+			executionOwnerOptions: {
+				boot_facts: {
+					boot_id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+					system_boot_time_ms: Date.parse("2026-08-17T17:00:00.000Z"),
+					runtime_started_at: "2026-08-17T17:00:01.000Z",
+				},
+				read_process_start_ticks: async () => "not-a-process-start-tick",
+			},
+		},
+	));
+	assert.equal(result.ok, false);
+	if (result.ok) return;
+	assert.equal(result.code, "start_failed");
+	assert.equal(result.durable_state?.status, "ABORTED");
+	assert.equal(
+		result.durable_state?.abort_reason,
+		RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.executionOwnerClaimFailed,
+	);
+	const durable = await readDelegationTransactionV2(projectRoot, delegationId);
+	assert.equal(durable.ok && durable.value.status, "ABORTED");
+});
+
+test("execution v2: ambiguous owner prepublication failure is closed under the exact start lock before same-process retry", async (t) => {
+	const projectRoot = await root(t);
+	const delegationId = id(48);
+	const start = await acquireProjectDelegationStartLockV1({
+		project_root: projectRoot,
+		delegation_id: delegationId,
+		now: "2026-08-17T18:09:58.000Z",
+	});
+	assert.equal(start.ok, true, start.ok ? "" : start.error.code);
+	if (!start.ok) return;
+
+	const base = createNodeDelegationTransactionStorageAdapter();
+	let failOwnerInspectionOnce = true;
+	const ownerSuffix = "/execution-owner.json";
+	const adapter = {
+		...base,
+		write: async (path: string, bytes: Uint8Array, exclusive: boolean) => {
+			if (path.endsWith(ownerSuffix)) {
+				const error = new Error("injected execution-owner prepublication failure") as NodeJS.ErrnoException;
+				error.code = "EIO";
+				throw error;
+			}
+			return base.write(path, bytes, exclusive);
+		},
+		inspect: async (path: string) => {
+			if (path.endsWith(ownerSuffix) && failOwnerInspectionOnce) {
+				failOwnerInspectionOnce = false;
+				const error = new Error("injected ambiguous owner absence") as NodeJS.ErrnoException;
+				error.code = "EIO";
+				throw error;
+			}
+			return base.inspect(path);
+		},
+	};
+	const result = await executeDelegationV2(await input(
+		projectRoot,
+		delegationId,
+		"implementation",
+		after([]),
+		worker(completeReport([])),
+		{ storageOptions: { adapter } },
+	));
+	assert.equal(result.ok, false);
+	if (result.ok) return;
+	assert.equal(result.code, "start_failed");
+	assert.equal(result.durable_state?.status, "PREPARED",
+		"ambiguous absence remains PREPARED at the execution boundary");
+	if (result.durable_state?.status !== "PREPARED") return;
+
+	const closed = await abortPristinePreparedDelegationUnderStartLockV2({
+		project_root: projectRoot,
+		transaction: result.durable_state,
+		start_lock_lease: start.value,
+		now: "2026-08-17T18:10:10.000Z",
+		options: { storage_options: { adapter } },
+	});
+	assert.equal(closed.status, "recovered", closed.status === "blocked" ? closed.code : "");
+	assert.equal(closed.transaction.status, "ABORTED");
+	assert.equal((await releaseProjectDelegationStartLockV1(start.value)).ok, true);
+
+	const retry = await acquireProjectDelegationStartLockV1({
+		project_root: projectRoot,
+		delegation_id: id(49),
+		now: "2026-08-17T18:10:11.000Z",
+	});
+	assert.equal(retry.ok, true, retry.ok ? "" : retry.error.code);
+	if (retry.ok) assert.equal((await releaseProjectDelegationStartLockV1(retry.value)).ok, true);
 });
 
 test("execution v2: a turn-only marker remains a successful committed delegation", async (t) => {

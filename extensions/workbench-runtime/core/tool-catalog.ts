@@ -222,9 +222,9 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 	workbench_review_worker_diff: Type.Object({
 		...WORKBENCH_REVIEW_WORKER_DIFF_V1_PROPERTIES,
 		semantic_decision: Type.Optional(
-			Type.Literal("ACCEPT", {
+			Type.Union([Type.Literal("ACCEPT"), Type.Literal("REPAIR")], {
 				description:
-					"Must be supplied together with expected_bound_diff_hash, and only after Sol has inspected the complete semantic-review packet. Omission produces provisional scope/integrity presentation only and grants no review or Gate authority.",
+					"Explicit Sol decision after the complete packet is presented. ACCEPT grants hash-bound semantic review authority. REPAIR rejects the current delta, grants no Gate authority, requires repair_reason, and only enables an exact fresh repair_of lineage.",
 			}),
 		),
 		expected_bound_diff_hash: Type.Optional(
@@ -233,7 +233,24 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 				minLength: 64,
 				maxLength: 64,
 				description:
-					"Exact packet-bound diff hash paired with semantic_decision=ACCEPT after Sol inspects the complete packet. It prevents accepting drift; either field alone is invalid and neither can grant Gate authority.",
+					"Exact packet-bound diff hash paired with semantic_decision=ACCEPT or REPAIR after Sol inspects the complete packet. It prevents deciding against drift; the hash alone grants no authority.",
+			}),
+		),
+		repair_reason: Type.Optional(
+			Type.String({
+				minLength: 1,
+				maxLength: 1024,
+				description:
+					"Required only with semantic_decision=REPAIR: a bounded, non-empty Sol diagnosis of what the fresh repair worker must correct. It is persisted in immutable negative authority and never grants Gate authority.",
+			}),
+		),
+		expected_migration_binding_hash: Type.Optional(
+			Type.String({
+				pattern: "^[a-f0-9]{64}$",
+				minLength: 64,
+				maxLength: 64,
+				description:
+					"Required only for the second-call ACCEPT of an upgrade-era finalized schema-2 packet. It must exactly match the migration binding shown by the preceding call and must accompany semantic_decision plus expected_bound_diff_hash.",
 			}),
 		),
 	}),
@@ -278,6 +295,15 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 		// Current schema supersedes only the budget description/limits. The
 		// frozen governance-v1 schema continues to use the original property.
 		budget_profile: WORKBENCH_DELEGATE_WORKER_CURRENT_BUDGET_PROFILE,
+		repair_of: Type.Optional(
+			Type.String({
+				minLength: 20,
+				maxLength: 20,
+				pattern: "^\\d{8}-\\d{6}-[A-Za-z0-9]{4}$",
+				description:
+					"Exact prior delegation id for a known repair. A PENDING_REVIEW implementation is referenceable only after Sol publishes an immutable current-binding semantic REPAIR decision; lineaged terminal retries require strict continuation authority. The fresh worker receives the rejected W/D closure, exact scope, plan identity, and repair decision, never the old session or Gate authority.",
+			}),
+		),
 		// S1.1 additive evolution only: governance-v1 task/bounds/budget/repair
 		// fields above remain byte-equivalent through the frozen property set.
 		// task_kind is appended and optional; runtime omission alone resolves
@@ -450,35 +476,36 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 	workbench_delegate_worker: {
 		...WORKBENCH_DELEGATE_WORKER_V1_METADATA,
 		description:
-			"Run one bounded delegation-v2 task on pinned GPT-5.6 Luna xhigh. Implementation may write only approved paths; diagnosis is strictly read-only. New contracts are canonicalized, verification names only declared mutation:none recipes, and contracts above 12 KiB require explicit extended budget plus extended_reason; 64 KiB is absolute. The worker runs in a fresh no-session process and cannot delegate, use free-form bash, or run final Gates. Immutable transaction, ChangeSet, journal, report and usage facts are retained; ambiguous authority fails closed. repair_of may supply only a minimal authority-derived repair capsule and never resumes a session or imports prior prose. Sol retains architecture, semantic review, final verification, Gates and verdict authority.",
+			"Run one bounded delegation-v2 task on pinned GPT-5.6 Luna xhigh. Implementation may write only approved paths; diagnosis is strictly read-only. New contracts are canonicalized, verification names only declared mutation:none recipes, and contracts above 12 KiB require explicit extended budget plus extended_reason; 64 KiB is absolute. The worker runs in a fresh no-session process and cannot delegate, use free-form bash, or run final Gates. Immutable transaction, ChangeSet, journal, report and usage facts are retained; ambiguous authority fails closed. Exact repair_of can consume strict terminal failure authority or a PENDING_REVIEW implementation with an immutable Sol REPAIR decision. Its lineage preserves rejected W/D paths, exact scope, root plan identity, and the latest continuation decision while a project lock prevents sibling starts. It never resumes a session or imports prior prose, and stays Gate-blocking until the corrected implementation receives strict semantic acceptance. Sol retains architecture, semantic review, final verification, Gates and verdict authority.",
 		promptSnippet:
 			"Run one bounded Luna xhigh implementation or read-only diagnosis under an immutable contract",
 		promptGuidelines: [
 			"Delegate one coherent slice with the smallest useful allowed_paths and observable criteria; use diagnosis only when the root cause or scope is genuinely unknown.",
 			"Verification entries are exact recipe:<declared-name> references. Omit budget_profile for the normal extended default; a contract above 12 KiB must explicitly set extended and provide extended_reason.",
-			"Use repair_of only for a known-root-cause repair. The fresh worker receives bounded immutable failure facts, not the old session, report, or authority.",
+			"For a complete current PENDING_REVIEW packet that is known wrong, first use workbench_review_worker_diff with semantic_decision=REPAIR, the exact shown bound hash, and repair_reason; then use only the exact repair_of action reported by status. Historical mechanical FINAL remains ACCEPT-migration-only. The fresh worker receives bounded immutable repair/lineage facts, not the old session or report.",
 			"Treat worker output as implementation evidence only. Sol owns semantic acceptance, final verification, Gates, permissions and the final verdict.",
 		],
 	},
 	workbench_review_worker_diff: {
 		...WORKBENCH_REVIEW_WORKER_DIFF_V1_METADATA,
 		description:
-			"Inspect the immutable worker delta and its scope/integrity binding. A call without semantic_decision and expected_bound_diff_hash produces only provisional presentation and grants no review or Gate authority. After Sol has inspected the complete semantic-review packet, supply both semantic_decision=ACCEPT and the exact packet-bound diff hash; either field alone fails closed. include_paths narrows rendering only, never scope checks. Workspace drift invalidates the binding. The tool writes review authority only, never project files or Gate results.",
-		promptSnippet: "Inspect a bound worker diff, then explicitly ACCEPT only the complete unchanged packet",
+			"Inspect the immutable worker delta and its scope/integrity binding. A call without semantic fields produces only provisional presentation and grants no review or Gate authority. If one ordinary source path is larger than the bounded packet, repeat that single include_path: the runtime resumes the next contiguous UTF-8 page only for the same diff and redacted-stream hashes. After Sol has inspected the complete current packet, semantic_decision=ACCEPT grants exact hash-bound semantic authority; semantic_decision=REPAIR plus a bounded repair_reason publishes immutable negative authority and enables only an exact fresh repair_of lineage. REPAIR never grants Gate authority. Historical migration supports ACCEPT only. include_paths narrows rendering only, never scope checks. Workspace drift invalidates either decision.",
+		promptSnippet: "Inspect a bound worker diff, then explicitly ACCEPT it or require an exact fresh REPAIR",
 		promptGuidelines: [
 			"First call without semantic fields to inspect the provisional scope/integrity packet; this cannot finalize review.",
-			"Only after Sol inspects the complete packet, call with semantic_decision=ACCEPT and its exact expected_bound_diff_hash. Always provide both or neither.",
-			"include_paths changes presentation only. Never accept after drift, incomplete packet coverage, unresolved semantic risk, or an unverified hash.",
+			"Only after Sol inspects the complete packet, call with semantic_decision=ACCEPT or REPAIR and its exact expected_bound_diff_hash. REPAIR also requires repair_reason, stays Gate-blocking, and permits only exact repair_of. For an explicitly reported historical migration, only ACCEPT is valid and also requires expected_migration_binding_hash. Never guess a hash.",
+			"include_paths changes presentation only. When one ordinary source path remains, repeat that single path until its hash-bound page range reaches the total; never accept after drift, incomplete packet coverage, unresolved semantic risk, or an unverified hash.",
 			"Review authority never substitutes for final verification or Gate authority.",
 		],
 	},
 	workbench_delegation_status: {
 		...WORKBENCH_DELEGATION_STATUS_V1_METADATA,
 		description:
-			"Show the write-authority and delegation-review state: actor, write policy, lease status, latest delegation, review status (PENDING_REVIEW/REVIEWED/STALE), current and actual diff hashes, reviewed hash, blocked write attempts, and the latest review verdict. The existing hash field names are retained for compatibility: a new tagged v2 delegation refreshes a ChangeSet relevance binding over W (the attributed worker delta), D (the explicit dependency closure), and S (relevant controls); baseline unrelated dirty paths and recognized workbench artifacts do not stale it, while Git HEAD, W/D/S drift, or a new unknown-origin path fails closed and makes a reviewed delegation STALE. Historical untagged v2 and v1 authority retain the complete full-diff binding, where any diff change makes a reviewed delegation STALE. For STALE plus strict v2 FINAL/PASS authority, status reports that a fresh successor is allowed after live revalidation while VERIFY remains blocked; all other blocking authority remains fail-closed. Emits an explicit CONTEXT RISK line when the latest delegation handoff is detected too large for safe context compaction.",
+				"Show the write-authority and delegation-review state: actor, write policy, lease status, latest delegation, review status (PENDING_REVIEW/REVIEWED/STALE), current and reviewed hashes, blocked writes, latest verdict, and durable semantic-repair state. REPAIR_REQUIRED reports one exact repair_of action only while its bound workspace is fresh; active, recovery, forked, missing-continuation, or corrupt lineages remain visibly blocked. New tagged v2 uses the W/D/S relevance binding; historical untagged v2/v1 retains the complete diff binding. Baseline unrelated dirt and recognized workbench artifacts do not stale tagged v2, while Git HEAD, W/D/S, unknown-origin, or repair-authority drift fails closed. Emits an explicit CONTEXT RISK line when the latest handoff is too large for safe compaction.",
 		promptGuidelines: [
 			"Successful non-zero implementation delivery returns a provisional scope/integrity packet and stays PENDING_REVIEW; after inspecting a complete unchanged packet, use workbench_review_worker_diff for hash-bound Sol ACCEPT. Use status only for diagnostics or recovery.",
-			"When STALE is backed by a strict v2 FINAL/PASS review, follow the reported successor action instead of retrying immutable review; VERIFY remains blocked until that successor is reviewed.",
+			"If a complete packet is wrong, publish semantic_decision=REPAIR with the exact bound hash and a bounded reason, then follow only the exact repair_of shown by status. REPAIR and every unresolved lineage remain Gate-blocking.",
+			"When STALE is backed by strict v2 FINAL/PASS plus explicit Sol semantic authority, follow the reported successor action instead of retrying immutable review; a mechanical FINAL/PASS remains blocked and VERIFY stays blocked until a valid successor is reviewed.",
 			"In the TUI, WF:LOCKED means routine writes belong to Luna, WF:LEASE means a bounded temporary Sol write exception is active, and WF:REVIEW means recovery review is outstanding.",
 		],
 	},

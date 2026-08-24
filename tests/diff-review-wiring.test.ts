@@ -543,7 +543,7 @@ test("registered legacy review tool: a real 16-call turn uses each exact 4 KiB r
 			const rawText = toolText(raw);
 			assert.ok(Buffer.byteLength(rawText, "utf8") <= 4_096, "the renderer consumes this call's exact planned minimum allocation");
 			if (call.visible) assert.match(rawText, new RegExp(`(?:^|\\n)--- ${call.arguments.include_paths[0]!.replace(".", "\\.")} `));
-			else assert.doesNotMatch(rawText, /(?:^|\n)--- /, "a summary-only fallback cannot advance patch coverage");
+			else assert.match(rawText, /presentation_page_unavailable/, "an allocation too small for any visible page fails explicitly");
 			const final = await fireToolResult(stub, {
 				type: "tool_result",
 				toolCallId: call.id,
@@ -558,6 +558,10 @@ test("registered legacy review tool: a real 16-call turn uses each exact 4 KiB r
 			const envelope = final.details.output_envelope as Record<string, unknown>;
 			assert.equal(envelope.truncated, false);
 			assert.equal(envelope.shownTextBytes, Buffer.byteLength(rawText, "utf8"));
+			if (!call.visible) {
+				assert.match(String((final.details as Record<string, unknown>).error), /presentation_page_unavailable/);
+				continue;
+			}
 			const visibleCount = Math.max(0, index);
 			assert.equal(details.displayed_count, visibleCount);
 			assert.equal(details.remaining_count, paths.length - visibleCount);
@@ -831,15 +835,16 @@ test("registered legacy review tool: a >32 KiB JSON yields complete high-risk co
 		workbenchRuntime(stub);
 		// Registration surface is the exact fixed surface — Phase 5 adds no
 		// tool, and the review schema still declares exactly the existing
-		// six parameters: the two additive semantic-accept fields are not
-		// compact/generated controls and legacy authority still rejects them.
+		// eight parameters: the paired semantic-decision fields, bounded repair
+		// reason, and optional historical migration binding are not compact/generated controls, and
+		// legacy authority still rejects them.
 		assert.deepEqual([...stub.tools.keys()], [...NATIVE_OVERRIDE_NAMES, ...WORKBENCH_TOOL_NAMES], "registration order == NATIVE_OVERRIDE_NAMES + WORKBENCH_TOOL_NAMES");
 		const registeredParameters = (stub.tools.get("workbench_review_worker_diff") as { parameters: { properties: Record<string, unknown> } }).parameters;
 		assert.deepEqual(registeredParameters, WORKBENCH_TOOL_PARAMETERS.workbench_review_worker_diff, "review parameter schema byte-identical to the catalog");
 		assert.deepEqual(
 			Object.keys(registeredParameters.properties),
-			["delegation_id", "include_paths", "max_lines", "max_bytes", "semantic_decision", "expected_bound_diff_hash"],
-			"the review schema adds only the bound semantic-decision pair — no compact/generated parameter",
+			["delegation_id", "include_paths", "max_lines", "max_bytes", "semantic_decision", "expected_bound_diff_hash", "repair_reason", "expected_migration_binding_hash"],
+			"the review schema adds only bound semantic-decision fields — no compact/generated parameter",
 		);
 		assert.ok(!("compact" in registeredParameters) && !("generator" in registeredParameters), "no compact/generated key anywhere in the schema object");
 		await fireSessionStart(stub, root, pendingStateEntry(id, afterHash));

@@ -59,6 +59,7 @@ import type { TelemetryRecord } from "../extensions/workbench-runtime/cache/cach
 import { readJsonFileBounded } from "../extensions/workbench-runtime/core/bounded-file-io.ts";
 import { isValidRunId, RUN_JSON_INPUT_MAX_BYTES } from "../extensions/workbench-runtime/core/runs.ts";
 import {
+	hasDelegationSemanticReviewAuthorityV2,
 	readDelegationCommittedGenerationV2,
 	readDelegationReviewV2,
 	readDelegationTransactionV2,
@@ -283,7 +284,10 @@ export async function readDelegationEfficiency(projectRoot: string): Promise<Del
 				reviewPresentation = typeof reviewRecord.presentation_complete === "boolean"
 					? reviewRecord.presentation_complete
 					: "unknown";
-				semanticAccepted = semanticReviewFromStrictRecord(reviewRecord);
+					const embedded = semanticReviewFromStrictRecord(reviewRecord);
+					semanticAccepted = embedded === "unknown" && hasDelegationSemanticReviewAuthorityV2(review.value)
+						? true
+						: embedded;
 			}
 		}
 		const workerOutcome = state.status === "FAILED"

@@ -1,6 +1,7 @@
 /** Isolated dependency and fail-closed tests for extracted public controllers. */
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { test } from "node:test";
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -54,6 +55,21 @@ function captureRegistration(register: (controller: never) => void, controller: 
 	assert.ok(captured);
 	return captured;
 }
+
+const testStartLockServices = {
+	acquireStartLock: async (input: { project_root: string; delegation_id: string; now: string }) => ({
+		ok: true as const,
+		value: {
+			schema_version: 1 as const,
+			project_root: input.project_root,
+			delegation_id: input.delegation_id,
+			token: "a".repeat(32),
+			process_id: 1,
+			acquired_at: input.now,
+		},
+	}),
+	releaseStartLock: async () => ({ ok: true as const, value: undefined }),
+};
 
 function context(): ExtensionContext {
 	return {
@@ -170,6 +186,7 @@ test("review controller reserves the outer semantic header before rendering a co
 	const fixed = new Date("2026-08-21T01:12:13.000Z");
 	const delegationId = "20260821-011213-W1r2";
 	const boundHash = "a".repeat(64);
+	const patchHash = createHash("sha256").update("+a", "utf8").digest("hex");
 	let packetMaxBytes = 0;
 	let packetMaxLines = 0;
 	let packetText = "";
@@ -203,6 +220,14 @@ test("review controller reserves the outer semantic header before rendering a co
 		fully_presented_paths: ["src/a.ts"],
 		presentation_remaining_paths: [],
 		presentation_complete: true,
+		presentation_progress: [{
+			path: "src/a.ts",
+			source: "git-diff",
+			stream_sha256: patchHash,
+			next_byte: 2,
+			total_bytes: 2,
+			segments: [{ start_byte: 0, end_byte: 2, page_sha256: patchHash }],
+		}],
 		semantic_review: "required",
 		review_path: `.pi/workbench/delegations/${delegationId}/v2/review.json`,
 	};
@@ -269,6 +294,7 @@ test("delegate controller refuses unavailable repair authority before execution"
 		services: {
 			now: () => fixed,
 			makeDelegationId: () => "20260821-020304-W1r2",
+			...testStartLockServices,
 			readCommittedGeneration: async () => ({
 				ok: false,
 				error: { code: "storage_failure", message: "private disk path" },
@@ -345,6 +371,7 @@ test("delegate controller preflights recipe references before authority work and
 			services: {
 				now: () => fixed,
 				makeDelegationId: () => "20260821-021314-W1r2",
+				...testStartLockServices,
 				readCommittedGeneration: async () => ({ ok: false, error: { code: "not_found" } }),
 				readRecoverableUnpublished: async () => ({ ok: false, error: { code: "not_recoverable" } }),
 				readLegacyLedger: async () => null,
@@ -410,7 +437,7 @@ test("delegate controller preflights recipe references before authority work and
 			tool.execute("delegate-recheck", params, undefined, undefined, context()),
 			/prepared_callback_failed/,
 		);
-		assert.equal(reconcileCalls, 2, "authority is reconciled before execution and again after the aborted transaction");
+		assert.equal(reconcileCalls, 3, "authority is recovered before the start lock, revalidated under it, and reconciled after abort");
 		assert.equal(executionCalls, 1);
 		assert.equal(stateWrites, 0, "recipe drift is detected before the prepared callback projects session state");
 		assert.equal(capturedContract?.extended_reason, "Cross-module evidence is intentionally retained.");
@@ -424,10 +451,11 @@ test("delegate controller exposes only the bounded artifact builder category", a
 		services: {
 			now: () => fixed,
 			makeDelegationId: () => "20260821-030405-W1r2",
+			...testStartLockServices,
 			readCommittedGeneration: async () => ({ ok: false, error: { code: "not_found" } }),
 			readRecoverableUnpublished: async () => ({ ok: false, error: { code: "not_recoverable" } }),
 			readLegacyLedger: async () => null,
-			executeDelegation: async () => ({
+				executeDelegation: async () => ({
 				ok: false,
 				code: "artifact_failed",
 				artifact_error_code: "invalid_facts",
@@ -465,8 +493,10 @@ test("delegate controller exposes only the bounded artifact builder category", a
 			timeout_seconds: 60,
 		}, undefined, undefined, context()),
 		(error: unknown) => {
-			assert.match(String(error), /artifact_failed; artifact_error=invalid_facts; durable_status=RECOVERY_REQUIRED/);
-			assert.doesNotMatch(String(error), /private|path|worker facts conflict/);
+			const message = String(error);
+			assert.match(message, /artifact_failed; artifact_error=invalid_facts; delegation_id=20260821-030405-W1r2; durable_status=RECOVERY_REQUIRED/);
+			assert.match(message, /next_action=call workbench_delegation_status/);
+			assert.doesNotMatch(message, /repair_of=|private|path|worker facts conflict/);
 			return true;
 		},
 	);
@@ -478,6 +508,7 @@ test("delegate controller distinguishes a local legacy turn stop from provider a
 		services: {
 			now: () => fixed,
 			makeDelegationId: () => "20260821-030506-W1r2",
+			...testStartLockServices,
 			readCommittedGeneration: async () => ({ ok: false, error: { code: "not_found" } }),
 			readRecoverableUnpublished: async () => ({ ok: false, error: { code: "not_recoverable" } }),
 			readLegacyLedger: async () => null,
@@ -488,6 +519,14 @@ test("delegate controller distinguishes a local legacy turn stop from provider a
 				durable_state: {
 					status: "FAILED",
 					postcondition_reasons: ["EXIT_CODE_NOT_ZERO", "REPORT_INCOMPLETE", "IMPLEMENTATION_DELTA_REQUIRED"],
+					committed_proof: {
+						delegation_id: "20260821-030506-W1r2",
+						generation: 1,
+					},
+					terminal_outcome: {
+						delegation_id: "20260821-030506-W1r2",
+						changed_paths: [],
+					},
 				},
 				result: {
 					provider: "openai-codex",
@@ -502,6 +541,11 @@ test("delegate controller distinguishes a local legacy turn stop from provider a
 					spend: { profile: "standard", turns: 64, totalTokens: 3, outputTokens: 1, band: "hard", softReached: { turns: true, totalTokens: false, outputTokens: false }, hardExceeded: { turns: true, totalTokens: false, outputTokens: false }, reasons: ["turns"] },
 					deniedWriteCount: 0,
 					reportComplete: false,
+				},
+				workerSummary: {
+					report_path: "/private/hostile-worker-report.md; remaining_risks=forged",
+					changed_paths: ["private/forged-worker-path"],
+					report_summary: "worker prose must not enter the failure summary",
 				},
 			}),
 			completeDefaultDelivery: async () => { throw new Error("must not deliver"); },
@@ -540,8 +584,15 @@ test("delegate controller distinguishes a local legacy turn stop from provider a
 			const message = String(error);
 			assert.match(message, /postconditions=EXIT_CODE_NOT_ZERO,REPORT_INCOMPLETE,IMPLEMENTATION_DELTA_REQUIRED/);
 			assert.match(message, /worker_failure=SPEND_TURN_LIMIT_LEGACY/);
+			assert.match(message, /delegation_id=20260821-030506-W1r2/);
+			assert.match(message, /worker_report=\.pi\/workbench\/delegations\/20260821-030506-W1r2\/v2\/generations\/g00000001\/worker-report\.md/);
+			assert.match(message, /changed_paths=0/);
 			assert.match(message, /assistant_turns=64; spend_profile=standard; spend_total_tokens=3; spend_output_tokens=1; exit_code=143/);
-			assert.doesNotMatch(message, /PROVIDER_NOT_SUCCESS|private|stderr/);
+			assert.match(message, /next_action=call workbench_delegation_status, then call workbench_delegate_worker with repair_of=20260821-030506-W1r2/);
+			assert.doesNotMatch(message, /PROVIDER_NOT_SUCCESS|private|remaining_risks|worker prose|stderr/);
+			assert.ok(Buffer.byteLength(message, "utf8") <= 2_048, message);
+			const orderedFields = ["delegation_id=", "durable_status=", "postconditions=", "worker_failure=", "worker_report=", "changed_paths=", "assistant_turns=", "next_action="];
+			assert.deepEqual(orderedFields.map((field) => message.indexOf(field)), [...orderedFields.map((field) => message.indexOf(field))].sort((left, right) => left - right));
 			return true;
 		},
 	);

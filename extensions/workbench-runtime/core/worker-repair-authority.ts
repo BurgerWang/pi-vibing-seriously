@@ -7,8 +7,19 @@
  */
 
 import { readDelegationLedger, type LedgerWorkerSummaryRecord } from "./delegation-ledger.ts";
+import {
+	isStrictRetryableAbortedRepairV2,
+	isStrictRetryableEmptyRepairRecoveryV2,
+} from "./delegation-execution-owner.ts";
 import { readRecoverableUnpublishedDelegationV2 } from "./delegation-project-authority.ts";
-import { readDelegationCommittedGenerationV2 } from "./delegation-transaction-storage.ts";
+import {
+	hasDelegationSemanticRepairAuthorityV2,
+	readDelegationCommittedGenerationV2,
+	readDelegationReviewV2,
+	readDelegationTransactionV2,
+	type DelegationSemanticRepairDecisionV1,
+} from "./delegation-transaction-storage.ts";
+import type { DelegationRepairLineageV1, DelegationTransactionRecord } from "./delegation-transaction.ts";
 import { parsePlanReference } from "./plan-reference.ts";
 import { readCommittedManifest, RUN_ID_RE } from "./runs.ts";
 import {
@@ -42,6 +53,59 @@ function boundedChangedPaths(paths: readonly string[]): { paths: string[]; omitt
 	};
 }
 
+function lineageFact(lineage: DelegationRepairLineageV1 | undefined): WorkerRepairCapsule["repair_lineage"] {
+	if (lineage === undefined) return undefined;
+	const carried = boundedChangedPaths(lineage.carried_paths);
+	return {
+		root_delegation_id: lineage.root_delegation_id,
+		repair_of: lineage.repair_of,
+		root_decision_hash: lineage.root_decision_hash,
+		continuation_decision_delegation_id: lineage.continuation_decision_delegation_id,
+		continuation_decision_hash: lineage.continuation_decision_hash,
+		lineage_hash: lineage.lineage_hash,
+		depth: lineage.depth,
+		carried_paths: carried.paths,
+		carried_paths_omitted: carried.omitted,
+	};
+}
+
+function semanticRepairFact(decision: DelegationSemanticRepairDecisionV1): NonNullable<WorkerRepairCapsule["semantic_repair"]> {
+	return {
+		delegation_id: decision.delegation_id,
+		decision_hash: decision.decision_hash,
+		expected_bound_diff_hash: decision.expected_bound_diff_hash,
+		repair_reason: decision.repair_reason,
+		repair_reason_hash: decision.repair_reason_hash,
+		reviewer: { ...decision.reviewer },
+		decided_at: decision.decided_at,
+	};
+}
+
+async function strictSemanticRepairDecision(
+	projectRoot: string,
+	state: DelegationTransactionRecord,
+): Promise<DelegationSemanticRepairDecisionV1 | undefined> {
+	const lineage = state.repair_lineage;
+	if (lineage === undefined) {
+		const review = await readDelegationReviewV2(projectRoot, state.delegation_id);
+		return review.ok && hasDelegationSemanticRepairAuthorityV2(review.value)
+			? review.value.semantic_repair!
+			: undefined;
+	}
+	const root = await readDelegationReviewV2(projectRoot, lineage.root_delegation_id);
+	if (!root.ok || !hasDelegationSemanticRepairAuthorityV2(root.value) ||
+		root.value.semantic_repair!.decision_hash !== lineage.root_decision_hash) return undefined;
+	if (lineage.continuation_decision_delegation_id === lineage.root_delegation_id) {
+		return lineage.continuation_decision_hash === lineage.root_decision_hash
+			? root.value.semantic_repair!
+			: undefined;
+	}
+	const continuation = await readDelegationReviewV2(projectRoot, lineage.continuation_decision_delegation_id);
+	if (!continuation.ok || !hasDelegationSemanticRepairAuthorityV2(continuation.value) ||
+		continuation.value.semantic_repair!.decision_hash !== lineage.continuation_decision_hash) return undefined;
+	return continuation.value.semantic_repair!;
+}
+
 function minimalPlanFact(before: unknown): WorkerRepairPlanFact | null {
 	const contract = record(record(before)?.contract);
 	const plan = parsePlanReference(contract?.plan_ref);
@@ -54,6 +118,17 @@ function minimalPlanFact(before: unknown): WorkerRepairPlanFact | null {
 			plan_sha256: plan.plan_sha256,
 			candidate: plan.candidate,
 		};
+}
+
+async function strictRepairPlanFact(
+	projectRoot: string,
+	state: DelegationTransactionRecord,
+	currentBefore?: unknown,
+): Promise<{ ok: true; value: WorkerRepairPlanFact | null } | { ok: false }> {
+	if (state.repair_lineage === undefined) return { ok: true, value: minimalPlanFact(currentBefore) };
+	const root = await readDelegationCommittedGenerationV2(projectRoot, state.repair_lineage.root_delegation_id);
+	if (!root.ok) return { ok: false };
+	return { ok: true, value: minimalPlanFact(root.value.records["before.json"]) };
 }
 
 function summaryFacts(value: unknown): Pick<LedgerWorkerSummaryRecord, "verification_commands" | "verification_observations"> | undefined {
@@ -112,30 +187,88 @@ export async function readWorkerRepairCapsule(
 		const { state, records, proof } = committed.value;
 		const outcome = state.terminal_outcome;
 		if (outcome === null) return { ok: false, code: "authority_invalid" };
+		let semanticDecision: DelegationSemanticRepairDecisionV1 | undefined;
+		if (state.status === "PENDING_REVIEW") {
+			const review = await readDelegationReviewV2(projectRoot, repairOf);
+			if (!review.ok || !hasDelegationSemanticRepairAuthorityV2(review.value)) {
+				return { ok: false, code: review.ok ? "authority_invalid" : review.error.code === "storage_failure" ? "authority_unavailable" : "authority_invalid" };
+			}
+			semanticDecision = review.value.semantic_repair!;
+		} else if (!new Set(["FAILED", "FINISHED", "REVIEWED"]).has(state.status) &&
+			!(state.status === "RECOVERY_REQUIRED" && state.repair_lineage !== undefined)) {
+			return { ok: false, code: "authority_invalid" };
+		}
+		if (state.repair_lineage !== undefined) {
+			const rootDecision = await strictSemanticRepairDecision(projectRoot, state);
+			if (rootDecision === undefined) return { ok: false, code: "authority_invalid" };
+			semanticDecision ??= rootDecision;
+		}
+		const plan = await strictRepairPlanFact(projectRoot, state, records["before.json"]);
+		if (!plan.ok) return { ok: false, code: "authority_invalid" };
 		const changed = boundedChangedPaths(outcome.changed_paths);
+		const reasonCodes = [
+			...(semanticDecision !== undefined || state.repair_lineage !== undefined ? ["SEMANTIC_REPAIR_REQUIRED"] : []),
+			...state.postcondition_reasons,
+		].slice(0, WORKER_REPAIR_CAPSULE_MAX_FAILURE_REASONS);
 		return ensureBounded({
 			schema: WORKER_REPAIR_CAPSULE_SCHEMA,
 			repair_of: repairOf,
-			authority_kind: "v2_committed",
+			authority_kind: state.repair_lineage === undefined ? "v2_committed" : "v2_repair_lineage",
 			authority_status: state.status,
 			contract_hash: state.contract_hash,
 			generation_content_hash: proof.content_hash,
 			journal_hash: null,
 			failure: {
 				exit_code: outcome.exit_code,
-				reason_codes: state.postcondition_reasons.slice(0, WORKER_REPAIR_CAPSULE_MAX_FAILURE_REASONS),
+				reason_codes: reasonCodes,
 				successful_write_count: outcome.successful_write_count,
 				denied_write_count: outcome.denied_write_count,
 			},
 			changed_paths: changed.paths,
 			changed_paths_omitted: changed.omitted,
 			failed_runs: await failedRunFacts(projectRoot, records["worker-summary.json"], state.created_at, state.updated_at),
-			plan_ref: minimalPlanFact(records["before.json"]),
+			plan_ref: plan.value,
+			...(state.repair_lineage === undefined ? {} : { repair_lineage: lineageFact(state.repair_lineage) }),
+			...(semanticDecision === undefined ? {} : { semantic_repair: semanticRepairFact(semanticDecision) }),
 		});
 	}
 	const committedAbsent = committed.error.code === "not_found";
 	if (!committedAbsent && committed.error.code !== "invalid_record") {
 		return { ok: false, code: "authority_unavailable" };
+	}
+	if (!committedAbsent) {
+		const raw = await readDelegationTransactionV2(projectRoot, repairOf);
+		const safeRawLineage = raw.ok && raw.value.repair_lineage !== undefined &&
+			(await isStrictRetryableAbortedRepairV2(projectRoot, raw.value) ||
+				await isStrictRetryableEmptyRepairRecoveryV2(projectRoot, raw.value));
+		if (raw.ok && safeRawLineage) {
+			const semanticDecision = await strictSemanticRepairDecision(projectRoot, raw.value);
+			if (semanticDecision === undefined) return { ok: false, code: "authority_invalid" };
+			const plan = await strictRepairPlanFact(projectRoot, raw.value);
+			if (!plan.ok) return { ok: false, code: "authority_invalid" };
+			return ensureBounded({
+				schema: WORKER_REPAIR_CAPSULE_SCHEMA,
+				repair_of: repairOf,
+				authority_kind: "v2_repair_lineage",
+				authority_status: raw.value.status,
+				contract_hash: raw.value.contract_hash,
+				generation_content_hash: null,
+				journal_hash: null,
+				failure: {
+					exit_code: null,
+					reason_codes: ["SEMANTIC_REPAIR_REQUIRED",
+						raw.value.status === "ABORTED" ? "REPAIR_ATTEMPT_ABORTED" : "REPAIR_EMPTY_RECOVERY_REQUIRED"],
+					successful_write_count: null,
+					denied_write_count: null,
+				},
+				changed_paths: [],
+				changed_paths_omitted: 0,
+				failed_runs: [],
+				plan_ref: plan.value,
+				repair_lineage: lineageFact(raw.value.repair_lineage),
+				semantic_repair: semanticRepairFact(semanticDecision),
+			});
+		}
 	}
 
 	const unpublished = await readRecoverableUnpublishedDelegationV2(projectRoot, repairOf);
@@ -143,25 +276,39 @@ export async function readWorkerRepairCapsule(
 		const { transaction, journal } = unpublished.value;
 		const outcome = transaction.terminal_outcome;
 		if (outcome === null || journal.journal_hash === null) return { ok: false, code: "authority_invalid" };
+		const semanticDecision = transaction.repair_lineage === undefined
+			? undefined
+			: await strictSemanticRepairDecision(projectRoot, transaction);
+		if (transaction.repair_lineage !== undefined && semanticDecision === undefined) {
+			return { ok: false, code: "authority_invalid" };
+		}
+		const plan = await strictRepairPlanFact(projectRoot, transaction);
+		if (!plan.ok) return { ok: false, code: "authority_invalid" };
 		const changed = boundedChangedPaths(outcome.changed_paths);
+		const reasonCodes = [
+			...(transaction.repair_lineage === undefined ? [] : ["SEMANTIC_REPAIR_REQUIRED"]),
+			...transaction.postcondition_reasons,
+		].slice(0, WORKER_REPAIR_CAPSULE_MAX_FAILURE_REASONS);
 		return ensureBounded({
 			schema: WORKER_REPAIR_CAPSULE_SCHEMA,
 			repair_of: repairOf,
-			authority_kind: "v2_unpublished",
+			authority_kind: transaction.repair_lineage === undefined ? "v2_unpublished" : "v2_repair_lineage",
 			authority_status: transaction.status,
 			contract_hash: transaction.contract_hash,
 			generation_content_hash: null,
 			journal_hash: journal.journal_hash,
 			failure: {
 				exit_code: outcome.exit_code,
-				reason_codes: transaction.postcondition_reasons.slice(0, WORKER_REPAIR_CAPSULE_MAX_FAILURE_REASONS),
+				reason_codes: reasonCodes,
 				successful_write_count: outcome.successful_write_count,
 				denied_write_count: outcome.denied_write_count,
 			},
 			changed_paths: changed.paths,
 			changed_paths_omitted: changed.omitted,
 			failed_runs: [],
-			plan_ref: null,
+			plan_ref: plan.value,
+			...(transaction.repair_lineage === undefined ? {} : { repair_lineage: lineageFact(transaction.repair_lineage) }),
+			...(semanticDecision === undefined ? {} : { semantic_repair: semanticRepairFact(semanticDecision) }),
 		});
 	}
 	if (!committedAbsent) {

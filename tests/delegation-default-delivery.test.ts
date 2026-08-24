@@ -50,6 +50,14 @@ function successfulReview(
 				fully_presented_paths: ["src/a.ts"],
 				presentation_remaining_paths: [],
 				presentation_complete: true,
+				presentation_progress: [{
+					path: "src/a.ts",
+					source: "file-content",
+					stream_sha256: "d".repeat(64),
+					next_byte: 1,
+					total_bytes: 1,
+					segments: [{ start_byte: 0, end_byte: 1, page_sha256: "e".repeat(64) }],
+				}],
 				semantic_review: "required",
 				path_stats: [],
 				violations: [],
@@ -173,6 +181,7 @@ test("incomplete review with no remaining-path progress stays pending", async ()
 				fully_presented_paths: [],
 				presentation_remaining_paths: ["src/a.ts", "src/b.ts"],
 				presentation_complete: false,
+				presentation_progress: [],
 			});
 		},
 	});
@@ -212,6 +221,7 @@ test("default delivery never auto-pages beyond its single handoff-sized segment"
 				fully_presented_paths: [],
 				presentation_remaining_paths: current,
 				presentation_complete: false,
+				presentation_progress: [],
 			});
 		},
 	});
@@ -363,6 +373,7 @@ test("complete zero-delta packet is the only mechanical implementation closure",
 			fully_presented_paths: [],
 			presentation_remaining_paths: [],
 			presentation_complete: true,
+			presentation_progress: [],
 			semantic_review: "not_required",
 			patch: [],
 		}, true),

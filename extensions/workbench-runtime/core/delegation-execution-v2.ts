@@ -52,6 +52,8 @@ import {
 } from "./delegation-transaction-storage.ts";
 import {
 	claimDelegationExecutionOwnerV2,
+	RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2,
+	RETRYABLE_EMPTY_RECOVERY_REASONS_V2,
 	releaseDelegationExecutionOwnerV2,
 	type DelegationExecutionOwnerOptionsV2,
 } from "./delegation-execution-owner.ts";
@@ -60,6 +62,8 @@ import {
 	DELEGATION_TRANSACTION_ID_RE,
 	DELEGATION_TRANSACTION_WORKER_ID_RE,
 	delegationPathAllowedV2,
+	parseDelegationRepairLineageV1,
+	type DelegationRepairLineageV1,
 	type DelegationTransactionRecord,
 	type DelegationWorkerIdentity,
 } from "./delegation-transaction.ts";
@@ -132,6 +136,8 @@ export interface ExecuteDelegationV2Input {
 	before?: GitFacts;
 	/** Internal closed dependency set; the public runtime default is exactly []. */
 	dependencyPaths?: readonly string[];
+	/** Strict unresolved semantic-repair continuity; never write authority. */
+	repairLineage?: DelegationRepairLineageV1;
 	workerIdentity: DelegationWorkerIdentity;
 	secrets?: readonly string[];
 	signal?: AbortSignal;
@@ -182,6 +188,7 @@ interface CheckedInput {
 	delegationId: string;
 	contract: DelegationBoundedTaskContractBindingV2;
 	dependencyPaths: string[];
+	repairLineage?: DelegationRepairLineageV1;
 	workerIdentity: DelegationWorkerIdentity;
 	secrets: string[];
 }
@@ -233,8 +240,12 @@ function checkInput(input: ExecuteDelegationV2Input): CheckedInput | undefined {
 	if (!isRecord(identity) || identity.provider !== WORKER_PROVIDER || identity.model !== WORKER_MODEL_ID ||
 		typeof identity.worker_id !== "string" || !DELEGATION_TRANSACTION_WORKER_ID_RE.test(identity.worker_id)) return undefined;
 	const dependencyPaths = [...(input.dependencyPaths ?? [])];
+	const repairLineage = input.repairLineage === undefined ? undefined : parseDelegationRepairLineageV1(input.repairLineage);
 	if (!dependencyPaths.every((path, index) => isStrictStreamingIdentityPath(path)
 		&& (index === 0 || byteCompare(dependencyPaths[index - 1]!, path) < 0)) ||
+		(input.repairLineage !== undefined && repairLineage === undefined) ||
+		(repairLineage !== undefined && (rebound.value.task_kind !== "implementation" ||
+			!sameByteSortedPaths(dependencyPaths, repairLineage.carried_paths))) ||
 		(input.secrets !== undefined &&
 		(!Array.isArray(input.secrets) || !input.secrets.every((secret) => typeof secret === "string")))) return undefined;
 	return {
@@ -242,6 +253,7 @@ function checkInput(input: ExecuteDelegationV2Input): CheckedInput | undefined {
 		delegationId: input.delegationId,
 		contract: structuredClone(rebound.value),
 		dependencyPaths,
+		...(repairLineage === undefined ? {} : { repairLineage }),
 		workerIdentity: { ...identity },
 		secrets: [...(input.secrets ?? [])],
 	};
@@ -454,6 +466,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 		worker_identity: checked.workerIdentity,
 		generation: 1,
 		now: preparedAt,
+		...(checked.repairLineage === undefined ? {} : { repair_lineage: checked.repairLineage }),
 	}, storageOptions).catch(() => undefined);
 	if (prepared === undefined || !prepared.ok) return failure("prepare_failed", checked, input);
 	let state = prepared.value;
@@ -466,7 +479,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 			expected_generation: state.generation,
 			expected_revision: state.revision,
 			now: preparedAt,
-			reason: "execution owner time was unavailable before worker launch",
+			reason: RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.executionOwnerTimeUnavailable,
 		}, storageOptions).catch(() => undefined);
 		if (aborted?.ok) state = aborted.value;
 		return failure("start_failed", checked, input, { durable_state: state });
@@ -482,15 +495,25 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 		ownerOptions,
 	).catch(() => undefined);
 	if (owner === undefined || !owner.ok) {
-		// A conflict may be a live concurrent owner, while a storage failure may
-		// have published partial evidence. Never abort either ambiguity here.
+		// No worker has been launched yet. The claim primitive marks absence only
+		// after a strict not-found observation or after removing the exact token
+		// created by this call. A foreign EEXIST owner is never removed here.
+		if (owner !== undefined && !owner.ok && owner.error.owner_absent === true) {
+			state = await attemptPreparedAbort(
+				checked,
+				state,
+				input.clock,
+				storageOptions,
+				RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.executionOwnerClaimFailed,
+			);
+		}
 		return failure("start_failed", checked, input, { durable_state: state });
 	}
 	try {
 	let changeSetPrepared: Readonly<PreparedDelegationChangeSetLifecycleV2>;
 	if (input.exec === undefined) {
 		state = await attemptPreparedAbort(checked, state, input.clock, storageOptions,
-			"change set lifecycle preparation failed before worker launch");
+			RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.changeSetPreparationFailed);
 		return failure("change_set_prepare_failed", checked, input, { durable_state: state });
 	}
 	try {
@@ -505,13 +528,13 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 		changeSetPrepared = preparedLifecycle.value;
 	} catch {
 		state = await attemptPreparedAbort(checked, state, input.clock, storageOptions,
-			"change set lifecycle preparation failed before worker launch");
+			RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.changeSetPreparationFailed);
 		return failure("change_set_prepare_failed", checked, input, { durable_state: state });
 	}
 	const preparedBeforeResult = derivePreparedDelegationWorkspaceBeforeV2(changeSetPrepared);
 	if (!preparedBeforeResult.ok) {
 		state = await attemptPreparedAbort(checked, state, input.clock, storageOptions,
-			"guard-native before facts could not be derived before worker launch");
+			RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.guardBeforeFailed);
 		return failure("change_set_prepare_failed", checked, input, { durable_state: state });
 	}
 	const preparedBefore = preparedBeforeResult.value;
@@ -529,7 +552,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 					expected_generation: state.generation,
 					expected_revision: state.revision,
 					now: abortedAt,
-					reason: "prepared callback failed before worker launch",
+					reason: RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.preparedCallbackFailed,
 				}, storageOptions).catch(() => undefined);
 				if (aborted?.ok) state = aborted.value;
 			}
@@ -538,7 +561,11 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 	}
 
 	const runningAt = safeClock(input.clock);
-	if (runningAt === undefined) return failure("start_failed", checked, input, { durable_state: state });
+	if (runningAt === undefined) {
+		state = await attemptPreparedAbort(checked, state, input.clock, storageOptions,
+			RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.runningTimeUnavailable);
+		return failure("start_failed", checked, input, { durable_state: state });
+	}
 	const running = await persistRunningDelegationTransaction(checked.projectRoot, {
 		delegation_id: checked.delegationId,
 		contract_hash: checked.contract.contract_hash,
@@ -549,7 +576,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 	}, storageOptions).catch(() => undefined);
 	if (running === undefined || !running.ok) {
 		state = await attemptPreparedAbort(checked, state, input.clock, storageOptions,
-			"running state could not be persisted before worker launch");
+			RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.runningPersistFailed);
 		return failure("start_failed", checked, input, { durable_state: state });
 	}
 	state = running.value;
@@ -569,11 +596,13 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 			spendProfile: checked.contract.budget_profile as WorkerSpendProfile,
 		});
 	} catch {
-		state = await attemptRecovery(checked, state, input.clock, storageOptions, "worker runner failed before terminal facts");
+		state = await attemptRecovery(checked, state, input.clock, storageOptions,
+			RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed);
 		return failure("runner_failed", checked, input, { durable_state: state });
 	}
 	if (!fixedWorkerIdentity(worker)) {
-		state = await attemptRecovery(checked, state, input.clock, storageOptions, "worker identity was missing or conflicted");
+		state = await attemptRecovery(checked, state, input.clock, storageOptions,
+			RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerIdentityInvalid);
 		return failure("worker_identity_invalid", checked, input, { durable_state: state });
 	}
 	const workerFailure = workerRunFailure(worker);
@@ -593,13 +622,14 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 		changeSetLifecycle = finalizedLifecycle.value;
 	} catch {
 		state = await attemptRecovery(checked, state, input.clock, storageOptions,
-			"change set lifecycle finalization failed after worker return");
+			RETRYABLE_EMPTY_RECOVERY_REASONS_V2.changeSetFinalizeFailed);
 		return failure("change_set_finalize_failed", checked, input, { durable_state: state });
 	}
 
 	const workspaceFacts = deriveFinalizedDelegationWorkspaceFactsV2(changeSetLifecycle);
 	if (!workspaceFacts.ok) {
-		state = await attemptRecovery(checked, state, input.clock, storageOptions, "after facts conflicted with the finalized workspace guard");
+		state = await attemptRecovery(checked, state, input.clock, storageOptions,
+			RETRYABLE_EMPTY_RECOVERY_REASONS_V2.afterFactsConflict);
 		return failure("after_failed", checked, input, { durable_state: state });
 	}
 	const before = workspaceFacts.value.before;
@@ -609,11 +639,13 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 	try {
 		report = deriveDelegationPersistedReportV2(worker.reportText, checked.secrets);
 	} catch {
-		state = await attemptRecovery(checked, state, input.clock, storageOptions, "worker report could not be safely derived");
+		state = await attemptRecovery(checked, state, input.clock, storageOptions,
+			RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerReportInvalid);
 		return failure("report_invalid", checked, input, { durable_state: state });
 	}
 	if (!report.ok) {
-		state = await attemptRecovery(checked, state, input.clock, storageOptions, "worker report could not be safely derived");
+		state = await attemptRecovery(checked, state, input.clock, storageOptions,
+			RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerReportInvalid);
 		return failure("report_invalid", checked, input, { durable_state: state });
 	}
 	const changedPaths = changeSetLifecycle.change_set.worker_delta.map((entry) => entry.path);
@@ -625,7 +657,8 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 	const scopeComplete = changedPaths.every((path) => delegationPathAllowedV2(path, checked.contract.allowed_paths));
 	const committingAt = safeClock(input.clock);
 	if (committingAt === undefined) {
-		state = await attemptRecovery(checked, state, input.clock, storageOptions, "commit state time was unavailable");
+		state = await attemptRecovery(checked, state, input.clock, storageOptions,
+			RETRYABLE_EMPTY_RECOVERY_REASONS_V2.commitTimeUnavailable);
 		return failure("commit_state_failed", checked, input, { durable_state: state });
 	}
 	const committing = await persistCommittingDelegationTransaction(checked.projectRoot, {
@@ -652,7 +685,8 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 		},
 	}, storageOptions).catch(() => undefined);
 	if (committing === undefined || !committing.ok) {
-		state = await attemptRecovery(checked, state, input.clock, storageOptions, "commit state could not be persisted");
+		state = await attemptRecovery(checked, state, input.clock, storageOptions,
+			RETRYABLE_EMPTY_RECOVERY_REASONS_V2.commitPersistFailed);
 		return failure("commit_state_failed", checked, input, { durable_state: state });
 	}
 	state = committing.value;

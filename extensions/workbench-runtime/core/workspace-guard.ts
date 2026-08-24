@@ -13,6 +13,7 @@ import { isAbsolute, posix, resolve, sep } from "node:path";
 import { TextDecoder } from "node:util";
 
 import type { ExecFn } from "./config.ts";
+import { isDelegationStartLockArtifactPath } from "./delegation-ledger.ts";
 
 export const WORKSPACE_GUARD_SCHEMA_VERSION = 2 as const;
 export const WORKSPACE_GUARD_MAX_RELEVANT_PATHS = 500;
@@ -269,7 +270,8 @@ function parseStatus(bytes: Buffer, maxPathBytes: number): ParsedStatusPath[] | 
 }
 
 function isIrrelevantArtifactPath(path: string): boolean {
-	return CONTROL_PREFIXES.some((prefix) => path.startsWith(prefix));
+	return CONTROL_PREFIXES.some((prefix) => path.startsWith(prefix))
+		|| isDelegationStartLockArtifactPath(".", path);
 }
 
 function byteCompare(left: string, right: string): number {

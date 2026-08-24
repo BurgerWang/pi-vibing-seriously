@@ -418,6 +418,140 @@ test("untracked patch reads are bounded prefixes — huge files are never loaded
 	});
 });
 
+test("a single 14 KiB untracked source resumes the same hash-bound page until fully presented", async () => {
+	await withTempDir(async (dir) => {
+		const source = Array.from({ length: 357 }, (_, index) =>
+			`def test_page_${String(index).padStart(3, "0")}(): assert ${index} >= 0  # page`,
+		).join("\n") + "\n";
+		const { id } = await setupDelegation(dir, async (d) => {
+			await writeFile(join(d, "src", "large.py"), source, "utf8");
+		});
+		const first = await reviewDelegation(reviewInput(dir, id, {
+			includePaths: ["src/large.py"], maxBytes: 32_000, maxLines: 398,
+		}));
+		assert.ok(first.ok, first.error ?? "first page failed");
+		const firstEntry = first.record?.patch[0];
+		assert.equal(firstEntry?.source, "file-content");
+		assert.equal(firstEntry?.page?.start_byte, 0);
+		assert.equal(first.record?.presentation_complete, false);
+
+		const second = await reviewDelegation(reviewInput(dir, id, {
+			includePaths: ["src/large.py"], maxBytes: 32_000, maxLines: 398,
+		}));
+		assert.ok(second.ok, second.error ?? "second page failed");
+		const secondEntry = second.record?.patch[0];
+		assert.equal(secondEntry?.page?.start_byte, firstEntry?.page?.end_byte);
+		assert.equal(secondEntry?.page?.end_byte, Buffer.byteLength(source, "utf8"));
+		assert.equal(second.record?.presentation_complete, true);
+		assert.deepEqual(second.record?.fully_presented_paths, ["src/large.py"]);
+		assert.equal(`${firstEntry?.text ?? ""}${secondEntry?.text ?? ""}`, source);
+		assert.match(second.lines.join("\n"), /complete across contiguous hash-bound pages/);
+	});
+});
+
+test("ordinary-source page progress resets to byte zero when the bound diff changes", async () => {
+	await withTempDir(async (dir) => {
+		const source = Array.from({ length: 357 }, (_, index) =>
+			`def test_page_${String(index).padStart(3, "0")}(): assert ${index} >= 0  # page`,
+		).join("\n") + "\n";
+		const { id } = await setupDelegation(dir, async (d) => {
+			await writeFile(join(d, "src", "large.py"), source, "utf8");
+		});
+		const first = await reviewDelegation(reviewInput(dir, id, {
+			includePaths: ["src/large.py"], maxBytes: 32_000, maxLines: 398,
+		}));
+		assert.ok(first.ok, first.error ?? "first page failed");
+		assert.ok((first.record?.presentation_progress?.[0]?.next_byte ?? 0) > 0);
+		const firstHash = first.record?.bound_diff_hash;
+
+		await writeFile(join(dir, "src", "large.py"), `${source}# later drift\n`, "utf8");
+		const changed = await reviewDelegation(reviewInput(dir, id, {
+			includePaths: ["src/large.py"], maxBytes: 32_000, maxLines: 398,
+		}));
+		assert.ok(changed.ok, changed.error ?? "changed page failed");
+		assert.notEqual(changed.record?.bound_diff_hash, firstHash);
+		assert.equal(changed.record?.patch[0]?.page?.start_byte, 0, "same-path progress from another binding is never reused");
+		assert.equal(changed.record?.presentation_complete, false);
+		assert.ok(changed.record?.mismatch);
+		assert.ok((changed.record?.drift_paths.length ?? 0) > 0);
+	});
+});
+
+test("same-bound redaction-stream changes reset the cursor without retaining old completion", async () => {
+	await withTempDir(async (dir) => {
+		const secret = "very-long-secret-token-123456789";
+		const source = Array.from({ length: 357 }, (_, index) =>
+			`value_${String(index).padStart(3, "0")} = ${JSON.stringify(secret)}  # unchanged bytes`,
+		).join("\n") + "\n";
+		const { id } = await setupDelegation(dir, async (d) => {
+			await writeFile(join(d, "src", "large.py"), source, "utf8");
+		});
+		let redacted = await reviewDelegation(reviewInput(dir, id, {
+			includePaths: ["src/large.py"], maxBytes: 32_000, maxLines: 398, secrets: [secret],
+		}));
+		assert.ok(redacted.ok, redacted.error ?? "redacted page failed");
+		while (!redacted.record?.presentation_complete) {
+			redacted = await reviewDelegation(reviewInput(dir, id, {
+				includePaths: ["src/large.py"], maxBytes: 32_000, maxLines: 398, secrets: [secret],
+			}));
+			assert.ok(redacted.ok, redacted.error ?? "redacted continuation failed");
+		}
+		const boundHash = redacted.record.bound_diff_hash;
+		const oldStreamHash = redacted.record.presentation_progress?.[0]?.stream_sha256;
+
+		const reset = await reviewDelegation(reviewInput(dir, id, {
+			includePaths: ["src/large.py"], maxBytes: 32_000, maxLines: 398, secrets: [],
+		}));
+		assert.ok(reset.ok, reset.error ?? "same-bound stream reset failed");
+		assert.equal(reset.record?.bound_diff_hash, boundHash, "redaction policy is presentation-only, not workspace authority");
+		assert.equal(reset.record?.patch[0]?.page?.start_byte, 0);
+		assert.notEqual(reset.record?.presentation_progress?.[0]?.stream_sha256, oldStreamHash);
+		assert.equal(reset.record?.presentation_complete, false);
+		assert.deepEqual(reset.record?.fully_presented_paths, [], "old completed stream cannot complete a different same-bound stream");
+	});
+});
+
+test("a 3 KiB review envelope either advances the selected page or fails explicitly", async () => {
+	await withTempDir(async (dir) => {
+		const source = Array.from({ length: 357 }, (_, index) =>
+			`def test_low_budget_${String(index).padStart(3, "0")}(): assert ${index} >= 0`,
+		).join("\n") + "\n";
+		const { id } = await setupDelegation(dir, async (d) => {
+			await writeFile(join(d, "src", "large.py"), source, "utf8");
+		});
+		const result = await reviewDelegation(reviewInput(dir, id, {
+			includePaths: ["src/large.py"], maxBytes: 3_000, maxLines: 50,
+		}));
+		assert.ok(result.ok, result.error ?? "low-budget review failed");
+		const page = result.record?.patch[0]?.page;
+		assert.ok(page, "a successful low-budget response cannot silently omit its continuation page");
+		assert.equal(page.start_byte, 0);
+		assert.ok(page.end_byte > 0);
+		assert.equal(result.record?.presentation_progress?.[0]?.next_byte, page.end_byte);
+	});
+});
+
+test("a multi-path entry that is only partly visible is persisted as truncated, never as complete presentation evidence", async () => {
+	await withTempDir(async (dir) => {
+		const { id } = await setupDelegation(dir, async (d) => {
+			await writeFile(join(d, "src", "a-small.ts"), "export const small = true;\n", "utf8");
+			await writeFile(join(d, "src", "b-large.ts"), "export const value = 1;\n".repeat(120), "utf8");
+		});
+		const result = await reviewDelegation(reviewInput(dir, id, {
+			maxBytes: 3_000,
+			maxLines: 80,
+		}));
+		assert.ok(result.ok, result.error ?? "bounded multi-path review failed");
+		const record = result.record!;
+		assert.ok(record.patch.some((entry) => entry.truncated), "the straddling visible entry is explicitly incomplete");
+		for (const entry of record.patch.filter((candidate) => !candidate.truncated)) {
+			const progress = record.presentation_progress?.find((item) => item.path === entry.path);
+			assert.ok(progress, `complete entry ${entry.path} has persisted presentation progress`);
+			assert.equal(progress.next_byte, progress.total_bytes);
+		}
+	});
+});
+
 test("any per-path truncated patch entry sets patch_truncated and renders the segmented include_paths guidance even when the entry fits the global envelope", async () => {
 	await withTempDir(async (dir) => {
 		const { id } = await setupDelegation(dir, async (d) => {
@@ -429,7 +563,7 @@ test("any per-path truncated patch entry sets patch_truncated and renders the se
 			await writeFile(join(d, "src", "secretly-huge.ts"), "pad-secret-token-xyz".repeat(100), "utf8");
 		});
 		const result = await reviewDelegation(
-			reviewInput(dir, id, { maxBytes: 1024, maxLines: 100, secrets: ["pad-secret-token-xyz"] }),
+			reviewInput(dir, id, { maxBytes: 3_000, maxLines: 100, secrets: ["pad-secret-token-xyz"] }),
 		);
 		assert.ok(result.ok, result.error ?? "review failed");
 		const record = result.record!;

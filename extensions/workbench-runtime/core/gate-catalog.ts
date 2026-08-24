@@ -51,8 +51,8 @@ const B0_CHECKS = [
 		"b0.2",
 		"Project entry point identifiable",
 		"file",
-		{ any_of: ["package.json", "pyproject.toml", "go.mod", "Cargo.toml", "setup.py", "pom.xml", "build.gradle"] },
-		"a standard project manifest exists at the project root",
+		{ any_of: ["package.json", "pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "go.mod", "Cargo.toml", "pom.xml", "build.gradle", "build.gradle.kts"] },
+		"a standard project or language-stack manifest exists at the project root",
 	),
 	check(
 		"b0.3",

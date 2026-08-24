@@ -127,48 +127,65 @@ top.
 
 A partial or defective delivery is repaired through a fresh bounded
 `--no-session` Luna worker because worker sessions are intentionally not
-resumed. The optional `repair_of` field records provenance for that repair;
-it never adds a second governance step or expands scope. Immediately before
-the fresh process starts, the runtime derives an at-most-8-KiB machine-fact
-capsule from the strict referenced authority (status, hashes, bounded changed
-paths, coded failure/run facts, and optional plan identity). It never copies
-worker prose, logs, error text, session state, or prior scope. Mechanical
-scope checks, Sol semantic review, and risk-proportionate final verification
-remain authoritative.
+resumed. Ordinary terminal failure repair still uses `repair_of` as strict
+provenance. A semantically wrong `PENDING_REVIEW` delivery uses a two-step
+negative decision: Sol first inspects the complete current packet and publishes
+`semantic_decision=REPAIR` with the exact bound hash and a bounded reason; only
+then may the exact reported `repair_of` start a fresh implementation. The
+immutable decision grants no review or Gate authority and the project remains
+blocked until a corrected descendant receives strict semantic acceptance.
 
-### Repair provenance pointer (`repair_of`, Phase 4A)
+Immediately before launch, the runtime derives an at-most-8-KiB machine-fact
+capsule from strict authority. For an unresolved semantic repair it carries the
+rejected W/D closure, exact approved files, root plan presence and identity,
+root decision, and latest continuation decision. It never copies worker prose,
+logs, transcripts, or session state. Every descendant preserves this lineage;
+mechanical scope checks, Sol semantic review, and risk-proportionate final
+verification remain authoritative.
+
+### Repair continuity (`repair_of`; current extension of the Phase 4A shape)
 
 The delegation tool exposes one optional public parameter, `repair_of`, for
-repairs whose root cause is already known. It is a strict pointer —
-provenance only, never a resume:
+repairs whose root cause is already known. Its 20-character public shape began
+as the Phase 4A provenance pointer and remains backward compatible, but current
+semantic repairs additionally require immutable decision and lineage authority.
+It is never a session resume:
 
 - **Public shape:** exactly 20 characters — `^\d{8}-\d{6}-[A-Za-z0-9]{4}$`
   — a prior delegation id such as `20260101-120000-abcd`. Omitted for
   ordinary delegations; any malformed value fails closed with a bounded
   error before any v2 transaction is prepared or any worker is launched.
-- **Use:** only after Sol has fixed the known root cause and decided the
-  scope. The pointer authorizes only extraction of the bounded immutable
-  repair capsule described above; the new task remains the sole source of
-  requirements, scope, and acceptance criteria.
+- **Use:** for a normal terminal failure, only after Sol has fixed the known
+  root cause and decided the scope. For a wrong pending delivery, only after a
+  complete unchanged packet has an immutable Sol `REPAIR` decision. The new
+  task remains the source of the corrective requirements and criteria, while
+  the lineage forcibly carries the rejected W/D paths and exact scope so they
+  cannot disappear into the successor baseline.
 - **Strict v2-first authority:** the runtime first strict-reads the prior
-  delegation's committed v2 authority. Terminal v2 states `FAILED`,
-  `FINISHED`, or `REVIEWED` are referenceable. There is one narrow recovery
-  exception for an unpublished artifact-construction failure: the prior
-  transaction must be exactly `RECOVERY_REQUIRED` with complete terminal and
-  scope facts, `committed_proof=null`, an exact bounded artifact error reason,
-  a strict complete `SEALED` write journal, and no published generation. An
-  explicit `repair_of` may then start a fresh repair and supersede the blocking
-  session mirror; it never marks the old delegation reviewed and never rewrites
-  its transaction or journal. Other pending, corrupt, unknown-version, or
-  invalid v2 authority fails closed and never falls back to v1. Only a strict
-  v2 `not_found` result permits the historical read-only fallback, which
-  accepts a finished v1 manifest with its `after` record. This check finishes
-  BEFORE any new v2 transaction is prepared or any worker is launched.
-- **What is not inherited:** the fresh worker inherits no prior report
-  (`worker-report.md`), summary prose, transcript, log, error message,
-  session, prior allowed paths/scope, or prior contract. It receives only
-  the strict machine-fact capsule, which never expands path/scope/authority
-  and never resumes the prior worker.
+  delegation's authority. In addition to supported terminal v2 records, a
+  committed implementation `PENDING_REVIEW` is referenceable only with its
+  strict current-binding Sol `REPAIR` sidecar. A lineaged `FAILED`, narrowly
+  proven before-write `ABORTED`, or strictly recoverable
+  `RECOVERY_REQUIRED` record may be retried only by its exact latest id. Live,
+  committing, ambiguous, corrupt, forked, or continuation-unbound authority
+  remains blocked. Only a strict v2 `not_found` result permits the historical
+  read-only fallback for finished v1. All checks finish before a child transaction or Luna
+  process exists.
+- **What is inherited:** ordinary repairs receive bounded failure facts only.
+  Semantic-repair descendants additionally inherit the exact cumulative W/D
+  paths, exact-file `allowed_paths`, root plan presence/hash, root decision
+  hash, and latest continuation-decision hash. They still inherit no prior
+  report prose, transcript, log, error text, or session and never resume the
+  old worker.
+- **Concurrency and closure:** a project-wide start lock binds OS boot, PID,
+  and process-start identity and serializes authority revalidation through
+  durable `PREPARED` publication. Reload, status, Gate projection, and
+  delegation scan the complete repair graph under a fixed 10,000-record cap,
+  a lineage-depth counter saturated at 16, and a 500-carried-path cap. Hitting
+  a hard cap,
+  missing/tampered decision, sibling fork, hidden unresolved branch, plan
+  mismatch, or unsafe recovery fails closed; only one strict semantically
+  accepted leaf discharges its exact chain.
 - **Unknown root causes** still follow bounded diagnosis → Sol
   architecture/scope decision → bounded implementation; `repair_of` is
   never a substitute for that path.
@@ -215,10 +232,11 @@ so at most one worker writes to a worktree at any time. Sol never starts a
 second delegation that could write the same worktree before the first has
 returned and its diff has been reviewed. `PENDING_REVIEW` remains a hard
 block. A `STALE` mirror is also blocking unless strict v2 authority proves the
-old transaction already has an immutable FINAL/PASS review; in that one case
-an ordinary fresh successor may atomically adopt the current workspace as its
-new baseline after live revalidation. Parallel reads are fine; parallel writes
-are not supported and must never be attempted.
+old transaction already has immutable FINAL/PASS plus explicit Sol semantic
+acceptance (embedded or in a valid migration receipt); only then may an
+ordinary fresh successor atomically adopt the current workspace as its new
+baseline after live revalidation. Parallel reads are fine; parallel writes are
+not supported and must never be attempted.
 
 ## Pi-native lifecycle
 
@@ -238,8 +256,8 @@ One invocation:
 3. refreshes the delegation review state against its versioned binding and
    refuses to start while review authority is pending, invalid, unpublished,
    recovery-required, or non-final. If the exact latest mirror is `STALE` but
-   strict v2 committed authority proves its old review is already FINAL/PASS,
-   an ordinary fresh successor is allowed after a second pre-launch authority
+   strict v2 committed authority proves its old review is FINAL/PASS with
+   explicit Sol semantic acceptance, an ordinary fresh successor is allowed after a second pre-launch authority
    check and atomically adopts the current workspace as its new baseline. The
    old transaction and review remain immutable; VERIFY stays blocked until the
    successor is reviewed. A new tagged v2 generation uses the ChangeSet
@@ -379,8 +397,13 @@ transaction timestamp plus both transaction and journal file mtimes to predate
 the current OS boot. A live/reused/unverifiable owner, any write evidence,
 `COMMITTING`, corrupt data, or ambiguous inventory remains blocking and is
 never cleared optimistically. A recovered `ABORTED` transaction is terminal
-FAIL evidence; status instructs the parent to start a fresh delegation rather
-than retry review.
+FAIL evidence. Only a non-lineaged ordinary abort is nonblocking for an
+unrelated fresh delegation; it cannot discharge or hide an unresolved repair
+obligation. A lineaged abort remains blocking and is retryable only through the
+exact reported `repair_of` when its reason is a known runtime before-write
+failure, its execution owner is absent, its journal is missing before launch
+or strictly pristine, and its v2 inventory has no extra artifact. Ambiguous or
+live owner evidence stays blocked.
 
 Records are atomic, bounded, redacted, and never contain full worker
 transcripts or secrets; the delegation directory is excluded from workspace
@@ -395,15 +418,17 @@ delta, workspace drift, and conflicts), the split `worker_delta_hash` and
 bounded redacted report summary, and the safe `reported_paths` parsed from
 the worker's bounded `## Files Changed` section.
 
-Implementation review authority is written only to
-`.pi/workbench/delegations/<id>/v2/review.json`. Review is strict v2-first:
-the immutable committed generation is validated before the mutable review
-artifact is read. A segmented provisional PASS, incomplete coverage, or any
-FAIL may persist bounded evidence but never grants authority and never moves
-the transaction to `REVIEWED`. Every non-zero delta additionally requires
-explicit Sol semantic acceptance of a previously presented complete packet;
-only complete scope `PASS`, complete presentation, and the exact accepted
-hash atomically publish the final review and `REVIEWED` transaction state.
+Positive implementation review authority is written only to
+`.pi/workbench/delegations/<id>/v2/review.json`; negative semantic repair
+authority is a separate immutable
+`.pi/workbench/delegations/<id>/v2/repair-decision.json` sidecar and is never
+review or Gate authority. Review is strict v2-first: the immutable committed
+generation is validated before either artifact is read. A segmented
+provisional PASS, incomplete coverage, or any FAIL may persist bounded evidence
+but never grants authority and never moves the transaction to `REVIEWED`. Every
+non-zero delta additionally requires an explicit Sol decision on a previously
+presented complete packet; only complete scope `PASS`, complete presentation,
+and exact ACCEPT hash atomically publish final review and `REVIEWED` state.
 For new tagged v2, the immutable review binds a schema-v2
 `changeset-relevance-v2` projection over the closed relevance set: W is the
 attributed worker delta, D is the explicit dependency closure (empty by
@@ -450,7 +475,17 @@ PENDING_REVIEW → REVIEWED → (versioned binding conflicts) → STALE
   presentation segments. After Sol has inspected a complete unchanged
   packet, a later call must pair `semantic_decision=ACCEPT` with its exact
   `expected_bound_diff_hash`; first-call, non-Sol, legacy, incomplete,
-  truncated ordinary-source, drifted, or mismatched acceptance fails closed.
+  drifted, or mismatched acceptance fails closed. A truncated ordinary-source
+  path is not accepted as a summary: repeating that single `include_path`
+  advances a persisted contiguous UTF-8 byte cursor bound to the unchanged
+  diff and complete redacted-stream SHA-256, and only fully visible pages
+  advance presentation completeness.
+  If the complete packet is semantically wrong, Sol instead supplies
+  `semantic_decision=REPAIR`, the same exact `expected_bound_diff_hash`, and a
+  bounded non-empty `repair_reason`. The runtime atomically publishes an
+  immutable negative sidecar; it does not finalize the review, change the
+  transaction from `PENDING_REVIEW`, or grant Gate authority. Status then
+  exposes one exact `repair_of` action while the binding remains current.
   `FAIL` (any out-of-scope path) keeps the transaction PENDING_REVIEW. The v2 review artifact binds
   the versioned current binding. The session mirror is prospective:
   `REVIEWED` unlocks in the current call only after its append succeeds. An
@@ -462,7 +497,24 @@ PENDING_REVIEW → REVIEWED → (versioned binding conflicts) → STALE
 - **`workbench_delegation_status`** (and `/q-delegation-status`): actor,
   fixed policy, lease status (bounded summary — never token parts), latest
   delegation, review status, current/reviewed diff hashes, blocked write
-  attempts, latest review verdict. The compatibility field names remain, but
+  attempts, latest review verdict. An upgrade-era immutable scope/integrity
+  `FINAL/PASS` without strict Sol semantic acceptance is reported explicitly
+  as `semantic v2: MISSING`, not as an accepted review. Its compatibility
+  continuation is a two-step historical migration review: active Sol first
+  calls `workbench_review_worker_diff` without a decision to inspect the
+  complete immutable packet and its current migration binding, then calls it
+  again with `semantic_decision=ACCEPT`, the shown
+  `expected_bound_diff_hash`, and the shown
+  `expected_migration_binding_hash`. Eligibility is fail-closed: the candidate
+  HEAD must descend from the historical HEAD, its raw committed delta may
+  contain exactly the historical W/checked paths, every current W path must be
+  clean, and current W/D/S content plus the non-W baseline guard must still
+  match. Extra paths, content or mode drift, and non-descendant history are
+  rejected. A fresh exact `repair_of` is not a
+  compatibility shortcut because it would adopt the unaccepted delta as a new
+  baseline. The ordinary successor and VERIFY remain blocked until acceptance,
+  and the old finalized files are never rewritten or relabelled. The
+  compatibility field names remain, but
   new tagged v2 refreshes the W/D/S relevance binding: B and recognized
   workbench artifacts do not stale it, while Git HEAD, W/D/S, or U conflicts
   fail closed. Historical untagged v2/v1 refreshes the complete full-diff
@@ -470,13 +522,17 @@ PENDING_REVIEW → REVIEWED → (versioned binding conflicts) → STALE
 - **Blocking:** a pending or stale review blocks VERIFY (`/q-mode-verify`
   refuses, and `/q-gate`/`workbench_run_gate` are refused in VERIFY) until
   the active delegation's versioned binding is reviewed. It also blocks the
-  next delegation by default. The only successor exception is exact latest
-  `STALE` plus strict committed v2 FINAL/PASS authority: the immutable old
-  review is preserved, the authority is revalidated immediately before worker
-  launch, and a fresh delegation replaces the stale session mirror with its
-  current-workspace baseline. No `repair_of` is used. `PENDING_REVIEW`,
-  corrupt, unpublished, recovery-required, non-final, v1, and untagged
-  authority remain blocked. `reviewedDiffHash === currentDiffHash`
+  next ordinary delegation by default. The only ordinary successor exception is exact latest
+  `STALE` plus strict committed v2 FINAL/PASS carrying explicit Sol semantic
+  acceptance: the immutable old review is preserved, the authority is
+  revalidated immediately before worker launch, and a fresh delegation
+  replaces the stale session mirror with its current-workspace baseline. No
+  `repair_of` is used. Separately, an exact semantic-repair continuation may
+  consume a current `PENDING_REVIEW` Sol `REPAIR` decision or the strictly
+  retryable latest lineaged failure/abort/recovery described above; it remains
+  Gate-blocking and cannot start an unrelated successor. Every other
+  `PENDING_REVIEW`, corrupt, unpublished, recovery-required, non-final, v1,
+  and untagged authority remains blocked. `reviewedDiffHash === currentDiffHash`
   remains the compact compatibility invariant: those fields hold the W/D/S
   projection hash for new tagged v2 and the complete diff hash for historical
   authority. A binding that returns to exactly the reviewed hash re-validates
@@ -982,7 +1038,14 @@ full diff for historical untagged v2/v1; truncation affects only the displayed
 patch. Every patch path carries bounded path/stat information (source,
 bytes, truncated/omitted), and when patch content is truncated or omitted
 the review returns an explicit segmented-review instruction: drive
-path-by-path `include_paths` re-reviews (max 50 paths per call).
+path-by-path `include_paths` re-reviews (max 50 paths per call). If an
+ordinary source path itself exceeds one packet, repeat that one path; the
+runtime resumes at the next contiguous UTF-8 byte, persists only the visible
+page plus its stream hash/cursor and bounded cumulative range/hash receipts,
+and resets progress when the bound diff or redacted stream changes. A page
+never advances from a title or cut body. Before ACCEPT, the runtime rebuilds
+the current redacted source/diff streams and verifies every receipt and the
+current page slice; a PENDING file cannot self-assert semantic acceptance.
 
 That scope/integrity result is provisional. For every non-zero actual delta,
 the first call only persists the current bound packet and leaves the
@@ -991,20 +1054,28 @@ decision. After inspecting the complete current packet, Sol calls the same
 tool again with the pair `semantic_decision: "ACCEPT"` and
 `expected_bound_diff_hash: <the exact 64-character packet hash>`. Supplying
 only one field, using another model identity, accepting on the first call,
-accepting a legacy/finalized mechanical record, or accepting after drift all
-fail closed. A successful acceptance persists the reviewer provider/model,
+accepting a legacy or non-migratable finalized mechanical record, or accepting
+after drift all fail closed. A narrowly eligible upgrade-era schema-2 FINAL
+uses the separate two-call historical-migration binding described above; it is
+never silently upgraded from the old mechanical PASS. A successful acceptance
+persists the reviewer provider/model,
 decision, exact hash, and timestamp inside the immutable review authority.
-`REPAIR` is expressed by a fresh `repair_of` delegation, not by a review
-verdict. A zero-delta delivery alone is `semantic_review: not_required`.
+`REPAIR` is an explicit Sol decision on the complete current packet, persisted
+as immutable negative authority rather than a PASS/FAIL review verdict. It only
+authorizes the subsequent exact fresh `repair_of` lineage. A zero-delta
+delivery alone is `semantic_review: not_required`.
 
-Ordinary source entries must be fully rendered across one or more segments.
+Ordinary source entries must be fully rendered across one or more segments;
+single-path segments automatically continue across bounded pages up to the
+fixed 4 MiB pageable-stream ceiling. Content above that ceiling remains
+explicitly incomplete rather than being summarized as source review.
 For sufficiently large current regular `.svg` and `.json` files, a strict
 bounded compact packet (status, size, digest binding, head/tail previews and
 explicit `generator_equality: NOT_VERIFIED`) may satisfy presentation
 completeness without embedding the full generated file. This is always
 high-risk semantic review and still requires final generator/recipe
-verification. A truncated ordinary source entry, omitted path, handoff
-clipping, corrupt record, or incomplete compact packet can never be accepted.
+verification. An unfinished ordinary-source page sequence, omitted path,
+handoff clipping, corrupt record, or incomplete compact packet can never be accepted.
 Semantic acceptance is review authority only; it never grants a Gate PASS.
 
 ## Task contract
@@ -1013,7 +1084,7 @@ Semantic acceptance is review authority only; it never grants a Gate PASS.
 {
   "task_kind": "implementation",
   "task": "Implement the already-approved parser change",
-  "allowed_paths": ["src/parser/**", "tests/parser.test.ts"],
+  "allowed_paths": ["src/parser/parser.ts", "tests/parser.test.ts"],
   "acceptance_criteria": [
     "Invalid input returns a structured error",
     "Existing valid input remains compatible"
@@ -1071,18 +1142,19 @@ unrepresented parameters. Relevant `recipes.yaml` parse/schema problems fail
 closed. An empty list stays compatible and does not require a recipe catalog;
 the preflight validates declarations only and does not execute a recipe.
 
-`repair_of` is optional and is the strict prior delegation-id provenance
-pointer for a known-root-cause repair (see Repair provenance pointer
+`repair_of` is optional and is the strict prior delegation-id continuity
+reference for a known-root-cause repair (see Repair continuity
 above): exactly the 20-character `^\d{8}-\d{6}-[A-Za-z0-9]{4}$` delegation
-id shape, used only after Sol has fixed the known root cause and decided
-the scope. The runtime strict-reads v2 first and accepts only a referenced terminal
-`FAILED`, `FINISHED`, or `REVIEWED` v2 authority. Only v2 `not_found` permits
-the finished-v1 read-only fallback; corrupt, pending, or unknown v2 authority
-never falls back. This check precedes any new v2 transaction or child launch,
-and the fresh worker receives only the bounded machine-fact repair capsule,
-not prior prose/session/scope/contract — the pointer adds no
-path/scope/authority. Ordinary delegations omit it entirely;
-unknown root causes still use bounded diagnosis, then a Sol decision.
+id shape. The runtime strict-reads v2 first. Ordinary supported terminal
+authority follows the compatibility rules above; `PENDING_REVIEW` is accepted
+only with its current hash-bound Sol `REPAIR` sidecar, and a lineaged terminal
+retry requires the exact latest continuation decision plus safe owner/journal
+evidence. Only v2 `not_found` permits the finished-v1 read-only fallback;
+corrupt or ambiguous v2 never falls back. A semantic-repair child must be an
+implementation, use exact-file paths, preserve the root plan presence/hash,
+and carry the cumulative rejected W/D closure. These checks precede every new
+transaction and child launch. Ordinary delegations omit `repair_of`; unknown
+root causes still use bounded diagnosis followed by a Sol decision.
 
 `plan_ref` is optional traceability only (see Plan traceability reference
 above). Its `plan_path` must resolve to a bounded regular file within the
@@ -1135,9 +1207,9 @@ command can still write despite an empty declaration.
    human-issued lease within its exact scope.
 9. **Review gating:** a pending or stale delegation review blocks VERIFY and
    normally blocks the next delegation. Exact latest `STALE` backed by strict
-   committed v2 FINAL/PASS authority may start only a fresh successor after
-   live revalidation; the old review stays immutable and all other authority
-   remains blocked. New tagged v2 binds W/D/S relevance, so baseline
+   committed v2 FINAL/PASS plus explicit Sol semantic acceptance may start
+   only a fresh successor after live revalidation; the old review stays
+   immutable and all other authority remains blocked. New tagged v2 binds W/D/S relevance, so baseline
    unrelated dirty paths and recognized workbench artifacts do not stale it;
    Git HEAD, W/D/S, or new unknown-origin drift fails closed. Historical
    untagged v2/v1 binds the complete full diff, where any later diff change
@@ -1154,7 +1226,9 @@ untrusted repositories or unattended automation.
    documentation slice. Use focused recipes while the candidate is changing.
 3. Inspect the provisional scope/integrity packet returned with every non-zero
    implementation. Complete any bounded presentation segments, then explicitly
-   ACCEPT the unchanged packet hash or start a bounded `repair_of` delegation.
+   ACCEPT the unchanged packet hash. If the complete unchanged packet is wrong,
+   publish hash-bound REPAIR and follow only the exact `repair_of` action shown
+   by status; `repair_of` cannot replace that negative semantic decision.
 4. Use the temporary Sol lease only for an explicit user-authorized exception;
    never turn it into the routine implementation path.
 5. Once the candidate is stable, switch to VERIFY and run one final recipe or

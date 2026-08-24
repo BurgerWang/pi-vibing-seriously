@@ -116,6 +116,77 @@ test("run-only completion claims require a committed run with the claimed outcom
 	);
 });
 
+test("plain status run ids are never reclassified as delegation ids", () => {
+	const committedRun = "20260823-200157-543x";
+	const unavailableLegacyGate = "20260816-173751-57p4";
+	const inspection = inspectDelegationClaims(assistant([
+		`gate: record BLOCKED (run ${unavailableLegacyGate})`,
+		`last run: run:${committedRun} git-status-short exit=0 OK`,
+		"blocking: latest gate run unavailable: committed run identity unavailable; older status not used",
+	].join("\n")));
+	assert.ok(inspection);
+	assert.deepEqual(inspection.ids, [], "explicit run-labelled ids never enter delegation authority lookup");
+	assert.deepEqual(inspection.runIds, [committedRun], "only the actual completed run requires committed-run authority");
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(), [], [{ id: committedRun, outcome: "SUCCESS" }]),
+		{ ok: true },
+	);
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(), [], []),
+		{ ok: false, code: "missing_run_authority" },
+	);
+	assert.equal(
+		inspectDelegationClaims(assistant(`gate: record BLOCKED (run ${unavailableLegacyGate}); committed run identity unavailable`)),
+		undefined,
+		"an unavailable gate-candidate pointer alone is diagnostic metadata, not an execution claim",
+	);
+});
+
+test("a failed Gate report and its persisted runs path never become delegation authority", () => {
+	const gateRun = "20260823-213649-ufu9";
+	const inspection = inspectDelegationClaims(assistant([
+		`Gate run ${gateRun} FAIL.`,
+		`Persisted authority: \`.pi/workbench/runs/${gateRun}/gates.json\`.`,
+		"B0 failed because b0.2 found no supported project manifest.",
+	].join("\n")));
+	assert.ok(inspection);
+	assert.deepEqual(inspection.ids, [], "the run directory path must not be queried as a delegation id");
+	assert.deepEqual(inspection.runIds, [gateRun]);
+	assert.equal(inspection.expectedRunOutcomes[gateRun], "FAILURE");
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(), [], [{ id: gateRun, outcome: "FAILURE" }]),
+		{ ok: true },
+	);
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(), [], []),
+		{ ok: false, code: "missing_run_authority" },
+	);
+});
+
+test("nearest labels independently bind mixed plain delegation and run ids", () => {
+	const runId = "20260823-200157-543x";
+	const inspection = inspectDelegationClaims(assistant(
+		`delegation ${REAL_ID} REVIEWED; focused run ${runId} completed with exit=0 OK`,
+	));
+	assert.ok(inspection);
+	assert.deepEqual(inspection.ids, [REAL_ID]);
+	assert.deepEqual(inspection.runIds, [runId]);
+	assert.deepEqual(
+		validateDelegationClaims(
+			inspection,
+			evidence(),
+			[{ id: REAL_ID, status: "REVIEWED" }],
+			[{ id: runId, outcome: "SUCCESS" }],
+		),
+		{ ok: true },
+	);
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(), [], [{ id: runId, outcome: "SUCCESS" }]),
+		{ ok: false, code: "missing_authority" },
+		"an explicit delegation claim remains fail-closed even beside a valid run",
+	);
+});
+
 test("fenced handoff run evidence requires committed authority for every claimed check", () => {
 	const runIds = [
 		"20260823-112731-wdaz",
@@ -511,6 +582,46 @@ test("controller rejects fabricated run ids even when the delegation itself is r
 	const replacement = (results.find((value) => value !== undefined) as { message: Record<string, unknown> }).message;
 	assert.match(finalText(replacement), /reason: missing_run_authority/u);
 	assert.equal(finalText(replacement).includes(fakeRun), false);
+});
+
+test("controller accepts the reproduced gate and last-run status with only real run authority", async () => {
+	const state = stub();
+	const committedRun = "20260823-200157-543x";
+	register(
+		state,
+		() => undefined,
+		true,
+		undefined,
+		undefined,
+		(id) => id === committedRun ? "SUCCESS" : undefined,
+	);
+	await emit(state, "agent_start", { type: "agent_start" });
+	const message = assistant([
+		"gate: record BLOCKED (run 20260816-173751-57p4)",
+		`last run: run:${committedRun} git-status-short exit=0 OK`,
+		"blocking: latest gate run unavailable: committed run identity unavailable; older status not used",
+	].join("\n"));
+	assert.deepEqual(await emit(state, "message_end", { type: "message_end", message }), [undefined]);
+});
+
+test("controller accepts a committed failed Gate report that cites its runs directory", async () => {
+	const state = stub();
+	const gateRun = "20260823-213649-ufu9";
+	register(
+		state,
+		() => undefined,
+		true,
+		undefined,
+		undefined,
+		(id) => id === gateRun ? "FAILURE" : undefined,
+	);
+	await emit(state, "agent_start", { type: "agent_start" });
+	const message = assistant([
+		`Gate run ${gateRun} FAIL.`,
+		`Full record: .pi/workbench/runs/${gateRun}/gates.json`,
+		"B0.2 is the only root failure; downstream gates are BLOCKED.",
+	].join("\n"));
+	assert.deepEqual(await emit(state, "message_end", { type: "message_end", message }), [undefined]);
 });
 
 test("a failed delegate tool attempt cannot be reported as a started worker", async () => {

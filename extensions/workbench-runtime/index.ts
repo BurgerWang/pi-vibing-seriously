@@ -13,18 +13,14 @@ import type {
 	ExtensionCommandContext,
 	ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import {
-	CONFIG_DIR_NAME,
-} from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import {
 	checkToolCall,
 	computeActiveTools,
 	type WorkbenchMode,
 } from "./core/mode-policy.ts";
-import {
-	type ReceiptHandle,
-} from "./core/tool-result-recovery.ts";
+import { type ReceiptHandle } from "./core/tool-result-recovery.ts";
 import {
 	computeRoleActiveTools,
 	parseWorkerAllowedPaths,
@@ -72,9 +68,7 @@ import {
 	type AdvisoryConfig,
 } from "./core/commander-advisory.ts";
 import { buildWidgetLines, widgetAction, type WidgetState } from "./core/widget.ts";
-import {
-	latestGateRunSummary,
-} from "./core/report.ts";
+import { latestGateRunSummary } from "./core/report.ts";
 import {
 	buildCompactNote,
 	collectDoNotRetry,
@@ -114,10 +108,10 @@ import {
 	readRecoverableUnpublishedDelegationV2,
 	readDelegationAuthorityObservationV2 as readDelegationAuthorityObservation,
 } from "./core/delegation-project-authority.ts";
+import { delegationNextActionTextV1, delegationProjectIssueRepairStatusV1, delegationRepairStatusLinesV1, readDelegationRepairStatusV1,
+	type DelegationRepairStatusV1 } from "./core/delegation-repair-status.ts";
 import { buildDelegationWorkerFirstGateFacts } from "./core/delegation-plan-reference.ts";
-import {
-	resolveToolOutputPolicy,
-} from "./core/output-policy.ts";
+import { resolveToolOutputPolicy } from "./core/output-policy.ts";
 import {
 	enforceOutputEnvelope,
 	type ImageContent as OutputImageContent,
@@ -580,17 +574,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		}
 	}
 
-	/** Bounded next action shared by compact state and delegation status. */
-	function nextDelegationActionText(state: DelegationState): string | undefined {
-		if (state.latestId === undefined) return "start the first worker delegation (no delegation yet)";
-		if (state.status === "PENDING_REVIEW") {
-			return `review delegation ${state.latestId} (PENDING_REVIEW) before the next delegation or VERIFY`;
-		}
-		if (state.status === "STALE") {
-			return `delegation ${state.latestId} is STALE — inspect status; a prior v2 FINAL/PASS review permits a fresh successor, otherwise recover the outstanding review; VERIFY remains blocked`;
-		}
-		return `delegation ${state.latestId} REVIEWED — start the next delegation or run final verification`;
-	}
+	let latestRepairStatus: DelegationRepairStatusV1 = { kind: "none" };
 
 	/** Refresh the non-authoritative compact summary from hard state. */
 	function refreshCompactP7Facts(delegationState = delegationSession.getState()): void {
@@ -615,7 +599,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			delegationState.blockedWriteAttempts > 0 ? delegationState.blockedWriteAttempts : undefined;
 		compactState.nextDelegationAction =
 			actor === "sol-commander" || delegationState.latestId !== undefined
-				? nextDelegationActionText(delegationState)
+				? delegationNextActionTextV1(delegationState, latestRepairStatus)
 				: undefined;
 		touchCompactState();
 	}
@@ -709,6 +693,8 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		try {
 			if (ctx.isProjectTrusted()) {
 				const projectRoot = await projectRootFor(ctx);
+				latestRepairStatus = delegationProjectIssueRepairStatusV1(delegationSession.getProjectAuthorityIssue()) ?? await readDelegationRepairStatusV1(projectRoot, delegationSession.getState(), execFn);
+				refreshCompactP7Facts();
 				const config = await loadProjectConfig(projectRoot, { trusted: true });
 				advisoryConfig = config.commanderAdvisory;
 				cacheTelemetry.setEnabled(config.cacheTelemetry);
@@ -905,6 +891,8 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		const now = new Date().toISOString();
 		let gitRefresh: "fresh" | "unavailable" = "fresh";
 		await delegationSession.reconcileProjectAuthority(projectRoot, now);
+		latestRepairStatus = delegationProjectIssueRepairStatusV1(delegationSession.getProjectAuthorityIssue()) ?? await readDelegationRepairStatusV1(projectRoot, delegationSession.getState(), execFn);
+		refreshCompactP7Facts();
 		try {
 			if (delegationSession.getProjectAuthorityIssue() !== undefined) throw new Error("project authority unavailable");
 			const binding = await delegationSession.collectCurrentBinding(projectRoot);
@@ -944,16 +932,15 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				`blocked writes: ${delegationState.blockedWriteAttempts}`,
 			);
 			const authority = await readDelegationAuthorityObservation(projectRoot, delegationState.latestId);
+			lines.push(...delegationRepairStatusLinesV1(latestRepairStatus));
 			const block = reviewBlockReason(delegationState, "delegation");
-			const finalizedReviewedStaleSuccessor = delegationState.status === "STALE"
-				&& authority.kind === "v2"
-				&& authority.transactionStatus === "REVIEWED"
-				&& authority.finalized
-				&& authority.review?.verdict === "PASS";
+			const finalizedReviewedStaleSuccessor = delegationState.status === "STALE" && authority.kind === "v2"
+				&& authority.transactionStatus === "REVIEWED" && authority.finalized
+				&& authority.review?.verdict === "PASS" && authority.semanticAccepted;
 			if (block && !finalizedReviewedStaleSuccessor) lines.push(`blocked      : ${block}`);
 			if (block && finalizedReviewedStaleSuccessor) {
 				lines.push(
-					"successor    : ALLOWED after live revalidation — prior v2 review is FINAL/PASS; a fresh delegation adopts the current workspace as its new baseline",
+					"successor    : ALLOWED after live revalidation — prior v2 review has strict semantic authority; a fresh delegation adopts the current workspace as its new baseline",
 					"verify block : VERIFY remains blocked until the fresh successor is reviewed",
 				);
 			}
@@ -976,7 +963,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 					`review bound : ${review.bound_diff_hash}`,
 				);
 			} else if (authority.kind === "v2") {
-				const recoverable = authority.transactionStatus === "RECOVERY_REQUIRED"
+				const recoverable = authority.transactionStatus === "RECOVERY_REQUIRED" && authority.repairLineage === undefined
 					? await readRecoverableUnpublishedDelegationV2(projectRoot, delegationState.latestId)
 					: undefined;
 				if (recoverable?.ok) {
@@ -992,11 +979,19 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 							`review path  : ${authority.reviewPath ?? "(none)"}`,
 							`review bound : ${authority.review.bound_diff_hash}`,
 						);
+						const strictSemantic = authority.finalized && authority.semanticAccepted;
+						if (authority.finalized && !strictSemantic) lines.push(
+							"semantic v2  : MISSING — historical scope/integrity FINAL is not hash-bound Sol ACCEPT",
+							authority.review.schema_version === 2 ? "next action  : call workbench_review_worker_diff without a decision; inspect the migration packet, then ACCEPT both displayed hashes" : "next action  : legacy schema-1 FINAL has no automatic semantic migration and remains blocked",
+						);
+						else if (authority.semanticSource === "migration") lines.push(`semantic v2  : ACCEPT (migration) by ${authority.semanticReviewer} at ${authority.semanticAcceptedAt}`, `reviewed bind : ${authority.semanticBindingHash}`);
+						else if (authority.semanticSource === "embedded") lines.push(`semantic v2  : ACCEPT by ${authority.semanticReviewer} at ${authority.semanticAcceptedAt}`);
+						else if (strictSemantic) lines.push("semantic v2  : NOT_REQUIRED (zero delta)");
 					} else if (authority.transactionVerdict !== null) {
 						lines.push(`completion v2: ${authority.transactionVerdict} (strict terminal machine facts; no review artifact)`);
-						if (authority.transactionStatus === "FAILED") {
+						if (authority.repairLineage === undefined && authority.transactionStatus === "FAILED") {
 							lines.push(`next action  : call workbench_delegate_worker with repair_of=${delegationState.latestId}; do not retry review`);
-						} else if (authority.transactionStatus === "ABORTED") {
+						} else if (authority.repairLineage === undefined && authority.transactionStatus === "ABORTED") {
 							lines.push("next action  : start a fresh delegation; the terminal before-worker transaction needs no review");
 						}
 					} else {
@@ -1005,6 +1000,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				}
 			}
 		} else {
+			latestRepairStatus = { kind: "none" };
 			lines.push(`latest       : (no delegation)`);
 			lines.push(`blocked writes: ${delegationState.blockedWriteAttempts}`);
 		}
@@ -1072,12 +1068,15 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				persistLease();
 			}
 		}
-		try {
+		try { if (!ctx.isProjectTrusted()) throw new Error("untrusted project");
 			const projectRoot = await projectRootFor(ctx);
 			await delegationSession.reconcileProjectAuthority(projectRoot, new Date().toISOString());
+			latestRepairStatus = delegationProjectIssueRepairStatusV1(delegationSession.getProjectAuthorityIssue()) ?? await readDelegationRepairStatusV1(projectRoot, delegationSession.getState(), execFn);
+			refreshCompactP7Facts();
 		} catch {
 			// Project discovery is retried at every project-authority consumer.
 			// A non-project session start must not invent an invalid authority.
+			latestRepairStatus = { kind: "none" };
 			delegationSession.clearProjectAuthorityIssue();
 		}
 		// P7 slice 3: mirror the restored authority facts into the compaction

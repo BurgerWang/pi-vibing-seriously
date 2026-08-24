@@ -360,13 +360,14 @@ test("delegate-tool metadata exposes canonical recipe, size and repair contracts
 	assert.match(text, /recipe:<declared-name>/);
 	assert.match(text, /12 KiB/);
 	assert.match(text, /64 KiB/);
-	assert.match(text, /known-root-cause repair/);
-	assert.match(text, /not the old session, report, or authority/);
+	assert.match(text, /PENDING_REVIEW implementation with an immutable Sol REPAIR decision/);
+	assert.match(text, /not the old session or report/);
 	assert.match(schema.properties.verification?.description ?? "", /mutation:none/);
 	assert.equal(schema.properties.verification?.items?.pattern, "^recipe:[^\\r\\n\\u0000-\\u001f\\u007f]{1,200}$");
 	assert.match(schema.properties.extended_reason?.description ?? "", /12 KiB ordinary soft limit/);
-	assert.match(schema.properties.repair_of?.description ?? "", /strict prior delegation-id provenance/);
-	assert.match(schema.properties.repair_of?.description ?? "", /adds no path\/scope\/authority/);
+	assert.match(schema.properties.repair_of?.description ?? "", /PENDING_REVIEW implementation/);
+	assert.match(schema.properties.repair_of?.description ?? "", /semantic REPAIR decision/);
+	assert.match(schema.properties.repair_of?.description ?? "", /never the old session or Gate authority/);
 });
 
 test("worker-delegation documentation defines fixed Sol/Luna boundaries and strict public v2 delegation authority", async () => {
@@ -401,7 +402,8 @@ test("worker-delegation documentation defines fixed Sol/Luna boundaries and stri
 	assert.match(doc, /## Recommended development workflow/);
 	assert.match(doc, /Give Luna one bounded contract for the coherent source, test, and\s+documentation slice/);
 	assert.match(doc, /Inspect the provisional scope\/integrity packet returned with every non-zero\s+implementation/);
-	assert.match(doc, /explicitly\s+ACCEPT the unchanged packet hash or start a bounded `repair_of` delegation/);
+	assert.match(doc, /explicitly\s+ACCEPT the unchanged packet hash/);
+	assert.match(doc, /If the complete unchanged packet is wrong,\s+publish hash-bound REPAIR and follow only the exact `repair_of` action shown\s+by status; `repair_of` cannot replace that negative semantic decision/);
 	assert.match(doc, /run one final recipe or\s+gate set proportionate to task or release risk/);
 	assert.match(doc, /## Delegation transaction and review lifecycle \(P7\)/);
 	assert.match(doc, /\.pi\/workbench\/delegations\/<id>\/v2\/transaction\.json/);
@@ -441,9 +443,9 @@ test("worker-delegation documentation defines fixed Sol/Luna boundaries and stri
 	// V2 review authority separates mechanical presentation from explicit
 	// hash-bound Sol acceptance and rebuilds the mirror only from durable FINAL.
 	assert.match(doc, /\.pi\/workbench\/delegations\/<id>\/v2\/review\.json/);
-	assert.match(doc, /segmented provisional PASS, incomplete coverage, or any\s+FAIL[\s\S]*never grants authority/);
-	assert.match(doc, /Every non-zero delta additionally requires\s+explicit Sol semantic acceptance of a previously presented complete packet/);
-	assert.match(doc, /only complete scope `PASS`, complete presentation, and the exact accepted\s+hash atomically publish[\s\S]*`REVIEWED`/);
+	assert.match(doc, /segmented\s+provisional PASS, incomplete coverage, or any\s+FAIL[\s\S]*never grants authority/);
+	assert.match(doc, /Every\s+non-zero delta additionally requires an explicit Sol decision on a previously\s+presented complete packet/);
+	assert.match(doc, /only complete scope `PASS`, complete presentation,\s+and exact ACCEPT hash atomically publish[\s\S]*`REVIEWED`/);
 	assert.match(doc, /persists exactly one provisional, globally bounded scope\/integrity packet/);
 	assert.match(doc, /later call must pair `semantic_decision=ACCEPT` with its exact\s+`expected_bound_diff_hash`/);
 	assert.match(doc, /PENDING_REVIEW → REVIEWED → \(versioned binding conflicts\) → STALE/);
@@ -459,11 +461,11 @@ test("worker-delegation documentation defines fixed Sol/Luna boundaries and stri
 	assert.match(doc, /append failure is returned as a persistence failure; a later tool call first\s+reconciles the strict durable FINAL artifact/);
 	// Strict repair provenance and legacy compatibility allow a v1 read only
 	// for a true v2 not-found result; invalid v2 authority remains blocking.
-	assert.match(doc, /Terminal v2 states `FAILED`,\s+`FINISHED`, or `REVIEWED` are referenceable/);
-	assert.match(doc, /one narrow recovery\s+exception for an unpublished artifact-construction failure/);
-	assert.match(doc, /explicit `repair_of` may then start a fresh repair and supersede the blocking\s+session mirror/);
+	assert.match(doc, /committed implementation `PENDING_REVIEW` is referenceable only with its\s+strict current-binding Sol `REPAIR` sidecar/);
+	assert.match(doc, /lineaged `FAILED`, narrowly\s+proven before-write `ABORTED`, or strictly recoverable\s+`RECOVERY_REQUIRED` record may be retried only by its exact latest id/);
+	assert.match(doc, /Semantic-repair descendants additionally inherit the exact cumulative W\/D\s+paths, exact-file `allowed_paths`, root plan presence\/hash, root decision\s+hash, and latest continuation-decision hash/);
 	assert.match(doc, /Only a strict\s+v2 `not_found` result permits the historical\s+read-only fallback/);
-	assert.match(doc, /pending, corrupt, unknown-[\s\S]*version[\s\S]*fails closed and never falls\s+back to v1/);
+	assert.match(doc, /Corrupt, pending, unsupported, storage-failed, or otherwise invalid v2 never\s+falls back/);
 	assert.match(doc, /v1 `manifest\.json`\/ledger\/review readers remain historical read-only\s+compatibility/);
 	assert.match(doc, /New public delegations never write v1/);
 	assert.match(doc, /Rollback may stop using v2 but must not delete or rewrite v2\s+authority/);
@@ -476,9 +478,10 @@ test("worker-delegation documentation defines fixed Sol/Luna boundaries and stri
 	// VERIFY remains hard-blocking; delegation recovery is narrowly limited to
 	// an exact strict finalized-v2 successor transition.
 	assert.match(doc, /pending or stale review blocks VERIFY \(`\/q-mode-verify`\s+refuses/);
-	assert.match(doc, /only successor exception is exact latest\s+`STALE` plus strict committed v2 FINAL\/PASS authority/);
-	assert.match(doc, /old\s+review is preserved, the authority is revalidated immediately before worker\s+launch/);
-	assert.match(doc, /`PENDING_REVIEW`,\s+corrupt, unpublished, recovery-required, non-final, v1, and untagged\s+authority remain blocked/);
+	assert.match(doc, /only ordinary successor exception is exact latest\s+`STALE` plus strict committed v2 FINAL\/PASS carrying explicit Sol semantic\s+acceptance/);
+	assert.match(doc, /immutable old review is preserved, the authority is\s+revalidated immediately before worker launch/);
+	assert.match(doc, /exact semantic-repair continuation may\s+consume a current `PENDING_REVIEW` Sol `REPAIR` decision or the strictly\s+retryable latest lineaged failure\/abort\/recovery/);
+	assert.match(doc, /Every other\s+`PENDING_REVIEW`, corrupt, unpublished, recovery-required, non-final, v1,\s+and untagged authority remains blocked/);
 });
 
 test("security documentation distinguishes new-v2 relevance from legacy full-diff review gating", async () => {

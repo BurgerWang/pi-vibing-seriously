@@ -34,6 +34,7 @@ import {
 	digestFromPrefix,
 	finishDelegationLedger,
 	isDelegationRecordPath,
+	isDelegationStartLockArtifactPath,
 	isToolResultReceiptPath,
 	isValidDelegationId,
 	makeDelegationId,
@@ -361,6 +362,47 @@ test("collectGitFacts excludes P8b tool-result receipts exactly (sibling-safe), 
 		]);
 		assert.ok(siblingFacts.pathStatuses[`${CONFIG_DIR_NAME}/workbench/tool-results-extra/x.json`], "sibling-prefix path keeps its porcelain status");
 		assert.ok(siblingFacts.pathStatuses[`${CONFIG_DIR_NAME}/workbench/other/x.json`], "other workbench paths keep their porcelain status");
+	});
+});
+
+test("collectGitFacts excludes only exact delegation-start lock artifacts", async () => {
+	await withTempDir(async (dir) => {
+		const fixed = `${CONFIG_DIR_NAME}/workbench/delegation-start.lock`;
+		const token = "a".repeat(32);
+		for (const path of [
+			fixed,
+			`${fixed}.candidate.${token}`,
+			`${fixed}.release.${token}`,
+			`${fixed}.recovered.${token}`,
+		]) assert.equal(isDelegationStartLockArtifactPath(dir, path), true);
+		for (const path of [
+			`${fixed}-extra`,
+			`${fixed}/child`,
+			`${fixed}.candidate.short`,
+			`${fixed}.candidate.${"A".repeat(32)}`,
+			`${CONFIG_DIR_NAME}/workbench/delegation-start.other`,
+		]) assert.equal(isDelegationStartLockArtifactPath(dir, path), false);
+
+		const exec: ExecFn = async (command, args) => {
+			if (command === "git" && args[0] === "rev-parse") {
+				return { stdout: `${"a".repeat(40)}\n`, stderr: "", code: 0, killed: false };
+			}
+			return {
+				stdout: [
+					`?? ${fixed}`,
+					`?? ${fixed}.candidate.${token}`,
+					`?? ${fixed}.release.${token}`,
+					`?? ${fixed}.recovered.${token}`,
+					`?? ${fixed}-extra`,
+					" M src/live.ts",
+				].join("\n"),
+				stderr: "",
+				code: 0,
+				killed: false,
+			};
+		};
+		const facts = await collectGitFacts(dir, exec);
+		assert.deepEqual(facts.changedPaths, [`${fixed}-extra`, "src/live.ts"]);
 	});
 });
 

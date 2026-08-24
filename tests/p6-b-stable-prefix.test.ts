@@ -186,7 +186,7 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 
 test("v0.10.0 public tool surface has the intentional framework-reliability transition hash", () => {
 	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
-	const currentHash = "96fd7c5bbf23dc363371e2f23e1d02372ef7b5c43a335d2b107d95199804516e";
+	const currentHash = "0b8ab153bc79003271ded6e989e089e4f08322cf88b7ebf54634df8aa2b6966b";
 	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
 	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the documented 0.10.0 hash");
 });
@@ -384,7 +384,10 @@ test("workbench_delegate_worker metadata is static, compact, and preserves autho
 	assert.match(text, /64 KiB/);
 	assert.match(text, /fresh no-session process/);
 	assert.match(text, /ambiguous authority fails closed/);
-	assert.match(text, /bounded immutable failure facts, not the old session, report, or authority/);
+	assert.match(text, /immutable Sol REPAIR decision/);
+	assert.match(text, /lineage preserves rejected W\/D paths, exact scope, root plan identity, and the latest continuation decision/);
+	assert.match(text, /project lock prevents sibling starts/);
+	assert.match(text, /never resumes a session or imports prior prose/);
 	assert.match(text, /Sol owns semantic acceptance, final verification, Gates, permissions and the final verdict/);
 	assert.doesNotMatch(text, /deepseek/i, "current delegate metadata contains no retired provider wording");
 	// Registration name/order stay stable. The current schema/hash intentionally
@@ -420,14 +423,13 @@ test("workbench_delegate_worker metadata is static, compact, and preserves autho
 	assert.match(budgetProfileSchema.description ?? "", /advisory turn marker 64, hard total 10,880,000, hard output 320,000/);
 	assert.match(budgetProfileSchema.description ?? "", /never kills healthy tool-heavy work by itself/);
 	assert.match(budgetProfileSchema.description ?? "", /current Sol session/);
-	// Phase 4A (public schema shape only): repair_of stays OPTIONAL —
+	// The current surface retains Phase 4A's public shape while strengthening
+	// its authority semantics: repair_of stays OPTIONAL —
 	// absent from `required` — and is an exactly-20-character string pinned
 	// to the strict delegation-id pattern ^\d{8}-\d{6}-[A-Za-z0-9]{4}$.
-	// The description preserves the fresh-worker/no-authority semantics:
-	// strict prior delegation-id provenance for a known-root-cause repair
-	// only; the parent task itself must carry the bounded root cause /
-	// failure evidence; and the pointer adds no path/scope/authority and
-	// never resumes or imports the old report.
+	// The description also exposes current semantic-REPAIR/lineage rules. The
+	// separately pinned governance-v1 schema above preserves the historical
+	// pointer-only wording byte-for-byte.
 	const repairOfSchema = delegateParameters.properties.repair_of;
 	assert.ok(repairOfSchema, "repair_of is present in the serialized parameter schema");
 	assert.ok(!(delegateParameters.required ?? []).includes("repair_of"), "repair_of stays optional — no required-list regression");
@@ -437,8 +439,8 @@ test("workbench_delegate_worker metadata is static, compact, and preserves autho
 	assert.equal(repairOfSchema.pattern, "^\\d{8}-\\d{6}-[A-Za-z0-9]{4}$", "repair_of matches the strict delegation-id pattern");
 	assert.equal(
 		repairOfSchema.description,
-		"strict prior delegation-id provenance for a known-root-cause repair; parent task must include bounded root cause/failure evidence; pointer adds no path/scope/authority and never resumes/imports old report",
-		"repair_of description preserves the fresh-worker/no-authority semantics",
+		"Exact prior delegation id for a known repair. A PENDING_REVIEW implementation is referenceable only after Sol publishes an immutable current-binding semantic REPAIR decision; lineaged terminal retries require strict continuation authority. The fresh worker receives the rejected W/D closure, exact scope, plan identity, and repair decision, never the old session or Gate authority.",
+		"repair_of description exposes the current semantic-repair continuity contract",
 	);
 	const taskKindSchema = delegateParameters.properties.task_kind;
 	assert.ok(taskKindSchema, "task_kind is present in the current serialized parameter schema");
@@ -475,8 +477,8 @@ test("workbench_delegate_worker metadata is static, compact, and preserves autho
 	);
 	assert.equal(
 		canonicalHash(WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker),
-		"3468c8525a80043b329ef2437889a8b4093bc6b641908b6c21cb1ea67e207928",
-		"current delegate parameter schema hash is pinned after recipe refs and contract sizing",
+		"fc20b3d36eb2f43f78bb2012635eb1906d96845aeafdacd130a70630a2a8dffd",
+		"current delegate parameter schema hash is pinned after semantic-repair continuity",
 	);
 });
 
@@ -654,21 +656,22 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.deepEqual(meta.promptGuidelines, [
 		"Successful non-zero implementation delivery returns a provisional scope/integrity packet and stays PENDING_REVIEW; after inspecting a complete unchanged packet, use workbench_review_worker_diff for hash-bound Sol ACCEPT. Use status only for diagnostics or recovery.",
-		"When STALE is backed by a strict v2 FINAL/PASS review, follow the reported successor action instead of retrying immutable review; VERIFY remains blocked until that successor is reviewed.",
+		"If a complete packet is wrong, publish semantic_decision=REPAIR with the exact bound hash and a bounded reason, then follow only the exact repair_of shown by status. REPAIR and every unresolved lineage remain Gate-blocking.",
+		"When STALE is backed by strict v2 FINAL/PASS plus explicit Sol semantic authority, follow the reported successor action instead of retrying immutable review; a mechanical FINAL/PASS remains blocked and VERIFY stays blocked until a valid successor is reviewed.",
 		"In the TUI, WF:LOCKED means routine writes belong to Luna, WF:LEASE means a bounded temporary Sol write exception is active, and WF:REVIEW means recovery review is outstanding.",
 	], "current status guidelines keep routine work out of the recovery chain");
-	assert.match(meta.description, /existing hash field names are retained for compatibility/);
-	assert.match(meta.description, /W \(the attributed worker delta\), D \(the explicit dependency closure\), and S \(relevant controls\)/);
-	assert.match(meta.description, /baseline unrelated dirty paths and recognized workbench artifacts do not stale it/);
-	assert.match(meta.description, /Git HEAD, W\/D\/S drift, or a new unknown-origin path fails closed/);
-	assert.match(meta.description, /Historical untagged v2 and v1 authority retain the complete full-diff binding/);
-	assert.match(meta.description, /STALE plus strict v2 FINAL\/PASS authority/);
-	assert.match(meta.description, /fresh successor is allowed after live revalidation while VERIFY remains blocked/);
+	assert.match(meta.description, /durable semantic-repair state/);
+	assert.match(meta.description, /REPAIR_REQUIRED reports one exact repair_of action only while its bound workspace is fresh/);
+	assert.match(meta.description, /active, recovery, forked, missing-continuation, or corrupt lineages remain visibly blocked/);
+	assert.match(meta.description, /New tagged v2 uses the W\/D\/S relevance binding/);
+	assert.match(meta.description, /historical untagged v2\/v1 retains the complete diff binding/);
+	assert.match(meta.description, /Baseline unrelated dirt and recognized workbench artifacts do not stale tagged v2/);
+	assert.match(meta.description, /Git HEAD, W\/D\/S, unknown-origin, or repair-authority drift fails closed/);
 	assert.doesNotMatch(meta.description, /real git diff \(any change after REVIEWED turns it STALE\)/);
 	assert.equal(
 		canonicalHash(meta),
-		"1c176896d60c9ad11b5b9684b6378239fb56aee41e2be67f604c7221430b1cc2",
-		"current status metadata hash is machine-pinned after the relevance-contract correction",
+		"c69030ba3e01c704cb32ee41f52c0b14931200bdfa0d66396a164eaf876a2c1d",
+		"current status metadata hash is machine-pinned after semantic-repair projection",
 	);
 	assert.equal(
 		canonicalHash(WORKBENCH_TOOL_PARAMETERS.workbench_delegation_status),
@@ -677,7 +680,7 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.equal(
 		canonicalHash(workbenchToolMetadataOrdered()),
-		"e87bf7df8a3a9aec51de415b62dea519afbf2e4dc5c2df1454e4444a078d020c",
+		"1b1d863f742ee881f1b52e922cd6e0db22231c82cf27520ea76ea91c5d6a2cf6",
 		"current public catalog hash is machine-pinned after the combined framework-reliability changes",
 	);
 });
@@ -686,44 +689,59 @@ test("delegation review metadata separates provisional inspection from explicit 
 	const meta = WORKBENCH_TOOL_METADATA.workbench_review_worker_diff;
 	assert.equal(
 		meta.promptSnippet,
-		"Inspect a bound worker diff, then explicitly ACCEPT only the complete unchanged packet",
-		"the current prompt separates inspection from semantic acceptance",
+		"Inspect a bound worker diff, then explicitly ACCEPT it or require an exact fresh REPAIR",
+		"the current prompt separates inspection from positive or negative semantic authority",
 	);
 	assert.deepEqual(meta.promptGuidelines, [
 		"First call without semantic fields to inspect the provisional scope/integrity packet; this cannot finalize review.",
-		"Only after Sol inspects the complete packet, call with semantic_decision=ACCEPT and its exact expected_bound_diff_hash. Always provide both or neither.",
-		"include_paths changes presentation only. Never accept after drift, incomplete packet coverage, unresolved semantic risk, or an unverified hash.",
+		"Only after Sol inspects the complete packet, call with semantic_decision=ACCEPT or REPAIR and its exact expected_bound_diff_hash. REPAIR also requires repair_reason, stays Gate-blocking, and permits only exact repair_of. For an explicitly reported historical migration, only ACCEPT is valid and also requires expected_migration_binding_hash. Never guess a hash.",
+		"include_paths changes presentation only. When one ordinary source path remains, repeat that single path until its hash-bound page range reaches the total; never accept after drift, incomplete packet coverage, unresolved semantic risk, or an unverified hash.",
 		"Review authority never substitutes for final verification or Gate authority.",
 	]);
 	assert.match(meta.description, /only provisional presentation/);
-	assert.match(meta.description, /supply both semantic_decision=ACCEPT and the exact packet-bound diff hash/);
-	assert.match(meta.description, /either field alone fails closed/);
-	assert.match(meta.description, /never project files or Gate results/);
+	assert.match(meta.description, /semantic_decision=ACCEPT grants exact hash-bound semantic authority/);
+	assert.match(meta.description, /semantic_decision=REPAIR plus a bounded repair_reason publishes immutable negative authority/);
+	assert.match(meta.description, /enables only an exact fresh repair_of lineage/);
+	assert.match(meta.description, /REPAIR never grants Gate authority/);
+	assert.match(meta.description, /Historical migration supports ACCEPT only/);
+	assert.match(meta.description, /resumes the next contiguous UTF-8 page/);
+	assert.match(meta.description, /redacted-stream hashes/);
+	assert.match(meta.description, /Workspace drift invalidates either decision/);
 	const reviewParameters = WORKBENCH_TOOL_PARAMETERS.workbench_review_worker_diff as unknown as {
 		required?: string[];
-		properties: Record<string, { const?: unknown; pattern?: string; minLength?: number; maxLength?: number; description?: string }>;
+		properties: Record<string, { anyOf?: Array<{ const?: unknown }>; pattern?: string; minLength?: number; maxLength?: number; description?: string }>;
 	};
 	const semantic = reviewParameters.properties.semantic_decision;
 	const expectedHash = reviewParameters.properties.expected_bound_diff_hash;
-	assert.equal(semantic?.const, "ACCEPT");
+	const repairReason = reviewParameters.properties.repair_reason;
+	const migrationHash = reviewParameters.properties.expected_migration_binding_hash;
+	assert.deepEqual((semantic?.anyOf ?? []).map((alternative) => alternative.const), ["ACCEPT", "REPAIR"]);
 	assert.equal(expectedHash?.pattern, "^[a-f0-9]{64}$");
 	assert.equal(expectedHash?.minLength, 64);
 	assert.equal(expectedHash?.maxLength, 64);
+	assert.equal(repairReason?.minLength, 1);
+	assert.equal(repairReason?.maxLength, 1024);
+	assert.equal(migrationHash?.pattern, "^[a-f0-9]{64}$");
+	assert.equal(migrationHash?.minLength, 64);
+	assert.equal(migrationHash?.maxLength, 64);
 	assert.ok(!(reviewParameters.required ?? []).includes("semantic_decision"));
 	assert.ok(!(reviewParameters.required ?? []).includes("expected_bound_diff_hash"));
-	assert.match(`${semantic?.description}\n${expectedHash?.description}`, /together/);
-	assert.match(`${semantic?.description}\n${expectedHash?.description}`, /Sol has inspected the complete semantic-review packet/);
-	assert.match(`${semantic?.description}\n${expectedHash?.description}`, /provisional scope\/integrity presentation/);
-	assert.match(`${semantic?.description}\n${expectedHash?.description}`, /no review or Gate authority/);
+	assert.ok(!(reviewParameters.required ?? []).includes("repair_reason"));
+	assert.ok(!(reviewParameters.required ?? []).includes("expected_migration_binding_hash"));
+	assert.match(`${semantic?.description}\n${expectedHash?.description}`, /complete packet/);
+	assert.match(`${semantic?.description}\n${expectedHash?.description}`, /ACCEPT or REPAIR/);
+	assert.match(repairReason?.description ?? "", /Required only with semantic_decision=REPAIR/);
+	assert.match(repairReason?.description ?? "", /immutable negative authority/);
+	assert.match(repairReason?.description ?? "", /never grants Gate authority/);
 	assert.equal(
 		canonicalHash(meta),
-		"c64111740b19bfc3fd821903dfbc9ef0a05672cc6d1b61261630a9b98d6f2574",
-		"current review metadata hash is pinned after semantic acceptance guidance",
+		"ca59da5db7ca6990e34105048b583ee82803140d27dc442ed3e473e4a213175e",
+		"current review metadata hash is pinned after ACCEPT/REPAIR and page-continuation guidance",
 	);
 	assert.equal(
 		canonicalHash(WORKBENCH_TOOL_PARAMETERS.workbench_review_worker_diff),
-		"23dc4ffa0a314a9a972889affaa38471f76a7ed3d26a5b0b2a1a141a20804682",
-		"review input schema pins the paired semantic ACCEPT fields",
+		"550a7af27010041ed60146e9a3ed1491e9004aa90dd62a007a2b7ee9ee30c903",
+		"review input schema pins ACCEPT/REPAIR and their bounded authority fields",
 	);
 });
 
@@ -1336,7 +1354,7 @@ test("slash commands are not registered as model-callable tools", async () => {
 	for (const tool of WORKBENCH_TOOL_NAMES) assert.ok(!commandNames.includes(tool), tool);
 });
 
-test("delegate wiring uses one v2 execution path and v2-authoritative repair fallback", async () => {
+test("delegate wiring uses one v2 execution path and whole-lineage repair authority", async () => {
 	const [block, adapters] = await Promise.all([
 		readFile(new URL("core/delegate-tool-controller.ts", EXTENSION_DIR), "utf8"),
 		readFile(new URL("core/runtime-controller-services.ts", EXTENSION_DIR), "utf8"),
@@ -1355,7 +1373,16 @@ test("delegate wiring uses one v2 execution path and v2-authoritative repair fal
 	assert.ok(block.indexOf(v2Read) < block.indexOf(v1Fallback));
 	assert.ok(block.indexOf(v1Fallback) < block.indexOf(execute));
 	assert.ok(block.includes('priorV2.error.code === "not_found"'), "only v2 not_found permits legacy fallback");
-	assert.ok(block.includes('["FAILED", "FINISHED", "REVIEWED"]'), "only approved committed v2 terminals are repairable");
+	assert.ok(block.includes("hasDelegationSemanticRepairAuthorityV2"), "PENDING_REVIEW repair requires immutable semantic REPAIR authority");
+	assert.ok(block.includes("isStrictRetryableAbortedRepairV2"), "lineaged ABORTED retry uses the strict before-write envelope");
+	assert.ok(block.includes("isStrictRetryableEmptyRepairRecoveryV2"), "empty lineaged recovery uses the strict released-owner envelope");
+	assert.ok(block.split("controller.reconcileProjectAuthority(projectRoot").length - 1 >= 2, "every start audits project authority before and inside the lock");
+	assert.ok(block.includes("controller.services.acquireStartLock({"), "project repair starts are serialized by the durable start lock");
+	assert.ok(block.includes("repair lineage cannot be advanced safely"), "unsafe lineage advancement fails closed");
+	assert.ok(block.includes("abortPristinePreparedDelegationUnderStartLockV2({"),
+		"an exact owned start lock closes an ownerless pristine PREPARED result before release");
+	assert.ok(block.indexOf("abortPristinePreparedDelegationUnderStartLockV2({") < block.indexOf("preserveStartLock = durableExecutionState?.status === \"PREPARED\""),
+		"controller attempts exact same-process PREPARED closure before deciding to preserve the lock");
 	for (const forbidden of ["createDelegationLedger", "finishDelegationLedger", "runPinnedWorker("]) {
 		assert.equal(block.includes(forbidden), false, `${forbidden} is absent from the public v2 handler`);
 	}

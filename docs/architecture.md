@@ -202,7 +202,8 @@ every tool call  →  checkToolCall(mode, tool, input)           (layer 2)
 ```
 GPT-5.6 Sol parent in DEV
   → workbench_delegate_worker(task, allowed_paths, acceptance_criteria,
-       verification[, budget_profile, extended_reason, repair_of, plan_ref])
+       verification[, task_kind, budget_profile, extended_reason, repair_of,
+       plan_ref])
   → trust + commander identity check
   → canonical contract lint: preserve meaningful text layout, stable-deduplicate,
        12 KiB soft / 64 KiB absolute; above soft requires explicit extended+reason
@@ -210,19 +211,26 @@ GPT-5.6 Sol parent in DEV
        params; run once before authority work and re-check immediately pre-launch
   → optional plan_ref: strict project-contained current-byte SHA-256 binding
   → P7: real-git diff refresh + review gate (PENDING_REVIEW blocks;
-       STALE blocks unless exact strict v2 FINAL/PASS authority permits a
-       fresh successor after live revalidation; VERIFY always stays blocked)
-  → P7: bounded ledger created (.pi/workbench/delegations/<id>/before.json,
-       manifest.json — recorded BEFORE the worker starts)
+       STALE blocks unless exact strict v2 FINAL/PASS with explicit Sol
+       semantic authority permits a fresh successor after live revalidation;
+       VERIFY always stays blocked)
+  → reconcile the bounded whole-project authority/repair graph
+  → acquire the project start lock (OS boot + PID + process-start identity),
+       re-reconcile inside it, and retain it through durable PREPARED + mirror
+       publication so sibling starts and the pre-owner crash window fail closed
+  → prepare the canonical delegation-v2 transaction at
+       .pi/workbench/delegations/<id>/v2/transaction.json BEFORE child launch
   → short-lived pi --mode json --no-session
        --model openai-codex/gpt-5.6-luna:xhigh
        (known-root-cause repair receives only an <=8 KiB immutable machine-fact
-       capsule; never prior prose, logs, session, scope, or contract)
+       capsule; unresolved semantic repair also carries cumulative W/D scope,
+       exact files, root plan, and root/latest decision hashes; never prior prose,
+       logs, or session)
   → child role matrix + hard guard: no recursion, no bash, no final gates
   → edit/write limited to parent-approved paths
-	→ execution owner is durable before baseline collection/worker launch;
-	     restart ABORTS only a provably dead owner with no write evidence,
-	     while nonempty/COMMITTING/ambiguous authority remains blocked
+  → execution owner is durable before baseline collection/worker launch;
+       restart ABORTS only a provably dead owner with no write evidence,
+       while nonempty/COMMITTING/ambiguous authority remains blocked
   → worker-role lifecycle: one hidden soft-budget steer at 80%, cancel
        session_before_compact before reading its preparation
   → bounded JSON event stream + verified model identity + nested usage
@@ -230,9 +238,9 @@ GPT-5.6 Sol parent in DEV
        compaction_start counting, 90% hard-stop termination, fail-closed
        rejection of any compaction attempt or hard-budget stop
   → untrusted report to Sol (budget/compaction facts in details + text)
-  → P7: ledger finished on EVERY outcome (success and failure) — after.json,
-       worker-summary.json, review.json placeholder; review_status
-       PENDING_REVIEW (never falls back)
+  → successful/final-failure output publishes one strictly inventoried immutable
+       v2 generation; incomplete terminal or publication evidence becomes
+       RECOVERY_REQUIRED rather than fabricated success
   → the same delegation call mechanically checks the ACTUAL diff and returns
        a provisional scope/integrity packet: whole-worker-diff scope check
        vs allowed_paths, current diff hash bound to the reviewed hash,
@@ -247,9 +255,15 @@ GPT-5.6 Sol parent in DEV
   → every non-zero delta remains PENDING_REVIEW; after inspecting the complete
        unchanged packet, Sol calls workbench_review_worker_diff with paired
        semantic_decision=ACCEPT + the exact expected_bound_diff_hash
+  → if that complete packet is wrong, Sol instead supplies paired
+       semantic_decision=REPAIR + the exact bound hash + repair_reason;
+       immutable negative authority leaves PENDING_REVIEW/Gates blocked and
+       enables one exact fresh repair_of lineage
   → strict compact facts may completely present a large regular SVG/JSON while
-       keeping generator equality NOT_VERIFIED; ordinary truncation, omission,
-       handoff clipping, first-call ACCEPT, legacy authority, or drift blocks ACCEPT
+       keeping generator equality NOT_VERIFIED; an ordinary single-path source
+       resumes through contiguous UTF-8 pages bound to the same diff and
+       redacted-stream hash, while unfinished paging, omission, handoff clipping,
+       first-call ACCEPT, legacy authority, or drift blocks ACCEPT
   → REVIEWED requires scope PASS, complete presentation, and durable hash-bound
        Sol semantic acceptance (zero delta alone is not_required); FAIL stays
        PENDING_REVIEW and ANY
@@ -258,8 +272,13 @@ GPT-5.6 Sol parent in DEV
        review record) invalidates a prior REVIEWED state fail-closed
        (demoted to PENDING_REVIEW, reviewed hash cleared); pending/stale
        blocks VERIFY and normally blocks the next delegation. Exact latest
-       STALE plus strict v2 FINAL/PASS may start a fresh successor without
-       rewriting the old review; every other authority stays blocked
+       STALE plus strict v2 FINAL/PASS with explicit Sol semantic authority
+       may start a fresh successor without rewriting the old review; every
+       other authority stays blocked; the project start lock and whole-lineage
+       audit reject sibling starts, hidden active work, missing continuation
+       decisions, unsafe recovery, and plan/scope drift; a lineaged ABORTED
+       attempt remains blocking and can continue only via the exact reported
+       repair_of under a proven before-write owner/journal envelope
   → Sol runs final VERIFY recipes/gates → final judgment
 ```
 
@@ -1483,7 +1502,8 @@ run/cache/gate/delegation artifacts or execution counts.
   coverage_complete plus presentation fields / review_path) — a worker path is displayed only
   when it appears in an ACTUALLY rendered patch entry (a globally
   omitted path never counts; an ordinary truncated source entry is visible
-  but does not complete semantic presentation); prior displayed coverage
+  but does not complete semantic presentation until repeated single-path calls
+  cover its contiguous hash-bound byte pages); prior displayed coverage
   merges ONLY from the persisted review.json with the SAME
   bound_diff_hash and valid worker-path membership (legacy
   schema_version-1 records stay readable and infer prior coverage ONLY
@@ -1502,6 +1522,10 @@ run/cache/gate/delegation artifacts or execution counts.
   first remains provisional/PENDING_REVIEW. REVIEWED requires scope PASS,
   complete presentation, and a second active-Sol call with paired
   semantic_decision=ACCEPT plus the exact previously presented bound hash;
+  a complete but wrong packet instead requires semantic_decision=REPAIR,
+  the same exact hash, and bounded repair_reason, which persists immutable
+  negative authority and leaves review/Gates blocked while enabling only the
+  exact fresh repair_of lineage;
   a same-hash accepted replay is idempotent, a changed hash resets coverage
   and acceptance, and ANY re-review that is not PASS with complete presentation (a scope FAIL or an
   incomplete PASS, e.g. a legacy partial review record) invalidates a
@@ -1511,7 +1535,11 @@ run/cache/gate/delegation artifacts or execution counts.
   cleared; pending/stale stay safely blocking); deterministic rendered
   displayed/remaining counts, bounded next include_paths guidance (max
   50 paths AND ≤ 1024 UTF-8 bytes, complete paths only with an exact
-  omitted count), the review-complete fact and the durable
+  omitted count), an additive per-path page cursor/stream SHA-256 plus bounded
+  contiguous range/hash receipts for ordinary sources up to 4 MiB (advanced
+  only after the complete page is visible and rebuilt against current source
+  authority before ACCEPT), the
+  review-complete fact and the durable
   project-relative review.json path; details expose review_record +
   presentation facts; the explicit semantic API is Sol-only, hash-bound,
   unavailable to legacy/finalized mechanical records, and never Gate

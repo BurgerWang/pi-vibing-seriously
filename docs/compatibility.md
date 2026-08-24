@@ -238,16 +238,19 @@ new committed artifacts cannot carry `low`. This intentional current-schema
 change produces a new static DEV fingerprint without rewriting historical
 fingerprint records.
 
-## Tool-schema fingerprint transition (Phase 4A, worker repair contract — `repair_of` pointer)
+## Historical tool-schema transition (Phase 4A — pointer-only `repair_of`)
 
-`workbench_delegate_worker` gained exactly ONE additive parameter in Phase
-4A of the worker token-budget repair (public schema shape plus strict
-runtime resolution and the finished-ledger guard): the optional `repair_of`
-strict prior delegation-id provenance pointer — exactly 20 characters,
-`^\d{8}-\d{6}-[A-Za-z0-9]{4}$` — used only for known-root-cause repairs
-whose bounded root-cause/failure evidence the parent task itself carries.
-The change is additive and intentionally changes the DEV tool-schema
-fingerprint exactly **once**:
+At the Phase 4A snapshot, `workbench_delegate_worker` gained exactly one
+additive parameter in the worker token-budget repair: the optional `repair_of`
+strict prior delegation-id provenance pointer. This section characterizes that
+frozen historical surface; it does not describe the stronger current semantic
+repair authority documented below. The historical pointer was exactly 20
+characters,
+`^\d{8}-\d{6}-[A-Za-z0-9]{4}$`, and was used only for known-root-cause repairs
+whose bounded root-cause/failure evidence the parent task itself carried.
+
+The Phase 4A change was additive and intentionally changed the DEV tool-schema
+fingerprint exactly once; the following pins belong to that frozen snapshot:
 
 - the pinned delegate parameter-schema hash moved from the historical
   final Phase 3 value
@@ -268,11 +271,12 @@ fingerprint exactly **once**:
   (task-contract wording / granularity) deliberately leaves the parameter
   schema byte-for-byte unchanged.
 
-The pointer is provenance only: the runtime verifies the referenced prior
+In that historical snapshot the pointer was provenance only: the runtime
+verified the referenced prior
 delegation ledger is finished (manifest status `finished` with a non-null
 `after` record) before any new ledger is created or any worker is
-launched, inspects only those id/status/after facts, and the fresh worker
-inherits no prior report/session/scope/contract — `repair_of` adds no
+launched, inspected only those id/status/after facts, and the fresh worker
+inherited no prior report/session/scope/contract — `repair_of` added no
 path/scope/authority.
 
 ## Tool-schema fingerprint transition (framework reliability — optional `plan_ref`)
@@ -302,10 +306,11 @@ reader semantics; no existing no-plan record is rewritten.
 The additive `plan_ref` field changed the delegate schema fingerprint once at
 that transition. Subsequent current contract/review additions documented
 below yield the current delegate parameter-schema hash
-`3468c8525a80043b329ef2437889a8b4093bc6b641908b6c21cb1ea67e207928` and
+`fc20b3d36eb2f43f78bb2012635eb1906d96845aeafdacd130a70630a2a8dffd` and
 the combined current unreleased framework-reliability public tool-surface
-hash (including the stricter Gate evidence wording) is
-`96fd7c5bbf23dc363371e2f23e1d02372ef7b5c43a335d2b107d95199804516e`.
+hash (including semantic REPAIR, repair-lineage, and stricter Gate evidence
+wording) is
+`0b8ab153bc79003271ded6e989e089e4f08322cf88b7ebf54634df8aa2b6966b`.
 Repeated same-mode builds remain deterministic; the separately retained
 governance-v1 schema hash does not change.
 
@@ -324,24 +329,78 @@ only bounded current-call rules:
   free-text verification values read through the frozen strict readers and
   are never rewritten. They do not become valid inputs for a new call merely
   because they remain readable;
-- current `repair_of` still starts a fresh process and grants no new scope. It
-  now supplies only an at-most-8-KiB machine-fact capsule derived from strict
-  immutable authority; the historical pointer-only record shape remains
-  readable without fabricating missing capsule facts.
+- current `repair_of` still starts a fresh process and grants no new write or
+  Gate scope, but it is no longer pointer-only authority. A wrong current
+  `PENDING_REVIEW` implementation becomes referenceable only after active Sol
+  inspects the complete unchanged packet and publishes immutable, hash-bound
+  `semantic_decision=REPAIR` negative authority. Every semantic-repair child
+  carries a strict lineage with the root/immediate decision identities and
+  cumulative rejected W/D closure; exact-file scope and root plan continuity
+  are revalidated separately. The at-most-8-KiB capsule is derived only from
+  these strict machine facts. Historical pointer-only records remain readable
+  without fabricating missing lineage or capsule facts.
 
 Review evolution is additive at the record boundary. Historical v1/v2
 mechanical review records remain strict-readable, but their `REVIEWED` or
 coverage fields are never inferred as semantic acceptance. Every new non-zero
 delta first persists a provisional scope/integrity packet, then requires a
-second Sol call carrying paired `semantic_decision=ACCEPT` and the exact bound
-hash. New accepted records include strict `semantic_review` and
+second Sol call carrying `semantic_decision=ACCEPT` or `REPAIR` plus the exact
+bound hash. `ACCEPT` grants strict semantic review authority. `REPAIR` also
+requires bounded `repair_reason`, writes a separate immutable
+`v2/repair-decision.json` negative sidecar, leaves the transaction
+`PENDING_REVIEW`, and grants only the exact
+fresh `repair_of` continuation reported by status; it never grants review or
+Gate authority. New accepted records include strict `semantic_review` and
 `semantic_acceptance` provenance; legacy/finalized mechanical records cannot be
 upgraded in place. Zero-delta records alone use `not_required`. Compact facts
-for large regular SVG/JSON files are an additive presentation shape; ordinary
-truncation and malformed or historical partial presentations remain
-non-acceptable. None of these fields grants Gate authority.
-The current review parameter-schema hash, including the paired ACCEPT fields,
-is `23dc4ffa0a314a9a972889affaa38471f76a7ed3d26a5b0b2a1a141a20804682`.
+for large regular SVG/JSON files are an additive presentation shape. Current
+ordinary single-path reviews may additionally carry `patch[].page` and
+`presentation_progress`: repeated calls resume a contiguous UTF-8 byte cursor
+only under the same bound-diff and redacted-stream hashes, up to 4 MiB, and
+only a fully visible page advances. Progress also carries a bounded contiguous
+page-receipt chain; either semantic decision rebuilds the current redacted
+streams and checks every range/hash/current-page slice. Historical records omit
+these fields and remain readable; unfinished paging, malformed cursors and
+historical partial presentations remain non-acceptable. The existing tool name, registration
+order, and mode placement are unchanged; `REPAIR` and `repair_reason` are
+additive current parameter-schema evolution. None of these fields grants Gate
+authority.
+
+Semantic repair starts are serialized by a project start lock whose owner is
+bound to OS boot id, PID, and process-start identity. Authority is reconciled
+both before and inside the lock, and the lock is retained through durable
+`PREPARED` publication, closing sibling-start and pre-owner crash windows.
+Reload, status, read-only Gate projection, formal Gate runs, and delegation
+startup scan the bounded whole-project repair graph. Missing or tampered
+decisions, forks, hidden unresolved work, plan/scope drift, unsafe execution
+owners/journals, or unknown artifacts remain blocking. A lineaged `ABORTED`
+record is not permission for an unrelated fresh delegation: only the exact
+reported `repair_of=<aborted-id>` may continue it, and only when a known
+before-write runtime reason, absent owner, pristine/missing journal, and exact
+v2 inventory are all proven. A non-lineaged recovered abort remains ordinary
+terminal FAIL compatibility data.
+
+When an upgrade-era finalized mechanical record is still mirrored as
+`PENDING_REVIEW`, the runtime preserves that fail-closed state and returns the
+structured `semantic_acceptance_required` recovery result. Compatibility uses
+a two-step `workbench_review_worker_diff` migration review: active Sol first
+requests the complete immutable packet and a freshly collected migration
+binding without a decision, then makes a second call with
+`semantic_decision=ACCEPT`, `expected_bound_diff_hash`, and
+`expected_migration_binding_hash`. Eligibility is intentionally narrow: the
+candidate HEAD must descend from the old HEAD, its raw committed delta may
+contain exactly the historical W/checked paths, every current W path must be
+clean, and current W/D/S content plus the non-W baseline guard must still
+match. Extra paths, content or mode drift, and non-descendant history fail
+closed. Acceptance is an additive, hash-bound
+supplement; the historical review and transaction bytes are not rewritten. A
+fresh exact `repair_of` is forbidden for this recovery because it would adopt
+the old non-semantic delta as a new baseline. An ordinary successor and VERIFY
+remain blocked until the explicit Sol acceptance is durable.
+
+The current review parameter-schema hash, including `ACCEPT|REPAIR`, the
+bounded repair reason, paired bound hash, and historical migration binding, is
+`550a7af27010041ed60146e9a3ed1491e9004aa90dd62a007a2b7ee9ee30c903`.
 
 ## Commander Token Optimization Slice A (P0 + P1) — additive compatibility
 
@@ -438,10 +497,10 @@ additive and backward compatible:
 
 The bullets in this subsection preserve the historical Slice B2 transition.
 They are not the current write contract: the current unreleased transition
-above adds schema-2 semantic markers, paired ACCEPT/hash parameters, and
-presentation completeness while keeping historical schema-1 records
-readable. In particular, historical mechanical `REVIEWED` is not current
-semantic acceptance.
+above adds schema-2 semantic markers, paired `ACCEPT|REPAIR`/hash parameters,
+the bounded REPAIR reason, and presentation completeness while keeping
+historical schema-1 records readable. In particular, historical mechanical
+`REVIEWED` is not current semantic acceptance.
 
 - **Additive review-record fields, unchanged `schema_version`.** The
   completed `review.json` records now carry the Slice B2 coverage facts
@@ -478,9 +537,10 @@ semantic acceptance.
   `demoteReviewedToPending` transition). PENDING_REVIEW and VERIFY blocking,
   the hash-binding invariants, and B6 Worker-First Compliance remain
   unchanged. Current v2 adds one delegation-only recovery seam: exact latest
-  STALE plus a strict committed FINAL/PASS review may be replaced by a fresh
-  successor after live revalidation; the old authority remains immutable and
-  all other stale authority stays blocked.
+  STALE plus strict committed FINAL/PASS carrying explicit Sol semantic
+  acceptance may be replaced by a fresh successor after live revalidation;
+  the old authority remains immutable and all other stale authority stays
+  blocked.
 - **Phase 5 compact/withheld entries: additive record surface,
   unchanged schema and tool.** Review `schema_version` stays `1`; the
   `patch[].source` literals `compact` and `withheld` (mirrored in the

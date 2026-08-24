@@ -661,6 +661,22 @@ test("config checks fail when the workbench config has issues", async () => {
 	});
 });
 
+test("built-in b0 recognizes a legacy Python project from requirements.txt", async () => {
+	await withTempDir(async (dir) => {
+		await writeConfigFile(dir, "recipes.yaml", "recipes: []\n");
+		await writeFile(join(dir, "requirements.txt"), "pytest==8.4.1\n", "utf8");
+		await writeFile(join(dir, "pytest.ini"), "[pytest]\n", "utf8");
+
+		const result = await runGates({ projectRoot: dir, selector: "b0", mode: "DEV", exec: spawnExec });
+		const byId = new Map(result.gates[0]!.checks.map((checkResult) => [checkResult.check_id, checkResult]));
+		assert.equal(byId.get("b0.1")!.status, "PASS", byId.get("b0.1")!.failure_reason ?? "");
+		assert.equal(byId.get("b0.2")!.status, "PASS", "requirements.txt is a supported legacy Python stack manifest");
+		assert.equal(byId.get("b0.3")!.status, "PASS", "the same requirements file is valid dependency configuration");
+		assert.equal(byId.get("b0.4")!.status, "PASS", "the repository-root recipes file satisfies workbench readiness");
+		assert.equal(result.gates[0]!.status, "PASS", result.gates[0]!.failure_reason ?? "");
+	});
+});
+
 // ---------------------------------------------------------------------------
 // Profiles: quant gates only for quant profiles
 // ---------------------------------------------------------------------------

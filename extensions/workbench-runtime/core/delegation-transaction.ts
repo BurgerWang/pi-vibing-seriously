@@ -8,6 +8,7 @@
 
 import { isAbsolute, posix } from "node:path";
 
+import { canonicalHash } from "../cache/canonical-hash.ts";
 import {
 	WORKER_MODEL_ID,
 	WORKER_PROVIDER,
@@ -18,6 +19,10 @@ export const DELEGATION_TRANSACTION_MAX_BYTES = 1_048_576 as const;
 export const DELEGATION_TRANSACTION_MAX_PATHS = 500 as const;
 export const DELEGATION_TRANSACTION_MAX_ALLOWED_PATHS = 50 as const;
 export const DELEGATION_TRANSACTION_MAX_REASON_CHARS = 500 as const;
+export const DELEGATION_REPAIR_LINEAGE_SCHEMA_VERSION = 1 as const;
+export const DELEGATION_REPAIR_LINEAGE_KIND = "semantic-repair-lineage-v1" as const;
+export const DELEGATION_REPAIR_LINEAGE_MAX_DEPTH = 16 as const;
+export const DELEGATION_REPAIR_LINEAGE_MAX_PATHS = DELEGATION_TRANSACTION_MAX_PATHS;
 
 export const DELEGATION_TRANSACTION_ID_RE = /^\d{8}-\d{6}-[A-Za-z0-9]{4}$/;
 export const DELEGATION_TRANSACTION_HASH_RE = /^[a-f0-9]{64}$/;
@@ -115,6 +120,28 @@ export interface DelegationReviewProof {
 	reviewer: "sol";
 }
 
+/**
+ * Immutable anti-laundering continuity carried by a fresh repair attempt.
+ *
+ * The paths are review dependencies, never additional worker write scope.
+ * The hash excludes only itself and is canonical-key-order independent.
+ */
+export interface DelegationRepairLineageV1 {
+	schema_version: typeof DELEGATION_REPAIR_LINEAGE_SCHEMA_VERSION;
+	kind: typeof DELEGATION_REPAIR_LINEAGE_KIND;
+	root_delegation_id: string;
+	repair_of: string;
+	root_decision_hash: string;
+	continuation_decision_delegation_id: string;
+	continuation_decision_hash: string;
+	parent_lineage_hash: string | null;
+	depth: number;
+	carried_paths: string[];
+	lineage_hash: string;
+}
+
+export type DelegationRepairLineageInputV1 = Omit<DelegationRepairLineageV1, "lineage_hash">;
+
 export interface DelegationTransactionRecord {
 	schema_version: typeof DELEGATION_TRANSACTION_SCHEMA_VERSION;
 	delegation_id: string;
@@ -133,6 +160,8 @@ export interface DelegationTransactionRecord {
 	review: DelegationReviewProof | null;
 	abort_reason: string | null;
 	recovery_reason: string | null;
+	/** Missing on historical records; present only for a fresh repair attempt. */
+	repair_lineage?: DelegationRepairLineageV1;
 }
 
 export interface PrepareDelegationTransactionInput {
@@ -147,6 +176,7 @@ export interface PrepareDelegationTransactionInput {
 	};
 	generation: number;
 	now: string;
+	repair_lineage?: DelegationRepairLineageV1;
 }
 
 export interface DelegationCasInput {
@@ -198,6 +228,20 @@ const TOP_LEVEL_FIELDS = [
 	"review",
 	"abort_reason",
 	"recovery_reason",
+] as const;
+
+const REPAIR_LINEAGE_FIELDS = [
+	"schema_version",
+	"kind",
+	"root_delegation_id",
+	"repair_of",
+	"root_decision_hash",
+	"continuation_decision_delegation_id",
+	"continuation_decision_hash",
+	"parent_lineage_hash",
+	"depth",
+	"carried_paths",
+	"lineage_hash",
 ] as const;
 
 const IDENTITY_FIELDS = ["provider", "model", "worker_id"] as const;
@@ -290,6 +334,14 @@ function isAllowedPathRule(value: unknown): value is string {
 	return base.length > 0 && isStrictRelativePath(base);
 }
 
+/** Exact-file scope required while a semantic-repair obligation is open. */
+export function exactDelegationRepairAllowedPathsV1(rules: readonly string[]): string[] | undefined {
+	return rules.length > 0 && rules.every((rule) =>
+		isAllowedPathRule(rule) && !rule.endsWith("/") && !rule.endsWith("/**") && !/[?*\[\]{}]/u.test(rule))
+		? [...rules]
+		: undefined;
+}
+
 function isSortedUnique(values: readonly string[]): boolean {
 	for (let index = 0; index < values.length; index += 1) {
 		if (index > 0 && values[index - 1]! >= values[index]!) return false;
@@ -300,6 +352,69 @@ function isSortedUnique(values: readonly string[]): boolean {
 function isByteSortedUnique(values: readonly string[]): boolean {
 	return values.every((value, index) => index === 0 ||
 		Buffer.from(values[index - 1]!, "utf8").compare(Buffer.from(value, "utf8")) < 0);
+}
+
+function repairLineageProjection(value: DelegationRepairLineageInputV1 | DelegationRepairLineageV1): DelegationRepairLineageInputV1 {
+	return {
+		schema_version: DELEGATION_REPAIR_LINEAGE_SCHEMA_VERSION,
+		kind: DELEGATION_REPAIR_LINEAGE_KIND,
+		root_delegation_id: value.root_delegation_id,
+		repair_of: value.repair_of,
+		root_decision_hash: value.root_decision_hash,
+		continuation_decision_delegation_id: value.continuation_decision_delegation_id,
+		continuation_decision_hash: value.continuation_decision_hash,
+		parent_lineage_hash: value.parent_lineage_hash,
+		depth: value.depth,
+		carried_paths: [...value.carried_paths],
+	};
+}
+
+export function computeDelegationRepairLineageHashV1(
+	value: DelegationRepairLineageInputV1 | DelegationRepairLineageV1,
+): string {
+	return canonicalHash(repairLineageProjection(value));
+}
+
+function validRepairLineageInput(value: unknown): value is DelegationRepairLineageInputV1 {
+	if (!isRecord(value)) return false;
+	const expected = REPAIR_LINEAGE_FIELDS.filter((field) => field !== "lineage_hash");
+	if (!hasExactFields(value, expected)) return false;
+	if (value.schema_version !== DELEGATION_REPAIR_LINEAGE_SCHEMA_VERSION || value.kind !== DELEGATION_REPAIR_LINEAGE_KIND ||
+		typeof value.root_delegation_id !== "string" || !DELEGATION_TRANSACTION_ID_RE.test(value.root_delegation_id) ||
+		typeof value.repair_of !== "string" || !DELEGATION_TRANSACTION_ID_RE.test(value.repair_of) ||
+		typeof value.root_decision_hash !== "string" || !DELEGATION_TRANSACTION_HASH_RE.test(value.root_decision_hash) ||
+		typeof value.continuation_decision_delegation_id !== "string" || !DELEGATION_TRANSACTION_ID_RE.test(value.continuation_decision_delegation_id) ||
+		typeof value.continuation_decision_hash !== "string" || !DELEGATION_TRANSACTION_HASH_RE.test(value.continuation_decision_hash) ||
+		!(value.parent_lineage_hash === null || (typeof value.parent_lineage_hash === "string" && DELEGATION_TRANSACTION_HASH_RE.test(value.parent_lineage_hash))) ||
+		!isPositiveInteger(value.depth) || value.depth > DELEGATION_REPAIR_LINEAGE_MAX_DEPTH ||
+		!Array.isArray(value.carried_paths) || value.carried_paths.length === 0 ||
+		value.carried_paths.length > DELEGATION_REPAIR_LINEAGE_MAX_PATHS ||
+		!value.carried_paths.every(isStrictRelativePath) || !isByteSortedUnique(value.carried_paths)) return false;
+	if (value.depth === 1) {
+		return value.parent_lineage_hash === null && value.root_delegation_id === value.repair_of &&
+			value.continuation_decision_delegation_id === value.root_delegation_id &&
+			value.continuation_decision_hash === value.root_decision_hash;
+	}
+	return value.parent_lineage_hash !== null && value.root_delegation_id !== value.repair_of;
+}
+
+export function bindDelegationRepairLineageV1(value: DelegationRepairLineageInputV1): DelegationRepairLineageV1 | undefined {
+	if (!validRepairLineageInput(value)) return undefined;
+	const projection = repairLineageProjection(value);
+	return { ...projection, lineage_hash: computeDelegationRepairLineageHashV1(projection) };
+}
+
+export function parseDelegationRepairLineageV1(value: unknown): DelegationRepairLineageV1 | undefined {
+	if (!isRecord(value) || !hasExactFields(value, REPAIR_LINEAGE_FIELDS)) return undefined;
+	const { lineage_hash: lineageHash, ...projection } = value;
+	if (typeof lineageHash !== "string" || !DELEGATION_TRANSACTION_HASH_RE.test(lineageHash) ||
+		!validRepairLineageInput(projection)) return undefined;
+	const bound = bindDelegationRepairLineageV1(projection);
+	return bound !== undefined && bound.lineage_hash === lineageHash ? bound : undefined;
+}
+
+function cloneRepairLineage(value: DelegationRepairLineageV1): DelegationRepairLineageV1 {
+	return { ...value, carried_paths: [...value.carried_paths] };
 }
 
 function cloneIdentity(identity: DelegationWorkerIdentity): DelegationWorkerIdentity {
@@ -430,6 +545,7 @@ function cloneState(state: DelegationTransactionRecord): DelegationTransactionRe
 		terminal_outcome: state.terminal_outcome === null ? null : cloneOutcome(state.terminal_outcome),
 		committed_proof: state.committed_proof === null ? null : cloneProof(state.committed_proof),
 		review: state.review === null ? null : cloneReview(state.review),
+		...(state.repair_lineage === undefined ? {} : { repair_lineage: cloneRepairLineage(state.repair_lineage) }),
 	};
 }
 
@@ -446,6 +562,7 @@ function validStateInvariants(state: DelegationTransactionRecord): boolean {
 	const outcome = state.terminal_outcome;
 	const proof = state.committed_proof;
 	const review = state.review;
+	if (state.repair_lineage !== undefined && state.task_kind !== "implementation") return false;
 	if (outcome !== null) {
 		if (outcome.delegation_id !== state.delegation_id || outcome.task_kind !== state.task_kind || !sameIdentity(outcome.worker_identity, state.worker_identity)) return false;
 		if (!exactReasons(state.postcondition_reasons, evaluateDelegationPostconditions(state, outcome))) return false;
@@ -498,7 +615,9 @@ function validStateInvariants(state: DelegationTransactionRecord): boolean {
 }
 
 function parseState(raw: unknown): DelegationTransactionRecord | undefined {
-	if (!isRecord(raw) || !hasExactFields(raw, TOP_LEVEL_FIELDS)) return undefined;
+	if (!isRecord(raw)) return undefined;
+	const hasRepairLineage = Object.prototype.hasOwnProperty.call(raw, "repair_lineage");
+	if (!hasExactFields(raw, hasRepairLineage ? [...TOP_LEVEL_FIELDS, "repair_lineage"] : TOP_LEVEL_FIELDS)) return undefined;
 	if (raw.schema_version !== DELEGATION_TRANSACTION_SCHEMA_VERSION) return undefined;
 	if (typeof raw.delegation_id !== "string" || !DELEGATION_TRANSACTION_ID_RE.test(raw.delegation_id)) return undefined;
 	if (!isTaskKind(raw.task_kind) || !isStatus(raw.status)) return undefined;
@@ -515,6 +634,7 @@ function parseState(raw: unknown): DelegationTransactionRecord | undefined {
 	if (raw.review !== null && !validReview(raw.review)) return undefined;
 	if (raw.abort_reason !== null && !validReasonText(raw.abort_reason)) return undefined;
 	if (raw.recovery_reason !== null && !validReasonText(raw.recovery_reason)) return undefined;
+	if (hasRepairLineage && parseDelegationRepairLineageV1(raw.repair_lineage) === undefined) return undefined;
 	const state = cloneState(raw as unknown as DelegationTransactionRecord);
 	return validStateInvariants(state) ? state : undefined;
 }
@@ -599,6 +719,9 @@ export function createPreparedDelegationTransaction(
 	if (!validIdentity(input.worker_identity)) return { ok: false, error: `worker identity must be ${WORKER_PROVIDER}/${WORKER_MODEL_ID} with a valid worker_id` };
 	if (!isPositiveInteger(input.generation)) return { ok: false, error: "generation must be a positive safe integer" };
 	if (!isIsoTime(input.now)) return { ok: false, error: "now must be canonical ISO-8601" };
+	const repairLineage = input.repair_lineage === undefined ? undefined : parseDelegationRepairLineageV1(input.repair_lineage);
+	if (input.repair_lineage !== undefined && repairLineage === undefined) return { ok: false, error: "repair_lineage is invalid or unbound" };
+	if (repairLineage !== undefined && input.task_kind !== "implementation") return { ok: false, error: "repair_lineage requires an implementation delegation" };
 	const allowedPaths = Array.isArray(input.allowed_paths) ? [...input.allowed_paths] : [];
 	if (allowedPaths.length === 0 || allowedPaths.length > DELEGATION_TRANSACTION_MAX_ALLOWED_PATHS || !allowedPaths.every(isAllowedPathRule)) {
 		return { ok: false, error: "allowed_paths must contain only bounded project-relative path rules" };
@@ -625,6 +748,7 @@ export function createPreparedDelegationTransaction(
 			review: null,
 			abort_reason: null,
 			recovery_reason: null,
+			...(repairLineage === undefined ? {} : { repair_lineage: cloneRepairLineage(repairLineage) }),
 		},
 	};
 }

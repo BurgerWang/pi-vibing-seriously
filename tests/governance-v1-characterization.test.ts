@@ -235,12 +235,14 @@ test("governance v1 freezes schema constants, public tool input/output categorie
 		extended_reason: _extendedReason,
 		budget_profile: currentBudgetProfile,
 		verification: currentVerification,
+		repair_of: currentRepairOf,
 		...currentStableProperties
 	} = currentDelegate.properties;
-	const { budget_profile: v1BudgetProfile, verification: v1Verification, ...v1StableProperties } = v1Delegate.properties;
-	assert.equal(canonicalHash(currentStableProperties), canonicalHash(v1StableProperties), "non-budget governance-v1 delegate properties stay exact");
+	const { budget_profile: v1BudgetProfile, verification: v1Verification, repair_of: v1RepairOf, ...v1StableProperties } = v1Delegate.properties;
+	assert.equal(canonicalHash(currentStableProperties), canonicalHash(v1StableProperties), "unmodified governance-v1 delegate properties stay exact");
 	assert.notEqual(canonicalHash(currentBudgetProfile), canonicalHash(v1BudgetProfile), "current budget description may identify the Luna policy without rewriting the frozen v1 catalog");
 	assert.notEqual(canonicalHash(currentVerification), canonicalHash(v1Verification), "current verification grammar evolves without rewriting the frozen v1 catalog");
+	assert.notEqual(canonicalHash(currentRepairOf), canonicalHash(v1RepairOf), "current repair_of describes semantic REPAIR lineage without rewriting the frozen v1 catalog");
 	assert.deepEqual(
 		(currentBudgetProfile as { anyOf?: Array<{ const?: unknown }> }).anyOf?.map((entry) => entry.const),
 		["standard", "extended"],
@@ -255,7 +257,8 @@ test("governance v1 freezes schema constants, public tool input/output categorie
 	].join("\n");
 	assert.match(currentMetadataText, /GPT-5\.6 Luna xhigh/);
 	assert.match(currentMetadataText, /diagnosis is strictly read-only/i);
-	assert.match(currentMetadataText, /repair_of .* minimal authority-derived repair capsule/is);
+	assert.match(currentMetadataText, /repair_of .* immutable Sol REPAIR decision/is);
+	assert.match(currentMetadataText, /lineage preserves rejected W\/D paths, exact scope, root plan identity/is);
 	assert.match(currentMetadataText, /Sol retains architecture, semantic review, final verification, Gates/i);
 
 	// Output contracts are deliberately categories + source symbols, not an

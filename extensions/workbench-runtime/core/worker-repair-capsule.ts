@@ -20,10 +20,35 @@ export interface WorkerRepairPlanFact {
 	candidate: string;
 }
 
+export interface WorkerRepairLineageFact {
+	root_delegation_id: string;
+	repair_of: string;
+	root_decision_hash: string;
+	continuation_decision_delegation_id: string;
+	continuation_decision_hash: string;
+	lineage_hash: string;
+	depth: number;
+	carried_paths: string[];
+	carried_paths_omitted: number;
+}
+
+export interface WorkerSemanticRepairDecisionFact {
+	delegation_id: string;
+	decision_hash: string;
+	expected_bound_diff_hash: string;
+	repair_reason: string;
+	repair_reason_hash: string;
+	reviewer: {
+		provider: "openai" | "openai-codex";
+		model: "gpt-5.6-sol";
+	};
+	decided_at: string;
+}
+
 export interface WorkerRepairCapsule {
 	schema: typeof WORKER_REPAIR_CAPSULE_SCHEMA;
 	repair_of: string;
-	authority_kind: "v2_committed" | "v2_unpublished" | "legacy_v1";
+	authority_kind: "v2_committed" | "v2_unpublished" | "v2_repair_lineage" | "legacy_v1";
 	authority_status: string;
 	contract_hash: string | null;
 	generation_content_hash: string | null;
@@ -38,6 +63,10 @@ export interface WorkerRepairCapsule {
 	changed_paths_omitted: number;
 	failed_runs: WorkerRepairFailedRunFact[];
 	plan_ref: WorkerRepairPlanFact | null;
+	/** Additive for unresolved repair attempts; absent on historical capsules. */
+	repair_lineage?: WorkerRepairLineageFact;
+	/** Exact immutable Sol decision; bounded by the capsule's existing 8 KiB cap. */
+	semantic_repair?: WorkerSemanticRepairDecisionFact;
 }
 
 /** Deterministic structured rendering; no report/session prose is accepted. */

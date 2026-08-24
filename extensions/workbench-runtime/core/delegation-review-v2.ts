@@ -6,9 +6,14 @@
 
 import { posix } from "node:path";
 
+import { canonicalHash } from "../cache/canonical-hash.ts";
 import {
 	collectReviewBoundDiffHash,
+	DEFAULT_REVIEW_MAX_BYTES,
+	DEFAULT_REVIEW_MAX_LINES,
+	isReviewPresentationFullyVisible,
 	isScopeIntegrityPacketComplete,
+	validateReviewPresentationAgainstAuthority,
 	isStrictSemanticAcceptedOrZeroDelta,
 	renderReviewLines,
 	reviewDelegationFromAuthority,
@@ -31,7 +36,12 @@ import { validateWorkspaceGuard, type WorkspaceGuardRecord } from "./workspace-g
 import { bindDelegationBoundedTaskContractV2 } from "./delegation-transaction-artifacts.ts";
 import {
 	delegationReviewRelativePathV2,
+	hasDelegationSemanticRepairAuthorityV2,
+	hasDelegationSemanticReviewAuthorityV2,
 	persistDelegationReviewProvisionalV2,
+	publishDelegationSemanticRepairDecisionV1,
+	publishHistoricalSemanticMigrationAcceptanceV2,
+	publishHistoricalSemanticMigrationPresentationV2,
 	publishDelegationReviewV2,
 	readDelegationCommittedGenerationV2,
 	readDelegationReviewV2,
@@ -39,6 +49,10 @@ import {
 	type DelegationReviewArtifactV2,
 	type DelegationTransactionStorageOptions,
 } from "./delegation-transaction-storage.ts";
+import {
+	collectHistoricalSemanticMigration,
+	type HistoricalSemanticMigrationProjection,
+} from "./historical-semantic-migration.ts";
 import {
 	DELEGATION_TRANSACTION_HASH_RE,
 	type DelegationTransactionRecord,
@@ -76,6 +90,7 @@ export type DelegationReviewV2ErrorCode =
 	| "invalid_state"
 	| "review_invalid"
 	| "review_conflict"
+	| "semantic_acceptance_required"
 	| "storage_failure";
 
 export interface DelegationReviewV2Success {
@@ -85,6 +100,10 @@ export interface DelegationReviewV2Success {
 	review_hash: string;
 	review_path: string;
 	finalized: boolean;
+	semantic_authority?: "embedded" | "migration_presented" | "migration_accepted" | "not_required" | "repair_required";
+	migration_binding_hash?: string;
+	repair_decision_hash?: string;
+	repair_reason_hash?: string;
 }
 
 export interface DelegationReviewV2Failure {
@@ -107,11 +126,17 @@ export interface ReviewDelegationV2Input {
 	secrets?: readonly string[];
 	now?: string;
 	/** Explicit Sol decision.  Omission performs scope/integrity presentation only. */
-	semanticDecision?: "ACCEPT";
+	semanticDecision?: "ACCEPT" | "REPAIR";
 	/** Exact hash shown in the prior complete provisional packet. */
 	expectedBoundDiffHash?: string;
+	/** Exact historical migration binding shown by the preceding presentation call. */
+	expectedMigrationBindingHash?: string;
+	/** Bounded Sol-authored reason persisted only for an explicit REPAIR decision. */
+	repairReason?: string;
 	/** Runtime-validated active commander identity, required for ACCEPT. */
 	reviewer?: { provider: string; model: string };
+	/** Runtime model identity used to bind a historical migration presentation. */
+	presenter?: { provider: string; model: string };
 	storage?: DelegationTransactionStorageOptions;
 }
 
@@ -121,6 +146,73 @@ function fail(
 	details?: Pick<DelegationReviewV2Failure, "review" | "transaction" | "binding_hash">,
 ): DelegationReviewV2Failure {
 	return { ok: false, error: { code, message: message.slice(0, 240) }, ...details };
+}
+
+function validSolIdentity(value: { provider: string; model: string } | undefined): value is {
+	provider: "openai" | "openai-codex";
+	model: "gpt-5.6-sol";
+} {
+	return value !== undefined && COMMANDER_PROVIDERS.includes(value.provider as (typeof COMMANDER_PROVIDERS)[number]) &&
+		value.model === COMMANDER_MODEL_ID;
+}
+
+function validRepairReason(value: unknown): value is string {
+	return typeof value === "string" && value === value.trim() && value.length > 0 &&
+		Buffer.byteLength(value, "utf8") <= 1_024 && !value.includes("\0");
+}
+
+function historicalMigrationLines(projection: HistoricalSemanticMigrationProjection, accepted: boolean): string[] {
+	return [
+		`semantic migration: ${accepted ? "ACCEPTED" : "REQUIRED"} — upgrade-era mechanical FINAL; historical files remain immutable`,
+		`migration old head: ${projection.old_git_head}`,
+		`migration new head: ${projection.candidate_git_head}`,
+		`migration head delta: ${projection.head_delta_paths.length} path(s); raw hash ${projection.head_delta_hash}`,
+		...projection.head_delta_paths.map((path) => `  - ${JSON.stringify(path)}`),
+		`migration W/D/S content: ${projection.closed_content_hash}`,
+		`migration baseline guard: ${projection.baseline_guard_hash}`,
+		`migration binding: ${projection.migration_binding_hash}`,
+		accepted
+			? "migration decision: ACCEPTED by explicit Sol decision bound to both hashes"
+			: "migration decision: after inspecting this entire packet, ACCEPT must bind both the packet hash and migration binding",
+	];
+}
+
+function sameMigrationProjection(left: HistoricalSemanticMigrationProjection, right: HistoricalSemanticMigrationProjection): boolean {
+	return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function historicalMigrationConflictHash(input: {
+	delegationId: string;
+	acceptedBindingHash: string;
+	current: string;
+	path?: string;
+}): string {
+	return canonicalHash({
+		schema_version: 1,
+		kind: "historical-semantic-migration-conflict-v1",
+		delegation_id: input.delegationId,
+		accepted_binding_hash: input.acceptedBindingHash,
+		current: input.current,
+		...(input.path === undefined ? {} : { path: input.path }),
+	});
+}
+
+function renderHistoricalMigrationPacket(
+	record: ReviewRecord,
+	projection: HistoricalSemanticMigrationProjection,
+	accepted: boolean,
+	maxBytes: number | undefined,
+	maxLines: number | undefined,
+): ReviewResult | undefined {
+	const lines = historicalMigrationLines(projection, accepted);
+	const lineCap = maxLines ?? DEFAULT_REVIEW_MAX_LINES;
+	const byteCap = maxBytes ?? DEFAULT_REVIEW_MAX_BYTES;
+	const manifestBytes = Buffer.byteLength(lines.join("\n"), "utf8") + 1;
+	const reviewCaps = { maxLines: lineCap - lines.length, maxBytes: byteCap - manifestBytes };
+	if (reviewCaps.maxLines < 16 || reviewCaps.maxBytes < 1024 || !isReviewPresentationFullyVisible(record, reviewCaps)) {
+		return undefined;
+	}
+	return { ok: true, record, lines: [...lines, ...renderReviewLines(record, reviewCaps)] };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -352,23 +444,29 @@ function artifactFor(state: DelegationTransactionRecord, reviewedAt: string, rev
 /** Public fail-closed v2 review boundary. */
 export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promise<DelegationReviewV2Result> {
 	try {
-		const semanticDecisionSupplied = input.semanticDecision !== undefined || input.expectedBoundDiffHash !== undefined || input.reviewer !== undefined;
-		if (
-			semanticDecisionSupplied
-			&& (input.semanticDecision !== "ACCEPT"
-				|| typeof input.expectedBoundDiffHash !== "string"
-				|| !DELEGATION_TRANSACTION_HASH_RE.test(input.expectedBoundDiffHash)
-				|| input.reviewer === undefined
-				|| input.reviewer.model !== COMMANDER_MODEL_ID
-				|| !COMMANDER_PROVIDERS.includes(input.reviewer.provider))
-		) {
-			return fail("review_invalid", "semantic ACCEPT requires an exact expected bound diff hash");
+		const semanticDecisionSupplied = input.semanticDecision !== undefined || input.expectedBoundDiffHash !== undefined ||
+			input.expectedMigrationBindingHash !== undefined || input.repairReason !== undefined || input.reviewer !== undefined;
+		const acceptDecision = input.semanticDecision === "ACCEPT";
+		const repairDecision = input.semanticDecision === "REPAIR";
+		const commonDecisionValid = typeof input.expectedBoundDiffHash === "string" &&
+			DELEGATION_TRANSACTION_HASH_RE.test(input.expectedBoundDiffHash) && validSolIdentity(input.reviewer);
+		const decisionShapeValid = acceptDecision
+			? commonDecisionValid && input.repairReason === undefined &&
+				(input.expectedMigrationBindingHash === undefined || DELEGATION_TRANSACTION_HASH_RE.test(input.expectedMigrationBindingHash))
+			: repairDecision
+				? commonDecisionValid && input.expectedMigrationBindingHash === undefined && validRepairReason(input.repairReason)
+				: !semanticDecisionSupplied;
+		if (!decisionShapeValid) {
+			return fail("review_invalid", "semantic decision requires an exact bound hash, active Sol identity, and decision-specific fields");
 		}
 		// Required ordering: immutable committed-generation authority is always
 		// resolved before the mutable v2 review path is inspected.
 		const generation = await readDelegationCommittedGenerationV2(input.projectRoot, input.delegationId, input.storage);
 		if (!generation.ok) return fail("authority_invalid", "delegation committed-generation authority is unavailable");
 		const state = generation.value.state;
+		if (repairDecision && state.status !== "PENDING_REVIEW") {
+			return fail("invalid_state", "semantic REPAIR is valid only for a current provisional implementation review", { transaction: state });
+		}
 		const authorityInfo = authorityFromGeneration(generation.value);
 		if (authorityInfo === undefined) return fail("invalid_state", "delegation is not a strictly bound implementation review", { transaction: state });
 		const reviewPath = delegationReviewRelativePathV2(state.delegation_id);
@@ -384,10 +482,171 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 		if (state.status === "REVIEWED") {
 			const existing = await readDelegationReviewV2(input.projectRoot, state.delegation_id, input.storage);
 			if (!existing.ok || !existing.value.finalized) return fail("authority_invalid", "finalized review authority is unavailable", { transaction: state });
+			const historicalSemanticMigrationRequired = existing.value.review.schema_version === 2 &&
+				existing.value.review.checked_paths.length > 0 && !isStrictSemanticAcceptedOrZeroDelta(existing.value.review);
+			if (historicalSemanticMigrationRequired) {
+				if (authorityInfo.kind !== "guard-v2") {
+					return fail("authority_invalid", "historical review is not eligible for schema-2 semantic migration", { transaction: state });
+				}
+				const candidate = await collectHistoricalSemanticMigration({
+					projectRoot: input.projectRoot,
+					delegationId: state.delegation_id,
+					contractHash: state.contract_hash,
+					baseReviewHash: existing.value.review_hash,
+					review: existing.value.review,
+					afterGuard: authorityInfo.after_guard,
+					exec: input.exec,
+				});
+				if (!candidate.ok) {
+					const acceptedMigration = existing.value.semantic_migration?.status === "ACCEPTED"
+						? existing.value.semantic_migration
+						: undefined;
+					if (acceptedMigration !== undefined) {
+						return fail(
+							"review_conflict",
+							`accepted historical semantic migration is stale because current authority is ${candidate.code}${candidate.path === undefined ? "" : ` at ${candidate.path}`}; start a fresh successor delegation`,
+							{
+								transaction: state,
+								binding_hash: historicalMigrationConflictHash({
+									delegationId: state.delegation_id,
+									acceptedBindingHash: acceptedMigration.migration_projection.migration_binding_hash,
+									current: candidate.code,
+									...(candidate.path === undefined ? {} : { path: candidate.path }),
+								}),
+							},
+						);
+					}
+					return fail(
+						"semantic_acceptance_required",
+						`historical semantic migration is blocked by ${candidate.code}${candidate.path === undefined ? "" : ` at ${candidate.path}`}; no worker repair or ordinary successor may erase this authority`,
+						{ transaction: state },
+					);
+				}
+				const packet = renderHistoricalMigrationPacket(
+					existing.value.review,
+					candidate.projection,
+					semanticDecisionSupplied || existing.value.semantic_migration?.status === "ACCEPTED",
+					input.maxBytes,
+					input.maxLines,
+				);
+				if (packet === undefined) {
+					return fail("review_invalid", "historical migration packet does not fit the authorized complete presentation envelope", { transaction: state });
+				}
+				const now = input.now ?? new Date().toISOString();
+				const migrationPresenter = validSolIdentity(input.presenter) ? input.presenter : undefined;
+				if (!semanticDecisionSupplied && migrationPresenter === undefined) {
+					return fail("review_invalid", "historical migration presentation requires the active Sol commander", { transaction: state });
+				}
+				const common = {
+					delegation_id: state.delegation_id,
+					contract_hash: state.contract_hash,
+					worker_identity: state.worker_identity,
+					expected_generation: state.generation,
+					expected_revision: 4 as const,
+					now,
+					base_review_hash: existing.value.review_hash,
+					expected_bound_diff_hash: existing.value.review.bound_diff_hash,
+					projection: candidate.projection,
+				};
+				let priorMigration = existing.value.semantic_migration;
+				if (priorMigration !== undefined && !sameMigrationProjection(priorMigration.migration_projection, candidate.projection)) {
+					if (priorMigration.status === "ACCEPTED") {
+						return fail("review_conflict", "accepted historical semantic migration binding is stale; start a fresh successor delegation", {
+							transaction: state,
+							binding_hash: historicalMigrationConflictHash({
+								delegationId: state.delegation_id,
+								acceptedBindingHash: priorMigration.migration_projection.migration_binding_hash,
+								current: candidate.projection.migration_binding_hash,
+							}),
+						});
+					}
+					if (semanticDecisionSupplied) {
+						return fail("review_conflict", "historical migration projection changed after presentation; present the current packet before ACCEPT", {
+							transaction: state,
+							binding_hash: candidate.projection.migration_binding_hash,
+						});
+					}
+					priorMigration = undefined;
+				}
+				if (priorMigration?.status === "ACCEPTED") {
+					const acceptance = priorMigration.acceptance;
+					if (semanticDecisionSupplied && (
+						input.expectedBoundDiffHash !== acceptance.expected_bound_diff_hash ||
+						input.expectedMigrationBindingHash !== acceptance.expected_migration_binding_hash ||
+						!validSolIdentity(input.reviewer) || input.reviewer.provider !== acceptance.reviewer.provider ||
+						input.reviewer.model !== acceptance.reviewer.model
+					)) return fail("review_conflict", "semantic migration ACCEPT replay does not match immutable authority", { transaction: state });
+					return {
+						ok: true,
+						review: packet,
+						transaction: state,
+						review_hash: existing.value.review_hash,
+						review_path: existing.value.review_path,
+						finalized: true,
+						semantic_authority: "migration_accepted",
+						migration_binding_hash: candidate.projection.migration_binding_hash,
+					};
+				}
+				if (!semanticDecisionSupplied) {
+					if (priorMigration?.status === "PRESENTED") {
+						return {
+							ok: true,
+							review: packet,
+							transaction: state,
+							review_hash: existing.value.review_hash,
+							review_path: existing.value.review_path,
+							finalized: true,
+							semantic_authority: "migration_presented",
+							migration_binding_hash: candidate.projection.migration_binding_hash,
+						};
+					}
+					const presented = await publishHistoricalSemanticMigrationPresentationV2(input.projectRoot, {
+						...common,
+						presenter: migrationPresenter!,
+					}, input.storage);
+					if (!presented.ok) return fail(presented.error.code === "storage_failure" ? "storage_failure" : "review_conflict", presented.error.message, { transaction: state });
+					return {
+						ok: true,
+						review: packet,
+						transaction: state,
+						review_hash: existing.value.review_hash,
+						review_path: existing.value.review_path,
+						finalized: true,
+						semantic_authority: presented.value.status === "ACCEPTED" ? "migration_accepted" : "migration_presented",
+						migration_binding_hash: candidate.projection.migration_binding_hash,
+					};
+				}
+				if (input.expectedMigrationBindingHash === undefined) {
+					return fail("review_invalid", "historical migration ACCEPT requires expected_migration_binding_hash from the preceding complete presentation", { transaction: state });
+				}
+				if (input.expectedBoundDiffHash !== existing.value.review.bound_diff_hash ||
+					input.expectedMigrationBindingHash !== candidate.projection.migration_binding_hash || !validSolIdentity(input.reviewer)) {
+					return fail("review_conflict", "historical migration ACCEPT does not match the current packet, migration binding, or Sol identity", { transaction: state });
+				}
+				const accepted = await publishHistoricalSemanticMigrationAcceptanceV2(input.projectRoot, {
+					...common,
+					expected_migration_binding_hash: input.expectedMigrationBindingHash,
+					reviewer: input.reviewer,
+				}, input.storage);
+				if (!accepted.ok) return fail(accepted.error.code === "storage_failure" ? "storage_failure" : "review_conflict", accepted.error.message, { transaction: state });
+				return {
+					ok: true,
+					review: packet,
+					transaction: state,
+					review_hash: existing.value.review_hash,
+					review_path: existing.value.review_path,
+					finalized: true,
+					semantic_authority: "migration_accepted",
+					migration_binding_hash: candidate.projection.migration_binding_hash,
+				};
+			}
+			if (input.expectedMigrationBindingHash !== undefined) {
+				return fail("review_invalid", "expected_migration_binding_hash is valid only for an explicitly presented historical migration", { transaction: state });
+			}
 			if (semanticDecisionSupplied) {
 				const acceptance = existing.value.review.semantic_acceptance;
 				if (existing.value.review.semantic_review !== "accepted" || acceptance === undefined) {
-					return fail("authority_invalid", "historical or zero-delta finalized scope/integrity authority cannot be upgraded to semantic acceptance; use a fresh bounded repair", { transaction: state });
+					return fail("authority_invalid", "zero-delta finalized authority needs no semantic ACCEPT", { transaction: state });
 				}
 				if (acceptance.expected_bound_diff_hash !== input.expectedBoundDiffHash ||
 					acceptance.reviewer.provider !== input.reviewer!.provider || acceptance.reviewer.model !== input.reviewer!.model) {
@@ -445,6 +704,7 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 
 		const priorRead = await readDelegationReviewV2(input.projectRoot, state.delegation_id, input.storage);
 		let priorReview: ReviewRecord | null = null;
+		let priorRepairDecision = priorRead.ok ? priorRead.value.semantic_repair : undefined;
 		if (priorRead.ok) {
 			if (priorRead.value.finalized) return fail("review_conflict", "pending transaction conflicts with a finalized review", { transaction: state });
 			priorReview = priorRead.value.review;
@@ -453,13 +713,19 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 		}
 		if (semanticDecisionSupplied) {
 			if (priorReview === null) {
-				return fail("review_invalid", "semantic ACCEPT requires a complete provisional scope/integrity packet from an earlier call", { transaction: state });
+				return fail("review_invalid", "semantic decision requires a complete provisional scope/integrity packet from an earlier call", { transaction: state });
 			}
 			if (priorReview.bound_diff_hash !== input.expectedBoundDiffHash) {
-				return fail("review_conflict", "semantic ACCEPT hash does not match the prior scope/integrity packet", { transaction: state });
+				return fail("review_conflict", "semantic decision hash does not match the prior scope/integrity packet", { transaction: state });
 			}
 			if (!isScopeIntegrityPacketComplete(priorReview)) {
-				return fail("review_invalid", "semantic ACCEPT requires a complete untruncated and drift-free scope/integrity packet", { transaction: state });
+				return fail("review_invalid", "semantic decision requires a complete untruncated and drift-free scope/integrity packet", { transaction: state });
+			}
+			if (priorReview.semantic_review !== "required" || priorReview.semantic_acceptance !== undefined) {
+				return fail("review_invalid", "semantic decision requires a provisional semantic-review-required packet, never self-asserted authority", { transaction: state });
+			}
+			if (acceptDecision && priorRepairDecision !== undefined) {
+				return fail("review_conflict", "semantic ACCEPT conflicts with the immutable REPAIR decision", { transaction: state });
 			}
 		}
 		if (authorityInfo.kind === "legacy-v2") {
@@ -510,7 +776,51 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 		let review: ReviewResult;
 		if (semanticDecisionSupplied) {
 			if (relevance.value.binding.projection_hash !== input.expectedBoundDiffHash || priorReview === null) {
-				return fail("review_conflict", "semantic ACCEPT no longer matches the current diff binding", { transaction: state });
+				return fail("review_conflict", "semantic decision no longer matches the current diff binding", { transaction: state });
+			}
+			if (!await validateReviewPresentationAgainstAuthority({
+				projectRoot: input.projectRoot,
+				record: priorReview,
+				authority,
+				exec: input.exec,
+				secrets: input.secrets,
+			})) {
+				return fail("review_invalid", "semantic decision presentation proof no longer matches the current authoritative redacted source streams", { transaction: state });
+			}
+			if (repairDecision) {
+				const decided = await publishDelegationSemanticRepairDecisionV1(input.projectRoot, {
+					delegation_id: state.delegation_id,
+					contract_hash: state.contract_hash,
+					worker_identity: { ...state.worker_identity },
+					expected_generation: state.generation,
+					expected_revision: state.revision,
+					now: reviewedAt,
+					base_review_hash: priorRead.ok ? priorRead.value.review_hash : "",
+					expected_bound_diff_hash: input.expectedBoundDiffHash!,
+					repair_reason: input.repairReason!,
+					reviewer: {
+						provider: input.reviewer!.provider as "openai" | "openai-codex",
+						model: COMMANDER_MODEL_ID,
+					},
+				}, input.storage);
+				if (!decided.ok) {
+					return fail(decided.error.code === "storage_failure" ? "storage_failure" : "review_conflict", decided.error.message, { transaction: state });
+				}
+				return {
+					ok: true,
+					review: {
+						ok: true,
+						record: priorReview,
+						lines: renderReviewLines(priorReview, { maxBytes: input.maxBytes, maxLines: input.maxLines }),
+					},
+					transaction: state,
+					review_hash: priorRead.ok ? priorRead.value.review_hash : "",
+					review_path: reviewPath,
+					finalized: false,
+					semantic_authority: "repair_required",
+					repair_decision_hash: decided.value.decision_hash,
+					repair_reason_hash: decided.value.repair_reason_hash,
+				};
 			}
 			const acceptedRecord: ReviewRecord = {
 				...priorReview,
@@ -531,6 +841,12 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 				record: acceptedRecord,
 				lines: renderReviewLines(acceptedRecord, { maxBytes: input.maxBytes, maxLines: input.maxLines }),
 			};
+		} else if (priorRead.ok && priorRepairDecision !== undefined && hasDelegationSemanticRepairAuthorityV2(priorRead.value)) {
+			review = {
+				ok: true,
+				record: priorReview!,
+				lines: renderReviewLines(priorReview!, { maxBytes: input.maxBytes, maxLines: input.maxLines }),
+			};
 		} else {
 			review = await reviewDelegationFromAuthority({
 				projectRoot: input.projectRoot,
@@ -546,7 +862,20 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 				reviewPath,
 			});
 		}
-		if (!review.ok || review.record === undefined) return fail("review_invalid", "delegation diff review failed closed", { review, transaction: state });
+		if (!review.ok || review.record === undefined) return fail("review_invalid", review.error ?? "delegation diff review failed closed", { review, transaction: state });
+		if (priorRepairDecision !== undefined) {
+			return {
+				ok: true,
+				review,
+				transaction: state,
+				review_hash: priorRead.ok ? priorRead.value.review_hash : "",
+				review_path: reviewPath,
+				finalized: false,
+				semantic_authority: "repair_required",
+				repair_decision_hash: priorRepairDecision.decision_hash,
+				repair_reason_hash: priorRepairDecision.repair_reason_hash,
+			};
+		}
 		const artifact = artifactFor(state, reviewedAt, review.record);
 		const cas = {
 			delegation_id: state.delegation_id,

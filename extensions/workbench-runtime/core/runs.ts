@@ -797,6 +797,53 @@ export async function readManifest(projectRoot: string, runId: string): Promise<
 	}
 }
 
+function minimallyValidLegacyRunRecord(value: RunRecord, runId: string): boolean {
+	return value.schema_version === RUN_SCHEMA_VERSION &&
+		value.run_transaction_schema_version === undefined &&
+		value.run_outcome === undefined &&
+		value.artifact_manifest_path === undefined &&
+		value.run_id === runId &&
+		typeof value.recipe === "string" && value.recipe.length > 0 &&
+		typeof value.started_at === "string" && Number.isFinite(Date.parse(value.started_at)) &&
+		typeof value.finished_at === "string" && Number.isFinite(Date.parse(value.finished_at)) &&
+		typeof value.duration_ms === "number" && Number.isFinite(value.duration_ms) && value.duration_ms >= 0 &&
+		(value.exit_code === null || (typeof value.exit_code === "number" && Number.isInteger(value.exit_code))) &&
+		typeof value.timed_out === "boolean" &&
+		typeof value.cancelled === "boolean" &&
+		Array.isArray(value.artifact_paths) && value.artifact_paths.every((path) => typeof path === "string");
+}
+
+async function v2RunMarkerState(projectRoot: string, runId: string): Promise<"absent" | "present" | "unavailable"> {
+	const directory = runDirFor(projectRoot, runId);
+	// Keep these literals local: run-transaction.ts imports this module, so a
+	// static import of its constants would introduce a runtime cycle.
+	for (const name of ["run-commit.json", "artifact-manifest.json"] as const) {
+		try {
+			await lstat(join(directory, name));
+			return "present";
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code !== "ENOENT") return "unavailable";
+		}
+	}
+	return "absent";
+}
+
+/**
+ * Diagnostic-only legacy discriminator. It never grants run or Gate
+ * authority: callers may use it only to replace a generic unavailable reason
+ * with an actionable upgrade message. Any v2 marker, mixed fields, invalid
+ * identity, or I/O uncertainty stays on the ordinary fail-closed path.
+ */
+export async function isPureLegacyRunForDiagnostic(projectRoot: string, runId: string): Promise<boolean> {
+	if (!isValidRunId(runId)) return false;
+	if (await v2RunMarkerState(projectRoot, runId) !== "absent") return false;
+	const manifest = await readManifest(projectRoot, runId);
+	if (!manifest || !minimallyValidLegacyRunRecord(manifest, runId)) return false;
+	// A concurrently appearing v2 marker must not be described as legacy even
+	// though the result remains non-authoritative either way.
+	return await v2RunMarkerState(projectRoot, runId) === "absent";
+}
+
 function minimallyValidRunRecord(value: RunRecord, runId: string): boolean {
 	return value.schema_version === RUN_MANIFEST_SCHEMA_VERSION_V2 &&
 		value.run_id === runId &&

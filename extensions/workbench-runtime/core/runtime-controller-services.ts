@@ -2,6 +2,7 @@
 
 import { compareRuns } from "./compare.ts";
 import { completeDefaultDelegationDeliveryV2 } from "./delegation-default-delivery.ts";
+import { acquireProjectDelegationStartLockV1, releaseProjectDelegationStartLockV1 } from "./delegation-start-lock.ts";
 import { executeDelegationV2 } from "./delegation-execution-v2.ts";
 import { makeDelegationId, readDelegationLedger } from "./delegation-ledger.ts";
 import { reviewDelegationV2 } from "./delegation-review-v2.ts";
@@ -26,6 +27,8 @@ const compare = Object.freeze({ compareRuns, buildTrustedRecoveryAuthority }) sa
 const delegate = Object.freeze({
 	now,
 	makeDelegationId,
+	acquireStartLock: acquireProjectDelegationStartLockV1,
+	releaseStartLock: releaseProjectDelegationStartLockV1,
 	readCommittedGeneration: readDelegationCommittedGenerationV2,
 	readRecoverableUnpublished: readRecoverableUnpublishedDelegationV2,
 	readLegacyLedger: readDelegationLedger,

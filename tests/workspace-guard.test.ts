@@ -289,6 +289,7 @@ test("control artifacts are separately bounded and cannot change the guard hash;
 		const common = [
 			{ status: "??", path: "src/live.ts" },
 			{ status: "??", path: ".pi/workbench/runs-sibling/kept.json" },
+			{ status: "??", path: ".pi/workbench/delegation-start.lock-extra" },
 		] as const;
 		const first = success(await collectWorkspaceGuard({
 			project_root: root,
@@ -296,6 +297,8 @@ test("control artifacts are separately bounded and cannot change the guard hash;
 				...common,
 				{ status: "??", path: ".pi/workbench/runs/one/report.json" },
 				{ status: "??", path: ".pi/workbench/delegations/d1/log.json" },
+				{ status: "??", path: ".pi/workbench/delegation-start.lock" },
+				{ status: "??", path: `.pi/workbench/delegation-start.lock.candidate.${"a".repeat(32)}` },
 			]) }),
 		}));
 		const second = success(await collectWorkspaceGuard({
@@ -303,17 +306,21 @@ test("control artifacts are separately bounded and cannot change the guard hash;
 			exec: fakeExec({ statusStdout: statusOutput([
 				...common,
 				{ status: "??", path: ".pi/workbench/tool-results/t2/result.json" },
+				{ status: "??", path: `.pi/workbench/delegation-start.lock.release.${"b".repeat(32)}` },
 			]) }),
 		}));
 		assert.deepEqual(first.entries.map((entry) => entry.path), [
-			".pi/workbench/runs-sibling/kept.json", "src/live.ts",
+			".pi/workbench/delegation-start.lock-extra", ".pi/workbench/runs-sibling/kept.json", "src/live.ts",
 		]);
 		assert.deepEqual(first.irrelevant_artifact_paths, [
-			".pi/workbench/delegations/d1/log.json", ".pi/workbench/runs/one/report.json",
+			`.pi/workbench/delegation-start.lock`,
+			`.pi/workbench/delegation-start.lock.candidate.${"a".repeat(32)}`,
+			".pi/workbench/delegations/d1/log.json",
+			".pi/workbench/runs/one/report.json",
 		]);
 		assert.notDeepEqual(first.irrelevant_artifact_paths, second.irrelevant_artifact_paths);
 		assert.equal(first.workspace_guard_hash, second.workspace_guard_hash);
-		assert.equal(first.meter.stat_calls, 4, "irrelevant artifact paths are never stated");
+		assert.equal(first.meter.stat_calls, 6, "irrelevant artifact paths are never stated");
 	} finally {
 		await cleanup(root);
 	}

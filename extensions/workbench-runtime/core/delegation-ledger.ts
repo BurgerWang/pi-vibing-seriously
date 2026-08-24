@@ -475,6 +475,22 @@ export function isToolResultReceiptPath(projectRoot: string, candidatePath: stri
 }
 
 /**
+ * True only for the fixed project delegation-start lock and the bounded,
+ * token-suffixed publication/release/recovery siblings created by the lock
+ * implementation. These files are workbench coordination artifacts, not
+ * project changes. Keep the match exact: similarly named user files and
+ * descendants remain visible to drift detection.
+ */
+export function isDelegationStartLockArtifactPath(_projectRoot: string, candidatePath: string): boolean {
+	const rel = normalizeStatusPath(candidatePath);
+	if (!rel) return false;
+	const fixed = `${CONFIG_DIR_NAME}/workbench/delegation-start.lock`;
+	if (rel === fixed) return true;
+	if (!rel.startsWith(`${fixed}.`)) return false;
+	return /^\.(?:candidate|release|recovered)\.[a-f0-9]{32}$/.test(rel.slice(fixed.length));
+}
+
+/**
  * Normalize a porcelain path to forward-slash project-relative form.
  * Absolute POSIX/Windows/backslash paths and `..` escapes are refused
  * (returns undefined). Empty and `.` segments are dropped.
@@ -777,6 +793,11 @@ export async function collectGitFacts(projectRoot: string, exec: ExecFn): Promis
 		// before-the-cap exclusion, so recovery artifacts never trigger
 		// refusal and never enter changedPaths/statuses/digests/hash inputs.
 		if (isToolResultReceiptPath(root, normalized)) continue;
+		// The cross-session delegation-start mutex and its strictly named
+		// atomic publication/release artifacts exist only while the workbench
+		// prepares a delegation. They must not become worker delta or trigger
+		// workspace drift, while sibling names remain ordinary project paths.
+		if (isDelegationStartLockArtifactPath(root, normalized)) continue;
 		// FAIL CLOSED on overflow: a silently truncated path set could let
 		// diff hashing and scope review PASS on a partial diff, so a
 		// distinct non-ledger path beyond MAX_CHANGED_PATHS REJECTS

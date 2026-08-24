@@ -1,7 +1,8 @@
 /** S1.1 strict public review/status/gate wiring for delegation transactions v2. */
 
 import assert from "node:assert/strict";
-import { mkdir, readFile, readdir, symlink, unlink, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { chmod, mkdir, readFile, readdir, symlink, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { before, test } from "node:test";
 
@@ -12,6 +13,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 import workbenchRuntime from "../extensions/workbench-runtime/index.ts";
+import { reconcileProjectDelegationAuthorityV2 } from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
 import { deriveFinalizedDelegationWorkspaceFactsV2 } from "../extensions/workbench-runtime/core/delegation-workspace-v2.ts";
 import { bindDelegationBoundedTaskContractV2, buildDelegationCommittedArtifactsV2 } from "../extensions/workbench-runtime/core/delegation-transaction-artifacts.ts";
 import { finalizeDelegationChangeSetLifecycleV2, prepareDelegationChangeSetLifecycleV2 } from "../extensions/workbench-runtime/core/delegation-change-set-lifecycle.ts";
@@ -22,6 +24,8 @@ import {
 	persistRunningDelegationTransaction,
 	readDelegationCommittedGenerationV2,
 	readDelegationReviewV2,
+	hasDelegationSemanticRepairAuthorityV2,
+	hasDelegationSemanticReviewAuthorityV2,
 	type DelegationCommittedRecords,
 } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
 import {
@@ -215,7 +219,11 @@ interface V2Fixture {
 	state: DelegationTransactionRecord;
 }
 
-async function seedV2(root: string, paths: string[] = ["src/a.ts"]): Promise<V2Fixture> {
+async function seedV2(
+	root: string,
+	paths: string[] = ["src/a.ts"],
+	workerContent: (path: string) => string | Buffer = (path) => `worker:${path}\n`,
+): Promise<V2Fixture> {
 	await initRepo(root, paths);
 	const contract = bindDelegationBoundedTaskContractV2({
 		task_kind: "implementation",
@@ -259,7 +267,7 @@ async function seedV2(root: string, paths: string[] = ["src/a.ts"]): Promise<V2F
 		assert.equal(begun.ok, true);
 		if (!begun.ok) throw new Error("journal begin failed");
 		revision = begun.value.revision;
-		await writeFile(join(root, path), `worker:${path}\n`);
+		await writeFile(join(root, path), workerContent(path));
 		const completed = await completeWriteJournalOperation({
 			project_root: root, delegation_id: ID, contract_hash: contract.value.contract_hash,
 			expected_revision: revision, operation_id: operationId, kind: "write", path, outcome: "succeeded",
@@ -382,12 +390,49 @@ async function latestGateRecord(root: string): Promise<Record<string, unknown>> 
 	return JSON.parse(await readFile(join(runs, names.at(-1)!, "gates.json"), "utf8")) as Record<string, unknown>;
 }
 
+async function gateRecord(root: string, runId: string): Promise<Record<string, unknown>> {
+	return JSON.parse(await readFile(join(root, CONFIG_DIR_NAME, "workbench", "runs", runId, "gates.json"), "utf8")) as Record<string, unknown>;
+}
+
 function semanticAccept(boundDiffHash: string): Record<string, unknown> {
 	return {
 		delegation_id: ID,
 		semantic_decision: "ACCEPT",
 		expected_bound_diff_hash: boundDiffHash,
 	};
+}
+
+function semanticRepair(boundDiffHash: string, repairReason: string): Record<string, unknown> {
+	return {
+		delegation_id: ID,
+		semantic_decision: "REPAIR",
+		expected_bound_diff_hash: boundDiffHash,
+		repair_reason: repairReason,
+	};
+}
+
+async function downgradeFinalToHistoricalMechanical(root: string, delegationId: string): Promise<{
+	reviewPath: string;
+	transactionPath: string;
+	boundDiffHash: string;
+}> {
+	const v2 = join(root, CONFIG_DIR_NAME, "workbench", "delegations", delegationId, "v2");
+	const reviewPath = join(v2, "review.json");
+	const transactionPath = join(v2, "transaction.json");
+	const artifact = JSON.parse(await readFile(reviewPath, "utf8")) as Record<string, any>;
+	const boundDiffHash = String(artifact.review.bound_diff_hash);
+	for (const field of [
+		"fully_presented_paths", "presentation_remaining_paths", "presentation_complete",
+		"presentation_progress",
+		"semantic_review", "semantic_acceptance",
+	]) delete artifact.review[field];
+	for (const entry of artifact.review.patch ?? []) delete entry.page;
+	const reviewBytes = `${JSON.stringify(artifact, null, 2)}\n`;
+	await writeFile(reviewPath, reviewBytes, "utf8");
+	const transaction = JSON.parse(await readFile(transactionPath, "utf8")) as Record<string, any>;
+	transaction.review.review_hash = createHash("sha256").update(reviewBytes).digest("hex");
+	await writeFile(transactionPath, `${JSON.stringify(transaction, null, 2)}\n`, "utf8");
+	return { reviewPath, transactionPath, boundDiffHash };
 }
 
 before(() => {
@@ -461,6 +506,199 @@ test("registered review is v2-first, stays provisional until a second Sol ACCEPT
 		assert.ok(check);
 		assert.equal(check.status, "PASS");
 		assert.match(JSON.stringify(check.evidence), /latest review PASS/);
+	});
+});
+
+test("registered review resumes a 14 KiB ordinary source page and only then permits Sol ACCEPT", async () => {
+	await withTempDir(async (root) => {
+		const source = Array.from({ length: 357 }, (_, index) =>
+			`def test_page_${String(index).padStart(3, "0")}(): assert ${index} >= 0  # page`,
+		).join("\n") + "\n";
+		const fixture = await seedV2(root, ["src/large.py"], () => source);
+		const { stub, ctx } = await runtimeFor(root, stateEntry(fixture.id, fixture.afterHash));
+		const reviewTool = tool(stub, "workbench_review_worker_diff");
+		const selection = { delegation_id: fixture.id, include_paths: ["src/large.py"] };
+
+		const first = await reviewTool.execute("v2-page-1", selection, undefined, undefined, ctx);
+		assert.equal(first.details.ok, true, text(first));
+		assert.equal(first.details.presentation_complete, false);
+		assert.deepEqual(first.details.next_include_paths, ["src/large.py"]);
+		assert.match(text(first), /page bytes 0-/);
+		assert.equal(latestState(stub).status, "PENDING_REVIEW");
+
+		const second = await reviewTool.execute("v2-page-2", selection, undefined, undefined, ctx);
+		assert.equal(second.details.ok, true, text(second));
+		assert.equal(second.details.presentation_complete, true);
+		assert.deepEqual(second.details.next_include_paths, []);
+		assert.match(text(second), /complete across contiguous hash-bound pages/);
+		assert.equal(latestState(stub).status, "PENDING_REVIEW");
+
+		const accepted = await reviewTool.execute(
+			"v2-page-accept",
+			semanticAccept(String(second.details.bound_diff_hash)),
+			undefined,
+			undefined,
+			ctx,
+		);
+		assert.equal(accepted.details.ok, true, text(accepted));
+		assert.equal(accepted.details.finalized, true);
+		assert.equal(accepted.details.review_status, "REVIEWED");
+		const strict = await readDelegationReviewV2(root, fixture.id);
+		assert.equal(strict.ok, true);
+		if (strict.ok) {
+			assert.equal(strict.value.review.presentation_progress?.[0]?.next_byte,
+				strict.value.review.presentation_progress?.[0]?.total_bytes);
+			assert.equal(strict.value.review.semantic_review, "accepted");
+		}
+	});
+});
+
+test("historical mechanical FINAL migrates by complete Sol presentation plus two-hash ACCEPT", async () => {
+	await withTempDir(async (root) => {
+		const fixture = await seedV2(root);
+		const firstRuntime = await runtimeFor(root, stateEntry(fixture.id, fixture.afterHash));
+		const firstReviewTool = tool(firstRuntime.stub, "workbench_review_worker_diff");
+		const initialPresented = await firstReviewTool.execute("historical-present", { delegation_id: fixture.id }, undefined, undefined, firstRuntime.ctx);
+		const accepted = await firstReviewTool.execute(
+			"historical-accept",
+			semanticAccept(String(initialPresented.details.bound_diff_hash)),
+			undefined,
+			undefined,
+			firstRuntime.ctx,
+		);
+		assert.equal(accepted.details.ok, true, text(accepted));
+
+		const historical = await downgradeFinalToHistoricalMechanical(root, fixture.id);
+		const immutableReview = await readFile(historical.reviewPath);
+		const immutableTransaction = await readFile(historical.transactionPath);
+		const strictHistorical = await readDelegationReviewV2(root, fixture.id);
+		assert.equal(strictHistorical.ok, true, strictHistorical.ok ? "" : strictHistorical.error.code);
+		if (strictHistorical.ok) assert.equal(strictHistorical.value.review.semantic_acceptance, undefined);
+
+		// Model the real upgrade case: a later commit materialised exactly the
+		// already-reviewed worker bytes and did not touch any fifth path.
+		await git(root, ["add", "--", "src/a.ts"]);
+		await git(root, ["commit", "-q", "-m", "materialize reviewed worker delta"]);
+		const { stub, ctx } = await runtimeFor(root, stateEntry(fixture.id, historical.boundDiffHash));
+		const status = await tool(stub, "workbench_delegation_status").execute("historical-status", {}, undefined, undefined, ctx);
+		assert.match(text(status), /latest\s+: .* PENDING_REVIEW/);
+		assert.match(text(status), /review v2\s+: PASS .*\(FINAL\)/);
+		assert.match(text(status), /semantic v2\s+: MISSING .*not hash-bound Sol ACCEPT/);
+		assert.match(text(status), /call workbench_review_worker_diff without a decision/);
+		await assert.rejects(tool(stub, "workbench_delegate_worker").execute(
+			"historical-mechanical-repair-refused",
+			{
+				task: "Do not erase an unaccepted historical review.",
+				task_kind: "diagnosis",
+				allowed_paths: ["src/**"],
+				acceptance_criteria: ["Historical authority remains blocking."],
+				verification: [],
+				timeout_seconds: 60,
+				repair_of: fixture.id,
+			},
+			undefined,
+			undefined,
+			ctx,
+		), /requires explicit historical semantic migration review first/);
+
+		const reviewTool = tool(stub, "workbench_review_worker_diff");
+		const presented = await reviewTool.execute(
+			"historical-migration-present", { delegation_id: fixture.id }, undefined, undefined, ctx,
+		);
+		assert.equal(presented.details.ok, true, text(presented));
+		assert.equal(presented.details.review_status, "PENDING_REVIEW");
+		assert.equal(presented.details.semantic_review, "required");
+		assert.match(text(presented), /semantic migration: REQUIRED/);
+		assert.match(text(presented), /migration decision: .*ACCEPT must bind both/);
+		const migrationBinding = String(presented.details.migration_binding_hash);
+		assert.match(migrationBinding, /^[0-9a-f]{64}$/u);
+		assert.equal(latestState(stub).status, "PENDING_REVIEW");
+
+		const acceptedMigration = await reviewTool.execute("historical-migration-accept", {
+			delegation_id: fixture.id,
+			semantic_decision: "ACCEPT",
+			expected_bound_diff_hash: historical.boundDiffHash,
+			expected_migration_binding_hash: migrationBinding,
+		}, undefined, undefined, ctx);
+		assert.equal(acceptedMigration.details.ok, true, text(acceptedMigration));
+		assert.equal(acceptedMigration.details.review_status, "REVIEWED");
+		assert.equal(acceptedMigration.details.semantic_review, "accepted");
+		assert.equal(acceptedMigration.details.migration_binding_hash, migrationBinding);
+		assert.equal(latestState(stub).status, "REVIEWED");
+		assert.deepEqual(await readFile(historical.reviewPath), immutableReview, "historical review bytes remain immutable");
+		assert.deepEqual(await readFile(historical.transactionPath), immutableTransaction, "historical transaction bytes remain immutable");
+		const deferredDifferentMirror = await reconcileProjectDelegationAuthorityV2({
+			project_root: root,
+			current_state: {
+				latestId: "20260817-185959-oldx",
+				status: "REVIEWED",
+				currentDiffHash: "1".repeat(64),
+				reviewedDiffHash: "1".repeat(64),
+				blockedWriteAttempts: 3,
+				updatedAt: NOW,
+			},
+			now: at(9),
+			exec: spawnExec,
+			defer_reviewed_freshness: true,
+		});
+		assert.equal(deferredDifferentMirror.ok, true);
+		if (deferredDifferentMirror.ok) {
+			assert.equal(deferredDifferentMirror.state?.latestId, fixture.id);
+			assert.equal(deferredDifferentMirror.state?.status, "PENDING_REVIEW", "defer never promotes a different session mirror before review freshness succeeds");
+			assert.equal(deferredDifferentMirror.state?.reviewedDiffHash, undefined);
+			assert.equal(deferredDifferentMirror.state?.blockedWriteAttempts, 3);
+		}
+
+		const reloaded = await runtimeFor(root, stateEntry(fixture.id, historical.boundDiffHash));
+		const reloadedStatus = await tool(reloaded.stub, "workbench_delegation_status").execute(
+			"historical-migration-reload", {}, undefined, undefined, reloaded.ctx,
+		);
+		assert.equal(latestState(reloaded.stub).status, "REVIEWED");
+		assert.equal(latestState(reloaded.stub).currentDiffHash, migrationBinding);
+		assert.equal(latestState(reloaded.stub).reviewedDiffHash, migrationBinding);
+		assert.match(text(reloadedStatus), /semantic v2\s+: ACCEPT \(migration\)/);
+		assert.match(text(reloadedStatus), new RegExp(migrationBinding));
+		await persistCompact(reloaded.stub, reloaded.ctx);
+		assert.equal(latestCompact(reloaded.stub).pendingDelegationReview, undefined);
+		assert.equal(latestCompact(reloaded.stub).reviewedDiffHash, migrationBinding);
+		const acceptedGateResult = await tool(reloaded.stub, "workbench_run_gate").execute(
+			"historical-migration-gate", { gates: "b6" }, undefined, undefined, reloaded.ctx,
+		);
+		const acceptedGateRecord = await gateRecord(root, String(acceptedGateResult.details.run_id));
+		const acceptedGate = (acceptedGateRecord.gates as Array<Record<string, unknown>>)
+			.find((candidate) => candidate.id === "b6");
+		const acceptedReviewCheck = (acceptedGate?.checks as Array<Record<string, unknown>> | undefined)
+			?.find((candidate) => candidate.check_id === "b6.6");
+		assert.equal(acceptedReviewCheck?.status, "PASS");
+
+		await chmod(join(root, "src/a.ts"), 0o755);
+		const driftedReview = await tool(reloaded.stub, "workbench_review_worker_diff").execute(
+			"historical-migration-review-after-drift", { delegation_id: fixture.id }, undefined, undefined, reloaded.ctx,
+		);
+		assert.equal(driftedReview.details.ok, false);
+		assert.equal(driftedReview.details.error, "review_conflict");
+		assert.match(String(driftedReview.details.binding_hash), /^[0-9a-f]{64}$/u);
+		assert.notEqual(driftedReview.details.binding_hash, migrationBinding);
+		assert.notEqual(driftedReview.details.next_action, "workbench_review_worker_diff");
+		assert.match(text(driftedReview), /accepted historical semantic migration is stale.*fresh successor delegation/);
+		assert.equal(latestState(reloaded.stub).status, "STALE", "review itself must persist accepted migration drift fail-closed");
+		const driftedStatus = await tool(reloaded.stub, "workbench_delegation_status").execute(
+			"historical-migration-mode-drift", {}, undefined, undefined, reloaded.ctx,
+		);
+		assert.equal(latestState(reloaded.stub).status, "STALE", "an unreviewed executable-bit change must invalidate migration authority");
+		assert.match(text(driftedStatus), /latest\s+: .* STALE/);
+		await persistCompact(reloaded.stub, reloaded.ctx);
+		assert.equal(latestCompact(reloaded.stub).pendingDelegationReview, true);
+		assert.equal(latestCompact(reloaded.stub).reviewedDiffHash, migrationBinding);
+		const staleGateResult = await tool(reloaded.stub, "workbench_run_gate").execute(
+			"historical-migration-stale-gate", { gates: "b6" }, undefined, undefined, reloaded.ctx,
+		);
+		const staleGateRecord = await gateRecord(root, String(staleGateResult.details.run_id));
+		const staleGate = (staleGateRecord.gates as Array<Record<string, unknown>>)
+			.find((candidate) => candidate.id === "b6");
+		const staleReviewCheck = (staleGate?.checks as Array<Record<string, unknown>> | undefined)
+			?.find((candidate) => candidate.check_id === "b6.6");
+		assert.equal(staleReviewCheck?.status, "BLOCKED");
 	});
 });
 
@@ -580,6 +818,57 @@ test("registered semantic ACCEPT rejects first-call, incomplete, hash-mismatch, 
 			assert.equal(strict.value.review.semantic_acceptance, undefined);
 		}
 		assert.equal(latestState(stub).status, "PENDING_REVIEW");
+	});
+});
+
+test("registered semantic REPAIR exposes exact repair_of guidance while strict review and Gate authority stay blocked", async () => {
+	await withTempDir(async (root) => {
+		const fixture = await seedV2(root);
+		const { stub, ctx } = await runtimeFor(root, stateEntry(fixture.id, fixture.afterHash));
+		const reviewTool = tool(stub, "workbench_review_worker_diff");
+		const presented = await reviewTool.execute(
+			"v2-repair-present", { delegation_id: fixture.id }, undefined, undefined, ctx,
+		);
+		assert.equal(presented.details.ok, true, text(presented));
+		assert.equal(presented.details.presentation_complete, true);
+		const boundHash = String(presented.details.bound_diff_hash);
+		const reason = "Canonicalize JSON before hashing, use max normalized latency, and fix the Rust float type.";
+
+		const repair = await reviewTool.execute(
+			"v2-repair-decide", semanticRepair(boundHash, reason), undefined, undefined, ctx,
+		);
+		assert.equal(repair.details.ok, true, text(repair));
+		assert.equal(repair.details.finalized, false);
+		assert.equal(repair.details.review_status, "PENDING_REVIEW");
+		assert.equal(repair.details.semantic_review, "repair_required");
+		assert.equal(repair.details.gate_authority, false);
+		assert.equal(repair.details.repair_of, fixture.id);
+		assert.equal(repair.details.next_action, "workbench_delegate_worker");
+		assert.match(String(repair.details.repair_decision_hash), /^[0-9a-f]{64}$/u);
+		assert.match(String(repair.details.repair_reason_hash), /^[0-9a-f]{64}$/u);
+		assert.match(text(repair), /start only exact repair_of/);
+		assert.equal(latestState(stub).status, "PENDING_REVIEW");
+
+		const strict = await readDelegationReviewV2(root, fixture.id);
+		assert.equal(strict.ok, true, strict.ok ? "" : JSON.stringify(strict.error));
+		if (strict.ok) {
+			assert.equal(strict.value.finalized, false);
+			assert.equal(strict.value.state.status, "PENDING_REVIEW");
+			assert.equal(strict.value.semantic_repair?.repair_reason, reason);
+			assert.equal(strict.value.semantic_repair?.expected_bound_diff_hash, boundHash);
+			assert.equal(hasDelegationSemanticRepairAuthorityV2(strict.value), true);
+			assert.equal(hasDelegationSemanticReviewAuthorityV2(strict.value), false);
+		}
+
+		const gateResult = await tool(stub, "workbench_run_gate").execute(
+			"v2-repair-gate", { gates: "b6" }, undefined, undefined, ctx,
+		);
+		const record = await gateRecord(root, String(gateResult.details.run_id));
+		const gate = (record.gates as Array<Record<string, unknown>>).find((candidate) => candidate.id === "b6");
+		const check = (gate?.checks as Array<Record<string, unknown>> | undefined)
+			?.find((candidate) => candidate.check_id === "b6.6");
+		assert.equal(check?.status, "BLOCKED");
+		assert.match(String(check?.blocked_reason), /PENDING_REVIEW|provisional|semantic/i);
 	});
 });
 

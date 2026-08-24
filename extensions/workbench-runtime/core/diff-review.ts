@@ -61,6 +61,12 @@
  *     tagged v2 binds the current W/D/S relevance projection; historical
  *     untagged v2/v1 binds the complete current full-diff hash.
  *     `include_paths` narrows only the rendered patch.
+ *   - ordinary-source continuation: when exactly one worker path is selected
+ *     and its complete redacted source/diff stream is at most 4 MiB, repeated
+ *     same-hash review calls resume the next contiguous UTF-8 byte page. The
+ *     cursor is bound to the stream SHA-256 and advances only when the page's
+ *     whole title/body fits the final bounded result; stream/binding changes
+ *     reset it and ACCEPT remains blocked until the cursor reaches the total.
  *   - Phase 5 (Execution Efficiency Optimization): CURRENT REGULAR
  *     `.svg`/`.json` worker paths LARGER than the default global review
  *     byte cap (COMPACT_MIN_BYTES = DEFAULT_REVIEW_MAX_BYTES = 32 KiB)
@@ -154,6 +160,23 @@ export const REVIEW_PATH_STATS_MAX_BYTES = 4 * 1024;
 export const REVIEW_CONTROL_MAX_LINES = 100;
 export const REVIEW_PATCH_MAX_LINES = 240;
 export const REVIEW_PATH_STATS_MAX_LINES = 60;
+/**
+ * Maximum complete redacted source/diff stream eligible for automatic
+ * continuation paging.  The stream is never persisted in full: only the
+ * currently visible page plus a hash-bound contiguous byte cursor is kept.
+ */
+export const REVIEW_PAGE_SOURCE_MAX_BYTES = MAX_DIGEST_BYTES;
+/** One durable presentation proof per checked worker path. */
+export const REVIEW_PRESENTATION_PROGRESS_MAX_ITEMS = 500;
+/** Bound the cumulative receipt chain stored for one path. */
+export const REVIEW_PRESENTATION_SEGMENT_MAX_ITEMS = 4_096;
+/** Bound total source bytes revalidated before semantic ACCEPT. */
+export const REVIEW_PRESENTATION_VALIDATION_MAX_BYTES = 64 * 1024 * 1024;
+/** Space reserved inside the patch section for the title and fail-closed marker. */
+const REVIEW_PAGE_ENVELOPE_RESERVE_BYTES = 1_152;
+const REVIEW_PAGE_ENVELOPE_RESERVE_LINES = 4;
+export const REVIEW_PAGE_BODY_MAX_BYTES = REVIEW_PATCH_MAX_BYTES - REVIEW_PAGE_ENVELOPE_RESERVE_BYTES;
+export const REVIEW_PAGE_BODY_MAX_LINES = REVIEW_PATCH_MAX_LINES - REVIEW_PAGE_ENVELOPE_RESERVE_LINES;
 
 /**
  * Compile the exact canonical payload accepted by readReviewRecord before
@@ -333,6 +356,36 @@ export interface ReviewPatchEntry {
 	 * source === "compact"; legacy records without the field stay readable.
 	 */
 	compact?: ReviewCompactFacts;
+	/**
+	 * Additive ordinary-source page identity.  A page is one contiguous
+	 * UTF-8 byte range of a complete, redacted source/diff stream.  Repeating
+	 * the same single include_path automatically resumes at end_byte.
+	 */
+	page?: ReviewPatchPage;
+}
+
+export interface ReviewPatchPage {
+	stream_sha256: string;
+	start_byte: number;
+	end_byte: number;
+	total_bytes: number;
+}
+
+/** Durable, same-bound-hash contiguous presentation cursor for one path. */
+export interface ReviewPresentationProgress {
+	path: string;
+	source: ReviewPatchEntry["source"];
+	stream_sha256: string;
+	next_byte: number;
+	total_bytes: number;
+	/** Contiguous page receipts from byte zero through next_byte. */
+	segments: ReviewPresentationSegment[];
+}
+
+export interface ReviewPresentationSegment {
+	start_byte: number;
+	end_byte: number;
+	page_sha256: string;
 }
 
 /** Bounded per-path patch stat (bytes of the rendered entry text; 0 when omitted). */
@@ -407,6 +460,12 @@ export interface ReviewRecord {
 	fully_presented_paths?: string[];
 	presentation_remaining_paths?: string[];
 	presentation_complete?: boolean;
+	/**
+	 * Additive automatic-page cursors. Historical records omit this field.
+	 * Each cursor starts at byte zero and advances only after the complete
+	 * page was present in the bounded tool result for the same bound hash.
+	 */
+	presentation_progress?: ReviewPresentationProgress[];
 	/** New strict semantic provenance. Historical records omit both fields. */
 	semantic_review?: "required" | "accepted" | "not_required";
 	semantic_acceptance?: SemanticAcceptanceRecord;
@@ -561,6 +620,7 @@ type ReviewFailureCode =
 	| "git_state_unavailable"
 	| "invalid_include_path"
 	| "include_path_not_in_diff"
+	| "presentation_page_unavailable"
 	| "review_persist_failed"
 	| "runtime_failure";
 
@@ -571,6 +631,7 @@ const REVIEW_FAILURE_TEXT: Readonly<Record<ReviewFailureCode, string>> = Object.
 	git_state_unavailable: "cannot collect the real git state; git status --porcelain failed",
 	invalid_include_path: "include_paths entry is not a safe project-relative path (absolute, drive-letter, parent escape, and overlong paths are refused)",
 	include_path_not_in_diff: "include_paths entry is not part of the worker diff",
+	presentation_page_unavailable: "the selected ordinary source cannot advance within the authorized review envelope or fixed 4 MiB paging ceiling",
 	review_persist_failed: "failed to write review record",
 	runtime_failure: "diff review failed closed",
 });
@@ -625,6 +686,30 @@ class ReviewLineBuilder {
 		this.lines.push(...lines);
 		return true;
 	}
+}
+
+interface ReviewSectionCaps {
+	controlBytes: number;
+	patchBytes: number;
+	statBytes: number;
+	controlLines: number;
+	patchLines: number;
+	statLines: number;
+}
+
+/** Keep review computation and final rendering on the same exact envelope. */
+function reviewSectionCaps(maxBytes: number, maxLines: number): ReviewSectionCaps {
+	// Two inter-section newline bytes are reserved inside the whole cap.
+	const allocatableBytes = Math.max(0, maxBytes - 2);
+	const controlBytes = Math.min(REVIEW_CONTROL_MAX_BYTES, Math.max(512, Math.floor(allocatableBytes / 4)));
+	const afterControlBytes = Math.max(0, allocatableBytes - controlBytes);
+	const statBytes = Math.min(REVIEW_PATH_STATS_MAX_BYTES, Math.floor(afterControlBytes / 5));
+	const patchBytes = Math.min(REVIEW_PATCH_MAX_BYTES, Math.max(0, afterControlBytes - statBytes));
+	const controlLines = Math.min(REVIEW_CONTROL_MAX_LINES, Math.max(12, Math.floor(maxLines / 4)));
+	const afterControlLines = Math.max(0, maxLines - controlLines);
+	const statLines = Math.min(REVIEW_PATH_STATS_MAX_LINES, Math.floor(afterControlLines / 5));
+	const patchLines = Math.min(REVIEW_PATCH_MAX_LINES, Math.max(0, afterControlLines - statLines));
+	return { controlBytes, patchBytes, statBytes, controlLines, patchLines, statLines };
 }
 
 function allowedScopeLine(allowedPaths: readonly string[]): string {
@@ -739,6 +824,84 @@ async function patchTextFor(
 		source: "file-content",
 		truncated: read.size > read.data.length,
 	};
+}
+
+interface PageablePatchStream {
+	text: string;
+	source: "git-diff" | "file-content";
+	streamSha256: string;
+}
+
+/**
+ * Read one complete ordinary presentation stream only when it stays within
+ * the fixed paging ceiling. This path is used solely for a single selected
+ * worker path; ordinary multi-path review keeps the existing bounded-prefix
+ * behavior. The complete stream is ephemeral and only its SHA-256 plus the
+ * currently visible page are persisted.
+ */
+async function pageablePatchStreamFor(
+	projectRoot: string,
+	path: string,
+	exec: ExecFn,
+	secrets: readonly string[],
+): Promise<PageablePatchStream | null> {
+	try {
+		const worktree = await exec("git", ["diff", "--", path], { cwd: projectRoot });
+		const staged = await exec("git", ["diff", "--cached", "--", path], { cwd: projectRoot });
+		const gitText = [worktree.stdout, staged.stdout].filter(Boolean).join("");
+		if (gitText.trim()) {
+			const text = redactText(gitText, secrets);
+			if (Buffer.byteLength(text, "utf8") > REVIEW_PAGE_SOURCE_MAX_BYTES) return null;
+			return {
+				text,
+				source: "git-diff",
+				streamSha256: createHash("sha256").update(text, "utf8").digest("hex"),
+			};
+		}
+	} catch {
+		return null;
+	}
+	const real = await realpathContained(projectRoot, path);
+	if (real === undefined) return null;
+	const read = await readBoundedFilePrefix(real, REVIEW_PAGE_SOURCE_MAX_BYTES);
+	if (!read || read.size > REVIEW_PAGE_SOURCE_MAX_BYTES) return null;
+	const text = redactText(read.data.toString("utf8"), secrets);
+	// Redaction may expand the stream (for example a short secret replaced by
+	// a longer marker).  The published ceiling applies to the actual stream
+	// whose hash/cursor are persisted, not merely to the pre-redaction file.
+	if (Buffer.byteLength(text, "utf8") > REVIEW_PAGE_SOURCE_MAX_BYTES) return null;
+	return {
+		text,
+		source: "file-content",
+		streamSha256: createHash("sha256").update(text, "utf8").digest("hex"),
+	};
+}
+
+function isUtf8Boundary(buffer: Buffer, offset: number): boolean {
+	return offset === 0 || offset === buffer.length || (buffer[offset]! & 0xc0) !== 0x80;
+}
+
+/** Return the next non-empty UTF-8-safe bounded page and its exact end. */
+function slicePresentationPage(
+	text: string,
+	startByte: number,
+	maxBytes: number,
+	maxLines: number,
+): { text: string; endByte: number; totalBytes: number } | null {
+	const encoded = Buffer.from(text, "utf8");
+	if (!Number.isSafeInteger(startByte) || startByte < 0 || startByte >= encoded.length ||
+		!isUtf8Boundary(encoded, startByte) || maxBytes <= 0 || maxLines <= 0) return null;
+	const suffix = encoded.subarray(startByte).toString("utf8");
+	const byteBounded = truncateUtf8(suffix, maxBytes);
+	let page = sliceTextToBudgets(byteBounded, maxLines, maxBytes);
+	// A prior page can end immediately before a newline. Consume that scalar
+	// rather than producing a zero-length page and stalling the cursor.
+	if (page.length === 0 && suffix.startsWith("\n") && maxBytes >= 1) page = "\n";
+	if (page.length === 0) return null;
+	const pageBytes = Buffer.byteLength(page, "utf8");
+	const endByte = startByte + pageBytes;
+	if (endByte <= startByte || endByte > encoded.length || !isUtf8Boundary(encoded, endByte)) return null;
+	return { text: page, endByte, totalBytes: encoded.length };
 }
 
 /**
@@ -993,11 +1156,44 @@ async function patchEntryFor(
 	maxBytes: number,
 	afterDigests: Readonly<Record<string, string>>,
 	currentStatus: string,
+	pageRequest?: {
+		prior?: ReviewPresentationProgress;
+		maxBytes: number;
+		maxLines: number;
+	},
 ): Promise<RawPatchEntry> {
 	if (isCompactEligiblePath(path)) {
 		const compact = await compactFactsFor(projectRoot, path, secrets, afterDigests, currentStatus);
 		if (compact) {
 			return { path, source: "compact", text: renderCompactFacts(compact), perPathTruncated: compact.content_truncated, compact };
+		}
+	}
+	if (pageRequest !== undefined) {
+		const stream = await pageablePatchStreamFor(projectRoot, path, exec, secrets);
+		if (stream !== null) {
+			const totalBytes = Buffer.byteLength(stream.text, "utf8");
+			const prior = pageRequest.prior;
+			const startByte = prior !== undefined && prior.source === stream.source &&
+				prior.stream_sha256 === stream.streamSha256 && prior.total_bytes === totalBytes
+				? prior.next_byte
+				: 0;
+			if (totalBytes > 0 && startByte < totalBytes) {
+				const page = slicePresentationPage(stream.text, startByte, pageRequest.maxBytes, pageRequest.maxLines);
+				if (page !== null) {
+					return {
+						path,
+						source: stream.source,
+						text: page.text,
+						perPathTruncated: page.endByte < page.totalBytes || startByte > 0,
+						page: {
+							stream_sha256: stream.streamSha256,
+							start_byte: startByte,
+							end_byte: page.endByte,
+							total_bytes: page.totalBytes,
+						},
+					};
+				}
+			}
 		}
 	}
 	return patchTextFor(projectRoot, path, exec, secrets, maxBytes).then((entry) => ({ path, ...entry, perPathTruncated: entry.truncated }));
@@ -1019,6 +1215,7 @@ interface RawPatchEntry {
 	perPathTruncated: boolean;
 	/** Phase 5: additive structured compact facts (source === "compact"). */
 	compact?: ReviewCompactFacts;
+	page?: ReviewPatchPage;
 }
 
 /**
@@ -1052,7 +1249,14 @@ function boundPatchEntries(
 			out.push({ path: entry.path, source: entry.source, text: cut, truncated: true, compact: entry.compact });
 			break;
 		}
-		out.push({ path: entry.path, source: entry.source, text: entry.text, truncated: entry.perPathTruncated, compact: entry.compact });
+		out.push({
+			path: entry.path,
+			source: entry.source,
+			text: entry.text,
+			truncated: entry.perPathTruncated,
+			compact: entry.compact,
+			...(entry.page === undefined ? {} : { page: entry.page }),
+		});
 		lines += entryLines + 1;
 		bytes += entryBytes + markerBytes;
 		// ANY per-path truncation makes the rendered patch incomplete, even
@@ -1168,11 +1372,18 @@ export function mergeReviewPresentationCoverage(
 			? prior.checked_paths.filter((path): path is string => typeof path === "string")
 			: [];
 		const priorCheckedSet = new Set(priorChecked);
-		const priorCandidates = Array.isArray(prior.fully_presented_paths)
-			? prior.fully_presented_paths
-			: Array.isArray(prior.patch)
-				? prior.patch.filter(isCompleteReviewPresentationEntry).map((entry) => entry.path)
-				: [];
+		// New schema-2 provisional records must prove presentation through the
+		// per-path cursor.  Bare legacy fully_presented_paths are deliberately
+		// ignored here so an old/tampered provisional record can be safely
+		// re-presented, but can never jump directly to semantic ACCEPT.
+		const priorProgress = normalizedPresentationProgress(prior);
+		const priorCandidates = prior.schema_version === 2 && prior.semantic_review === "required"
+			? priorProgress.filter((item) => item.next_byte === item.total_bytes).map((item) => item.path)
+			: Array.isArray(prior.fully_presented_paths)
+				? prior.fully_presented_paths
+				: Array.isArray(prior.patch)
+					? prior.patch.filter(isCompleteReviewPresentationEntry).map((entry) => entry.path)
+					: [];
 		for (const path of priorCandidates) {
 			if (typeof path === "string" && priorCheckedSet.has(path) && workerSet.has(path)) fullyPresented.add(path);
 		}
@@ -1184,6 +1395,193 @@ export function mergeReviewPresentationCoverage(
 		presentation_remaining_paths: remainingPaths,
 		presentation_complete: remainingPaths.length === 0,
 	};
+}
+
+function isPresentationProgressSource(value: unknown): value is ReviewPatchEntry["source"] {
+	return value === "git-diff" || value === "file-content" || value === "deleted" || value === "compact" || value === "withheld";
+}
+
+/** Hostile-safe normalization used by merge/readiness paths. */
+function normalizedPresentationProgress(record: ReviewRecord): ReviewPresentationProgress[] {
+	if (!Array.isArray(record.presentation_progress) || record.presentation_progress.length > REVIEW_PRESENTATION_PROGRESS_MAX_ITEMS) return [];
+	const checked = new Set(Array.isArray(record.checked_paths) ? record.checked_paths : []);
+	const seen = new Set<string>();
+	const normalized: ReviewPresentationProgress[] = [];
+	for (const item of record.presentation_progress) {
+		if (typeof item !== "object" || item === null || Array.isArray(item) ||
+			typeof item.path !== "string" || !checked.has(item.path) || seen.has(item.path) ||
+			!isPresentationProgressSource(item.source) || !/^[0-9a-f]{64}$/u.test(item.stream_sha256) ||
+			!Number.isSafeInteger(item.next_byte) || item.next_byte < 0 ||
+			!Number.isSafeInteger(item.total_bytes) || item.total_bytes < 0 ||
+			item.total_bytes > REVIEW_PAGE_SOURCE_MAX_BYTES || item.next_byte > item.total_bytes ||
+			((item.source === "deleted" || item.source === "compact" || item.source === "withheld") && item.next_byte !== item.total_bytes)) return [];
+		if (!Array.isArray(item.segments) || item.segments.length > REVIEW_PRESENTATION_SEGMENT_MAX_ITEMS) return [];
+		let segmentCursor = 0;
+		for (const segment of item.segments) {
+			if (typeof segment !== "object" || segment === null || Array.isArray(segment) ||
+				!Number.isSafeInteger(segment.start_byte) || segment.start_byte !== segmentCursor ||
+				!Number.isSafeInteger(segment.end_byte) || segment.end_byte <= segment.start_byte || segment.end_byte > item.total_bytes ||
+				typeof segment.page_sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(segment.page_sha256)) return [];
+			segmentCursor = segment.end_byte;
+		}
+		if (segmentCursor !== item.next_byte || (item.total_bytes === 0 && item.segments.length !== 0) ||
+			(item.total_bytes > 0 && item.next_byte > 0 && item.segments.length === 0)) return [];
+		seen.add(item.path);
+		normalized.push({ ...item, segments: item.segments.map((segment) => ({ ...segment })) });
+	}
+	return normalized.sort((left, right) => Buffer.from(left.path, "utf8").compare(Buffer.from(right.path, "utf8")));
+}
+
+function priorPresentationProgress(
+	workerPaths: readonly string[],
+	prior: ReviewRecord | null,
+	boundDiffHash: string,
+): ReviewPresentationProgress[] {
+	if (prior === null || prior.bound_diff_hash !== boundDiffHash) return [];
+	const workerSet = new Set(workerPaths);
+	const progress = normalizedPresentationProgress(prior).filter((item) => workerSet.has(item.path));
+	return workerPaths.flatMap((path) => {
+		const item = progress.find((candidate) => candidate.path === path);
+		return item === undefined ? [] : [item];
+	}).sort((left, right) => Buffer.from(left.path, "utf8").compare(Buffer.from(right.path, "utf8")));
+}
+
+function mergeReviewPresentationProgress(
+	workerPaths: readonly string[],
+	prior: readonly ReviewPresentationProgress[],
+	fullyVisibleEntries: readonly ReviewPatchEntry[],
+): ReviewPresentationProgress[] {
+	const byPath = new Map(prior.map((item) => [item.path, { ...item }]));
+	for (const entry of fullyVisibleEntries) {
+		const page = entry.page;
+		if (page === undefined) {
+			if (!isCompleteReviewPresentationEntry(entry)) continue;
+			const bytes = Buffer.byteLength(entry.text, "utf8");
+			if (bytes > REVIEW_PAGE_SOURCE_MAX_BYTES) continue;
+			byPath.set(entry.path, {
+				path: entry.path,
+				source: entry.source,
+				stream_sha256: createHash("sha256").update(entry.text, "utf8").digest("hex"),
+				next_byte: bytes,
+				total_bytes: bytes,
+				segments: bytes === 0 ? [] : [{
+					start_byte: 0,
+					end_byte: bytes,
+					page_sha256: createHash("sha256").update(entry.text, "utf8").digest("hex"),
+				}],
+			});
+			continue;
+		}
+		if (entry.source !== "git-diff" && entry.source !== "file-content" ||
+			Buffer.byteLength(entry.text, "utf8") !== page.end_byte - page.start_byte ||
+			page.total_bytes > REVIEW_PAGE_SOURCE_MAX_BYTES) continue;
+		const existing = byPath.get(entry.path);
+		const sameStream = existing !== undefined && existing.source === entry.source &&
+			existing.stream_sha256 === page.stream_sha256 && existing.total_bytes === page.total_bytes;
+		const expectedStart = sameStream ? existing.next_byte : 0;
+		if (page.start_byte !== expectedStart || page.end_byte <= page.start_byte || page.end_byte > page.total_bytes) continue;
+		const priorSegments = sameStream ? existing.segments : [];
+		if (priorSegments.length >= REVIEW_PRESENTATION_SEGMENT_MAX_ITEMS) continue;
+		byPath.set(entry.path, {
+			path: entry.path,
+			source: entry.source,
+			stream_sha256: page.stream_sha256,
+			next_byte: page.end_byte,
+			total_bytes: page.total_bytes,
+			segments: [...priorSegments.map((segment) => ({ ...segment })), {
+				start_byte: page.start_byte,
+				end_byte: page.end_byte,
+				page_sha256: createHash("sha256").update(entry.text, "utf8").digest("hex"),
+			}],
+		});
+	}
+	return workerPaths.flatMap((path) => {
+		const item = byPath.get(path);
+		return item === undefined ? [] : [item];
+	}).sort((left, right) => Buffer.from(left.path, "utf8").compare(Buffer.from(right.path, "utf8")));
+}
+
+interface ReviewPresentationValidationInput {
+	projectRoot: string;
+	record: ReviewRecord;
+	authority: ReviewAuthorityFacts;
+	exec: ExecFn;
+	secrets?: readonly string[];
+}
+
+/**
+ * Rebuild every completed presentation stream from the current bound
+ * authority before semantic ACCEPT.  review.json is provisional and cannot
+ * self-attest its stream hash, byte total, or final-page slice.
+ */
+export async function validateReviewPresentationAgainstAuthority(
+	input: ReviewPresentationValidationInput,
+): Promise<boolean> {
+	try {
+		const checked = Array.isArray(input.record.checked_paths) ? input.record.checked_paths : [];
+		if (checked.length === 0) return true;
+		const progress = normalizedPresentationProgress(input.record);
+		if (progress.length === 0 || progress.length > checked.length) return false;
+		const completed = progress.filter((item) => item.next_byte === item.total_bytes);
+		if (completed.length !== checked.length || !checked.every((path, index) => completed[index]?.path === path)) return false;
+		const current = input.authority.current ?? await collectGitFacts(input.projectRoot, input.exec);
+		const secrets = input.secrets ?? [];
+		let validatedBytes = 0;
+		const actualByPath = new Map<string, { source: ReviewPatchEntry["source"]; text: string; hash: string; total: number }>();
+		for (const item of progress) {
+			let source: ReviewPatchEntry["source"];
+			let text: string;
+			if (item.source === "git-diff" || item.source === "file-content") {
+				const stream = await pageablePatchStreamFor(input.projectRoot, item.path, input.exec, secrets);
+				if (stream === null) return false;
+				source = stream.source;
+				text = stream.text;
+			} else if (item.source === "compact") {
+				const facts = await compactFactsFor(
+					input.projectRoot,
+					item.path,
+					secrets,
+					input.authority.after.pathDigests,
+					current.pathStatuses[item.path] ?? "",
+				);
+				if (facts === null) return false;
+				source = "compact";
+				text = renderCompactFacts(facts);
+			} else if (item.source === "deleted") {
+				if (await contentDigest(input.projectRoot, item.path) !== undefined) return false;
+				source = "deleted";
+				text = "(deleted or unreadable)";
+			} else {
+				// A withheld path necessarily makes the scope verdict FAIL and can
+				// never be part of a semantic PASS authority.
+				return false;
+			}
+			const total = Buffer.byteLength(text, "utf8");
+			validatedBytes += total;
+			if (validatedBytes > REVIEW_PRESENTATION_VALIDATION_MAX_BYTES || source !== item.source ||
+				total !== item.total_bytes || createHash("sha256").update(text, "utf8").digest("hex") !== item.stream_sha256) return false;
+			actualByPath.set(item.path, { source, text, hash: item.stream_sha256, total });
+			const actualBytes = Buffer.from(text, "utf8");
+			for (const segment of item.segments) {
+				if (createHash("sha256").update(actualBytes.subarray(segment.start_byte, segment.end_byte)).digest("hex") !== segment.page_sha256) return false;
+			}
+		}
+		for (const entry of input.record.patch) {
+			const actual = actualByPath.get(entry.path);
+			if (actual === undefined || actual.source !== entry.source) continue;
+			if (entry.page !== undefined) {
+				const bytes = Buffer.from(actual.text, "utf8");
+				if (entry.page.stream_sha256 !== actual.hash || entry.page.total_bytes !== actual.total ||
+					entry.page.end_byte > bytes.length ||
+					bytes.subarray(entry.page.start_byte, entry.page.end_byte).toString("utf8") !== entry.text) return false;
+			} else if (isCompleteReviewPresentationEntry(entry) && entry.text !== actual.text) {
+				return false;
+			}
+		}
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 /**
@@ -1366,6 +1764,16 @@ async function reviewDelegationInner(
 	// Fail closed: a violating path is withheld BEFORE any content open/
 	// read/digest/display — its entry is the deterministic bounded marker,
 	// never a git diff, file read, digest or rendered content.
+	const sectionCaps = reviewSectionCaps(maxBytes, maxLines);
+	const priorProgress = priorPresentationProgress(workerPaths, priorReview, boundDiffHash);
+	const priorProgressByPath = new Map(priorProgress.map((item) => [item.path, item]));
+	// Paging is deliberately single-path: the persisted cursor is contiguous
+	// and repeating the same include_path has one deterministic meaning. A
+	// multi-path call keeps the existing bounded segment behavior and directs
+	// the reviewer to select one remaining path on the next call.
+	const pageMaxBytes = Math.max(0, sectionCaps.patchBytes - REVIEW_PAGE_ENVELOPE_RESERVE_BYTES);
+	const pageMaxLines = Math.max(0, sectionCaps.patchLines - REVIEW_PAGE_ENVELOPE_RESERVE_LINES);
+	const pageOnePath = patchPaths.length === 1 && pageMaxBytes > 0 && pageMaxLines > 0;
 	const rawEntries: RawPatchEntry[] = [];
 	for (const path of patchPaths.slice(0, MAX_REVIEW_PATCH_PATHS)) {
 		if (violationSet.has(path)) {
@@ -1379,7 +1787,20 @@ async function reviewDelegationInner(
 			rawEntries.push({ path, source: "withheld", text: WITHHELD_MARKER, perPathTruncated: false });
 			continue;
 		}
-		const entry = await patchEntryFor(projectRoot, path, input.exec, secrets, Math.min(maxBytes, REVIEW_PATCH_MAX_BYTES), authority.after.pathDigests, current.pathStatuses[path] ?? "");
+		const entry = await patchEntryFor(
+			projectRoot,
+			path,
+			input.exec,
+			secrets,
+			Math.min(maxBytes, REVIEW_PATCH_MAX_BYTES),
+			authority.after.pathDigests,
+			current.pathStatuses[path] ?? "",
+			pageOnePath ? {
+				prior: priorProgressByPath.get(path),
+				maxBytes: pageMaxBytes,
+				maxLines: pageMaxLines,
+			} : undefined,
+		);
 		rawEntries.push(entry);
 	}
 	const bounded = boundPatchEntries(
@@ -1415,6 +1836,7 @@ async function reviewDelegationInner(
 		fully_presented_paths: priorPresentationCoverage.fully_presented_paths,
 		presentation_remaining_paths: priorPresentationCoverage.presentation_remaining_paths,
 		presentation_complete: priorPresentationCoverage.presentation_complete,
+		...(priorProgress.length === 0 ? {} : { presentation_progress: priorProgress }),
 		semantic_review: semanticClassification.required ? "required" : "not_required",
 		review_path: reviewPath,
 		...(relevanceSupplied ? {
@@ -1430,7 +1852,12 @@ async function reviewDelegationInner(
 	// therefore receives already-bounded content and remains a no-op.
 	const provisionalPresentation = renderReviewPresentationInner(provisionalRecord, { maxBytes, maxLines });
 	const visibleSet = new Set(provisionalPresentation.visiblePatchPaths);
-	const patch = candidatePatch.filter((entry) => visibleSet.has(entry.path));
+	const fullyVisibleSet = new Set(provisionalPresentation.fullyVisiblePatchPaths);
+	const patch = candidatePatch
+		.filter((entry) => visibleSet.has(entry.path))
+		.map((entry) => fullyVisibleSet.has(entry.path)
+			? entry
+			: { path: entry.path, source: entry.source, text: entry.text, truncated: true, ...(entry.compact === undefined ? {} : { compact: entry.compact }) });
 	const patchTruncated = bounded.truncated || patchPaths.length > patch.length;
 	const patchPathsStat: ReviewPatchPathStat[] = patchPaths.map((path) => {
 		const entry = patch.find((candidate) => candidate.path === path);
@@ -1445,12 +1872,36 @@ async function reviewDelegationInner(
 	// content advance this call; prior same-hash durable coverage still
 	// merges normally (legacy records infer it from their persisted patch).
 	const coverage = mergeReviewCoverage(workerPaths, patch.map((entry) => entry.path), priorReview, boundDiffHash);
+	const presentationProgress = mergeReviewPresentationProgress(
+		workerPaths,
+		priorProgress,
+		patch.filter((entry) => fullyVisibleSet.has(entry.path)),
+	);
+	const completedPagedPaths = presentationProgress
+		.filter((item) => item.next_byte === item.total_bytes)
+		.map((item) => item.path);
 	const presentationCoverage = mergeReviewPresentationCoverage(
 		workerPaths,
-		patch.filter(isCompleteReviewPresentationEntry).map((entry) => entry.path),
-		priorReview,
+		completedPagedPaths,
+		null,
 		boundDiffHash,
 	);
+	if (patchPaths.length === 1) {
+		const selectedPath = patchPaths[0]!;
+		const selectedEntry = patch.find((entry) => entry.path === selectedPath);
+		const selectedRawEntry = rawEntries.find((entry) => entry.path === selectedPath);
+		const priorItem = priorProgressByPath.get(selectedPath);
+		const currentItem = presentationProgress.find((item) => item.path === selectedPath);
+		const priorCursor = priorItem !== undefined && currentItem !== undefined &&
+			priorItem.source === currentItem.source && priorItem.stream_sha256 === currentItem.stream_sha256 &&
+			priorItem.total_bytes === currentItem.total_bytes ? priorItem.next_byte : 0;
+		const currentCursor = currentItem?.next_byte ?? 0;
+		if (presentationCoverage.presentation_remaining_paths.includes(selectedPath) &&
+			selectedRawEntry !== undefined && (selectedRawEntry.source === "git-diff" || selectedRawEntry.source === "file-content") &&
+			(selectedEntry === undefined || selectedEntry.truncated || selectedRawEntry.perPathTruncated) && currentCursor <= priorCursor) {
+			return reviewFailure("presentation_page_unavailable");
+		}
+	}
 	const record: ReviewRecord = {
 		...provisionalRecord,
 		patch,
@@ -1462,11 +1913,13 @@ async function reviewDelegationInner(
 		fully_presented_paths: presentationCoverage.fully_presented_paths,
 		presentation_remaining_paths: presentationCoverage.presentation_remaining_paths,
 		presentation_complete: presentationCoverage.presentation_complete,
+		...(presentationProgress.length === 0 ? {} : { presentation_progress: presentationProgress }),
 	};
 	const presentation = renderReviewPresentationInner(record, { maxBytes, maxLines });
 	if (
 		presentation.visiblePatchPaths.length !== patch.length
 		|| presentation.visiblePatchPaths.some((path, index) => path !== patch[index]?.path)
+		|| patch.some((entry) => entry.page !== undefined && !presentation.fullyVisiblePatchPaths.includes(entry.path))
 	) {
 		return reviewFailure("runtime_failure");
 	}
@@ -1588,11 +2041,14 @@ export function normalizeReviewPresentationCoverage(record: ReviewRecord): Revie
 		? record.checked_paths.filter((path): path is string => typeof path === "string")
 		: [];
 	const checkedSet = new Set(checked);
-	const candidates = Array.isArray(record.fully_presented_paths)
-		? record.fully_presented_paths
-		: Array.isArray(record.patch)
-			? record.patch.filter(isCompleteReviewPresentationEntry).map((entry) => entry.path)
-			: [];
+	const progress = normalizedPresentationProgress(record);
+	const candidates = record.schema_version === 2 && record.semantic_review === "required"
+		? progress.filter((item) => item.next_byte === item.total_bytes).map((item) => item.path)
+		: Array.isArray(record.fully_presented_paths)
+			? record.fully_presented_paths
+			: Array.isArray(record.patch)
+				? record.patch.filter(isCompleteReviewPresentationEntry).map((entry) => entry.path)
+				: [];
 	const completeSet = new Set(candidates.filter((path): path is string => typeof path === "string" && checkedSet.has(path)));
 	const fullyPresentedPaths = checked.filter((path) => completeSet.has(path));
 	const remainingPaths = checked.filter((path) => !completeSet.has(path));
@@ -1612,6 +2068,18 @@ export function normalizeReviewPresentationCoverage(record: ReviewRecord): Revie
 export function isScopeIntegrityPacketComplete(record: ReviewRecord): boolean {
 	const coverage = normalizeReviewCoverage(record);
 	const presentation = normalizeReviewPresentationCoverage(record);
+	const requiresStrictProgress = record.schema_version === 2 && record.semantic_review === "required" &&
+		Array.isArray(record.checked_paths) && record.checked_paths.length > 0;
+	const completedProgress = normalizedPresentationProgress(record)
+		.filter((item) => item.next_byte === item.total_bytes)
+		.map((item) => item.path);
+	const strictProgressMatches = !requiresStrictProgress || (
+		Array.isArray(record.presentation_progress) &&
+		Array.isArray(record.fully_presented_paths) &&
+		new Set(completedProgress).size === completedProgress.length &&
+		completedProgress.length === record.fully_presented_paths.length &&
+		completedProgress.every((path, index) => path === record.fully_presented_paths![index])
+	);
 	return record.verdict === "PASS"
 		&& record.mismatch === false
 		&& Array.isArray(record.violations) && record.violations.length === 0
@@ -1619,7 +2087,8 @@ export function isScopeIntegrityPacketComplete(record: ReviewRecord): boolean {
 		&& coverage.coverage_complete
 		&& coverage.remaining_paths.length === 0
 		&& presentation.presentation_complete
-		&& presentation.presentation_remaining_paths.length === 0;
+		&& presentation.presentation_remaining_paths.length === 0
+		&& strictProgressMatches;
 }
 
 /**
@@ -1681,6 +2150,8 @@ interface ReviewSectionFacts {
 	truncated: boolean;
 	/** Complete patch-entry paths that are actually present in final content. */
 	visiblePaths?: string[];
+	/** Paths whose title and complete current entry body both fit. */
+	fullyVisiblePaths?: string[];
 }
 
 function selectedPatchCount(record: ReviewRecord): number {
@@ -1699,10 +2170,13 @@ function reviewPathOf(record: ReviewRecord): string {
 
 function renderPatchSection(record: ReviewRecord, maxBytes: number, maxLines: number): { lines: string[]; facts: ReviewSectionFacts } {
 	const original = selectedPatchCount(record);
-	if (maxBytes <= 0 || maxLines <= 0) return { lines: [], facts: { original, shown: 0, omitted: original, truncated: original > 0 || record.patch_truncated, visiblePaths: [] } };
+	if (maxBytes <= 0 || maxLines <= 0) return { lines: [], facts: { original, shown: 0, omitted: original, truncated: original > 0 || record.patch_truncated, visiblePaths: [], fullyVisiblePaths: [] } };
 	const presentation = normalizeReviewPresentationCoverage(record);
+	const hasPagedSource = Array.isArray(record.presentation_progress) && record.presentation_progress.length > 0;
 	const marker = presentation.presentation_complete
-		? `Compact content is intentionally summarized — strict digest/size/head/tail facts form the complete bounded evidence packet; generator equality remains NOT_VERIFIED for final verification. Scope/integrity artifact: ${reviewPathOf(record)}.`
+		? hasPagedSource
+			? `Ordinary source presentation is complete across contiguous hash-bound pages; each page advanced only after its whole bounded entry was visible. Scope/integrity artifact: ${reviewPathOf(record)}.`
+			: `Compact content is intentionally summarized — strict digest/size/head/tail facts form the complete bounded evidence packet; generator equality remains NOT_VERIFIED for final verification. Scope/integrity artifact: ${reviewPathOf(record)}.`
 		: `Patch content truncated or omitted — scope/integrity artifact: ${reviewPathOf(record)}; request bounded presentation segments via workbench_review_worker_diff include_paths (max ${MAX_REVIEW_PATCH_PATHS} paths per call). Semantic ACCEPT remains blocked until presentation is complete.`;
 	const markerReserveBytes = Buffer.byteLength(marker, "utf8") + 1;
 	const content = new ReviewLineBuilder(Math.max(0, maxBytes - markerReserveBytes), Math.max(0, maxLines - 1));
@@ -1711,15 +2185,19 @@ function renderPatchSection(record: ReviewRecord, maxBytes: number, maxLines: nu
 	let shown = 0;
 	let cut = false;
 	const visiblePaths: string[] = [];
+	const fullyVisiblePaths: string[] = [];
 	for (const entry of Array.isArray(record.patch) ? record.patch : []) {
 		const path = boundedInline(entry.path, MAX_REVIEW_PATH_BYTES);
-		const title = `--- ${path} (${entry.source}${entry.truncated ? ", truncated" : ""}) ---`;
+		const page = entry.page;
+		const pageLabel = page === undefined ? "" : `, page bytes ${page.start_byte}-${page.end_byte}/${page.total_bytes}, stream_sha256=${page.stream_sha256}`;
+		const title = `--- ${path} (${entry.source}${pageLabel}${entry.truncated ? ", truncated" : ""}) ---`;
 		const normalized = unicodeScalarText(typeof entry.text === "string" ? entry.text : "(invalid)")
 			.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "\ufffd");
 		const body = normalized.split("\n");
 		if (content.add([title, ...body])) {
 			shown += 1;
 			visiblePaths.push(entry.path);
+			fullyVisiblePaths.push(entry.path);
 			continue;
 		}
 		// Preserve one deterministic bounded segment of the straddling entry;
@@ -1746,7 +2224,7 @@ function renderPatchSection(record: ReviewRecord, maxBytes: number, maxLines: nu
 	content.lines[0] = `patch (${original} path(s), shown ${shown}, omitted ${omitted}${truncated ? ", truncated" : ""}):`;
 	const lines = [...content.lines];
 	if (truncated && lines.length < maxLines && textByteLength([...lines, marker]) <= maxBytes) lines.push(marker);
-	return { lines, facts: { original, shown, omitted, truncated, visiblePaths } };
+	return { lines, facts: { original, shown, omitted, truncated, visiblePaths, fullyVisiblePaths } };
 }
 
 function renderPathStatsSection(record: ReviewRecord, maxBytes: number, maxLines: number): { lines: string[]; facts: ReviewSectionFacts } {
@@ -1889,6 +2367,8 @@ interface ReviewPresentation {
 	lines: string[];
 	/** Paths whose bounded patch entry is actually present in `lines`. */
 	visiblePatchPaths: string[];
+	/** Paths whose complete current patch entry, not only its title/prefix, is present. */
+	fullyVisiblePatchPaths: string[];
 }
 
 function renderReviewPresentationInner(record: ReviewRecord, caps: ReviewRenderCaps): ReviewPresentation {
@@ -1902,30 +2382,25 @@ function renderReviewPresentationInner(record: ReviewRecord, caps: ReviewRenderC
 		];
 		const builder = new ReviewLineBuilder(maxBytes, maxLines);
 		for (const line of fallback) if (!builder.add([line])) break;
-		return { lines: builder.lines, visiblePatchPaths: [] };
+		return { lines: builder.lines, visiblePatchPaths: [], fullyVisiblePatchPaths: [] };
 	}
-	// Two inter-section newline bytes are reserved inside the whole cap.
-	const allocatableBytes = Math.max(0, maxBytes - 2);
-	const controlBytes = Math.min(REVIEW_CONTROL_MAX_BYTES, Math.max(512, Math.floor(allocatableBytes / 4)));
-	const afterControlBytes = Math.max(0, allocatableBytes - controlBytes);
-	const statBytes = Math.min(REVIEW_PATH_STATS_MAX_BYTES, Math.floor(afterControlBytes / 5));
-	const patchBytes = Math.min(REVIEW_PATCH_MAX_BYTES, Math.max(0, afterControlBytes - statBytes));
-	const controlLines = Math.min(REVIEW_CONTROL_MAX_LINES, Math.max(12, Math.floor(maxLines / 4)));
-	const afterControlLines = Math.max(0, maxLines - controlLines);
-	const statLines = Math.min(REVIEW_PATH_STATS_MAX_LINES, Math.floor(afterControlLines / 5));
-	const patchLines = Math.min(REVIEW_PATCH_MAX_LINES, Math.max(0, afterControlLines - statLines));
-
-	const patch = renderPatchSection(record, patchBytes, patchLines);
-	const stats = renderPathStatsSection(record, statBytes, statLines);
-	const control = renderControlSection(record, patch.facts, stats.facts, controlBytes, controlLines);
+	const sectionCaps = reviewSectionCaps(maxBytes, maxLines);
+	const patch = renderPatchSection(record, sectionCaps.patchBytes, sectionCaps.patchLines);
+	const stats = renderPathStatsSection(record, sectionCaps.statBytes, sectionCaps.statLines);
+	const control = renderControlSection(record, patch.facts, stats.facts, sectionCaps.controlBytes, sectionCaps.controlLines);
 	const lines = [...control, ...patch.lines, ...stats.lines];
 	if (lines.length <= maxLines && textByteLength(lines) <= maxBytes) {
-		return { lines, visiblePatchPaths: patch.facts.visiblePaths ?? [] };
+		return {
+			lines,
+			visiblePatchPaths: patch.facts.visiblePaths ?? [],
+			fullyVisiblePatchPaths: patch.facts.fullyVisiblePaths ?? [],
+		};
 	}
 	// Defensive fail-closed boundary; allocations above make this unreachable.
 	return {
 		lines: truncateUtf8("[workbench-diff-review error code=runtime_failure]", maxBytes).split("\n").slice(0, maxLines),
 		visiblePatchPaths: [],
+		fullyVisiblePatchPaths: [],
 	};
 }
 
@@ -1935,6 +2410,24 @@ export function renderReviewLines(record: ReviewRecord, caps: ReviewRenderCaps =
 		return renderReviewPresentationInner(record, caps).lines;
 	} catch {
 		return reviewFailure("runtime_failure").lines;
+	}
+}
+
+/**
+ * True only when the bounded renderer actually includes every path whose
+ * persisted patch/compact facts constitute the record's complete semantic
+ * presentation. This closes the outer-envelope gap for historical migration:
+ * durable packet completeness alone does not prove that this call showed it.
+ */
+export function isReviewPresentationFullyVisible(record: ReviewRecord, caps: ReviewRenderCaps = {}): boolean {
+	try {
+		const expected = normalizeReviewPresentationCoverage(record);
+		if (!expected.presentation_complete) return false;
+		const rendered = renderReviewPresentationInner(record, caps);
+		const visible = new Set(rendered.visiblePatchPaths);
+		return expected.fully_presented_paths.every((path) => visible.has(path));
+	} catch {
+		return false;
 	}
 }
 

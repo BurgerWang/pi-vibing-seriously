@@ -41,18 +41,19 @@ const SEMANTIC_REVIEW_HEADER_SEPARATOR_BYTES = 2;
 const MAX_BOUND_DIFF_HASH = "f".repeat(64);
 
 function semanticReviewHeader(
-	semanticReview: "accepted" | "required" | "not_required",
+	semanticReview: "accepted" | "required" | "not_required" | "repair_required",
 	boundDiffHash: string,
+	repairOf?: string,
 ): string[] {
 	return [
 		"review kind: scope_integrity (mechanical evidence; never Gate authority)",
-		`semantic review: ${semanticReview.toUpperCase()}${semanticReview === "accepted" ? ` — explicit Sol ACCEPT bound ${boundDiffHash}` : semanticReview === "required" ? ` — inspect the complete packet, then call again with semantic_decision=ACCEPT and expected_bound_diff_hash=${boundDiffHash}; use repair_of for REPAIR` : " — zero actual delta"}`,
+		`semantic review: ${semanticReview.toUpperCase()}${semanticReview === "accepted" ? ` — explicit Sol ACCEPT bound ${boundDiffHash}` : semanticReview === "repair_required" ? ` — explicit Sol REPAIR bound ${boundDiffHash}; start only exact repair_of=${repairOf ?? "20260823-000000-xxxx"}` : semanticReview === "required" ? ` — inspect the complete packet, then call again with semantic_decision=ACCEPT or REPAIR and expected_bound_diff_hash=${boundDiffHash}; REPAIR also requires repair_reason` : " — zero actual delta"}`,
 	];
 }
 
 const SEMANTIC_REVIEW_HEADER_MAX_BYTES = Math.max(
-	...(["accepted", "required", "not_required"] as const).map((status) =>
-		Buffer.byteLength(semanticReviewHeader(status, MAX_BOUND_DIFF_HASH).join("\n"), "utf8")),
+	...(["accepted", "required", "not_required", "repair_required"] as const).map((status) =>
+		Buffer.byteLength(semanticReviewHeader(status, MAX_BOUND_DIFF_HASH, "20260823-000000-xxxx").join("\n"), "utf8")),
 );
 
 export interface ReviewToolController {
@@ -108,25 +109,36 @@ export function registerReviewTool(controller: ReviewToolController): void {
 			}).text;
 			const semanticDecisionRaw = (params as unknown as { semantic_decision?: unknown }).semantic_decision;
 			const expectedBoundDiffHashRaw = (params as unknown as { expected_bound_diff_hash?: unknown }).expected_bound_diff_hash;
-			const semanticDecisionSupplied = semanticDecisionRaw !== undefined || expectedBoundDiffHashRaw !== undefined;
-			if (
-				semanticDecisionSupplied
-				&& (semanticDecisionRaw !== "ACCEPT"
-					|| typeof expectedBoundDiffHashRaw !== "string"
-					|| !/^[0-9a-f]{64}$/u.test(expectedBoundDiffHashRaw))
-			) {
+			const expectedMigrationBindingHashRaw = (params as unknown as { expected_migration_binding_hash?: unknown }).expected_migration_binding_hash;
+			const repairReasonRaw = (params as unknown as { repair_reason?: unknown }).repair_reason;
+			const semanticDecisionSupplied = semanticDecisionRaw !== undefined || expectedBoundDiffHashRaw !== undefined ||
+				expectedMigrationBindingHashRaw !== undefined || repairReasonRaw !== undefined;
+			const boundHashValid = typeof expectedBoundDiffHashRaw === "string" && /^[0-9a-f]{64}$/u.test(expectedBoundDiffHashRaw);
+			const acceptShape = semanticDecisionRaw === "ACCEPT" && boundHashValid && repairReasonRaw === undefined &&
+				(expectedMigrationBindingHashRaw === undefined || (
+					typeof expectedMigrationBindingHashRaw === "string" && /^[0-9a-f]{64}$/u.test(expectedMigrationBindingHashRaw)
+				));
+			const repairShape = semanticDecisionRaw === "REPAIR" && boundHashValid && expectedMigrationBindingHashRaw === undefined &&
+				typeof repairReasonRaw === "string" && repairReasonRaw === repairReasonRaw.trim() && repairReasonRaw.length > 0 &&
+				Buffer.byteLength(repairReasonRaw, "utf8") <= 1_024 && !repairReasonRaw.includes("\0");
+			if (semanticDecisionSupplied && !acceptShape && !repairShape) {
+				const repairIntent = semanticDecisionRaw === "REPAIR" || repairReasonRaw !== undefined;
 				return {
-					content: [{ type: "text", text: reviewText("workbench_review_worker_diff: invalid semantic ACCEPT; semantic_decision=ACCEPT and expected_bound_diff_hash=<64 lowercase hex> must be supplied together") }],
-					details: { ok: false, error: "invalid_semantic_accept", review_kind: "scope_integrity", gate_authority: false },
+					content: [{ type: "text", text: reviewText("workbench_review_worker_diff: invalid semantic decision; ACCEPT requires the exact bound hash, while REPAIR requires the exact bound hash plus a bounded repair_reason") }],
+					details: { ok: false, error: repairIntent ? "invalid_semantic_repair" : "invalid_semantic_accept", review_kind: "scope_integrity", gate_authority: false },
 				};
 			}
 			const expectedBoundDiffHash = semanticDecisionSupplied ? expectedBoundDiffHashRaw as string : undefined;
+			const expectedMigrationBindingHash = typeof expectedMigrationBindingHashRaw === "string"
+				? expectedMigrationBindingHashRaw
+				: undefined;
 			if (semanticDecisionSupplied) {
 				const commanderError = commanderBlockReason(ctx.model?.provider, ctx.model?.id);
 				if (commanderError) {
+					const repairIntent = semanticDecisionRaw === "REPAIR";
 					return {
-						content: [{ type: "text", text: reviewText(`workbench_review_worker_diff: semantic ACCEPT refused; ${commanderError}`) }],
-						details: { ok: false, error: "semantic_accept_requires_sol", review_kind: "scope_integrity", gate_authority: false },
+						content: [{ type: "text", text: reviewText(`workbench_review_worker_diff: semantic decision refused; ${commanderError}`) }],
+						details: { ok: false, error: repairIntent ? "semantic_repair_requires_sol" : "semantic_accept_requires_sol", review_kind: "scope_integrity", gate_authority: false },
 					};
 				}
 			}
@@ -137,7 +149,7 @@ export function registerReviewTool(controller: ReviewToolController): void {
 						`workbench_review_worker_diff: repair_required; delegation ${delegationId} cannot be completed by review; call workbench_delegate_worker with repair_of=${delegationId} to start a fresh bounded repair; do not retry review`,
 					),
 				}],
-				details: {
+							details: {
 					ok: false,
 					error: "repair_required",
 					authority_version: 2,
@@ -179,7 +191,10 @@ export function registerReviewTool(controller: ReviewToolController): void {
 			let authorityVersion: 1 | 2;
 			let finalized = false;
 			let reviewRecordPath: string | undefined;
-			let semanticReview: "accepted" | "required" | "not_required" = "required";
+			let migrationBindingHash: string | undefined;
+			let repairDecisionHash: string | undefined;
+			let repairReasonHash: string | undefined;
+			let semanticReview: "accepted" | "required" | "not_required" | "repair_required" = "required";
 			let semanticRisk: "low" | "medium" | "high" = "medium";
 			if (v2Preflight.ok) {
 				if (v2Preflight.value.state.status === "FAILED") return repairRequired(delegationId);
@@ -193,9 +208,12 @@ export function registerReviewTool(controller: ReviewToolController): void {
 					maxBytes: packetMaxBytes,
 					secrets: controller.secrets,
 					now,
+					...(ctx.model === undefined ? {} : { presenter: { provider: ctx.model.provider, model: ctx.model.id } }),
 					...(semanticDecisionSupplied ? {
-						semanticDecision: "ACCEPT" as const,
+						semanticDecision: semanticDecisionRaw as "ACCEPT" | "REPAIR",
 						expectedBoundDiffHash: expectedBoundDiffHash!,
+						...(expectedMigrationBindingHash === undefined ? {} : { expectedMigrationBindingHash }),
+						...(typeof repairReasonRaw === "string" ? { repairReason: repairReasonRaw } : {}),
 						reviewer: { provider: ctx.model!.provider, model: ctx.model!.id },
 					} : {}),
 				});
@@ -217,14 +235,26 @@ export function registerReviewTool(controller: ReviewToolController): void {
 							}
 						}
 					}
+					const migrationBlocked = v2Result.error.code === "semantic_acceptance_required";
 					return {
-						content: [{ type: "text", text: reviewText(`workbench_review_worker_diff: v2 ${v2Result.error.code}`) }],
-						details: { ok: false, error: v2Result.error.code, authority_version: 2 },
+						content: [{ type: "text", text: reviewText(`workbench_review_worker_diff: v2 ${v2Result.error.code}: ${v2Result.error.message}`) }],
+						details: {
+							ok: false,
+								error: v2Result.error.code,
+								authority_version: 2,
+								review_kind: "scope_integrity",
+								gate_authority: false,
+								...(v2Result.binding_hash === undefined ? {} : { binding_hash: v2Result.binding_hash }),
+								...(migrationBlocked ? { next_action: "workbench_review_worker_diff", delegation_id: delegationId } : {}),
+						},
 					};
 				}
 				result = v2Result.review;
 				finalized = v2Result.finalized;
 				reviewRecordPath = v2Result.review_path;
+				migrationBindingHash = v2Result.migration_binding_hash;
+				repairDecisionHash = v2Result.repair_decision_hash;
+				repairReasonHash = v2Result.repair_reason_hash;
 				if (!result.ok || !result.record) {
 					return {
 						content: [{ type: "text", text: reviewText("workbench_review_worker_diff: v2 review record unavailable") }],
@@ -234,14 +264,17 @@ export function registerReviewTool(controller: ReviewToolController): void {
 
 				const semantic = classifySemanticReviewRisk(result.record.checked_paths);
 				semanticRisk = semantic.risk;
-				semanticReview = result.record.semantic_review === "accepted"
+				semanticReview = v2Result.semantic_authority === "repair_required"
+					? "repair_required"
+					: v2Result.semantic_authority === "migration_accepted" || result.record.semantic_review === "accepted"
 					? "accepted"
 					: result.record.semantic_review === "not_required" || !semantic.required ? "not_required" : "required";
-				let projected = observeDiffChange(controller.getDelegationState(), result.record.bound_diff_hash, now);
-				if (finalized && isStrictSemanticAcceptedOrZeroDelta(result.record)) {
+				const effectiveBindingHash = v2Result.migration_binding_hash ?? result.record.bound_diff_hash;
+				let projected = observeDiffChange(controller.getDelegationState(), effectiveBindingHash, now);
+				if (finalized && (isStrictSemanticAcceptedOrZeroDelta(result.record) || v2Result.semantic_authority === "migration_accepted")) {
 					if (projected.status !== "REVIEWED") {
-						const marked = result.record.semantic_review === "accepted"
-							? markSemanticAccepted(projected, { delegationId, expectedDiffHash: result.record.bound_diff_hash, now })
+						const marked = result.record.semantic_review === "accepted" || v2Result.semantic_authority === "migration_accepted"
+							? markSemanticAccepted(projected, { delegationId, expectedDiffHash: effectiveBindingHash, now })
 							: markReviewed(projected, now);
 						if (!marked.ok) {
 							return {
@@ -321,10 +354,10 @@ export function registerReviewTool(controller: ReviewToolController): void {
 					details: { ok: false, error: v2Preflight.error.code, authority_version: 2 },
 				};
 			}
-			void controller.refreshStatus(ctx);
+			await controller.refreshStatus(ctx);
 			const record = result.record;
 			const presentation = normalizeReviewPresentationCoverage(record);
-			const semanticHeader = semanticReviewHeader(semanticReview, record.bound_diff_hash);
+			const semanticHeader = semanticReviewHeader(semanticReview, record.bound_diff_hash, delegationId);
 			const text = reviewText([...semanticHeader, ...result.lines].join("\n"));
 			const nextIncludePaths: string[] = [];
 			let nextIncludeBytes = 0;
@@ -350,6 +383,17 @@ export function registerReviewTool(controller: ReviewToolController): void {
 						semantic_risk: semanticRisk,
 						gate_authority: false,
 						bound_diff_hash: record.bound_diff_hash,
+					...(migrationBindingHash !== undefined
+						? { migration_binding_hash: migrationBindingHash }
+						: {}),
+					...(semanticReview === "repair_required"
+						? {
+							repair_of: delegationId,
+							next_action: "workbench_delegate_worker",
+							...(repairDecisionHash === undefined ? {} : { repair_decision_hash: repairDecisionHash }),
+							...(repairReasonHash === undefined ? {} : { repair_reason_hash: repairReasonHash }),
+						}
+						: {}),
 					recorded_after_hash: record.recorded_after_hash,
 					mismatch: record.mismatch,
 					violation_count: record.violations.length,

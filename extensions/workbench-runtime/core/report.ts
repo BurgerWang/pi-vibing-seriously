@@ -25,6 +25,7 @@ import { validateQuantResult, type QuantResultValidation } from "./quant-result.
 import { displayRelative } from "./recipe-runner.ts";
 import {
 	isValidRunId,
+	isPureLegacyRunForDiagnostic,
 	iterateGateRunCandidates,
 	listRuns,
 	readCommittedManifest,
@@ -48,6 +49,7 @@ const GATE_EVIDENCE_MAX_SHOWN_CHECKS = 96;
 const GATE_EVIDENCE_MAX_ITEMS_PER_CHECK = 4;
 
 const GATE_SOURCE = ".pi/workbench/gates.yaml + builtin ladder";
+const LEGACY_GATE_RERUN_REASON = "historical pre-transaction Gate run (schema v1) is read-only and has no committed v2 identity; rerun /q-gate all";
 const STATUS = new Set<GateStatus>(["PASS", "FAIL", "BLOCKED", "NOT_RUN"]);
 const CONTROL = /[\x00-\x1f\x7f]/g;
 
@@ -265,7 +267,15 @@ async function readStrictGateCandidate(
 	hooks?.onCandidateValidation?.(runId);
 	if (source === "marker-invalid") return { ok: false, reason: "gate attempt marker unavailable or invalid" };
 	const manifest = await readCommittedManifest(projectRoot, runId);
-	if (!manifest) return { ok: false, reason: "committed run identity unavailable" };
+	if (!manifest) {
+		// Only an unindexed, strictly readable, marker-free schema-v1 record gets
+		// the upgrade-specific diagnosis. Crash markers, corrupt/mixed v2 runs,
+		// and every uncertain classification retain the generic fail-closed reason.
+		if (source === "manifest" && await isPureLegacyRunForDiagnostic(projectRoot, runId)) {
+			return { ok: false, reason: LEGACY_GATE_RERUN_REASON };
+		}
+		return { ok: false, reason: "committed run identity unavailable" };
+	}
 	if (manifest.recipe !== "gate") return { ok: false, reason: "indexed run is not a gate run" };
 	if (source === "marker" && indexedStartedAt !== undefined && manifest.started_at !== indexedStartedAt) {
 		return { ok: false, reason: "gate attempt marker start identity mismatch" };

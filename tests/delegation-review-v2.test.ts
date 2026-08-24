@@ -21,6 +21,8 @@ import {
 	persistRunningDelegationTransaction,
 	readDelegationCommittedGenerationV2,
 	readDelegationReviewV2,
+	hasDelegationSemanticRepairAuthorityV2,
+	hasDelegationSemanticReviewAuthorityV2,
 	readDelegationTransactionV2,
 	hashDelegationCommittedRecords,
 	type DelegationCommittedRecords,
@@ -37,6 +39,7 @@ import type {
 	DelegationWorkerIdentity,
 } from "../extensions/workbench-runtime/core/delegation-transaction.ts";
 import { delegationCommitMarker } from "../extensions/workbench-runtime/core/delegation-transaction.ts";
+import { REVIEW_PAGE_SOURCE_MAX_BYTES, type ReviewPresentationProgress } from "../extensions/workbench-runtime/core/diff-review.ts";
 import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { beginWriteJournalOperation, completeWriteJournalOperation } from "../extensions/workbench-runtime/core/write-journal.ts";
 import { spawnExec } from "./helpers.ts";
@@ -316,6 +319,24 @@ async function acceptPresentedReview(
 	});
 }
 
+async function repairPresentedReview(
+	fixture: ReviewFixture,
+	boundDiffHash: string,
+	repairReason: string,
+	second: number,
+) {
+	return reviewDelegationV2({
+		projectRoot: fixture.root,
+		delegationId: ID,
+		exec: spawnExec,
+		now: at(second),
+		semanticDecision: "REPAIR",
+		expectedBoundDiffHash: boundDiffHash,
+		repairReason,
+		reviewer: SOL_REVIEWER,
+	});
+}
+
 async function presentAndAcceptReview(fixture: ReviewFixture, second = 4) {
 	const presented = await reviewDelegationV2({
 		projectRoot: fixture.root, delegationId: ID, exec: spawnExec, now: at(second),
@@ -342,6 +363,10 @@ test("review v2: complete scope packet stays provisional until a second bound So
 		assert.equal(result.transaction.status, "PENDING_REVIEW");
 		assert.equal(result.review.record?.semantic_review, "required");
 		assert.equal(result.review.record?.semantic_acceptance, undefined);
+		assert.deepEqual(result.review.record?.presentation_progress?.map((item) => ({
+			path: item.path,
+			complete: item.next_byte === item.total_bytes,
+		})), [{ path: "src/a.ts", complete: true }], "even a one-page source carries an exact presentation proof");
 		const boundHash = result.review.record?.bound_diff_hash;
 		assert.equal(typeof boundHash, "string");
 		const accepted = await acceptPresentedReview(fixture, boundHash!, 5);
@@ -393,6 +418,43 @@ test("review v2: complete scope packet stays provisional until a second bound So
 	}
 });
 
+test("review v2: a default multi-path bounded presentation persists only fully visible entries as progress", async () => {
+	const fixture = await setupReviewFixture(
+		["src/a-small.ts", "src/b-large.ts"],
+		undefined,
+		["src/a-small.ts", "src/b-large.ts"],
+		false,
+		false,
+		(path) => path.endsWith("a-small.ts") ? "export const small = true;\n" : "export const value = 1;\n".repeat(120),
+	);
+	try {
+		const result = await reviewDelegationV2({
+			projectRoot: fixture.root,
+			delegationId: ID,
+			exec: spawnExec,
+			maxBytes: 3_000,
+			maxLines: 80,
+			now: at(4),
+		});
+		assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result.error));
+		if (!result.ok) return;
+		assert.equal(result.finalized, false);
+		assert.equal(result.review.record?.presentation_complete, false);
+		assert.ok(result.review.record?.patch.some((entry) => entry.truncated));
+		const strict = await readDelegationReviewV2(fixture.root, ID);
+		assert.equal(strict.ok, true, strict.ok ? "" : JSON.stringify(strict.error));
+		if (!strict.ok) return;
+		for (const entry of strict.value.review.patch.filter((candidate) => !candidate.truncated)) {
+			const progress: ReviewPresentationProgress | undefined = strict.value.review.presentation_progress
+				?.find((item) => item.path === entry.path);
+			assert.ok(progress, `complete entry ${entry.path} has strict persisted progress`);
+			assert.equal(progress.next_byte, progress.total_bytes);
+		}
+	} finally {
+		await cleanup(fixture);
+	}
+});
+
 test("review v2: first-call ACCEPT, wrong hash, non-Sol identity, and incomplete packet all fail closed", async () => {
 	const fixture = await setupReviewFixture(["src/a.ts", "src/b.ts"]);
 	try {
@@ -431,6 +493,130 @@ test("review v2: first-call ACCEPT, wrong hash, non-Sol identity, and incomplete
 		const durable = await readDelegationTransactionV2(fixture.root, ID);
 		assert.equal(durable.ok, true);
 		if (durable.ok) assert.equal(durable.value.status, "PENDING_REVIEW");
+	} finally {
+		await cleanup(fixture);
+	}
+});
+
+test("review v2: REPAIR requires a prior complete current packet, exact hash, and active Sol", async () => {
+	const fixture = await setupReviewFixture(["src/a.ts", "src/b.ts"]);
+	const repairReason = "Canonicalize JSON before hashing and use max normalized latency; fix the Rust float type.";
+	try {
+		const firstRepair = await repairPresentedReview(fixture, "a".repeat(64), repairReason, 4);
+		assert.equal(firstRepair.ok, false);
+		if (!firstRepair.ok) assert.equal(firstRepair.error.code, "review_invalid");
+
+		const partial = await reviewDelegationV2({
+			projectRoot: fixture.root, delegationId: ID, exec: spawnExec, includePaths: ["src/a.ts"], now: at(5),
+		});
+		assert.equal(partial.ok, true, partial.ok ? "" : JSON.stringify(partial.error));
+		if (!partial.ok || partial.review.record === undefined) return;
+		assert.equal(partial.review.record.presentation_complete, false);
+		const incomplete = await repairPresentedReview(fixture, partial.review.record.bound_diff_hash, repairReason, 6);
+		assert.equal(incomplete.ok, false);
+		if (!incomplete.ok) assert.equal(incomplete.error.code, "review_invalid");
+
+		const complete = await reviewDelegationV2({
+			projectRoot: fixture.root, delegationId: ID, exec: spawnExec, includePaths: ["src/b.ts"], now: at(7),
+		});
+		assert.equal(complete.ok, true, complete.ok ? "" : JSON.stringify(complete.error));
+		if (!complete.ok || complete.review.record === undefined) return;
+		assert.equal(complete.review.record.presentation_complete, true);
+		const boundHash = complete.review.record.bound_diff_hash;
+
+		const wrongHash = await repairPresentedReview(fixture, "f".repeat(64), repairReason, 8);
+		assert.equal(wrongHash.ok, false);
+		if (!wrongHash.ok) assert.equal(wrongHash.error.code, "review_conflict");
+		const nonSol = await reviewDelegationV2({
+			projectRoot: fixture.root,
+			delegationId: ID,
+			exec: spawnExec,
+			now: at(8),
+			semanticDecision: "REPAIR",
+			expectedBoundDiffHash: boundHash,
+			repairReason,
+			reviewer: { provider: "openai-codex", model: "gpt-5.6-luna" },
+		});
+		assert.equal(nonSol.ok, false);
+		if (!nonSol.ok) assert.equal(nonSol.error.code, "review_invalid");
+
+		await writeFile(join(fixture.root, "src/a.ts"), "post-presentation drift\n");
+		const drifted = await repairPresentedReview(fixture, boundHash, repairReason, 9);
+		assert.equal(drifted.ok, false);
+		if (!drifted.ok) assert.equal(drifted.error.code, "review_conflict");
+		await writeFile(join(fixture.root, "src/a.ts"), "worker:src/a.ts\n");
+
+		const strict = await readDelegationReviewV2(fixture.root, ID);
+		assert.equal(strict.ok, true, strict.ok ? "" : JSON.stringify(strict.error));
+		if (strict.ok) assert.equal(strict.value.semantic_repair, undefined, "refused decisions publish no negative authority");
+		const durable = await readDelegationTransactionV2(fixture.root, ID);
+		assert.equal(durable.ok, true);
+		if (durable.ok) {
+			assert.equal(durable.value.status, "PENDING_REVIEW");
+			assert.equal(durable.value.revision, 3);
+			assert.equal(durable.value.review, null);
+		}
+	} finally {
+		await cleanup(fixture);
+	}
+});
+
+test("review v2: complete Sol REPAIR is immutable negative authority, remains Gate-blocking, and replays logically", async () => {
+	const fixture = await setupReviewFixture();
+	const repairReason = "Canonicalize JSON before hashing and use max normalized latency; fix the Rust float type.";
+	try {
+		const presented = await reviewDelegationV2({
+			projectRoot: fixture.root, delegationId: ID, exec: spawnExec, now: at(4),
+		});
+		assert.equal(presented.ok, true, presented.ok ? "" : JSON.stringify(presented.error));
+		if (!presented.ok || presented.review.record === undefined) return;
+		assert.equal(presented.review.record.presentation_complete, true);
+		const boundHash = presented.review.record.bound_diff_hash;
+		const reviewBytes = await readFile(reviewPath(fixture.root));
+
+		const repaired = await repairPresentedReview(fixture, boundHash, repairReason, 5);
+		assert.equal(repaired.ok, true, repaired.ok ? "" : JSON.stringify(repaired.error));
+		if (!repaired.ok) return;
+		assert.equal(repaired.finalized, false);
+		assert.equal(repaired.transaction.status, "PENDING_REVIEW");
+		assert.equal(repaired.transaction.revision, 3);
+		assert.equal(repaired.transaction.review, null);
+		assert.equal(repaired.semantic_authority, "repair_required");
+		assert.match(repaired.repair_decision_hash ?? "", /^[0-9a-f]{64}$/u);
+		assert.match(repaired.repair_reason_hash ?? "", /^[0-9a-f]{64}$/u);
+		assert.deepEqual(await readFile(reviewPath(fixture.root)), reviewBytes, "REPAIR never rewrites the presented review packet");
+
+		const strict = await readDelegationReviewV2(fixture.root, ID);
+		assert.equal(strict.ok, true, strict.ok ? "" : JSON.stringify(strict.error));
+		if (!strict.ok) return;
+		assert.equal(strict.value.finalized, false);
+		assert.equal(strict.value.state.status, "PENDING_REVIEW");
+		assert.equal(strict.value.review.semantic_review, "required");
+		assert.equal(strict.value.semantic_repair?.decision, "REPAIR");
+		assert.equal(strict.value.semantic_repair?.repair_reason, repairReason);
+		assert.equal(strict.value.semantic_repair?.expected_bound_diff_hash, boundHash);
+		assert.equal(strict.value.semantic_repair?.decision_hash, repaired.repair_decision_hash);
+		assert.equal(hasDelegationSemanticRepairAuthorityV2(strict.value), true);
+		assert.equal(hasDelegationSemanticReviewAuthorityV2(strict.value), false, "negative authority can never satisfy review or Gate authority");
+
+		const repairBytes = await readFile(join(transactionDir(fixture.root), "repair-decision.json"));
+		const replay = await repairPresentedReview(fixture, boundHash, repairReason, 6);
+		assert.equal(replay.ok, true, replay.ok ? "" : JSON.stringify(replay.error));
+		if (replay.ok) {
+			assert.equal(replay.semantic_authority, "repair_required");
+			assert.equal(replay.repair_decision_hash, repaired.repair_decision_hash);
+		}
+		assert.deepEqual(await readFile(join(transactionDir(fixture.root), "repair-decision.json")), repairBytes,
+			"same binding, reason, and Sol identity replay immutable authority even when invocation time advances");
+
+		const changedReason = await repairPresentedReview(fixture, boundHash, `${repairReason} Also update snapshots.`, 7);
+		assert.equal(changedReason.ok, false);
+		if (!changedReason.ok) assert.equal(changedReason.error.code, "review_conflict");
+		const acceptAfterRepair = await acceptPresentedReview(fixture, boundHash, 7);
+		assert.equal(acceptAfterRepair.ok, false);
+		if (!acceptAfterRepair.ok) assert.equal(acceptAfterRepair.error.code, "review_conflict");
+		assert.deepEqual(await readFile(join(transactionDir(fixture.root), "repair-decision.json")), repairBytes,
+			"conflicting semantic decisions cannot mutate the immutable REPAIR record");
 	} finally {
 		await cleanup(fixture);
 	}
@@ -496,6 +682,190 @@ test("review v2: strict compact SVG/JSON fact packets can terminate through Sol 
 		if (durable.ok) assert.equal(durable.value.status, "PENDING_REVIEW");
 	} finally {
 		await cleanup(sourceFixture);
+	}
+});
+
+test("review v2: a 14 KiB ordinary source file advances contiguous hash-bound pages and then accepts", async () => {
+	const source = Array.from({ length: 357 }, (_, index) =>
+		`def test_page_${String(index).padStart(3, "0")}(): assert ${index} >= 0  # page`,
+	).join("\n") + "\n";
+	assert.ok(Buffer.byteLength(source, "utf8") > 14_000);
+	const fixture = await setupReviewFixture(
+		["src/large.py"],
+		undefined,
+		["src/large.py"],
+		false,
+		false,
+		() => source,
+	);
+	try {
+		const first = await reviewDelegationV2({
+			projectRoot: fixture.root, delegationId: ID, exec: spawnExec,
+			includePaths: ["src/large.py"], maxBytes: 32_000, maxLines: 398, now: at(4),
+		});
+		assert.equal(first.ok, true, first.ok ? "" : JSON.stringify(first.error));
+		if (!first.ok || first.review.record === undefined) return;
+		const firstEntry = first.review.record.patch[0]!;
+		assert.equal(firstEntry.source, "git-diff");
+		assert.ok(firstEntry.page, "the first bounded page carries its exact byte range");
+		assert.equal(firstEntry.page?.start_byte, 0);
+		assert.ok((firstEntry.page?.end_byte ?? 0) < (firstEntry.page?.total_bytes ?? 0));
+		assert.equal(first.review.record.presentation_complete, false);
+		assert.deepEqual(first.review.record.presentation_remaining_paths, ["src/large.py"]);
+		assert.equal(first.review.record.presentation_progress?.[0]?.next_byte, firstEntry.page?.end_byte);
+
+		const second = await reviewDelegationV2({
+			projectRoot: fixture.root, delegationId: ID, exec: spawnExec,
+			includePaths: ["src/large.py"], maxBytes: 32_000, maxLines: 398, now: at(5),
+		});
+		assert.equal(second.ok, true, second.ok ? "" : JSON.stringify(second.error));
+		if (!second.ok || second.review.record === undefined) return;
+		const secondEntry = second.review.record.patch[0]!;
+		assert.ok(secondEntry.page);
+		assert.equal(secondEntry.page?.start_byte, firstEntry.page?.end_byte, "the second page resumes without a gap or overlap");
+		assert.equal(secondEntry.page?.end_byte, secondEntry.page?.total_bytes);
+		assert.equal(second.review.record.presentation_complete, true);
+		assert.deepEqual(second.review.record.presentation_remaining_paths, []);
+		assert.equal(second.review.record.presentation_progress?.[0]?.next_byte, secondEntry.page?.total_bytes);
+		const expectedDiff = await spawnExec("git", ["diff", "--", "src/large.py"], { cwd: fixture.root });
+		assert.equal(expectedDiff.code, 0, expectedDiff.stderr);
+		const reconstructed = `${firstEntry.text}${secondEntry.text}`;
+		assert.equal(createHash("sha256").update(reconstructed, "utf8").digest("hex"), firstEntry.page?.stream_sha256);
+		assert.equal(reconstructed, expectedDiff.stdout, "the visible pages reconstruct the complete redacted diff stream exactly");
+
+		const accepted = await acceptPresentedReview(fixture, second.review.record.bound_diff_hash, 6);
+		assert.equal(accepted.ok, true, accepted.ok ? "" : JSON.stringify(accepted.error));
+		if (accepted.ok) {
+			assert.equal(accepted.finalized, true);
+			assert.equal(accepted.transaction.status, "REVIEWED");
+			assert.equal(accepted.review.record?.semantic_review, "accepted");
+		}
+		const artifact = JSON.parse(await readFile(reviewPath(fixture.root), "utf8")) as Record<string, any>;
+		artifact.review.presentation_progress[0].next_byte -= 1;
+		const tamperedBytes = Buffer.from(`${JSON.stringify(artifact, null, 2)}\n`, "utf8");
+		await writeFile(reviewPath(fixture.root), tamperedBytes);
+		const transaction = JSON.parse(await readFile(transactionPath(fixture.root), "utf8")) as Record<string, any>;
+		transaction.review.review_hash = createHash("sha256").update(tamperedBytes).digest("hex");
+		await writeFile(transactionPath(fixture.root), `${JSON.stringify(transaction, null, 2)}\n`);
+		const tampered = await readDelegationReviewV2(fixture.root, ID);
+		assert.equal(tampered.ok, false, "a cursor that no longer reaches the accepted complete stream fails strict read");
+		if (!tampered.ok) assert.equal(tampered.error.code, "invalid_record");
+	} finally {
+		await cleanup(fixture);
+	}
+});
+
+test("review v2: provisional presentation fields cannot forge page completion or bypass Sol review", async () => {
+	const source = Array.from({ length: 357 }, (_, index) =>
+		`def test_guard_${String(index).padStart(3, "0")}(): assert ${index} >= 0  # guard`,
+	).join("\n") + "\n";
+	const fixture = await setupReviewFixture(
+		["src/large.py"], undefined, ["src/large.py"], false, false, () => source,
+	);
+	try {
+		const first = await reviewDelegationV2({
+			projectRoot: fixture.root, delegationId: ID, exec: spawnExec,
+			includePaths: ["src/large.py"], maxBytes: 32_000, maxLines: 398, now: at(4),
+		});
+		assert.equal(first.ok, true, first.ok ? "" : JSON.stringify(first.error));
+		if (!first.ok || first.review.record === undefined) return;
+		const original = JSON.parse(await readFile(reviewPath(fixture.root), "utf8")) as Record<string, any>;
+
+		// Compatibility keeps an old schema-2 provisional record readable, but
+		// bare coverage flags and a truncated ordinary entry never satisfy the
+		// semantic ACCEPT predicate. A fresh no-decision call rebuilds proof.
+		const bare = structuredClone(original);
+		delete bare.review.presentation_progress;
+		for (const entry of bare.review.patch) delete entry.page;
+		bare.review.fully_presented_paths = ["src/large.py"];
+		bare.review.presentation_remaining_paths = [];
+		bare.review.presentation_complete = true;
+		await writeFile(reviewPath(fixture.root), `${JSON.stringify(bare, null, 2)}\n`);
+		const readableCompatibility = await readDelegationReviewV2(fixture.root, ID);
+		assert.equal(readableCompatibility.ok, true, readableCompatibility.ok ? "" : JSON.stringify(readableCompatibility.error));
+		const refused = await acceptPresentedReview(fixture, first.review.record.bound_diff_hash, 5);
+		assert.equal(refused.ok, false, "bare fully-presented fields cannot authorize semantic ACCEPT");
+		if (!refused.ok) assert.equal(refused.error.code, "review_invalid");
+		const selfAccepted = structuredClone(bare);
+		selfAccepted.review.semantic_review = "accepted";
+		selfAccepted.review.semantic_acceptance = {
+			decision: "ACCEPT",
+			expected_bound_diff_hash: first.review.record.bound_diff_hash,
+			reviewer: SOL_REVIEWER,
+			accepted_at: selfAccepted.review.reviewed_at,
+		};
+		await writeFile(reviewPath(fixture.root), `${JSON.stringify(selfAccepted, null, 2)}\n`);
+		const provisionalAccepted = await readDelegationReviewV2(fixture.root, ID);
+		assert.equal(provisionalAccepted.ok, true, provisionalAccepted.ok ? "" : JSON.stringify(provisionalAccepted.error));
+		if (provisionalAccepted.ok) assert.equal(hasDelegationSemanticReviewAuthorityV2(provisionalAccepted.value), false,
+			"a PENDING transaction never gains authority from a self-asserted accepted review file");
+		const refusedSelfAcceptance = await acceptPresentedReview(fixture, first.review.record.bound_diff_hash, 5);
+		assert.equal(refusedSelfAcceptance.ok, false);
+		if (!refusedSelfAcceptance.ok) assert.equal(refusedSelfAcceptance.error.code, "review_invalid");
+		const rebuilt = await reviewDelegationV2({
+			projectRoot: fixture.root, delegationId: ID, exec: spawnExec,
+			includePaths: ["src/large.py"], maxBytes: 32_000, maxLines: 398, now: at(6),
+		});
+		assert.equal(rebuilt.ok, true, rebuilt.ok ? "" : JSON.stringify(rebuilt.error));
+		if (rebuilt.ok) {
+			assert.ok(rebuilt.review.record?.presentation_progress?.length);
+			assert.equal(rebuilt.review.record?.presentation_complete, false, "forged legacy completeness is discarded");
+		}
+
+		const pageWithoutProgress = structuredClone(original);
+		delete pageWithoutProgress.review.presentation_progress;
+		await writeFile(reviewPath(fixture.root), `${JSON.stringify(pageWithoutProgress, null, 2)}\n`);
+		const missingProgress = await readDelegationReviewV2(fixture.root, ID);
+		assert.equal(missingProgress.ok, false, "a page always requires its durable cursor");
+		if (!missingProgress.ok) assert.equal(missingProgress.error.code, "invalid_record");
+
+		const forgedLength = structuredClone(original);
+		const forgedPage = forgedLength.review.patch[0].page;
+		forgedPage.end_byte = forgedPage.total_bytes;
+		forgedLength.review.presentation_progress[0].next_byte = forgedPage.total_bytes;
+		forgedLength.review.fully_presented_paths = ["src/large.py"];
+		forgedLength.review.presentation_remaining_paths = [];
+		forgedLength.review.presentation_complete = true;
+		await writeFile(reviewPath(fixture.root), `${JSON.stringify(forgedLength, null, 2)}\n`);
+		const mismatchedLength = await readDelegationReviewV2(fixture.root, ID);
+		assert.equal(mismatchedLength.ok, false, "declared page bytes must equal the visible UTF-8 body bytes");
+		if (!mismatchedLength.ok) assert.equal(mismatchedLength.error.code, "invalid_record");
+
+		// A structurally contiguous chain still cannot jump to a fabricated tail:
+		// ACCEPT rebuilds the real stream and checks every segment plus the exact
+		// visible slice against current authority.
+		const forgedTail = structuredClone(original);
+		const tailEntry = forgedTail.review.patch[0];
+		const tailPage = tailEntry.page;
+		const visibleBytes = Buffer.byteLength(tailEntry.text, "utf8");
+		const tailStart = tailPage.total_bytes - visibleBytes;
+		tailPage.start_byte = tailStart;
+		tailPage.end_byte = tailPage.total_bytes;
+		tailEntry.truncated = true;
+		forgedTail.review.presentation_progress[0].next_byte = tailPage.total_bytes;
+		forgedTail.review.presentation_progress[0].segments = [
+			{ start_byte: 0, end_byte: tailStart, page_sha256: "f".repeat(64) },
+			{ start_byte: tailStart, end_byte: tailPage.total_bytes, page_sha256: createHash("sha256").update(tailEntry.text, "utf8").digest("hex") },
+		];
+		forgedTail.review.fully_presented_paths = ["src/large.py"];
+		forgedTail.review.presentation_remaining_paths = [];
+		forgedTail.review.presentation_complete = true;
+		await writeFile(reviewPath(fixture.root), `${JSON.stringify(forgedTail, null, 2)}\n`);
+		const structurallyReadableTail = await readDelegationReviewV2(fixture.root, ID);
+		assert.equal(structurallyReadableTail.ok, true, structurallyReadableTail.ok ? "" : JSON.stringify(structurallyReadableTail.error));
+		const refusedTail = await acceptPresentedReview(fixture, first.review.record.bound_diff_hash, 7);
+		assert.equal(refusedTail.ok, false, "actual-source validation rejects a fabricated contiguous tail chain");
+		if (!refusedTail.ok) assert.equal(refusedTail.error.code, "review_invalid");
+
+		const oversized = structuredClone(original);
+		oversized.review.patch[0].page.total_bytes = REVIEW_PAGE_SOURCE_MAX_BYTES + 1;
+		oversized.review.presentation_progress[0].total_bytes = REVIEW_PAGE_SOURCE_MAX_BYTES + 1;
+		await writeFile(reviewPath(fixture.root), `${JSON.stringify(oversized, null, 2)}\n`);
+		const aboveCeiling = await readDelegationReviewV2(fixture.root, ID);
+		assert.equal(aboveCeiling.ok, false, "page streams above the fixed ceiling fail closed");
+		if (!aboveCeiling.ok) assert.equal(aboveCeiling.error.code, "invalid_record");
+	} finally {
+		await cleanup(fixture);
 	}
 });
 
@@ -573,6 +943,8 @@ test("review v2: historical untagged schema1 authority is full-diff replay-only 
 		delete artifact.review.fully_presented_paths;
 		delete artifact.review.presentation_remaining_paths;
 		delete artifact.review.presentation_complete;
+		delete artifact.review.presentation_progress;
+		for (const entry of artifact.review.patch ?? []) delete entry.page;
 		delete artifact.review.semantic_review;
 		delete artifact.review.semantic_acceptance;
 		artifact.review.bound_diff_hash = legacyHash;

@@ -46,8 +46,12 @@ const ASSERTED_START_RE = /\b(?:started|launched|created|called)\b|已(?:按要�
 const PLANNED_EXECUTION_RE = /\b(?:will|can|could|should|may|might|plan(?:ned)?\s+to|need\s+to|ready\s+to|going\s+to)\b.{0,32}\b(?:start|launch|execute|create|call)\b|(?:下一步|计划|准备|打算|可以|需要).{0,24}(?:启动|执行|创建|调用|改用)/iu;
 const DISTRIBUTIVE_CLAIM_RE = /\b(?:all|both|each|these|those)\b|(?:两|三|四|五|六|七|八|九|十|多)次|(?:全部|都|分别|上述|这些)/iu;
 const INLINE_CODE_RE = /`([^`\r\n]*)`/gu;
-const RUN_ONLY_LABEL_RE = /\b(?:run|recipe|tests?|pytest|mypy|compileall|loader|targeted|focused|audit|checks?|diff|gate(?:[-_ ]?profile)?|typecheck|lint)\b|(?:完整\s*)?G1|测试|验证|审计/iu;
+const RUN_ONLY_LABEL_RE = /\b(?:runs?|recipe|tests?|pytest|mypy|compileall|loader|targeted|focused|audit|checks?|diff|gate(?:[-_ ]?profile)?|typecheck|lint)\b|(?:完整\s*)?G1|测试|验证|审计/iu;
 const DELEGATION_LABEL_RE = /\b(?:delegation(?:s)?|worker(?:s)?|latest|authority)\b|delegation[_ ]?id|委派|工作线程/iu;
+const RUN_SUCCESS_OUTCOME_RE = /\b(?:PASS(?:ED)?|SUCCESS(?:FUL(?:LY)?)?|SUCCEEDED|OK)\b|\bexit(?:\s+code)?\s*[:=]?\s*0\b|成功(?:退出|完成)?/iu;
+const RUN_FAILURE_OUTCOME_RE = /\b(?:FAIL(?:ED)?|EXCEPTION|CANCELLED|TIMED\s+OUT)\b|\bexit(?:\s+code)?\s*[:=]?\s*[1-9]\d*\b|失败|超时|已取消/iu;
+const RUN_COMPLETION_RE = /\b(?:complet(?:e|ed)|finish(?:ed)?|return(?:ed)?|exit(?:ed)?|ended)\b|(?:已|本次|刚刚|刚才)?(?:完成|结束|返回|退出)|完整\s*G1/iu;
+const RUN_UNAVAILABLE_DIAGNOSTIC_RE = /\b(?:not\s+found|does\s+not\s+exist|missing|unavailable|uncommitted|invalid\s+(?:record|identity)|identity\s+unavailable)\b|不存在|未运行|未执行|不可用|未提交|无效(?:记录|身份)?|无法读取|虚构/iu;
 const MAX_CLAIM_IDS = 32;
 
 export type DelegationClaimAuthorityStatus = DelegationTransactionStatus | "LEGACY_RUNNING" | "LEGACY_SUCCEEDED" | "LEGACY_FAILED";
@@ -139,11 +143,14 @@ function claimClauses(text: string): string[] {
 				prefix.lastIndexOf("!"), prefix.lastIndexOf("?"), prefix.lastIndexOf("！"), prefix.lastIndexOf("？"),
 			);
 			const localLabel = prefix.slice(boundary + 1);
-			const delegationLabeled = DELEGATION_LABEL_RE.test(localLabel);
-			const runOnlyLabeled = RUN_ONLY_LABEL_RE.test(localLabel) && !delegationLabeled;
-			if (runOnlyLabeled) return " ";
-			const ids = [...inline.matchAll(new RegExp(DELEGATION_ID_SCAN_RE.source, "g"))].map((match) => match[0]!);
-			const statuses = delegationLabeled
+			const contextPrefix = `${localLabel} `;
+			const contextualInline = `${contextPrefix}${inline}`;
+			const ids = [...inline.matchAll(new RegExp(DELEGATION_ID_SCAN_RE.source, "g"))]
+				.filter((match) => !idHasNearestRunLabel(contextualInline, contextPrefix.length + (match.index ?? 0)))
+				.map((match) => match[0]!);
+			const runLabelIndex = lastLabelIndex(contextualInline, RUN_ONLY_LABEL_RE);
+			const delegationLabelIndex = lastLabelIndex(contextualInline, DELEGATION_LABEL_RE);
+			const statuses = delegationLabelIndex >= runLabelIndex && delegationLabelIndex >= 0
 				? [...inline.matchAll(new RegExp(STATUS_SCAN_RE.source, "gi"))].map((match) => match[0]!)
 				: [];
 			return [...ids, ...statuses].join(" ") || " ";
@@ -154,6 +161,26 @@ function claimClauses(text: string): string[] {
 		}
 	}
 	return clauses;
+}
+
+function lastLabelIndex(text: string, pattern: RegExp): number {
+	let last = -1;
+	for (const match of text.matchAll(new RegExp(pattern.source, "giu"))) last = match.index ?? last;
+	return last;
+}
+
+/**
+ * Run ids and delegation ids intentionally share the same canonical shape.
+ * Bind each visible occurrence to the nearest explicit label before it:
+ * `delegation ID ... run ID` therefore classifies the two ids independently,
+ * while an unlabeled id retains the historical delegation fail-closed path.
+ */
+function idHasNearestRunLabel(clause: string, idIndex: number): boolean {
+	const prefix = clause.slice(0, idIndex);
+	const runIndex = lastLabelIndex(prefix, RUN_ONLY_LABEL_RE);
+	if (runIndex < 0) return false;
+	const delegationIndex = lastLabelIndex(prefix, DELEGATION_LABEL_RE);
+	return runIndex > delegationIndex;
 }
 
 function inspectWorkbenchRunClaims(text: string): {
@@ -174,12 +201,21 @@ function inspectWorkbenchRunClaims(text: string): {
 		if (/^\s*>/u.test(rawLine) || /^["'“‘].*["'”’]$/u.test(trimmed)) continue;
 		const visible = rawLine.replace(INLINE_CODE_RE, (_whole, inline: string) => inline);
 		for (const segment of visible.split(/[.;；。!?！？]+/u)) {
-			if (!RUN_ONLY_LABEL_RE.test(segment) || DELEGATION_LABEL_RE.test(segment)) continue;
-			if (/\b(?:not found|does not exist|missing)\b|不存在|未运行|未执行|虚构/iu.test(segment)) continue;
-			const lineIds = [...segment.matchAll(new RegExp(DELEGATION_ID_SCAN_RE.source, "g"))].map((match) => match[0]!);
-			const outcome = /\b(?:PASS(?:ED)?|SUCCESS(?:FUL(?:LY)?)?|OK)\b/iu.test(segment)
+			if (!RUN_ONLY_LABEL_RE.test(segment)) continue;
+			const success = RUN_SUCCESS_OUTCOME_RE.test(segment);
+			const failure = RUN_FAILURE_OUTCOME_RE.test(segment);
+			const completion = success || failure || RUN_COMPLETION_RE.test(segment);
+			// A neutral pointer such as `gate: record BLOCKED (run ID)` or an
+			// explicit unavailable-identity diagnostic is not a claim that a run
+			// executed or completed. Positive/negative terminal outcome words still
+			// require strict committed-run authority even if other prose is noisy.
+			if (!completion || (RUN_UNAVAILABLE_DIAGNOSTIC_RE.test(segment) && !success && !failure)) continue;
+			const lineIds = [...segment.matchAll(new RegExp(DELEGATION_ID_SCAN_RE.source, "g"))]
+				.filter((match) => idHasNearestRunLabel(segment, match.index ?? 0))
+				.map((match) => match[0]!);
+			const outcome = success
 				? "SUCCESS" as const
-				: /\b(?:FAIL(?:ED)?|EXCEPTION|CANCELLED|TIMED\s+OUT)\b/iu.test(segment)
+				: failure
 					? "FAILURE" as const
 					: undefined;
 			for (const id of lineIds) {
@@ -304,7 +340,8 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 			sawNegativeDelegation = true;
 			continue;
 		}
-		const idMatches = [...clause.matchAll(new RegExp(DELEGATION_ID_SCAN_RE.source, "g"))];
+		const idMatches = [...clause.matchAll(new RegExp(DELEGATION_ID_SCAN_RE.source, "g"))]
+			.filter((match) => !idHasNearestRunLabel(clause, match.index ?? 0));
 		const plannedExecution = hasDelegationSubject && PLANNED_EXECUTION_RE.test(clause);
 		if (plannedExecution && idMatches.length === 0 && statusesIn(clause).length === 0) continue;
 		const clauseExecution = hasDelegationSubject && !plannedExecution && EXECUTION_WORD_RE.test(clause);

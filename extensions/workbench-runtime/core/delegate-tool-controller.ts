@@ -3,8 +3,14 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import type { ExecFn } from "./config.ts";
+import { validateChangeSet, type ChangeSetRecord } from "./change-set.ts";
 import type { completeDefaultDelegationDeliveryV2 } from "./delegation-default-delivery.ts";
 import type { executeDelegationV2 } from "./delegation-execution-v2.ts";
+import {
+	abortPristinePreparedDelegationUnderStartLockV2,
+	isStrictRetryableAbortedRepairV2,
+	isStrictRetryableEmptyRepairRecoveryV2,
+} from "./delegation-execution-owner.ts";
 import type { makeDelegationId, readDelegationLedger } from "./delegation-ledger.ts";
 import {
 	observeDiffChange,
@@ -15,10 +21,30 @@ import {
 	type DelegationState,
 } from "./delegation-state.ts";
 import { normalizeDelegationBoundedTaskContractV2 } from "./delegation-transaction-artifacts.ts";
+import {
+	acquireProjectDelegationStartLockV1,
+	releaseProjectDelegationStartLockV1,
+	type ProjectDelegationStartLockLeaseV1,
+} from "./delegation-start-lock.ts";
 import { readDelegationPlanContractAuthority } from "./delegation-plan-reference.ts";
-import { verifyCurrentPlanReference } from "./plan-reference.ts";
+import { planReferenceHash, verifyCurrentPlanReference } from "./plan-reference.ts";
 import type { readRecoverableUnpublishedDelegationV2 } from "./delegation-project-authority.ts";
-import type { readDelegationCommittedGenerationV2 } from "./delegation-transaction-storage.ts";
+import {
+	delegationGenerationRecordRelativePathV2,
+	hasDelegationSemanticRepairAuthorityV2,
+	hasDelegationSemanticReviewAuthorityV2,
+	readDelegationTransactionV2,
+	readDelegationReviewV2,
+	type DelegationCommittedGenerationV2,
+	type readDelegationCommittedGenerationV2,
+} from "./delegation-transaction-storage.ts";
+import {
+	bindDelegationRepairLineageV1,
+	exactDelegationRepairAllowedPathsV1,
+	DELEGATION_REPAIR_LINEAGE_MAX_DEPTH,
+	type DelegationRepairLineageV1,
+	type DelegationTransactionRecord,
+} from "./delegation-transaction.ts";
 import { WORKBENCH_TOOL_METADATA, WORKBENCH_TOOL_PARAMETERS } from "./tool-catalog.ts";
 import type { buildTrustedRecoveryAuthority } from "./trusted-recovery-authority.ts";
 import type { TrustedRecoveryAuthority } from "./tool-result-ingress-projection.ts";
@@ -36,6 +62,98 @@ import { buildDelegateWorkerResult, type HandoffScopeIntegrityPacket } from "../
 type CurrentDelegationBinding =
 	| { readonly status: "unavailable" }
 	| { readonly status: "fresh" | "conflict"; readonly hash: string };
+
+const DELEGATION_FAILURE_SUMMARY_MAX_BYTES = 2_048 as const;
+
+type V2RepairAuthorityKind = "committed" | "unpublished" | "raw-lineage";
+
+interface V2RepairAuthority {
+	id: string;
+	kind: V2RepairAuthorityKind;
+	status: DelegationTransactionRecord["status"];
+	contractHash: string;
+	generationContentHash: string | null;
+	semanticDecisionHash: string | null;
+	expectedBindingHash: string;
+	repairLineage?: DelegationRepairLineageV1;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function byteCompare(left: string, right: string): number {
+	return Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8"));
+}
+
+function byteSortedUnion(...sets: ReadonlyArray<readonly string[]>): string[] | undefined {
+	const paths = [...new Set(sets.flatMap((set) => [...set]))].sort(byteCompare);
+	return paths.length > 0 && paths.length <= 500 ? paths : undefined;
+}
+
+function strictCommittedChangeSet(value: DelegationCommittedGenerationV2): ChangeSetRecord | undefined {
+	const scope = value.records["scope.json"];
+	if (!isRecord(scope) || !validateChangeSet(scope.change_set)) return undefined;
+	const changeSet = scope.change_set as ChangeSetRecord;
+	if (changeSet.delegation_id !== value.state.delegation_id || changeSet.contract_hash !== value.state.contract_hash ||
+		value.state.terminal_outcome === null || value.state.terminal_outcome.change_set_status !== changeSet.status ||
+		value.state.terminal_outcome.delta_hash !== changeSet.worker_delta_hash) return undefined;
+	return changeSet;
+}
+
+/**
+ * Derive the immutable continuity for one exact repair successor.
+ *
+ * The first link is rooted in the packet-bound Sol REPAIR decision. Later
+ * links preserve that root and add the immediate parent's strict W/D scope.
+ */
+export function deriveDelegationRepairLineageV1(input: {
+	parent: DelegationTransactionRecord;
+	changeSet?: ChangeSetRecord;
+	semanticDecision?: { delegationId: string; decisionHash: string };
+	additionalPaths?: readonly string[];
+}): DelegationRepairLineageV1 | undefined {
+	const parentLineage = input.parent.repair_lineage;
+	const workerPaths = input.changeSet?.worker_delta.map((entry) => entry.path) ?? [];
+	const dependencyPaths = input.changeSet?.dependency_paths ?? [];
+	const carriedPaths = byteSortedUnion(
+		parentLineage?.carried_paths ?? [],
+		workerPaths,
+		dependencyPaths,
+		input.additionalPaths ?? [],
+	);
+	if (carriedPaths === undefined) return undefined;
+	if (parentLineage === undefined) {
+		if (input.semanticDecision === undefined || input.semanticDecision.delegationId !== input.parent.delegation_id || input.changeSet === undefined) return undefined;
+		return bindDelegationRepairLineageV1({
+			schema_version: 1,
+			kind: "semantic-repair-lineage-v1",
+			root_delegation_id: input.parent.delegation_id,
+			repair_of: input.parent.delegation_id,
+			root_decision_hash: input.semanticDecision.decisionHash,
+			continuation_decision_delegation_id: input.parent.delegation_id,
+			continuation_decision_hash: input.semanticDecision.decisionHash,
+			parent_lineage_hash: null,
+			depth: 1,
+			carried_paths: carriedPaths,
+		});
+	}
+	if (input.semanticDecision !== undefined && input.semanticDecision.delegationId !== input.parent.delegation_id) return undefined;
+	return bindDelegationRepairLineageV1({
+		schema_version: 1,
+		kind: "semantic-repair-lineage-v1",
+		root_delegation_id: parentLineage.root_delegation_id,
+		repair_of: input.parent.delegation_id,
+		root_decision_hash: parentLineage.root_decision_hash,
+		continuation_decision_delegation_id: input.semanticDecision?.delegationId ?? parentLineage.continuation_decision_delegation_id,
+		continuation_decision_hash: input.semanticDecision?.decisionHash ?? parentLineage.continuation_decision_hash,
+		parent_lineage_hash: parentLineage.lineage_hash,
+		// Depth is a bounded/saturated diagnostic counter. The cryptographic
+		// parent hash and immediate repair_of continue to advance at the cap.
+		depth: Math.min(parentLineage.depth + 1, DELEGATION_REPAIR_LINEAGE_MAX_DEPTH),
+		carried_paths: carriedPaths,
+	});
+}
 
 export interface DelegateToolController<TIngress> {
 	pi: Pick<ExtensionAPI, "registerTool">;
@@ -61,7 +179,13 @@ export interface DelegateToolController<TIngress> {
 export interface DelegateToolServices {
 	now(): Date;
 	makeDelegationId: typeof makeDelegationId;
+	acquireStartLock: typeof acquireProjectDelegationStartLockV1;
+	releaseStartLock: typeof releaseProjectDelegationStartLockV1;
 	readCommittedGeneration: typeof readDelegationCommittedGenerationV2;
+	/** Optional injection seam; production falls back to the strict storage reader. */
+	readTransaction?: typeof readDelegationTransactionV2;
+	/** Optional injection seam; production falls back to the strict storage reader. */
+	readReview?: typeof readDelegationReviewV2;
 	readRecoverableUnpublished: typeof readRecoverableUnpublishedDelegationV2;
 	readLegacyLedger: typeof readDelegationLedger;
 	executeDelegation: typeof executeDelegationV2;
@@ -77,6 +201,14 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 		executionMode: "sequential",
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			let trustedIngress: TIngress | undefined;
+			let startLockLease: ProjectDelegationStartLockLeaseV1 | undefined;
+			let preserveStartLock = false;
+			const releaseStartLock = async (): Promise<void> => {
+				if (startLockLease === undefined) return;
+				const released = await controller.services.releaseStartLock(startLockLease);
+				if (!released.ok) throw new Error(`workbench_delegate_worker: project start lock release ${released.error.code}`);
+				startLockLease = undefined;
+			};
 			try {
 				const trustError = controller.trustedOrError(ctx);
 				if (trustError) throw new Error(`workbench_delegate_worker: ${trustError}`);
@@ -114,36 +246,242 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					const currentPlan = await verifyCurrentPlanReference(projectRoot, contract.value.plan_ref);
 					if (!currentPlan.ok) throw new Error(`workbench_delegate_worker: plan_ref ${currentPlan.error.code}`);
 				}
+				// Reconcile before acquiring a new start lock so a dead prior lock can
+				// prove and close the PREPARED-before-execution-owner crash window.
+				await controller.reconcileProjectAuthority(projectRoot, controller.services.now().toISOString());
+				const initialProjectBlock = controller.getProjectAuthorityBlockReason("delegation");
+				if (initialProjectBlock) throw new Error(`workbench_delegate_worker: ${initialProjectBlock}`);
+				const startedAt = controller.services.now().toISOString();
+				const delegationId = controller.services.makeDelegationId(new Date(startedAt));
+				const acquired = await controller.services.acquireStartLock({
+					project_root: projectRoot,
+					delegation_id: delegationId,
+					now: startedAt,
+				});
+				if (!acquired.ok) throw new Error(`workbench_delegate_worker: project start lock ${acquired.error.code}`);
+				startLockLease = acquired.value;
 				await controller.reconcileProjectAuthority(projectRoot, controller.services.now().toISOString());
 				const projectBlock = controller.getProjectAuthorityBlockReason("delegation");
 				if (projectBlock) throw new Error(`workbench_delegate_worker: ${projectBlock}`);
 
-				let v2RepairAuthority: { id: string; kind: "committed" | "unpublished" } | undefined;
+				const readTransaction = controller.services.readTransaction ?? readDelegationTransactionV2;
+				const readReview = controller.services.readReview ?? readDelegationReviewV2;
+				const lineageWritePaths = exactDelegationRepairAllowedPathsV1(contract.value.allowed_paths);
+				const requireLineageWritePaths = (): string[] => {
+					if (lineageWritePaths === undefined) {
+						throw new Error("workbench_delegate_worker: unresolved semantic repair requires only exact-file allowed_paths; subtree or glob rules are forbidden");
+					}
+					return lineageWritePaths;
+				};
+				const hasStrictLineageRoot = async (state: DelegationTransactionRecord): Promise<boolean> => {
+					if (state.repair_lineage === undefined) return true;
+					const root = await readReview(projectRoot, state.repair_lineage.root_delegation_id);
+					return root.ok && hasDelegationSemanticRepairAuthorityV2(root.value) &&
+						root.value.semantic_repair!.decision_hash === state.repair_lineage.root_decision_hash;
+				};
+				let v2RepairAuthority: V2RepairAuthority | undefined;
 				if (contract.value.repair_of !== undefined) {
 					const repairId = contract.value.repair_of;
 					const priorV2 = await controller.services.readCommittedGeneration(projectRoot, repairId);
 					if (priorV2.ok) {
-						if (!new Set<string>(["FAILED", "FINISHED", "REVIEWED"]).has(priorV2.value.state.status)) {
-							throw new Error(`workbench_delegate_worker: repair_of ${repairId} references non-terminal v2 status ${priorV2.value.state.status}`);
+						const parent = priorV2.value.state;
+						if (!await hasStrictLineageRoot(parent)) {
+							throw new Error(`workbench_delegate_worker: repair_of ${repairId} repair lineage root authority is invalid`);
 						}
-						v2RepairAuthority = { id: repairId, kind: "committed" };
+						let semanticDecisionHash: string | null = null;
+						let expectedSemanticBinding: string | undefined;
+						let repairLineage: DelegationRepairLineageV1 | undefined;
+						if (parent.status === "PENDING_REVIEW") {
+							const priorReview = await readReview(projectRoot, repairId);
+							if (!priorReview.ok || !hasDelegationSemanticRepairAuthorityV2(priorReview.value)) {
+								throw new Error(`workbench_delegate_worker: repair_of ${repairId} requires an exact immutable semantic REPAIR decision`);
+							}
+							const changeSet = strictCommittedChangeSet(priorV2.value);
+							semanticDecisionHash = priorReview.value.semantic_repair!.decision_hash;
+							expectedSemanticBinding = priorReview.value.semantic_repair!.expected_bound_diff_hash;
+							repairLineage = changeSet === undefined ? undefined : deriveDelegationRepairLineageV1({
+								parent,
+								changeSet,
+								semanticDecision: { delegationId: parent.delegation_id, decisionHash: semanticDecisionHash },
+								additionalPaths: requireLineageWritePaths(),
+							});
+							if (repairLineage === undefined) {
+								throw new Error(`workbench_delegate_worker: repair_of ${repairId} has no bounded strict ChangeSet lineage`);
+							}
+						} else if (parent.status === "FAILED" || parent.status === "RECOVERY_REQUIRED") {
+							if (parent.status === "RECOVERY_REQUIRED" && parent.repair_lineage === undefined) {
+								throw new Error(`workbench_delegate_worker: repair_of ${repairId} references recovery without inherited repair lineage`);
+							}
+							if (parent.repair_lineage !== undefined) {
+								const changeSet = strictCommittedChangeSet(priorV2.value);
+								repairLineage = changeSet === undefined ? undefined : deriveDelegationRepairLineageV1({
+									parent,
+									changeSet,
+									additionalPaths: requireLineageWritePaths(),
+								});
+								if (repairLineage === undefined) {
+									throw new Error(`workbench_delegate_worker: repair_of ${repairId} repair lineage cannot be advanced safely`);
+								}
+							}
+						} else if (parent.status === "REVIEWED") {
+							const priorReview = await readReview(projectRoot, repairId);
+							if (!priorReview.ok || !priorReview.value.finalized ||
+								!hasDelegationSemanticReviewAuthorityV2(priorReview.value)) {
+								throw new Error(`workbench_delegate_worker: repair_of ${repairId} requires explicit historical semantic migration review first`);
+							}
+						} else if (parent.status !== "FINISHED") {
+							throw new Error(`workbench_delegate_worker: repair_of ${repairId} references non-repairable v2 status ${parent.status}`);
+						}
+						const binding = await controller.collectCurrentDelegationBinding(projectRoot, repairId);
+						if (binding.status !== "fresh" ||
+							(expectedSemanticBinding !== undefined && binding.hash !== expectedSemanticBinding)) {
+							throw new Error(`workbench_delegate_worker: repair_of ${repairId} current binding is not the exact repair authority`);
+						}
+						v2RepairAuthority = {
+							id: repairId,
+							kind: "committed",
+							status: parent.status,
+							contractHash: parent.contract_hash,
+							generationContentHash: priorV2.value.proof.content_hash,
+							semanticDecisionHash,
+							expectedBindingHash: binding.hash,
+							...(repairLineage === undefined ? {} : { repairLineage }),
+						};
 					} else if (priorV2.error.code === "not_found") {
 						const priorV1 = await controller.services.readLegacyLedger(projectRoot, repairId);
 						if (priorV1 === null || priorV1.manifest.status !== "finished" || priorV1.after === null) {
 							throw new Error(`workbench_delegate_worker: repair_of ${repairId} does not reference a finished delegation authority`);
 						}
 					} else if (priorV2.error.code === "invalid_record") {
-						const recoverable = await controller.services.readRecoverableUnpublished(projectRoot, repairId);
-						if (!recoverable.ok) {
-							throw new Error(`workbench_delegate_worker: repair_of ${repairId} unpublished v2 authority is ${recoverable.error.code}`);
+						const raw = await readTransaction(projectRoot, repairId);
+						const rawLineageRetryable = raw.ok && raw.value.repair_lineage !== undefined &&
+							(await isStrictRetryableAbortedRepairV2(projectRoot, raw.value) ||
+								await isStrictRetryableEmptyRepairRecoveryV2(projectRoot, raw.value));
+						if (raw.ok && rawLineageRetryable && await hasStrictLineageRoot(raw.value)) {
+							const repairLineage = deriveDelegationRepairLineageV1({
+								parent: raw.value,
+								additionalPaths: requireLineageWritePaths(),
+							});
+							const binding = await controller.collectCurrentDelegationBinding(projectRoot, repairId);
+							if (repairLineage === undefined || binding.status !== "fresh") {
+								throw new Error(`workbench_delegate_worker: repair_of ${repairId} raw repair lineage cannot be advanced safely`);
+							}
+							v2RepairAuthority = {
+								id: repairId,
+								kind: "raw-lineage",
+								status: raw.value.status,
+								contractHash: raw.value.contract_hash,
+								generationContentHash: null,
+								semanticDecisionHash: null,
+								expectedBindingHash: binding.hash,
+								repairLineage,
+							};
+						} else {
+							const recoverable = await controller.services.readRecoverableUnpublished(projectRoot, repairId);
+							if (!recoverable.ok) {
+								throw new Error(`workbench_delegate_worker: repair_of ${repairId} unpublished v2 authority is ${recoverable.error.code}`);
+							}
+							const parent = recoverable.value.transaction;
+							if (!await hasStrictLineageRoot(parent)) {
+								throw new Error(`workbench_delegate_worker: repair_of ${repairId} repair lineage root authority is invalid`);
+							}
+							const retryPaths = parent.repair_lineage === undefined
+								? undefined
+								: byteSortedUnion(parent.terminal_outcome?.changed_paths ?? [], requireLineageWritePaths());
+							const repairLineage = parent.repair_lineage === undefined || retryPaths === undefined ? undefined : deriveDelegationRepairLineageV1({
+								parent,
+								additionalPaths: retryPaths,
+							});
+							if (parent.repair_lineage !== undefined && repairLineage === undefined) {
+								throw new Error(`workbench_delegate_worker: repair_of ${repairId} recovery lineage cannot be advanced safely`);
+							}
+							const binding = await controller.collectCurrentDelegationBinding(projectRoot, repairId);
+							if (binding.status !== "fresh") {
+								throw new Error(`workbench_delegate_worker: repair_of ${repairId} current binding is unavailable`);
+							}
+							v2RepairAuthority = {
+								id: repairId,
+								kind: "unpublished",
+								status: parent.status,
+								contractHash: parent.contract_hash,
+								generationContentHash: null,
+								semanticDecisionHash: null,
+								expectedBindingHash: binding.hash,
+								...(repairLineage === undefined ? {} : { repairLineage }),
+							};
 						}
-						v2RepairAuthority = { id: repairId, kind: "unpublished" };
 					} else {
 						throw new Error(`workbench_delegate_worker: repair_of ${repairId} v2 authority is ${priorV2.error.code}`);
 					}
+					if (v2RepairAuthority?.repairLineage !== undefined && taskKind.taskKind !== "implementation") {
+						throw new Error("workbench_delegate_worker: unresolved semantic repair lineage requires an implementation delegation");
+					}
 				}
+				const revalidateV2RepairAuthority = async (): Promise<boolean> => {
+					const authority = v2RepairAuthority;
+					if (authority === undefined) return true;
+					try {
+						if (authority.kind === "committed") {
+							const current = await controller.services.readCommittedGeneration(projectRoot, authority.id);
+							if (!current.ok || current.value.state.status !== authority.status ||
+								current.value.state.contract_hash !== authority.contractHash ||
+								current.value.proof.content_hash !== authority.generationContentHash ||
+								!await hasStrictLineageRoot(current.value.state)) return false;
+							if (authority.semanticDecisionHash !== null) {
+								const review = await readReview(projectRoot, authority.id);
+								if (!review.ok || !hasDelegationSemanticRepairAuthorityV2(review.value) ||
+									review.value.semantic_repair!.decision_hash !== authority.semanticDecisionHash ||
+									review.value.semantic_repair!.expected_bound_diff_hash !== authority.expectedBindingHash) return false;
+							} else if (authority.status === "REVIEWED") {
+								const review = await readReview(projectRoot, authority.id);
+								if (!review.ok || !review.value.finalized || !hasDelegationSemanticReviewAuthorityV2(review.value)) return false;
+							}
+							if (authority.repairLineage !== undefined) {
+								const changeSet = strictCommittedChangeSet(current.value);
+								const advanced = changeSet === undefined ? undefined : deriveDelegationRepairLineageV1({
+									parent: current.value.state,
+									changeSet,
+									...(authority.semanticDecisionHash === null ? {} : {
+										semanticDecision: { delegationId: current.value.state.delegation_id, decisionHash: authority.semanticDecisionHash },
+									}),
+									additionalPaths: requireLineageWritePaths(),
+								});
+								if (advanced?.lineage_hash !== authority.repairLineage.lineage_hash) return false;
+							}
+						} else if (authority.kind === "raw-lineage") {
+							const current = await readTransaction(projectRoot, authority.id);
+							if (!current.ok || current.value.status !== authority.status || current.value.contract_hash !== authority.contractHash ||
+								!await hasStrictLineageRoot(current.value) ||
+								(current.value.status === "RECOVERY_REQUIRED" &&
+									!await isStrictRetryableEmptyRepairRecoveryV2(projectRoot, current.value)) ||
+								deriveDelegationRepairLineageV1({
+									parent: current.value,
+									additionalPaths: requireLineageWritePaths(),
+								})?.lineage_hash !== authority.repairLineage?.lineage_hash) return false;
+						} else {
+							const current = await controller.services.readRecoverableUnpublished(projectRoot, authority.id);
+							if (!current.ok || current.value.transaction.status !== authority.status ||
+								current.value.transaction.contract_hash !== authority.contractHash ||
+								!await hasStrictLineageRoot(current.value.transaction)) return false;
+							if (authority.repairLineage !== undefined) {
+								const retryPaths = byteSortedUnion(
+									current.value.transaction.terminal_outcome?.changed_paths ?? [],
+									requireLineageWritePaths(),
+								);
+								const advanced = deriveDelegationRepairLineageV1({
+									parent: current.value.transaction,
+									...(retryPaths === undefined ? {} : { additionalPaths: retryPaths }),
+								});
+								if (retryPaths === undefined || advanced?.lineage_hash !== authority.repairLineage.lineage_hash) return false;
+							}
+						}
+						const binding = await controller.collectCurrentDelegationBinding(projectRoot, authority.id);
+						return binding.status === "fresh" && binding.hash === authority.expectedBindingHash;
+					} catch {
+						return false;
+					}
+				};
 
-				const startedAt = controller.services.now().toISOString();
 				let currentState = controller.getDelegationState();
 				if (currentState.latestId !== undefined) {
 					const priorBinding = await controller.collectCurrentDelegationBinding(projectRoot, currentState.latestId);
@@ -156,6 +494,9 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 						controller.persistDelegationState();
 						currentState = observedState;
 					}
+				}
+				if (!await revalidateV2RepairAuthority()) {
+					throw new Error("workbench_delegate_worker: repair authority or current binding changed before transaction preparation");
 				}
 				const reviewBlock = reviewBlockReason(currentState, "delegation");
 				const exactBlockingRepair = reviewBlock !== undefined
@@ -170,34 +511,54 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 				) {
 					const prior = await controller.services.readCommittedGeneration(projectRoot, currentState.latestId);
 					if (prior.ok && prior.value.state.status === "REVIEWED") {
-						finalizedStaleSuccessorId = currentState.latestId;
+						const priorReview = await readDelegationReviewV2(projectRoot, currentState.latestId);
+						if (priorReview.ok && priorReview.value.finalized && hasDelegationSemanticReviewAuthorityV2(priorReview.value)) {
+							finalizedStaleSuccessorId = currentState.latestId;
+						}
 					}
 				}
 				if (reviewBlock && !exactBlockingRepair && finalizedStaleSuccessorId === undefined) {
 					throw new Error(`workbench_delegate_worker: ${reviewBlock}`);
 				}
-				if (v2RepairAuthority?.kind === "unpublished" && !exactBlockingRepair) {
+				const reviewedPrelaunch = reviewBlock === undefined && currentState.latestId !== undefined &&
+					currentState.status === "REVIEWED" && currentState.reviewedDiffHash !== undefined
+					? { id: currentState.latestId, hash: currentState.reviewedDiffHash }
+					: undefined;
+				if (v2RepairAuthority !== undefined &&
+					(v2RepairAuthority.kind !== "committed" || v2RepairAuthority.repairLineage !== undefined ||
+						v2RepairAuthority.status === "PENDING_REVIEW") && !exactBlockingRepair) {
 					throw new Error(`workbench_delegate_worker: repair_of ${v2RepairAuthority.id} is not the latest blocking delegation`);
 				}
 				// Continuity is anchored only in a strict committed generation. An
 				// exact recoverable unpublished repair has no such generation yet and
 				// follows its existing dedicated authority path above. Every ordinary
 				// successor must preserve (or explicitly replace) a proven latest plan.
-				if (!(v2RepairAuthority?.kind === "unpublished" && exactBlockingRepair)) {
-					const priorPlan = await readDelegationPlanContractAuthority(projectRoot, currentState.latestId);
+				const lineagePlanRoot = v2RepairAuthority?.repairLineage?.root_delegation_id;
+				if (lineagePlanRoot !== undefined || !(v2RepairAuthority !== undefined && v2RepairAuthority.kind !== "committed" && exactBlockingRepair)) {
+					const priorPlan = await readDelegationPlanContractAuthority(projectRoot, lineagePlanRoot ?? currentState.latestId);
 					if (priorPlan.status === "blocked") {
 						throw new Error(`workbench_delegate_worker: latest plan_ref authority is ${priorPlan.reason}`);
 					}
 					if (priorPlan.status === "present" && contract.value.plan_ref === undefined) {
 						throw new Error("workbench_delegate_worker: plan_ref is required because the latest strict committed delegation carries one");
 					}
+					if (priorPlan.status === "present" &&
+						planReferenceHash(contract.value.plan_ref!) !== priorPlan.planReferenceHash) {
+						throw new Error("workbench_delegate_worker: plan_ref must exactly inherit the unresolved repair root plan");
+					}
+					if (lineagePlanRoot !== undefined && priorPlan.status === "absent" && contract.value.plan_ref !== undefined) {
+						throw new Error("workbench_delegate_worker: plan_ref must exactly preserve the unresolved repair root's absent plan authority");
+					}
 				}
 
-				const delegationId = controller.services.makeDelegationId(controller.services.now());
 				const execution = await controller.services.executeDelegation({
 					projectRoot,
 					delegationId,
 					contract: contract.value,
+					...(v2RepairAuthority?.repairLineage === undefined ? {} : {
+						dependencyPaths: [...v2RepairAuthority.repairLineage.carried_paths],
+						repairLineage: v2RepairAuthority.repairLineage,
+					}),
 					workerIdentity: {
 						provider: WORKER_PROVIDER,
 						model: WORKER_MODEL_ID,
@@ -213,18 +574,21 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 							const currentPlan = await verifyCurrentPlanReference(projectRoot, contract.value.plan_ref);
 							if (!currentPlan.ok) throw new Error(`plan_ref ${currentPlan.error.code} before worker launch`);
 						}
-						if (v2RepairAuthority?.kind === "unpublished") {
-							const revalidated = await controller.services.readRecoverableUnpublished(projectRoot, v2RepairAuthority.id);
-							if (!revalidated.ok) throw new Error("recoverable repair authority changed before worker launch");
-						} else if (v2RepairAuthority?.kind === "committed") {
-							const revalidated = await controller.services.readCommittedGeneration(projectRoot, v2RepairAuthority.id);
-							if (!revalidated.ok || !new Set<string>(["FAILED", "FINISHED", "REVIEWED"]).has(revalidated.value.state.status)) {
-								throw new Error("committed repair authority changed before worker launch");
+						if (v2RepairAuthority !== undefined) {
+							if (!await revalidateV2RepairAuthority()) {
+								throw new Error("repair authority or current binding changed before worker launch");
 							}
 						} else if (finalizedStaleSuccessorId !== undefined) {
 							const revalidated = await controller.services.readCommittedGeneration(projectRoot, finalizedStaleSuccessorId);
-							if (!revalidated.ok || revalidated.value.state.status !== "REVIEWED") {
+							const revalidatedReview = await readDelegationReviewV2(projectRoot, finalizedStaleSuccessorId);
+							if (!revalidated.ok || revalidated.value.state.status !== "REVIEWED" || !revalidatedReview.ok ||
+								!revalidatedReview.value.finalized || !hasDelegationSemanticReviewAuthorityV2(revalidatedReview.value)) {
 								throw new Error("finalized stale successor authority changed before worker launch");
+							}
+						} else if (reviewedPrelaunch !== undefined) {
+							const rebound = await controller.collectCurrentDelegationBinding(projectRoot, reviewedPrelaunch.id);
+							if (rebound.status !== "fresh" || rebound.hash !== reviewedPrelaunch.hash) {
+								throw new Error("reviewed delegation authority changed before worker launch");
 							}
 						}
 						const recordInput = {
@@ -240,6 +604,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 						if (!recorded.ok) throw new Error("delegation session mirror refused PREPARED");
 						controller.setDelegationState(recorded.state);
 						controller.persistDelegationStateStrict(recorded.state);
+						await releaseStartLock();
 						void controller.refreshStatus(ctx);
 						onUpdate?.({
 							content: [{ type: "text", text: `Pinned worker: 0 turn(s), model ${WORKER_MODEL_SELECTOR} | spend total 0 | output 0 | band ok` }],
@@ -270,6 +635,20 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 						});
 					},
 				});
+				let durableExecutionState = execution.durable_state;
+				if (durableExecutionState?.status === "PREPARED" && startLockLease !== undefined) {
+					const closed = await abortPristinePreparedDelegationUnderStartLockV2({
+						project_root: projectRoot,
+						transaction: durableExecutionState,
+						start_lock_lease: startLockLease,
+						now: controller.services.now().toISOString(),
+					});
+					if (closed.status === "recovered") durableExecutionState = closed.transaction;
+				}
+				// PREPARED remains ambiguous only when exact-lock, absent-owner,
+				// pristine-journal/inventory proof could not close it. Preserve the lock
+				// in that fail-closed case; a recovered ABORTED record releases it below.
+				preserveStartLock = durableExecutionState?.status === "PREPARED";
 
 				if (execution.after !== undefined) {
 					const observed = observeDiffChange(controller.getDelegationState(), execution.after.diffHash, controller.services.now().toISOString());
@@ -284,7 +663,8 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					await controller.reconcileProjectAuthority(projectRoot, controller.services.now().toISOString());
 				}
 				if (!execution.ok) {
-					if (execution.durable_state?.status === "FAILED" && execution.after !== undefined && execution.after.changedSinceBefore.length === 0) {
+					if (durableExecutionState?.status === "FAILED" && durableExecutionState.repair_lineage === undefined &&
+						execution.after !== undefined && execution.after.changedSinceBefore.length === 0) {
 						const reviewed = await controller.projectTerminalReviewedBinding(projectRoot, delegationId, controller.services.now().toISOString());
 						if (reviewed === null) {
 							throw new Error("workbench_delegate_worker: delegation v2 failed terminal session mirror could not enter REVIEWED");
@@ -296,8 +676,8 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 							throw new Error("workbench_delegate_worker: delegation v2 failed terminal session mirror persistence failed");
 						}
 					}
-					const status = execution.durable_state?.status ?? "UNAVAILABLE";
-					const reasons = execution.durable_state?.postcondition_reasons.join(",") || "none";
+					const status = durableExecutionState?.status ?? "UNAVAILABLE";
+					const reasons = durableExecutionState?.postcondition_reasons.join(",") || "none";
 					const artifactError = execution.artifact_error_code === undefined
 						? ""
 						: `; artifact_error=${execution.artifact_error_code}`;
@@ -307,7 +687,26 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					const workerFacts = execution.result === undefined
 						? ""
 						: `; assistant_turns=${execution.result.turns}; spend_profile=${execution.result.spend.profile}; spend_total_tokens=${execution.result.spend.totalTokens}; spend_output_tokens=${execution.result.spend.outputTokens}; exit_code=${execution.result.exitCode ?? "none"}`;
-					throw new Error(`workbench_delegate_worker: delegation v2 ${execution.code}${artifactError}; durable_status=${status}; postconditions=${reasons}${workerFailure}${workerFacts}`);
+					// Reconstruct the immutable report locator only from strict durable
+					// authority. Never echo a worker-authored report path or report prose.
+					const committedProof = durableExecutionState?.committed_proof;
+					const workerReportPath = committedProof?.delegation_id === delegationId
+						? delegationGenerationRecordRelativePathV2(delegationId, committedProof.generation, "worker-report.md")
+						: undefined;
+					const workerReport = workerReportPath === undefined ? "" : `; worker_report=${workerReportPath}`;
+					const terminalOutcome = durableExecutionState?.terminal_outcome;
+					const changedPathCount = terminalOutcome?.delegation_id === delegationId
+						? terminalOutcome.changed_paths.length
+						: undefined;
+					const changedPaths = changedPathCount === undefined ? "" : `; changed_paths=${changedPathCount}`;
+					const nextAction = status === "FAILED"
+						? `; next_action=call workbench_delegation_status, then call workbench_delegate_worker with repair_of=${delegationId}`
+						: "; next_action=call workbench_delegation_status";
+					const summary = `workbench_delegate_worker: delegation v2 ${execution.code}${artifactError}; delegation_id=${delegationId}; durable_status=${status}; postconditions=${reasons}${workerFailure}${workerReport}${changedPaths}${workerFacts}${nextAction}`;
+					const boundedSummary = Buffer.byteLength(summary, "utf8") <= DELEGATION_FAILURE_SUMMARY_MAX_BYTES
+						? summary
+						: `workbench_delegate_worker: delegation v2 ${execution.code}; delegation_id=${delegationId}; durable_status=${status}; postconditions=summary_over_bound${workerReport}${changedPaths}${nextAction}`;
+					throw new Error(boundedSummary);
 				}
 				const result = execution.result;
 				const handoffSummary = execution.workerSummary;
@@ -395,6 +794,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 				return toolResult;
 			} finally {
 				controller.rememberTrustedIngressAuthority(toolCallId, "workbench_delegate_worker", trustedIngress);
+				if (!preserveStartLock) await releaseStartLock();
 			}
 		},
 	});

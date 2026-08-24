@@ -13,7 +13,10 @@ import {
 } from "./delegation-transaction-artifacts.ts";
 import { readDelegationCommittedGenerationV2 } from "./delegation-transaction-storage.ts";
 import type { DelegationTransactionStatus } from "./delegation-transaction.ts";
-import { readDelegationAuthorityObservationV2 } from "./delegation-project-authority.ts";
+import {
+	readDelegationAuthorityObservationV2,
+	readProjectDelegationRepairClosureV1,
+} from "./delegation-project-authority.ts";
 import type { DelegationState } from "./delegation-state.ts";
 import { isStrictSemanticAcceptedOrZeroDelta } from "./diff-review.ts";
 import type { WorkerFirstGateFacts } from "./gate-schema.ts";
@@ -27,6 +30,7 @@ import {
 export type DelegationPlanBlockedReason =
 	| "plan-generation-invalid"
 	| "plan-generation-not-reusable"
+	| "plan-repair-lineage-mismatch"
 	| "plan-contract-invalid"
 	| "plan-reference-invalid"
 	| "plan-reference-unsafe-path"
@@ -124,9 +128,20 @@ export async function readCurrentDelegationPlanAuthority(
 	delegationId: string | null | undefined,
 ): Promise<CurrentDelegationPlanAuthority> {
 	const contract = await readDelegationPlanContractAuthority(projectRoot, delegationId);
-	if (contract.status === "absent") return contract;
 	if (contract.status === "blocked") {
 		return { status: "blocked", reason: contract.reason, planReferenceHash: null, requiredGateIds: [] };
+	}
+	if (contract.status === "absent") {
+		if (delegationId !== null && delegationId !== undefined) {
+			const observation = await readDelegationAuthorityObservationV2(projectRoot, delegationId);
+			if (observation.kind === "v2" && observation.repairLineage !== undefined) {
+				const root = await readDelegationPlanContractAuthority(projectRoot, observation.repairLineage.rootDelegationId);
+				if (root.status !== "absent") {
+					return { status: "blocked", reason: "plan-repair-lineage-mismatch", planReferenceHash: null, requiredGateIds: [] };
+				}
+			}
+		}
+		return contract;
 	}
 	if (contract.generationStatus !== "FINISHED" && contract.generationStatus !== "REVIEWED") {
 		return {
@@ -138,7 +153,7 @@ export async function readCurrentDelegationPlanAuthority(
 	}
 	const observation = await readDelegationAuthorityObservationV2(projectRoot, delegationId!);
 	const accepted = observation.kind === "v2" && observation.finalized &&
-		(observation.transactionVerdict === "PASS" || observation.review?.verdict === "PASS");
+		(observation.transactionVerdict === "PASS" || (observation.review?.verdict === "PASS" && observation.semanticAccepted));
 	if (!accepted) {
 		return {
 			status: "blocked",
@@ -146,6 +161,21 @@ export async function readCurrentDelegationPlanAuthority(
 			planReferenceHash: contract.planReferenceHash,
 			requiredGateIds: [...contract.requiredGateIds],
 		};
+	}
+	if (observation.kind === "v2" && observation.repairLineage !== undefined) {
+		const root = await readDelegationPlanContractAuthority(projectRoot, observation.repairLineage.rootDelegationId);
+		// Repair lineage preserves both plan presence and identity exactly. This
+		// avoids a later retry silently adopting, dropping, or replacing the plan
+		// that governed the rejected root delta.
+		const samePlan = root.status === "present" && root.planReferenceHash === contract.planReferenceHash;
+		if (!samePlan) {
+			return {
+				status: "blocked",
+				reason: "plan-repair-lineage-mismatch",
+				planReferenceHash: contract.status === "present" ? contract.planReferenceHash : null,
+				requiredGateIds: contract.status === "present" ? [...contract.requiredGateIds] : [],
+			};
+		}
 	}
 	const current = await verifyCurrentPlanReference(projectRoot, contract.reference);
 	if (!current.ok) {
@@ -212,6 +242,14 @@ export async function buildDelegationWorkerFirstGateFacts(
 	let reviewBlock = input.reviewBlock;
 	let reviewVerdict: "PASS" | "FAIL" | null = null;
 	let reviewViolationCount: number | null = null;
+	const repairClosure = await readProjectDelegationRepairClosureV1(projectRoot);
+	if (reviewBlock === undefined) {
+		if (!repairClosure.ok) {
+			reviewBlock = `delegation repair authority is ${repairClosure.issue.code}; verification fails closed`;
+		} else if (repairClosure.unresolvedTipId !== null && repairClosure.unresolvedTipId !== state.latestId) {
+			reviewBlock = `delegation ${repairClosure.unresolvedTipId} has an unresolved semantic repair; verification fails closed`;
+		}
+	}
 	if (state.latestId !== undefined && reviewBlock === undefined) {
 		const authority = await readDelegationAuthorityObservationV2(projectRoot, state.latestId);
 		if (authority.kind === "invalid-v2") {
@@ -223,7 +261,7 @@ export async function buildDelegationWorkerFirstGateFacts(
 			} else {
 				reviewBlock = `delegation ${state.latestId} legacy review lacks strict semantic acceptance`;
 			}
-		} else if (authority.review && authority.finalized && isStrictSemanticAcceptedOrZeroDelta(authority.review)) {
+		} else if (authority.review && authority.finalized && authority.semanticAccepted) {
 			reviewVerdict = authority.review.verdict;
 			reviewViolationCount = authority.review.violations.length;
 		} else if (authority.review && authority.finalized) {

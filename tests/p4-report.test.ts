@@ -80,6 +80,21 @@ async function runGateAt(dir: string, date: string): Promise<string> {
 	return result.runId;
 }
 
+async function makeGateRunPureLegacyV1(dir: string, runId: string): Promise<void> {
+	const runsRoot = join(dir, CONFIG_DIR_NAME, "workbench", "runs");
+	const runDir = join(runsRoot, runId);
+	const manifestPath = join(runDir, "manifest.json");
+	const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>;
+	manifest.schema_version = 1;
+	delete manifest.run_transaction_schema_version;
+	delete manifest.run_outcome;
+	delete manifest.artifact_manifest_path;
+	await writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf8");
+	await rm(join(runDir, "run-commit.json"));
+	await rm(join(runsRoot, GATE_ATTEMPT_INDEX_DIR, `${runId}.json`));
+	clearGateRunCandidateCacheForTests(dir);
+}
+
 // ------------------------------------------------------------------- target
 
 test("resolveRunTarget latest returns the newest run", async () => {
@@ -234,6 +249,66 @@ test("latestGateRunSummary returns null when no gate run exists", async () => {
 	});
 });
 
+test("a pure historical schema-v1 Gate stays blocked with an actionable fresh-v2 rerun reason", async () => {
+	await withTempDir(async (dir) => {
+		await setupRecipeProject(dir);
+		await writeConfigFile(
+			dir,
+			"gates.yaml",
+			"gates:\n  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Config, kind: config }\n",
+		);
+		const legacy = await runGateAt(dir, "2026-08-01T00:00:00.000Z");
+		await makeGateRunPureLegacyV1(dir, legacy);
+		const legacyManifestPath = join(dir, CONFIG_DIR_NAME, "workbench", "runs", legacy, "manifest.json");
+		const immutableLegacyBytes = await readFile(legacyManifestPath);
+
+		const summary = await latestGateRunSummary(dir);
+		assert.equal(summary?.run_id, legacy);
+		assert.equal(summary?.record_state, "UNAVAILABLE");
+		assert.equal(summary?.status, "BLOCKED");
+		assert.match(summary?.blocking_reason ?? "", /historical pre-transaction Gate run \(schema v1\)/);
+		assert.match(summary?.blocking_reason ?? "", /rerun \/q-gate all/);
+		assert.match(summary?.blocking_reason ?? "", /older status not used/);
+		const status = (await latestGateStatuses(dir, ["g1"])).g1;
+		assert.equal(status?.status, "UNKNOWN");
+		assert.equal(status?.run_id, legacy);
+		assert.match(status?.unavailable_reason ?? "", /rerun \/q-gate all/);
+		assert.deepEqual(await readFile(legacyManifestPath), immutableLegacyBytes, "diagnosis never rewrites legacy evidence");
+
+		const fresh = await runGateAt(dir, "2026-08-02T00:00:00.000Z");
+		assert.equal((await latestGateRunSummary(dir))?.run_id, fresh, "a fresh committed v2 Gate supersedes the read-only legacy record");
+		assert.deepEqual((await latestGateStatuses(dir, ["g1"])).g1, { status: "PASS", run_id: fresh });
+		assert.deepEqual(await readFile(legacyManifestPath), immutableLegacyBytes, "fresh execution leaves the historical run byte-identical");
+	});
+});
+
+test("a schema-v1-looking Gate with a v2 marker is mixed authority, not a legacy rerun diagnosis", async () => {
+	await withTempDir(async (dir) => {
+		await setupRecipeProject(dir);
+		await writeConfigFile(
+			dir,
+			"gates.yaml",
+			"gates:\n  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Config, kind: config }\n",
+		);
+		const runId = await runGateAt(dir, "2026-08-01T00:00:00.000Z");
+		await makeGateRunPureLegacyV1(dir, runId);
+		await writeFile(
+			join(dir, CONFIG_DIR_NAME, "workbench", "runs", runId, "run-commit.json"),
+			"{}\n",
+			"utf8",
+		);
+		clearGateRunCandidateCacheForTests(dir);
+
+		const summary = await latestGateRunSummary(dir);
+		assert.equal(summary?.record_state, "UNAVAILABLE");
+		assert.match(summary?.blocking_reason ?? "", /committed run identity unavailable/);
+		assert.doesNotMatch(summary?.blocking_reason ?? "", /historical pre-transaction/);
+		const status = (await latestGateStatuses(dir, ["g1"])).g1;
+		assert.match(status?.unavailable_reason ?? "", /committed run identity unavailable/);
+		assert.doesNotMatch(status?.unavailable_reason ?? "", /historical pre-transaction/);
+	});
+});
+
 test("latest gate summary and statuses survive more than fifty newer non-gate runs", async () => {
 	await withTempDir(async (dir) => {
 		await setupRecipeProject(dir);
@@ -334,6 +409,7 @@ test("a corrupt newest gate record becomes UNKNOWN/BLOCKED instead of falling ba
 		assert.equal(summary?.record_state, "UNAVAILABLE");
 		assert.equal(summary?.status, "BLOCKED");
 		assert.match(summary?.blocking_reason ?? "", /older status not used/);
+		assert.doesNotMatch(summary?.blocking_reason ?? "", /historical pre-transaction/);
 		const latest = await latestGateStatuses(dir, ["g1"]);
 		assert.equal(latest.g1?.run_id, newest);
 		assert.equal(latest.g1?.status, "UNKNOWN");
@@ -362,6 +438,7 @@ test("a crash marker registered before transaction creation blocks an older PASS
 		assert.equal(summary?.run_id, crashedRunId);
 		assert.equal(summary?.record_state, "UNAVAILABLE");
 		assert.equal(summary?.status, "BLOCKED");
+		assert.doesNotMatch(summary?.blocking_reason ?? "", /historical pre-transaction/);
 		assert.equal((await latestGateStatuses(dir, ["g1"])).g1?.status, "UNKNOWN");
 	});
 });

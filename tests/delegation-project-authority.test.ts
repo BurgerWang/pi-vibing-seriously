@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, symlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, readFile, symlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -7,6 +7,7 @@ import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import {
 	projectDelegationDispositionV2,
+	readProjectDelegationRepairClosureV1,
 	readLatestProjectDelegationTransactionV2,
 	readRecoverableUnpublishedDelegationV2,
 	reconcileProjectDelegationAuthorityV2,
@@ -14,13 +15,23 @@ import {
 import type { ExecFn } from "../extensions/workbench-runtime/core/config.ts";
 import { emptyDelegationState } from "../extensions/workbench-runtime/core/delegation-state.ts";
 import {
+	claimDelegationExecutionOwnerV2,
+	readDelegationExecutionOwnerV2,
+	type DelegationExecutionOwnerOptionsV2,
+} from "../extensions/workbench-runtime/core/delegation-execution-owner.ts";
+import {
+	createNodeDelegationTransactionStorageAdapter,
 	persistAbortedDelegationTransaction,
 	persistCommittingDelegationTransaction,
 	persistPreparedDelegationTransaction,
 	persistRecoveryRequiredDelegationTransaction,
 	persistRunningDelegationTransaction,
 } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
-import type { DelegationTransactionRecord } from "../extensions/workbench-runtime/core/delegation-transaction.ts";
+import {
+	bindDelegationRepairLineageV1,
+	type DelegationRepairLineageV1,
+	type DelegationTransactionRecord,
+} from "../extensions/workbench-runtime/core/delegation-transaction.ts";
 import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { createWorkerWriteJournal, sealWorkerWriteJournal } from "../extensions/workbench-runtime/core/write-journal.ts";
 import { withTempDir } from "./helpers.ts";
@@ -31,7 +42,24 @@ function at(second: number): string {
 	return `2026-08-20T10:00:${String(second).padStart(2, "0")}.000Z`;
 }
 
-async function prepared(root: string, id: string, second: number): Promise<DelegationTransactionRecord> {
+function repairLineage(parent: string): DelegationRepairLineageV1 {
+	const lineage = bindDelegationRepairLineageV1({
+		schema_version: 1,
+		kind: "semantic-repair-lineage-v1",
+		root_delegation_id: parent,
+		repair_of: parent,
+		root_decision_hash: "b".repeat(64),
+		continuation_decision_delegation_id: parent,
+		continuation_decision_hash: "b".repeat(64),
+		parent_lineage_hash: null,
+		depth: 1,
+		carried_paths: ["src/rejected.ts"],
+	});
+	if (lineage === undefined) throw new Error("invalid repair-lineage test fixture");
+	return lineage;
+}
+
+async function prepared(root: string, id: string, second: number, lineage?: DelegationRepairLineageV1): Promise<DelegationTransactionRecord> {
 	const result = await persistPreparedDelegationTransaction(root, {
 		delegation_id: id,
 		task_kind: "implementation",
@@ -44,12 +72,17 @@ async function prepared(root: string, id: string, second: number): Promise<Deleg
 		},
 		generation: 1,
 		now: at(second),
+		...(lineage === undefined ? {} : { repair_lineage: lineage }),
 	});
 	if (!result.ok) throw new Error(result.error.code);
 	return result.value;
 }
 
-async function recoverableUnpublished(root: string, id: string): Promise<DelegationTransactionRecord> {
+async function recoverableUnpublished(
+	root: string,
+	id: string,
+	ownerOptions?: DelegationExecutionOwnerOptionsV2,
+): Promise<DelegationTransactionRecord> {
 	const initial = await prepared(root, id, 0);
 	const journal = await createWorkerWriteJournal({
 		project_root: root,
@@ -64,6 +97,10 @@ async function recoverableUnpublished(root: string, id: string): Promise<Delegat
 		expected_revision: journal.value.revision,
 	});
 	if (!sealed.ok) throw new Error(sealed.error.code);
+	if (ownerOptions !== undefined) {
+		const owner = await claimDelegationExecutionOwnerV2(root, initial, at(1), ownerOptions);
+		if (!owner.ok) throw new Error(owner.error.code);
+	}
 	const cas = (state: DelegationTransactionRecord, second: number) => ({
 		delegation_id: state.delegation_id,
 		contract_hash: state.contract_hash,
@@ -104,6 +141,55 @@ async function recoverableUnpublished(root: string, id: string): Promise<Delegat
 test("project authority discovery returns null when no delegation root exists", async () => {
 	await withTempDir(async (root) => {
 		assert.deepEqual(await readLatestProjectDelegationTransactionV2(root), { ok: true, value: null });
+	});
+});
+
+test("repair closure distinguishes v1-only history from incomplete or identity-mismatched v2 authority", async () => {
+	await withTempDir(async (root) => {
+		const legacyId = "20260820-095959-v1ok";
+		await mkdir(join(root, CONFIG_DIR_NAME, "workbench", "delegations", legacyId), { recursive: true });
+		assert.deepEqual(await readProjectDelegationRepairClosureV1(root), {
+			ok: true, unresolvedTipId: null, rootCount: 0, lineageCount: 0,
+		});
+
+		const incompleteId = "20260820-100000-inc1";
+		await mkdir(join(root, CONFIG_DIR_NAME, "workbench", "delegations", incompleteId, "v2"), { recursive: true });
+		const incomplete = await readProjectDelegationRepairClosureV1(root);
+		assert.equal(incomplete.ok, false);
+		if (!incomplete.ok) assert.equal(incomplete.issue.code, "incomplete_v2_authority");
+	});
+	await withTempDir(async (root) => {
+		const sourceId = "20260820-100000-src1";
+		const foreignId = "20260820-100001-frn1";
+		await prepared(root, sourceId, 0);
+		const source = join(root, CONFIG_DIR_NAME, "workbench", "delegations", sourceId, "v2", "transaction.json");
+		const foreign = join(root, CONFIG_DIR_NAME, "workbench", "delegations", foreignId, "v2", "transaction.json");
+		await mkdir(join(root, CONFIG_DIR_NAME, "workbench", "delegations", foreignId, "v2"), { recursive: true });
+		await writeFile(foreign, await readFile(source));
+		const latestMismatch = await readLatestProjectDelegationTransactionV2(root);
+		assert.equal(latestMismatch.ok, false);
+		if (!latestMismatch.ok) assert.equal(latestMismatch.error.delegation_id, foreignId);
+		const mismatch = await readProjectDelegationRepairClosureV1(root);
+		assert.equal(mismatch.ok, false);
+		if (!mismatch.ok) assert.equal(mismatch.issue.code, "repair_lineage_identity_mismatch");
+	});
+});
+
+test("reconcile never treats an incomplete v2-only project as having no delegation authority", async () => {
+	await withTempDir(async (root) => {
+		const incompleteId = "20260820-100000-inc2";
+		await mkdir(join(root, CONFIG_DIR_NAME, "workbench", "delegations", incompleteId, "v2"), { recursive: true });
+		const reconciled = await reconcileProjectDelegationAuthorityV2({
+			project_root: root,
+			current_state: emptyDelegationState(),
+			now: "2026-08-20T10:00:01.000Z",
+			exec: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+		});
+		assert.equal(reconciled.ok, false);
+		if (!reconciled.ok) {
+			assert.equal(reconciled.issue.code, "incomplete_v2_authority");
+			assert.equal(reconciled.issue.delegationId, incompleteId);
+		}
 	});
 });
 
@@ -167,6 +253,60 @@ test("project authority rejects a valid-id symlink and classifies durable blocki
 	});
 });
 
+test("an aborted repair attempt remains blocking so it cannot hide its unresolved parent", async () => {
+	await withTempDir(async (root) => {
+		const parent = "20260820-100001-prnt";
+		const repair = await prepared(root, "20260820-100002-rpr1", 0, repairLineage(parent));
+		const aborted = await persistAbortedDelegationTransaction(root, {
+			delegation_id: repair.delegation_id,
+			contract_hash: repair.contract_hash,
+			worker_identity: repair.worker_identity,
+			expected_generation: repair.generation,
+			expected_revision: repair.revision,
+			now: at(1),
+			reason: "repair process ended before launch",
+		});
+		assert.equal(aborted.ok, true);
+		if (!aborted.ok) return;
+		assert.deepEqual(projectDelegationDispositionV2(aborted.value), { blocking: true, terminal_verdict: "FAIL" });
+		const latest = await readLatestProjectDelegationTransactionV2(root);
+		assert.equal(latest.ok, true);
+		if (latest.ok) assert.equal(latest.value?.repair_lineage?.root_delegation_id, parent);
+	});
+});
+
+test("a zero-delta failed repair remains blocking while an ordinary zero-delta failure stays compatible", async () => {
+	await withTempDir(async (root) => {
+		const parent = "20260820-100001-prnt";
+		const repair = await prepared(root, "20260820-100002-rpr2", 0, repairLineage(parent));
+		const zeroDeltaFailure = {
+			...repair,
+			status: "FAILED" as const,
+			terminal_outcome: {
+				delegation_id: repair.delegation_id,
+				task_kind: "implementation" as const,
+				worker_identity: repair.worker_identity,
+				provider_success: false,
+				exit_code: 1,
+				report_complete: false,
+				terminal_facts_complete: true,
+				scope_complete: true,
+				change_set_status: "ATTRIBUTED" as const,
+				changed_paths: [],
+				successful_write_count: 0,
+				denied_write_count: 0,
+				delta_hash: "c".repeat(64),
+			},
+		};
+		assert.deepEqual(projectDelegationDispositionV2(zeroDeltaFailure), { blocking: true, terminal_verdict: "FAIL" });
+		const { repair_lineage: _lineage, ...ordinaryZeroDeltaFailure } = zeroDeltaFailure;
+		assert.deepEqual(projectDelegationDispositionV2(ordinaryZeroDeltaFailure), {
+			blocking: false,
+			terminal_verdict: "FAIL",
+		});
+	});
+});
+
 test("only an exact proof-null artifact failure with a sealed journal is recoverable by repair_of", async () => {
 	await withTempDir(async (root) => {
 		const id = "20260820-100003-rp01";
@@ -184,6 +324,51 @@ test("only an exact proof-null artifact failure with a sealed journal is recover
 		await mkdir(join(generations, "g00000001"), { recursive: true });
 		const refused = await readRecoverableUnpublishedDelegationV2(root, id);
 		assert.deepEqual(refused, { ok: false, error: { code: "not_recoverable" } });
+	});
+});
+
+test("reconcile releases a provably dead terminal owner before exposing unpublished repair authority", async () => {
+	await withTempDir(async (root) => {
+		const id = "20260820-100003-own1";
+		let alive = true;
+		const adapter = {
+			...createNodeDelegationTransactionStorageAdapter(),
+			processId: 787_878,
+			isProcessAlive: () => alive,
+		};
+		const ownerOptions: DelegationExecutionOwnerOptionsV2 = {
+			storage_options: { adapter },
+			boot_facts: {
+				boot_id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+				system_boot_time_ms: Date.parse("2026-08-20T09:00:00.000Z"),
+				runtime_started_at: "2026-08-20T09:00:01.000Z",
+			},
+			read_process_start_ticks: async () => "500",
+		};
+		const recovery = await recoverableUnpublished(root, id, ownerOptions);
+		assert.equal((await readDelegationExecutionOwnerV2(root, recovery, ownerOptions)).ok, true);
+
+		const live = await reconcileProjectDelegationAuthorityV2({
+			project_root: root,
+			current_state: emptyDelegationState(),
+			now: at(10),
+			exec: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+			interruption_recovery_options: ownerOptions,
+		});
+		assert.equal(live.ok, false);
+		if (!live.ok) assert.equal(live.issue.code, "execution_owner_active");
+
+		alive = false;
+		const reconciled = await reconcileProjectDelegationAuthorityV2({
+			project_root: root,
+			current_state: emptyDelegationState(),
+			now: at(11),
+			exec: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+			interruption_recovery_options: ownerOptions,
+		});
+		assert.equal(reconciled.ok, true, reconciled.ok ? "" : reconciled.issue.code);
+		assert.equal((await readDelegationExecutionOwnerV2(root, recovery, ownerOptions)).ok, false);
+		assert.equal((await readRecoverableUnpublishedDelegationV2(root, id)).ok, true);
 	});
 });
 

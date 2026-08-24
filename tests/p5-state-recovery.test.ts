@@ -2100,11 +2100,12 @@ test("workbench_delegate_worker durably ABORTS before launch when the v2 ChangeS
 			),
 			(error: unknown) => {
 				assert.ok(error instanceof Error);
-				assert.equal(
+				assert.match(
 					error.message,
-					"workbench_delegate_worker: delegation v2 change_set_prepare_failed; durable_status=ABORTED; postconditions=none",
-					"the public edge reports the bounded v2 failure and durable terminal status",
+					/^workbench_delegate_worker: delegation v2 change_set_prepare_failed; delegation_id=\d{8}-\d{6}-[A-Za-z0-9]{4}; durable_status=ABORTED; postconditions=none; next_action=call workbench_delegation_status$/,
+					"the public edge reports the bounded v2 identity, terminal status, and non-repair recovery action",
 				);
+				assert.doesNotMatch(error.message, /repair_of=/, "ABORTED never advertises FAILED-only repair authority");
 				assert.ok(!error.message.includes("git exec failed"), "the raw execution failure is not exposed");
 				assert.ok(!error.message.includes(root), "the temporary project path is not exposed");
 				return true;

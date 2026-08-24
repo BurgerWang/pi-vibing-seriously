@@ -3,7 +3,9 @@ import { test } from "node:test";
 
 import {
 	abortDelegationTransaction,
+	bindDelegationRepairLineageV1,
 	beginDelegationCommit,
+	computeDelegationRepairLineageHashV1,
 	createPreparedDelegationTransaction,
 	DELEGATION_COMMITTED_RECORD_NAMES,
 	DELEGATION_POSTCONDITION_REASON_ORDER,
@@ -18,6 +20,7 @@ import {
 	startDelegationTransaction,
 	type DelegationCasInput,
 	type DelegationCommittedGenerationProof,
+	type DelegationRepairLineageV1,
 	type DelegationTaskKind,
 	type DelegationTerminalOutcome,
 	type DelegationTransactionRecord,
@@ -42,6 +45,23 @@ const T2 = "2026-08-17T05:00:02.000Z";
 const T3 = "2026-08-17T05:00:03.000Z";
 const T4 = "2026-08-17T05:00:04.000Z";
 const INVALID_SOURCE_STATE_ERROR = "invalid delegation transaction source state";
+
+function repairLineage(overrides: Partial<DelegationRepairLineageV1> = {}): DelegationRepairLineageV1 {
+	const lineage = bindDelegationRepairLineageV1({
+		schema_version: 1,
+		kind: "semantic-repair-lineage-v1",
+		root_delegation_id: OTHER_ID,
+		repair_of: OTHER_ID,
+		root_decision_hash: "9".repeat(64),
+		continuation_decision_delegation_id: OTHER_ID,
+		continuation_decision_hash: "9".repeat(64),
+		parent_lineage_hash: null,
+		depth: 1,
+		carried_paths: ["src/a.ts", "src/z.ts"],
+	});
+	assert.ok(lineage);
+	return { ...lineage, ...overrides };
+}
 
 const IDENTITY: DelegationWorkerIdentity = {
 	provider: WORKER_PROVIDER,
@@ -365,6 +385,61 @@ test("strict parser/serializer round-trips and returns detached data", () => {
 	assert.notEqual(parsed.state.allowed_paths, state.allowed_paths);
 	assert.notEqual(parsed.state.committed_proof, state.committed_proof);
 	assert.deepEqual(serializeDelegationTransaction(state), state);
+});
+
+test("repair lineage is optional for old records, strict for new records, and immutable across lifecycle transitions", () => {
+	const legacy = prepared();
+	assert.equal(legacy.repair_lineage, undefined);
+	assert.equal(parseDelegationTransaction(legacy).ok, true);
+
+	const lineage = repairLineage();
+	assert.equal(lineage.lineage_hash, computeDelegationRepairLineageHashV1(lineage));
+	const created = ok(createPreparedDelegationTransaction({
+		delegation_id: ID,
+		task_kind: "implementation",
+		contract_hash: CONTRACT_HASH,
+		allowed_paths: ["src/**"],
+		worker_identity: IDENTITY,
+		generation: 1,
+		now: T0,
+		repair_lineage: lineage,
+	}));
+	assert.deepEqual(created.repair_lineage, lineage);
+	assert.notEqual(created.repair_lineage, lineage);
+	assert.notEqual(created.repair_lineage!.carried_paths, lineage.carried_paths);
+	const started = ok(startDelegationTransaction(created, cas(created, T1)));
+	const committed = ok(beginDelegationCommit(started, { ...cas(started, T2), outcome: terminalOutcome(started) }));
+	const pending = ok(publishDelegationCommit(committed, { ...cas(committed, T3), proof: committedProof(committed) }));
+	assert.deepEqual(started.repair_lineage, lineage);
+	assert.deepEqual(committed.repair_lineage, lineage);
+	assert.deepEqual(pending.repair_lineage, lineage);
+	assert.deepEqual(serializeDelegationTransaction(pending).repair_lineage, lineage);
+});
+
+test("repair lineage rejects diagnosis, malformed ancestry, unsorted paths, unknown fields, and hash tampering", () => {
+	const lineage = repairLineage();
+	const input = {
+		delegation_id: ID,
+		task_kind: "implementation",
+		contract_hash: CONTRACT_HASH,
+		allowed_paths: ["src/**"],
+		worker_identity: IDENTITY,
+		generation: 1,
+		now: T0,
+		repair_lineage: lineage,
+	};
+	assert.equal(createPreparedDelegationTransaction({ ...input, task_kind: "diagnosis" }).ok, false);
+	for (const repair_lineage of [
+		{ ...lineage, lineage_hash: "0".repeat(64) },
+		{ ...lineage, carried_paths: ["src/z.ts", "src/a.ts"] },
+		{ ...lineage, depth: 2 },
+		{ ...lineage, parent_lineage_hash: "8".repeat(64) },
+		{ ...lineage, unknown: true },
+	]) {
+		assert.equal(createPreparedDelegationTransaction({ ...input, repair_lineage } as typeof input).ok, false);
+	}
+	const withLineage = ok(createPreparedDelegationTransaction(input));
+	assert.equal(parseDelegationTransaction({ ...withLineage, repair_lineage: { ...lineage, lineage_hash: "0".repeat(64) } }).ok, false);
 });
 
 test("strict parser rejects unknown fields at every authority layer", () => {
