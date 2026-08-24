@@ -585,6 +585,25 @@ test("TUI compare renderer marks incompatible comparisons in the warning color",
 	assert.ok(out.includes("<warning>"), out);
 });
 
+test("TUI review and compare renderers preserve the controller's actionable error text", () => {
+	const review = workbenchToolRenderer("review", "workbench_review_worker_diff");
+	const reviewText = "workbench_review_worker_diff: delegation old-id is not the latest delegation (new-id); retry without delegation_id";
+	const reviewOut = renderText(review.renderResult(
+		{ details: { ok: false, error: "not_latest_delegation" }, content: [{ type: "text", text: reviewText }] },
+		{ expanded: false, isPartial: false }, FAKE_THEME, { isError: false },
+	));
+	assert.match(reviewOut, /old-id is not the latest delegation \(new-id\)/);
+	assert.doesNotMatch(reviewOut, /review unavailable/);
+
+	const compare = workbenchToolRenderer("compare", "workbench_compare_runs");
+	const compareOut = renderText(compare.renderResult(
+		{ details: { ok: false, error: "missing_run" }, content: [{ type: "text", text: "workbench_compare_runs: run left-id was not found" }] },
+		{ expanded: false, isPartial: false }, FAKE_THEME, { isError: false },
+	));
+	assert.match(compareOut, /run left-id was not found/);
+	assert.doesNotMatch(compareOut, /comparison unavailable/);
+});
+
 // --------------------------------------------------------------- UI disabled
 
 test("widget is a no-op when UI is disabled (print/json never touch TUI APIs)", () => {

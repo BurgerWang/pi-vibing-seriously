@@ -747,15 +747,19 @@ function allowedScopeLine(allowedPaths: readonly string[]): string {
 
 function boundedPathList(prefix: string, paths: readonly string[], maxItems: number): string {
 	const shown: string[] = [];
-	let bytes = Buffer.byteLength(prefix, "utf8");
 	for (const raw of paths.slice(0, maxItems)) {
 		const path = boundedInline(raw, MAX_REVIEW_PATH_BYTES);
-		const next = Buffer.byteLength(path, "utf8") + (shown.length > 0 ? 2 : 0);
-		if (bytes + next > MAX_REVIEW_NOTE_BYTES) break;
+		const trial = [...shown, path];
+		const omitted = paths.length - trial.length;
+		const suffix = omitted > 0 ? ` …(+${omitted} more)` : "";
+		if (Buffer.byteLength(`${prefix}${trial.join(", ")}${suffix}`, "utf8") > MAX_REVIEW_NOTE_BYTES) break;
 		shown.push(path);
-		bytes += next;
 	}
-	return `${prefix}${shown.join(", ")}${paths.length > shown.length ? ` …(+${paths.length - shown.length} more)` : ""}`;
+	const omitted = paths.length - shown.length;
+	const suffix = omitted > 0 ? ` …(+${omitted} more)` : "";
+	const body = `${prefix}${shown.join(", ")}`;
+	const bodyBudget = Math.max(0, MAX_REVIEW_NOTE_BYTES - Buffer.byteLength(suffix, "utf8"));
+	return `${boundedInline(body, bodyBudget)}${suffix}`;
 }
 
 /**

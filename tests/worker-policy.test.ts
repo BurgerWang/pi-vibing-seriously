@@ -12,6 +12,7 @@ import {
 	isWorkerPathAllowed,
 	parseWorkerAllowedPaths,
 	parseWorkerTaskKindEnvironment,
+	parseWorkerTimeoutMsEnvironment,
 	recipeMutationBlockReason,
 	resolveWorkerBudgetProfile,
 	resolveWorkerRepairOf,
@@ -42,6 +43,14 @@ test("worker identity is pinned to GPT-5.6 Luna at xhigh reasoning", () => {
 	assert.equal(WORKER_MODEL_ID, "gpt-5.6-luna");
 	assert.equal(WORKER_THINKING_LEVEL, "xhigh");
 	assert.equal(WORKER_MODEL_SELECTOR, "openai-codex/gpt-5.6-luna:xhigh");
+});
+
+test("worker timeout env parsing is strict and advisory-only", () => {
+	assert.equal(parseWorkerTimeoutMsEnvironment("3600000"), 3_600_000);
+	assert.equal(parseWorkerTimeoutMsEnvironment(undefined), undefined);
+	assert.equal(parseWorkerTimeoutMsEnvironment("0"), undefined);
+	assert.equal(parseWorkerTimeoutMsEnvironment(" 3600000"), undefined);
+	assert.equal(parseWorkerTimeoutMsEnvironment("86400001"), undefined);
 });
 
 test("active worker runtime is DeepSeek-free and formal stress isolates only the explicit legacy-v1 fixture", async () => {

@@ -817,13 +817,16 @@ function register(
 			const status = readStatus(id);
 			return status === undefined
 				? { ok: false, error: { code: "not_found", message: "missing" } }
-				: { ok: true, value: { delegation_id: id, status } };
+				: { ok: true, value: { delegation_id: id, status, task_kind: status === "FINISHED" ? "diagnosis" : "implementation" } };
 		}) as never,
 		readCommittedGeneration: (async (_root: string, id: string) => {
 			const status = readStatus(id);
 			return status === undefined || !committedAuthority
 				? { ok: false, error: { code: "not_found", message: "missing" } }
-				: { ok: true, value: { state: { delegation_id: id, status } } };
+				: {
+					ok: true,
+					value: { state: { delegation_id: id, status, task_kind: status === "FINISHED" ? "diagnosis" : "implementation" } },
+				};
 		}) as never,
 		readLegacyLedger: (async () => legacyLedger ?? null) as never,
 		readCommittedRun: (async (_root: string, id: string) => {
@@ -879,6 +882,25 @@ test("controller rejects the exact backticked fake completion even when an older
 	const replacement = (results.find((value) => value !== undefined) as { message: Record<string, unknown> }).message;
 	assert.match(finalText(replacement), /reason: missing_authority/u);
 	assert.equal(finalText(replacement).includes("20260822-230337-hdwr"), false);
+});
+
+test("status mismatch output names only independently verified machine authority", async () => {
+	const state = stub();
+	register(state, (id) => id === REAL_ID ? "FAILED" : undefined, true, "REVIEWED");
+	await emit(state, "agent_start", { type: "agent_start" });
+	const results = await emit(state, "message_end", {
+		type: "message_end",
+		message: assistant(`delegation_id ${REAL_ID}; authority v2 transaction REVIEWED`),
+	});
+	const replacement = (results.find((value) => value !== undefined) as { message: Record<string, unknown> }).message;
+	const text = finalText(replacement);
+	assert.match(text, /reason: status_mismatch/u);
+	assert.match(text, /status_mismatch_count: 1/u);
+	assert.match(text, new RegExp(`"delegation_id":"${REAL_ID}"`, "u"));
+	assert.match(text, /"transaction_status":"FAILED"/u);
+	assert.match(text, /"session_status":"REVIEWED"/u);
+	assert.match(text, /"claimed":\["transaction:REVIEWED"\]/u);
+	assert.match(text, /next_action: query workbench_delegation_status and restate each machine_mismatch_fact/u);
 });
 
 test("controller rejects fabricated run ids even when the delegation itself is real", async () => {
@@ -986,6 +1008,60 @@ test("the exact OnChain failed Gate footer is accepted when both runs are commit
 		`gate: b2 FAIL (run ${gateRun})`,
 		`last run: run:${lastRun} check:d4-source-binding exit=1 FAILED`,
 		"blocking: check(s) failed: b2.1",
+	].join("\n"));
+	assert.deepEqual(await emit(state, "message_end", { type: "message_end", message }), [undefined]);
+});
+
+test("completed diagnosis review projections remain REVIEWED after a later implementation becomes latest", async () => {
+	const state = stub();
+	const diagnosisA = "20260824-173830-h1at";
+	const diagnosisB = "20260824-181411-nx2q";
+	const implementationA = "20260824-163820-a71f";
+	const implementationB = "20260824-182629-oj27";
+	const runOutcomes = new Map<string, "SUCCESS" | "FAILURE">([
+		["20260824-165749-7g8l", "FAILURE"],
+		["20260824-165754-tnb1", "FAILURE"],
+		["20260824-182943-5arf", "SUCCESS"],
+		["20260824-182958-bofb", "SUCCESS"],
+		["20260824-183456-a7n3", "FAILURE"],
+		["20260824-183510-wmyl", "SUCCESS"],
+	]);
+	register(
+		state,
+		(id) => id === diagnosisA || id === diagnosisB
+			? "FINISHED"
+			: id === implementationA || id === implementationB ? "REVIEWED" : undefined,
+		true,
+		undefined,
+		undefined,
+		(id) => runOutcomes.get(id),
+	);
+	await emit(state, "agent_start", { type: "agent_start" });
+	for (const [callId, delegationId] of [["call-diagnosis", diagnosisB], ["call-implementation", implementationB]] as const) {
+		await emit(state, "message_end", {
+			type: "message_end",
+			message: { role: "assistant", content: [{ type: "toolCall", id: callId, name: "workbench_delegate_worker", arguments: {} }] },
+		});
+		await emit(state, "tool_execution_end", {
+			type: "tool_execution_end",
+			toolCallId: callId,
+			toolName: "workbench_delegate_worker",
+			isError: false,
+			result: { details: { delegation_id: delegationId, status: "success" } },
+		});
+	}
+	const message = assistant([
+		`本次 diagnosis delegation ${diagnosisB} 已成功完成，review: REVIEWED`,
+		`本次 implementation delegation ${implementationB} 已成功完成，transaction REVIEWED`,
+		`prior diagnosis delegation ${diagnosisA} review: REVIEWED`,
+		`prior implementation delegation ${implementationA} transaction REVIEWED`,
+		"runs:",
+		"run 20260824-165749-7g8l FAILED",
+		"run 20260824-165754-tnb1 FAILED",
+		"run 20260824-182943-5arf OK",
+		"run 20260824-182958-bofb OK",
+		"run 20260824-183456-a7n3 FAILED",
+		"run 20260824-183510-wmyl OK",
 	].join("\n"));
 	assert.deepEqual(await emit(state, "message_end", { type: "message_end", message }), [undefined]);
 });

@@ -26,7 +26,25 @@ import {
 interface WorkerMessageContext {
 	readonly role?: string;
 	readonly spendProfile: WorkerSpendProfile;
+	readonly timeoutMs?: number;
 }
+
+export const WORKER_TIME_CHECKPOINT_MESSAGE_TYPE = "workbench-worker-time-checkpoint";
+export const WORKER_TIME_FINALIZE_MESSAGE_TYPE = "workbench-worker-time-finalize";
+export const WORKER_TIME_CHECKPOINT_RATIO = 0.65;
+export const WORKER_TIME_FINALIZE_RATIO = 0.85;
+
+export const WORKER_TIME_CHECKPOINT_TEXT = [
+	"Worker wall-clock checkpoint reached (65% of the existing timeout).",
+	"Stop broad exploration. Finish one coherent in-scope change, run the cheapest requested verification that still fits, and keep the final report ready.",
+	"If the contract cannot fit, report the exact blocker and remaining work instead of starting another branch of investigation.",
+].join("\n");
+
+export const WORKER_TIME_FINALIZE_TEXT = [
+	"Worker wall-clock finalization window reached (85% of the existing timeout).",
+	"Do not start new edits or broad tests. Preserve truthful verification facts and write the required four-heading final report now.",
+	"Incomplete work is an explicit Remaining Risk; a usable handoff is better than a timeout with an empty report.",
+].join("\n");
 
 export interface MessageEndController {
 	pi: Pick<ExtensionAPI, "on" | "sendMessage" | "getThinkingLevel" | "getActiveTools" | "getAllTools">;
@@ -35,6 +53,9 @@ export interface MessageEndController {
 	projectRootFor(ctx: ExtensionContext): Promise<string>;
 	refreshStatus(ctx: ExtensionContext, pendingMessage?: unknown): Promise<void>;
 	onWorkerBudgetSteerSent?(): void;
+	/** Deterministic timer seams for direct tests. */
+	scheduleTimer?(callback: () => void, delayMs: number): unknown;
+	clearTimer?(handle: unknown): void;
 }
 
 /** Register the best-effort message_end observer. */
@@ -42,11 +63,56 @@ export function registerMessageEndController(controller: MessageEndController): 
 	let workerSoftSteerSent = false;
 	let workerSpendSoftSteerSent = false;
 	let workerSpendState: WorkerSpendState = { ...EMPTY_WORKER_SPEND_STATE };
+	let wallClockTimers: unknown[] = [];
+
+	const clearWallClockTimers = (): void => {
+		for (const handle of wallClockTimers) {
+			if (controller.clearTimer) controller.clearTimer(handle);
+			else clearTimeout(handle as ReturnType<typeof setTimeout>);
+		}
+		wallClockTimers = [];
+	};
+	const scheduleWallClockSteer = (delayMs: number, customType: string, content: string, ratio: number): void => {
+		const callback = () => {
+			try {
+				controller.pi.sendMessage({
+					customType,
+					content,
+					display: false,
+					details: { timeout_ratio: ratio, delay_ms: delayMs },
+				}, { deliverAs: "steer" });
+				controller.onWorkerBudgetSteerSent?.();
+			} catch {
+				// Advisory delivery never changes worker execution or authority.
+			}
+		};
+		const handle = controller.scheduleTimer?.(callback, delayMs) ?? setTimeout(callback, delayMs);
+		if (!controller.scheduleTimer && typeof handle === "object" && handle !== null && "unref" in handle) {
+			(handle as { unref(): void }).unref();
+		}
+		wallClockTimers.push(handle);
+	};
 
 	controller.pi.on("session_start", () => {
+		clearWallClockTimers();
 		workerSoftSteerSent = false;
 		workerSpendSoftSteerSent = false;
 		workerSpendState = { ...EMPTY_WORKER_SPEND_STATE };
+		const worker = controller.getWorkerContext();
+		if (worker.role === "worker" && worker.timeoutMs !== undefined) {
+			scheduleWallClockSteer(
+				Math.max(1, Math.floor(worker.timeoutMs * WORKER_TIME_CHECKPOINT_RATIO)),
+				WORKER_TIME_CHECKPOINT_MESSAGE_TYPE,
+				WORKER_TIME_CHECKPOINT_TEXT,
+				WORKER_TIME_CHECKPOINT_RATIO,
+			);
+			scheduleWallClockSteer(
+				Math.max(1, Math.floor(worker.timeoutMs * WORKER_TIME_FINALIZE_RATIO)),
+				WORKER_TIME_FINALIZE_MESSAGE_TYPE,
+				WORKER_TIME_FINALIZE_TEXT,
+				WORKER_TIME_FINALIZE_RATIO,
+			);
+		}
 	});
 
 	controller.pi.on("message_end", async (event, ctx) => {

@@ -200,6 +200,9 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker,
 		executionMode: "sequential",
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			const refreshFailureStatus = async (): Promise<void> => {
+				try { await controller.refreshStatus(ctx); } catch { /* failure reporting stays primary */ }
+			};
 			let trustedIngress: TIngress | undefined;
 			let startLockLease: ProjectDelegationStartLockLeaseV1 | undefined;
 			let preserveStartLock = false;
@@ -622,7 +625,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					},
 					onProgress: (progress) => {
 						onUpdate?.({
-							content: [{ type: "text", text: `Pinned worker: ${progress.turns} turn(s), model ${progress.provider ?? WORKER_PROVIDER}/${progress.model ?? WORKER_MODEL_ID} | spend total ${progress.totalTokens} | output ${progress.outputTokens} | band ${progress.spendBand}` }],
+							content: [{ type: "text", text: `Pinned worker: ${progress.turns} turn(s), model ${progress.provider ?? WORKER_PROVIDER}/${progress.model ?? WORKER_MODEL_ID} | spend total ${progress.totalTokens} | output ${progress.outputTokens} | band ${progress.spendBand} | elapsed ${Math.floor(progress.elapsedMs / 60_000)}m | remaining ${Math.ceil(progress.remainingMs / 60_000)}m` }],
 							details: {
 								phase: "running",
 								turns: progress.turns,
@@ -631,6 +634,8 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 								spendBand: progress.spendBand,
 								provider: progress.provider,
 								model: progress.model,
+								elapsed_ms: progress.elapsedMs,
+								remaining_ms: progress.remainingMs,
 							},
 						});
 					},
@@ -673,6 +678,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 							controller.persistDelegationStateStrict(reviewed);
 						} catch {
 							controller.markTerminalMirrorBlocked();
+							await refreshFailureStatus();
 							throw new Error("workbench_delegate_worker: delegation v2 failed terminal session mirror persistence failed");
 						}
 					}
@@ -732,6 +738,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 						controller.persistDelegationStateStrict(reviewed);
 					} catch {
 						controller.markTerminalMirrorBlocked();
+						await refreshFailureStatus();
 						throw new Error("workbench_delegate_worker: diagnosis session mirror persistence failed");
 					}
 				} else {
@@ -746,7 +753,10 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 						persistState: (nextState) => controller.persistDelegationStateStrict(nextState),
 					});
 					if (!delivery.ok) {
-						if (delivery.code === "session_persistence_failed") controller.markTerminalMirrorBlocked();
+						if (delivery.code === "session_persistence_failed") {
+							controller.markTerminalMirrorBlocked();
+							await refreshFailureStatus();
+						}
 						const reviewError = delivery.review_error === undefined ? "" : `; review_error=${delivery.review_error}`;
 						throw new Error(`workbench_delegate_worker: default delivery ${delivery.code}${reviewError}; explicit review required`);
 					}

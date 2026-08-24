@@ -30,6 +30,14 @@ type V2Observation = Extract<DelegationAuthorityObservationV2, { kind: "v2" }>;
 export type DelegationRepairStatusV1 =
 	| { kind: "none" }
 	| { kind: "authority_invalid"; delegationId: string | null; code: string }
+	| { kind: "delegation_active"; delegationId: string; transactionStatus: string }
+	| {
+		kind: "delegation_retry";
+		delegationId: string;
+		transactionStatus: string;
+		binding: "fresh" | "conflict" | "unavailable";
+	}
+	| { kind: "delegation_recovery"; delegationId: string; transactionStatus: string }
 	| {
 		kind: "repair_required";
 		delegationId: string;
@@ -92,6 +100,17 @@ export function delegationProjectIssueRepairStatusV1(
 		: { kind: "authority_invalid", delegationId: issue.delegationId ?? null, code: issue.code };
 }
 
+/** Prefer durable execution state, except where a terminal success still needs session completion/freshness. */
+export function delegationDisplayedStatusV1(
+	sessionStatus: DelegationState["status"],
+	transactionStatus: string | undefined,
+): string {
+	if (transactionStatus === undefined) return sessionStatus;
+	return ["REVIEWED", "FINISHED"].includes(transactionStatus) && sessionStatus !== "REVIEWED"
+		? sessionStatus
+		: transactionStatus;
+}
+
 function bindingStatus(
 	binding: CurrentDelegationBindingV2,
 	expectedHash: string,
@@ -135,7 +154,23 @@ export function classifyDelegationRepairStatusV1(input: {
 			};
 	}
 	const lineage = authority.repairLineage;
-	if (lineage === undefined || authority.transactionStatus === "REVIEWED") return { kind: "none" };
+	if (lineage === undefined) {
+		if (["PREPARED", "RUNNING", "COMMITTING"].includes(authority.transactionStatus)) {
+			return { kind: "delegation_active", delegationId: input.delegationId, transactionStatus: authority.transactionStatus };
+		}
+		if (["FAILED", "RECOVERY_REQUIRED"].includes(authority.transactionStatus)) {
+			return input.retryable === true
+				? {
+					kind: "delegation_retry",
+					delegationId: input.delegationId,
+					transactionStatus: authority.transactionStatus,
+					binding: input.binding.status,
+				}
+				: { kind: "delegation_recovery", delegationId: input.delegationId, transactionStatus: authority.transactionStatus };
+		}
+		return { kind: "none" };
+	}
+	if (authority.transactionStatus === "REVIEWED") return { kind: "none" };
 	if (authority.transactionStatus === "PENDING_REVIEW") {
 		return {
 			kind: "repair_review",
@@ -195,7 +230,7 @@ export async function readDelegationRepairStatusV1(
 			services.readAuthority(projectRoot, delegationId),
 			services.collectBinding(projectRoot, delegationId, exec),
 		]);
-		const retryable = authority.kind === "v2" && authority.repairLineage !== undefined &&
+		const retryable = authority.kind === "v2" &&
 			["ABORTED", "FAILED", "RECOVERY_REQUIRED"].includes(authority.transactionStatus)
 			? (await services.readRepairCapsule(projectRoot, delegationId)).ok
 			: false;
@@ -213,6 +248,17 @@ export function delegationNextActionTextV1(
 	if (repair.kind === "authority_invalid") {
 		const subject = repair.delegationId === null ? "project delegation" : `delegation ${repair.delegationId}`;
 		return `${subject} authority is ${repair.code}; repair, delegation, and VERIFY remain fail-closed`;
+	}
+	if (repair.kind === "delegation_active") {
+		return `delegation ${repair.delegationId} is ${repair.transactionStatus}; wait for the worker result before review or another delegation`;
+	}
+	if (repair.kind === "delegation_retry") {
+		return repair.binding === "fresh"
+			? `continue with workbench_delegate_worker repair_of=${repair.delegationId}; do not retry review`
+			: `delegation ${repair.delegationId} is ${repair.transactionStatus}, but its binding is ${repair.binding}; inspect status before repair`;
+	}
+	if (repair.kind === "delegation_recovery") {
+		return `delegation ${repair.delegationId} is ${repair.transactionStatus}; query workbench_delegation_status for the recovery action; do not retry review`;
 	}
 	if (repair.kind === "repair_required" || repair.kind === "repair_retry") {
 		if (repair.binding !== "fresh") {
@@ -249,6 +295,26 @@ export function delegationRepairStatusLinesV1(status: DelegationRepairStatusV1):
 	if (status.kind === "none") return [];
 	if (status.kind === "authority_invalid") {
 		return [`repair state : INVALID (${status.code}); no repair or Gate authority is inferred`];
+	}
+	if (status.kind === "delegation_active") {
+		return [
+			`execution v2 : ${status.transactionStatus} — review is not available yet`,
+			"next action  : wait for the current worker result",
+		];
+	}
+	if (status.kind === "delegation_retry") {
+		return [
+			`completion v2: ${status.transactionStatus} — review is not the recovery path`,
+			status.binding === "fresh"
+				? `next action  : call workbench_delegate_worker with repair_of=${status.delegationId}`
+				: `next action  : binding is ${status.binding}; inspect status before repair`,
+		];
+	}
+	if (status.kind === "delegation_recovery") {
+		return [
+			`completion v2: ${status.transactionStatus} — strict recovery is required`,
+			"next action  : inspect workbench_delegation_status; do not retry review",
+		];
 	}
 	if (status.kind === "repair_required" || status.kind === "repair_retry") {
 		const lines = [

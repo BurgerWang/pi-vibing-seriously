@@ -203,15 +203,56 @@ function normalizeLimits(value: Readonly<ReviewRelevanceLimitsV2> | undefined): 
 	return { max_paths, max_total_bytes, max_file_bytes };
 }
 
+/**
+ * Compare one persisted guard entry across an ordinary filesystem remount.
+ *
+ * Linux device numbers are mount-instance metadata: the same unchanged inode
+ * can receive a different `st_dev` after reboot/remount.  Keep every other
+ * cheap guard field strict, then restore the persisted device number only
+ * after the current file has been streamed and its full identity has been
+ * tied back to this exact current guard entry.  Content hashes and the
+ * immutable projection/envelope remain authoritative.
+ */
 function sameGuardEntry(left: WorkspaceGuardEntry | undefined, right: WorkspaceGuardEntry | undefined): boolean {
 	if (left === undefined || right === undefined) return left === right;
 	if (left.path !== right.path || left.status !== right.status || left.identity.kind !== right.identity.kind) return false;
 	if (left.identity.kind === "missing" || right.identity.kind === "missing") return left.identity.kind === right.identity.kind;
 	return left.identity.byte_size === right.identity.byte_size
-		&& left.identity.stat.dev === right.identity.stat.dev
 		&& left.identity.stat.ino === right.identity.stat.ino
 		&& left.identity.stat.mtime_ns === right.identity.stat.mtime_ns
 		&& left.identity.stat.ctime_ns === right.identity.stat.ctime_ns;
+}
+
+function restorePersistedDeviceForStableRemount(
+	identity: StreamingPathIdentity,
+	baseline: WorkspaceGuardEntry | undefined,
+	current: WorkspaceGuardEntry | undefined,
+	expected: ReviewRelevanceEntryV2 | undefined,
+): StreamingPathIdentity {
+	if (identity.kind === "missing") return identity;
+	if (expected?.full_identity.kind === "file"
+		&& identity.path === expected.full_identity.path
+		&& identity.byte_size === expected.full_identity.byte_size
+		&& identity.sha256 === expected.full_identity.sha256
+		&& identity.stat.ino === expected.full_identity.stat.ino
+		&& identity.stat.mtime_ns === expected.full_identity.stat.mtime_ns
+		&& identity.stat.ctime_ns === expected.full_identity.stat.ctime_ns) {
+		return identity.stat.dev === expected.full_identity.stat.dev ? identity : Object.freeze({
+			...identity,
+			stat: Object.freeze({ ...identity.stat, dev: expected.full_identity.stat.dev }),
+		});
+	}
+	if (baseline?.identity.kind !== "file" || current?.identity.kind !== "file"
+		|| baseline.identity.stat.dev === current.identity.stat.dev) return identity;
+	if (identity.byte_size !== current.identity.byte_size
+		|| identity.stat.dev !== current.identity.stat.dev
+		|| identity.stat.ino !== current.identity.stat.ino
+		|| identity.stat.mtime_ns !== current.identity.stat.mtime_ns
+		|| identity.stat.ctime_ns !== current.identity.stat.ctime_ns) return identity;
+	return Object.freeze({
+		...identity,
+		stat: Object.freeze({ ...identity.stat, dev: baseline.identity.stat.dev }),
+	});
 }
 
 /** Closed predicate for versioned managed policy/schema controls. */
@@ -387,7 +428,16 @@ export async function collectReviewRelevanceV2(
 		if (!captured.ok) {
 			return fail(captured.error.code.includes("overflow") ? "limit_exceeded" : "identity_unavailable", meter, captured.error.path);
 		}
-		const identityByPath = new Map(captured.identities.map((identity) => [identity.path, identity]));
+		const expectedByPath = new Map((input.expected_projection?.entries ?? []).map((entry) => [entry.path, entry]));
+		const identityByPath = new Map(captured.identities.map((identity) => [
+			identity.path,
+			restorePersistedDeviceForStableRemount(
+				identity,
+				baselineByPath.get(identity.path),
+				currentByPath.get(identity.path),
+				expectedByPath.get(identity.path),
+			),
+		]));
 		for (const workerEntry of input.change_set.worker_delta) {
 			const currentIdentity = identityByPath.get(workerEntry.path);
 			if (currentIdentity === undefined || currentIdentity.path !== workerEntry.path ||

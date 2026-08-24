@@ -12,6 +12,7 @@ import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
+import { performance } from "node:perf_hooks";
 import { types as utilTypes } from "node:util";
 
 import {
@@ -40,6 +41,7 @@ import {
 	WORKER_ROLE,
 	WORKER_ROLE_ENV,
 	WORKER_TASK_KIND_ENV,
+	WORKER_TIMEOUT_MS_ENV,
 	type WorkerTaskKind,
 	type WorkerTaskContract,
 } from "../core/worker-policy.ts";
@@ -293,6 +295,10 @@ export interface WorkerProgress {
 	collapsedToolResults: number;
 	/** Reserved bytes in the latest completed child tool batch. */
 	turnReservedBytes: number;
+	/** Monotonic wall-clock observation; never authority. */
+	elapsedMs: number;
+	/** Remaining time until the existing hard timeout, clamped at zero. */
+	remainingMs: number;
 	provider?: string;
 	model?: string;
 }
@@ -556,6 +562,7 @@ function childEnvironment(
 	spendProfile: WorkerSpendProfile,
 	taskKind: WorkerTaskKind,
 	runtimeIdentity: Readonly<WorkerRuntimeIdentity> | undefined,
+	timeoutMs: number,
 ): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = { ...process.env };
 	// Parent-session identity/model facts must never masquerade as child facts.
@@ -566,11 +573,13 @@ function childEnvironment(
 	// omit it and therefore always launch with both keys absent.
 	delete env[WORKER_DELEGATION_ID_ENV];
 	delete env[WORKER_CONTRACT_HASH_ENV];
+	delete env[WORKER_TIMEOUT_MS_ENV];
 	env[WORKER_ROLE_ENV] = WORKER_ROLE;
 	env[WORKER_DEPTH_ENV] = "1";
 	env[WORKER_PROJECT_ROOT_ENV] = projectRoot;
 	env[WORKER_ALLOWED_PATHS_ENV] = JSON.stringify(allowedPaths);
 	env[WORKER_TASK_KIND_ENV] = taskKind;
+	env[WORKER_TIMEOUT_MS_ENV] = String(timeoutMs);
 	// Phase 2: the fixed spend-profile child env contract — the runner ALWAYS
 	// writes a valid resolved profile value here (never empty/malformed).
 	env[WORKER_SPEND_PROFILE_ENV] = spendProfile;
@@ -739,8 +748,9 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 				shell: false,
 				detached: process.platform !== "win32",
 				stdio: ["ignore", "pipe", "pipe"],
-				env: childEnvironment(options.projectRoot, options.contract.allowedPaths, spendProfile, taskKind, runtimeIdentity),
+				env: childEnvironment(options.projectRoot, options.contract.allowedPaths, spendProfile, taskKind, runtimeIdentity, options.timeoutMs),
 			});
+			const startedAtMs = performance.now();
 			let stdoutBuffer = "";
 			let stderrBuffer = "";
 			let settled = false;
@@ -901,6 +911,7 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 				// the final ledger counters at the last event, hard stops
 				// included (the callback still runs after terminate()). Numeric
 				// counters only plus the pinned identity: never text of any kind.
+				const elapsedMs = Math.max(0, performance.now() - startedAtMs);
 				options.onProgress?.({
 					turns: result.spendState.turns,
 					totalTokens: result.spendState.totalTokens,
@@ -909,6 +920,8 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 					currentToolTextBytes: outputControl.currentToolTextBytes,
 					collapsedToolResults: outputControl.collapsedToolResults,
 					turnReservedBytes: outputControl.turnReservedBytes,
+					elapsedMs,
+					remainingMs: Math.max(0, options.timeoutMs - elapsedMs),
 					provider: result.provider,
 					model: result.model,
 				});

@@ -12,7 +12,10 @@ import {
 } from "./delegation-state.ts";
 import type { reviewDelegationV2 } from "./delegation-review-v2.ts";
 import type { readRecoverableUnpublishedDelegationV2 } from "./delegation-project-authority.ts";
-import type { readDelegationCommittedGenerationV2 } from "./delegation-transaction-storage.ts";
+import type {
+	readDelegationCommittedGenerationV2,
+	readDelegationTransactionV2,
+} from "./delegation-transaction-storage.ts";
 import {
 	MAX_REVIEW_GUIDANCE_BYTES,
 	MAX_REVIEW_PATCH_PATHS,
@@ -80,6 +83,7 @@ export interface ReviewToolController {
 
 export interface ReviewToolServices {
 	now(): Date;
+	readTransaction: typeof readDelegationTransactionV2;
 	readCommittedGeneration: typeof readDelegationCommittedGenerationV2;
 	readRecoverableUnpublished: typeof readRecoverableUnpublishedDelegationV2;
 	reviewV2: typeof reviewDelegationV2;
@@ -108,23 +112,27 @@ export function registerReviewTool(controller: ReviewToolController): void {
 				maxLines: renderMaxLines,
 			}).text;
 			const semanticDecisionRaw = (params as unknown as { semantic_decision?: unknown }).semantic_decision;
+			const delegationIdRaw = (params as unknown as { delegation_id?: unknown }).delegation_id;
+			const explicitDelegationId = typeof delegationIdRaw === "string" && delegationIdRaw.length > 0
+				? delegationIdRaw
+				: undefined;
 			const expectedBoundDiffHashRaw = (params as unknown as { expected_bound_diff_hash?: unknown }).expected_bound_diff_hash;
 			const expectedMigrationBindingHashRaw = (params as unknown as { expected_migration_binding_hash?: unknown }).expected_migration_binding_hash;
 			const repairReasonRaw = (params as unknown as { repair_reason?: unknown }).repair_reason;
 			const semanticDecisionSupplied = semanticDecisionRaw !== undefined || expectedBoundDiffHashRaw !== undefined ||
 				expectedMigrationBindingHashRaw !== undefined || repairReasonRaw !== undefined;
 			const boundHashValid = typeof expectedBoundDiffHashRaw === "string" && /^[0-9a-f]{64}$/u.test(expectedBoundDiffHashRaw);
-			const acceptShape = semanticDecisionRaw === "ACCEPT" && boundHashValid && repairReasonRaw === undefined &&
+			const acceptShape = explicitDelegationId !== undefined && semanticDecisionRaw === "ACCEPT" && boundHashValid && repairReasonRaw === undefined &&
 				(expectedMigrationBindingHashRaw === undefined || (
 					typeof expectedMigrationBindingHashRaw === "string" && /^[0-9a-f]{64}$/u.test(expectedMigrationBindingHashRaw)
 				));
-			const repairShape = semanticDecisionRaw === "REPAIR" && boundHashValid && expectedMigrationBindingHashRaw === undefined &&
+			const repairShape = explicitDelegationId !== undefined && semanticDecisionRaw === "REPAIR" && boundHashValid && expectedMigrationBindingHashRaw === undefined &&
 				typeof repairReasonRaw === "string" && repairReasonRaw === repairReasonRaw.trim() && repairReasonRaw.length > 0 &&
 				Buffer.byteLength(repairReasonRaw, "utf8") <= 1_024 && !repairReasonRaw.includes("\0");
 			if (semanticDecisionSupplied && !acceptShape && !repairShape) {
 				const repairIntent = semanticDecisionRaw === "REPAIR" || repairReasonRaw !== undefined;
 				return {
-					content: [{ type: "text", text: reviewText("workbench_review_worker_diff: invalid semantic decision; ACCEPT requires the exact bound hash, while REPAIR requires the exact bound hash plus a bounded repair_reason") }],
+					content: [{ type: "text", text: reviewText("workbench_review_worker_diff: invalid semantic decision; ACCEPT and REPAIR require the exact delegation_id and bound hash returned by the complete packet; REPAIR also requires a bounded repair_reason") }],
 					details: { ok: false, error: repairIntent ? "invalid_semantic_repair" : "invalid_semantic_accept", review_kind: "scope_integrity", gate_authority: false },
 				};
 			}
@@ -174,18 +182,44 @@ export function registerReviewTool(controller: ReviewToolController): void {
 					details: { ok: false, error: controller.getProjectAuthorityIssueCode() ?? "project_authority_invalid", authority_version: 2 },
 				};
 			}
-			const delegationId = params.delegation_id.trim();
 			const initialState = controller.getDelegationState();
 			if (initialState.latestId === undefined) {
-				return { content: [{ type: "text", text: reviewText("workbench_review_worker_diff: no delegation to review") }], details: {} };
+				return {
+					content: [{ type: "text", text: reviewText("workbench_review_worker_diff: no delegation to review; start a worker delegation first") }],
+					details: { ok: false, error: "no_delegation", next_action: "workbench_delegate_worker" },
+				};
 			}
+			const delegationId = explicitDelegationId ?? initialState.latestId;
 			if (initialState.latestId !== delegationId) {
 				return {
 					content: [{ type: "text", text: reviewText(`workbench_review_worker_diff: delegation ${delegationId} is not the latest delegation (${initialState.latestId}); only the latest delegation can be reviewed`) }],
-					details: {},
+					details: {
+						ok: false,
+						error: "not_latest_delegation",
+						delegation_id: delegationId,
+						latest_delegation_id: initialState.latestId,
+						next_action: "retry_without_delegation_id",
+					},
 				};
 			}
 			const now = controller.services.now().toISOString();
+			const transaction = await controller.services.readTransaction(projectRoot, delegationId);
+			if (transaction.ok && transaction.value.status === "FAILED") return repairRequired(delegationId);
+			if (transaction.ok && ["PREPARED", "RUNNING", "COMMITTING"].includes(transaction.value.status)) {
+				return {
+					content: [{
+						type: "text",
+						text: reviewText(`workbench_review_worker_diff: delegation ${delegationId} is ${transaction.value.status}; wait for the worker to finish before review`),
+					}],
+					details: {
+						ok: false,
+						error: "delegation_not_reviewable",
+						delegation_id: delegationId,
+						transaction_status: transaction.value.status,
+						next_action: "wait_for_worker",
+					},
+				};
+			}
 			const v2Preflight = await controller.services.readCommittedGeneration(projectRoot, delegationId);
 			let result: Awaited<ReturnType<typeof reviewDelegation>>;
 			let authorityVersion: 1 | 2;

@@ -186,7 +186,7 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 
 test("v0.10.0 public tool surface has the intentional framework-reliability transition hash", () => {
 	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
-	const currentHash = "0b8ab153bc79003271ded6e989e089e4f08322cf88b7ebf54634df8aa2b6966b";
+	const currentHash = "9b091d42735c61fdc9032ff84d0c06d92b6556cd077d1051b2fab1e2b7e5f76d";
 	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
 	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the documented 0.10.0 hash");
 });
@@ -680,7 +680,7 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.equal(
 		canonicalHash(workbenchToolMetadataOrdered()),
-		"1b1d863f742ee881f1b52e922cd6e0db22231c82cf27520ea76ea91c5d6a2cf6",
+		"191ae25058f6aaea05a7740514b491a15fb1ae3971569255876e54bf499df2c8",
 		"current public catalog hash is machine-pinned after the combined framework-reliability changes",
 	);
 });
@@ -693,12 +693,13 @@ test("delegation review metadata separates provisional inspection from explicit 
 		"the current prompt separates inspection from positive or negative semantic authority",
 	);
 	assert.deepEqual(meta.promptGuidelines, [
-		"First call without semantic fields to inspect the provisional scope/integrity packet; this cannot finalize review.",
-		"Only after Sol inspects the complete packet, call with semantic_decision=ACCEPT or REPAIR and its exact expected_bound_diff_hash. REPAIR also requires repair_reason, stays Gate-blocking, and permits only exact repair_of. For an explicitly reported historical migration, only ACCEPT is valid and also requires expected_migration_binding_hash. Never guess a hash.",
+		"First call without semantic fields and normally without delegation_id; the runtime selects the durable latest delegation and returns its exact id. This provisional presentation cannot finalize review.",
+		"Only after Sol inspects the complete packet, call with that exact delegation_id plus semantic_decision=ACCEPT or REPAIR and its exact expected_bound_diff_hash. REPAIR also requires repair_reason, stays Gate-blocking, and permits only exact repair_of. For an explicitly reported historical migration, only ACCEPT is valid and also requires expected_migration_binding_hash. Never guess an id or hash.",
 		"include_paths changes presentation only. When one ordinary source path remains, repeat that single path until its hash-bound page range reaches the total; never accept after drift, incomplete packet coverage, unresolved semantic risk, or an unverified hash.",
 		"Review authority never substitutes for final verification or Gate authority.",
 	]);
 	assert.match(meta.description, /only provisional presentation/);
+	assert.match(meta.description, /Omit delegation_id for a read-only presentation of the durable latest delegation/);
 	assert.match(meta.description, /semantic_decision=ACCEPT grants exact hash-bound semantic authority/);
 	assert.match(meta.description, /semantic_decision=REPAIR plus a bounded repair_reason publishes immutable negative authority/);
 	assert.match(meta.description, /enables only an exact fresh repair_of lineage/);
@@ -725,6 +726,7 @@ test("delegation review metadata separates provisional inspection from explicit 
 	assert.equal(migrationHash?.minLength, 64);
 	assert.equal(migrationHash?.maxLength, 64);
 	assert.ok(!(reviewParameters.required ?? []).includes("semantic_decision"));
+	assert.ok(!(reviewParameters.required ?? []).includes("delegation_id"));
 	assert.ok(!(reviewParameters.required ?? []).includes("expected_bound_diff_hash"));
 	assert.ok(!(reviewParameters.required ?? []).includes("repair_reason"));
 	assert.ok(!(reviewParameters.required ?? []).includes("expected_migration_binding_hash"));
@@ -735,12 +737,12 @@ test("delegation review metadata separates provisional inspection from explicit 
 	assert.match(repairReason?.description ?? "", /never grants Gate authority/);
 	assert.equal(
 		canonicalHash(meta),
-		"ca59da5db7ca6990e34105048b583ee82803140d27dc442ed3e473e4a213175e",
+		"80a8f9242431c26eb8700cc24b8b2d48c9fce2e98b89007045d719fee034b4e4",
 		"current review metadata hash is pinned after ACCEPT/REPAIR and page-continuation guidance",
 	);
 	assert.equal(
 		canonicalHash(WORKBENCH_TOOL_PARAMETERS.workbench_review_worker_diff),
-		"550a7af27010041ed60146e9a3ed1491e9004aa90dd62a007a2b7ee9ee30c903",
+		"75e16f08badfe5762541904d242e34121214d86ded0454067c9c28f40c2dd087",
 		"review input schema pins ACCEPT/REPAIR and their bounded authority fields",
 	);
 });

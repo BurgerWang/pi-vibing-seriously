@@ -199,7 +199,8 @@ export function workbenchToolRenderer(kind: RendererKind, name: string): { rende
 			case "compare": {
 				const d = details as ProjectedCompareDetails;
 				if (d.ok !== true) {
-					lines = [renderErrorLine(name, d.error ?? "comparison unavailable")];
+					const message = extractErrorMessage(result);
+					lines = [renderErrorLine(name, message === "unknown error" ? d.error ?? "comparison unavailable" : message)];
 					color = "error";
 				} else if (d.report && typeof d.report === "object") {
 					// Backward-compatible rendering for already-open legacy results.
@@ -214,7 +215,8 @@ export function workbenchToolRenderer(kind: RendererKind, name: string): { rende
 			case "review": {
 				const d = details as ProjectedReviewDetails;
 				if (d.ok !== true) {
-					lines = [renderErrorLine(name, d.error ?? "review unavailable")];
+					const message = extractErrorMessage(result);
+					lines = [renderErrorLine(name, message === "unknown error" ? d.error ?? "review unavailable" : message)];
 					color = "error";
 				} else {
 					lines = renderProjectedReviewLines(d, options.expanded);

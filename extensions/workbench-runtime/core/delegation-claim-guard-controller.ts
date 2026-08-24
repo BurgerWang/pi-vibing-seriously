@@ -129,6 +129,13 @@ interface DelegationClaimFailureFacts {
 	readonly verifiedRuns: number;
 	readonly attemptedDelegateCalls: number;
 	readonly successfulDelegateResults: number;
+	readonly statusMismatchCount: number;
+	readonly statusMismatches: readonly {
+		readonly delegation_id: string;
+		readonly transaction_status: DelegationClaimAuthorityStatus;
+		readonly session_status: DelegationReviewStatus | null;
+		readonly claimed: readonly string[];
+	}[];
 }
 
 function assistantText(message: unknown): string | undefined {
@@ -462,6 +469,7 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 	let workerStartClaim = false;
 	let successClaim = false;
 	let recentClaim = false;
+	let unboundRecentClaim = false;
 	let sawNegativeDelegation = false;
 
 	for (const rawClause of claimClauses(text)) {
@@ -491,6 +499,7 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 		workerStartClaim ||= clauseStart;
 		successClaim ||= clauseSuccess;
 		recentClaim ||= clauseRecent;
+		unboundRecentClaim ||= clauseRecent && idMatches.length === 0;
 
 		for (let index = 0; index < idMatches.length; index += 1) {
 			const match = idMatches[index]!;
@@ -552,7 +561,10 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 	}
 	const negativeOnly = sawNegativeDelegation && ids.length === 0 && !executionClaim && !successClaim;
 	if (ids.length === 0 && runClaims.ids.length === 0 && !overflow && !executionClaim && !successClaim && !negativeOnly) return undefined;
-	const boundSameRunStartIds = recentClaim ? ids : [...sameRunStartIds].filter((id) => ids.includes(id));
+	const explicitSameRunStartIds = [...sameRunStartIds].filter((id) => ids.includes(id));
+	const boundSameRunStartIds = explicitSameRunStartIds.length > 0
+		? explicitSameRunStartIds
+		: unboundRecentClaim ? ids : [];
 	return {
 		ids,
 		runIds,
@@ -596,6 +608,19 @@ function authoritySatisfiesStatus(authority: DelegationClaimAuthority, expected:
 		return transactionSatisfiesStatus(status, expected.status) || authority.sessionStatus === expected.status;
 	}
 	return transactionSatisfiesStatus(status, expected.status);
+}
+
+function committedSessionStatus(
+	state: { readonly task_kind: string; readonly status: DelegationTransactionStatus },
+): DelegationReviewStatus | undefined {
+	// A successful diagnosis is durably terminal as transaction FINISHED. The
+	// public worker result and session mirror intentionally project that same
+	// zero-delta closure as review REVIEWED. Reconstruct that projection from
+	// the strict committed generation after it stops being the latest session
+	// item, rather than treating Pi's own earlier result as a status mismatch.
+	if (state.task_kind === "diagnosis" && state.status === "FINISHED") return "REVIEWED";
+	if (state.status === "PENDING_REVIEW" || state.status === "REVIEWED") return state.status;
+	return undefined;
 }
 
 function authorityProvesWorkerStart(authority: DelegationClaimAuthority): boolean {
@@ -806,6 +831,9 @@ function claimGuardNextAction(code: NonNullable<DelegationClaimValidation["code"
 	if (code === "missing_authority") {
 		return "discard guessed delegation ids; query workbench_delegation_status; if its persisted next action permits delegation, call workbench_delegate_worker and report only the returned delegation_id";
 	}
+	if (code === "status_mismatch") {
+		return "query workbench_delegation_status and restate each machine_mismatch_fact without collapsing transaction FINISHED into transaction REVIEWED";
+	}
 	return "query workbench_delegation_status and follow its persisted next action; review PENDING_REVIEW or STALE, and delegate only when unblocked";
 }
 
@@ -820,6 +848,19 @@ function claimFailureFacts(
 	const resolved = resolveClaimNamespaces(inspection, authorityById, runAuthorityById);
 	const claimedDelegations = resolved.delegationIds.length;
 	const claimedRuns = resolved.runIds.length;
+	const statusMismatches = resolved.delegationIds.flatMap((id) => {
+		const authority = authorityById.get(id);
+		if (authority === undefined) return [];
+		const mismatched = (resolved.expectedStatuses[id] ?? [])
+			.filter((expected) => !authoritySatisfiesStatus(authority, expected));
+		if (mismatched.length === 0) return [];
+		return [{
+			delegation_id: id,
+			transaction_status: authority.status,
+			session_status: authority.sessionStatus ?? null,
+			claimed: mismatched.slice(0, 8).map((expected) => `${expected.source}:${expected.status}`),
+		}];
+	}).slice(0, 8);
 	return {
 		claimNamespace: claimedDelegations > 0 && claimedRuns > 0
 			? "mixed"
@@ -830,6 +871,8 @@ function claimFailureFacts(
 		verifiedRuns: resolved.runIds.filter((id) => runAuthorityById.has(id)).length,
 		attemptedDelegateCalls: turn.attemptedCalls,
 		successfulDelegateResults: turn.successfulResults,
+		statusMismatchCount: statusMismatches.length,
+		statusMismatches,
 	};
 }
 
@@ -860,6 +903,8 @@ function replacementMessage(
 				`verified_run_authority_count: ${facts.verifiedRuns}`,
 				`delegate_calls_this_turn: ${facts.attemptedDelegateCalls}`,
 				`successful_delegate_results_this_turn: ${facts.successfulDelegateResults}`,
+				`status_mismatch_count: ${facts.statusMismatchCount}`,
+				`machine_mismatch_facts: ${JSON.stringify(facts.statusMismatches)}`,
 				`next_action: ${claimGuardNextAction(code)}`,
 				`claim_hash: ${claimHash}`,
 			].join("\n"),
@@ -975,14 +1020,18 @@ export function registerDelegationClaimGuard(controller: DelegationClaimGuardCon
 			for (const id of claimAuthorityIds) {
 				const current = await controller.readTransaction(projectRoot, id);
 				if (current.ok) {
+					let historicalSessionStatus: DelegationReviewStatus | undefined;
 					if (["FINISHED", "PENDING_REVIEW", "REVIEWED", "FAILED"].includes(current.value.status)) {
 						const committed = await controller.readCommittedGeneration(projectRoot, id);
 						if (!committed.ok || committed.value.state.status !== current.value.status) continue;
+						historicalSessionStatus = committedSessionStatus(committed.value.state);
 					}
 					authorities.push({
 						id,
 						status: current.value.status,
-						...(sessionState.latestId === id ? { sessionStatus: sessionState.status } : {}),
+						...(sessionState.latestId === id
+							? { sessionStatus: sessionState.status }
+							: historicalSessionStatus === undefined ? {} : { sessionStatus: historicalSessionStatus }),
 					});
 				} else if (current.error.code === "not_found") {
 					const legacy = await controller.readLegacyLedger(projectRoot, id);

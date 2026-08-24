@@ -1001,6 +1001,12 @@ test("public WORKSPACE_DRIFT failure keeps a nonzero binding PENDING and never a
 				assert.ok(after.changed_since_before.length > 0);
 				assert.ok(after.changed_since_before.includes("src/unowned-drift.txt"));
 			}
+			const status = await delegationStatusTool(stub).execute("implementation-drift-status", {}, undefined, undefined, ctx);
+			const statusOutput = resultText(status);
+			assert.match(statusOutput, new RegExp(`latest\\s+: ${state.latestId} FAILED`, "u"));
+			assert.match(statusOutput, new RegExp(`repair_of=${state.latestId}`, "u"));
+			assert.doesNotMatch(statusOutput, /latest\s+: .* PENDING_REVIEW/u);
+			assert.equal((statusOutput.match(/next action\s+:/gu) ?? []).length, 1, "FAILED reports one durable recovery action");
 			await assert.rejects(
 				delegateTool(stub).execute("implementation-drift-blocked", delegateParams({ task_kind: "diagnosis" }), undefined, undefined, ctx),
 				/PENDING_REVIEW/,
@@ -1522,7 +1528,7 @@ test("resuming an older session mirror advances monotonically to the newest dura
 		assert.equal(mirror.latestId, newestId, "the session-local old id never overrides newer project authority");
 		assert.equal(mirror.status, "REVIEWED");
 		const status = await delegationStatusTool(stub).execute("project-monotonic-status", {}, undefined, undefined, ctx);
-		assert.match(resultText(status), new RegExp(`latest\\s+: ${newestId} REVIEWED`, "u"));
+		assert.match(resultText(status), new RegExp(`latest\\s+: ${newestId} ABORTED`, "u"));
 		assert.match(resultText(status), /authority v2\s+: transaction ABORTED/u);
 		assert.doesNotMatch(resultText(status), new RegExp(oldId, "u"));
 		assert.doesNotMatch(resultText(status), /blocked\s+: Starting a new worker delegation/u);
@@ -1610,7 +1616,8 @@ test("RECOVERY_REQUIRED project authority survives a failed session append and b
 		assert.deepEqual(await delegationDirectories(root), before, "reconciliation blocks before a second transaction directory");
 		const status = await delegationStatusTool(stub).execute("project-recovery-status", {}, undefined, undefined, ctx);
 		assert.match(resultText(status), /authority v2\s+: transaction RECOVERY_REQUIRED/);
-		assert.match(resultText(status), /latest\s+: .* PENDING_REVIEW/);
+		assert.match(resultText(status), /latest\s+: .* RECOVERY_REQUIRED/);
+		assert.doesNotMatch(resultText(status), /review delegation/);
 		assert.doesNotMatch(resultText(status), /authority v2\s+: INVALID/);
 		assert.equal(await readFile(transactionPath, "utf8"), transactionBefore, "reconciliation never rewrites historical transaction authority");
 	});

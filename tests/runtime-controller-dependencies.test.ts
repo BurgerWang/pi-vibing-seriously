@@ -142,6 +142,7 @@ test("review controller refuses corrupt v2 authority and never falls back to leg
 	const controller = {
 		services: {
 			now: () => fixed,
+			readTransaction: async () => ({ ok: true, value: { status: "PENDING_REVIEW" } }),
 			readCommittedGeneration: async () => ({
 				ok: false,
 				error: { code: "invalid_record", message: "private storage detail" },
@@ -234,6 +235,7 @@ test("review controller reserves the outer semantic header before rendering a co
 	const controller = {
 		services: {
 			now: () => fixed,
+			readTransaction: async () => ({ ok: true, value: { status: "PENDING_REVIEW" } }),
 			readCommittedGeneration: async () => ({ ok: true, value: { state: { status: "PENDING_REVIEW" } } }),
 			readRecoverableUnpublished: async () => ({ ok: false, error: { code: "not_recoverable" } }),
 			reviewV2: async (input: { maxBytes: number; maxLines: number }) => {
@@ -272,7 +274,7 @@ test("review controller reserves the outer semantic header before rendering a co
 	const tool = captureRegistration(registerReviewTool, controller);
 	const result = await tool.execute(
 		"review-budget",
-		{ delegation_id: delegationId, max_bytes: 4_096, max_lines: 56 },
+		{ max_bytes: 4_096, max_lines: 56 },
 		undefined,
 		undefined,
 		context(),
@@ -283,6 +285,43 @@ test("review controller reserves the outer semantic header before rendering a co
 	assert.equal(resultText(result).split("\n").at(-1), packetText, "the outer clamp presents the complete saturated packet");
 	assert.ok(Buffer.byteLength(resultText(result), "utf8") <= 4_096);
 	assert.equal(result.details.presentation_complete, true);
+	assert.equal(result.details.delegation_id, delegationId, "a presentation call defaults to the durable latest id");
+
+	const unboundDecision = await tool.execute(
+		"review-unbound-decision",
+		{ semantic_decision: "ACCEPT", expected_bound_diff_hash: boundHash },
+		undefined,
+		undefined,
+		context(),
+	);
+	assert.equal(unboundDecision.details.error, "invalid_semantic_accept");
+	assert.match(resultText(unboundDecision), /exact delegation_id/);
+});
+
+test("review controller rejects active durable transactions with one actionable status", async () => {
+	const id = "20260821-011214-W1r3";
+	const state = { latestId: id, status: "PENDING_REVIEW" as const, blockedWriteAttempts: 0, updatedAt: "2026-08-21T01:12:14.000Z" };
+	const controller = {
+		services: {
+			now: () => new Date("2026-08-21T01:12:14.000Z"),
+			readTransaction: async () => ({ ok: true, value: { status: "RUNNING" } }),
+			readCommittedGeneration: async () => { throw new Error("active transaction must stop before generation read"); },
+			readRecoverableUnpublished: async () => ({ ok: false, error: { code: "not_recoverable" } }),
+			reviewV2: async () => { throw new Error("active transaction must not review"); },
+			reviewLegacy: async () => { throw new Error("active transaction must not review"); },
+		},
+		exec: async () => ({ code: 0, stdout: "", stderr: "" }), secrets: [], trustedOrError: () => undefined,
+		projectRootFor: async () => "/project", peekOutputAuthorization: () => undefined, syncLease: () => {},
+		reconcileProjectAuthority: async () => true, getProjectAuthorityBlockReason: () => undefined,
+		getProjectAuthorityIssueCode: () => undefined, getDelegationState: () => state, setDelegationState: () => {},
+		isStrictMirrorDirty: () => false, setStrictMirrorDirty: () => {}, persistDelegationState: () => {},
+		persistDelegationStateStrict: () => {}, refreshCompactFacts: () => {}, refreshStatus: async () => {},
+	} as unknown as Omit<ReviewToolController, "pi">;
+	const result = await captureRegistration(registerReviewTool, controller).execute("review-running", {}, undefined, undefined, context());
+	assert.equal(result.details.error, "delegation_not_reviewable");
+	assert.equal(result.details.transaction_status, "RUNNING");
+	assert.equal(result.details.next_action, "wait_for_worker");
+	assert.match(resultText(result), /wait for the worker to finish/);
 });
 
 test("delegate controller refuses unavailable repair authority before execution", async () => {

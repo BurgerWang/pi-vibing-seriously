@@ -910,7 +910,7 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 			: await persistDelegationReviewProvisionalV2(input.projectRoot, cas, input.storage);
 		if (!persisted.ok) {
 			const point = persisted.error.point === undefined ? "" : ` at ${persisted.error.point}`;
-			return fail("storage_failure", `delegation v2 review persistence failed (${persisted.error.code}${point})`, { review, transaction: state });
+			return fail("storage_failure", `delegation v2 review persistence failed (${persisted.error.code}${point}): ${persisted.error.message}`, { review, transaction: state });
 		}
 		const persistedReview: ReviewResult = {
 			...review,

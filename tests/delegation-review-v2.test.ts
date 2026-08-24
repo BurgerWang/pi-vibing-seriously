@@ -122,6 +122,7 @@ async function setupReviewFixture(
 	withPlanReference = false,
 	withExtendedReason = false,
 	workerContent: (path: string) => string | Buffer = (path) => `worker:${path}\n`,
+	reportedPaths?: readonly string[],
 ): Promise<ReviewFixture> {
 	const root = await mkdtemp(join(tmpdir(), "delegation-review-v2-"));
 	await git(root, ["init"]);
@@ -232,7 +233,7 @@ async function setupReviewFixture(
 	const committing = await persistCommittingDelegationTransaction(root, { ...cas(running.value, 2), outcome });
 	assert.equal(committing.ok, true);
 	if (!committing.ok) throw new Error("commit begin failed");
-	const report = `## Completed\n- changed fixture files\n## Files Changed\n${workerPaths.map((path) => `- ${path}`).join("\n")}\n## Verification\n- facts\n## Remaining Risks\n- none\n`;
+	const report = `## Completed\n- changed fixture files\n## Files Changed\n${(reportedPaths ?? workerPaths).map((path) => `- ${path}`).join("\n")}\n## Verification\n- facts\n## Remaining Risks\n- none\n`;
 	const relevance = await collectReviewRelevanceV2({
 		project_root: root, delegation_id: ID, contract_hash: contract.value.contract_hash,
 		after_guard: lifecycle.value.after_guard, change_set: lifecycle.value.change_set, exec: spawnExec,
@@ -271,6 +272,53 @@ test("review v2 fixture: reverse journal order builds, commits, and strict-reads
 		assert.deepEqual(Object.keys(after.path_digests), ["src/a.ts", "src/b.ts"]);
 		const strict = await readDelegationCommittedGenerationV2(fixture.root, ID);
 		assert.equal(strict.ok, true, strict.ok ? "" : JSON.stringify(strict.error));
+	} finally {
+		await cleanup(fixture);
+	}
+});
+
+test("review v2: report-only path notes reserve their omitted suffix and persist within the UTF-8 record bound", async () => {
+	const workerPaths = ["src/a.ts", "src/b.ts", "src/c.ts", "src/d.ts", "src/e.ts"];
+	const reportOnlyPaths = [
+		"config/scheduler/a5.0.yaml",
+		"scripts/checks/failure_propagation.py",
+		"scripts/checks/idempotency_report.py",
+		"scripts/checks/orchestration_e2e.py",
+		"src/ueras/orchestration/__init__.py",
+		"src/ueras/orchestration/artifacts.py",
+		"src/ueras/orchestration/contracts.py",
+		"src/ueras/orchestration/job_registry.py",
+		"src/ueras/orchestration/run_cli.py",
+		"src/ueras/orchestration/scheduler.py",
+		"tests/orchestration/test_failure_propagation.py",
+		"tests/orchestration/test_idempotency.py",
+	];
+	const fixture = await setupReviewFixture(
+		workerPaths,
+		undefined,
+		workerPaths,
+		false,
+		false,
+		(path) => `worker:${path}\n`,
+		[...workerPaths, ...reportOnlyPaths],
+	);
+	try {
+		const reviewed = await reviewDelegationV2({
+			projectRoot: fixture.root,
+			delegationId: ID,
+			exec: spawnExec,
+			maxLines: 400,
+			maxBytes: 32_768,
+			now: at(4),
+		});
+		assert.equal(reviewed.ok, true, reviewed.ok ? "" : JSON.stringify(reviewed.error));
+		if (!reviewed.ok || reviewed.review.record === undefined) return;
+		const mismatchNote = reviewed.review.record.notes.find((note) => note.startsWith("worker report lists 12 path(s)"));
+		assert.ok(mismatchNote, JSON.stringify(reviewed.review.record.notes));
+		assert.ok(Buffer.byteLength(mismatchNote, "utf8") <= 240, mismatchNote);
+		assert.match(mismatchNote, /…\(\+\d+ more\)$/u, "the exact omitted count remains visible inside the bound");
+		const persisted = await readDelegationReviewV2(fixture.root, ID);
+		assert.equal(persisted.ok, true, persisted.ok ? "" : JSON.stringify(persisted.error));
 	} finally {
 		await cleanup(fixture);
 	}

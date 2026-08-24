@@ -43,7 +43,11 @@ import {
 	readReviewRecord,
 	type ReviewRecord,
 } from "./diff-review.ts";
-import { collectReviewRelevanceV2, computeReviewRelevanceConflictHashV2 } from "./review-relevance-v2.ts";
+import {
+	collectReviewRelevanceV2,
+	computeReviewRelevanceConflictHashV2,
+	REVIEW_RELEVANCE_KIND_V2,
+} from "./review-relevance-v2.ts";
 import { validateWorkspaceGuard, type WorkspaceGuardRecord } from "./workspace-guard.ts";
 import { readWorkerWriteJournal, type WorkerWriteJournalRecord } from "./write-journal.ts";
 import { collectHistoricalSemanticMigration } from "./historical-semantic-migration.ts";
@@ -728,7 +732,8 @@ export async function collectCurrentDelegationBindingV2(
 	// reviews.  Diagnosis and failed/unfinished implementations keep their
 	// existing transaction-derived binding and must not be forced through a
 	// review reader that is intentionally invalid for those states.
-	const reviewAuthority = committed.value.state.task_kind === "implementation" && committed.value.state.status === "REVIEWED"
+	const reviewAuthority = committed.value.state.task_kind === "implementation"
+		&& (committed.value.state.status === "PENDING_REVIEW" || committed.value.state.status === "REVIEWED")
 		? await readDelegationReviewV2(projectRoot, delegationId)
 		: undefined;
 	if (reviewAuthority?.ok && reviewAuthority.value.semantic_migration?.status === "ACCEPTED") {
@@ -762,6 +767,10 @@ export async function collectCurrentDelegationBindingV2(
 	if (reviewAuthority !== undefined && !reviewAuthority.ok && reviewAuthority.error.code !== "not_found") {
 		return { status: "unavailable" };
 	}
+	const expectedProjection = reviewAuthority?.ok
+		&& reviewAuthority.value.review.diff_identity_kind === REVIEW_RELEVANCE_KIND_V2
+		? reviewAuthority.value.review.relevance_projection
+		: undefined;
 	const relevance = await collectReviewRelevanceV2({
 		project_root: projectRoot,
 		delegation_id: committed.value.state.delegation_id,
@@ -769,6 +778,7 @@ export async function collectCurrentDelegationBindingV2(
 		after_guard: afterGuard as WorkspaceGuardRecord,
 		change_set: changeSet as ChangeSetRecord,
 		exec,
+		...(expectedProjection === undefined ? {} : { expected_projection: expectedProjection }),
 	});
 	if (relevance.ok) {
 		return { status: "fresh", hash: relevance.value.binding.projection_hash, kind: "changeset-relevance-v2" };

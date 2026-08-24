@@ -310,7 +310,7 @@ below yield the current delegate parameter-schema hash
 the combined current unreleased framework-reliability public tool-surface
 hash (including semantic REPAIR, repair-lineage, and stricter Gate evidence
 wording) is
-`0b8ab153bc79003271ded6e989e089e4f08322cf88b7ebf54634df8aa2b6966b`.
+`9b091d42735c61fdc9032ff84d0c06d92b6556cd077d1051b2fab1e2b7e5f76d`.
 Repeated same-mode builds remain deterministic; the separately retained
 governance-v1 schema hash does not change.
 
@@ -401,9 +401,10 @@ fresh exact `repair_of` is forbidden for this recovery because it would adopt
 the old non-semantic delta as a new baseline. An ordinary successor and VERIFY
 remain blocked until the explicit Sol acceptance is durable.
 
-The current review parameter-schema hash, including `ACCEPT|REPAIR`, the
-bounded repair reason, paired bound hash, and historical migration binding, is
-`550a7af27010041ed60146e9a3ed1491e9004aa90dd62a007a2b7ee9ee30c903`.
+The current review parameter-schema hash, including optional latest-id
+presentation, explicit-id `ACCEPT|REPAIR`, the bounded repair reason, paired
+bound hash, and historical migration binding, is
+`75e16f08badfe5762541904d242e34121214d86ded0454067c9c28f40c2dd087`.
 
 ## Commander Token Optimization Slice A (P0 + P1) — additive compatibility
 

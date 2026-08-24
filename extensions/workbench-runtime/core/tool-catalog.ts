@@ -220,7 +220,14 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 		b: Type.String({ description: "Second run id, e.g. 20260102-120000-efgh" }),
 	}),
 	workbench_review_worker_diff: Type.Object({
-		...WORKBENCH_REVIEW_WORKER_DIFF_V1_PROPERTIES,
+		delegation_id: Type.Optional(Type.String({
+			pattern: "^[0-9]{8}-[0-9]{6}-[a-z0-9]{4}$",
+			description:
+				"Omit for a read-only presentation of the durable latest delegation. For ACCEPT or REPAIR, pass the exact delegation_id returned by that complete packet; never guess an id.",
+		})),
+		include_paths: WORKBENCH_REVIEW_WORKER_DIFF_V1_PROPERTIES.include_paths,
+		max_lines: WORKBENCH_REVIEW_WORKER_DIFF_V1_PROPERTIES.max_lines,
+		max_bytes: WORKBENCH_REVIEW_WORKER_DIFF_V1_PROPERTIES.max_bytes,
 		semantic_decision: Type.Optional(
 			Type.Union([Type.Literal("ACCEPT"), Type.Literal("REPAIR")], {
 				description:
@@ -489,11 +496,11 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 	workbench_review_worker_diff: {
 		...WORKBENCH_REVIEW_WORKER_DIFF_V1_METADATA,
 		description:
-			"Inspect the immutable worker delta and its scope/integrity binding. A call without semantic fields produces only provisional presentation and grants no review or Gate authority. If one ordinary source path is larger than the bounded packet, repeat that single include_path: the runtime resumes the next contiguous UTF-8 page only for the same diff and redacted-stream hashes. After Sol has inspected the complete current packet, semantic_decision=ACCEPT grants exact hash-bound semantic authority; semantic_decision=REPAIR plus a bounded repair_reason publishes immutable negative authority and enables only an exact fresh repair_of lineage. REPAIR never grants Gate authority. Historical migration supports ACCEPT only. include_paths narrows rendering only, never scope checks. Workspace drift invalidates either decision.",
+			"Inspect the immutable worker delta and its scope/integrity binding. Omit delegation_id for a read-only presentation of the durable latest delegation; this removes guessed/stale IDs. A semantic ACCEPT or REPAIR must explicitly repeat the exact delegation_id and bound hash returned by the complete packet. A call without semantic fields produces only provisional presentation and grants no review or Gate authority. If one ordinary source path is larger than the bounded packet, repeat that single include_path: the runtime resumes the next contiguous UTF-8 page only for the same diff and redacted-stream hashes. semantic_decision=ACCEPT grants exact hash-bound semantic authority; semantic_decision=REPAIR plus a bounded repair_reason publishes immutable negative authority and enables only an exact fresh repair_of lineage. REPAIR never grants Gate authority. Historical migration supports ACCEPT only. include_paths narrows rendering only, never scope checks. Workspace drift invalidates either decision.",
 		promptSnippet: "Inspect a bound worker diff, then explicitly ACCEPT it or require an exact fresh REPAIR",
 		promptGuidelines: [
-			"First call without semantic fields to inspect the provisional scope/integrity packet; this cannot finalize review.",
-			"Only after Sol inspects the complete packet, call with semantic_decision=ACCEPT or REPAIR and its exact expected_bound_diff_hash. REPAIR also requires repair_reason, stays Gate-blocking, and permits only exact repair_of. For an explicitly reported historical migration, only ACCEPT is valid and also requires expected_migration_binding_hash. Never guess a hash.",
+			"First call without semantic fields and normally without delegation_id; the runtime selects the durable latest delegation and returns its exact id. This provisional presentation cannot finalize review.",
+			"Only after Sol inspects the complete packet, call with that exact delegation_id plus semantic_decision=ACCEPT or REPAIR and its exact expected_bound_diff_hash. REPAIR also requires repair_reason, stays Gate-blocking, and permits only exact repair_of. For an explicitly reported historical migration, only ACCEPT is valid and also requires expected_migration_binding_hash. Never guess an id or hash.",
 			"include_paths changes presentation only. When one ordinary source path remains, repeat that single path until its hash-bound page range reaches the total; never accept after drift, incomplete packet coverage, unresolved semantic risk, or an unverified hash.",
 			"Review authority never substitutes for final verification or Gate authority.",
 		],

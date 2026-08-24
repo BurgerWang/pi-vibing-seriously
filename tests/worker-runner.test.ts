@@ -23,6 +23,7 @@ import {
 	WORKER_MODEL_SELECTOR,
 	WORKER_PROVIDER,
 	WORKER_TASK_KIND_ENV,
+	WORKER_TIMEOUT_MS_ENV,
 	type WorkerTaskContract,
 } from "../extensions/workbench-runtime/core/worker-policy.ts";
 import {
@@ -294,13 +295,13 @@ test("worker system prompt pins the three mandatory execution disciplines (early
 
 test("runner pins xhigh model selector and passes a non-recursive worker role contract", async () => {
 	const script = `
-const facts = JSON.stringify({ argv: process.argv.slice(2), role: process.env.WORKBENCH_AGENT_ROLE, depth: process.env.WORKBENCH_WORKER_DEPTH, paths: JSON.parse(process.env.WORKBENCH_WORKER_ALLOWED_PATHS || "[]"), taskKind: process.env.${WORKER_TASK_KIND_ENV} || null, inheritedModel: process.env.PI_MODEL || null, spendProfile: process.env.${WORKER_SPEND_PROFILE_ENV} || null });
+const facts = JSON.stringify({ argv: process.argv.slice(2), role: process.env.WORKBENCH_AGENT_ROLE, depth: process.env.WORKBENCH_WORKER_DEPTH, paths: JSON.parse(process.env.WORKBENCH_WORKER_ALLOWED_PATHS || "[]"), taskKind: process.env.${WORKER_TASK_KIND_ENV} || null, timeoutMs: process.env.${WORKER_TIMEOUT_MS_ENV} || null, inheritedModel: process.env.PI_MODEL || null, spendProfile: process.env.${WORKER_SPEND_PROFILE_ENV} || null });
 console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "openai-codex", model: "gpt-5.6-luna", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
 `;
 	await withFakeWorker(script, async (invocation, dir) => {
 		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assertWorkerSucceeded(result);
-		const facts = JSON.parse(result.output) as { argv: string[]; role: string; depth: string; paths: string[]; taskKind: string | null; inheritedModel: string | null; spendProfile: string | null };
+		const facts = JSON.parse(result.output) as { argv: string[]; role: string; depth: string; paths: string[]; taskKind: string | null; timeoutMs: string | null; inheritedModel: string | null; spendProfile: string | null };
 		const modelFlag = facts.argv.indexOf("--model");
 		assert.ok(modelFlag >= 0);
 		assert.equal(facts.argv[modelFlag + 1], WORKER_MODEL_SELECTOR);
@@ -309,6 +310,7 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 		assert.equal(facts.depth, "1");
 		assert.deepEqual(facts.paths, CONTRACT.allowedPaths);
 		assert.equal(facts.taskKind, "implementation", "omitted task kind is explicitly carried as the compatibility default");
+		assert.equal(facts.timeoutMs, "2000", "the child sees the existing hard timeout for advisory checkpoints");
 		const toolsFlag = facts.argv.indexOf("--tools");
 		assert.ok(facts.argv[toolsFlag + 1]?.split(",").includes("edit"));
 		assert.ok(facts.argv[toolsFlag + 1]?.split(",").includes("write"));
@@ -1129,11 +1131,19 @@ function assertNumericOnlyProgress(updates: Array<Record<string, unknown>>, forb
 		assert.ok(band === "ok" || band === "soft" || band === "hard", `spendBand is only ok|soft|hard, got ${String(band)}`);
 		for (const key of [
 			"turns", "totalTokens", "outputTokens", "currentToolTextBytes", "collapsedToolResults", "turnReservedBytes",
+			"elapsedMs", "remainingMs",
 		]) {
 			const value = update[key];
 			assert.ok(typeof value === "number" && Number.isFinite(value), `${key} is a finite number, got ${String(value)}`);
 		}
 	}
+}
+
+function progressWithoutTime(update: Record<string, unknown>): Record<string, unknown> {
+	const { elapsedMs, remainingMs, ...rest } = update;
+	assert.ok(typeof elapsedMs === "number" && elapsedMs >= 0);
+	assert.ok(typeof remainingMs === "number" && remainingMs >= 0);
+	return rest;
 }
 
 test("progress callbacks expose spend and output-control numeric facts plus provider/model — never lastText or worker text", async () => {
@@ -1161,7 +1171,7 @@ test("progress callbacks expose spend and output-control numeric facts plus prov
 	for (const update of updates) {
 		assert.equal(
 			Object.keys(update).sort().join(","),
-			"collapsedToolResults,currentToolTextBytes,model,outputTokens,provider,spendBand,totalTokens,turnReservedBytes,turns",
+			"collapsedToolResults,currentToolTextBytes,elapsedMs,model,outputTokens,provider,remainingMs,spendBand,totalTokens,turnReservedBytes,turns",
 			"WorkerProgress exposes only fixed spend/output-control numbers and provider/model",
 		);
 		assert.ok(!("lastText" in update), "lastText is removed from progress");
@@ -1169,7 +1179,7 @@ test("progress callbacks expose spend and output-control numeric facts plus prov
 	// Exact cumulative values after each processed assistant message (each
 	// event carries totalTokens 35 / output 5, so totals accumulate 35→70 and
 	// 5→10; band stays ok under the standard profile).
-	assert.deepEqual(updates[0], {
+	assert.deepEqual(progressWithoutTime(updates[0]!), {
 		turns: 1,
 		totalTokens: 35,
 		outputTokens: 5,
@@ -1180,7 +1190,7 @@ test("progress callbacks expose spend and output-control numeric facts plus prov
 		provider: WORKER_PROVIDER,
 		model: WORKER_MODEL_ID,
 	});
-	assert.deepEqual(updates[1], {
+	assert.deepEqual(progressWithoutTime(updates[1]!), {
 		turns: 2,
 		totalTokens: 70,
 		outputTokens: 10,
@@ -1218,7 +1228,7 @@ test("progress counters stay finite and normalized under cacheRead fallback and 
 		assert.deepEqual(result.spendState, { turns: 2, totalTokens: 40, outputTokens: 5 });
 		assert.equal(result.spendBand, "ok");
 	});
-	assert.deepEqual(updates[0], {
+	assert.deepEqual(progressWithoutTime(updates[0]!), {
 		turns: 1,
 		totalTokens: 35,
 		outputTokens: 5,
@@ -1229,7 +1239,7 @@ test("progress counters stay finite and normalized under cacheRead fallback and 
 		provider: WORKER_PROVIDER,
 		model: WORKER_MODEL_ID,
 	});
-	assert.deepEqual(updates[1], {
+	assert.deepEqual(progressWithoutTime(updates[1]!), {
 		turns: 2,
 		totalTokens: 40,
 		outputTokens: 5,

@@ -293,7 +293,8 @@ test("review block reasons name the target and the outstanding review", () => {
 	assert.ok(delegationReason);
 	assert.match(delegationReason, /Starting a new worker delegation is blocked/);
 	assert.match(delegationReason, /PENDING_REVIEW/);
-	assert.match(delegationReason, /review the current diff/);
+	assert.match(delegationReason, /query workbench_delegation_status/);
+	assert.match(delegationReason, /review only when durable status is PENDING_REVIEW/);
 	const verifyReason = reviewBlockReason(pending, "verify");
 	assert.ok(verifyReason);
 	assert.match(verifyReason, /VERIFY mode \/ final gate verification is blocked/);

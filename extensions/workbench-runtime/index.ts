@@ -24,13 +24,13 @@ import { type ReceiptHandle } from "./core/tool-result-recovery.ts";
 import {
 	computeRoleActiveTools,
 	parseWorkerAllowedPaths,
-	parseWorkerTaskKindEnvironment,
+	parseWorkerTaskKindEnvironment, parseWorkerTimeoutMsEnvironment,
 	WORKER_ALLOWED_PATHS_ENV,
 	WORKER_CONTRACT_HASH_ENV,
 	WORKER_DELEGATION_ID_ENV,
 	WORKER_PROJECT_ROOT_ENV,
 	WORKER_ROLE_ENV,
-	WORKER_TASK_KIND_ENV,
+	WORKER_TASK_KIND_ENV, WORKER_TIMEOUT_MS_ENV,
 	type RecipeMutationFacts,
 } from "./core/worker-policy.ts";
 import {
@@ -109,7 +109,7 @@ import {
 	readRecoverableUnpublishedDelegationV2,
 	readDelegationAuthorityObservationV2 as readDelegationAuthorityObservation,
 } from "./core/delegation-project-authority.ts";
-import { delegationNextActionTextV1, delegationProjectIssueRepairStatusV1, delegationRepairStatusLinesV1, readDelegationRepairStatusV1,
+import { delegationDisplayedStatusV1, delegationNextActionTextV1, delegationProjectIssueRepairStatusV1, delegationRepairStatusLinesV1, readDelegationRepairStatusV1,
 	type DelegationRepairStatusV1 } from "./core/delegation-repair-status.ts";
 import { buildDelegationWorkerFirstGateFacts } from "./core/delegation-plan-reference.ts";
 import { resolveToolOutputPolicy } from "./core/output-policy.ts";
@@ -275,6 +275,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		// standard/extended; retired `low` and malformed/missing child env
 		// resolve defensively to `standard`.
 		spendProfile: resolveWorkerSpendProfile(process.env[WORKER_SPEND_PROFILE_ENV]),
+		timeoutMs: parseWorkerTimeoutMsEnvironment(process.env[WORKER_TIMEOUT_MS_ENV]),
 	};
 	const workerWriteJournalRuntime = createWorkerWriteJournalRuntime({
 		role: workerRoleContext.role,
@@ -923,15 +924,18 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				`blocked writes: ${delegationState.blockedWriteAttempts}`,
 			);
 		} else if (delegationState.latestId !== undefined) {
+			const authority = await readDelegationAuthorityObservation(projectRoot, delegationState.latestId);
+			const displayedStatus = delegationDisplayedStatusV1(delegationState.status, authority.kind === "v2" ? authority.transactionStatus : undefined);
 			lines.push(
-				`latest       : ${delegationState.latestId} ${delegationState.status}`,
+				`latest       : ${delegationState.latestId} ${displayedStatus}`,
 				`current hash : ${delegationState.currentDiffHash ?? "(none)"}`,
 				`reviewed hash: ${delegationState.reviewedDiffHash ?? "(none)"}`,
 				`blocked writes: ${delegationState.blockedWriteAttempts}`,
 			);
-			const authority = await readDelegationAuthorityObservation(projectRoot, delegationState.latestId);
 			lines.push(...delegationRepairStatusLinesV1(latestRepairStatus));
-			const block = reviewBlockReason(delegationState, "delegation");
+			const block = authority.kind === "v2" && !["PENDING_REVIEW", "REVIEWED"].includes(authority.transactionStatus)
+				? undefined
+				: reviewBlockReason(delegationState, "delegation");
 			const finalizedReviewedStaleSuccessor = delegationState.status === "STALE" && authority.kind === "v2"
 				&& authority.transactionStatus === "REVIEWED" && authority.finalized
 				&& authority.review?.verdict === "PASS" && authority.semanticAccepted;
@@ -949,8 +953,10 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				if (recoverable?.ok) {
 					lines.push(
 						"authority v2 : RECOVERABLE_UNPUBLISHED (RECOVERY_REQUIRED; committed proof absent)",
-						`next action  : call workbench_delegate_worker with repair_of=${delegationState.latestId}; do not retry review`,
 					);
+					if (latestRepairStatus.kind !== "delegation_retry") {
+						lines.push(`next action  : call workbench_delegate_worker with repair_of=${delegationState.latestId}; do not retry review`);
+					}
 				} else {
 					lines.push(`authority v2 : INVALID (${authority.code}) — legacy fallback refused`);
 				}
@@ -965,10 +971,10 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 					? await readRecoverableUnpublishedDelegationV2(projectRoot, delegationState.latestId)
 					: undefined;
 				if (recoverable?.ok) {
-					lines.push(
-						"authority v2 : RECOVERABLE_UNPUBLISHED (RECOVERY_REQUIRED; committed proof absent)",
-						`next action  : call workbench_delegate_worker with repair_of=${delegationState.latestId}; do not retry review`,
-					);
+					lines.push("authority v2 : RECOVERABLE_UNPUBLISHED (RECOVERY_REQUIRED; committed proof absent)");
+					if (latestRepairStatus.kind !== "delegation_retry") {
+						lines.push(`next action  : call workbench_delegate_worker with repair_of=${delegationState.latestId}; do not retry review`);
+					}
 				} else {
 					lines.push(`authority v2 : transaction ${authority.transactionStatus}`);
 					if (authority.review) {
@@ -987,9 +993,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 						else if (strictSemantic) lines.push("semantic v2  : NOT_REQUIRED (zero delta)");
 					} else if (authority.transactionVerdict !== null) {
 						lines.push(`completion v2: ${authority.transactionVerdict} (strict terminal machine facts; no review artifact)`);
-						if (authority.repairLineage === undefined && authority.transactionStatus === "FAILED") {
-							lines.push(`next action  : call workbench_delegate_worker with repair_of=${delegationState.latestId}; do not retry review`);
-						} else if (authority.repairLineage === undefined && authority.transactionStatus === "ABORTED") {
+						if (authority.repairLineage === undefined && authority.transactionStatus === "ABORTED") {
 							lines.push("next action  : start a fresh delegation; the terminal before-worker transaction needs no review");
 						}
 					} else {
@@ -1673,8 +1677,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		pi,
 		cacheTelemetry,
 		getWorkerContext: () => ({
-			role: workerRoleContext.role,
-			spendProfile: workerRoleContext.spendProfile,
+			role: workerRoleContext.role, spendProfile: workerRoleContext.spendProfile, timeoutMs: workerRoleContext.timeoutMs,
 		}),
 		projectRootFor,
 		refreshStatus,

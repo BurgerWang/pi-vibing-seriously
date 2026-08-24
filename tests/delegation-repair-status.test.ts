@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
 	classifyDelegationRepairStatusV1,
+	delegationDisplayedStatusV1,
 	delegationNextActionTextV1,
 	delegationProjectIssueRepairStatusV1,
 	delegationRepairStatusLinesV1,
@@ -190,4 +191,33 @@ test("lineaged terminal retry, active execution, and pending review have distinc
 	});
 	assert.equal(pending.kind, "repair_review");
 	assert.match(delegationNextActionTextV1(state, pending) ?? "", /explicitly ACCEPT.*or issue another REPAIR/);
+});
+
+test("ordinary active and failed v2 transactions never inherit the mirror's review instruction", () => {
+	const ordinaryFailed = classifyDelegationRepairStatusV1({
+		delegationId: ID,
+		authority: observation({ transactionStatus: "FAILED", repairLineage: undefined }),
+		binding: { status: "fresh", hash: HASH, kind: "changeset-relevance-v2" },
+		retryable: true,
+	});
+	assert.equal(ordinaryFailed.kind, "delegation_retry");
+	assert.match(delegationNextActionTextV1(state, ordinaryFailed) ?? "", new RegExp(`repair_of=${ID}`));
+	assert.doesNotMatch(delegationNextActionTextV1(state, ordinaryFailed) ?? "", /review delegation/);
+
+	const ordinaryRunning = classifyDelegationRepairStatusV1({
+		delegationId: ID,
+		authority: observation({ transactionStatus: "RUNNING", repairLineage: undefined }),
+		binding: { status: "fresh", hash: HASH, kind: "changeset-relevance-v2" },
+	});
+	assert.equal(ordinaryRunning.kind, "delegation_active");
+	assert.match(delegationNextActionTextV1(state, ordinaryRunning) ?? "", /wait for the worker result/);
+	assert.doesNotMatch(delegationNextActionTextV1(state, ordinaryRunning) ?? "", /review delegation/);
+});
+
+test("status display uses durable execution while preserving pending/stale terminal completion", () => {
+	assert.equal(delegationDisplayedStatusV1("PENDING_REVIEW", "FAILED"), "FAILED");
+	assert.equal(delegationDisplayedStatusV1("PENDING_REVIEW", "RUNNING"), "RUNNING");
+	assert.equal(delegationDisplayedStatusV1("PENDING_REVIEW", "REVIEWED"), "PENDING_REVIEW");
+	assert.equal(delegationDisplayedStatusV1("STALE", "REVIEWED"), "STALE");
+	assert.equal(delegationDisplayedStatusV1("REVIEWED", "FINISHED"), "FINISHED");
 });

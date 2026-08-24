@@ -22,6 +22,7 @@ export const WORKER_DEPTH_ENV = "WORKBENCH_WORKER_DEPTH";
 export const WORKER_TASK_KIND_ENV = "WORKBENCH_WORKER_TASK_KIND";
 export const WORKER_DELEGATION_ID_ENV = "WORKBENCH_WORKER_DELEGATION_ID";
 export const WORKER_CONTRACT_HASH_ENV = "WORKBENCH_WORKER_CONTRACT_HASH";
+export const WORKER_TIMEOUT_MS_ENV = "WORKBENCH_WORKER_TIMEOUT_MS";
 export const WORKER_ROLE = "worker";
 
 export type WorkerTaskKind = "implementation" | "diagnosis";
@@ -81,6 +82,8 @@ export interface WorkerRoleContext {
 	allowedPaths?: readonly string[];
 	/** `invalid` is the fail-closed child-env parse result. */
 	taskKind?: WorkerRuntimeTaskKind;
+	/** Advisory wall-clock budget inherited from the parent runner. */
+	timeoutMs?: number;
 }
 
 export type ResolveWorkerTaskKindResult =
@@ -98,6 +101,13 @@ export function resolveWorkerTaskKind(raw: unknown): ResolveWorkerTaskKindResult
 export function parseWorkerTaskKindEnvironment(raw: string | undefined): WorkerRuntimeTaskKind {
 	const resolved = resolveWorkerTaskKind(raw);
 	return resolved.ok ? resolved.taskKind : "invalid";
+}
+
+/** Strict numeric child-env parser; malformed input disables advisory timers only. */
+export function parseWorkerTimeoutMsEnvironment(raw: string | undefined): number | undefined {
+	if (raw === undefined || !/^[1-9][0-9]*$/u.test(raw)) return undefined;
+	const value = Number(raw);
+	return Number.isSafeInteger(value) && value <= 24 * 60 * 60 * 1_000 ? value : undefined;
 }
 
 function effectiveWorkerTaskKind(taskKind: WorkerRuntimeTaskKind | undefined): WorkerRuntimeTaskKind {

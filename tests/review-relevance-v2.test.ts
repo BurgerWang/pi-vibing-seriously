@@ -66,7 +66,7 @@ function guard(entries: readonly WorkspaceGuardEntry[], irrelevant: readonly str
 interface Fixture {
 	afterGuard: WorkspaceGuardRecord;
 	changeSet: ChangeSetRecord;
-	workerAfter: StreamingPathIdentity;
+	workerAfter: FileIdentity;
 }
 
 function fixture(preDirtyCount = 0, dependency = false, workerSize = 11): Fixture {
@@ -183,6 +183,135 @@ test("pre-dirty unrelated mutation, artifact drift and identity key order do not
 	if (!second.ok) return;
 	assert.equal(computeReviewRelevanceProjectionHashV2(first.value.projection), computeReviewRelevanceProjectionHashV2(second.value.projection));
 	assert.equal(second.value.projection.diff_identity_kind, REVIEW_RELEVANCE_KIND_V2);
+});
+
+test("an unchanged relevance projection survives a filesystem device renumber", async () => {
+	const source = fixture();
+	const first = await collect(source);
+	assert.equal(first.ok, true);
+	if (!first.ok) return;
+	const current = guard(source.afterGuard.entries.map((candidate) => candidate.identity.kind === "file"
+		? {
+			...candidate,
+			identity: {
+				...candidate.identity,
+				stat: { ...candidate.identity.stat, dev: "59" },
+			},
+		}
+		: candidate));
+	const remountedWorker = {
+		...source.workerAfter,
+		stat: { ...source.workerAfter.stat, dev: "59" },
+	} as StreamingPathIdentity;
+	const second = await collectReviewRelevanceV2({
+		project_root: "/tmp/review-relevance-v2",
+		delegation_id: ID,
+		contract_hash: CONTRACT,
+		after_guard: source.afterGuard,
+		change_set: source.changeSet,
+		exec: EXEC,
+		expected_projection: first.value.projection,
+	}, dependencies(current, source.workerAfter, remountedWorker));
+	assert.equal(second.ok, true);
+	if (!second.ok) return;
+	assert.equal(
+		computeReviewRelevanceProjectionHashV2(second.value.projection),
+		computeReviewRelevanceProjectionHashV2(first.value.projection),
+	);
+	const worker = second.value.projection.entries.find((candidate) => candidate.path === W);
+	assert.equal(worker?.full_identity.kind, "file");
+	if (worker?.full_identity.kind === "file") assert.equal(worker.full_identity.stat.dev, "1");
+});
+
+test("device renumber compatibility does not hide changed worker bytes", async () => {
+	const source = fixture();
+	const first = await collect(source);
+	assert.equal(first.ok, true);
+	if (!first.ok) return;
+	const current = guard(source.afterGuard.entries.map((candidate) => candidate.identity.kind === "file"
+		? {
+			...candidate,
+			identity: {
+				...candidate.identity,
+				stat: { ...candidate.identity.stat, dev: "59" },
+			},
+		}
+		: candidate));
+	const changedWorker = file(W, "9".repeat(64), source.workerAfter.kind === "file" ? source.workerAfter.byte_size : 11, "2");
+	changedWorker.stat.dev = "59";
+	const conflict = await collectReviewRelevanceV2({
+		project_root: "/tmp/review-relevance-v2",
+		delegation_id: ID,
+		contract_hash: CONTRACT,
+		after_guard: source.afterGuard,
+		change_set: source.changeSet,
+		exec: EXEC,
+		expected_projection: first.value.projection,
+	}, dependencies(current, source.workerAfter, changedWorker));
+	assert.equal(conflict.ok, false);
+	if (!conflict.ok) assert.equal(conflict.error.code, "relevant_conflict");
+});
+
+test("a clean control path uses the prior full projection to survive only device drift", async () => {
+	const source = fixture();
+	const first = await collect(source);
+	assert.equal(first.ok, true);
+	if (!first.ok) return;
+	const controlPath = "AGENTS.md";
+	const control = file(controlPath, "7".repeat(64), 19, "77");
+	const expected = {
+		...first.value.projection,
+		entries: first.value.projection.entries.map((candidate) => candidate.path === controlPath
+			? { ...candidate, full_identity: control }
+			: candidate),
+	};
+	const current = guard(source.afterGuard.entries.map((candidate) => candidate.identity.kind === "file"
+		? {
+			...candidate,
+			identity: {
+				...candidate.identity,
+				stat: { ...candidate.identity.stat, dev: "59" },
+			},
+		}
+		: candidate));
+	const remountedWorker = { ...source.workerAfter, stat: { ...source.workerAfter.stat, dev: "59" } };
+	const remountedControl = { ...control, stat: { ...control.stat, dev: "59" } };
+	const collectControl = (controlIdentity: FileIdentity) => collectReviewRelevanceV2({
+		project_root: "/tmp/review-relevance-v2",
+		delegation_id: ID,
+		contract_hash: CONTRACT,
+		after_guard: source.afterGuard,
+		change_set: source.changeSet,
+		exec: EXEC,
+		expected_projection: expected,
+	}, {
+		collect_guard: async () => ({ ok: true, guard: current }),
+		capture_identities: async (input) => {
+			const identities = input.paths.map((path) => path === W
+				? remountedWorker
+				: path === controlPath ? controlIdentity : missing(path));
+			return {
+				ok: true,
+				identities,
+				meter: {
+					paths_attempted: identities.length,
+					paths_completed: identities.length,
+					bytes_read: identities.reduce((sum, identity) => sum + (identity.kind === "file" ? identity.byte_size : 0), 0),
+				},
+			};
+		},
+	});
+	const stable = await collectControl(remountedControl);
+	assert.equal(stable.ok, true);
+	if (stable.ok) {
+		assert.equal(
+			computeReviewRelevanceProjectionHashV2(stable.value.projection),
+			computeReviewRelevanceProjectionHashV2(expected),
+		);
+	}
+	const changed = await collectControl({ ...remountedControl, sha256: "8".repeat(64) });
+	assert.equal(changed.ok, false);
+	if (!changed.ok) assert.equal(changed.error.code, "binding_conflict");
 });
 
 test("first-review W tail drift conflicts even with same size and stat", async () => {

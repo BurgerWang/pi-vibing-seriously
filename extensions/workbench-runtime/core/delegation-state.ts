@@ -101,7 +101,7 @@ export function blocksVerify(state: DelegationState): boolean {
 export function reviewBlockReason(state: DelegationState, target: "delegation" | "verify"): string | undefined {
 	if (state.latestId === undefined || !blocksNextDelegation(state)) return undefined;
 	const action = target === "delegation" ? "Starting a new worker delegation" : "VERIFY mode / final gate verification";
-	return `${action} is blocked while delegation ${state.latestId} is ${state.status}; review the current diff (${state.currentDiffHash ?? "no diff"}) first`;
+	return `${action} is blocked while delegation ${state.latestId} is ${state.status}; query workbench_delegation_status and follow its durable next action (review only when durable status is PENDING_REVIEW)`;
 }
 
 export interface RecordDelegationInput {
@@ -141,7 +141,7 @@ export function recordDelegation(
 	if (blocksNextDelegation(state)) {
 		return {
 			ok: false,
-			error: `A new delegation is blocked while delegation ${state.latestId} is ${state.status}; review the current diff first`,
+			error: `A new delegation is blocked while delegation ${state.latestId} is ${state.status}; query workbench_delegation_status and follow its durable next action`,
 		};
 	}
 	return {

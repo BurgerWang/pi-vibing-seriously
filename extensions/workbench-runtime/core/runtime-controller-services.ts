@@ -6,7 +6,7 @@ import { acquireProjectDelegationStartLockV1, releaseProjectDelegationStartLockV
 import { executeDelegationV2 } from "./delegation-execution-v2.ts";
 import { makeDelegationId, readDelegationLedger } from "./delegation-ledger.ts";
 import { reviewDelegationV2 } from "./delegation-review-v2.ts";
-import { readDelegationCommittedGenerationV2 } from "./delegation-transaction-storage.ts";
+import { readDelegationCommittedGenerationV2, readDelegationTransactionV2 } from "./delegation-transaction-storage.ts";
 import { reviewDelegation } from "./diff-review.ts";
 import {
 	collectCurrentDelegationBindingV2,
@@ -38,6 +38,7 @@ const delegate = Object.freeze({
 }) satisfies DelegateToolServices;
 const review = Object.freeze({
 	now,
+	readTransaction: readDelegationTransactionV2,
 	readCommittedGeneration: readDelegationCommittedGenerationV2,
 	readRecoverableUnpublished: readRecoverableUnpublishedDelegationV2,
 	reviewV2: reviewDelegationV2,

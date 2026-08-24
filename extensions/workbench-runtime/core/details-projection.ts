@@ -125,7 +125,8 @@ const TOOL_FIELDS: Readonly<Record<string, readonly string[]>> = Object.freeze({
 	workbench_review_worker_diff: [
 		"ok", "delegation_id", "verdict", "review_status", "bound_diff_hash", "recorded_after_hash", "mismatch",
 		"violation_count", "drift_count", "checked_count", "displayed_count", "remaining_count", "coverage_complete",
-		"review_record", "next_include_paths", "patch_truncated", "error",
+		"review_record", "next_include_paths", "patch_truncated", "error", "latest_delegation_id", "transaction_status",
+		"next_action", "repair_of",
 	],
 	workbench_delegation_status: ["git_refresh", "actor", "write_policy", "lease_status", "review_status"],
 	workbench_recover_tool_result: [

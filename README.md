@@ -74,6 +74,24 @@ header still says `workbench-delegation-claim-guard-v1`, or the binding revision
 line is absent after updating, the Pi process still has older extension code
 loaded and must be `/reload`ed before starting the next conversation.
 
+Diff review is optimized for continuity: call `workbench_review_worker_diff`
+without `delegation_id` or semantic fields to inspect the durable latest
+delivery. The returned complete packet supplies the exact id and hash required
+for a later `ACCEPT` or `REPAIR`; never guess either value. TUI failures retain
+the controller's actionable error instead of collapsing to `review unavailable`,
+and status/footer guidance follows the durable transaction (`RUNNING`, `FAILED`,
+or `PENDING_REVIEW`) so only one next action is shown. Long worker runs also get
+hidden wall-clock checkpoints at 65% and 85% of the existing timeout to finish a
+coherent slice, preserve verification, and write the required handoff before the
+unchanged hard timeout. These are workflow/observability improvements, not new
+approval or Gate layers.
+
+For a successful diagnosis worker, the durable transaction remains `FINISHED`
+while the worker result and session review projection are `REVIEWED` because no
+implementation diff needs semantic review. The guard derives both facts from
+the strict committed diagnosis generation, including after a later delegation
+becomes the session's latest item; neither projection grants Gate authority.
+
 ## The product workflow
 
 | Mode | Use it for | Write behavior |
