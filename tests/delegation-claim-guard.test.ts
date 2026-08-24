@@ -388,6 +388,42 @@ test("multiple ids and transaction/session statuses bind only to their own claus
 		]),
 		{ ok: false, code: "ambiguous_status_binding" },
 	);
+
+	const latestWithRepairRoot = inspectDelegationClaims(assistant([
+		`latest delegation: ${FAKE_IDS[0]}`,
+		`repair root: ${FAKE_IDS[1]}`,
+		"authority v2: transaction REVIEWED",
+		"session status: REVIEWED",
+	].join("\n")));
+	assert.ok(latestWithRepairRoot);
+	assert.equal(latestWithRepairRoot.ambiguousStatusBinding, false);
+	assert.deepEqual(latestWithRepairRoot.expectedStatuses[FAKE_IDS[0]], [
+		{ status: "REVIEWED", source: "transaction" },
+		{ status: "REVIEWED", source: "session" },
+	]);
+	assert.deepEqual(latestWithRepairRoot.expectedStatuses[FAKE_IDS[1]], []);
+	assert.deepEqual(
+		validateDelegationClaims(latestWithRepairRoot, evidence(), [
+			{ id: FAKE_IDS[0], status: "REVIEWED", sessionStatus: "REVIEWED" },
+			{ id: FAKE_IDS[1], status: "PENDING_REVIEW" },
+		]),
+		{ ok: true },
+	);
+
+	const stillAmbiguousWorker = inspectDelegationClaims(assistant([
+		`latest delegation: ${FAKE_IDS[0]}`,
+		`repair root: ${FAKE_IDS[1]}`,
+		"worker SUCCESS",
+	].join("\n")));
+	assert.ok(stillAmbiguousWorker);
+	assert.deepEqual(
+		validateDelegationClaims(stillAmbiguousWorker, evidence(), [
+			{ id: FAKE_IDS[0], status: "REVIEWED" },
+			{ id: FAKE_IDS[1], status: "PENDING_REVIEW" },
+		]),
+		{ ok: false, code: "ambiguous_status_binding" },
+		"an unqualified worker-success claim remains ambiguous across multiple delegations",
+	);
 });
 
 test("claim id overflow fails closed instead of silently ignoring later ids", () => {

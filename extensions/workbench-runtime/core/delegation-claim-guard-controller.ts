@@ -50,6 +50,7 @@ const INLINE_CODE_RE = /`([^`\r\n]*)`/gu;
 const RUN_ONLY_LABEL_RE = /\b(?:runs?|recipe|tests?|pytest|mypy|compileall|loader|targeted|focused|audit|checks?|diff|gate(?:[-_ ]?profile)?|typecheck|lint)\b|(?:完整\s*)?G1|测试|验证|审计/iu;
 const BUILD_ONLY_LABEL_RE = /\b(?:build|job|workflow|pipeline)\b|构建|流水线/iu;
 const DELEGATION_LABEL_RE = /\b(?:delegation(?:s)?|worker(?:s)?|latest|authority)\b|delegation[_ ]?id|委派|工作线程/iu;
+const LATEST_DELEGATION_LABEL_RE = /\blatest(?:\s+(?:delegation|authority))?(?:\s+id)?\s*[:=]?|最新(?:的)?\s*(?:delegation|authority|委派|工作线程)(?:\s*(?:id|编号))?\s*[:：=]?/iu;
 const REVIEW_PASS_FINAL_RE = /\breview(?:\s+v2)?\b.{0,24}\bPASS\b.{0,24}\bFINAL\b|审查.{0,24}(?:通过|PASS).{0,24}(?:最终|FINAL)/iu;
 const RUN_SUCCESS_OUTCOME_RE = /\b(?:PASS(?:ED)?|SUCCESS(?:FUL(?:LY)?)?|SUCCEEDED|OK)\b|\bexit(?:\s+code)?\s*[:=]?\s*0\b|成功(?:退出|完成)?/iu;
 const RUN_FAILURE_OUTCOME_RE = /\b(?:FAIL(?:ED)?|EXCEPTION|CANCELLED|TIMED\s+OUT)\b|\bexit(?:\s+code)?\s*[:=]?\s*[1-9]\d*\b|失败|超时|已取消/iu;
@@ -199,6 +200,14 @@ function idHasNearestNonDelegationLabel(clause: string, idIndex: number): boolea
 	return buildIndex > lastLabelIndex(prefix, DELEGATION_LABEL_RE);
 }
 
+function idHasLatestDelegationLabel(clause: string, idIndex: number): boolean {
+	const prefix = clause.slice(0, idIndex);
+	const latestIndex = lastLabelIndex(prefix, LATEST_DELEGATION_LABEL_RE);
+	if (latestIndex < 0) return false;
+	return latestIndex >= lastLabelIndex(prefix, RUN_ONLY_LABEL_RE)
+		&& latestIndex >= lastLabelIndex(prefix, BUILD_ONLY_LABEL_RE);
+}
+
 function inspectWorkbenchRunClaims(text: string): {
 	ids: string[];
 	expected: Record<string, "SUCCESS" | "FAILURE" | undefined>;
@@ -338,6 +347,7 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 	if (!DELEGATION_WORD_RE.test(text) && !WORKER_MACHINE_CLAIM_RE.test(text) && !hasWorkerExecutionPair && !hasIdStatusPair && runClaims.ids.length === 0 && !runClaims.overflow) return undefined;
 	const idOrder: string[] = [];
 	const expectedStatuses = new Map<string, DelegationClaimExpectedStatus[]>();
+	const explicitlyLatestIds = new Set<string>();
 	const sameRunStartIds = new Set<string>();
 	const unboundStatusClaims: Array<{
 		readonly statuses: readonly DelegationClaimExpectedStatus[];
@@ -385,6 +395,7 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 				idOrder.push(id);
 				expectedStatuses.set(id, []);
 			}
+			if (idHasLatestDelegationLabel(affirmativeClause, match.index ?? 0)) explicitlyLatestIds.add(id);
 			const nextIndex = idMatches[index + 1]?.index ?? affirmativeClause.length;
 			const segment = affirmativeClause.slice(index === 0 ? 0 : (match.index ?? 0), nextIndex);
 			const statuses = addSemanticSuccess(statusesIn(segment), segment);
@@ -407,11 +418,18 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 
 	const overflow = idOrder.length > MAX_CLAIM_IDS || runClaims.overflow;
 	const ids = idOrder.slice(0, MAX_CLAIM_IDS);
+	const latestIds = [...explicitlyLatestIds].filter((id) => ids.includes(id));
 	let ambiguousStatusBinding = false;
 	for (const claim of unboundStatusClaims) {
 		if (ids.length === 1) expectedStatuses.get(ids[0]!)!.push(...claim.statuses);
 		else if (ids.length > 1 && claim.distributive) {
 			for (const id of ids) expectedStatuses.get(id)!.push(...claim.statuses);
+		} else if (
+			ids.length > 1
+			&& latestIds.length === 1
+			&& claim.statuses.every((status) => status.source !== "unspecified")
+		) {
+			expectedStatuses.get(latestIds[0]!)!.push(...claim.statuses);
 		} else if (ids.length > 1) ambiguousStatusBinding = true;
 	}
 	const negativeOnly = sawNegativeDelegation && ids.length === 0 && !executionClaim && !successClaim;
