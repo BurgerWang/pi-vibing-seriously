@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
 	DELEGATION_CLAIM_GUARD_CODE,
+	DELEGATION_CLAIM_GUARD_SCHEMA,
 	inspectDelegationClaims,
 	registerDelegationClaimGuard,
 	validateDelegationClaims,
@@ -850,9 +851,15 @@ test("controller replaces fabricated final prose and never repeats its ids", asy
 	const replacement = (results.find((value) => value !== undefined) as { message: Record<string, unknown> }).message;
 	const text = finalText(replacement);
 	assert.ok(text.includes(DELEGATION_CLAIM_GUARD_CODE));
+	assert.equal(DELEGATION_CLAIM_GUARD_SCHEMA, "workbench-delegation-claim-guard-v2");
+	assert.ok(text.includes("[workbench-delegation-claim-guard-v2]"));
 	assert.ok(text.includes("binding_revision: authority-resolved-v2"), "old loaded runtimes are distinguishable from the new binder");
 	assert.ok(text.includes("reason: missing_authority"), "the bounded machine reason makes future failures diagnosable");
-	assert.match(text, /next_action: query workbench_delegation_status/u);
+	assert.match(text, /claim_namespace: delegation/u);
+	assert.match(text, /claimed_delegation_count: 1/u);
+	assert.match(text, /verified_delegation_authority_count: 0/u);
+	assert.match(text, /delegate_calls_this_turn: 0/u);
+	assert.match(text, /next_action: discard guessed delegation ids/u);
 	assert.match(text, /claim_hash: [a-f0-9]{64}/u, "the rejected prose remains correlatable without retaining it verbatim");
 	assert.equal(text.includes(FAKE_IDS[0]), false, "the guard never reinforces a fabricated id");
 	assert.equal(finalText(message).includes(DELEGATION_CLAIM_GUARD_CODE), false, "caller message is immutable");
@@ -924,6 +931,61 @@ test("controller accepts a committed failed Gate report that cites its runs dire
 		`Gate run ${gateRun} FAIL.`,
 		`Full record: .pi/workbench/runs/${gateRun}/gates.json`,
 		"B0.2 is the only root failure; downstream gates are BLOCKED.",
+	].join("\n"));
+	assert.deepEqual(await emit(state, "message_end", { type: "message_end", message }), [undefined]);
+});
+
+test("OnChain footer authorities remain valid while a fabricated delegation claim is diagnosed separately", async () => {
+	const state = stub();
+	const gateRun = "20260824-113850-2heu";
+	const lastRun = "20260824-174226-ne15";
+	const fabricatedDelegation = "20260824-180606-zTjN";
+	register(
+		state,
+		() => undefined,
+		true,
+		undefined,
+		undefined,
+		(id) => id === gateRun || id === lastRun ? "FAILURE" : undefined,
+	);
+	await emit(state, "agent_start", { type: "agent_start" });
+	const results = await emit(state, "message_end", {
+		type: "message_end",
+		message: assistant([
+			`delegation_id ${fabricatedDelegation} completed successfully`,
+			`gate: b2 FAIL (run ${gateRun})`,
+			`last run: run:${lastRun} check:d4-source-binding exit=1 FAILED`,
+			"blocking: check(s) failed: b2.1",
+		].join("\n")),
+	});
+	const replacement = (results.find((value) => value !== undefined) as { message: Record<string, unknown> }).message;
+	const text = finalText(replacement);
+	assert.match(text, /reason: missing_authority/u);
+	assert.match(text, /claim_namespace: mixed/u);
+	assert.match(text, /claimed_delegation_count: 1/u);
+	assert.match(text, /verified_delegation_authority_count: 0/u);
+	assert.match(text, /claimed_run_count: 2/u);
+	assert.match(text, /verified_run_authority_count: 2/u);
+	assert.equal(text.includes(fabricatedDelegation), false);
+});
+
+test("the exact OnChain failed Gate footer is accepted when both runs are committed", async () => {
+	const state = stub();
+	const gateRun = "20260824-113850-2heu";
+	const lastRun = "20260824-174226-ne15";
+	register(
+		state,
+		() => undefined,
+		true,
+		undefined,
+		undefined,
+		(id) => id === gateRun || id === lastRun ? "FAILURE" : undefined,
+	);
+	await emit(state, "agent_start", { type: "agent_start" });
+	const message = assistant([
+		`gate: b2 FAIL (run ${gateRun})`,
+		`last run: run:${lastRun} check:d4-source-binding exit=1 FAILED`,
+		"blocking: check(s) failed: b2.1",
 	].join("\n"));
 	assert.deepEqual(await emit(state, "message_end", { type: "message_end", message }), [undefined]);
 });

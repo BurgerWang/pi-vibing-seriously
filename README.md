@@ -67,9 +67,12 @@ failures direct you to `workbench_delegation_status`. Explicit `delegation_id`
 and `run_id` labels are never interchangeable. For an otherwise unlabeled id,
 the guard resolves the shared id shape through exclusive strict on-disk run or
 delegation authority instead of relying only on prose word order. New guard
-messages include `binding_revision: authority-resolved-v2`; if that line is
-absent after updating, the Pi process still has older extension code loaded and
-must be `/reload`ed before starting the next conversation.
+messages use the `[workbench-delegation-claim-guard-v2]` envelope and include
+`binding_revision: authority-resolved-v2` plus bounded claim/authority counts.
+The counts diagnose missing authority without echoing an untrusted id. If the
+header still says `workbench-delegation-claim-guard-v1`, or the binding revision
+line is absent after updating, the Pi process still has older extension code
+loaded and must be `/reload`ed before starting the next conversation.
 
 ## The product workflow
 

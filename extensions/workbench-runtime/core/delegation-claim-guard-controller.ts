@@ -20,7 +20,7 @@ import type { DelegationReviewStatus, DelegationState } from "./delegation-state
 import { ownDataValue } from "./runtime-output-controller.ts";
 import type { readCommittedManifest } from "./runs.ts";
 
-export const DELEGATION_CLAIM_GUARD_SCHEMA = "workbench-delegation-claim-guard-v1" as const;
+export const DELEGATION_CLAIM_GUARD_SCHEMA = "workbench-delegation-claim-guard-v2" as const;
 export const DELEGATION_CLAIM_GUARD_CODE = "UNVERIFIED_EXECUTION_CLAIM" as const;
 export const DELEGATION_CLAIM_BINDING_REVISION = "authority-resolved-v2" as const;
 export const DELEGATION_CLAIM_GUARD_TEXT = [
@@ -119,6 +119,16 @@ export interface DelegationClaimTurnEvidence {
 export interface DelegationClaimValidation {
 	readonly ok: boolean;
 	readonly code?: "claim_overflow" | "ambiguous_authority_namespace" | "ambiguous_run_outcome" | "ambiguous_status_binding" | "missing_authority" | "status_mismatch" | "missing_attempt_authority" | "missing_started_authority" | "missing_success_result" | "missing_run_authority" | "run_status_mismatch";
+}
+
+interface DelegationClaimFailureFacts {
+	readonly claimNamespace: "delegation" | "run" | "mixed" | "implicit";
+	readonly claimedDelegations: number;
+	readonly verifiedDelegations: number;
+	readonly claimedRuns: number;
+	readonly verifiedRuns: number;
+	readonly attemptedDelegateCalls: number;
+	readonly successfulDelegateResults: number;
 }
 
 function assistantText(message: unknown): string | undefined {
@@ -793,12 +803,40 @@ function claimGuardNextAction(code: NonNullable<DelegationClaimValidation["code"
 	if (code === "missing_attempt_authority" || code === "missing_started_authority" || code === "missing_success_result") {
 		return "do not claim a current-turn worker attempt or completion; query workbench_delegation_status and follow its persisted next action";
 	}
+	if (code === "missing_authority") {
+		return "discard guessed delegation ids; query workbench_delegation_status; if its persisted next action permits delegation, call workbench_delegate_worker and report only the returned delegation_id";
+	}
 	return "query workbench_delegation_status and follow its persisted next action; review PENDING_REVIEW or STALE, and delegate only when unblocked";
+}
+
+function claimFailureFacts(
+	inspection: DelegationClaimInspection,
+	turn: DelegationClaimTurnEvidence,
+	authorities: readonly DelegationClaimAuthority[],
+	runAuthorities: readonly WorkbenchRunClaimAuthority[],
+): DelegationClaimFailureFacts {
+	const authorityById = new Map(authorities.map((authority) => [authority.id, authority]));
+	const runAuthorityById = new Map(runAuthorities.map((authority) => [authority.id, authority]));
+	const resolved = resolveClaimNamespaces(inspection, authorityById, runAuthorityById);
+	const claimedDelegations = resolved.delegationIds.length;
+	const claimedRuns = resolved.runIds.length;
+	return {
+		claimNamespace: claimedDelegations > 0 && claimedRuns > 0
+			? "mixed"
+			: claimedDelegations > 0 ? "delegation" : claimedRuns > 0 ? "run" : "implicit",
+		claimedDelegations,
+		verifiedDelegations: resolved.delegationIds.filter((id) => authorityById.has(id)).length,
+		claimedRuns,
+		verifiedRuns: resolved.runIds.filter((id) => runAuthorityById.has(id)).length,
+		attemptedDelegateCalls: turn.attemptedCalls,
+		successfulDelegateResults: turn.successfulResults,
+	};
 }
 
 function replacementMessage(
 	message: unknown,
 	code: NonNullable<DelegationClaimValidation["code"]>,
+	facts: DelegationClaimFailureFacts,
 ): Record<string, unknown> {
 	const timestamp = ownDataValue(message, "timestamp");
 	const provider = ownDataValue(message, "provider");
@@ -811,7 +849,20 @@ function replacementMessage(
 		role: "assistant",
 		content: [{
 			type: "text",
-			text: `${DELEGATION_CLAIM_GUARD_TEXT}\nbinding_revision: ${DELEGATION_CLAIM_BINDING_REVISION}\nreason: ${code}\nnext_action: ${claimGuardNextAction(code)}\nclaim_hash: ${claimHash}`,
+			text: [
+				DELEGATION_CLAIM_GUARD_TEXT,
+				`binding_revision: ${DELEGATION_CLAIM_BINDING_REVISION}`,
+				`reason: ${code}`,
+				`claim_namespace: ${facts.claimNamespace}`,
+				`claimed_delegation_count: ${facts.claimedDelegations}`,
+				`verified_delegation_authority_count: ${facts.verifiedDelegations}`,
+				`claimed_run_count: ${facts.claimedRuns}`,
+				`verified_run_authority_count: ${facts.verifiedRuns}`,
+				`delegate_calls_this_turn: ${facts.attemptedDelegateCalls}`,
+				`successful_delegate_results_this_turn: ${facts.successfulDelegateResults}`,
+				`next_action: ${claimGuardNextAction(code)}`,
+				`claim_hash: ${claimHash}`,
+			].join("\n"),
 		}],
 		...(typeof provider === "string" ? { provider } : {}),
 		...(typeof model === "string" ? { model } : {}),
@@ -954,13 +1005,20 @@ export function registerDelegationClaimGuard(controller: DelegationClaimGuardCon
 		} catch {
 			// An unreadable project root or authority is not execution evidence.
 		}
-		const verdict = validateDelegationClaims(inspection, {
+		const turnEvidence: DelegationClaimTurnEvidence = {
 			attemptedCalls: attemptedCallIds.size,
 			successfulResults: successfulResultIds.size,
 			resultIds: [...successfulResultIds],
 			startedIds: [...startedIds],
 			observedStatusIds: [...observedStatusIds],
-		}, authorities, runAuthorities);
-		return verdict.ok ? undefined : { message: replacementMessage(message, verdict.code ?? "missing_authority") as never };
+		};
+		const verdict = validateDelegationClaims(inspection, turnEvidence, authorities, runAuthorities);
+		return verdict.ok ? undefined : {
+			message: replacementMessage(
+				message,
+				verdict.code ?? "missing_authority",
+				claimFailureFacts(inspection, turnEvidence, authorities, runAuthorities),
+			) as never,
+		};
 	});
 }
