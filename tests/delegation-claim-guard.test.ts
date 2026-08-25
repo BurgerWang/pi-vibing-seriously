@@ -798,6 +798,7 @@ function register(
 	sessionStatus?: "PENDING_REVIEW" | "REVIEWED" | "STALE",
 	legacyLedger?: unknown,
 	readRun: (id: string) => "SUCCESS" | "FAILURE" | undefined = () => undefined,
+	readSessionState?: () => { latestId?: string; status: "PENDING_REVIEW" | "REVIEWED" | "STALE" },
 ): void {
 	registerDelegationClaimGuard({
 		pi: {
@@ -809,10 +810,10 @@ function register(
 		} as never,
 		isCommander: () => true,
 		projectRootFor: async () => "/project",
-		getDelegationState: () => ({
+		getDelegationState: readSessionState ?? (() => ({
 			...(sessionStatus === undefined ? {} : { latestId: REAL_ID }),
 			status: sessionStatus ?? "PENDING_REVIEW",
-		}),
+		})),
 		readTransaction: (async (_root: string, id: string) => {
 			const status = readStatus(id);
 			return status === undefined
@@ -1129,6 +1130,69 @@ test("a failed delegate tool attempt cannot be reported as a started worker", as
 	});
 	const replacement = (results.find((value) => value !== undefined) as { message: Record<string, unknown> }).message;
 	assert.ok(finalText(replacement).includes("reason: missing_started_authority"));
+	assert.match(finalText(replacement), /durable_attempt_facts: \[\]/u);
+});
+
+test("a guessed id is rejected while the same-turn durable FAILED attempt remains recoverable", async () => {
+	const state = stub();
+	const failedId = "20260824-213723-hw1j";
+	const guessedId = "20260824-221820-d8z4";
+	const runOutcomes = new Map<string, "SUCCESS" | "FAILURE">([
+		["20260824-220428-l4wv", "SUCCESS"],
+		["20260824-220432-ppq2", "SUCCESS"],
+		["20260824-220435-g4s4", "FAILURE"],
+		["20260824-220630-nzub", "SUCCESS"],
+		["20260824-220643-iggb", "SUCCESS"],
+		["20260824-220648-6r46", "SUCCESS"],
+		["20260824-220700-zs4k", "SUCCESS"],
+		["20260824-220707-ptsp", "SUCCESS"],
+	]);
+	let sessionState: { latestId?: string; status: "PENDING_REVIEW" | "REVIEWED" | "STALE" } = {
+		latestId: REAL_ID,
+		status: "REVIEWED",
+	};
+	register(
+		state,
+		(id) => id === REAL_ID ? "FINISHED" : id === failedId ? "FAILED" : undefined,
+		true,
+		undefined,
+		undefined,
+		(id) => runOutcomes.get(id),
+		() => sessionState,
+	);
+	await emit(state, "agent_start", { type: "agent_start" });
+	await emit(state, "message_end", {
+		type: "message_end",
+		message: {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "call-failed-durable", name: "workbench_delegate_worker", arguments: {} }],
+		},
+	});
+	sessionState = { latestId: failedId, status: "REVIEWED" };
+	await emit(state, "tool_execution_end", {
+		type: "tool_execution_end",
+		toolCallId: "call-failed-durable",
+		toolName: "workbench_delegate_worker",
+		isError: true,
+		result: { details: { status: "error" } },
+	});
+	const results = await emit(state, "message_end", {
+		type: "message_end",
+		message: assistant([
+			`new delegation ${guessedId} completed`,
+			...[...runOutcomes].map(([id, outcome]) => `run ${id} ${outcome === "SUCCESS" ? "OK" : "FAILED"}`),
+		].join("\n")),
+	});
+	const replacement = (results.find((value) => value !== undefined) as { message: Record<string, unknown> }).message;
+	const text = finalText(replacement);
+	assert.match(text, /reason: missing_authority/u);
+	assert.match(text, /claimed_delegation_count: 1/u);
+	assert.match(text, /verified_delegation_authority_count: 0/u);
+	assert.match(text, /claimed_run_count: 8/u);
+	assert.match(text, /verified_run_authority_count: 8/u);
+	assert.match(text, new RegExp(`durable_attempt_facts: .*${failedId}.*FAILED`, "u"));
+	assert.match(text, new RegExp(`repair_of=${failedId}`, "u"));
+	assert.equal(text.includes(guessedId), false, "the rejected guessed id is never repeated");
 });
 
 test("controller rejects a silent-drop diagnosis when no delegate tool call occurred", async () => {

@@ -115,6 +115,11 @@ The report is never acceptance evidence. Do not claim final PASS or label criter
 ## Remaining Risks`;
 
 const MAX_JSON_LINE_BYTES = 2 * 1024 * 1024;
+// Pi JSON mode emits a final cumulative copy of the entire run. Every
+// authoritative message/tool event has already appeared separately before it,
+// so retaining this duplicate would make healthy long workers fail only at
+// shutdown once their history crosses the per-event bound.
+const AGENT_END_JSON_PREFIX = '{"type":"agent_end","messages":[';
 const MAX_TASK_ARGUMENT_BYTES = 64 * 1024;
 const KILL_GRACE_MS = 5_000;
 /** Exact custom-entry identity already emitted by the child runtime. */
@@ -756,6 +761,7 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 			let settled = false;
 			let terminating = false;
 			let streamInvalid = false;
+			let discardingCumulativeAgentEnd = false;
 			let killTimer: NodeJS.Timeout | undefined;
 			const signalProcessTree = (value: NodeJS.Signals): void => {
 				try {
@@ -802,6 +808,12 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 
 			const processLine = (line: string) => {
 				if (!line.trim()) return;
+				// `agent_end.messages` is a redundant cumulative snapshot in Pi's
+				// documented JSON wire format. Its component `message_end` and
+				// `entry_appended` events were already processed independently. Ignore
+				// the exact canonical prefix before applying the event-size limit; every
+				// other oversized record remains a hard stream failure.
+				if (line.startsWith(AGENT_END_JSON_PREFIX)) return;
 				if (Buffer.byteLength(line, "utf8") > MAX_JSON_LINE_BYTES) {
 					streamInvalid = true;
 					result.errorMessage = `Worker JSON event exceeded ${MAX_JSON_LINE_BYTES} bytes`;
@@ -929,11 +941,23 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 
 			child.stdout.on("data", (chunk: Buffer | string) => {
 				if (streamInvalid) return;
-				stdoutBuffer += chunk.toString();
+				let incoming = chunk.toString();
+				if (discardingCumulativeAgentEnd) {
+					const newline = incoming.indexOf("\n");
+					if (newline === -1) return;
+					discardingCumulativeAgentEnd = false;
+					incoming = incoming.slice(newline + 1);
+				}
+				stdoutBuffer += incoming;
 				if (Buffer.byteLength(stdoutBuffer, "utf8") > MAX_JSON_LINE_BYTES && !stdoutBuffer.includes("\n")) {
-					streamInvalid = true;
-					result.errorMessage = `Worker JSON event exceeded ${MAX_JSON_LINE_BYTES} bytes`;
-					terminate("error");
+					if (stdoutBuffer.startsWith(AGENT_END_JSON_PREFIX)) {
+						stdoutBuffer = "";
+						discardingCumulativeAgentEnd = true;
+					} else {
+						streamInvalid = true;
+						result.errorMessage = `Worker JSON event exceeded ${MAX_JSON_LINE_BYTES} bytes`;
+						terminate("error");
+					}
 					return;
 				}
 				const lines = stdoutBuffer.split("\n");

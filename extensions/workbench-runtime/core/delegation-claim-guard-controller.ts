@@ -130,6 +130,11 @@ interface DelegationClaimFailureFacts {
 	readonly attemptedDelegateCalls: number;
 	readonly successfulDelegateResults: number;
 	readonly statusMismatchCount: number;
+	readonly durableAttemptFacts: readonly {
+		readonly delegation_id: string;
+		readonly transaction_status: DelegationClaimAuthorityStatus;
+		readonly session_status: DelegationReviewStatus | null;
+	}[];
 	readonly statusMismatches: readonly {
 		readonly delegation_id: string;
 		readonly transaction_status: DelegationClaimAuthorityStatus;
@@ -818,7 +823,10 @@ function validToolCallId(value: unknown): string | undefined {
 	return typeof value === "string" && value.length > 0 && value.length <= 512 ? value : undefined;
 }
 
-function claimGuardNextAction(code: NonNullable<DelegationClaimValidation["code"]>): string {
+function claimGuardNextAction(
+	code: NonNullable<DelegationClaimValidation["code"]>,
+	facts: DelegationClaimFailureFacts,
+): string {
 	if (code === "missing_run_authority" || code === "run_status_mismatch" || code === "ambiguous_run_outcome") {
 		return "query workbench_read_run for every stated run_id and report only its committed outcome";
 	}
@@ -829,6 +837,13 @@ function claimGuardNextAction(code: NonNullable<DelegationClaimValidation["code"
 		return "do not claim a current-turn worker attempt or completion; query workbench_delegation_status and follow its persisted next action";
 	}
 	if (code === "missing_authority") {
+		if (facts.durableAttemptFacts.length === 1) {
+			const attempt = facts.durableAttemptFacts[0]!;
+			if (attempt.transaction_status === "FAILED") {
+				return `discard guessed delegation ids; current-turn durable delegation ${attempt.delegation_id} is FAILED; call workbench_delegation_status, then call workbench_delegate_worker with repair_of=${attempt.delegation_id}`;
+			}
+			return `discard guessed delegation ids; current-turn durable delegation ${attempt.delegation_id} is ${attempt.transaction_status}; query workbench_delegation_status and follow its persisted next action`;
+		}
 		return "discard guessed delegation ids; query workbench_delegation_status; if its persisted next action permits delegation, call workbench_delegate_worker and report only the returned delegation_id";
 	}
 	if (code === "status_mismatch") {
@@ -848,6 +863,14 @@ function claimFailureFacts(
 	const resolved = resolveClaimNamespaces(inspection, authorityById, runAuthorityById);
 	const claimedDelegations = resolved.delegationIds.length;
 	const claimedRuns = resolved.runIds.length;
+	const durableAttemptFacts = [...new Set(turn.startedIds)].flatMap((id) => {
+		const authority = authorityById.get(id);
+		return authority === undefined ? [] : [{
+			delegation_id: id,
+			transaction_status: authority.status,
+			session_status: authority.sessionStatus ?? null,
+		}];
+	}).slice(0, 8);
 	const statusMismatches = resolved.delegationIds.flatMap((id) => {
 		const authority = authorityById.get(id);
 		if (authority === undefined) return [];
@@ -872,6 +895,7 @@ function claimFailureFacts(
 		attemptedDelegateCalls: turn.attemptedCalls,
 		successfulDelegateResults: turn.successfulResults,
 		statusMismatchCount: statusMismatches.length,
+		durableAttemptFacts,
 		statusMismatches,
 	};
 }
@@ -903,9 +927,10 @@ function replacementMessage(
 				`verified_run_authority_count: ${facts.verifiedRuns}`,
 				`delegate_calls_this_turn: ${facts.attemptedDelegateCalls}`,
 				`successful_delegate_results_this_turn: ${facts.successfulDelegateResults}`,
+				`durable_attempt_facts: ${JSON.stringify(facts.durableAttemptFacts)}`,
 				`status_mismatch_count: ${facts.statusMismatchCount}`,
 				`machine_mismatch_facts: ${JSON.stringify(facts.statusMismatches)}`,
-				`next_action: ${claimGuardNextAction(code)}`,
+				`next_action: ${claimGuardNextAction(code, facts)}`,
 				`claim_hash: ${claimHash}`,
 			].join("\n"),
 		}],
@@ -1015,7 +1040,10 @@ export function registerDelegationClaimGuard(controller: DelegationClaimGuardCon
 			) {
 				authorityIds.add(sessionState.latestId);
 			}
-			if (inspection.recentClaim || inspection.successClaim) for (const id of startedIds) authorityIds.add(id);
+			// A failed tool result can still leave a strict FAILED/ABORTED durable
+			// transaction. Always read a same-turn changed latest id so the guard can
+			// reject guessed prose while returning the real recovery authority.
+			for (const id of startedIds) authorityIds.add(id);
 			const claimAuthorityIds = new Set([...authorityIds, ...inspection.runIds]);
 			for (const id of claimAuthorityIds) {
 				const current = await controller.readTransaction(projectRoot, id);

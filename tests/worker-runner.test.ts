@@ -138,6 +138,41 @@ test("runner rejects a newline-terminated oversized JSON event before later outp
 	);
 });
 
+test("runner ignores Pi's oversized cumulative agent_end after an authoritative final message", async () => {
+	const final = assistantEvent();
+	const cumulativeAgentEnd = JSON.stringify({
+		type: "agent_end",
+		messages: [{ role: "toolResult", content: [{ type: "text", text: "x".repeat(2 * 1024 * 1024) }] }],
+	});
+	await withFakeWorker(
+		`process.stdout.write(${JSON.stringify(`${final}\n${cumulativeAgentEnd}\n`)});`,
+		async (invocation, dir) => {
+			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+			assertWorkerSucceeded(result);
+			assert.equal(result.exitCode, 0);
+			assert.equal(result.turns, 1, "the duplicate messages inside agent_end are never counted again");
+			assert.match(result.output, /Implemented/u);
+		},
+	);
+});
+
+test("runner stream-discards a chunked oversized cumulative agent_end without weakening unknown-event bounds", async () => {
+	const final = assistantEvent();
+	await withFakeWorker(
+		[
+			`process.stdout.write(${JSON.stringify(`${final}\n{"type":"agent_end","messages":[`)});`,
+			`process.stdout.write("x".repeat(${2 * 1024 * 1024}));`,
+			'process.stdout.write("]}\\n");',
+		].join("\n"),
+		async (invocation, dir) => {
+			const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+			assertWorkerSucceeded(result);
+			assert.equal(result.exitCode, 0);
+			assert.equal(result.turns, 1);
+		},
+	);
+});
+
 test("runner does not accept a tool-use assistant message as the terminal report", async () => {
 	const nonterminal = assistantEvent({ content: [{ type: "text", text: "working" }], stopReason: "toolUse" });
 	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${nonterminal}\n`)});`, async (invocation, dir) => {
