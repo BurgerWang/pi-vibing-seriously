@@ -85,10 +85,14 @@ loaded and must be `/reload`ed before starting the next conversation.
 Diff review is optimized for continuity: call `workbench_review_worker_diff`
 without `delegation_id` or semantic fields to inspect the durable latest
 delivery. The returned complete packet supplies the exact id and hash required
-for a later `ACCEPT` or `REPAIR`; never guess either value. TUI failures retain
-the controller's actionable error instead of collapsing to `review unavailable`,
-and status/footer guidance follows the durable transaction (`RUNNING`, `FAILED`,
-or `PENDING_REVIEW`) so only one next action is shown. Long worker runs also get
+for a later `ACCEPT` or `REPAIR`; never guess either value. A provisional
+read-only call that nevertheless carries a stale or guessed id now recovers to
+the durable latest delegation and discards selector-bound path hints. This
+recovery never applies to `ACCEPT` or `REPAIR`, which remain exact-id/hash
+bound. TUI failures retain the controller's actionable error instead of
+collapsing to `review unavailable`, and status/footer guidance follows the
+durable transaction (`RUNNING`, `FAILED`, or `PENDING_REVIEW`) so only one next
+action is shown. Long worker runs also get
 hidden wall-clock checkpoints at 65% and 85% of the existing timeout to finish a
 coherent slice, preserve verification, and write the required handoff before the
 unchanged hard timeout. These are workflow/observability improvements, not new

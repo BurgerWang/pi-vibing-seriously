@@ -476,13 +476,22 @@ test("registered diff-review bounds both a real successful review and a huge ret
 		await fireSessionStart(stub, root, entries);
 		const review = registeredTool(stub, "workbench_review_worker_diff");
 
-		const hugeMismatch = await review.execute(
-			"call-review-error",
-			{ delegation_id: "z".repeat(100_000), max_lines: 2_000, max_bytes: 512_000 },
-			undefined,
-			undefined,
-			trustedContext(root),
-		);
+			const hugeMismatch = await review.execute(
+				"call-review-error",
+				{
+					delegation_id: "z".repeat(100_000),
+					semantic_decision: "ACCEPT",
+					expected_bound_diff_hash: after.diffHash,
+					max_lines: 2_000,
+					max_bytes: 512_000,
+				},
+				undefined,
+				undefined,
+				{
+					...trustedContext(root),
+					model: { provider: "openai-codex", id: "gpt-5.6-sol" },
+				} as never,
+			);
 		const errorText = assertToolTextWithin(hugeMismatch, DIFF_REVIEW_RESULT_MAX_BYTES, DIFF_REVIEW_RESULT_MAX_LINES, "review error");
 		assert.match(errorText, /\[workbench-output truncated /);
 

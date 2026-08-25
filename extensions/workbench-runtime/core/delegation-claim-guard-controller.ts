@@ -40,6 +40,7 @@ const EXECUTION_WORD_RE = /\b(?:start(?:ed)?|launch(?:ed)?|execut(?:e|ed)|creat(
 const SUCCESS_WORD_RE = /\b(?:SUCCESS(?:FUL(?:LY)?)?|SUCCEEDED|REVIEWED|FINISHED)\b|成功(?:退出|完成)?|已完成|已落地/i;
 const NEGATED_WORD_RE = /\b(?:(?:did|does|is|was|were|has|have)\s+not|didn't|doesn't|isn't|wasn't|weren't|hasn't|haven't|never)\s+(?:start|launch|execute|create|complete|find|exist|succeed|review|finish|fail|started|launched|executed|created|completed|found|successful|reviewed|finished|failed)\b|\bno\s+delegation\b|不存在|不是|并非|未创建|未启动|未执行|没有(?:启动|执行|创建|形成)|虚构/i;
 const NEGATED_CLAIM_SCAN_RE = /\b(?:(?:did|does|is|was|were|has|have)\s+not|didn't|doesn't|isn't|wasn't|weren't|hasn't|haven't|never|not)\s+(?:start|launch|execute|create|complete|find|exist|succeed|review|finish|fail|started|launched|executed|created|completed|found|successful|reviewed|finished|failed)\b|\bno\s+delegation\b|不存在|不是|并非|未创建|未启动|未执行|未完成|没有(?:启动|执行|创建|形成|完成)|并未(?:启动|执行|创建|完成)|虚构/gi;
+const DELEGATION_UNAVAILABLE_DIAGNOSTIC_RE = /\bworkbench_(?:review_worker_diff|delegation_status)\b.{0,200}\b(?:is\s+not\s+the\s+latest|not\s+found|missing|invalid|reject(?:ed)?|refus(?:ed|al))\b|\bdelegation\b.{0,120}\b(?:is\s+not\s+the\s+latest|was\s+not\s+found|does\s+not\s+exist|was\s+reject(?:ed)?|was\s+refus(?:ed)?)\b|\bonly\s+the\s+latest\s+delegation\s+can\s+be\s+reviewed\b|(?:委派|工作线程).{0,120}(?:不是最新|未找到|找不到|不存在|无效|被拒绝|已拒绝)/isu;
 const BLOCKED_EXECUTION_SCAN_RE = /(?:\b(?:starting|launching|creating)\b.{0,120}\bdelegation\b.{0,120}\bis blocked\b|(?:启动|开始|创建).{0,80}(?:委派|worker|工作线程).{0,80}(?:被阻止|被拦截|已阻止|无法启动))/gis;
 const RECENT_WORD_RE = /\b(?:new|fresh|this\s+(?:turn|attempt|delegation)|just)\b|本次|刚刚|刚才|再次|重新|全新(?:的)?|新(?:的)?\s*(?:delegation|worker|工作线程|委派)|已按要求/i;
 const START_WORD_RE = /\b(?:start(?:ed)?|launch(?:ed)?|creat(?:e|ed)|call(?:ed)?)\b|启动|创建|调用|改用/i;
@@ -131,6 +132,11 @@ interface DelegationClaimFailureFacts {
 	readonly successfulDelegateResults: number;
 	readonly statusMismatchCount: number;
 	readonly durableAttemptFacts: readonly {
+		readonly delegation_id: string;
+		readonly transaction_status: DelegationClaimAuthorityStatus;
+		readonly session_status: DelegationReviewStatus | null;
+	}[];
+	readonly freshStatusFacts: readonly {
 		readonly delegation_id: string;
 		readonly transaction_status: DelegationClaimAuthorityStatus;
 		readonly session_status: DelegationReviewStatus | null;
@@ -462,6 +468,18 @@ function addSemanticSuccess(
 	return [...result, { status: "SUCCESS", source: "unspecified" }];
 }
 
+function isUnavailableDelegationDiagnostic(clause: string): boolean {
+	const evidence = clause.replace(
+		/\b(?:can|cannot|can't|could\s+not|may\s+not|must\s+not|should\s+not)\s+be\s+reviewed\b/giu,
+		" ",
+	);
+	return DELEGATION_UNAVAILABLE_DIAGNOSTIC_RE.test(clause)
+		&& !SUCCESS_WORD_RE.test(evidence)
+		&& !ASSERTED_START_RE.test(evidence)
+		&& !ASSERTED_ATTEMPT_RE.test(evidence)
+		&& !REVIEW_PASS_FINAL_RE.test(evidence);
+}
+
 function strictLegacyStatus(ledger: DelegationLedger, id: string): DelegationClaimAuthorityStatus | undefined {
 	if (
 		ledger.manifest.schema_version !== DELEGATION_SCHEMA_VERSION
@@ -538,7 +556,16 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 	for (const rawClause of claimClauses(text)) {
 		const clause = rawClause.replace(BLOCKED_EXECUTION_SCAN_RE, " ");
 		const hasDelegationSubject = DELEGATION_WORD_RE.test(clause) || WORKER_WORD_RE.test(clause);
-		const affirmativeClause = clause.replace(new RegExp(NEGATED_CLAIM_SCAN_RE.source, "gi"), " ");
+		let affirmativeClause = clause.replace(new RegExp(NEGATED_CLAIM_SCAN_RE.source, "gi"), " ");
+		const diagnosticBoundary = clause.search(/[,，]/u);
+		if (diagnosticBoundary >= 0 && isUnavailableDelegationDiagnostic(clause.slice(0, diagnosticBoundary))) {
+			sawNegativeDelegation = true;
+			affirmativeClause = clause.slice(diagnosticBoundary + 1).trim();
+		}
+		if (isUnavailableDelegationDiagnostic(affirmativeClause)) {
+			sawNegativeDelegation = true;
+			continue;
+		}
 		const negative = hasDelegationSubject && (NEGATED_WORD_RE.test(clause) || affirmativeClause !== clause);
 		if (negative) {
 			sawNegativeDelegation = true;
@@ -902,6 +929,10 @@ function claimGuardNextAction(
 			}
 			return `discard guessed delegation ids; current-turn durable delegation ${attempt.delegation_id} is ${attempt.transaction_status}; query workbench_delegation_status and follow its persisted next action`;
 		}
+		if (facts.freshStatusFacts.length === 1) {
+			const observed = facts.freshStatusFacts[0]!;
+			return `discard guessed delegation ids; reuse verified latest delegation ${observed.delegation_id} (${observed.transaction_status}/${observed.session_status ?? "NO_SESSION_STATUS"}) and follow the already returned fresh workbench_delegation_status next action; never guess delegation_id`;
+		}
 		return "discard guessed delegation ids; query workbench_delegation_status; if its persisted next action permits delegation, call workbench_delegate_worker and report only the returned delegation_id";
 	}
 	if (code === "status_mismatch") {
@@ -922,6 +953,14 @@ function claimFailureFacts(
 	const claimedDelegations = resolved.delegationIds.length;
 	const claimedRuns = resolved.runIds.length;
 	const durableAttemptFacts = [...new Set(turn.startedIds)].flatMap((id) => {
+		const authority = authorityById.get(id);
+		return authority === undefined ? [] : [{
+			delegation_id: id,
+			transaction_status: authority.status,
+			session_status: authority.sessionStatus ?? null,
+		}];
+	}).slice(0, 8);
+	const freshStatusFacts = [...new Set(turn.observedStatusIds)].flatMap((id) => {
 		const authority = authorityById.get(id);
 		return authority === undefined ? [] : [{
 			delegation_id: id,
@@ -965,6 +1004,7 @@ function claimFailureFacts(
 		successfulDelegateResults: turn.successfulResults,
 		statusMismatchCount: statusMismatches.length,
 		durableAttemptFacts,
+		freshStatusFacts,
 		statusMismatches,
 	};
 }
@@ -997,6 +1037,7 @@ function replacementMessage(
 				`delegate_calls_this_turn: ${facts.attemptedDelegateCalls}`,
 				`successful_delegate_results_this_turn: ${facts.successfulDelegateResults}`,
 				`durable_attempt_facts: ${JSON.stringify(facts.durableAttemptFacts)}`,
+				`fresh_status_facts: ${JSON.stringify(facts.freshStatusFacts)}`,
 				`status_mismatch_count: ${facts.statusMismatchCount}`,
 				`machine_mismatch_facts: ${JSON.stringify(facts.statusMismatches)}`,
 				`next_action: ${claimGuardNextAction(code, facts)}`,
@@ -1113,6 +1154,7 @@ export function registerDelegationClaimGuard(controller: DelegationClaimGuardCon
 			// transaction. Always read a same-turn changed latest id so the guard can
 			// reject guessed prose while returning the real recovery authority.
 			for (const id of startedIds) authorityIds.add(id);
+			for (const id of observedStatusIds) authorityIds.add(id);
 			const claimAuthorityIds = new Set([...authorityIds, ...inspection.runIds]);
 			for (const id of claimAuthorityIds) {
 				const current = await controller.readTransaction(projectRoot, id);

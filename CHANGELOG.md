@@ -55,6 +55,12 @@ publication, `/reload`, or measured live provider cache improvement is claimed.
 
 ### Changed
 
+- Provisional `workbench_review_worker_diff` presentation now recovers a stale
+  or guessed `delegation_id` to the durable latest transaction and drops the
+  stale selector's `include_paths`. Semantic `ACCEPT`/`REPAIR` remains strict
+  exact-id/hash authority. Explicit not-latest/rejected-selector diagnostics no
+  longer become delegation execution claims, and a claim rejection reuses a
+  fresh status observation instead of prescribing another redundant query.
 - The pre-release single-slice local-commit draft is replaced by one structured
   `workbench_git` surface. `action=checkpoint` binds directly to sealed reviewed
   path bytes, batches every compatible semantic-ACCEPT slice into one commit,

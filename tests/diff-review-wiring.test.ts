@@ -142,7 +142,15 @@ function trustedCtx(root: string, entries: unknown[] = []): ExtensionCommandCont
 interface ReviewTool {
 	execute: (
 		toolCallId: string,
-		params: { delegation_id: string; include_paths?: string[]; max_lines?: number; max_bytes?: number },
+		params: {
+			delegation_id?: string;
+			include_paths?: string[];
+			max_lines?: number;
+			max_bytes?: number;
+			semantic_decision?: "ACCEPT" | "REPAIR";
+			expected_bound_diff_hash?: string;
+			repair_reason?: string;
+		},
 		signal: unknown,
 		onUpdate: unknown,
 		ctx: ExtensionContext,
@@ -151,7 +159,9 @@ interface ReviewTool {
 
 interface ReviewDetails {
 	ok: boolean;
+	error?: string;
 	delegation_id: string;
+	selector_recovery?: "durable_latest";
 	verdict: "PASS" | "FAIL";
 	review_status: string;
 	bound_diff_hash: string;
@@ -484,9 +494,35 @@ test("registered legacy review tool merges scope/integrity segments but keeps no
 		assert.deepEqual([...stub.tools.keys()], [...NATIVE_OVERRIDE_NAMES, ...WORKBENCH_TOOL_NAMES]);
 		assert.deepEqual(stub.activeTools, activeToolsBefore, "review calls never change the active tool set");
 
-		// Only the latest delegation is reviewable.
-		const other = await review.execute("call-4", { delegation_id: "20260101-000000-zzzz" }, undefined, undefined, trustedCtx(root) as never);
-		assert.match(toolText(other), /is not the latest delegation/);
+		// A stale or guessed selector cannot stall a provisional read. The
+		// controller resolves durable latest and discards path hints that may
+		// have belonged to another delegation; this grants no semantic authority.
+		const other = await review.execute(
+			"call-4",
+			{ delegation_id: "20260101-000000-zzzz", include_paths: ["not-in-latest.ts"] },
+			undefined,
+			undefined,
+			trustedCtx(root) as never,
+		);
+		const otherDetails = reviewDetails(other);
+		assert.equal(otherDetails.ok, true);
+		assert.equal(otherDetails.delegation_id, id);
+		assert.equal(otherDetails.selector_recovery, "durable_latest");
+		assert.match(toolText(other), /selector: RECOVERED_DURABLE_LATEST/u);
+		assert.doesNotMatch(toolText(other), /20260101-000000-zzzz/u, "guessed selector is not reinforced");
+
+		// Semantic decisions remain exact-id/hash bound and never recover by
+		// silently retargeting a guessed delegation.
+		const wrongSemantic = await review.execute("call-5", {
+			delegation_id: "20260101-000000-zzzz",
+			semantic_decision: "ACCEPT",
+			expected_bound_diff_hash: afterHash,
+		}, undefined, undefined, {
+			...trustedCtx(root),
+			model: { provider: "openai-codex", id: "gpt-5.6-sol" },
+		} as never);
+		assert.match(toolText(wrongSemantic), /is not the latest delegation/u);
+		assert.equal(reviewDetails(wrongSemantic).error, "not_latest_delegation");
 	});
 });
 

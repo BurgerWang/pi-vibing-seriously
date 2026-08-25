@@ -470,6 +470,37 @@ test("negative audit mentions remain readable while status mismatches fail", () 
 	);
 });
 
+test("rejected or unavailable review selectors remain reportable diagnostics", () => {
+	for (const message of [
+		`workbench_review_worker_diff: delegation ${FAKE_IDS[0]} is not the latest delegation (${REAL_ID}); only the latest delegation can be reviewed`,
+		`workbench_review_worker_diff rejected delegation ${FAKE_IDS[1]} as invalid.`,
+		`委派 ${FAKE_IDS[2]} 不是最新工作线程，review 已拒绝。`,
+	]) {
+		const inspection = inspectDelegationClaims(assistant(message));
+		assert.ok(inspection);
+		assert.equal(inspection.negativeOnly, true);
+		assert.deepEqual(validateDelegationClaims(inspection, evidence(), []), { ok: true });
+	}
+
+	const mixed = inspectDelegationClaims(assistant(
+		`workbench_review_worker_diff rejected delegation ${FAKE_IDS[0]} as invalid, but delegation ${FAKE_IDS[1]} completed successfully.`,
+	));
+	assert.ok(mixed);
+	assert.equal(mixed.negativeOnly, false, "a diagnostic prefix cannot erase an affirmative completion claim");
+	assert.deepEqual(validateDelegationClaims(mixed, evidence(), []), { ok: false, code: "missing_authority" });
+
+	const statusAfterDiagnostic = inspectDelegationClaims(assistant(
+		`workbench_review_worker_diff rejected delegation ${FAKE_IDS[0]} as invalid, latest delegation ${REAL_ID} is STALE.`,
+	));
+	assert.ok(statusAfterDiagnostic);
+	assert.deepEqual(statusAfterDiagnostic.ids, [REAL_ID], "only the status-bearing durable selector remains a claim");
+	assert.deepEqual(validateDelegationClaims(statusAfterDiagnostic, evidence(), []), { ok: false, code: "missing_authority" });
+	assert.deepEqual(
+		validateDelegationClaims(statusAfterDiagnostic, evidence(), [{ id: REAL_ID, status: "REVIEWED", sessionStatus: "STALE" }]),
+		{ ok: true },
+	);
+});
+
 test("mixed negation cannot erase an affirmative success claim in the same sentence", () => {
 	const english = inspectDelegationClaims(assistant(
 		`delegation ${REAL_ID} did not fail, but completed successfully.`,
@@ -893,10 +924,41 @@ test("controller replaces fabricated final prose and never repeats its ids", asy
 	assert.match(text, /claimed_delegation_count: 1/u);
 	assert.match(text, /verified_delegation_authority_count: 0/u);
 	assert.match(text, /delegate_calls_this_turn: 0/u);
+	assert.match(text, /fresh_status_facts: \[\]/u);
 	assert.match(text, /next_action: discard guessed delegation ids/u);
 	assert.match(text, /claim_hash: [a-f0-9]{64}/u, "the rejected prose remains correlatable without retaining it verbatim");
 	assert.equal(text.includes(FAKE_IDS[0]), false, "the guard never reinforces a fabricated id");
 	assert.equal(finalText(message).includes(DELEGATION_CLAIM_GUARD_CODE), false, "caller message is immutable");
+});
+
+test("missing authority reuses a fresh observed latest instead of requesting another status query", async () => {
+	const state = stub();
+	const guessedId = "20260826-094520-9udf";
+	register(state, (id) => id === REAL_ID ? "REVIEWED" : undefined, true, "STALE");
+	await emit(state, "agent_start", { type: "agent_start" });
+	await emit(state, "tool_execution_end", {
+		type: "tool_execution_end",
+		toolCallId: "status-fresh",
+		toolName: "workbench_delegation_status",
+		isError: false,
+		result: { details: { git_refresh: "fresh" } },
+	});
+	const results = await emit(state, "message_end", {
+		type: "message_end",
+		message: assistant([
+			`delegation ${guessedId} completed`,
+			`latest delegation ${REAL_ID} is STALE`,
+		].join("\n")),
+	});
+	const replacement = (results.find((value) => value !== undefined) as { message: Record<string, unknown> }).message;
+	const text = finalText(replacement);
+	assert.match(text, /reason: missing_authority/u);
+	assert.match(text, /claimed_delegation_count: 2/u);
+	assert.match(text, /verified_delegation_authority_count: 1/u);
+	assert.match(text, new RegExp(`fresh_status_facts: .*${REAL_ID}.*REVIEWED.*STALE`, "u"));
+	assert.match(text, new RegExp(`next_action: discard guessed delegation ids; reuse verified latest delegation ${REAL_ID}`, "u"));
+	assert.doesNotMatch(text, new RegExp(guessedId, "u"));
+	assert.equal(text.includes("query workbench_delegation_status; if"), false, "fresh status is not redundantly requested");
 });
 
 test("controller rejects the exact backticked fake completion even when an older latest transaction is reviewed", async () => {

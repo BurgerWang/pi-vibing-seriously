@@ -47,16 +47,20 @@ function semanticReviewHeader(
 	semanticReview: "accepted" | "required" | "not_required" | "repair_required",
 	boundDiffHash: string,
 	repairOf?: string,
+	selectorRecovered = false,
 ): string[] {
 	return [
-		"review kind: scope_integrity (mechanical evidence; never Gate authority)",
+		`review kind: scope_integrity (mechanical evidence; never Gate authority)${selectorRecovered ? "; selector: RECOVERED_DURABLE_LATEST (stale provisional id/path hints ignored)" : ""}`,
 		`semantic review: ${semanticReview.toUpperCase()}${semanticReview === "accepted" ? ` — explicit Sol ACCEPT bound ${boundDiffHash}` : semanticReview === "repair_required" ? ` — explicit Sol REPAIR bound ${boundDiffHash}; start only exact repair_of=${repairOf ?? "20260823-000000-xxxx"}` : semanticReview === "required" ? ` — inspect the complete packet, then call again with semantic_decision=ACCEPT or REPAIR and expected_bound_diff_hash=${boundDiffHash}; REPAIR also requires repair_reason` : " — zero actual delta"}`,
 	];
 }
 
 const SEMANTIC_REVIEW_HEADER_MAX_BYTES = Math.max(
-	...(["accepted", "required", "not_required", "repair_required"] as const).map((status) =>
-		Buffer.byteLength(semanticReviewHeader(status, MAX_BOUND_DIFF_HASH, "20260823-000000-xxxx").join("\n"), "utf8")),
+	...(["accepted", "required", "not_required", "repair_required"] as const).flatMap((status) =>
+		[false, true].map((selectorRecovered) => Buffer.byteLength(
+			semanticReviewHeader(status, MAX_BOUND_DIFF_HASH, "20260823-000000-xxxx", selectorRecovered).join("\n"),
+			"utf8",
+		))),
 );
 
 export interface ReviewToolController {
@@ -189,8 +193,11 @@ export function registerReviewTool(controller: ReviewToolController): void {
 					details: { ok: false, error: "no_delegation", next_action: "workbench_delegate_worker" },
 				};
 			}
-			const delegationId = explicitDelegationId ?? initialState.latestId;
-			if (initialState.latestId !== delegationId) {
+			const selectorRecovered = !semanticDecisionSupplied
+				&& explicitDelegationId !== undefined
+				&& explicitDelegationId !== initialState.latestId;
+			const delegationId = selectorRecovered ? initialState.latestId : explicitDelegationId ?? initialState.latestId;
+			if (semanticDecisionSupplied && initialState.latestId !== delegationId) {
 				return {
 					content: [{ type: "text", text: reviewText(`workbench_review_worker_diff: delegation ${delegationId} is not the latest delegation (${initialState.latestId}); only the latest delegation can be reviewed`) }],
 					details: {
@@ -202,6 +209,11 @@ export function registerReviewTool(controller: ReviewToolController): void {
 					},
 				};
 			}
+			// Provisional presentation grants no semantic authority. If a model
+			// supplies a guessed or stale selector, recover against the durable
+			// latest transaction and discard path hints that belonged to the wrong
+			// selector. ACCEPT/REPAIR remains exact-id/hash bound above.
+			const includePaths = selectorRecovered ? undefined : params.include_paths;
 			const now = controller.services.now().toISOString();
 			const transaction = await controller.services.readTransaction(projectRoot, delegationId);
 			if (transaction.ok && transaction.value.status === "FAILED") return repairRequired(delegationId);
@@ -237,7 +249,7 @@ export function registerReviewTool(controller: ReviewToolController): void {
 					projectRoot,
 					delegationId,
 					exec: controller.exec,
-					includePaths: params.include_paths,
+					includePaths,
 					maxLines: packetMaxLines,
 					maxBytes: packetMaxBytes,
 					secrets: controller.secrets,
@@ -349,7 +361,7 @@ export function registerReviewTool(controller: ReviewToolController): void {
 					projectRoot,
 					delegationId,
 					exec: controller.exec,
-					includePaths: params.include_paths,
+					includePaths,
 					maxLines: packetMaxLines,
 					maxBytes: packetMaxBytes,
 					secrets: controller.secrets,
@@ -391,7 +403,7 @@ export function registerReviewTool(controller: ReviewToolController): void {
 			await controller.refreshStatus(ctx);
 			const record = result.record;
 			const presentation = normalizeReviewPresentationCoverage(record);
-			const semanticHeader = semanticReviewHeader(semanticReview, record.bound_diff_hash, delegationId);
+			const semanticHeader = semanticReviewHeader(semanticReview, record.bound_diff_hash, delegationId, selectorRecovered);
 			const text = reviewText([...semanticHeader, ...result.lines].join("\n"));
 			const nextIncludePaths: string[] = [];
 			let nextIncludeBytes = 0;
@@ -409,6 +421,7 @@ export function registerReviewTool(controller: ReviewToolController): void {
 					details: {
 						ok: true,
 						delegation_id: delegationId,
+						...(selectorRecovered ? { selector_recovery: "durable_latest" } : {}),
 						review_kind: "scope_integrity",
 						verdict: record.verdict,
 						scope_integrity_verdict: record.verdict,
