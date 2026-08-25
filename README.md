@@ -117,7 +117,10 @@ and reports `push=NOT_RUN`. If reviewed changes remain, its result directs Sol
 to call the same tool again; Sol does not hand staging back to the user. An
 older slice is accepted after HEAD advances only when the conflict is exactly a
 HEAD conflict, the new HEAD descends from the reviewed HEAD without touching
-that slice, and its live bytes/status still equal the sealed review snapshot.
+that slice, and its live bytes/status still equal the sealed review snapshot. A
+newer finalized successful zero-change diagnosis is skipped because it has no
+implementation commit obligation; pending, failed, or incomplete latest work
+still blocks.
 The tool cannot amend, reset the worktree, clean, stash, switch branches, or
 push. If its own commit attempt fails before creating a commit, it may unstage
 only the exact paths it staged, without discarding their worktree bytes.

@@ -55,6 +55,10 @@ publication, `/reload`, or measured live provider cache improvement is claimed.
 
 ### Changed
 
+- A finalized successful zero-change diagnosis no longer hides older
+  still-present semantic-ACCEPT commit slices. Only that strict no-write
+  terminal diagnosis shape is skipped; pending, failed, corrupt, or unfinished
+  latest authority remains fail-closed and blocks backlog checkpointing.
 - Review-bound local checkpointing now continues through older finalized
   semantic-ACCEPT slices after the first checkpoint advances HEAD. The
   fallback accepts only exact `head_conflict` descendants whose intervening

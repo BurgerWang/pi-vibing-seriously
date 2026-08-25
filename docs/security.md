@@ -118,7 +118,10 @@ semantic ACCEPT authorities and derives the newest still-present non-empty
 checked path set. The normal path revalidates the current binding. The only
 historical fallback is an exact `head_conflict`: current HEAD must descend from
 the reviewed HEAD, its intervening commits must not touch those paths, and live
-status/content must equal the sealed after-record. It rejects unrelated staged
+status/content must equal the sealed after-record. A newer authority can be
+scanned past only when its strict shape is a finalized successful zero-change
+diagnosis with no review or commit obligation; unresolved and failed authority
+still blocks. It rejects unrelated staged
 paths and in-progress Git operations, serializes against delegation starts,
 stages only explicit derived paths, and verifies the new commit contains
 exactly that set. A successful non-clean result tells Sol to repeat the tool;

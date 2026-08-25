@@ -292,6 +292,9 @@ current live binding. After a prior reviewed checkpoint changes HEAD, an older
 accepted slice is eligible only for `head_conflict`, when current HEAD is its
 descendant, the intervening commit range did not touch its paths, and live
 path status/content exactly equal its sealed after-record. The controller
+may scan past a newer strict `FINISHED/PASS` zero-change diagnosis because it
+has no implementation review or commit obligation; every pending, failed,
+unfinished, or invalid latest authority remains blocking. The controller
 rejects an unrelated Git index or in-progress Git operation, stages only the
 derived paths, and verifies the resulting commit tree. A non-clean result tells
 Sol to call the tool again for the next reviewed slice instead of asking the

@@ -332,7 +332,9 @@ Consequences for the commander workflow:
   verifies the resulting local commit. After one checkpoint changes HEAD, the
   next older slice must pass the strict accepted-descendant proof (exact
   `head_conflict`, descendant HEAD, no intervening touch of its paths, exact
-  sealed status/content). A non-clean success directs Sol to call the tool
+  sealed status/content). A newer finalized successful zero-change diagnosis
+  is skipped because it has no implementation commit obligation; pending,
+  failed, or incomplete latest authority still blocks. A non-clean success directs Sol to call the tool
   again rather than request manual staging. It never pushes, amends, resets the
   worktree, cleans, stashes, switches branches, or accepts caller-supplied
   paths; no per-commit user confirmation is needed. A failed commit attempt may

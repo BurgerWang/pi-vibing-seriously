@@ -25,6 +25,7 @@ import {
 } from "./delegation-ledger.ts";
 import {
 	collectCurrentDelegationBindingV2,
+	type DelegationAuthorityObservationV2,
 	MAX_PROJECT_DELEGATION_ENTRIES_V2,
 	readDelegationAuthorityObservationV2,
 	readLatestProjectDelegationTransactionV2,
@@ -234,6 +235,25 @@ function matchesReviewedSnapshot(
 		&& facts.pathDigests[path] === snapshot.pathDigests[path]);
 }
 
+/**
+ * A completed zero-write diagnosis has no implementation review obligation and
+ * therefore must not hide an older still-present ACCEPT checkpoint. Every
+ * unresolved or failed latest transaction remains blocking.
+ */
+function isFinalizedZeroDeltaDiagnosis(authority: DelegationAuthorityObservationV2): boolean {
+	return authority.kind === "v2"
+		&& authority.transactionStatus === "FINISHED"
+		&& authority.transactionVerdict === "PASS"
+		&& authority.review === null
+		&& authority.reviewPath === null
+		&& authority.finalized
+		&& !authority.semanticAccepted
+		&& authority.semanticBindingHash === null
+		&& authority.semanticSource === null
+		&& authority.semanticReviewer === null
+		&& authority.semanticAcceptedAt === null;
+}
+
 async function runGit(exec: ExecFn, projectRoot: string, args: string[]): Promise<{ ok: true; stdout: string } | { ok: false }> {
 	try {
 		const result = await exec("git", args, { cwd: projectRoot });
@@ -382,6 +402,7 @@ export async function commitLatestReviewedDelegationV1(input: {
 			if (authority.kind !== "v2" || authority.transactionStatus !== "REVIEWED" || !authority.finalized
 				|| !authority.semanticAccepted || authority.semanticBindingHash === null || authority.review === null) {
 				if (candidateId === lockDelegationId) {
+					if (isFinalizedZeroDeltaDiagnosis(authority)) continue;
 					outcome = failure("review_not_ready", "latest delegation lacks finalized semantic ACCEPT authority", candidateId);
 					return outcome;
 				}

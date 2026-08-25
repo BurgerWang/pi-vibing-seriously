@@ -14,6 +14,7 @@ import {
 } from "../extensions/workbench-runtime/core/local-commit.ts";
 
 const execFileAsync = promisify(execFile);
+const DIAGNOSIS_DELEGATION_ID = "20260825-130000-diag";
 const DELEGATION_ID = "20260825-120000-abcd";
 const EARLIER_DELEGATION_ID = "20260825-110000-wxyz";
 const BINDING_HASH = "a".repeat(64);
@@ -70,6 +71,22 @@ function acceptedAuthority(delegationId: string, paths: string[]) {
 		semanticSource: "embedded" as const,
 		semanticReviewer: "openai-codex/gpt-5.6-sol",
 		semanticAcceptedAt: "2026-08-25T12:00:00.000Z",
+	};
+}
+
+function completedDiagnosisAuthority() {
+	return {
+		kind: "v2" as const,
+		transactionStatus: "FINISHED",
+		transactionVerdict: "PASS" as const,
+		review: null,
+		reviewPath: null,
+		finalized: true,
+		semanticAccepted: false,
+		semanticBindingHash: null,
+		semanticSource: null,
+		semanticReviewer: null,
+		semanticAcceptedAt: null,
 	};
 }
 
@@ -221,6 +238,69 @@ test("reviewed local commit continues through older accepted slices after HEAD a
 		assert.equal(earlier.remaining_changed_paths, 0);
 		assert.equal((await git(root, "status", "--short")).trim(), "");
 		assert.equal((await git(root, "log", "-2", "--format=%s")).trim(), "feat: earlier reviewed slice\nfeat: newest reviewed slice");
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("a finalized zero-change diagnosis does not hide an older accepted slice", async () => {
+	const root = await repo();
+	try {
+		await writeFile(join(root, "unrelated.txt"), "earlier accepted change\n", "utf8");
+		const reviewedSnapshot = await collectGitFacts(root, exec);
+		assert.ok(reviewedSnapshot.gitHead);
+		await writeFile(join(root, "reviewed.txt"), "already checkpointed change\n", "utf8");
+		await git(root, "add", "--", "reviewed.txt");
+		await git(root, "commit", "-m", "checkpoint newer reviewed slice");
+
+		const base = services();
+		const diagnosisLatestServices: LocalReviewedCommitServicesV1 = {
+			...base,
+			readLatestTransaction: async () => ({
+				ok: true,
+				value: { delegation_id: DIAGNOSIS_DELEGATION_ID } as never,
+			}),
+			listCandidateIds: async () => ({
+				ok: true,
+				value: [DIAGNOSIS_DELEGATION_ID, EARLIER_DELEGATION_ID],
+			}),
+			readAuthority: async (_projectRoot, delegationId) => delegationId === DIAGNOSIS_DELEGATION_ID
+				? completedDiagnosisAuthority()
+				: acceptedAuthority(EARLIER_DELEGATION_ID, ["unrelated.txt"]),
+			readCommittedGeneration: async (_projectRoot, delegationId) => {
+				assert.equal(delegationId, EARLIER_DELEGATION_ID);
+				return {
+					ok: true,
+					value: {
+						records: {
+							"after.json": {
+								git_head: reviewedSnapshot.gitHead,
+								changed_paths: ["unrelated.txt"],
+								path_statuses: { "unrelated.txt": reviewedSnapshot.pathStatuses["unrelated.txt"] },
+								path_digests: { "unrelated.txt": reviewedSnapshot.pathDigests["unrelated.txt"] },
+							},
+						},
+					} as never,
+				};
+			},
+			collectBinding: async (_projectRoot, delegationId) => {
+				assert.equal(delegationId, EARLIER_DELEGATION_ID);
+				return { status: "conflict", hash: "b".repeat(64), kind: "changeset-relevance-v2", code: "head_conflict" };
+			},
+		};
+		const result = await commitLatestReviewedDelegationV1({
+			project_root: root,
+			message: "feat: commit earlier reviewed slice",
+			now: "2026-08-25T13:01:00.000Z",
+			exec,
+		}, diagnosisLatestServices);
+		assert.equal(result.ok, true);
+		if (!result.ok) return;
+		assert.equal(result.delegation_id, EARLIER_DELEGATION_ID);
+		assert.equal(result.authority_binding, "accepted_head_descendant");
+		assert.deepEqual(result.committed_paths, ["unrelated.txt"]);
+		assert.equal(result.remaining_changed_paths, 0);
+		assert.equal((await git(root, "status", "--short")).trim(), "");
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
