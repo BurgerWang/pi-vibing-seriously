@@ -309,8 +309,9 @@ below yield the current delegate parameter-schema hash
 `fc20b3d36eb2f43f78bb2012635eb1906d96845aeafdacd130a70630a2a8dffd` and
 the combined current unreleased framework-reliability public tool-surface
 hash (including semantic REPAIR, repair-lineage, stricter Gate evidence, and
-the appended review-bound local-commit capability) is
-`9b3ac0e27420f2e1269cd619c837d2cddab582830642a3ad121eeda0a469b410`.
+the appended review-bound local-commit capability and its reviewed-backlog
+continuation contract) is
+`8752017b6c43021147b7c0f7c7e0a73ef9b67a518269a94d8bbe7c492bbd4013`.
 Repeated same-mode builds remain deterministic; the separately retained
 governance-v1 schema hash does not change.
 
@@ -652,9 +653,22 @@ remain unchanged; the current catalog is 12 tools and the strict Sol DEV
 surface moves 15 → 16 (an active edit/write lease moves 17 → 18). The frozen
 governance-v1 catalog remains the original 11-tool view. This is an intentional
 one-time tool-name/order/schema fingerprint transition. The new tool accepts
-only a bounded message and derives its exact non-empty paths from the latest
-strict finalized semantic review; it adds no push, amend, reset, clean, stash,
+only a bounded message and derives its exact non-empty paths from strict
+finalized semantic reviews; it adds no push, amend, clean, stash,
 branch-switch, Gate, Formal, or production authority.
+
+The reviewed-backlog continuation keeps that same tool name, position, and
+single-message input shape. Its static metadata now tells Sol to call the tool
+again after a successful non-clean checkpoint rather than ask the user to
+stage older reviewed changes. After HEAD advances, an older accepted slice is
+eligible only for the exact `head_conflict` case, when current HEAD descends
+from its reviewed HEAD, no intervening commit touched its reviewed paths, and
+their live status/content equal the sealed after-record. This metadata/schema
+wording update is one intentional current fingerprint transition; after
+reload, same-mode builds are stable again. The current ordered workbench
+catalog hash is
+`38aea91e9f4fe478874e2ecdcc4ad6c2400df262182097ef71e7be2dd1c42ef3`;
+the frozen governance-v1 catalog remains unchanged.
 
 ## NRO N1/N2 (Commander Native Tool Optimization) — additive compatibility
 

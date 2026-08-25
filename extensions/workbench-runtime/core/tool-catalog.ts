@@ -299,7 +299,7 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 	workbench_commit_reviewed: Type.Object({
 		message: Type.String({
 			description:
-				"Single-line local Git commit message. The runtime selects only the latest finalized semantic review's checked paths; it never pushes, amends, resets, cleans, stashes, switches branches, or bypasses review authority.",
+				"Single-line local Git commit message. The runtime selects the newest still-present finalized semantic review's exact checked paths, including a strictly compatible older reviewed slice after an earlier checkpoint advanced HEAD; it never pushes, amends, resets the worktree, cleans, stashes, switches branches, accepts paths, or bypasses review authority.",
 			minLength: 1,
 			maxLength: 240,
 			pattern: "^[^\\r\\n\\u0000-\\u001f\\u007f]+$",
@@ -548,10 +548,11 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 		name: "workbench_commit_reviewed",
 		label: "Workbench commit reviewed changes",
 		description:
-			"Create one local Git commit from the latest finalized, hash-bound semantic ACCEPT authority. The runtime derives the exact reviewed path set from durable delegation records, revalidates current project bytes, rejects unrelated staged changes and in-progress Git operations, serializes against worker starts, verifies the created commit path set, and preserves unrelated dirty files. Available only to the approved Sol commander in DEV. It never pushes, amends, resets or cleans the worktree, stashes, switches branches, or accepts caller-supplied paths.",
-		promptSnippet: "Commit the latest semantically accepted worker changes locally (review-bound paths only; never push)",
+			"Create one local Git commit from the newest still-present finalized, hash-bound semantic ACCEPT authority. After an earlier reviewed checkpoint advances HEAD, the runtime may continue to an older reviewed slice only when the current failure is exactly head_conflict, HEAD is a descendant of that review's HEAD, intervening commits did not touch its paths, and its live status/content exactly match the sealed after-record. It derives paths from durable authority, rejects unrelated staged changes and in-progress Git operations, serializes against worker starts, verifies the created commit path set, and preserves unrelated dirty files. Available only to the approved Sol commander in DEV. It never pushes, amends, resets the worktree, cleans or stashes it, switches branches, or accepts caller-supplied paths.",
+		promptSnippet: "Commit the next still-present semantically accepted worker slice locally (review-bound paths only; never push)",
 		promptGuidelines: [
-			"After the latest non-zero implementation diff has complete semantic ACCEPT authority and the relevant checks are done, use workbench_commit_reviewed to create the local checkpoint without asking the user to run Git manually.",
+			"After non-zero implementation diffs have complete semantic ACCEPT authority and the relevant checks are done, use workbench_commit_reviewed to create the local checkpoint without asking the user to run Git manually.",
+			"When a successful result reports remaining changes and next_action=CALL_WORKBENCH_COMMIT_REVIEWED_AGAIN, call it again with the next concise message. The tool itself selects the next exact reviewed slice; continue until the worktree is clean or it reports review_not_ready or another fail-closed error. Never ask the user to stage an already reviewed backlog manually.",
 			"Pass only a concise commit message. Paths are derived from durable review authority; never claim push, release, Gate, Formal, or production authority from a local commit.",
 		],
 	},

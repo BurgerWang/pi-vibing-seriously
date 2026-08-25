@@ -55,6 +55,13 @@ publication, `/reload`, or measured live provider cache improvement is claimed.
 
 ### Changed
 
+- Review-bound local checkpointing now continues through older finalized
+  semantic-ACCEPT slices after the first checkpoint advances HEAD. The
+  fallback accepts only exact `head_conflict` descendants whose intervening
+  commits did not touch the candidate paths and whose current status/content
+  still match the sealed review snapshot. A successful non-clean checkpoint
+  tells Sol to call the tool again; reviewed backlog staging is no longer
+  handed back to the user, and push remains unavailable.
 - Skill loading is development-first: five concise workflow/router skills stay
   model-visible, while nine orientation, CLI, release, and research specialists
   are explicit-only. Prompt templates select one primary workflow, references

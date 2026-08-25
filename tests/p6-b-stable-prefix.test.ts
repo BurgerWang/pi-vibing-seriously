@@ -184,9 +184,9 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 	assert.equal(a.toolOrderHash, canonicalHash(VERIFY_TOOLS), "order hash = canonical hash of the explicit MODE_TOOLS order");
 });
 
-test("v0.10.0 public tool surface has the intentional framework-reliability transition hash", () => {
+test("v0.10.0 public tool surface has the intentional reviewed-backlog continuation transition hash", () => {
 	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
-	const currentHash = "9b3ac0e27420f2e1269cd619c837d2cddab582830642a3ad121eeda0a469b410";
+	const currentHash = "8752017b6c43021147b7c0f7c7e0a73ef9b67a518269a94d8bbe7c492bbd4013";
 	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
 	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the documented 0.10.0 hash");
 });
@@ -681,8 +681,8 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.equal(
 		canonicalHash(workbenchToolMetadataOrdered()),
-		"efd02bf5b1fa358a37bb7838c372817a9f24279985f0f70149462e9eb49b8ed4",
-		"current public catalog hash is machine-pinned after reviewed local commit was appended",
+		"38aea91e9f4fe478874e2ecdcc4ad6c2400df262182097ef71e7be2dd1c42ef3",
+		"current public catalog hash is machine-pinned after reviewed backlog continuation was added",
 	);
 });
 

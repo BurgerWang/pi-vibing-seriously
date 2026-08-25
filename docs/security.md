@@ -113,15 +113,21 @@ guards remain authoritative; other controllers are not newly denied).
 
 The single mutation capability added to the ordinary Sol surface is
 `workbench_commit_reviewed`. It is not a shell or general Git tool: its only
-caller input is a bounded single-line message. It strict-reads the latest
-finalized semantic ACCEPT authority, derives that review's non-empty checked
-path set, revalidates the current binding, rejects unrelated staged paths and
-in-progress Git operations, and serializes against delegation starts. It then
-stages only those reviewed paths and verifies the new commit contains exactly
-that set. Unrelated dirt remains uncommitted. Push, amend, reset, clean, stash,
-branch switching, caller-selected paths, and review/Gate bypass are absent by
-construction. A local commit is a checkpoint, never Gate/Formal/production
-authority.
+caller input is a bounded single-line message. It strict-reads finalized
+semantic ACCEPT authorities and derives the newest still-present non-empty
+checked path set. The normal path revalidates the current binding. The only
+historical fallback is an exact `head_conflict`: current HEAD must descend from
+the reviewed HEAD, its intervening commits must not touch those paths, and live
+status/content must equal the sealed after-record. It rejects unrelated staged
+paths and in-progress Git operations, serializes against delegation starts,
+stages only explicit derived paths, and verifies the new commit contains
+exactly that set. A successful non-clean result tells Sol to repeat the tool;
+it does not transfer reviewed backlog staging to the user. Unrelated dirt
+remains uncommitted. If a pre-commit failure follows tool-owned staging, it may
+unstage only that exact derived path set without changing worktree bytes. Push,
+amend, worktree reset, clean, stash, branch switching,
+caller-selected paths, and review/Gate bypass are absent by construction. A
+local commit is a checkpoint, never Gate/Formal/production authority.
 
 Second-layer `tool_call` guard for Sol: `bash` is always blocked; any direct
 canonical project-relative `edit`/`write` requires an ACTIVE user-issued

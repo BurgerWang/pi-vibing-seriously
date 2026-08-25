@@ -325,13 +325,19 @@ Consequences for the commander workflow:
   declared workbench recipes only.
 - Sol does not receive ordinary `edit`/`write`; routine implementation is a
   bounded Luna delegation.
-- After the latest non-zero implementation has finalized semantic ACCEPT
-  authority and the relevant checks are complete, Sol may call
-  `workbench_commit_reviewed` with a commit message. The runtime selects only
-  the reviewed paths, revalidates their current binding, preserves unrelated
-  dirt, serializes against worker starts, and verifies the resulting local
-  commit. It never pushes, amends, resets, cleans, stashes, switches branches,
-  or accepts caller-supplied paths; no per-commit user confirmation is needed.
+- After non-zero implementations have finalized semantic ACCEPT authority and
+  the relevant checks are complete, Sol may call `workbench_commit_reviewed`
+  with a commit message. The runtime selects the newest still-present reviewed
+  slice, preserves unrelated dirt, serializes against worker starts, and
+  verifies the resulting local commit. After one checkpoint changes HEAD, the
+  next older slice must pass the strict accepted-descendant proof (exact
+  `head_conflict`, descendant HEAD, no intervening touch of its paths, exact
+  sealed status/content). A non-clean success directs Sol to call the tool
+  again rather than request manual staging. It never pushes, amends, resets the
+  worktree, cleans, stashes, switches branches, or accepts caller-supplied
+  paths; no per-commit user confirmation is needed. A failed commit attempt may
+  unstage only the exact tool-staged paths without changing their worktree
+  bytes.
 - Any direct Sol `edit`/`write` requires a **temporary write lease exception**, issued by the
   human through user-only slash commands (never by prompts or config):
   `/q-commander-write-unlock <reason> --paths <comma-list> --calls <N>
@@ -1260,10 +1266,13 @@ untrusted repositories or unattended automation.
 5. Once the candidate is stable, switch to VERIFY and run one final recipe or
    gate set proportionate to task or release risk. Base the verdict on current
    records and code, never worker prose or a historical handoff document.
-6. Return to DEV if needed and use `workbench_commit_reviewed` for the local
-   checkpoint. Run verification before this commit: changing HEAD intentionally
-   makes the reviewed worktree binding historical, while the next bounded
-   delegation may proceed from that accepted descendant commit.
+6. Return to DEV if needed and use `workbench_commit_reviewed` for local
+   checkpoints. Run verification before the first commit. When a success
+   reports remaining changes and `CALL_WORKBENCH_COMMIT_REVIEWED_AGAIN`, call
+   it again; the runtime selects and proves the next reviewed slice, or stops
+   fail-closed if the remainder lacks usable authority. Changing HEAD makes
+   older worktree bindings historical, while the accepted-descendant proof and
+   the existing successor rule preserve safe continuation.
 
 ## Stable-prefix and cache behavior
 

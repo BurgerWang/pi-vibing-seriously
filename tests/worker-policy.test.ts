@@ -408,7 +408,7 @@ test("worker-delegation documentation defines fixed Sol/Luna boundaries and stri
 	assert.match(doc, /## Fixed Sol -> Luna write authority \(current; legacy id P7\)/);
 	assert.match(doc, /fixed 16-tool\s+read\/control\/delegation\/local-commit surface/);
 	assert.match(doc, /`workbench_commit_reviewed`/);
-	assert.match(doc, /never pushes, amends, resets, cleans, stashes, switches branches/);
+	assert.match(doc, /never pushes, amends, resets the\s+worktree, cleans, stashes, switches branches/);
 	assert.match(doc, /routine source,\s+test, and documentation edits are delegated to Luna/);
 	assert.match(doc, /Any direct Sol `edit`\/`write` requires a \*\*temporary write lease exception\*\*/);
 	assert.match(doc, /`WF:LOCKED` otherwise/);

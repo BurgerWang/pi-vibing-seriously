@@ -2,13 +2,14 @@
  * Bound local Git commit for one finalized semantic delegation review.
  *
  * This is deliberately not a shell escape. The caller supplies only a commit
- * message; paths come from the latest strict review authority. The operation
+ * message; paths come from strict review authority. The operation
  * never pushes, amends, cleans, resets the worktree, switches branches, or
  * stages an unrelated path.
  */
 
-import { lstat } from "node:fs/promises";
-import { isAbsolute, resolve } from "node:path";
+import type { Dirent } from "node:fs";
+import { lstat, readdir } from "node:fs/promises";
+import { isAbsolute, join, resolve } from "node:path";
 
 import type { ExecFn } from "./config.ts";
 import {
@@ -16,12 +17,19 @@ import {
 	releaseProjectDelegationStartLockV1,
 	type ProjectDelegationStartLockLeaseV1,
 } from "./delegation-start-lock.ts";
-import { collectGitFacts, type GitFacts } from "./delegation-ledger.ts";
+import {
+	collectGitFacts,
+	delegationsDir,
+	isValidDelegationId,
+	type GitFacts,
+} from "./delegation-ledger.ts";
 import {
 	collectCurrentDelegationBindingV2,
+	MAX_PROJECT_DELEGATION_ENTRIES_V2,
 	readDelegationAuthorityObservationV2,
 	readLatestProjectDelegationTransactionV2,
 } from "./delegation-project-authority.ts";
+import { readDelegationCommittedGenerationV2 } from "./delegation-transaction-storage.ts";
 
 export const LOCAL_COMMIT_MESSAGE_MAX_BYTES_V1 = 240 as const;
 const COMMIT_HASH_RE = /^[0-9a-f]{40,64}$/u;
@@ -65,14 +73,58 @@ export interface LocalReviewedCommitSuccessV1 {
 	branch: string;
 	committed_paths: string[];
 	remaining_changed_paths: number;
+	authority_binding: "current" | "accepted_head_descendant";
 	lock_release: "released" | "recovery_required";
 }
 
 export type LocalReviewedCommitResultV1 = LocalReviewedCommitFailureV1 | LocalReviewedCommitSuccessV1;
 
+export type LocalCommitCandidateDelegationIdsResultV1 =
+	| { ok: true; value: string[] }
+	| { ok: false };
+
+/**
+ * Discover bounded delegation ids for reviewed-backlog checkpointing.
+ *
+ * This reads names only. Every candidate still has to pass the strict v2
+ * transaction, committed-generation, review, and live Git checks below.
+ */
+export async function listLocalCommitCandidateDelegationIdsV1(
+	projectRoot: string,
+): Promise<LocalCommitCandidateDelegationIdsResultV1> {
+	const root = delegationsDir(projectRoot);
+	let entries: Dirent<string>[];
+	try {
+		const stat = await lstat(root);
+		if (!stat.isDirectory() || stat.isSymbolicLink()) return { ok: false };
+		entries = await readdir(root, { withFileTypes: true, encoding: "utf8" });
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ENOENT"
+			? { ok: true, value: [] }
+			: { ok: false };
+	}
+	if (entries.length > MAX_PROJECT_DELEGATION_ENTRIES_V2) return { ok: false };
+	const ids: string[] = [];
+	for (const entry of entries) {
+		if (!isValidDelegationId(entry.name)) continue;
+		if (!entry.isDirectory() || entry.isSymbolicLink()) return { ok: false };
+		try {
+			const stat = await lstat(join(root, entry.name));
+			if (!stat.isDirectory() || stat.isSymbolicLink()) return { ok: false };
+		} catch {
+			return { ok: false };
+		}
+		ids.push(entry.name);
+	}
+	ids.sort((left, right) => left === right ? 0 : left < right ? 1 : -1);
+	return { ok: true, value: ids };
+}
+
 export interface LocalReviewedCommitServicesV1 {
 	readLatestTransaction: typeof readLatestProjectDelegationTransactionV2;
+	listCandidateIds: typeof listLocalCommitCandidateDelegationIdsV1;
 	readAuthority: typeof readDelegationAuthorityObservationV2;
+	readCommittedGeneration: typeof readDelegationCommittedGenerationV2;
 	collectBinding: typeof collectCurrentDelegationBindingV2;
 	collectGitFacts: typeof collectGitFacts;
 	acquireStartLock: typeof acquireProjectDelegationStartLockV1;
@@ -81,7 +133,9 @@ export interface LocalReviewedCommitServicesV1 {
 
 export const LOCAL_REVIEWED_COMMIT_SERVICES_V1: LocalReviewedCommitServicesV1 = Object.freeze({
 	readLatestTransaction: readLatestProjectDelegationTransactionV2,
+	listCandidateIds: listLocalCommitCandidateDelegationIdsV1,
 	readAuthority: readDelegationAuthorityObservationV2,
+	readCommittedGeneration: readDelegationCommittedGenerationV2,
 	collectBinding: collectCurrentDelegationBindingV2,
 	collectGitFacts,
 	acquireStartLock: acquireProjectDelegationStartLockV1,
@@ -138,12 +192,75 @@ function parseNulPaths(value: string): string[] {
 	return value.split("\0").filter(Boolean).sort((left, right) => Buffer.from(left).compare(Buffer.from(right)));
 }
 
+interface ReviewedAfterSnapshotV1 {
+	gitHead: string;
+	pathStatuses: Record<string, string>;
+	pathDigests: Record<string, string>;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function reviewedAfterSnapshot(
+	after: unknown,
+	reviewedPaths: readonly string[],
+): ReviewedAfterSnapshotV1 | undefined {
+	if (!isRecord(after) || typeof after.git_head !== "string" || !COMMIT_HASH_RE.test(after.git_head)
+		|| !isRecord(after.path_statuses) || !isRecord(after.path_digests)
+		|| !Array.isArray(after.changed_paths) || !after.changed_paths.every((path) => typeof path === "string")
+		|| !sameStrings(after.changed_paths, reviewedPaths)) return undefined;
+	const statuses: Record<string, string> = {};
+	const digests: Record<string, string> = {};
+	for (const path of reviewedPaths) {
+		const status = after.path_statuses[path];
+		if (typeof status !== "string" || status.length === 0) return undefined;
+		statuses[path] = status;
+		const digest = after.path_digests[path];
+		if (digest !== undefined) {
+			if (typeof digest !== "string" || !/^[a-f0-9]{64}$/u.test(digest)) return undefined;
+			digests[path] = digest;
+		}
+	}
+	return { gitHead: after.git_head, pathStatuses: statuses, pathDigests: digests };
+}
+
+function matchesReviewedSnapshot(
+	facts: GitFacts,
+	paths: readonly string[],
+	snapshot: ReviewedAfterSnapshotV1,
+): boolean {
+	return paths.every((path) => facts.pathStatuses[path] === snapshot.pathStatuses[path]
+		&& facts.pathDigests[path] === snapshot.pathDigests[path]);
+}
+
 async function runGit(exec: ExecFn, projectRoot: string, args: string[]): Promise<{ ok: true; stdout: string } | { ok: false }> {
 	try {
 		const result = await exec("git", args, { cwd: projectRoot });
 		return result.code === 0 ? { ok: true, stdout: result.stdout } : { ok: false };
 	} catch {
 		return { ok: false };
+	}
+}
+
+async function acceptedHeadDescendantCompatible(input: {
+	exec: ExecFn;
+	projectRoot: string;
+	reviewedHead: string;
+	currentHead: string;
+	reviewedPaths: string[];
+}): Promise<boolean> {
+	try {
+		const ancestor = await input.exec("git", ["merge-base", "--is-ancestor", input.reviewedHead, input.currentHead], {
+			cwd: input.projectRoot,
+		});
+		if (ancestor.code !== 0) return false;
+		const touched = await input.exec("git", [
+			"diff", "--name-only", "--find-renames", "-z", `${input.reviewedHead}..${input.currentHead}`, "--", ...input.reviewedPaths,
+		], { cwd: input.projectRoot });
+		return touched.code === 0 && parseNulPaths(touched.stdout).length === 0;
+	} catch {
+		return false;
 	}
 }
 
@@ -185,8 +302,14 @@ async function releaseLease(
 }
 
 /**
- * Commit exactly the latest finalized semantic review's checked paths.
- * Receipt/Gate/review files remain outside the commit and push is never run.
+ * Commit exactly one still-present finalized semantic review's checked paths.
+ *
+ * The newest authority is preferred. After an earlier reviewed checkpoint has
+ * advanced HEAD, the next historical authority is usable only for the narrow
+ * `head_conflict` case: its reviewed bytes/status must still match the sealed
+ * after-record, current HEAD must descend from the reviewed HEAD, and no
+ * intervening commit may have touched those paths. Receipt/Gate/review files
+ * remain outside the commit and push is never run.
  */
 export async function commitLatestReviewedDelegationV1(input: {
 	project_root: string;
@@ -205,40 +328,24 @@ export async function commitLatestReviewedDelegationV1(input: {
 	const firstLatest = await services.readLatestTransaction(input.project_root);
 	if (!firstLatest.ok) return failure("authority_unavailable", "latest delegation authority is unavailable");
 	if (firstLatest.value === null) return failure("review_not_ready", "no reviewed delegation is available to commit");
-	const delegationId = firstLatest.value.delegation_id;
+	const lockDelegationId = firstLatest.value.delegation_id;
 
 	const acquired = await services.acquireStartLock({
 		project_root: input.project_root,
-		delegation_id: delegationId,
+		delegation_id: lockDelegationId,
 		now: input.now,
 	});
-	if (!acquired.ok) return failure("lock_conflict", "another delegation or local commit is active", delegationId);
+	if (!acquired.ok) return failure("lock_conflict", "another delegation or local commit is active", lockDelegationId);
 	const lease = acquired.value;
+	let delegationId = lockDelegationId;
 	let stagedByOperation = false;
 	let committedHash: string | undefined;
 	let reviewedPathsForRecovery: string[] = [];
 	let outcome: LocalReviewedCommitResultV1;
 	const perform = async (): Promise<LocalReviewedCommitResultV1> => {
 		const latest = await services.readLatestTransaction(input.project_root);
-		if (!latest.ok || latest.value === null || latest.value.delegation_id !== delegationId) {
-			outcome = failure("authority_unavailable", "latest delegation changed before commit authority was acquired", delegationId);
-			return outcome;
-		}
-		const authority = await services.readAuthority(input.project_root, delegationId);
-		if (authority.kind !== "v2" || authority.transactionStatus !== "REVIEWED" || !authority.finalized
-			|| !authority.semanticAccepted || authority.semanticBindingHash === null || authority.review === null) {
-			outcome = failure("review_not_ready", "latest delegation lacks finalized semantic ACCEPT authority", delegationId);
-			return outcome;
-		}
-		const reviewedPaths = sortedUnique(authority.review.checked_paths);
-		reviewedPathsForRecovery = reviewedPaths;
-		if (reviewedPaths.length === 0) {
-			outcome = failure("review_not_ready", "the reviewed delegation has no project changes to commit", delegationId);
-			return outcome;
-		}
-		const binding = await services.collectBinding(input.project_root, delegationId, input.exec);
-		if (binding.status !== "fresh" || binding.hash !== authority.semanticBindingHash) {
-			outcome = failure("binding_conflict", "reviewed project bytes no longer match semantic ACCEPT authority", delegationId);
+		if (!latest.ok || latest.value === null || latest.value.delegation_id !== lockDelegationId) {
+			outcome = failure("authority_unavailable", "latest delegation changed before commit authority was acquired", lockDelegationId);
 			return outcome;
 		}
 
@@ -246,17 +353,90 @@ export async function commitLatestReviewedDelegationV1(input: {
 		try {
 			before = await services.collectGitFacts(input.project_root, input.exec);
 		} catch {
-			outcome = failure("workspace_unavailable", "Git workspace facts are unavailable", delegationId);
+			outcome = failure("workspace_unavailable", "Git workspace facts are unavailable", lockDelegationId);
 			return outcome;
 		}
 		if (before.gitHead === null) {
-			outcome = failure("workspace_unavailable", "a committed Git HEAD is required", delegationId);
+			outcome = failure("workspace_unavailable", "a committed Git HEAD is required", lockDelegationId);
 			return outcome;
 		}
-		if (hasConflict(before) || !reviewedPaths.every((path) => before.changedPaths.includes(path))) {
-			outcome = failure("workspace_changed", "reviewed paths are missing or contain unresolved conflicts", delegationId);
+		if (hasConflict(before)) {
+			outcome = failure("workspace_changed", "the workspace contains unresolved conflicts", lockDelegationId);
 			return outcome;
 		}
+
+		const listed = await services.listCandidateIds(input.project_root);
+		if (!listed.ok || !listed.value.includes(lockDelegationId)) {
+			outcome = failure("authority_unavailable", "reviewed delegation history is unavailable", lockDelegationId);
+			return outcome;
+		}
+		const candidateIds = [lockDelegationId, ...listed.value.filter((id) => id !== lockDelegationId)];
+		let reviewedPaths: string[] | undefined;
+		let authorityBinding: LocalReviewedCommitSuccessV1["authority_binding"] | undefined;
+		for (const candidateId of candidateIds) {
+			const authority = await services.readAuthority(input.project_root, candidateId);
+			if (authority.kind === "invalid-v2") {
+				outcome = failure("authority_unavailable", "reviewed delegation history contains invalid authority", candidateId);
+				return outcome;
+			}
+			if (authority.kind !== "v2" || authority.transactionStatus !== "REVIEWED" || !authority.finalized
+				|| !authority.semanticAccepted || authority.semanticBindingHash === null || authority.review === null) {
+				if (candidateId === lockDelegationId) {
+					outcome = failure("review_not_ready", "latest delegation lacks finalized semantic ACCEPT authority", candidateId);
+					return outcome;
+				}
+				continue;
+			}
+			const paths = sortedUnique(authority.review.checked_paths);
+			if (paths.length === 0) continue;
+			const present = paths.filter((path) => before.changedPaths.includes(path));
+			if (present.length === 0) continue;
+			if (present.length !== paths.length) {
+				outcome = failure("workspace_changed", "a semantic ACCEPT path set is only partially present", candidateId);
+				return outcome;
+			}
+
+			const binding = await services.collectBinding(input.project_root, candidateId, input.exec);
+			if (binding.status === "fresh" && binding.hash === authority.semanticBindingHash) {
+				delegationId = candidateId;
+				reviewedPaths = paths;
+				authorityBinding = "current";
+				break;
+			}
+			if (binding.status !== "conflict" || binding.code !== "head_conflict") {
+				outcome = failure("binding_conflict", "reviewed project bytes no longer match semantic ACCEPT authority", candidateId);
+				return outcome;
+			}
+			const committed = await services.readCommittedGeneration(input.project_root, candidateId);
+			if (!committed.ok) {
+				outcome = failure("authority_unavailable", "the accepted delegation generation is unavailable", candidateId);
+				return outcome;
+			}
+			const snapshot = reviewedAfterSnapshot(committed.value.records["after.json"], paths);
+			if (snapshot === undefined || !matchesReviewedSnapshot(before, paths, snapshot)) {
+				outcome = failure("workspace_changed", "historical semantic ACCEPT bytes no longer match the sealed reviewed snapshot", candidateId);
+				return outcome;
+			}
+			if (!await acceptedHeadDescendantCompatible({
+				exec: input.exec,
+				projectRoot: input.project_root,
+				reviewedHead: snapshot.gitHead,
+				currentHead: before.gitHead,
+				reviewedPaths: paths,
+			})) {
+				outcome = failure("binding_conflict", "HEAD advancement is not a path-disjoint descendant of semantic ACCEPT authority", candidateId);
+				return outcome;
+			}
+			delegationId = candidateId;
+			reviewedPaths = paths;
+			authorityBinding = "accepted_head_descendant";
+			break;
+		}
+		if (reviewedPaths === undefined || authorityBinding === undefined) {
+			outcome = failure("review_not_ready", "no still-present finalized semantic ACCEPT path set is available to commit", lockDelegationId);
+			return outcome;
+		}
+		reviewedPathsForRecovery = reviewedPaths;
 		const stagedBefore = sortedUnique(stagedPaths(before));
 		if (stagedBefore.length > 0 && !sameStrings(stagedBefore, reviewedPaths)) {
 			outcome = failure("staged_changes_present", "the Git index contains changes outside the reviewed path set", delegationId);
@@ -279,7 +459,7 @@ export async function commitLatestReviewedDelegationV1(input: {
 			return outcome;
 		}
 
-		const added = await runGit(input.exec, input.project_root, ["add", "-A", "--", ...reviewedPaths]);
+		const added = await runGit(input.exec, input.project_root, ["add", "--", ...reviewedPaths]);
 		if (!added.ok) {
 			outcome = failure("commit_failed", "reviewed paths could not be staged", delegationId);
 			return outcome;
@@ -364,6 +544,7 @@ export async function commitLatestReviewedDelegationV1(input: {
 			branch,
 			committed_paths: reviewedPaths,
 			remaining_changed_paths: remaining.changedPaths.length,
+			authority_binding: authorityBinding,
 			lock_release: "released",
 		};
 		return outcome;

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -15,6 +15,7 @@ import {
 
 const execFileAsync = promisify(execFile);
 const DELEGATION_ID = "20260825-120000-abcd";
+const EARLIER_DELEGATION_ID = "20260825-110000-wxyz";
 const BINDING_HASH = "a".repeat(64);
 
 const exec: ExecFn = async (command, args, options = {}) => {
@@ -56,9 +57,25 @@ async function repo(): Promise<string> {
 	return root;
 }
 
+function acceptedAuthority(delegationId: string, paths: string[]) {
+	return {
+		kind: "v2" as const,
+		transactionStatus: "REVIEWED",
+		transactionVerdict: null,
+		review: { checked_paths: paths } as never,
+		reviewPath: `.pi/workbench/delegations/${delegationId}/v2/review.json`,
+		finalized: true,
+		semanticAccepted: true,
+		semanticBindingHash: BINDING_HASH,
+		semanticSource: "embedded" as const,
+		semanticReviewer: "openai-codex/gpt-5.6-sol",
+		semanticAcceptedAt: "2026-08-25T12:00:00.000Z",
+	};
+}
+
 function services(options: {
 	paths?: string[];
-	bindingStatus?: "fresh" | "conflict" | "unavailable";
+	bindingStatus?: "fresh" | "conflict" | "head_conflict" | "unavailable";
 } = {}): LocalReviewedCommitServicesV1 {
 	const paths = options.paths ?? ["reviewed.txt"];
 	return {
@@ -66,23 +83,18 @@ function services(options: {
 			ok: true,
 			value: { delegation_id: DELEGATION_ID } as never,
 		}),
-		readAuthority: async () => ({
-			kind: "v2",
-			transactionStatus: "REVIEWED",
-			transactionVerdict: null,
-			review: { checked_paths: paths } as never,
-			reviewPath: `.pi/workbench/delegations/${DELEGATION_ID}/v2/review.json`,
-			finalized: true,
-			semanticAccepted: true,
-			semanticBindingHash: BINDING_HASH,
-			semanticSource: "embedded",
-			semanticReviewer: "openai-codex/gpt-5.6-sol",
-			semanticAcceptedAt: "2026-08-25T12:00:00.000Z",
-		}),
+		listCandidateIds: async () => ({ ok: true, value: [DELEGATION_ID] }),
+		readAuthority: async () => acceptedAuthority(DELEGATION_ID, paths),
+		readCommittedGeneration: async () => { throw new Error("historical generation must not be read"); },
 		collectBinding: async () => options.bindingStatus === "unavailable"
 			? { status: "unavailable" }
-			: options.bindingStatus === "conflict"
-				? { status: "conflict", hash: "b".repeat(64), kind: "changeset-relevance-v2", code: "binding_conflict" }
+			: options.bindingStatus === "conflict" || options.bindingStatus === "head_conflict"
+				? {
+					status: "conflict",
+					hash: "b".repeat(64),
+					kind: "changeset-relevance-v2",
+					code: options.bindingStatus === "head_conflict" ? "head_conflict" : "binding_conflict",
+				}
 				: { status: "fresh", hash: BINDING_HASH, kind: "changeset-relevance-v2" },
 		collectGitFacts,
 		acquireStartLock: async (input) => ({
@@ -118,10 +130,173 @@ test("reviewed local commit commits only authority paths and preserves unrelated
 		assert.equal(result.branch, "main");
 		assert.deepEqual(result.committed_paths, ["reviewed.txt"]);
 		assert.equal(result.remaining_changed_paths, 1);
+		assert.equal(result.authority_binding, "current");
 		assert.equal(result.lock_release, "released");
 		assert.equal((await git(root, "show", "--format=", "--name-only", "HEAD")).trim(), "reviewed.txt");
 		assert.equal((await readFile(join(root, "unrelated.txt"), "utf8")), "unrelated change\n");
 		assert.match(await git(root, "status", "--short"), /^ M unrelated\.txt$/m);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("explicit reviewed-path staging includes a reviewed deletion without git add -A", async () => {
+	const root = await repo();
+	try {
+		await unlink(join(root, "reviewed.txt"));
+		const result = await commitLatestReviewedDelegationV1({
+			project_root: root,
+			message: "fix: remove reviewed file",
+			now: "2026-08-25T12:01:30.000Z",
+			exec,
+		}, services());
+		assert.equal(result.ok, true);
+		if (!result.ok) return;
+		assert.deepEqual(result.committed_paths, ["reviewed.txt"]);
+		assert.match(await git(root, "show", "--format=", "--name-status", "HEAD"), /^D\s+reviewed\.txt$/m);
+		assert.equal((await git(root, "status", "--short")).trim(), "");
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("reviewed local commit continues through older accepted slices after HEAD advances", async () => {
+	const root = await repo();
+	try {
+		await writeFile(join(root, "reviewed.txt"), "newest accepted change\n", "utf8");
+		await writeFile(join(root, "unrelated.txt"), "earlier accepted change\n", "utf8");
+		const reviewedSnapshot = await collectGitFacts(root, exec);
+		assert.ok(reviewedSnapshot.gitHead);
+		const base = services();
+		const historicalServices: LocalReviewedCommitServicesV1 = {
+			...base,
+			listCandidateIds: async () => ({ ok: true, value: [DELEGATION_ID, EARLIER_DELEGATION_ID] }),
+			readAuthority: async (_projectRoot, delegationId) => delegationId === DELEGATION_ID
+				? acceptedAuthority(DELEGATION_ID, ["reviewed.txt"])
+				: acceptedAuthority(EARLIER_DELEGATION_ID, ["unrelated.txt"]),
+			readCommittedGeneration: async (_projectRoot, delegationId) => {
+				assert.equal(delegationId, EARLIER_DELEGATION_ID);
+				return {
+					ok: true,
+					value: {
+						records: {
+							"after.json": {
+								git_head: reviewedSnapshot.gitHead,
+								changed_paths: ["unrelated.txt"],
+								path_statuses: { "unrelated.txt": reviewedSnapshot.pathStatuses["unrelated.txt"] },
+								path_digests: { "unrelated.txt": reviewedSnapshot.pathDigests["unrelated.txt"] },
+							},
+						},
+					} as never,
+				};
+			},
+			collectBinding: async (_projectRoot, delegationId) => delegationId === DELEGATION_ID
+				? { status: "fresh", hash: BINDING_HASH, kind: "changeset-relevance-v2" }
+				: { status: "conflict", hash: "b".repeat(64), kind: "changeset-relevance-v2", code: "head_conflict" },
+		};
+
+		const newest = await commitLatestReviewedDelegationV1({
+			project_root: root,
+			message: "feat: newest reviewed slice",
+			now: "2026-08-25T12:01:00.000Z",
+			exec,
+		}, historicalServices);
+		assert.equal(newest.ok, true);
+		if (!newest.ok) return;
+		assert.equal(newest.delegation_id, DELEGATION_ID);
+		assert.equal(newest.authority_binding, "current");
+		assert.equal(newest.remaining_changed_paths, 1);
+
+		const earlier = await commitLatestReviewedDelegationV1({
+			project_root: root,
+			message: "feat: earlier reviewed slice",
+			now: "2026-08-25T12:02:00.000Z",
+			exec,
+		}, historicalServices);
+		assert.equal(earlier.ok, true);
+		if (!earlier.ok) return;
+		assert.equal(earlier.delegation_id, EARLIER_DELEGATION_ID);
+		assert.equal(earlier.authority_binding, "accepted_head_descendant");
+		assert.deepEqual(earlier.committed_paths, ["unrelated.txt"]);
+		assert.equal(earlier.remaining_changed_paths, 0);
+		assert.equal((await git(root, "status", "--short")).trim(), "");
+		assert.equal((await git(root, "log", "-2", "--format=%s")).trim(), "feat: earlier reviewed slice\nfeat: newest reviewed slice");
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("historical acceptance cannot cross a descendant commit that touched its paths", async () => {
+	const root = await repo();
+	try {
+		const reviewedHead = (await git(root, "rev-parse", "HEAD")).trim();
+		await writeFile(join(root, "reviewed.txt"), "accepted bytes\n", "utf8");
+		const reviewedSnapshot = await collectGitFacts(root, exec);
+		await writeFile(join(root, "reviewed.txt"), "intervening committed bytes\n", "utf8");
+		await git(root, "add", "--", "reviewed.txt");
+		await git(root, "commit", "-m", "manual intervening change");
+		await writeFile(join(root, "reviewed.txt"), "accepted bytes\n", "utf8");
+		const base = services({ bindingStatus: "head_conflict" });
+		const historicalServices: LocalReviewedCommitServicesV1 = {
+			...base,
+			readCommittedGeneration: async () => ({
+				ok: true,
+				value: {
+					records: {
+						"after.json": {
+							git_head: reviewedHead,
+							changed_paths: ["reviewed.txt"],
+							path_statuses: { "reviewed.txt": reviewedSnapshot.pathStatuses["reviewed.txt"] },
+							path_digests: { "reviewed.txt": reviewedSnapshot.pathDigests["reviewed.txt"] },
+						},
+					},
+				} as never,
+			}),
+		};
+		const result = await commitLatestReviewedDelegationV1({
+			project_root: root,
+			message: "feat: must reject touched history",
+			now: "2026-08-25T12:03:00.000Z",
+			exec,
+		}, historicalServices);
+		assert.deepEqual(result.ok ? "ok" : result.code, "binding_conflict");
+		assert.equal((await git(root, "diff", "--cached", "--name-only")).trim(), "");
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("an unresolved latest review cannot be bypassed by an older accepted slice", async () => {
+	const root = await repo();
+	try {
+		await writeFile(join(root, "unrelated.txt"), "earlier accepted change\n", "utf8");
+		let bindingCalls = 0;
+		const base = services();
+		const guardedServices: LocalReviewedCommitServicesV1 = {
+			...base,
+			listCandidateIds: async () => ({ ok: true, value: [DELEGATION_ID, EARLIER_DELEGATION_ID] }),
+			readAuthority: async (_projectRoot, delegationId) => delegationId === DELEGATION_ID
+				? {
+					...acceptedAuthority(DELEGATION_ID, ["reviewed.txt"]),
+					transactionStatus: "PENDING_REVIEW",
+					finalized: false,
+					semanticAccepted: false,
+					semanticBindingHash: null,
+				}
+				: acceptedAuthority(EARLIER_DELEGATION_ID, ["unrelated.txt"]),
+			collectBinding: async () => {
+				bindingCalls += 1;
+				return { status: "fresh", hash: BINDING_HASH, kind: "changeset-relevance-v2" };
+			},
+		};
+		const result = await commitLatestReviewedDelegationV1({
+			project_root: root,
+			message: "feat: must not bypass review",
+			now: "2026-08-25T12:04:00.000Z",
+			exec,
+		}, guardedServices);
+		assert.deepEqual(result.ok ? "ok" : result.code, "review_not_ready");
+		assert.equal(bindingCalls, 0);
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}

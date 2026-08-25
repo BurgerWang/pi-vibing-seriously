@@ -30,9 +30,12 @@ description: Primary workflow for building or changing functionality. Use for im
   `skill:validation-ladder` only for a formal verdict, not routine feedback.
 - In a pi-dev-workbench project, after semantic ACCEPT and the relevant final
   checks, `workbench_commit_reviewed` may create the review-bound local
-  checkpoint without per-commit user confirmation. It never authorizes push,
-  publish, release, amend, reset, clean, stash, or branch switching. Outside
-  that dedicated capability, do not commit unless explicitly asked.
+  checkpoint without per-commit user confirmation. If it reports
+  `CALL_WORKBENCH_COMMIT_REVIEWED_AGAIN`, continue until clean or until the tool
+  fails closed; do not ask the user to stage an already reviewed backlog. It
+  never authorizes push, publish, release, amend, worktree reset, clean, stash,
+  or branch switching. Outside that dedicated capability, do not commit unless
+  explicitly asked.
 
 ## Conditional references
 

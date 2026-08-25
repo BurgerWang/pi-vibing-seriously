@@ -82,10 +82,18 @@ export function registerLocalCommitTool(controller: LocalCommitToolController): 
 			const warning = result.lock_release === "recovery_required"
 				? "; warning=local commit succeeded but the project lock requires recovery before the next delegation"
 				: "";
+			const nextActionCode = result.lock_release === "recovery_required"
+				? "RECOVER_PROJECT_LOCK"
+				: result.remaining_changed_paths > 0 ? "CALL_WORKBENCH_COMMIT_REVIEWED_AGAIN" : "NONE";
+			const nextAction = nextActionCode === "RECOVER_PROJECT_LOCK"
+				? "; next_action=RECOVER_PROJECT_LOCK (do not start another commit or delegation until lock recovery succeeds)"
+				: nextActionCode === "CALL_WORKBENCH_COMMIT_REVIEWED_AGAIN"
+					? "; next_action=CALL_WORKBENCH_COMMIT_REVIEWED_AGAIN (the tool will select the next still-present reviewed slice or report review_not_ready; do not ask the user to stage paths)"
+					: "; next_action=NONE (worktree has no remaining project changes)";
 			return {
 				content: [{
 					type: "text" as const,
-					text: `workbench_commit_reviewed: committed; delegation_id=${result.delegation_id}; commit=${result.commit}; branch=${result.branch}; paths=${result.committed_paths.length}; remaining_changes=${result.remaining_changed_paths}; push=NOT_RUN${warning}`,
+					text: `workbench_commit_reviewed: committed; delegation_id=${result.delegation_id}; commit=${result.commit}; branch=${result.branch}; paths=${result.committed_paths.length}; authority_binding=${result.authority_binding}; remaining_changes=${result.remaining_changed_paths}; push=NOT_RUN${warning}${nextAction}`,
 				}],
 				details: {
 					ok: true,
@@ -93,7 +101,9 @@ export function registerLocalCommitTool(controller: LocalCommitToolController): 
 					commit: result.commit,
 					branch: result.branch,
 					path_count: result.committed_paths.length,
+					authority_binding: result.authority_binding,
 					remaining_changed_count: result.remaining_changed_paths,
+					next_action: nextActionCode,
 					push: "NOT_RUN",
 					lock_release: result.lock_release,
 				},

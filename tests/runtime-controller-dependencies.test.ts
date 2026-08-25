@@ -145,6 +145,7 @@ test("local commit controller grants only DEV Sol and reports that push was not 
 				branch: "main",
 				committed_paths: ["src/a.ts"],
 				remaining_changed_paths: 1,
+				authority_binding: "accepted_head_descendant" as const,
 				lock_release: "released" as const,
 			}),
 			commitServices: {} as never,
@@ -163,7 +164,10 @@ test("local commit controller grants only DEV Sol and reports that push was not 
 	assert.equal(result.details.ok, true);
 	assert.equal(result.details.commit, "a".repeat(40));
 	assert.equal(result.details.push, "NOT_RUN");
+	assert.equal(result.details.authority_binding, "accepted_head_descendant");
+	assert.equal(result.details.next_action, "CALL_WORKBENCH_COMMIT_REVIEWED_AGAIN");
 	assert.match(resultText(result), /push=NOT_RUN/);
+	assert.match(resultText(result), /do not ask the user to stage paths/);
 	assert.equal(reconciliations, 2);
 	assert.equal(refreshed, 1);
 });

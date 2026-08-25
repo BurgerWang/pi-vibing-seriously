@@ -35,7 +35,9 @@ NOT_RUN checks cannot pass; model prose cannot satisfy machine checks.
   and never authorizes bash.
 - After semantic ACCEPT and the relevant final checks, Sol may use
   `workbench_commit_reviewed` to create the review-bound local checkpoint
-  without another user confirmation. It never pushes or rewrites Git history.
+  without another user confirmation. When the result requests another call,
+  Sol continues through the strictly compatible reviewed backlog instead of
+  asking the user to stage it. It never pushes or rewrites Git history.
 - Use focused tests while iterating. Run final gates once on a stable
   candidate when research or release risk requires them; do not run the full
   ladder after every edit.

@@ -19,7 +19,7 @@ runtime.
 | --- | --- |
 | **Fixed Sol → Luna delivery** | GPT-5.6 Sol owns requirements, architecture, scope, review, and verdict; GPT-5.6 Luna xhigh owns routine implementation inside one bounded contract |
 | **Low-ceremony governance** | One successful delegation scope-checks, reviews, and closes itself; explicit review/status is reserved for recovery |
-| **Review-bound local commits** | After semantic acceptance, Sol can checkpoint exactly the reviewed paths locally without asking you to stage or commit them; push and history rewriting remain unavailable |
+| **Review-bound local commits** | After semantic acceptance, Sol can checkpoint each exact reviewed slice locally, including an earlier reviewed backlog after the first checkpoint changes HEAD, without asking you to stage or commit it; push and history rewriting remain unavailable |
 | **Repeatable verification** | Named recipes create durable evidence; gates return PASS / FAIL / BLOCKED / NOT_RUN |
 | **Context that stays usable** | Bounded results, pagination, history projection, and cumulative worker budgets prevent long sessions from collapsing under their own output |
 | **Safe reuse** | Success-only action caching reuses declared recipe results without caching model answers or arbitrary shell work |
@@ -113,8 +113,14 @@ recovery surfaces, not mandatory follow-up steps. Once semantic acceptance and
 the relevant final checks are complete, Sol can call
 `workbench_commit_reviewed` with only a commit message. The runtime derives the
 exact path set from durable review authority, preserves unrelated dirty files,
-and reports `push=NOT_RUN`; it cannot amend, reset, clean, stash, switch branches,
-or push.
+and reports `push=NOT_RUN`. If reviewed changes remain, its result directs Sol
+to call the same tool again; Sol does not hand staging back to the user. An
+older slice is accepted after HEAD advances only when the conflict is exactly a
+HEAD conflict, the new HEAD descends from the reviewed HEAD without touching
+that slice, and its live bytes/status still equal the sealed review snapshot.
+The tool cannot amend, reset the worktree, clean, stash, switch branches, or
+push. If its own commit attempt fails before creating a commit, it may unstage
+only the exact paths it staged, without discarding their worktree bytes.
 
 ## Sol + Luna
 
@@ -129,10 +135,11 @@ Sol does not receive ordinary `edit`/`write` tools. A user may grant a
 short-lived, path- and call-bounded lease for an explicit exceptional direct
 write; locking, expiry, or exhaustion restores the fixed worker-first surface.
 Local checkpointing is separate from that lease: the approved Sol commander in
-DEV may use `workbench_commit_reviewed` only after the latest non-zero delivery
-has finalized semantic ACCEPT authority and still matches current project
-bytes. No per-commit user action is required, but push/publish/release authority
-is never implied.
+DEV may use `workbench_commit_reviewed` only for a still-present non-zero
+delivery with finalized semantic ACCEPT authority and an exact current or
+accepted-descendant binding. Repeated calls select the reviewed backlog one
+slice at a time. No per-commit user action is required, but
+push/publish/release authority is never implied.
 
 Worker cumulative limits provide a continuation reserve rather than an early
 dead end:
