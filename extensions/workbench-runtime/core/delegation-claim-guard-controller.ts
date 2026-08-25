@@ -135,12 +135,19 @@ interface DelegationClaimFailureFacts {
 		readonly transaction_status: DelegationClaimAuthorityStatus;
 		readonly session_status: DelegationReviewStatus | null;
 	}[];
-	readonly statusMismatches: readonly {
-		readonly delegation_id: string;
-		readonly transaction_status: DelegationClaimAuthorityStatus;
-		readonly session_status: DelegationReviewStatus | null;
-		readonly claimed: readonly string[];
-	}[];
+	readonly statusMismatches: readonly (
+		| {
+			readonly delegation_id: string;
+			readonly transaction_status: DelegationClaimAuthorityStatus;
+			readonly session_status: DelegationReviewStatus | null;
+			readonly claimed: readonly string[];
+		}
+		| {
+			readonly run_id: string;
+			readonly committed_outcome: WorkbenchRunClaimAuthority["outcome"];
+			readonly claimed_outcome: WorkbenchRunClaimAuthority["outcome"];
+		}
+	)[];
 }
 
 function assistantText(message: unknown): string | undefined {
@@ -284,6 +291,52 @@ function idHasLatestDelegationLabel(clause: string, idIndex: number): boolean {
 		&& latestIndex >= lastLabelIndex(prefix, BUILD_ONLY_LABEL_RE);
 }
 
+interface IndexedRunOutcome {
+	readonly outcome: WorkbenchRunClaimAuthority["outcome"];
+	readonly start: number;
+	readonly end: number;
+}
+
+function indexedRunOutcomes(segment: string): IndexedRunOutcome[] {
+	const outcomes: IndexedRunOutcome[] = [];
+	for (const [pattern, outcome] of [
+		[RUN_SUCCESS_OUTCOME_RE, "SUCCESS"],
+		[RUN_FAILURE_OUTCOME_RE, "FAILURE"],
+	] as const) {
+		for (const match of segment.matchAll(new RegExp(pattern.source, "giu"))) {
+			const start = match.index ?? 0;
+			outcomes.push({ outcome, start, end: start + match[0]!.length });
+		}
+	}
+	return outcomes.sort((left, right) => left.start - right.start || left.end - right.end);
+}
+
+function outcomeForRunOccurrence(
+	match: RegExpMatchArray,
+	outcomes: readonly IndexedRunOutcome[],
+): WorkbenchRunClaimAuthority["outcome"] | "AMBIGUOUS" | undefined {
+	if (outcomes.length === 0) return undefined;
+	const distinct = new Set(outcomes.map((outcome) => outcome.outcome));
+	if (distinct.size === 1) return outcomes[0]!.outcome;
+	const start = match.index ?? 0;
+	const end = start + match[0]!.length;
+	let nearestDistance = Number.POSITIVE_INFINITY;
+	const nearest = new Set<WorkbenchRunClaimAuthority["outcome"]>();
+	for (const outcome of outcomes) {
+		const distance = outcome.end <= start
+			? start - outcome.end
+			: outcome.start >= end ? outcome.start - end : 0;
+		if (distance < nearestDistance) {
+			nearestDistance = distance;
+			nearest.clear();
+			nearest.add(outcome.outcome);
+		} else if (distance === nearestDistance) {
+			nearest.add(outcome.outcome);
+		}
+	}
+	return nearest.size === 1 ? [...nearest][0] : "AMBIGUOUS";
+}
+
 function inspectWorkbenchRunClaims(text: string): {
 	ids: string[];
 	candidateIds: string[];
@@ -319,34 +372,39 @@ function inspectWorkbenchRunClaims(text: string): {
 		const contextualLine = runSection && listItem ? `run ${rawLine}` : rawLine;
 		const visible = contextualLine.replace(INLINE_CODE_RE, (_whole, inline: string) => inline);
 		for (const segment of visible.split(/[.;；。!?！？]+/u)) {
-			const success = RUN_SUCCESS_OUTCOME_RE.test(segment);
-			const failure = RUN_FAILURE_OUTCOME_RE.test(segment);
-			const completion = success || failure || RUN_COMPLETION_RE.test(segment);
+			const outcomes = indexedRunOutcomes(segment);
+			const hasSuccess = outcomes.some((outcome) => outcome.outcome === "SUCCESS");
+			const hasFailure = outcomes.some((outcome) => outcome.outcome === "FAILURE");
+			const completion = outcomes.length > 0 || RUN_COMPLETION_RE.test(segment);
 			// A neutral pointer such as `gate: record BLOCKED (run ID)` or an
 			// explicit unavailable-identity diagnostic is not a claim that a run
 			// executed or completed. Positive/negative terminal outcome words still
 			// require strict committed-run authority even if other prose is noisy.
-			if (!completion || (RUN_UNAVAILABLE_DIAGNOSTIC_RE.test(segment) && !success && !failure)) continue;
+			if (!completion || (RUN_UNAVAILABLE_DIAGNOSTIC_RE.test(segment) && !hasSuccess && !hasFailure)) continue;
 			const allLineIds = [...segment.matchAll(new RegExp(DELEGATION_ID_SCAN_RE.source, "g"))];
-			const outcome = success
-				? "SUCCESS" as const
-				: failure
-					? "FAILURE" as const
-					: undefined;
 			for (const match of allLineIds) {
 				const id = match[0]!;
+				const outcome = outcomeForRunOccurrence(match, outcomes);
 				if (!insideFence && !BUILD_ONLY_LABEL_RE.test(segment) && !candidateIds.includes(id)) candidateIds.push(id);
+				if (outcome === "AMBIGUOUS") {
+					conflictingIds.add(id);
+					continue;
+				}
 				if (outcome !== undefined && candidateExpected[id] !== undefined && candidateExpected[id] !== outcome) {
 					conflictingIds.add(id);
 				}
 				candidateExpected[id] = outcome ?? candidateExpected[id];
 			}
 			if (!RUN_ONLY_LABEL_RE.test(segment)) continue;
-			const lineIds = allLineIds
-				.filter((match) => idHasNearestRunLabel(segment, match.index ?? 0))
-				.map((match) => match[0]!);
-			for (const id of lineIds) {
+			const lineMatches = allLineIds.filter((match) => idHasNearestRunLabel(segment, match.index ?? 0));
+			for (const match of lineMatches) {
+				const id = match[0]!;
+				const outcome = outcomeForRunOccurrence(match, outcomes);
 				if (!Object.hasOwn(expected, id)) ids.push(id);
+				if (outcome === "AMBIGUOUS") {
+					conflictingIds.add(id);
+					continue;
+				}
 				if (outcome !== undefined && expected[id] !== undefined && expected[id] !== outcome) conflictingIds.add(id);
 				expected[id] = outcome ?? expected[id];
 			}
@@ -871,7 +929,7 @@ function claimFailureFacts(
 			session_status: authority.sessionStatus ?? null,
 		}];
 	}).slice(0, 8);
-	const statusMismatches = resolved.delegationIds.flatMap((id) => {
+	const delegationStatusMismatches = resolved.delegationIds.flatMap((id) => {
 		const authority = authorityById.get(id);
 		if (authority === undefined) return [];
 		const mismatched = (resolved.expectedStatuses[id] ?? [])
@@ -883,7 +941,18 @@ function claimFailureFacts(
 			session_status: authority.sessionStatus ?? null,
 			claimed: mismatched.slice(0, 8).map((expected) => `${expected.source}:${expected.status}`),
 		}];
-	}).slice(0, 8);
+	});
+	const runStatusMismatches = resolved.runIds.flatMap((id) => {
+		const authority = runAuthorityById.get(id);
+		const expected = resolved.expectedRunOutcomes[id];
+		if (authority === undefined || expected === undefined || authority.outcome === expected) return [];
+		return [{
+			run_id: id,
+			committed_outcome: authority.outcome,
+			claimed_outcome: expected,
+		}];
+	});
+	const statusMismatches = [...delegationStatusMismatches, ...runStatusMismatches].slice(0, 8);
 	return {
 		claimNamespace: claimedDelegations > 0 && claimedRuns > 0
 			? "mixed"

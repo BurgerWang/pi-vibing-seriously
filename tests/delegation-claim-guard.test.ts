@@ -117,6 +117,36 @@ test("run-only completion claims require a committed run with the claimed outcom
 	);
 });
 
+test("mixed run outcomes on one line bind to each run instead of success winning the whole sentence", () => {
+	const failedRun = "20260825-084204-8adr";
+	const focusedRun = "20260825-091258-edkc";
+	const diffRun = "20260825-091306-hqk2";
+	const inspection = inspectDelegationClaims(assistant(
+		`Runs: ${failedRun} FAILED (2397 passed, 10 failed), ${focusedRun} SUCCESS, ${diffRun} SUCCESS`,
+	));
+	assert.ok(inspection);
+	assert.deepEqual(inspection.runIds, [failedRun, focusedRun, diffRun]);
+	assert.equal(inspection.expectedRunOutcomes[failedRun], "FAILURE");
+	assert.equal(inspection.expectedRunOutcomes[focusedRun], "SUCCESS");
+	assert.equal(inspection.expectedRunOutcomes[diffRun], "SUCCESS");
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(), [], [
+			{ id: failedRun, outcome: "FAILURE" },
+			{ id: focusedRun, outcome: "SUCCESS" },
+			{ id: diffRun, outcome: "SUCCESS" },
+		]),
+		{ ok: true },
+	);
+
+	const ambiguous = inspectDelegationClaims(assistant(`run SUCCESS ${failedRun} FAILURE`));
+	assert.ok(ambiguous);
+	assert.deepEqual(
+		validateDelegationClaims(ambiguous, evidence(), [], [{ id: failedRun, outcome: "FAILURE" }]),
+		{ ok: false, code: "ambiguous_run_outcome" },
+		"equally near contradictory outcomes remain fail-closed",
+	);
+});
+
 test("run ids before recipe labels and under run headings never become delegation ids", () => {
 	const suffixRun = "20260824-161713-eyl5";
 	const sectionRun = "20260824-161642-9as0";
@@ -916,6 +946,31 @@ test("controller rejects fabricated run ids even when the delegation itself is r
 	const replacement = (results.find((value) => value !== undefined) as { message: Record<string, unknown> }).message;
 	assert.match(finalText(replacement), /reason: missing_run_authority/u);
 	assert.equal(finalText(replacement).includes(fakeRun), false);
+});
+
+test("run outcome mismatch output includes the independently verified run fact", async () => {
+	const state = stub();
+	const runId = "20260825-084204-8adr";
+	register(
+		state,
+		() => undefined,
+		true,
+		undefined,
+		undefined,
+		(id) => id === runId ? "FAILURE" : undefined,
+	);
+	await emit(state, "agent_start", { type: "agent_start" });
+	const results = await emit(state, "message_end", {
+		type: "message_end",
+		message: assistant(`run ${runId} SUCCESS`),
+	});
+	const replacement = (results.find((value) => value !== undefined) as { message: Record<string, unknown> }).message;
+	const text = finalText(replacement);
+	assert.match(text, /reason: run_status_mismatch/u);
+	assert.match(text, /status_mismatch_count: 1/u);
+	assert.match(text, new RegExp(`"run_id":"${runId}"`, "u"));
+	assert.match(text, /"committed_outcome":"FAILURE"/u);
+	assert.match(text, /"claimed_outcome":"SUCCESS"/u);
 });
 
 test("controller accepts the reproduced gate and last-run status with only real run authority", async () => {
