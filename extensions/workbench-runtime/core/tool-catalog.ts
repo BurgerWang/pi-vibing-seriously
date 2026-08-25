@@ -46,10 +46,10 @@ export const WORKBENCH_TOOL_NAMES = [
 	// docs/cache/stable-prefix-contract.md). It never starts a receipt for
 	// itself and is excluded from the begin step of the receipt lifecycle.
 	"workbench_recover_tool_result",
-	// Local commit is intentionally appended after every established tool.
-	// It accepts only a message; reviewed paths are resolved from strict
-	// durable authority and it never pushes or rewrites Git history.
-	"workbench_commit_reviewed",
+	// Structured Git completion is intentionally appended after every
+	// established tool. It checkpoints sealed reviewed paths and may perform
+	// an exact-HEAD ordinary push; history rewriting remains impossible.
+	"workbench_git",
 ] as const;
 
 /** P8b: the public read-only tool-result recovery tool. */
@@ -296,15 +296,31 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 			}),
 		),
 	}),
-	workbench_commit_reviewed: Type.Object({
-		message: Type.String({
-			description:
-				"Single-line local Git commit message. The runtime selects the newest still-present finalized semantic review's exact checked paths, including a strictly compatible older reviewed slice after an earlier checkpoint advanced HEAD; it never pushes, amends, resets the worktree, cleans, stashes, switches branches, accepts paths, or bypasses review authority.",
-			minLength: 1,
-			maxLength: 240,
-			pattern: "^[^\\r\\n\\u0000-\\u001f\\u007f]+$",
+	workbench_git: Type.Union([
+		Type.Object({
+			action: Type.Literal("checkpoint"),
+			message: Type.String({
+				description:
+					"Single-line local Git commit message. One checkpoint batches every still-present compatible finalized semantic review whose exact sealed path bytes remain present.",
+				minLength: 1,
+				maxLength: 240,
+				pattern: "^[^\\r\\n\\u0000-\\u001f\\u007f]+$",
+			}),
 		}),
-	}),
+		Type.Object({
+			action: Type.Literal("push"),
+			expected_head: Type.String({
+				description: "Exact current 40- or 64-character lowercase Git commit hash authorized for an ordinary push",
+				pattern: "^[0-9a-f]{40}([0-9a-f]{24})?$",
+			}),
+			remote: Type.Optional(Type.String({
+				description: "Simple existing Git remote name (default origin)",
+				minLength: 1,
+				maxLength: 64,
+				pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+			})),
+		}),
+	]),
 	workbench_delegate_worker: Type.Object({
 		...WORKBENCH_DELEGATE_WORKER_V1_PROPERTIES,
 		verification: Type.Optional(Type.Array(Type.String({
@@ -544,16 +560,16 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 			"Recovery returns only the bounded persisted summary, never the original full output, and is never acceptance evidence; it never re-executes the original tool call.",
 		],
 	},
-	workbench_commit_reviewed: {
-		name: "workbench_commit_reviewed",
-		label: "Workbench commit reviewed changes",
+	workbench_git: {
+		name: "workbench_git",
+		label: "Workbench Git checkpoint or push",
 		description:
-			"Create one local Git commit from the newest still-present finalized, hash-bound semantic ACCEPT authority. After an earlier reviewed checkpoint advances HEAD, the runtime may continue to an older reviewed slice only when the current failure is exactly head_conflict, HEAD is a descendant of that review's HEAD, intervening commits did not touch its paths, and its live status/content exactly match the sealed after-record. It derives paths from durable authority, rejects unrelated staged changes and in-progress Git operations, serializes against worker starts, verifies the created commit path set, and preserves unrelated dirty files. Available only to the approved Sol commander in DEV. It never pushes, amends, resets the worktree, cleans or stashes it, switches branches, or accepts caller-supplied paths.",
-		promptSnippet: "Commit the next still-present semantically accepted worker slice locally (review-bound paths only; never push)",
+			"Complete bounded Git work without a shell. checkpoint batches every still-present finalized semantic ACCEPT slice whose exact sealed path bytes remain compatible, even when unrelated worktree/index state or path-disjoint descendant commits exist; it preserves unrelated staged entries and verifies the commit. push requires an exact expected current HEAD, pushes only HEAD to the same named branch on an existing remote with ordinary non-force semantics, then verifies the remote ref. Available only to the approved Sol commander in DEV. It cannot reset, clean, stash, amend, force-push, delete refs, switch branches, accept checkpoint paths, or bypass semantic review.",
+		promptSnippet: "Checkpoint all compatible reviewed paths locally, or push an explicitly authorized exact current HEAD without force",
 		promptGuidelines: [
-			"After non-zero implementation diffs have complete semantic ACCEPT authority and the relevant checks are done, use workbench_commit_reviewed to create the local checkpoint without asking the user to run Git manually.",
-			"When a successful result reports remaining changes and next_action=CALL_WORKBENCH_COMMIT_REVIEWED_AGAIN, call it again with the next concise message. The tool itself selects the next exact reviewed slice; continue until the worktree is clean or it reports review_not_ready or another fail-closed error. Never ask the user to stage an already reviewed backlog manually.",
-			"Pass only a concise commit message. Paths are derived from durable review authority; never claim push, release, Gate, Formal, or production authority from a local commit.",
+			"After non-zero implementation diffs have complete semantic ACCEPT authority and relevant checks are done, call action=checkpoint once with a concise message. The runtime batches every compatible reviewed slice and preserves unrelated dirty or staged work.",
+			"Call action=push only after the user explicitly requests publication and the exact current HEAD is known. Pass that hash as expected_head; ordinary push can fail on non-fast-forward and never permits force or ref deletion.",
+			"A checkpoint or push never grants review, release, Gate, Formal, or production authority. Remaining changes after checkpoint need review or belong to unrelated work; do not loop blindly.",
 		],
 	},
 };

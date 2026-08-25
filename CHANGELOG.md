@@ -55,17 +55,19 @@ publication, `/reload`, or measured live provider cache improvement is claimed.
 
 ### Changed
 
-- A finalized successful zero-change diagnosis no longer hides older
-  still-present semantic-ACCEPT commit slices. Only that strict no-write
-  terminal diagnosis shape is skipped; pending, failed, corrupt, or unfinished
-  latest authority remains fail-closed and blocks backlog checkpointing.
-- Review-bound local checkpointing now continues through older finalized
-  semantic-ACCEPT slices after the first checkpoint advances HEAD. The
-  fallback accepts only exact `head_conflict` descendants whose intervening
-  commits did not touch the candidate paths and whose current status/content
-  still match the sealed review snapshot. A successful non-clean checkpoint
-  tells Sol to call the tool again; reviewed backlog staging is no longer
-  handed back to the user, and push remains unavailable.
+- The pre-release single-slice local-commit draft is replaced by one structured
+  `workbench_git` surface. `action=checkpoint` binds directly to sealed reviewed
+  path bytes, batches every compatible semantic-ACCEPT slice into one commit,
+  preserves unrelated dirty/staged work, and is not blocked by an unrelated
+  newer pending/failed/diagnostic transaction or path-disjoint HEAD movement.
+  Reviewed path drift, non-descendant history, intervening committed touches,
+  invalid authority, conflicts, and in-progress Git operations still fail
+  closed.
+- `workbench_git action=push` adds explicit exact-HEAD ordinary publication for
+  Sol in DEV. It pushes only current HEAD to the same named branch on an
+  existing remote, never force-pushes or deletes refs, and verifies the remote
+  ref after success. It grants no release, Gate, Formal, or production
+  authority.
 - Skill loading is development-first: five concise workflow/router skills stay
   model-visible, while nine orientation, CLI, release, and research specialists
   are explicit-only. Prompt templates select one primary workflow, references

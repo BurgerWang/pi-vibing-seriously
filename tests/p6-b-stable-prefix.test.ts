@@ -184,9 +184,9 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 	assert.equal(a.toolOrderHash, canonicalHash(VERIFY_TOOLS), "order hash = canonical hash of the explicit MODE_TOOLS order");
 });
 
-test("v0.10.0 public tool surface has the intentional reviewed-backlog continuation transition hash", () => {
+test("v0.10.0 public tool surface has the intentional structured-Git transition hash", () => {
 	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
-	const currentHash = "8752017b6c43021147b7c0f7c7e0a73ef9b67a518269a94d8bbe7c492bbd4013";
+	const currentHash = "b212fe63aa889f77442559420709beb938c26cc841347e59b459c04b9a1e7e20";
 	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
 	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the documented 0.10.0 hash");
 });
@@ -618,9 +618,9 @@ test("computeActiveTools: DEV foreign-tool order is deterministic (sorted by nam
 	assert.deepEqual(a, computeActiveTools("DEV", ["read", "bash", ...foreign]));
 });
 
-test("P7/P8b order stays fixed and reviewed local commit is appended last", () => {
+test("P7/P8b order stays fixed and structured Git completion is appended last", () => {
 	const names = [...WORKBENCH_TOOL_NAMES];
-	assert.equal(names.length, 12, "twelve workbench custom tools after reviewed local commit");
+	assert.equal(names.length, 12, "twelve workbench custom tools after structured Git completion");
 	assert.deepEqual(
 		names.slice(0, 7),
 		["workbench_project_inspect", "workbench_run_recipe", "workbench_read_run", "workbench_run_gate", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs"],
@@ -632,7 +632,7 @@ test("P7/P8b order stays fixed and reviewed local commit is appended last", () =
 		"the three P7 tools follow in strict delegate → review → status order",
 	);
 	assert.deepEqual(names.slice(10, 11), ["workbench_recover_tool_result"], "the P8b recovery tool keeps its position");
-	assert.deepEqual(names.slice(11), ["workbench_commit_reviewed"], "reviewed local commit is appended LAST");
+	assert.deepEqual(names.slice(11), ["workbench_git"], "structured Git completion is appended LAST");
 	// Every P7/P8b tool's metadata stays free of dynamic values (no dates,
 	// times, hashes, absolute paths, or concrete run/gate/task ids).
 	for (const name of names.slice(7)) {
@@ -681,8 +681,8 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.equal(
 		canonicalHash(workbenchToolMetadataOrdered()),
-		"38aea91e9f4fe478874e2ecdcc4ad6c2400df262182097ef71e7be2dd1c42ef3",
-		"current public catalog hash is machine-pinned after reviewed backlog continuation was added",
+		"09a9f327341cf5bd3c9490e1f873c46a34cafeb0ee91cc3d5cc6d47065d4c003",
+		"current public catalog hash is machine-pinned after structured Git completion was added",
 	);
 });
 

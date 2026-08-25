@@ -19,7 +19,7 @@ runtime.
 | --- | --- |
 | **Fixed Sol → Luna delivery** | GPT-5.6 Sol owns requirements, architecture, scope, review, and verdict; GPT-5.6 Luna xhigh owns routine implementation inside one bounded contract |
 | **Low-ceremony governance** | One successful delegation scope-checks, reviews, and closes itself; explicit review/status is reserved for recovery |
-| **Review-bound local commits** | After semantic acceptance, Sol can checkpoint each exact reviewed slice locally, including an earlier reviewed backlog after the first checkpoint changes HEAD, without asking you to stage or commit it; push and history rewriting remain unavailable |
+| **Bounded Git completion** | After semantic acceptance, Sol checkpoints all compatible reviewed slices at once while preserving unrelated worktree/index state; an explicitly requested exact-HEAD ordinary push is available without force or history rewriting |
 | **Repeatable verification** | Named recipes create durable evidence; gates return PASS / FAIL / BLOCKED / NOT_RUN |
 | **Context that stays usable** | Bounded results, pagination, history projection, and cumulative worker budgets prevent long sessions from collapsing under their own output |
 | **Safe reuse** | Success-only action caching reuses declared recipe results without caching model answers or arbitrary shell work |
@@ -110,20 +110,22 @@ inspect → Sol contract → one Luna delivery → focused feedback → stable c
 A successful delegated implementation performs its scope check and bounded
 actual-diff review in the same call. Explicit review and status tools are
 recovery surfaces, not mandatory follow-up steps. Once semantic acceptance and
-the relevant final checks are complete, Sol can call
-`workbench_commit_reviewed` with only a commit message. The runtime derives the
-exact path set from durable review authority, preserves unrelated dirty files,
-and reports `push=NOT_RUN`. If reviewed changes remain, its result directs Sol
-to call the same tool again; Sol does not hand staging back to the user. An
-older slice is accepted after HEAD advances only when the conflict is exactly a
-HEAD conflict, the new HEAD descends from the reviewed HEAD without touching
-that slice, and its live bytes/status still equal the sealed review snapshot. A
-newer finalized successful zero-change diagnosis is skipped because it has no
-implementation commit obligation; pending, failed, or incomplete latest work
-still blocks.
-The tool cannot amend, reset the worktree, clean, stash, switch branches, or
-push. If its own commit attempt fails before creating a commit, it may unstage
-only the exact paths it staged, without discarding their worktree bytes.
+the relevant final checks are complete, Sol can call `workbench_git` with
+`action=checkpoint` and one commit message. The runtime derives exact paths
+from durable review authority, verifies their sealed after-records, batches
+all compatible accepted slices into one commit, and preserves unrelated dirty
+and staged work. A newer unrelated pending/failed/diagnostic transaction does
+not hide an older accepted slice. Path-disjoint descendant commits and index
+status changes do not force semantic re-review; reviewed path-content drift,
+non-descendant history, or an intervening commit touching a still-dirty
+reviewed path still fails closed.
+
+When the user explicitly asks to publish, Sol may call the same tool with
+`action=push` and the exact current `expected_head`. It performs only an
+ordinary push of the current named branch to the same remote branch and reads
+the remote ref back for exact verification. Force, ref deletion, amend,
+reset, clean, stash, branch switching, and caller-selected checkpoint paths
+are not expressible.
 
 ## Sol + Luna
 
@@ -137,12 +139,12 @@ The active worker is pinned to `openai-codex/gpt-5.6-luna:xhigh`.
 Sol does not receive ordinary `edit`/`write` tools. A user may grant a
 short-lived, path- and call-bounded lease for an explicit exceptional direct
 write; locking, expiry, or exhaustion restores the fixed worker-first surface.
-Local checkpointing is separate from that lease: the approved Sol commander in
-DEV may use `workbench_commit_reviewed` only for a still-present non-zero
-delivery with finalized semantic ACCEPT authority and an exact current or
-accepted-descendant binding. Repeated calls select the reviewed backlog one
-slice at a time. No per-commit user action is required, but
-push/publish/release authority is never implied.
+Git completion is separate from that lease: the approved Sol commander in DEV
+may use `workbench_git` to checkpoint still-present non-zero deliveries with
+finalized semantic ACCEPT authority. One call batches all compatible sealed
+path sets. `action=push` is available only for an explicitly requested
+publication and must bind the exact current HEAD; it grants no release, Gate,
+Formal, or production authority.
 
 Worker cumulative limits provide a continuation reserve rather than an early
 dead end:

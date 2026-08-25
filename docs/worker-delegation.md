@@ -308,7 +308,7 @@ the delegation and performing late writes.
 ## Fixed Sol -> Luna write authority (current; legacy id P7)
 
 Approved GPT-5.6 Sol in DEV receives the fixed 16-tool
-read/control/delegation/local-commit surface. `bash`, `edit`, `write`, and foreign tools
+read/control/delegation/Git-completion surface. `bash`, `edit`, `write`, and foreign tools
 remain unavailable by default. The persisted policy id
 `worker-first-strict` describes the active product behavior: routine source,
 test, and documentation edits are delegated to Luna.
@@ -326,20 +326,21 @@ Consequences for the commander workflow:
 - Sol does not receive ordinary `edit`/`write`; routine implementation is a
   bounded Luna delegation.
 - After non-zero implementations have finalized semantic ACCEPT authority and
-  the relevant checks are complete, Sol may call `workbench_commit_reviewed`
-  with a commit message. The runtime selects the newest still-present reviewed
-  slice, preserves unrelated dirt, serializes against worker starts, and
-  verifies the resulting local commit. After one checkpoint changes HEAD, the
-  next older slice must pass the strict accepted-descendant proof (exact
-  `head_conflict`, descendant HEAD, no intervening touch of its paths, exact
-  sealed status/content). A newer finalized successful zero-change diagnosis
-  is skipped because it has no implementation commit obligation; pending,
-  failed, or incomplete latest authority still blocks. A non-clean success directs Sol to call the tool
-  again rather than request manual staging. It never pushes, amends, resets the
-  worktree, cleans, stashes, switches branches, or accepts caller-supplied
-  paths; no per-commit user confirmation is needed. A failed commit attempt may
-  unstage only the exact tool-staged paths without changing their worktree
-  bytes.
+  the relevant checks are complete, Sol may call `workbench_git` with
+  `action=checkpoint` and a commit message. The runtime scans all durable
+  accepted slices, selects only paths whose current bytes/presence equal their
+  sealed after-records, requires descendant history with no intervening touch
+  of a still-dirty selected path, and commits every compatible slice once.
+  Unrelated pending/failed/diagnostic transactions, unrelated dirt, staging
+  state, and path-disjoint HEAD movement do not block the checkpoint. An
+  unrelated staged index is captured and verified unchanged. No per-commit
+  user confirmation or manual staging is needed.
+- When the user explicitly requests publication, Sol may call
+  `workbench_git` with `action=push` and the exact current `expected_head`.
+  Only current HEAD to the same named branch on an existing remote is allowed;
+  the push is non-force and the remote ref is read back for exact verification.
+  The tool cannot amend, reset, clean, stash, switch branches, delete refs,
+  force-push, or accept caller-selected checkpoint paths.
 - Any direct Sol `edit`/`write` requires a **temporary write lease exception**, issued by the
   human through user-only slash commands (never by prompts or config):
   `/q-commander-write-unlock <reason> --paths <comma-list> --calls <N>
@@ -1268,13 +1269,12 @@ untrusted repositories or unattended automation.
 5. Once the candidate is stable, switch to VERIFY and run one final recipe or
    gate set proportionate to task or release risk. Base the verdict on current
    records and code, never worker prose or a historical handoff document.
-6. Return to DEV if needed and use `workbench_commit_reviewed` for local
-   checkpoints. Run verification before the first commit. When a success
-   reports remaining changes and `CALL_WORKBENCH_COMMIT_REVIEWED_AGAIN`, call
-   it again; the runtime selects and proves the next reviewed slice, or stops
-   fail-closed if the remainder lacks usable authority. Changing HEAD makes
-   older worktree bindings historical, while the accepted-descendant proof and
-   the existing successor rule preserve safe continuation.
+6. Return to DEV if needed and use `workbench_git action=checkpoint` once for
+   all compatible reviewed paths. Run verification before the checkpoint.
+   Remaining changes need review or belong to unrelated work; do not loop
+   blindly. Use `action=push` only when the user explicitly requests it and
+   bind the exact current HEAD. The existing successor rule continues to govern
+   semantic review; the path-local checkpoint never upgrades that authority.
 
 ## Stable-prefix and cache behavior
 

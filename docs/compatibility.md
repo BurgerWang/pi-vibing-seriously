@@ -309,9 +309,9 @@ below yield the current delegate parameter-schema hash
 `fc20b3d36eb2f43f78bb2012635eb1906d96845aeafdacd130a70630a2a8dffd` and
 the combined current unreleased framework-reliability public tool-surface
 hash (including semantic REPAIR, repair-lineage, stricter Gate evidence, and
-the appended review-bound local-commit capability and its reviewed-backlog
-continuation contract) is
-`8752017b6c43021147b7c0f7c7e0a73ef9b67a518269a94d8bbe7c492bbd4013`.
+the appended structured Git checkpoint/push capability and its sealed-path
+batching contract) is
+`b212fe63aa889f77442559420709beb938c26cc841347e59b459c04b9a1e7e20`.
 Repeated same-mode builds remain deterministic; the separately retained
 governance-v1 schema hash does not change.
 
@@ -645,29 +645,27 @@ historical schema-1 records readable. In particular, historical mechanical
   other) transport — receipts are plain local files with no network path;
   the workbench owns no transport.
 
-### Review-bound local commit additive transition
+### Structured Git completion additive transition
 
-The current catalog appends `workbench_commit_reviewed` after the historical
+The current catalog appends `workbench_git` after the historical
 11-tool P8b inventory. Existing tool names, schemas, and registration positions
 remain unchanged; the current catalog is 12 tools and the strict Sol DEV
 surface moves 15 → 16 (an active edit/write lease moves 17 → 18). The frozen
 governance-v1 catalog remains the original 11-tool view. This is an intentional
-one-time tool-name/order/schema fingerprint transition. The new tool accepts
-only a bounded message and derives its exact non-empty paths from strict
-finalized semantic reviews; it adds no push, amend, clean, stash,
-branch-switch, Gate, Formal, or production authority.
+one-time tool-name/order/schema fingerprint transition before release.
+`action=checkpoint` accepts a bounded message and derives exact non-empty
+paths from strict finalized semantic reviews. It binds the checkpoint to
+sealed path bytes rather than the broader live review binding, batches every
+compatible accepted slice, and preserves unrelated staged entries.
+`action=push` requires an exact current HEAD and permits only an ordinary push
+of the current named branch to the same branch on an existing remote, followed
+by remote-ref verification. Force, ref deletion, amend, clean, stash,
+branch-switch, Gate, Formal, and production authority remain unavailable.
 
-The reviewed-backlog continuation keeps that same tool name, position, and
-single-message input shape. Its static metadata now tells Sol to call the tool
-again after a successful non-clean checkpoint rather than ask the user to
-stage older reviewed changes. After HEAD advances, an older accepted slice is
-eligible only for the exact `head_conflict` case, when current HEAD descends
-from its reviewed HEAD, no intervening commit touched its reviewed paths, and
-their live status/content equal the sealed after-record. This metadata/schema
-wording update is one intentional current fingerprint transition; after
-reload, same-mode builds are stable again. The current ordered workbench
-catalog hash is
-`38aea91e9f4fe478874e2ecdcc4ad6c2400df262182097ef71e7be2dd1c42ef3`;
+This pre-release replacement supersedes the earlier local-only single-slice
+draft rather than creating a second overlapping Git tool. After reload,
+same-mode builds are stable again. The current ordered workbench catalog hash
+is `09a9f327341cf5bd3c9490e1f873c46a34cafeb0ee91cc3d5cc6d47065d4c003`;
 the frozen governance-v1 catalog remains unchanged.
 
 ## NRO N1/N2 (Commander Native Tool Optimization) — additive compatibility

@@ -282,26 +282,30 @@ GPT-5.6 Sol parent in DEV
   → Sol runs final VERIFY recipes/gates → final judgment
 ```
 
-### Review-bound local commit
+### Bounded Git completion
 
 After a non-zero implementation has finalized semantic ACCEPT authority and
-the relevant checks have run, Sol may call `workbench_commit_reviewed(message)`
-in DEV. The controller reuses the project delegation-start lock and selects the
-newest still-present strict review path set. The ordinary path requires the
-current live binding. After a prior reviewed checkpoint changes HEAD, an older
-accepted slice is eligible only for `head_conflict`, when current HEAD is its
-descendant, the intervening commit range did not touch its paths, and live
-path status/content exactly equal its sealed after-record. The controller
-may scan past a newer strict `FINISHED/PASS` zero-change diagnosis because it
-has no implementation review or commit obligation; every pending, failed,
-unfinished, or invalid latest authority remains blocking. The controller
-rejects an unrelated Git index or in-progress Git operation, stages only the
-derived paths, and verifies the resulting commit tree. A non-clean result tells
-Sol to call the tool again for the next reviewed slice instead of asking the
-user to stage it. No path parameter or arbitrary Git command exists, and the
-tool never pushes or rewrites history. Verification should precede the first
-checkpoint; subsequent work continues through accepted descendant commits and
-the existing finalized STALE successor rule.
+the relevant checks have run, Sol may call `workbench_git` with
+`action=checkpoint` in DEV. The controller reuses the project
+delegation-start lock and scans durable finalized ACCEPT authorities. It
+selects every dirty path whose current content/presence still equals the
+sealed after-record, requires current HEAD to descend from the review HEAD,
+and rejects any intervening commit that touched a still-dirty selected path.
+Already-clean reviewed paths are recognized only when their current bytes equal
+the sealed bytes. This checkpoint binding is deliberately path-local: an
+unrelated pending/failed/diagnostic transaction, unrelated worktree changes,
+staging-state changes, and path-disjoint descendant commits do not invalidate
+it. All compatible slices are committed once; `git commit --only` plus
+before/after index verification preserves unrelated staged entries.
+
+`action=push` is a separate branch of the same structured tool. It requires an
+exact `expected_head`, accepts only a simple existing remote name, pushes only
+current `HEAD` to the same named branch with ordinary non-force semantics, and
+strictly verifies the remote ref afterward. No arbitrary Git command or
+caller-selected checkpoint path exists; force, ref deletion, amend, reset,
+clean, stash, and branch switching remain unavailable. Checkpoint and push are
+operational Git facts, never review, Gate, release, Formal, or production
+authority.
 
 Responsibility split is fixed Sol -> Luna. Sol owns the contract,
 cross-cutting architecture, scope, review, and verdict; Luna owns routine

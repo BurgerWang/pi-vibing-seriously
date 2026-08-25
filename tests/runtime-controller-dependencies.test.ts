@@ -21,8 +21,8 @@ import {
 	type RecoveryToolController,
 } from "../extensions/workbench-runtime/core/recovery-tool-controller.ts";
 import {
-	registerLocalCommitTool,
-	type LocalCommitToolController,
+	registerGitTool,
+	type GitToolController,
 } from "../extensions/workbench-runtime/core/local-commit-tool-controller.ts";
 import {
 	registerReviewTool,
@@ -132,7 +132,7 @@ test("recovery controller uses injected storage and reports missing without file
 	assert.deepEqual(result.details, { ok: false, available: false, code: "missing", result_id: resultId });
 });
 
-test("local commit controller grants only DEV Sol and reports that push was not run", async () => {
+test("Git controller checkpoints all compatible reviewed slices and reports remaining work", async () => {
 	let reconciliations = 0;
 	let refreshed = 0;
 	const controller = {
@@ -141,14 +141,17 @@ test("local commit controller grants only DEV Sol and reports that push was not 
 			commitReviewed: async () => ({
 				ok: true as const,
 				delegation_id: "20260825-120000-abcd",
+				delegation_ids: ["20260825-120000-abcd", "20260825-110000-wxyz"],
 				commit: "a".repeat(40),
 				branch: "main",
 				committed_paths: ["src/a.ts"],
 				remaining_changed_paths: 1,
-				authority_binding: "accepted_head_descendant" as const,
+				authority_binding: "sealed_review_paths" as const,
+				preserved_staged_paths: 1,
 				lock_release: "released" as const,
 			}),
 			commitServices: {} as never,
+			pushCurrent: async () => { throw new Error("must not push"); },
 		},
 		exec: async () => ({ code: 0, stdout: "", stderr: "", killed: false }),
 		trustedOrError: () => undefined,
@@ -157,28 +160,31 @@ test("local commit controller grants only DEV Sol and reports that push was not 
 		getIdentity: () => ({ provider: "openai-codex", model: "gpt-5.6-sol" }),
 		reconcileProjectAuthority: async () => { reconciliations += 1; return true; },
 		refreshStatus: async () => { refreshed += 1; },
-	} as unknown as Omit<LocalCommitToolController, "pi">;
-	const tool = captureRegistration(registerLocalCommitTool, controller);
-	const result = await tool.execute("commit-1", { message: "feat: reviewed" }, undefined, undefined, context());
+	} as unknown as Omit<GitToolController, "pi">;
+	const tool = captureRegistration(registerGitTool, controller);
+	const result = await tool.execute("commit-1", { action: "checkpoint", message: "feat: reviewed" }, undefined, undefined, context());
 
 	assert.equal(result.details.ok, true);
 	assert.equal(result.details.commit, "a".repeat(40));
 	assert.equal(result.details.push, "NOT_RUN");
-	assert.equal(result.details.authority_binding, "accepted_head_descendant");
-	assert.equal(result.details.next_action, "CALL_WORKBENCH_COMMIT_REVIEWED_AGAIN");
+	assert.equal(result.details.authority_binding, "sealed_review_paths");
+	assert.deepEqual(result.details.delegation_ids, ["20260825-120000-abcd", "20260825-110000-wxyz"]);
+	assert.equal(result.details.preserved_staged_count, 1);
+	assert.equal(result.details.next_action, "REVIEW_REMAINING_CHANGES");
 	assert.match(resultText(result), /push=NOT_RUN/);
-	assert.match(resultText(result), /do not ask the user to stage paths/);
+	assert.match(resultText(result), /all compatible accepted slices were checkpointed/);
 	assert.equal(reconciliations, 2);
 	assert.equal(refreshed, 1);
 });
 
-test("local commit controller denies non-Sol identity before calling commit service", async () => {
+test("Git controller denies non-Sol identity before checkpoint or push", async () => {
 	let commitCalls = 0;
 	const controller = {
 		services: {
 			now: () => new Date("2026-08-25T12:00:00.000Z"),
 			commitReviewed: async () => { commitCalls += 1; throw new Error("must not run"); },
 			commitServices: {} as never,
+			pushCurrent: async () => { commitCalls += 1; throw new Error("must not run"); },
 		},
 		exec: async () => ({ code: 0, stdout: "", stderr: "", killed: false }),
 		trustedOrError: () => undefined,
@@ -187,12 +193,50 @@ test("local commit controller denies non-Sol identity before calling commit serv
 		getIdentity: () => ({ provider: "openai-codex", model: "gpt-5.6-terra" }),
 		reconcileProjectAuthority: async () => true,
 		refreshStatus: async () => {},
-	} as unknown as Omit<LocalCommitToolController, "pi">;
-	const tool = captureRegistration(registerLocalCommitTool, controller);
-	const result = await tool.execute("commit-2", { message: "feat: denied" }, undefined, undefined, context());
+	} as unknown as Omit<GitToolController, "pi">;
+	const tool = captureRegistration(registerGitTool, controller);
+	const result = await tool.execute("commit-2", { action: "checkpoint", message: "feat: denied" }, undefined, undefined, context());
 
 	assert.equal(result.details.code, "permission_denied");
 	assert.equal(commitCalls, 0);
+});
+
+test("Git controller pushes only the exact authorized HEAD without semantic reconciliation", async () => {
+	let reconciliations = 0;
+	const controller = {
+		services: {
+			now: () => new Date("2026-08-25T12:00:00.000Z"),
+			commitReviewed: async () => { throw new Error("must not checkpoint"); },
+			commitServices: {} as never,
+			pushCurrent: async (input: { expected_head: string; remote?: string }) => ({
+				ok: true as const,
+				commit: input.expected_head,
+				branch: "main",
+				remote: input.remote ?? "origin",
+				upstream: `${input.remote ?? "origin"}/main` as const,
+				verification: "remote_head_exact" as const,
+			}),
+		},
+		exec: async () => ({ code: 0, stdout: "", stderr: "", killed: false }),
+		trustedOrError: () => undefined,
+		projectRootFor: async () => "/project",
+		getMode: () => "DEV" as const,
+		getIdentity: () => ({ provider: "openai-codex", model: "gpt-5.6-sol" }),
+		reconcileProjectAuthority: async () => { reconciliations += 1; return true; },
+		refreshStatus: async () => {},
+	} as unknown as Omit<GitToolController, "pi">;
+	const tool = captureRegistration(registerGitTool, controller);
+	const result = await tool.execute("push-1", {
+		action: "push",
+		expected_head: "b".repeat(40),
+		remote: "origin",
+	}, undefined, undefined, context());
+
+	assert.equal(result.details.ok, true);
+	assert.equal(result.details.action, "push");
+	assert.equal(result.details.verification, "remote_head_exact");
+	assert.match(resultText(result), /force=NOT_ALLOWED/);
+	assert.equal(reconciliations, 0);
 });
 
 test("review controller refuses corrupt v2 authority and never falls back to legacy", async () => {
@@ -712,4 +756,6 @@ test("production controller service bundle is immutable and complete", () => {
 	assert.equal(typeof RUNTIME_CONTROLLER_SERVICES.review.reviewV2, "function");
 	assert.equal(typeof RUNTIME_CONTROLLER_SERVICES.compare.compareRuns, "function");
 	assert.equal(typeof RUNTIME_CONTROLLER_SERVICES.recovery.recoverReceipt, "function");
+	assert.equal(typeof RUNTIME_CONTROLLER_SERVICES.git.commitReviewed, "function");
+	assert.equal(typeof RUNTIME_CONTROLLER_SERVICES.git.pushCurrent, "function");
 });

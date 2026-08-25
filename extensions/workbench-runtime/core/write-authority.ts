@@ -153,9 +153,10 @@ export const STRICT_SOL_DEV_ALLOWLIST: readonly string[] = [
 	"workbench_delegation_status",
 	// P8b: the public read-only recovery tool follows the established tools.
 	"workbench_recover_tool_result",
-	// Dedicated local commit authority: reviewed paths only; no bash/push or
-	// caller-controlled path selection.
-	"workbench_commit_reviewed",
+	// Structured Git completion: sealed reviewed-path checkpointing plus an
+	// exact-HEAD ordinary push; no bash, force, ref deletion, or caller-selected
+	// checkpoint paths.
+	"workbench_git",
 ];
 
 export const STRICT_ALLOWLIST_SET: ReadonlySet<string> = new Set(STRICT_SOL_DEV_ALLOWLIST);

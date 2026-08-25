@@ -29,13 +29,12 @@ description: Primary workflow for building or changing functionality. Use for im
 - Use `skill:debugging-workflow` only after an actual failure and
   `skill:validation-ladder` only for a formal verdict, not routine feedback.
 - In a pi-dev-workbench project, after semantic ACCEPT and the relevant final
-  checks, `workbench_commit_reviewed` may create the review-bound local
-  checkpoint without per-commit user confirmation. If it reports
-  `CALL_WORKBENCH_COMMIT_REVIEWED_AGAIN`, continue until clean or until the tool
-  fails closed; do not ask the user to stage an already reviewed backlog. It
-  never authorizes push, publish, release, amend, worktree reset, clean, stash,
-  or branch switching. Outside that dedicated capability, do not commit unless
-  explicitly asked.
+  checks, `workbench_git action=checkpoint` may batch every compatible sealed
+  reviewed slice without per-commit user confirmation or manual staging. Do
+  not loop on unrelated remaining changes. Use `action=push` only after the
+  user explicitly requests publication and bind the exact current HEAD. It
+  never authorizes force, ref deletion, release, amend, worktree reset, clean,
+  stash, branch switching, Gate, Formal, or production authority.
 
 ## Conditional references
 

@@ -22,10 +22,10 @@
   lease bounded by paths, tools, calls, and time. It is an exceptional path
   and never authorizes bash.
 - After semantic ACCEPT and the relevant final checks, Sol may use
-  `workbench_commit_reviewed` to create the review-bound local checkpoint
-  without another user confirmation. When the result requests another call,
-  Sol continues through the strictly compatible reviewed backlog instead of
-  asking the user to stage it. It never pushes or rewrites Git history.
+  `workbench_git action=checkpoint` once to batch all compatible sealed
+  reviewed paths while preserving unrelated dirty/staged work. Use
+  `action=push` only after an explicit user publication request and bind the
+  exact current HEAD. Force, ref deletion, and history rewriting are absent.
 
 ## Efficient skill routing
 

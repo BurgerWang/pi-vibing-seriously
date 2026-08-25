@@ -206,7 +206,7 @@ import { registerDelegationStatusTool } from "./core/delegation-status-tool-cont
 import { registerReviewTool } from "./core/review-tool-controller.ts";
 import { registerDelegateTool } from "./core/delegate-tool-controller.ts";
 import { registerRecoveryTool } from "./core/recovery-tool-controller.ts";
-import { registerLocalCommitTool } from "./core/local-commit-tool-controller.ts";
+import { registerGitTool } from "./core/local-commit-tool-controller.ts";
 import { RUNTIME_CONTROLLER_SERVICES } from "./core/runtime-controller-services.ts";
 import { createRuntimeTransientState } from "./core/runtime-transient-state.ts";
 import { createDelegationSessionController } from "./core/delegation-session-controller.ts";
@@ -1953,7 +1953,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		trustedOrError,
 		projectRootFor,
 	});
-	registerLocalCommitTool({ pi, services: RUNTIME_CONTROLLER_SERVICES.localCommit, exec: execFn, trustedOrError, projectRootFor, getMode: () => mode, getIdentity: () => ({ roleEnv: workerRoleContext.role, provider: currentModelFacts.provider, model: currentModelFacts.model }), reconcileProjectAuthority: delegationSession.reconcileProjectAuthority, refreshStatus });
+	registerGitTool({ pi, services: RUNTIME_CONTROLLER_SERVICES.git, exec: execFn, trustedOrError, projectRootFor, getMode: () => mode, getIdentity: () => ({ roleEnv: workerRoleContext.role, provider: currentModelFacts.provider, model: currentModelFacts.model }), reconcileProjectAuthority: delegationSession.reconcileProjectAuthority, refreshStatus });
 	registerToolResultMiddleware({
 		pi,
 		workerJournalActive: workerRoleContext.role === "worker" && workerRoleContext.taskKind === "implementation",

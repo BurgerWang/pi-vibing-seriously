@@ -81,8 +81,8 @@ export const EXPECTED_TOOLS = [
 	"workbench_delegation_status",
 	// P8b: the public read-only recovery tool follows the original tools.
 	"workbench_recover_tool_result",
-	// Review-bound local commit is the additive final catalog tool.
-	"workbench_commit_reviewed",
+	// Structured Git completion is the additive final catalog tool.
+	"workbench_git",
 ] as const;
 
 export const EXPECTED_PROMPTS = ["q-audit", "q-plan", "q-build", "q-debug", "q-verify", "q-optimize", "q-review"] as const;

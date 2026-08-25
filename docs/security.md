@@ -102,7 +102,7 @@ Defense-in-depth controls:
 ### Fixed Sol -> Luna write authority (current; legacy id P7)
 
 Approved GPT-5.6 Sol in DEV receives the fixed 16-tool
-read/control/delegation/local-commit surface; `bash`, `edit`, `write`, and
+read/control/delegation/Git-completion surface; `bash`, `edit`, `write`, and
 foreign tools stay unavailable by
 default. The serialized `worker-first-strict` policy id describes the active
 product behavior: routine development is implemented by Luna. Actor identity comes only from the
@@ -112,25 +112,25 @@ Workers and other controllers are outside the policy (the existing worker
 guards remain authoritative; other controllers are not newly denied).
 
 The single mutation capability added to the ordinary Sol surface is
-`workbench_commit_reviewed`. It is not a shell or general Git tool: its only
-caller input is a bounded single-line message. It strict-reads finalized
-semantic ACCEPT authorities and derives the newest still-present non-empty
-checked path set. The normal path revalidates the current binding. The only
-historical fallback is an exact `head_conflict`: current HEAD must descend from
-the reviewed HEAD, its intervening commits must not touch those paths, and live
-status/content must equal the sealed after-record. A newer authority can be
-scanned past only when its strict shape is a finalized successful zero-change
-diagnosis with no review or commit obligation; unresolved and failed authority
-still blocks. It rejects unrelated staged
-paths and in-progress Git operations, serializes against delegation starts,
-stages only explicit derived paths, and verifies the new commit contains
-exactly that set. A successful non-clean result tells Sol to repeat the tool;
-it does not transfer reviewed backlog staging to the user. Unrelated dirt
-remains uncommitted. If a pre-commit failure follows tool-owned staging, it may
-unstage only that exact derived path set without changing worktree bytes. Push,
-amend, worktree reset, clean, stash, branch switching,
-caller-selected paths, and review/Gate bypass are absent by construction. A
-local commit is a checkpoint, never Gate/Formal/production authority.
+`workbench_git`. It is structured, not a shell or general Git escape.
+`action=checkpoint` accepts only a bounded message and derives paths from
+finalized semantic ACCEPT authority. Selection verifies exact sealed
+path-content/presence, descendant HEAD, and no intervening committed touch of
+a still-dirty selected path. It batches all compatible slices, serializes
+against delegation starts, uses path-limited commit semantics, verifies the
+created commit path set, and captures unrelated staged index entries before
+the commit so they must remain byte-identical afterward. Unrelated worktree
+state and newer unrelated transaction disposition cannot grant or revoke this
+path-local checkpoint authority.
+
+`action=push` accepts only an exact expected lowercase commit hash and a simple
+existing remote name. It rechecks current HEAD, requires a named current
+branch, pushes exactly `HEAD:refs/heads/<current-branch>` without force, checks
+that local HEAD stayed fixed, and reads the remote ref back for exact equality.
+Caller-selected checkpoint paths, other local refs, ref deletion, force and
+force-with-lease, amend, worktree reset, clean, stash, branch switching, and
+review/Gate bypass are absent by construction. A checkpoint or push is an
+operational fact, never Gate/Formal/production authority.
 
 Second-layer `tool_call` guard for Sol: `bash` is always blocked; any direct
 canonical project-relative `edit`/`write` requires an ACTIVE user-issued

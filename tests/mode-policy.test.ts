@@ -108,7 +108,7 @@ test("VERIFY hard-denies bash, edit and write (no free bash in P1)", () => {
 });
 
 test("DEV hard-denies nothing", () => {
-	for (const tool of ["read", "grep", "find", "ls", "bash", "edit", "write", "workbench_delegate_worker", "workbench_commit_reviewed"]) {
+	for (const tool of ["read", "grep", "find", "ls", "bash", "edit", "write", "workbench_delegate_worker", "workbench_git"]) {
 		assert.ok(!isToolHardDenied("DEV", tool));
 		assert.equal(checkToolCall("DEV", tool, {}).allowed, true, `${tool} allowed in DEV`);
 	}
@@ -123,8 +123,8 @@ test("AUDIT and VERIFY hard-deny workbench_run_recipe/workbench_run_gate / free 
 	assert.ok(!isToolAllowedInMode("AUDIT", "workbench_run_gate"));
 	assert.equal(checkToolCall("AUDIT", "workbench_run_gate", {}).allowed, false);
 	assert.equal(checkToolCall("VERIFY", "edit", {}).allowed, false);
-	assert.equal(checkToolCall("AUDIT", "workbench_commit_reviewed", {}).allowed, false);
-	assert.equal(checkToolCall("VERIFY", "workbench_commit_reviewed", {}).allowed, false);
+	assert.equal(checkToolCall("AUDIT", "workbench_git", {}).allowed, false);
+	assert.equal(checkToolCall("VERIFY", "workbench_git", {}).allowed, false);
 });
 
 // ---------------------------------------------------------------------------

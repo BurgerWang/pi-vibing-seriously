@@ -15,6 +15,7 @@ import {
 } from "./delegation-project-authority.ts";
 import { recoverReceipt } from "./tool-result-recovery.ts";
 import { commitLatestReviewedDelegationV1, LOCAL_REVIEWED_COMMIT_SERVICES_V1 } from "./local-commit.ts";
+import { pushCurrentBranchV1 } from "./git-publish.ts";
 import { buildTrustedRecoveryAuthority } from "./trusted-recovery-authority.ts";
 import type { CompareToolServices } from "./compare-tool-controller.ts";
 import type { DelegateToolServices } from "./delegate-tool-controller.ts";
@@ -47,10 +48,11 @@ const review = Object.freeze({
 	reviewLegacy: reviewDelegation,
 }) satisfies ReviewToolServices;
 const recovery = Object.freeze({ recoverReceipt }) satisfies RecoveryToolServices;
-const localCommit = Object.freeze({
+const git = Object.freeze({
 	now,
 	commitReviewed: commitLatestReviewedDelegationV1,
 	commitServices: LOCAL_REVIEWED_COMMIT_SERVICES_V1,
+	pushCurrent: pushCurrentBranchV1,
 }) satisfies LocalCommitToolServices;
 const delegationSession = Object.freeze({
 	collectCurrentBinding: collectCurrentDelegationBindingV2,
@@ -58,4 +60,4 @@ const delegationSession = Object.freeze({
 }) satisfies DelegationSessionServices;
 
 /** Immutable production dependency bundle; tests inject bounded alternatives. */
-export const RUNTIME_CONTROLLER_SERVICES = Object.freeze({ compare, delegate, review, recovery, localCommit, delegationSession });
+export const RUNTIME_CONTROLLER_SERVICES = Object.freeze({ compare, delegate, review, recovery, git, delegationSession });

@@ -209,7 +209,7 @@ test("governance v1 freezes schema constants, public tool input/output categorie
 	assert.deepEqual(WORKBENCH_TOOL_NAMES_V1, snapshot.tools.map((tool) => tool.name));
 	assert.deepEqual(
 		WORKBENCH_TOOL_NAMES.slice(WORKBENCH_TOOL_NAMES_V1.length),
-		["workbench_commit_reviewed"],
+		["workbench_git"],
 		"current catalog appends local commit without rewriting governance v1",
 	);
 	for (const tool of snapshot.tools) {

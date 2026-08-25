@@ -200,7 +200,7 @@ test("strict Sol DEV allowlist is exactly the fixed 16-tool order, no bash/edit/
 		"workbench_delegation_status",
 		// P8b recovery remains before the additive local-commit tool.
 		"workbench_recover_tool_result",
-		"workbench_commit_reviewed",
+		"workbench_git",
 	]);
 	assert.equal(new Set(STRICT_SOL_DEV_ALLOWLIST).size, STRICT_SOL_DEV_ALLOWLIST.length, "no duplicates");
 	for (const tool of STRICT_SOL_DEV_ALLOWLIST) {
