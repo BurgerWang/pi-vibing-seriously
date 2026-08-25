@@ -57,6 +57,6 @@ export function describeMode(mode: WorkbenchMode): string {
 		case "VERIFY":
 			return "verification only: read, grep, find, ls, workbench_project_inspect, workbench_run_recipe, workbench_read_run (no free bash/edit/write; runs only declared recipes)";
 		case "DEV":
-			return "local development: full tool set (no auto commit/push/publish)";
+			return "local development: reviewed local commits allowed (no push/publish/history rewrite)";
 	}
 }

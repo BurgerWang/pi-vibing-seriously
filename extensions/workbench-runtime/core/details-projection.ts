@@ -133,6 +133,10 @@ const TOOL_FIELDS: Readonly<Record<string, readonly string[]>> = Object.freeze({
 		"ok", "available", "code", "result_id", "tool", "status", "path", "summary_omitted_lines",
 		"summary_omitted_bytes",
 	],
+	workbench_commit_reviewed: [
+		"ok", "code", "delegation_id", "commit", "branch", "path_count", "remaining_changed_count",
+		"push", "lock_release",
+	],
 });
 
 interface ArrayProjectionFacts {

@@ -40,15 +40,23 @@ export const WORKBENCH_TOOL_NAMES = [
 	"workbench_delegate_worker",
 	"workbench_review_worker_diff",
 	"workbench_delegation_status",
-	// P8b: the public read-only tool-result recovery tool is appended LAST
+	// P8b: the public read-only tool-result recovery tool was appended after
+	// the original delegation tools.
 	// (intentional one-tool fingerprint transition — see
 	// docs/cache/stable-prefix-contract.md). It never starts a receipt for
 	// itself and is excluded from the begin step of the receipt lifecycle.
 	"workbench_recover_tool_result",
+	// Local commit is intentionally appended after every established tool.
+	// It accepts only a message; reviewed paths are resolved from strict
+	// durable authority and it never pushes or rewrites Git history.
+	"workbench_commit_reviewed",
 ] as const;
 
-/** P8b: the public read-only tool-result recovery tool (appended LAST). */
+/** P8b: the public read-only tool-result recovery tool. */
 export const RECOVERY_TOOL_NAME = "workbench_recover_tool_result";
+
+/** Frozen governance-v1 tool-name inventory (before local commit existed). */
+export const WORKBENCH_TOOL_NAMES_V1 = Object.freeze(WORKBENCH_TOOL_NAMES.slice(0, 11));
 
 /**
  * Read-only or idempotent-observation tools whose replay cannot duplicate an
@@ -287,6 +295,15 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 				maxLength: 256,
 			}),
 		),
+	}),
+	workbench_commit_reviewed: Type.Object({
+		message: Type.String({
+			description:
+				"Single-line local Git commit message. The runtime selects only the latest finalized semantic review's checked paths; it never pushes, amends, resets, cleans, stashes, switches branches, or bypasses review authority.",
+			minLength: 1,
+			maxLength: 240,
+			pattern: "^[^\\r\\n\\u0000-\\u001f\\u007f]+$",
+		}),
 	}),
 	workbench_delegate_worker: Type.Object({
 		...WORKBENCH_DELEGATE_WORKER_V1_PROPERTIES,
@@ -527,6 +544,17 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 			"Recovery returns only the bounded persisted summary, never the original full output, and is never acceptance evidence; it never re-executes the original tool call.",
 		],
 	},
+	workbench_commit_reviewed: {
+		name: "workbench_commit_reviewed",
+		label: "Workbench commit reviewed changes",
+		description:
+			"Create one local Git commit from the latest finalized, hash-bound semantic ACCEPT authority. The runtime derives the exact reviewed path set from durable delegation records, revalidates current project bytes, rejects unrelated staged changes and in-progress Git operations, serializes against worker starts, verifies the created commit path set, and preserves unrelated dirty files. Available only to the approved Sol commander in DEV. It never pushes, amends, resets or cleans the worktree, stashes, switches branches, or accepts caller-supplied paths.",
+		promptSnippet: "Commit the latest semantically accepted worker changes locally (review-bound paths only; never push)",
+		promptGuidelines: [
+			"After the latest non-zero implementation diff has complete semantic ACCEPT authority and the relevant checks are done, use workbench_commit_reviewed to create the local checkpoint without asking the user to run Git manually.",
+			"Pass only a concise commit message. Paths are derived from durable review authority; never claim push, release, Gate, Formal, or production authority from a local commit.",
+		],
+	},
 };
 
 /** Frozen v1 Gate-tool metadata and schema; repaired human provenance must not rewrite history. */
@@ -574,7 +602,7 @@ export function workbenchToolMetadataOrdered(): readonly (WorkbenchToolMeta & { 
 
 /** Frozen governance-v1 catalog view; current additive fields never rewrite history. */
 export function workbenchToolMetadataV1Ordered(): readonly (WorkbenchToolMeta & { parameters: unknown })[] {
-	return WORKBENCH_TOOL_NAMES.map((name) => ({
+	return WORKBENCH_TOOL_NAMES_V1.map((name) => ({
 		...(name === "workbench_delegate_worker"
 			? {
 				...WORKBENCH_DELEGATE_WORKER_V1_METADATA,

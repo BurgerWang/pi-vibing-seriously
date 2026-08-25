@@ -129,6 +129,10 @@ place. See `docs/context-output-control-plane.md`.
   Guideline text remains static and contains no runtime facts.
 - Tool metadata (name/label/description/promptSnippet/promptGuidelines/
   parameters) is static at runtime and centralized in the catalog.
+- The current additive local-commit transition appends
+  `workbench_commit_reviewed` after the frozen 11-tool governance-v1 prefix.
+  It intentionally changes the tool-name/order/schema fingerprint once; after
+  reload the new 12-tool catalog is stable in the same mode.
 - Parameter JSON schemas are built in source order; `canonicalHash`
   on the schema is stable across runs (tested).
 - No dependence on filesystem readdir order, YAML key order, glob return
@@ -145,9 +149,9 @@ place. See `docs/context-output-control-plane.md`.
 | ---- | -------- | -------------------------- |
 | AUDIT | read, grep, find, ls, workbench_project_inspect, workbench_read_run, workbench_read_gate, workbench_list_gates, workbench_compare_runs, workbench_recover_tool_result | bash, edit, write, workbench_run_recipe, workbench_run_gate, workbench_delegate_worker |
 | VERIFY | read, grep, find, ls + the 8 inspection/recipe/gate/comparison/recovery tools | bash, edit, write, workbench_delegate_worker |
-| DEV commander | read, grep, find, ls, bash, edit, write + all 11 workbench tools | (none beyond the global guards) |
-| DEV strict Sol (`worker-first-strict`) | read, grep, find, ls + all 11 workbench tools (exact canonical 15; an ACTIVE user lease adds edit/write → 17) | bash always; edit/write without an ACTIVE user-issued lease or outside its paths; any foreign tool |
-| DEV worker child | DEV commander set minus bash, workbench_run_gate, workbench_delegate_worker | bash, workbench_run_gate, workbench_delegate_worker; edit/write also require approved paths |
+| DEV commander | read, grep, find, ls, bash, edit, write + all 12 workbench tools | (none beyond the global guards) |
+| DEV strict Sol (`worker-first-strict`) | read, grep, find, ls + all 12 workbench tools (exact canonical 16; an ACTIVE user lease adds edit/write → 18) | bash always; edit/write without an ACTIVE user-issued lease or outside its paths; any foreign tool |
+| DEV worker child | DEV commander set minus bash, workbench_run_gate, workbench_commit_reviewed, workbench_delegate_worker | bash, workbench_run_gate, workbench_commit_reviewed, workbench_delegate_worker; edit/write also require approved paths |
 
 The worker-role reduction is deterministic and applied inside the same single
 `setActiveTools` call. It is fixed for the lifetime of the child process; no

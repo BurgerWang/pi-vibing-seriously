@@ -308,9 +308,9 @@ that transition. Subsequent current contract/review additions documented
 below yield the current delegate parameter-schema hash
 `fc20b3d36eb2f43f78bb2012635eb1906d96845aeafdacd130a70630a2a8dffd` and
 the combined current unreleased framework-reliability public tool-surface
-hash (including semantic REPAIR, repair-lineage, and stricter Gate evidence
-wording) is
-`9b091d42735c61fdc9032ff84d0c06d92b6556cd077d1051b2fab1e2b7e5f76d`.
+hash (including semantic REPAIR, repair-lineage, stricter Gate evidence, and
+the appended review-bound local-commit capability) is
+`9b3ac0e27420f2e1269cd619c837d2cddab582830642a3ad121eeda0a469b410`.
 Repeated same-mode builds remain deterministic; the separately retained
 governance-v1 schema hash does not change.
 
@@ -643,6 +643,18 @@ historical schema-1 records readable. In particular, historical mechanical
 - **No transport claim.** This repository implements no WebSocket (or any
   other) transport — receipts are plain local files with no network path;
   the workbench owns no transport.
+
+### Review-bound local commit additive transition
+
+The current catalog appends `workbench_commit_reviewed` after the historical
+11-tool P8b inventory. Existing tool names, schemas, and registration positions
+remain unchanged; the current catalog is 12 tools and the strict Sol DEV
+surface moves 15 → 16 (an active edit/write lease moves 17 → 18). The frozen
+governance-v1 catalog remains the original 11-tool view. This is an intentional
+one-time tool-name/order/schema fingerprint transition. The new tool accepts
+only a bounded message and derives its exact non-empty paths from the latest
+strict finalized semantic review; it adds no push, amend, reset, clean, stash,
+branch-switch, Gate, Formal, or production authority.
 
 ## NRO N1/N2 (Commander Native Tool Optimization) — additive compatibility
 

@@ -295,7 +295,7 @@ export function renderLeaseConfirmed(lease: WriteLease, _now: string): string[] 
 		`tools    : ${lease.tools.join(", ")} only — bash is never authorized`,
 		`calls    : ${lease.callsUsed}/${lease.maxCalls} used (one per authorized edit/write)`,
 		`expires  : ${lease.expiresAt}`,
-		`edit/write are active in strict Sol DEV (canonical 15-tool allowlist + lease tools); lock, expiry or exhaustion revokes them`,
+		`edit/write are active in strict Sol DEV (canonical 16-tool allowlist + lease tools); lock, expiry or exhaustion revokes them`,
 	];
 }
 

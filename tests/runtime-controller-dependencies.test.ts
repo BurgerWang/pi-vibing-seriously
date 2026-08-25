@@ -21,6 +21,10 @@ import {
 	type RecoveryToolController,
 } from "../extensions/workbench-runtime/core/recovery-tool-controller.ts";
 import {
+	registerLocalCommitTool,
+	type LocalCommitToolController,
+} from "../extensions/workbench-runtime/core/local-commit-tool-controller.ts";
+import {
 	registerReviewTool,
 	type ReviewToolController,
 } from "../extensions/workbench-runtime/core/review-tool-controller.ts";
@@ -126,6 +130,65 @@ test("recovery controller uses injected storage and reports missing without file
 
 	assert.deepEqual(calls, [{ projectRoot: "/project", id: resultId }]);
 	assert.deepEqual(result.details, { ok: false, available: false, code: "missing", result_id: resultId });
+});
+
+test("local commit controller grants only DEV Sol and reports that push was not run", async () => {
+	let reconciliations = 0;
+	let refreshed = 0;
+	const controller = {
+		services: {
+			now: () => new Date("2026-08-25T12:00:00.000Z"),
+			commitReviewed: async () => ({
+				ok: true as const,
+				delegation_id: "20260825-120000-abcd",
+				commit: "a".repeat(40),
+				branch: "main",
+				committed_paths: ["src/a.ts"],
+				remaining_changed_paths: 1,
+				lock_release: "released" as const,
+			}),
+			commitServices: {} as never,
+		},
+		exec: async () => ({ code: 0, stdout: "", stderr: "", killed: false }),
+		trustedOrError: () => undefined,
+		projectRootFor: async () => "/project",
+		getMode: () => "DEV" as const,
+		getIdentity: () => ({ provider: "openai-codex", model: "gpt-5.6-sol" }),
+		reconcileProjectAuthority: async () => { reconciliations += 1; return true; },
+		refreshStatus: async () => { refreshed += 1; },
+	} as unknown as Omit<LocalCommitToolController, "pi">;
+	const tool = captureRegistration(registerLocalCommitTool, controller);
+	const result = await tool.execute("commit-1", { message: "feat: reviewed" }, undefined, undefined, context());
+
+	assert.equal(result.details.ok, true);
+	assert.equal(result.details.commit, "a".repeat(40));
+	assert.equal(result.details.push, "NOT_RUN");
+	assert.match(resultText(result), /push=NOT_RUN/);
+	assert.equal(reconciliations, 2);
+	assert.equal(refreshed, 1);
+});
+
+test("local commit controller denies non-Sol identity before calling commit service", async () => {
+	let commitCalls = 0;
+	const controller = {
+		services: {
+			now: () => new Date("2026-08-25T12:00:00.000Z"),
+			commitReviewed: async () => { commitCalls += 1; throw new Error("must not run"); },
+			commitServices: {} as never,
+		},
+		exec: async () => ({ code: 0, stdout: "", stderr: "", killed: false }),
+		trustedOrError: () => undefined,
+		projectRootFor: async () => "/project",
+		getMode: () => "DEV" as const,
+		getIdentity: () => ({ provider: "openai-codex", model: "gpt-5.6-terra" }),
+		reconcileProjectAuthority: async () => true,
+		refreshStatus: async () => {},
+	} as unknown as Omit<LocalCommitToolController, "pi">;
+	const tool = captureRegistration(registerLocalCommitTool, controller);
+	const result = await tool.execute("commit-2", { message: "feat: denied" }, undefined, undefined, context());
+
+	assert.equal(result.details.code, "permission_denied");
+	assert.equal(commitCalls, 0);
 });
 
 test("review controller refuses corrupt v2 authority and never falls back to legacy", async () => {

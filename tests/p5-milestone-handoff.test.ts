@@ -1023,7 +1023,7 @@ test("the source lease never transfers: DEV source with an ACTIVE lease yields a
 	// Restored target: the source session's lease is absent and the exact
 	// worker-first surface is locked.
 	assert.deepEqual(stub.activeTools, [...STRICT_SOL_DEV_ALLOWLIST]);
-	assert.equal(stub.activeTools.length, 15);
+	assert.equal(stub.activeTools.length, 16);
 	const ordinaryBlocked = await guardCall(stub, "edit", { path: "src/main.ts" });
 	assert.ok(ordinaryBlocked && ordinaryBlocked.block === true);
 	assert.match(String(ordinaryBlocked.reason), /lease locked/);

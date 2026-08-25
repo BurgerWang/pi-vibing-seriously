@@ -28,7 +28,11 @@ description: Primary workflow for building or changing functionality. Use for im
   this skill neither duplicates nor weakens that authority.
 - Use `skill:debugging-workflow` only after an actual failure and
   `skill:validation-ladder` only for a formal verdict, not routine feedback.
-- Do not commit, push, publish, or release unless explicitly asked.
+- In a pi-dev-workbench project, after semantic ACCEPT and the relevant final
+  checks, `workbench_commit_reviewed` may create the review-bound local
+  checkpoint without per-commit user confirmation. It never authorizes push,
+  publish, release, amend, reset, clean, stash, or branch switching. Outside
+  that dedicated capability, do not commit unless explicitly asked.
 
 ## Conditional references
 

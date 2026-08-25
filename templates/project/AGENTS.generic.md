@@ -21,6 +21,9 @@
 - Sol may edit/write directly only through an active user-issued temporary
   lease bounded by paths, tools, calls, and time. It is an exceptional path
   and never authorizes bash.
+- After semantic ACCEPT and the relevant final checks, Sol may use
+  `workbench_commit_reviewed` to create the review-bound local checkpoint
+  without another user confirmation. It never pushes or rewrites Git history.
 
 ## Efficient skill routing
 

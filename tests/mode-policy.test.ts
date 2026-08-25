@@ -108,7 +108,7 @@ test("VERIFY hard-denies bash, edit and write (no free bash in P1)", () => {
 });
 
 test("DEV hard-denies nothing", () => {
-	for (const tool of ["read", "grep", "find", "ls", "bash", "edit", "write", "workbench_delegate_worker"]) {
+	for (const tool of ["read", "grep", "find", "ls", "bash", "edit", "write", "workbench_delegate_worker", "workbench_commit_reviewed"]) {
 		assert.ok(!isToolHardDenied("DEV", tool));
 		assert.equal(checkToolCall("DEV", tool, {}).allowed, true, `${tool} allowed in DEV`);
 	}
@@ -123,6 +123,8 @@ test("AUDIT and VERIFY hard-deny workbench_run_recipe/workbench_run_gate / free 
 	assert.ok(!isToolAllowedInMode("AUDIT", "workbench_run_gate"));
 	assert.equal(checkToolCall("AUDIT", "workbench_run_gate", {}).allowed, false);
 	assert.equal(checkToolCall("VERIFY", "edit", {}).allowed, false);
+	assert.equal(checkToolCall("AUDIT", "workbench_commit_reviewed", {}).allowed, false);
+	assert.equal(checkToolCall("VERIFY", "workbench_commit_reviewed", {}).allowed, false);
 });
 
 // ---------------------------------------------------------------------------
@@ -266,10 +268,10 @@ const FULL_DEV_ACTIVE = [
 	"a_foreign",
 ];
 
-test("worker-first Sol DEV exposes the locked 15-tool surface without bash/edit/write or foreign tools", () => {
+test("worker-first Sol DEV exposes the locked 16-tool surface without bash/edit/write or foreign tools", () => {
 	const tools = computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS);
 	assert.deepEqual(tools, [...STRICT_SOL_DEV_ALLOWLIST], "exact canonical allowlist order");
-	assert.equal(tools.length, 15);
+	assert.equal(tools.length, 16);
 	assert.ok(!tools.includes("bash"));
 	assert.ok(!tools.includes("edit"));
 	assert.ok(!tools.includes("write"));
@@ -307,7 +309,7 @@ test("strict Sol allowlist applies only to the approved Sol identity; workers an
 test("active lease inputs add only the exact canonical edit/write subset", () => {
 	const tools = computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["edit", "write"]);
 	assert.deepEqual(tools, [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
-	assert.equal(tools.length, 17);
+	assert.equal(tools.length, 18);
 	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["write"]), [...STRICT_SOL_DEV_ALLOWLIST, "write"]);
 	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["write", "edit"]), [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
 	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["edit", "edit", "write", "write"]), [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
@@ -317,7 +319,7 @@ test("active lease inputs add only the exact canonical edit/write subset", () =>
 test("no lease or malformed lease tools retain the locked surface", () => {
 	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS), [...STRICT_SOL_DEV_ALLOWLIST], "no lease");
 	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, []), [...STRICT_SOL_DEV_ALLOWLIST], "empty lease tools");
-	assert.equal(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, []).length, 15);
+	assert.equal(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, []).length, 16);
 	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["bash", "edit", "write"]), [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
 	assert.deepEqual(computeActiveTools("DEV", FULL_DEV_ACTIVE, SOL_FACTS, ["bash"]), [...STRICT_SOL_DEV_ALLOWLIST]);
 });

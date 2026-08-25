@@ -101,14 +101,27 @@ Defense-in-depth controls:
 
 ### Fixed Sol -> Luna write authority (current; legacy id P7)
 
-Approved GPT-5.6 Sol in DEV receives the fixed 15-tool read/control/delegation
-surface; `bash`, `edit`, `write`, and foreign tools stay unavailable by
+Approved GPT-5.6 Sol in DEV receives the fixed 16-tool
+read/control/delegation/local-commit surface; `bash`, `edit`, `write`, and
+foreign tools stay unavailable by
 default. The serialized `worker-first-strict` policy id describes the active
 product behavior: routine development is implemented by Luna. Actor identity comes only from the
 `WORKBENCH_AGENT_ROLE=worker` env contract and the provider/model pair;
 project config can never self-label a controller as Sol or as a worker.
 Workers and other controllers are outside the policy (the existing worker
 guards remain authoritative; other controllers are not newly denied).
+
+The single mutation capability added to the ordinary Sol surface is
+`workbench_commit_reviewed`. It is not a shell or general Git tool: its only
+caller input is a bounded single-line message. It strict-reads the latest
+finalized semantic ACCEPT authority, derives that review's non-empty checked
+path set, revalidates the current binding, rejects unrelated staged paths and
+in-progress Git operations, and serializes against delegation starts. It then
+stages only those reviewed paths and verifies the new commit contains exactly
+that set. Unrelated dirt remains uncommitted. Push, amend, reset, clean, stash,
+branch switching, caller-selected paths, and review/Gate bypass are absent by
+construction. A local commit is a checkpoint, never Gate/Formal/production
+authority.
 
 Second-layer `tool_call` guard for Sol: `bash` is always blocked; any direct
 canonical project-relative `edit`/`write` requires an ACTIVE user-issued

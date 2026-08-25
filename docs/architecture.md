@@ -282,6 +282,19 @@ GPT-5.6 Sol parent in DEV
   → Sol runs final VERIFY recipes/gates → final judgment
 ```
 
+### Review-bound local commit
+
+After a non-zero implementation has finalized semantic ACCEPT authority and
+the relevant checks have run, Sol may call `workbench_commit_reviewed(message)`
+in DEV. The controller reuses the project delegation-start lock, selects paths
+only from the strict latest review record, confirms the live review binding,
+rejects an unrelated Git index or in-progress Git operation, stages only that
+set, and verifies the resulting commit tree. No path parameter or arbitrary
+Git command exists, and the tool never pushes or rewrites history. Committing
+changes HEAD, so verification should precede the checkpoint; subsequent work
+continues from the accepted descendant commit through the existing finalized
+STALE successor rule.
+
 Responsibility split is fixed Sol -> Luna. Sol owns the contract,
 cross-cutting architecture, scope, review, and verdict; Luna owns routine
 source, test, and documentation implementation inside one bounded task. A

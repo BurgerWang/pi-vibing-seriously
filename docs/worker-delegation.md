@@ -307,8 +307,8 @@ the delegation and performing late writes.
 
 ## Fixed Sol -> Luna write authority (current; legacy id P7)
 
-Approved GPT-5.6 Sol in DEV receives the fixed 15-tool
-read/control/delegation surface. `bash`, `edit`, `write`, and foreign tools
+Approved GPT-5.6 Sol in DEV receives the fixed 16-tool
+read/control/delegation/local-commit surface. `bash`, `edit`, `write`, and foreign tools
 remain unavailable by default. The persisted policy id
 `worker-first-strict` describes the active product behavior: routine source,
 test, and documentation edits are delegated to Luna.
@@ -325,6 +325,13 @@ Consequences for the commander workflow:
   declared workbench recipes only.
 - Sol does not receive ordinary `edit`/`write`; routine implementation is a
   bounded Luna delegation.
+- After the latest non-zero implementation has finalized semantic ACCEPT
+  authority and the relevant checks are complete, Sol may call
+  `workbench_commit_reviewed` with a commit message. The runtime selects only
+  the reviewed paths, revalidates their current binding, preserves unrelated
+  dirt, serializes against worker starts, and verifies the resulting local
+  commit. It never pushes, amends, resets, cleans, stashes, switches branches,
+  or accepts caller-supplied paths; no per-commit user confirmation is needed.
 - Any direct Sol `edit`/`write` requires a **temporary write lease exception**, issued by the
   human through user-only slash commands (never by prompts or config):
   `/q-commander-write-unlock <reason> --paths <comma-list> --calls <N>
@@ -344,7 +351,7 @@ Consequences for the commander workflow:
   status or compact summaries.
 - Expiry (30 min), exhaustion (10 calls) and revocation (leaving DEV, model/
   provider change, session end, or `/q-commander-write-lock`) restore the
-  locked 15-tool Sol surface. Concurrent edit/write requests consume the
+  locked 16-tool Sol surface. Concurrent edit/write requests consume the
   bounded call count serially, and a consume is authorized only after its
   updated lease entry is durably appended. A reload/session replacement never
   reactivates a previously confirmed lease; a fresh human grant is required.
@@ -1253,6 +1260,10 @@ untrusted repositories or unattended automation.
 5. Once the candidate is stable, switch to VERIFY and run one final recipe or
    gate set proportionate to task or release risk. Base the verdict on current
    records and code, never worker prose or a historical handoff document.
+6. Return to DEV if needed and use `workbench_commit_reviewed` for the local
+   checkpoint. Run verification before this commit: changing HEAD intentionally
+   makes the reviewed worktree binding historical, while the next bounded
+   delegation may proceed from that accepted descendant commit.
 
 ## Stable-prefix and cache behavior
 

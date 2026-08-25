@@ -964,7 +964,7 @@ test("Sol DEV exposes the fixed worker-first surface on session_start", async ()
 	});
 	await handlers[0]!({ type: "session_start", reason: "resume" } as never, ctx as never);
 	assert.deepEqual(stub.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST], "exactly the fixed allowlist in canonical order");
-	assert.equal(stub.activeTools.length, 15, "15 tools: edit/write/bash/foreign are locked");
+	assert.equal(stub.activeTools.length, 16, "16 tools: reviewed local commit is available while edit/write/bash/foreign stay locked");
 	assert.ok(!stub.activeTools.includes("edit"));
 	assert.ok(!stub.activeTools.includes("write"));
 	for (const tool of ["bash", "web_search"]) {
@@ -1229,7 +1229,7 @@ test("non-TUI unlock issues a pending lease, emits two distinct bounded token pa
 	assert.ok(issued.output.includes("BLOCKED until confirmed"));
 	// Pending lease does not alter the locked worker-first surface.
 	assert.deepEqual(stub.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST]);
-	assert.equal(stub.activeTools.length, 15);
+	assert.equal(stub.activeTools.length, 16);
 	const pendingOrdinary = await guardCall(stub, "edit", { path: "src/main.ts" });
 	assert.ok(pendingOrdinary && pendingOrdinary.block === true);
 	assert.match(String(pendingOrdinary.reason), /lease pending/);
@@ -1263,7 +1263,7 @@ test("non-TUI confirmation requires BOTH exact parts on the same command; mismat
 	const ok = await runCmd(stub, "q-commander-write-unlock", `confirm ${partA} ${partB}`);
 	assert.ok(ok.output.includes("CONFIRMED and active"));
 	assert.deepEqual(stub.activeTools, ACTIVE_SOL_DEV_ALLOWLIST);
-	assert.equal(stub.activeTools.length, 17);
+	assert.equal(stub.activeTools.length, 18);
 	assert.equal(await guardCall(stub, "edit", { path: "src/main.ts" }), undefined, "authorized edit passes the guard");
 	// The lease-id form confirms too, and a wrong id is refused.
 	const id = /pending lease (\S+)/.exec(issued.output)?.[1];
@@ -1283,7 +1283,7 @@ test("TUI unlock requires explicit human confirmation; cancel leaves the lease l
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	await solSession(stub);
-	// Cancel: nothing issued, nothing persisted, tools stay exactly 15.
+	// Cancel: nothing issued, nothing persisted, tools stay exactly 16.
 	const cancel = await runCmd(stub, "q-commander-write-unlock", UNLOCK_ARGS, { hasUI: true, mode: "tui", confirm: async () => false });
 	assert.match(cancel.output, /canceled/);
 	assert.equal(cancel.confirmCalls.length, 1, "exactly one confirmation dialog");
@@ -1376,13 +1376,13 @@ test("only authorized leased edit/write consumes calls; exhaustion restores the 
 	workbenchRuntime(stub);
 	await solSession(stub);
 	await issueAndConfirm(stub, "user-directed --paths package.json --calls 1 --minutes 10");
-	assert.equal(stub.activeTools.length, 17);
+	assert.equal(stub.activeTools.length, 18);
 	// A path outside the lease is blocked BEFORE consumption: the call stays available.
 	const outOfScope = await guardCall(stub, "edit", { path: ".github/workflows/ci.yml" });
 	assert.ok(outOfScope && outOfScope.block === true);
 	assert.match(String(outOfScope.reason), /outside the active write lease/);
 	assert.match(await leaseStatusLine(stub), /active.*0\/1/);
-	// The single authorized write consumes the only call; exhaustion reapplies the exact 15.
+	// The single authorized write consumes the only call; exhaustion reapplies the exact 16.
 	assert.equal(await guardCall(stub, "edit", { path: "package.json" }), undefined);
 	assert.deepEqual(stub.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST]);
 	assert.match(await leaseStatusLine(stub), /WRITE-LEASE exhausted/);
@@ -1487,7 +1487,7 @@ test("/q-commander-write-lock revokes the exception and restores the worker-firs
 	workbenchRuntime(stub);
 	await solSession(stub);
 	await issueAndConfirm(stub);
-	assert.equal(stub.activeTools.length, 17);
+	assert.equal(stub.activeTools.length, 18);
 	const locked = await runCmd(stub, "q-commander-write-lock", "");
 	assert.match(locked.output, /revoked/);
 	assert.match(locked.output, /user-directed lock/);
@@ -1519,13 +1519,13 @@ test("leaving DEV, model change and session end revoke the lease and reapply loc
 	workbenchRuntime(stubA);
 	await solSession(stubA);
 	await issueAndConfirm(stubA);
-	assert.equal(stubA.activeTools.length, 17);
+	assert.equal(stubA.activeTools.length, 18);
 	await runCmd(stubA, "q-mode-verify", "", { hasUI: true });
 	assert.match(await leaseStatusLine(stubA), /WRITE-LEASE revoked/);
 	assert.ok(!stubA.activeTools.includes("edit") && !stubA.activeTools.includes("write"));
 	assert.ok(!stubA.activeTools.includes("workbench_delegate_worker"), "VERIFY set applied");
 	await runCmd(stubA, "q-mode-dev", "", { hasUI: true });
-	assert.deepEqual(stubA.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST], "back to exact 15 after re-entering DEV");
+	assert.deepEqual(stubA.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST], "back to exact 16 after re-entering DEV");
 	// Model change: the lease is bound to GPT-5.6 Sol — it is revoked and the
 	// audit fact is persisted; the non-Sol actor falls back to the existing
 	// DEV behavior, and a returning Sol session reapplies the locked tools.
@@ -1544,7 +1544,7 @@ test("leaving DEV, model change and session end revoke the lease and reapply loc
 	assert.ok(last && typeof last.data === "object" && last.data !== null);
 	assert.match(String((last.data as { revokedReason?: unknown }).revokedReason), /model\/provider change/);
 	assert.ok(stubB.activeTools.includes("bash"), "non-Sol controllers keep the existing DEV tool set");
-	// Returning Sol: the revoked lease keeps the exact 15 locked tools.
+	// Returning Sol: the revoked lease keeps the exact 16 locked tools.
 	const sessionStart = stubB.events.get("session_start")![0]!;
 	await sessionStart(
 		{ type: "session_start", reason: "resume" } as never,
@@ -1576,7 +1576,7 @@ test("a confirmed lease is audit-restored but re-locks across session replacemen
 	await solSession(stubA);
 	await issueAndConfirm(stubA, "user-directed --paths package.json,.github/workflows/ci.yml --calls 2 --minutes 10");
 	assert.equal(await guardCall(stubA, "edit", { path: "package.json" }), undefined, "one authorized high-risk write");
-	assert.equal(stubA.activeTools.length, 17, "still active with one call left");
+	assert.equal(stubA.activeTools.length, 18, "still active with one call left");
 	// Runtime B restores audit facts but requires a fresh user grant. This
 	// prevents a failed revoke/consume append from reviving older authority.
 	const stubB = makeStub();
@@ -1627,7 +1627,7 @@ test("lease restore is policy-bound and fail-closed: wrong model, corrupt or exp
 	if (!confirmed.ok) throw new Error(confirmed.error);
 	const validEntry = entry(LEASE_STATE_ENTRY_TYPE, serializeLease(confirmed.lease));
 	// Expired entry (valid structure, past expiry): session_start sees it as
-	// expired — tools stay exactly 15.
+	// expired — tools stay exactly 16.
 	const expiredEntry = entry(LEASE_STATE_ENTRY_TYPE, {
 		...serializeLease(confirmed.lease),
 		issuedAt: "2020-01-01T00:00:00.000Z",
@@ -1714,7 +1714,7 @@ test("RPC mode is non-TUI: hasUI never opens the human dialog — the pending tw
 	const tui = await runCmd(stubTui, "q-commander-write-unlock", UNLOCK_ARGS, { mode: "tui", hasUI: true, confirm: async () => false });
 	assert.equal(tui.confirmCalls.length, 1, "only the real TUI asks for human confirmation");
 	assert.match(tui.output, /canceled/);
-	assert.deepEqual(stubTui.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST], "cancel leaves the exact canonical 15");
+	assert.deepEqual(stubTui.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST], "cancel leaves the exact canonical 16");
 });
 
 test("/q-write-policy accepts exactly the trimmed `status` argument; other/missing args print usage and never alter state", async () => {
@@ -1725,7 +1725,7 @@ test("/q-write-policy accepts exactly the trimmed `status` argument; other/missi
 		const { output } = await runCmd(stub, "q-write-policy", bad);
 		assert.match(output, /usage: \/q-write-policy status/, JSON.stringify(bad));
 	}
-	// No state change: the lease stays locked and the tools stay exact 15.
+	// No state change: the lease stays locked and the tools stay exact 16.
 	assert.match(await leaseStatusLine(stub), /WRITE-LEASE locked/);
 	assert.deepEqual(stub.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST]);
 	assert.ok(!stub.appendEntryCalls.some((c) => c.customType === LEASE_STATE_ENTRY_TYPE), "no lease entry written");

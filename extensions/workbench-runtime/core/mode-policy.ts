@@ -148,11 +148,13 @@ export function isToolHardDenied(mode: WorkbenchMode, toolName: string): boolean
 			toolName === "write" ||
 			toolName === "workbench_run_recipe" ||
 			toolName === "workbench_run_gate" ||
-			toolName === WORKER_TOOL_NAME
+			toolName === WORKER_TOOL_NAME ||
+			toolName === "workbench_commit_reviewed"
 		);
 	}
 	if (mode === "VERIFY") {
-		return toolName === "bash" || toolName === "edit" || toolName === "write" || toolName === WORKER_TOOL_NAME;
+		return toolName === "bash" || toolName === "edit" || toolName === "write" || toolName === WORKER_TOOL_NAME
+			|| toolName === "workbench_commit_reviewed";
 	}
 	return false;
 }
@@ -161,7 +163,7 @@ export function isToolHardDenied(mode: WorkbenchMode, toolName: string): boolean
  * Active-tool set to configure for a mode, based on the currently active set.
  *
  * Worker-first Sol DEV: the approved GPT-5.6 Sol identity receives the
- * canonical 15-tool read/control/delegation surface. Bash and foreign tools
+ * canonical 16-tool read/control/delegation/local-commit surface. Bash and foreign tools
  * remain excluded. An ACTIVE human-issued lease adds only its exact
  * edit/write subset, and the second-layer guard still checks path/tool scope.
  * Delegated workers and

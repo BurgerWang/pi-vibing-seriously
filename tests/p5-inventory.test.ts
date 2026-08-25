@@ -79,8 +79,10 @@ export const EXPECTED_TOOLS = [
 	"workbench_delegate_worker",
 	"workbench_review_worker_diff",
 	"workbench_delegation_status",
-	// P8b: the public read-only recovery tool is appended LAST (10 → 11).
+	// P8b: the public read-only recovery tool follows the original tools.
 	"workbench_recover_tool_result",
+	// Review-bound local commit is the additive final catalog tool.
+	"workbench_commit_reviewed",
 ] as const;
 
 export const EXPECTED_PROMPTS = ["q-audit", "q-plan", "q-build", "q-debug", "q-verify", "q-optimize", "q-review"] as const;
@@ -124,20 +126,19 @@ test("extension module direct-loads and registers exactly the 30 deterministic c
 	);
 });
 
-test("extension registers exactly 14 tools: the three fixed native overrides first, then the 11 workbench catalog tools", () => {
+test("extension registers exactly 15 tools: the three fixed native overrides first, then the 12 workbench catalog tools", () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	const tools = stub.tools as Map<string, unknown>;
-	// EXPECTED_TOOLS stays the unchanged 11-workbench-tool constant (NRO N1:
-	// the native overrides are same-name overrides, never catalog tools).
+	// Native overrides are same-name overrides, never catalog tools.
 	assert.deepEqual([...EXPECTED_TOOLS], [...WORKBENCH_TOOL_NAMES], "EXPECTED_TOOLS tracks WORKBENCH_TOOL_NAMES");
 	assert.deepEqual(
 		[...tools.keys()],
 		[...NATIVE_OVERRIDE_NAMES, ...EXPECTED_TOOLS],
-		"native read/grep/find fixed first, then the 11 catalog tools in order (14 total)",
+		"native read/grep/find fixed first, then the 12 catalog tools in order (15 total)",
 	);
 	const catalogTools = [...tools.keys()].filter((n) => n.startsWith("workbench_"));
-	assert.deepEqual(catalogTools, [...EXPECTED_TOOLS], "catalog subset unchanged");
+	assert.deepEqual(catalogTools, [...EXPECTED_TOOLS], "catalog subset matches the current additive inventory");
 	for (const name of catalogTools) {
 		assert.ok(name.startsWith("workbench_"), name);
 	}

@@ -14,12 +14,14 @@ import {
 	reconcileProjectDelegationAuthorityV2,
 } from "./delegation-project-authority.ts";
 import { recoverReceipt } from "./tool-result-recovery.ts";
+import { commitLatestReviewedDelegationV1, LOCAL_REVIEWED_COMMIT_SERVICES_V1 } from "./local-commit.ts";
 import { buildTrustedRecoveryAuthority } from "./trusted-recovery-authority.ts";
 import type { CompareToolServices } from "./compare-tool-controller.ts";
 import type { DelegateToolServices } from "./delegate-tool-controller.ts";
 import type { RecoveryToolServices } from "./recovery-tool-controller.ts";
 import type { ReviewToolServices } from "./review-tool-controller.ts";
 import type { DelegationSessionServices } from "./delegation-session-controller.ts";
+import type { LocalCommitToolServices } from "./local-commit-tool-controller.ts";
 
 const now = (): Date => new Date();
 
@@ -45,10 +47,15 @@ const review = Object.freeze({
 	reviewLegacy: reviewDelegation,
 }) satisfies ReviewToolServices;
 const recovery = Object.freeze({ recoverReceipt }) satisfies RecoveryToolServices;
+const localCommit = Object.freeze({
+	now,
+	commitReviewed: commitLatestReviewedDelegationV1,
+	commitServices: LOCAL_REVIEWED_COMMIT_SERVICES_V1,
+}) satisfies LocalCommitToolServices;
 const delegationSession = Object.freeze({
 	collectCurrentBinding: collectCurrentDelegationBindingV2,
 	reconcileProjectAuthority: reconcileProjectDelegationAuthorityV2,
 }) satisfies DelegationSessionServices;
 
 /** Immutable production dependency bundle; tests inject bounded alternatives. */
-export const RUNTIME_CONTROLLER_SERVICES = Object.freeze({ compare, delegate, review, recovery, delegationSession });
+export const RUNTIME_CONTROLLER_SERVICES = Object.freeze({ compare, delegate, review, recovery, localCommit, delegationSession });

@@ -28,6 +28,7 @@ import { readManifest, RUN_SCHEMA_VERSION, type RunRecord } from "../extensions/
 import {
 	WORKBENCH_TOOL_METADATA,
 	WORKBENCH_TOOL_NAMES,
+	WORKBENCH_TOOL_NAMES_V1,
 	WORKBENCH_TOOL_PARAMETERS,
 	workbenchToolMetadataV1Ordered,
 } from "../extensions/workbench-runtime/core/tool-catalog.ts";
@@ -205,7 +206,12 @@ test("governance v1 freezes schema constants, public tool input/output categorie
 	const snapshot = await readJson<ContractSnapshot>(join(FIXTURES, "public-tool-contract.json"));
 	const v1Catalog = workbenchToolMetadataV1Ordered();
 	assert.equal(canonicalHash(v1Catalog), snapshot.catalog_hash);
-	assert.deepEqual(WORKBENCH_TOOL_NAMES, snapshot.tools.map((tool) => tool.name));
+	assert.deepEqual(WORKBENCH_TOOL_NAMES_V1, snapshot.tools.map((tool) => tool.name));
+	assert.deepEqual(
+		WORKBENCH_TOOL_NAMES.slice(WORKBENCH_TOOL_NAMES_V1.length),
+		["workbench_commit_reviewed"],
+		"current catalog appends local commit without rewriting governance v1",
+	);
 	for (const tool of snapshot.tools) {
 		const v1Tool = v1Catalog.find((entry) => entry.name === tool.name);
 		assert.ok(v1Tool, `${tool.name} missing from v1 catalog`);
@@ -274,7 +280,7 @@ test("governance v1 freezes schema constants, public tool input/output categorie
 				.map((name) => readFile(join(runtimeCore, name), "utf8")),
 		),
 	].join("\n");
-	assert.deepEqual(snapshot.observable_result_semantics.map((entry) => entry.name), [...WORKBENCH_TOOL_NAMES]);
+	assert.deepEqual(snapshot.observable_result_semantics.map((entry) => entry.name), [...WORKBENCH_TOOL_NAMES_V1]);
 	for (const entry of snapshot.observable_result_semantics) {
 		assert.equal(entry.envelope, "text-content+bounded-details");
 		assert.ok(entry.category.length > 0);

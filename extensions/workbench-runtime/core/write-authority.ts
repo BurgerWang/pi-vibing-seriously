@@ -151,10 +151,11 @@ export const STRICT_SOL_DEV_ALLOWLIST: readonly string[] = [
 	"workbench_delegate_worker",
 	"workbench_review_worker_diff",
 	"workbench_delegation_status",
-	// P8b: the public read-only recovery tool is appended LAST (14 → 15), in
-	// the same order as WORKBENCH_TOOL_NAMES / MODE_TOOLS (stable-prefix
-	// discipline: never reorder, never add tools implicitly).
+	// P8b: the public read-only recovery tool follows the established tools.
 	"workbench_recover_tool_result",
+	// Dedicated local commit authority: reviewed paths only; no bash/push or
+	// caller-controlled path selection.
+	"workbench_commit_reviewed",
 ];
 
 export const STRICT_ALLOWLIST_SET: ReadonlySet<string> = new Set(STRICT_SOL_DEV_ALLOWLIST);

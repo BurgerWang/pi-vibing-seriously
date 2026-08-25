@@ -148,6 +148,7 @@ test("worker-role filtering still hides recursion/final-gate tools from the stri
 	const workerTools = computeRoleActiveTools(STRICT_SOL_DEV_ALLOWLIST, WORKER_ROLE);
 	assert.ok(!workerTools.includes("workbench_delegate_worker"), "workers can never recursively delegate");
 	assert.ok(!workerTools.includes("workbench_run_gate"), "workers can never run final gates");
+	assert.ok(!workerTools.includes("workbench_commit_reviewed"), "workers can never create reviewed commits");
 	assert.ok(workerTools.includes("read"));
 	assert.ok(workerTools.includes("workbench_run_recipe"));
 });
@@ -157,6 +158,7 @@ test("worker role blocks recursion, free bash, final gates, and out-of-scope wri
 	assert.match(workerRoleToolCallBlockReason(context, "workbench_delegate_worker", {}) ?? "", /recursively/);
 	assert.match(workerRoleToolCallBlockReason(context, "bash", { command: "npm test" }) ?? "", /declared workbench recipes/);
 	assert.match(workerRoleToolCallBlockReason(context, "workbench_run_gate", {}) ?? "", /Sol commander/);
+	assert.match(workerRoleToolCallBlockReason(context, "workbench_commit_reviewed", {}) ?? "", /Sol commander/);
 	assert.equal(workerRoleToolCallBlockReason(context, "edit", { path: "src/main.ts" }), undefined);
 	assert.equal(workerRoleToolCallBlockReason(context, "write", { path: "tests/new.test.ts" }), undefined);
 	assert.match(workerRoleToolCallBlockReason(context, "edit", { path: "README.md" }) ?? "", /outside the parent-approved scope/);
@@ -404,7 +406,9 @@ test("worker-delegation documentation defines fixed Sol/Luna boundaries and stri
 	assert.match(doc, /at most one worker writes to a worktree at any time/);
 	// Current worker-first write authority and the single public v2 transaction.
 	assert.match(doc, /## Fixed Sol -> Luna write authority \(current; legacy id P7\)/);
-	assert.match(doc, /fixed 15-tool\s+read\/control\/delegation surface/);
+	assert.match(doc, /fixed 16-tool\s+read\/control\/delegation\/local-commit surface/);
+	assert.match(doc, /`workbench_commit_reviewed`/);
+	assert.match(doc, /never pushes, amends, resets, cleans, stashes, switches branches/);
 	assert.match(doc, /routine source,\s+test, and documentation edits are delegated to Luna/);
 	assert.match(doc, /Any direct Sol `edit`\/`write` requires a \*\*temporary write lease exception\*\*/);
 	assert.match(doc, /`WF:LOCKED` otherwise/);

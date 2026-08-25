@@ -19,6 +19,7 @@ runtime.
 | --- | --- |
 | **Fixed Sol → Luna delivery** | GPT-5.6 Sol owns requirements, architecture, scope, review, and verdict; GPT-5.6 Luna xhigh owns routine implementation inside one bounded contract |
 | **Low-ceremony governance** | One successful delegation scope-checks, reviews, and closes itself; explicit review/status is reserved for recovery |
+| **Review-bound local commits** | After semantic acceptance, Sol can checkpoint exactly the reviewed paths locally without asking you to stage or commit them; push and history rewriting remain unavailable |
 | **Repeatable verification** | Named recipes create durable evidence; gates return PASS / FAIL / BLOCKED / NOT_RUN |
 | **Context that stays usable** | Bounded results, pagination, history projection, and cumulative worker budgets prevent long sessions from collapsing under their own output |
 | **Safe reuse** | Success-only action caching reuses declared recipe results without caching model answers or arbitrary shell work |
@@ -108,7 +109,12 @@ inspect → Sol contract → one Luna delivery → focused feedback → stable c
 
 A successful delegated implementation performs its scope check and bounded
 actual-diff review in the same call. Explicit review and status tools are
-recovery surfaces, not mandatory follow-up steps.
+recovery surfaces, not mandatory follow-up steps. Once semantic acceptance and
+the relevant final checks are complete, Sol can call
+`workbench_commit_reviewed` with only a commit message. The runtime derives the
+exact path set from durable review authority, preserves unrelated dirty files,
+and reports `push=NOT_RUN`; it cannot amend, reset, clean, stash, switch branches,
+or push.
 
 ## Sol + Luna
 
@@ -122,6 +128,11 @@ The active worker is pinned to `openai-codex/gpt-5.6-luna:xhigh`.
 Sol does not receive ordinary `edit`/`write` tools. A user may grant a
 short-lived, path- and call-bounded lease for an explicit exceptional direct
 write; locking, expiry, or exhaustion restores the fixed worker-first surface.
+Local checkpointing is separate from that lease: the approved Sol commander in
+DEV may use `workbench_commit_reviewed` only after the latest non-zero delivery
+has finalized semantic ACCEPT authority and still matches current project
+bytes. No per-commit user action is required, but push/publish/release authority
+is never implied.
 
 Worker cumulative limits provide a continuation reserve rather than an early
 dead end:
