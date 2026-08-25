@@ -182,6 +182,9 @@ function hasConflict(facts: GitFacts): boolean {
 
 function sameContentSnapshot(before: GitFacts, after: GitFacts, reviewedPaths: ReadonlySet<string>): boolean {
 	if (before.gitHead !== after.gitHead || !sameStrings(before.changedPaths, after.changedPaths)) return false;
+	const beforeRenames = Object.entries(before.renameSources ?? {}).sort(([left], [right]) => Buffer.from(left).compare(Buffer.from(right)));
+	const afterRenames = Object.entries(after.renameSources ?? {}).sort(([left], [right]) => Buffer.from(left).compare(Buffer.from(right)));
+	if (JSON.stringify(beforeRenames) !== JSON.stringify(afterRenames)) return false;
 	for (const path of before.changedPaths) {
 		if (before.pathDigests[path] !== after.pathDigests[path]) return false;
 		if (!reviewedPaths.has(path) && before.pathStatuses[path] !== after.pathStatuses[path]) return false;
@@ -413,6 +416,14 @@ export async function commitLatestReviewedDelegationV1(input: {
 			if (paths.length === 0) continue;
 			const dirtyPaths = paths.filter((path) => before.changedPaths.includes(path));
 			if (dirtyPaths.length === 0) continue;
+			const incompleteRename = dirtyPaths.some((path) => {
+				const source = before.renameSources?.[path];
+				return source !== undefined && !paths.includes(source);
+			});
+			if (incompleteRename) {
+				incompatibleCandidateId ??= candidateId;
+				continue;
+			}
 			const committed = await services.readCommittedGeneration(input.project_root, candidateId);
 			if (!committed.ok) {
 				outcome = failure("authority_unavailable", "the accepted delegation generation is unavailable", candidateId);
@@ -537,7 +548,10 @@ export async function commitLatestReviewedDelegationV1(input: {
 			return outcome;
 		}
 		const committedPaths = await runGit(input.exec, input.project_root, [
-			"diff-tree", "--root", "--no-commit-id", "--name-only", "--find-renames", "-r", "-z", committedHash,
+			// Verify the actual tree path set. Rename presentation collapses the
+			// source deletion under --name-only, so disable rename detection here
+			// and require both changed tree paths to match review authority.
+			"diff-tree", "--root", "--no-commit-id", "--name-only", "--no-renames", "-r", "-z", committedHash,
 		]);
 		if (!committedPaths.ok || !sameStrings(parseNulPaths(committedPaths.stdout), reviewedPaths)) {
 			outcome = failure(

@@ -334,7 +334,9 @@ Consequences for the commander workflow:
   Unrelated pending/failed/diagnostic transactions, unrelated dirt, staging
   state, and path-disjoint HEAD movement do not block the checkpoint. An
   unrelated staged index is captured and verified unchanged. No per-commit
-  user confirmation or manual staging is needed.
+  user confirmation or manual staging is needed. A staged rename is one atomic
+  reviewed pair: both the source deletion and destination must be sealed; a
+  legacy destination-only record fails closed before Git creates a commit.
 - When the user explicitly requests publication, Sol may call
   `workbench_git` with `action=push` and the exact current `expected_head`.
   Only current HEAD to the same named branch on an existing remote is allowed;

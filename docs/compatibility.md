@@ -656,7 +656,10 @@ one-time tool-name/order/schema fingerprint transition before release.
 `action=checkpoint` accepts a bounded message and derives exact non-empty
 paths from strict finalized semantic reviews. It binds the checkpoint to
 sealed path bytes rather than the broader live review binding, batches every
-compatible accepted slice, and preserves unrelated staged entries.
+compatible accepted slice, and preserves unrelated staged entries. A staged
+rename is represented and verified as both its source deletion and destination;
+pre-fix destination-only review authority is rejected rather than partially
+committed.
 `action=push` requires an exact current HEAD and permits only an ordinary push
 of the current named branch to the same branch on an existing remote, followed
 by remote-ref verification. Force, ref deletion, amend, clean, stash,
@@ -667,6 +670,12 @@ draft rather than creating a second overlapping Git tool. After reload,
 same-mode builds are stable again. The current ordered workbench catalog hash
 is `09a9f327341cf5bd3c9490e1f873c46a34cafeb0ee91cc3d5cc6d47065d4c003`;
 the frozen governance-v1 catalog remains unchanged.
+
+An existing project-root `AGENTS.md` is intentionally never rewritten during
+package update. If it came from the pre-release draft and still references
+`workbench_commit_reviewed`, run `/q-init` with the existing profile, decline
+the four workbench-config overwrites, and explicitly approve only the
+`AGENTS.md` overwrite. The current runtime exposes no legacy Git alias.
 
 ## NRO N1/N2 (Commander Native Tool Optimization) — additive compatibility
 

@@ -63,11 +63,19 @@ publication, `/reload`, or measured live provider cache improvement is claimed.
   Reviewed path drift, non-descendant history, intervening committed touches,
   invalid authority, conflicts, and in-progress Git operations still fail
   closed.
+- Staged renames are now bound as an atomic source-deletion plus destination
+  pair throughout Git facts, scope review, and checkpoint verification. A
+  legacy destination-only review fails closed before commit instead of
+  creating an addition-only checkpoint and leaving the source deletion staged.
 - `workbench_git action=push` adds explicit exact-HEAD ordinary publication for
   Sol in DEV. It pushes only current HEAD to the same named branch on an
   existing remote, never force-pushes or deletes refs, and verifies the remote
   ref after success. It grants no release, Gate, Formal, or production
   authority.
+- Existing projects that used the pre-release `workbench_commit_reviewed`
+  AGENTS template migrate explicitly through `/q-init`: keep the four existing
+  workbench config files and approve only the project-root `AGENTS.md`
+  overwrite. No compatibility alias or silent instruction rewrite is added.
 - Skill loading is development-first: five concise workflow/router skills stay
   model-visible, while nine orientation, CLI, release, and research specialists
   are explicit-only. Prompt templates select one primary workflow, references

@@ -58,6 +58,13 @@ After updating or reinstalling the package, run `/reload` before starting a
 new conversation. `/new` resets conversation history but does not reload the
 workbench extension code already held by the Pi process.
 
+If a project was initialized from the pre-release local-commit draft and its
+existing `AGENTS.md` still names `workbench_commit_reviewed`, run `/q-init`
+again with the project's current profile, decline the four workbench-config
+overwrites, and approve only the `AGENTS.md` overwrite. This is an explicit
+one-time template migration; the runtime does not register a second Git alias
+or silently rewrite project instructions.
+
 Execution summaries are checked against machine evidence. In particular, the
 assistant may report a current-turn worker attempt only when that turn actually
 called `workbench_delegate_worker`; delegation status and completion claims

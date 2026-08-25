@@ -106,6 +106,26 @@ test("AGENTS.md is overwritten only after explicit confirmation", async () => {
 	});
 });
 
+test("a pre-release Git instruction migrates only through explicit AGENTS overwrite", async () => {
+	await withTempDir(async (dir) => {
+		const agentsPath = join(dir, AGENTS_ENTRY_FILE);
+		await writeFile(agentsPath, "Use workbench_commit_reviewed after acceptance.\n", "utf8");
+
+		const declined = await planInit(dir, "generic", { exists, confirmOverwrite: async () => false });
+		assert.equal(declined.entries.find((entry) => entry.file === AGENTS_ENTRY_FILE)?.action, "skip");
+
+		const approved = await planInit(dir, "generic", {
+			exists,
+			confirmOverwrite: async (file) => file === AGENTS_ENTRY_FILE,
+		});
+		const written = new Map<string, string>();
+		await applyInit(approved, memoryIO(written));
+		const migrated = written.get(agentsPath) ?? "";
+		assert.match(migrated, /workbench_git action=checkpoint/);
+		assert.doesNotMatch(migrated, /workbench_commit_reviewed/);
+	});
+});
+
 test("q-init does NOT overwrite existing config files by default", async () => {
 	await withTempDir(async (dir) => {
 		await mkdir(join(dir, ".pi", "workbench"), { recursive: true });

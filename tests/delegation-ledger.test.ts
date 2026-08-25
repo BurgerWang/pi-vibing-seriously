@@ -40,6 +40,7 @@ import {
 	makeDelegationId,
 	normalizeStatusPath,
 	parsePorcelainPath,
+	parsePorcelainPathChanges,
 	parseReportedPaths,
 	readDelegationLedger,
 	MAX_CHANGED_PATHS,
@@ -149,6 +150,16 @@ test("parsePorcelainPath decodes Git C-quoted UTF-8 bytes and rejects malformed 
 	assert.equal(parsePorcelainPath('R  "bad\\q.txt" -> good.txt'), undefined, "a malformed rename source rejects the whole record");
 });
 
+test("parsePorcelainPathChanges represents a rename as source deletion plus destination", () => {
+	assert.deepEqual(parsePorcelainPathChanges("R  old.ts -> new.ts"), [
+		{ path: "old.ts", status: "D " },
+		{ path: "new.ts", status: "R ", renameSource: "old.ts" },
+	]);
+	assert.deepEqual(parsePorcelainPathChanges("C  old.ts -> new.ts"), [
+		{ path: "new.ts", status: "C " },
+	]);
+});
+
 test("the ledger's own directory is recognized and never a project change", async () => {
 	await withTempDir(async (dir) => {
 		assert.equal(isDelegationRecordPath(dir, `${CONFIG_DIR_NAME}/workbench/delegations/x/manifest.json`), true);
@@ -190,6 +201,46 @@ test("collectGitFacts records HEAD, dirty state and per-path digests (tracked + 
 		assert.deepEqual(dirty.changedPaths, ["README.md", "src/nested/new.ts"]);
 		assert.match(dirty.pathDigests["README.md"] ?? "", /^[0-9a-f]{64}$/);
 		assert.match(dirty.pathDigests["src/nested/new.ts"] ?? "", /^[0-9a-f]{64}$/);
+	});
+});
+
+test("collectGitFacts binds both sides of a real staged rename", async () => {
+	await withTempDir(async (dir) => {
+		await cleanRepo(dir);
+		await git(dir, ["mv", "README.md", "RENAMED.md"]);
+		const facts = await collectGitFacts(dir, spawnExec);
+		assert.deepEqual(facts.changedPaths, ["README.md", "RENAMED.md"]);
+		assert.equal(facts.pathStatuses["README.md"], "D ");
+		assert.equal(facts.pathStatuses["RENAMED.md"], "R ");
+		assert.equal(facts.pathDigests["README.md"], undefined);
+		assert.match(facts.pathDigests["RENAMED.md"] ?? "", /^[0-9a-f]{64}$/);
+		assert.deepEqual(facts.renameSources, { "RENAMED.md": "README.md" });
+	});
+});
+
+test("collectGitFacts rejects a rename that crosses the workbench artifact boundary", async () => {
+	await withTempDir(async (dir) => {
+		await cleanRepo(dir);
+		const artifactRelative = join(CONFIG_DIR_NAME, "workbench", "delegations", "20260825-120000-abcd");
+		const artifactDir = join(dir, artifactRelative);
+		await mkdir(artifactDir, { recursive: true });
+		await git(dir, ["mv", "README.md", join(artifactRelative, "README.md")]);
+		await assert.rejects(
+			collectGitFacts(dir, spawnExec),
+			/rename crosses the workbench artifact boundary/,
+		);
+	});
+});
+
+test("collectGitFacts fails closed when a staged rename source is recreated", async () => {
+	await withTempDir(async (dir) => {
+		await cleanRepo(dir);
+		await git(dir, ["mv", "README.md", "RENAMED.md"]);
+		await writeFile(join(dir, "README.md"), "replacement at the old path\n", "utf8");
+		await assert.rejects(
+			collectGitFacts(dir, spawnExec),
+			/overlapping records for one path/,
+		);
 	});
 });
 

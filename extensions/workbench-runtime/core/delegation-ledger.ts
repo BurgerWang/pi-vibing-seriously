@@ -165,6 +165,13 @@ export interface GitFacts {
 	pathStatuses: Record<string, string>;
 	/** Per-path bounded content digests for paths that are readable files. */
 	pathDigests: Record<string, string>;
+	/**
+	 * Current porcelain rename pairing (destination -> source). This is a
+	 * live checkpoint guard, not a persisted authority field: new records bind
+	 * both paths through changedPaths/statuses, while legacy destination-only
+	 * records can be rejected before a partial path-limited commit.
+	 */
+	renameSources?: Record<string, string>;
 }
 
 export interface AfterFacts extends GitFacts {
@@ -599,22 +606,53 @@ function porcelainRenameArrow(raw: string): number {
 	return -1;
 }
 
-/** Extract the destination path from one `git status --porcelain` line. */
-export function parsePorcelainPath(line: string): string | undefined {
+export interface PorcelainPathChange {
+	path: string;
+	status: string;
+	renameSource?: string;
+}
+
+function renameSourceStatus(status: string): string {
+	return `${status[0] === "R" ? "D" : " "}${status[1] === "R" ? "D" : " "}`;
+}
+
+/**
+ * Extract every changed path represented by one porcelain record.
+ *
+ * A rename is one Git status line but two project changes: the source is
+ * deleted and the destination is present. Keeping both paths in GitFacts is
+ * required for scope review and for an atomic path-limited checkpoint. Copies
+ * keep their source, so only their destination is a changed path.
+ */
+export function parsePorcelainPathChanges(line: string): PorcelainPathChange[] | undefined {
 	if (line.length < 4) return undefined;
+	const status = line.slice(0, 2);
 	let rest = line.slice(3).trim();
 	// Renames/copies render as "XY <source> -> <dest>": only R/C status
 	// lines give the arrow structural meaning. An ordinary filename may
 	// legitimately contain the same text and must remain whole.
-	if (/[RC]/.test(line.slice(0, 2))) {
+	if (/[RC]/.test(status)) {
 		const arrow = porcelainRenameArrow(rest);
 		if (arrow < 0) return undefined;
 		const source = unquotePorcelainPath(rest.slice(0, arrow).trim());
 		if (!source) return undefined;
 		rest = rest.slice(arrow + 4).trim();
+		const destination = unquotePorcelainPath(rest);
+		if (!destination) return undefined;
+		return status.includes("R")
+			? [
+				{ path: source, status: renameSourceStatus(status) },
+				{ path: destination, status, renameSource: source },
+			]
+			: [{ path: destination, status }];
 	}
 	const decoded = unquotePorcelainPath(rest);
-	return decoded || undefined;
+	return decoded ? [{ path: decoded, status }] : undefined;
+}
+
+/** Extract the primary/destination path for legacy single-path callers. */
+export function parsePorcelainPath(line: string): string | undefined {
+	return parsePorcelainPathChanges(line)?.at(-1)?.path;
 }
 
 const REPORTED_SECTION_HEADING = /^##\s*files changed\s*$/i;
@@ -780,44 +818,53 @@ export async function collectGitFacts(projectRoot: string, exec: ExecFn): Promis
 	const changedPaths: string[] = [];
 	const pathStatuses: Record<string, string> = {};
 	const pathDigests: Record<string, string> = {};
+	const renameSources: Record<string, string> = {};
 	const seen = new Set<string>();
 	for (const line of lines) {
-		const raw = parsePorcelainPath(line);
-		if (!raw) throw new Error("git status --porcelain returned an invalid or undecodable path");
-		const normalized = normalizeStatusPath(raw);
-		if (!normalized || seen.has(normalized)) continue;
-		// The workbench's own delegation records are never part of the diff
-		// (excluded before the cap, so they never trigger refusal either).
-		if (isDelegationRecordPath(root, normalized)) continue;
-		// P8b tool-result receipts are never part of the diff either — same
-		// before-the-cap exclusion, so recovery artifacts never trigger
-		// refusal and never enter changedPaths/statuses/digests/hash inputs.
-		if (isToolResultReceiptPath(root, normalized)) continue;
-		// The cross-session delegation-start mutex and its strictly named
-		// atomic publication/release artifacts exist only while the workbench
-		// prepares a delegation. They must not become worker delta or trigger
-		// workspace drift, while sibling names remain ordinary project paths.
-		if (isDelegationStartLockArtifactPath(root, normalized)) continue;
-		// FAIL CLOSED on overflow: a silently truncated path set could let
-		// diff hashing and scope review PASS on a partial diff, so a
-		// distinct non-ledger path beyond MAX_CHANGED_PATHS REJECTS
-		// collection — never a partial fact set.
-		if (changedPaths.length >= MAX_CHANGED_PATHS) {
-			throw new Error(
-				`git status --porcelain reports more than ${MAX_CHANGED_PATHS} changed paths; refusing to record a truncated diff (diff hashing and scope review must never run on a partial path set)`,
-			);
+		const changes = parsePorcelainPathChanges(line);
+		if (!changes) throw new Error("git status --porcelain returned an invalid or undecodable path");
+		const normalizedChanges = changes.map((change) => {
+			const path = normalizeStatusPath(change.path);
+			if (!path) throw new Error("git status --porcelain returned an unsafe path");
+			return { change, path };
+		});
+		const ignored = normalizedChanges.map(({ path }) => isDelegationRecordPath(root, path)
+			|| isToolResultReceiptPath(root, path) || isDelegationStartLockArtifactPath(root, path));
+		if (normalizedChanges.length === 2 && ignored.some(Boolean) && !ignored.every(Boolean)) {
+			throw new Error("git status --porcelain rename crosses the workbench artifact boundary");
 		}
-		seen.add(normalized);
-		changedPaths.push(normalized);
-		// Raw porcelain XY status code (" M", "??", "D ", "R "...) — path
-		// identity facts that keep the hash sensitive to tracked/untracked/
-		// staged/deleted transitions, not only to content digests.
-		pathStatuses[normalized] = line.slice(0, 2);
-		const digest = await contentDigest(root, normalized);
-		if (digest) pathDigests[normalized] = digest;
+		for (const [{ change, path: normalized }, isIgnored] of normalizedChanges.map((value, index) => [value, ignored[index]!] as const)) {
+			if (seen.has(normalized)) {
+				throw new Error("git status --porcelain returned overlapping records for one path");
+			}
+			// Delegation records, P8b receipts, and the exact delegation-start
+			// lock artifacts are excluded before the cap. A rename cannot cross
+			// this boundary because dropping either half would fabricate a
+			// partial project change.
+			if (isIgnored) continue;
+			// FAIL CLOSED on overflow: a silently truncated path set could let
+			// diff hashing and scope review PASS on a partial diff, so a
+			// distinct non-ledger path beyond MAX_CHANGED_PATHS REJECTS
+			// collection — never a partial fact set.
+			if (changedPaths.length >= MAX_CHANGED_PATHS) {
+				throw new Error(
+					`git status --porcelain reports more than ${MAX_CHANGED_PATHS} changed paths; refusing to record a truncated diff (diff hashing and scope review must never run on a partial path set)`,
+				);
+			}
+			seen.add(normalized);
+			changedPaths.push(normalized);
+			pathStatuses[normalized] = change.status;
+			if (change.renameSource !== undefined) {
+				const source = normalizeStatusPath(change.renameSource);
+				if (!source) throw new Error("git status --porcelain returned an unsafe rename source");
+				renameSources[normalized] = source;
+			}
+			const digest = await contentDigest(root, normalized);
+			if (digest) pathDigests[normalized] = digest;
+		}
 	}
 	changedPaths.sort();
-	return { gitHead, gitDirty: changedPaths.length > 0, changedPaths, pathStatuses, pathDigests };
+	return { gitHead, gitDirty: changedPaths.length > 0, changedPaths, pathStatuses, pathDigests, renameSources };
 }
 
 /**

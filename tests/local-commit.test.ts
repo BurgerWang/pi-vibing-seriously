@@ -181,6 +181,44 @@ test("path-limited checkpoint includes a reviewed deletion without git add -A", 
 	}
 });
 
+test("path-limited checkpoint commits a reviewed rename atomically", async () => {
+	const root = await repo();
+	try {
+		await git(root, "mv", "reviewed.txt", "renamed.txt");
+		const result = await commitLatestReviewedDelegationV1({
+			project_root: root,
+			message: "refactor: rename reviewed file",
+			now: "2026-08-25T12:01:45.000Z",
+			exec,
+		}, services({ paths: ["reviewed.txt", "renamed.txt"] }));
+		assert.equal(result.ok, true, JSON.stringify(result));
+		if (!result.ok) return;
+		assert.deepEqual(result.committed_paths, ["renamed.txt", "reviewed.txt"]);
+		assert.match(await git(root, "show", "--format=", "--name-status", "--find-renames", "HEAD"), /^R100\s+reviewed\.txt\s+renamed\.txt$/m);
+		assert.equal((await git(root, "status", "--short")).trim(), "");
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("legacy destination-only rename authority fails closed before creating a partial commit", async () => {
+	const root = await repo();
+	try {
+		await git(root, "mv", "reviewed.txt", "renamed.txt");
+		const result = await commitLatestReviewedDelegationV1({
+			project_root: root,
+			message: "refactor: reject incomplete rename authority",
+			now: "2026-08-25T12:01:50.000Z",
+			exec,
+		}, services({ paths: ["renamed.txt"] }));
+		assert.deepEqual(result.ok ? "ok" : result.code, "binding_conflict");
+		assert.equal((await git(root, "log", "-1", "--format=%s")).trim(), "initial");
+		assert.match(await git(root, "status", "--short"), /^R\s+reviewed\.txt -> renamed\.txt$/m);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
 test("one checkpoint batches all compatible reviewed slices", async () => {
 	const root = await repo();
 	try {
