@@ -15,6 +15,10 @@ import {
 	readRecoverableUnpublishedDelegationV2,
 	reconcileProjectDelegationAuthorityV2,
 } from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
+import {
+	inactiveBlockerRelevantPathsV2,
+	publishDelegationInactiveBlockerClosureV2,
+} from "../extensions/workbench-runtime/core/delegation-authority-closure.ts";
 import type { ExecFn } from "../extensions/workbench-runtime/core/config.ts";
 import { emptyDelegationState } from "../extensions/workbench-runtime/core/delegation-state.ts";
 import {
@@ -31,12 +35,21 @@ import {
 	persistRunningDelegationTransaction,
 } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
 import {
+	beginDelegationCommit,
 	bindDelegationRepairLineageV1,
+	DELEGATION_COMMITTED_RECORD_NAMES,
+	delegationCommitMarker,
+	publishDelegationCommit,
+	startDelegationTransaction,
+	type DelegationCasInput,
+	type DelegationCommittedGenerationProof,
 	type DelegationRepairLineageV1,
 	type DelegationTransactionRecord,
+	type DelegationTransactionResult,
 } from "../extensions/workbench-runtime/core/delegation-transaction.ts";
 import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { createWorkerWriteJournal, sealWorkerWriteJournal } from "../extensions/workbench-runtime/core/write-journal.ts";
+import { collectWorkspaceGuard } from "../extensions/workbench-runtime/core/workspace-guard.ts";
 import { spawnExec, withTempDir } from "./helpers.ts";
 
 const HASH = "a".repeat(64);
@@ -79,6 +92,38 @@ async function prepared(root: string, id: string, second: number, lineage?: Dele
 	});
 	if (!result.ok) throw new Error(result.error.code);
 	return result.value;
+}
+
+function transactionState(result: DelegationTransactionResult): DelegationTransactionRecord {
+	assert.equal(result.ok, true, result.ok ? "" : result.error);
+	return result.state;
+}
+
+function transactionCas(state: DelegationTransactionRecord, second: number): DelegationCasInput {
+	return {
+		delegation_id: state.delegation_id,
+		contract_hash: state.contract_hash,
+		worker_identity: state.worker_identity,
+		expected_generation: state.generation,
+		expected_revision: state.revision,
+		now: at(second),
+	};
+}
+
+function committedProof(state: DelegationTransactionRecord): DelegationCommittedGenerationProof {
+	const payload: Omit<DelegationCommittedGenerationProof, "commit_marker"> = {
+		schema_version: 2,
+		delegation_id: state.delegation_id,
+		task_kind: state.task_kind,
+		contract_hash: state.contract_hash,
+		worker_identity: state.worker_identity,
+		generation: state.generation,
+		revision: state.revision,
+		record_names: [...DELEGATION_COMMITTED_RECORD_NAMES],
+		record_count: DELEGATION_COMMITTED_RECORD_NAMES.length,
+		content_hash: "e".repeat(64),
+	};
+	return { ...payload, commit_marker: delegationCommitMarker(payload) };
 }
 
 async function recoverableUnpublished(
@@ -310,6 +355,76 @@ test("inactive blocker closure requires only its exact changed paths clean and p
 		assert.equal(closed.ok, true, closed.ok ? "" : closed.code);
 		assert.equal(await readFile(join(root, "notes.txt"), "utf8"), "unrelated user work\n");
 		assert.deepEqual(await readProjectDelegationBlockerV2(root), { ok: true, value: null });
+	});
+});
+
+test("inactive blocker closure accepts committed zero delta under directory scope but keeps unknown delta fail-closed", async () => {
+	await withTempDir(async (root) => {
+		assert.equal((await spawnExec("git", ["init", "-q"], { cwd: root })).code, 0);
+		await writeFile(join(root, "README.md"), "baseline\n", "utf8");
+		assert.equal((await spawnExec("git", ["add", "README.md"], { cwd: root })).code, 0);
+		assert.equal((await spawnExec("git", ["-c", "user.name=Workbench Test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "baseline"], { cwd: root })).code, 0);
+
+		const failedState = async (
+			id: string,
+			changeSetStatus: "ATTRIBUTED" | "WORKSPACE_DRIFT" | "CONFLICT",
+			terminalFactsComplete = true,
+		): Promise<DelegationTransactionRecord> => {
+			const initial = await prepared(root, id, 0);
+			const running = transactionState(startDelegationTransaction(initial, transactionCas(initial, 1)));
+			const committing = transactionState(beginDelegationCommit(running, {
+				...transactionCas(running, 2),
+				outcome: {
+					delegation_id: id,
+					task_kind: "implementation",
+					worker_identity: running.worker_identity,
+					provider_success: true,
+					exit_code: 0,
+					report_complete: true,
+					terminal_facts_complete: terminalFactsComplete,
+					scope_complete: true,
+					change_set_status: changeSetStatus,
+					changed_paths: [],
+					successful_write_count: 0,
+					denied_write_count: 0,
+					delta_hash: "d".repeat(64),
+				},
+			}));
+			return transactionState(publishDelegationCommit(committing, {
+				...transactionCas(committing, 3),
+				proof: committedProof(committing),
+			}));
+		};
+
+		const attributed = await failedState("20260820-100000-zd01", "ATTRIBUTED");
+		assert.equal(attributed.status, "FAILED");
+		assert.deepEqual(attributed.allowed_paths, ["src/**"]);
+		assert.deepEqual(inactiveBlockerRelevantPathsV2(attributed), []);
+
+		const drift = await failedState("20260820-100001-zd02", "WORKSPACE_DRIFT");
+		assert.equal(drift.status, "FAILED");
+		assert.deepEqual(inactiveBlockerRelevantPathsV2(drift), []);
+		await writeFile(join(root, "notes.txt"), "unrelated user work\n", "utf8");
+		const guard = await collectWorkspaceGuard({ project_root: root, exec: spawnExec });
+		assert.equal(guard.ok, true, guard.ok ? "" : guard.error.code);
+		if (!guard.ok) return;
+		const closed = await publishDelegationInactiveBlockerClosureV2({
+			project_root: root,
+			transaction: drift,
+			workspace_guard: guard.guard,
+			closed_by: { provider: "openai", model: "gpt-5.6-sol" },
+			now: at(4),
+		});
+		assert.equal(closed.ok, true, closed.ok ? "" : closed.error.code);
+		if (closed.ok) assert.deepEqual(closed.value.relevant_paths, []);
+		assert.equal(await readFile(join(root, "notes.txt"), "utf8"), "unrelated user work\n");
+
+		const conflicted = await failedState("20260820-100002-zd03", "CONFLICT");
+		assert.equal(conflicted.status, "FAILED");
+		assert.equal(inactiveBlockerRelevantPathsV2(conflicted), undefined);
+		const incomplete = await failedState("20260820-100003-zd04", "ATTRIBUTED", false);
+		assert.equal(incomplete.status, "RECOVERY_REQUIRED");
+		assert.equal(inactiveBlockerRelevantPathsV2(incomplete), undefined);
 	});
 });
 

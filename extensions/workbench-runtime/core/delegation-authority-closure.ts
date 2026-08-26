@@ -208,6 +208,17 @@ export function inactiveBlockerRelevantPathsV2(transaction: DelegationTransactio
 		...(transaction.repair_lineage?.carried_paths ?? []),
 	]);
 	if (paths.size === 0) {
+		const outcome = transaction.terminal_outcome;
+		// A committed, complete ChangeSet can prove that the exact worker delta
+		// is empty. Directory-shaped allowed_paths are permission, not evidence;
+		// workspace drift remains unrelated, while attribution conflicts do not.
+		const committedZeroDelta = transaction.committed_proof !== null && outcome !== null &&
+			outcome.terminal_facts_complete && outcome.scope_complete &&
+			outcome.change_set_status !== "CONFLICT" && outcome.changed_paths.length === 0 &&
+			(transaction.task_kind !== "implementation" || outcome.delta_hash !== null);
+		if (committedZeroDelta) return [];
+	}
+	if (paths.size === 0) {
 		const exact = exactDelegationRepairAllowedPathsV1(transaction.allowed_paths);
 		if (exact !== undefined) for (const path of exact) paths.add(path);
 	}
