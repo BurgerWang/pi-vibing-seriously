@@ -69,20 +69,24 @@
  *     reset it and ACCEPT remains blocked until the cursor reaches the total.
  *   - Phase 5 (Execution Efficiency Optimization): CURRENT REGULAR
  *     `.svg`/`.json` worker paths LARGER than the default global review
- *     byte cap (COMPACT_MIN_BYTES = DEFAULT_REVIEW_MAX_BYTES = 32 KiB)
+ *     byte cap (COMPACT_MIN_BYTES = DEFAULT_REVIEW_MAX_BYTES = 32 KiB),
+ *     plus binary/container paths of any size (known extension or bounded
+ *     invalid-UTF-8/NUL detection),
  *     render as a deterministic COMPACT entry (bounded redacted
  *     UTF-8-safe head/tail previews — never empty for a non-empty
  *     window: the head is a bounded PREFIX and the tail a bounded
  *     SUFFIX of the redacted capture, so the tail preview represents
  *     the actual end of the file even for the bounded partial-line
- *     fallback of minified/single-line JSON — plus status/size/digest/
+ *     fallback of minified/single-line JSON; binary bytes are never decoded
+ *     into a text preview — plus status/size/digest/
  *     recorded-after-equality facts and generator equality
  *     NOT_VERIFIED — the review never executes or imports repository
  *     generators), counting as displayed-path coverage, with no per-path
  *     git diff capture and no additional unbounded/full-file DISPLAY or
  *     preview capture — the existing bounded content digest is preserved
  *     (it may read the complete file through MAX_DIGEST_BYTES = 4 MiB and
- *     uses prefix+size beyond); ordinary source/small/
+ *     uses prefix+size beyond for historical authority; guard-v2 reuses the
+ *     bounded full-file ChangeSet hashing ceiling); ordinary source/small/
  *     deleted/unreadable paths keep the existing behavior; scope/
  *     authority-binding/include_paths/coverage/STALE invariants are
  *     unchanged.
@@ -108,6 +112,7 @@
  * grants Gate authority, and never computes business metrics.
  */
 
+import { isUtf8 } from "node:buffer";
 import { createHash } from "node:crypto";
 import { open } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -133,6 +138,7 @@ import {
 } from "./delegation-ledger.ts";
 import { realpathContained } from "./path-guard.ts";
 import { redactText } from "./redact.ts";
+import { captureStreamingIdentities } from "./streaming-identity.ts";
 import { isWorkerPathAllowedRealpath } from "../worker/path-scope.ts";
 import { readJsonFileBounded, type BoundedFileIoHooks } from "./bounded-file-io.ts";
 import type { ExecFn } from "./config.ts";
@@ -226,8 +232,23 @@ export const MAX_REVIEW_GUIDANCE_BYTES = 1024;
  */
 export const COMPACT_ELIGIBLE_EXTENSIONS = [".svg", ".json"] as const;
 /**
- * A path is compact-eligible only when its CURRENT REGULAR file is
- * LARGER than this size. The threshold is tied to the existing default
+ * Binary/container formats that are compact evidence by construction,
+ * regardless of file size. Unknown extensions are still detected from
+ * bounded head/tail bytes (invalid UTF-8 or NUL content).
+ */
+export const BINARY_COMPACT_EXTENSIONS = [
+	".7z", ".a", ".apk", ".arrow", ".avi", ".bin", ".bmp", ".bz2", ".class", ".db", ".dll", ".doc",
+	".docx", ".dylib", ".exe", ".feather", ".gif", ".gz", ".ico", ".jar", ".jpeg", ".jpg", ".mkv",
+	".mov", ".mp3", ".mp4", ".npy", ".npz", ".onnx", ".parquet", ".pdf", ".pickle", ".pkl", ".png",
+	".ppt", ".pptx", ".pyc", ".rar", ".so", ".sqlite", ".tar", ".tgz", ".tif", ".tiff", ".wasm",
+	".wav", ".webp", ".xls", ".xlsx", ".xz", ".zip",
+] as const;
+const BINARY_COMPACT_EXTENSION_SET = new Set<string>(BINARY_COMPACT_EXTENSIONS);
+const BINARY_PREVIEW_OMITTED = "(binary preview omitted)";
+/**
+ * A text SVG/JSON path is compact-eligible only when its CURRENT REGULAR
+ * file is LARGER than this size. Binary compact packets are size-independent.
+ * The threshold is tied to the existing default
  * global review byte cap (DEFAULT_REVIEW_MAX_BYTES = 32 KiB): a file at
  * or above the default review envelope could never fit a global-budget
  * git diff, so the compact form is the deterministic bounded
@@ -289,7 +310,7 @@ export type ReviewDigestKind = "sha256" | "sha256-prefix+size";
 /**
  * Phase 5 (Execution Efficiency Optimization): deterministic structured
  * compact facts for one sufficiently large current regular `.svg` /
- * `.json` worker path. Additive on the review record — schema_version
+ * `.json` worker path or one detected binary/container path. Additive on the review record — schema_version
  * stays 1; legacy records without the field remain readable. The digest
  * is the EXISTING bounded current path content digest (full SHA-256 up to
  * 4 MiB, bounded-prefix+size beyond — never weakened, honestly labelled
@@ -304,15 +325,17 @@ export type ReviewDigestKind = "sha256" | "sha256-prefix+size";
  * independent current-state generator validation.
  */
 export interface ReviewCompactFacts {
+	/** Present only for binary compact packets; absence preserves historical text compact records. */
+	content_kind?: "binary";
 	/** Current porcelain status code of the path (" M", "??", "A ", "D "...). */
 	git_status: string;
 	/** Real byte size of the current regular file. */
 	size_bytes: number;
 	/** Current content digest (the existing digest form — see digest_kind). */
 	digest: string;
-	/** "sha256" full form (≤ 4 MiB) or "sha256-prefix+size" bounded form (> 4 MiB). */
+	/** Full "sha256" authority, or historical "sha256-prefix+size" display authority beyond 4 MiB. */
 	digest_kind: ReviewDigestKind;
-	/** Fixed byte boundary of the existing digest form (MAX_DIGEST_BYTES). */
+	/** Fixed byte boundary at which the historical display digest switches form (MAX_DIGEST_BYTES). */
 	digest_max_bytes: number;
 	/** True when the current digest exactly equals the worker's recorded-after digest. */
 	digest_matches_after: boolean;
@@ -537,7 +560,7 @@ export function classifySemanticReviewRisk(paths: readonly string[]): SemanticRe
 	// packet.  Keep the path-only hint conservative so the risk remains high
 	// across segmented reviews even when the compact entry is in a prior
 	// same-hash segment and is no longer present in the current patch array.
-	if (paths.some((path) => COMPACT_ELIGIBLE_EXTENSIONS.includes(pathExtension(path) as ".svg" | ".json"))) {
+	if (paths.some(isCompactEligiblePath)) {
 		return { risk: "high", required: true, reason: "compact_evidence" };
 	}
 	if (paths.some(isSensitiveReviewPath)) {
@@ -604,20 +627,56 @@ export interface ReviewFromAuthorityInput extends ReviewInput {
 }
 
 /**
- * Deterministic compact eligibility: the project-relative worker path ends
- * in `.svg` or `.json` (case-insensitive). Ordinary source/text files are
- * never eligible — their diffs are never hidden by compactness.
+ * Deterministic path-level compact eligibility: large `.svg`/`.json` files
+ * and known binary/container extensions. Unknown-extension binary files are
+ * additionally detected from bounded bytes by compactFactsFor.
  */
 export function isCompactEligiblePath(path: string): boolean {
-	const lower = path.toLowerCase();
-	return COMPACT_ELIGIBLE_EXTENSIONS.some((ext) => lower.endsWith(ext));
+	const extension = pathExtension(path);
+	return COMPACT_ELIGIBLE_EXTENSIONS.includes(extension as ".svg" | ".json") ||
+		BINARY_COMPACT_EXTENSION_SET.has(extension);
+}
+
+function isTextCompactEligiblePath(path: string): boolean {
+	return COMPACT_ELIGIBLE_EXTENSIONS.includes(pathExtension(path) as ".svg" | ".json");
+}
+
+function utf8SequenceBytes(lead: number): number | undefined {
+	if (lead >= 0xc2 && lead <= 0xdf) return 2;
+	if (lead >= 0xe0 && lead <= 0xef) return 3;
+	if (lead >= 0xf0 && lead <= 0xf4) return 4;
+	return undefined;
+}
+
+function isUtf8HeadWindow(buffer: Buffer, mayEndMidScalar: boolean): boolean {
+	if (isUtf8(buffer)) return true;
+	if (!mayEndMidScalar) return false;
+	for (let suffixBytes = 1; suffixBytes <= 3 && suffixBytes <= buffer.length; suffixBytes += 1) {
+		const leadIndex = buffer.length - suffixBytes;
+		const sequenceBytes = utf8SequenceBytes(buffer[leadIndex]!);
+		if (sequenceBytes === undefined || sequenceBytes <= suffixBytes) continue;
+		if (!buffer.subarray(leadIndex + 1).every((byte) => (byte & 0xc0) === 0x80)) continue;
+		if (isUtf8(buffer.subarray(0, leadIndex))) return true;
+	}
+	return false;
+}
+
+function isUtf8TailWindow(buffer: Buffer): boolean {
+	if (isUtf8(buffer)) return true;
+	let start = 0;
+	while (start < Math.min(3, buffer.length) && (buffer[start]! & 0xc0) === 0x80) start += 1;
+	return start > 0 && isUtf8(buffer.subarray(start));
+}
+
+function boundedBytesLookBinary(path: string, head: Buffer, tail: Buffer, size: number): boolean {
+	return BINARY_COMPACT_EXTENSION_SET.has(pathExtension(path)) || head.includes(0) || tail.includes(0) ||
+		!isUtf8HeadWindow(head, size > head.length) || !isUtf8TailWindow(tail);
 }
 
 /**
- * Honest label of the existing digest form: a 64-hex SHA-256 is the full
- * form (file ≤ MAX_DIGEST_BYTES); `sha256:size` is the bounded
- * prefix+size form (file > MAX_DIGEST_BYTES). The 4 MiB digest semantics
- * are unchanged — only the label is explicit.
+ * Honest label of the active digest form: 64 hex is a full SHA-256
+ * (including guard-v2 streaming authority beyond 4 MiB); `sha256:size` is
+ * the historical bounded prefix+size display form.
  */
 export function digestKindOf(digest: string): ReviewDigestKind {
 	return /^[0-9a-f]{64}:\d+$/.test(digest) ? "sha256-prefix+size" : "sha256";
@@ -1077,13 +1136,49 @@ async function compactFactsFor(
 	secrets: readonly string[],
 	afterDigests: Readonly<Record<string, string>>,
 	currentStatus: string,
+	mode: "current" | "legacy-text-only" = "current",
 ): Promise<ReviewCompactFacts | null> {
 	const real = await realpathContained(projectRoot, path);
 	if (real === undefined) return null;
 	const read = await readBoundedHeadTail(real, COMPACT_READ_BYTES);
-	if (!read || read.size <= COMPACT_MIN_BYTES) return null;
-	const digest = await contentDigest(projectRoot, path);
+	if (!read) return null;
+	const binary = mode === "current" && boundedBytesLookBinary(path, read.head, read.tail, read.size);
+	if (!binary && (!isTextCompactEligiblePath(path) || read.size <= COMPACT_MIN_BYTES)) return null;
+	const afterDigest = afterDigests[path];
+	let digest = await contentDigest(projectRoot, path);
 	if (digest === undefined) return null;
+	// Guard-v2 ChangeSet authority retains a full streaming SHA-256 through
+	// its 64 MiB file ceiling, while the historical display digest switches
+	// to prefix+size above 4 MiB. Reuse the same bounded streaming primitive
+	// when a full recorded-after digest is available so large binary packets
+	// remain closable without weakening legacy digest semantics.
+	if (digest.includes(":") && afterDigest !== undefined && /^[0-9a-f]{64}$/u.test(afterDigest)) {
+		const captured = await captureStreamingIdentities({ project_root: projectRoot, paths: [path] });
+		const identity = captured.ok ? captured.identities[0] : undefined;
+		if (identity === undefined || identity.kind !== "file" || identity.byte_size !== read.size) return null;
+		digest = identity.sha256;
+	}
+	if (binary) {
+		return {
+			content_kind: "binary",
+			git_status: currentStatus,
+			size_bytes: read.size,
+			digest,
+			digest_kind: digestKindOf(digest),
+			digest_max_bytes: MAX_DIGEST_BYTES,
+			digest_matches_after: afterDigest !== undefined && afterDigest === digest,
+			generator_equality: COMPACT_GENERATOR_EQUALITY,
+			head_preview: JSON.stringify(BINARY_PREVIEW_OMITTED),
+			tail_preview: JSON.stringify(BINARY_PREVIEW_OMITTED),
+			head_lines: 0,
+			tail_lines: 0,
+			head_partial_line: false,
+			tail_partial_line: false,
+			head_bytes: 0,
+			tail_bytes: 0,
+			content_truncated: read.size > 0,
+		};
+	}
 	const head = captureHeadLines(read.head.toString("utf8"), read.headEndsAtLineBoundary, COMPACT_PREVIEW_LINES);
 	const tail = captureTailLines(read.tail.toString("utf8"), read.tailStartsAtLineBoundary, COMPACT_PREVIEW_LINES);
 	const headRaw = head.lines.length > 0 ? head.lines.join("\n") : head.partial;
@@ -1097,7 +1192,6 @@ async function compactFactsFor(
 	const tailShown = suffixUtf8(redactText(tailRaw, secrets), COMPACT_PREVIEW_MAX_BYTES);
 	const headBytes = Buffer.byteLength(headShown, "utf8");
 	const tailBytes = Buffer.byteLength(tailShown, "utf8");
-	const afterDigest = afterDigests[path];
 	return {
 		git_status: currentStatus,
 		size_bytes: read.size,
@@ -1126,6 +1220,15 @@ async function compactFactsFor(
  */
 export function renderCompactFacts(facts: ReviewCompactFacts): string {
 	const digestKindNote = facts.digest_kind === "sha256-prefix+size" ? ` beyond ${facts.digest_max_bytes} bytes` : "";
+	if (facts.content_kind === "binary") {
+		return [
+			`compact   : kind=binary status=${JSON.stringify(facts.git_status)} size=${facts.size_bytes} bytes digest=${facts.digest} (${facts.digest_kind}${digestKindNote})`,
+			`digest    : ${facts.digest_matches_after ? "matches the worker's recorded-after digest" : "DIFFERS from the worker's recorded-after digest (or no recorded-after digest exists)"}`,
+			`preview   : ${facts.head_preview} (binary bytes are not decoded or paged as UTF-8; shown_bytes=${facts.head_bytes + facts.tail_bytes})`,
+			`truncated : binary content is represented only by bounded identity facts (content_truncated=${facts.content_truncated})`,
+			`semantic  : binary contents NOT_INSPECTED; generator equality ${facts.generator_equality} — independent artifact validation is required`,
+		].join("\n");
+	}
 	const headDetail = facts.head_partial_line ? "partial line — no complete line in the head window" : `${facts.head_lines} complete line(s)`;
 	const tailDetail = facts.tail_partial_line ? "partial line — no complete line in the tail window" : `${facts.tail_lines} complete line(s)`;
 	return [
@@ -1150,16 +1253,17 @@ export function renderCompactFacts(facts: ReviewCompactFacts): string {
  * upgraded into a Gate fact here.
  */
 export function isCompleteReviewPresentationEntry(entry: ReviewPatchEntry): boolean {
-	if (!entry.truncated) return true;
-	if (entry.source !== "compact" || entry.compact === undefined) return false;
-	return entry.compact.digest_matches_after === true
-		&& entry.compact.generator_equality === "NOT_VERIFIED"
-		&& entry.text === renderCompactFacts(entry.compact);
+	if (entry.source === "compact" && entry.compact !== undefined) {
+		return entry.compact.digest_matches_after === true
+			&& entry.compact.generator_equality === "NOT_VERIFIED"
+			&& entry.text === renderCompactFacts(entry.compact);
+	}
+	return !entry.truncated;
 }
 
 /**
  * Bounded redacted patch entry for ONE path. Phase 5: a sufficiently
- * large CURRENT REGULAR `.svg`/`.json` worker path takes the compact path
+ * large CURRENT REGULAR `.svg`/`.json` worker path or detected binary takes the compact path
  * FIRST — no per-path git diff capture and no additional unbounded/
  * full-file DISPLAY or preview capture (the existing bounded content
  * digest may read the complete file through 4 MiB and uses prefix+size
@@ -1184,11 +1288,9 @@ async function patchEntryFor(
 		maxLines: number;
 	},
 ): Promise<RawPatchEntry> {
-	if (isCompactEligiblePath(path)) {
-		const compact = await compactFactsFor(projectRoot, path, secrets, afterDigests, currentStatus);
-		if (compact) {
-			return { path, source: "compact", text: renderCompactFacts(compact), perPathTruncated: compact.content_truncated, compact };
-		}
+	const compact = await compactFactsFor(projectRoot, path, secrets, afterDigests, currentStatus);
+	if (compact) {
+		return { path, source: "compact", text: renderCompactFacts(compact), perPathTruncated: compact.content_truncated, compact };
 	}
 	if (pageRequest !== undefined) {
 		const stream = await pageablePatchStreamFor(projectRoot, path, exec, secrets);
@@ -1275,23 +1377,16 @@ export async function preflightSemanticReviewEnvelopeV1(input: {
 			}
 			let source: SemanticReviewStreamDescriptorV1["source"];
 			let text: string;
-			if (isCompactEligiblePath(path)) {
-				const compact = await compactFactsFor(
-					input.projectRoot,
-					path,
-					secrets,
-					input.afterDigests,
-					input.pathStatuses[path] ?? "",
-				);
-				if (compact !== null) {
-					source = "compact";
-					text = renderCompactFacts(compact);
-				} else {
-					const stream = await pageablePatchStreamFor(input.projectRoot, path, input.exec, secrets);
-					if (stream === null) return { ok: false, code: "stream_limit_exceeded" };
-					source = stream.source;
-					text = stream.text;
-				}
+			const compact = await compactFactsFor(
+				input.projectRoot,
+				path,
+				secrets,
+				input.afterDigests,
+				input.pathStatuses[path] ?? "",
+			);
+			if (compact !== null) {
+				source = "compact";
+				text = renderCompactFacts(compact);
 			} else {
 				const stream = await pageablePatchStreamFor(input.projectRoot, path, input.exec, secrets);
 				if (stream === null) {
@@ -1677,6 +1772,79 @@ interface ReviewPresentationValidationInput {
 }
 
 /**
+ * Rebuild the exact pre-binary-compaction v1 envelope for a generation that
+ * entered PENDING_REVIEW before this runtime learned binary compact packets.
+ * This is validation-only compatibility: current presentation still has to
+ * validate byte-for-byte from fresh authority, and the immutable legacy
+ * envelope must also reproduce exactly.
+ */
+async function rebuildLegacySemanticReviewEnvelopeV1(input: {
+	projectRoot: string;
+	paths: readonly string[];
+	authority: ReviewAuthorityFacts;
+	current: GitFacts;
+	exec: ExecFn;
+	secrets: readonly string[];
+}): Promise<SemanticReviewEnvelopeV1 | undefined> {
+	if (input.authority.relevance_projection === undefined || input.authority.relevance_binding === undefined) return undefined;
+	const streams: SemanticReviewStreamDescriptorV1[] = [];
+	for (const path of input.paths) {
+		let source: SemanticReviewStreamDescriptorV1["source"];
+		let text: string;
+		const compact = await compactFactsFor(
+			input.projectRoot,
+			path,
+			input.secrets,
+			input.authority.after.pathDigests,
+			input.current.pathStatuses[path] ?? "",
+			"legacy-text-only",
+		);
+		if (compact !== null) {
+			source = "compact";
+			text = renderCompactFacts(compact);
+		} else {
+			const stream = await pageablePatchStreamFor(input.projectRoot, path, input.exec, input.secrets);
+			if (stream === null) {
+				const deleted = !(path in input.authority.after.pathDigests) &&
+					(input.current.pathStatuses[path] ?? "").includes("D");
+				if (!deleted) return undefined;
+				source = "deleted";
+				text = "(deleted or unreadable)";
+			} else {
+				source = stream.source;
+				text = stream.text;
+			}
+		}
+		const streamBytes = Buffer.byteLength(text, "utf8");
+		if (streamBytes > REVIEW_PAGE_SOURCE_MAX_BYTES) return undefined;
+		const pageCount = source === "compact" || source === "deleted"
+			? (streamBytes === 0 ? 0 : 1)
+			: projectedPageCount(text);
+		if (pageCount === undefined) return undefined;
+		streams.push({
+			path,
+			source,
+			stream_bytes: streamBytes,
+			stream_sha256: createHash("sha256").update(text, "utf8").digest("hex"),
+			page_count: pageCount,
+		});
+	}
+	const projectedBytes = estimateSemanticReviewRecordBytesV1({
+		worker_paths: input.paths,
+		allowed_paths: input.authority.allowed_paths,
+		streams,
+		relevance_projection: input.authority.relevance_projection,
+	});
+	if (projectedBytes === undefined) return undefined;
+	const rebuilt = buildSemanticReviewEnvelopeV1({
+		streams,
+		projected_review_record_bytes: projectedBytes,
+		relevance_projection_hash: input.authority.relevance_binding.projection_hash,
+	});
+	return rebuilt.ok ? rebuilt.value : undefined;
+}
+
+/**
  * Rebuild every completed presentation stream from the current bound
  * authority before semantic ACCEPT.  review.json is provisional and cannot
  * self-attest its stream hash, byte total, or final-page slice.
@@ -1777,7 +1945,18 @@ export async function validateReviewPresentationAgainstAuthority(
 				projected_review_record_bytes: projectedBytes,
 				relevance_projection_hash: input.authority.relevance_binding.projection_hash,
 			});
-			if (!rebuilt.ok || canonicalHash(rebuilt.value) !== canonicalHash(authorityEnvelope)) return false;
+			if (!rebuilt.ok) return false;
+			if (canonicalHash(rebuilt.value) !== canonicalHash(authorityEnvelope)) {
+				const legacy = await rebuildLegacySemanticReviewEnvelopeV1({
+					projectRoot: input.projectRoot,
+					paths: checked,
+					authority: input.authority,
+					current,
+					exec: input.exec,
+					secrets,
+				});
+				if (legacy === undefined || canonicalHash(legacy) !== canonicalHash(authorityEnvelope)) return false;
+			}
 		}
 		return true;
 	} catch {
@@ -2377,11 +2556,12 @@ function renderPatchSection(record: ReviewRecord, maxBytes: number, maxLines: nu
 	const original = selectedPatchCount(record);
 	if (maxBytes <= 0 || maxLines <= 0) return { lines: [], facts: { original, shown: 0, omitted: original, truncated: original > 0 || record.patch_truncated, visiblePaths: [], fullyVisiblePaths: [] } };
 	const presentation = normalizeReviewPresentationCoverage(record);
-	const hasPagedSource = Array.isArray(record.presentation_progress) && record.presentation_progress.length > 0;
+	const hasPagedSource = Array.isArray(record.presentation_progress) && record.presentation_progress.some((item) =>
+		item.source === "git-diff" || item.source === "file-content");
 	const marker = presentation.presentation_complete
 		? hasPagedSource
 			? `Ordinary source presentation is complete across contiguous hash-bound pages; each page advanced only after its whole bounded entry was visible. Scope/integrity artifact: ${reviewPathOf(record)}.`
-			: `Compact content is intentionally summarized — strict digest/size/head/tail facts form the complete bounded evidence packet; generator equality remains NOT_VERIFIED for final verification. Scope/integrity artifact: ${reviewPathOf(record)}.`
+			: `Compact content is intentionally summarized — strict identity and bounded preview/omission facts form the complete evidence packet; semantic contents and generator equality remain NOT_VERIFIED for independent final verification. Scope/integrity artifact: ${reviewPathOf(record)}.`
 		: `Patch content truncated or omitted — scope/integrity artifact: ${reviewPathOf(record)}; request bounded presentation segments via workbench_review_worker_diff include_paths (max ${MAX_REVIEW_PATCH_PATHS} paths per call). Semantic ACCEPT remains blocked until presentation is complete.`;
 	const markerReserveBytes = Buffer.byteLength(marker, "utf8") + 1;
 	const content = new ReviewLineBuilder(Math.max(0, maxBytes - markerReserveBytes), Math.max(0, maxLines - 1));
@@ -2521,7 +2701,7 @@ function renderControlSection(
 		`remaining  : ${coverage.remaining_paths.length} worker path(s)`,
 		`coverage   : ${coverage.coverage_complete ? "COMPLETE — every worker path has a bounded scope/integrity segment" : "INCOMPLETE — scope/integrity packet needs the remaining worker paths"}`,
 		`evidence   : ${presentationCoverage.presentation_complete ? "COMPLETE — each worker path has a full patch or strict compact fact packet" : `INCOMPLETE — ${presentationCoverage.presentation_remaining_paths.length} path(s) still need a full patch or strict compact fact packet`}`,
-		`semantic   : ${semantic.required ? `REQUIRED (${semantic.risk} risk; explicit Sol ACCEPT must bind this hash${semantic.risk === "high" && Array.isArray(record.checked_paths) && record.checked_paths.some((path) => COMPACT_ELIGIBLE_EXTENSIONS.includes(pathExtension(path) as ".svg" | ".json")) ? "; compact generator equality remains NOT_VERIFIED for final verification" : ""})` : "NOT_REQUIRED (zero actual delta)"}`,
+		`semantic   : ${semantic.required ? `REQUIRED (${semantic.risk} risk; explicit Sol ACCEPT must bind this hash${semantic.risk === "high" && Array.isArray(record.checked_paths) && record.checked_paths.some(isCompactEligiblePath) ? "; generator equality remains NOT_VERIFIED and compact semantic contents require independent final verification" : ""})` : "NOT_REQUIRED (zero actual delta)"}`,
 		summaryReserve,
 	];
 	const builder = new ReviewLineBuilder(maxBytes, maxLines);

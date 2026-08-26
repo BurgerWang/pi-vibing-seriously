@@ -722,12 +722,14 @@ function validReviewPatchEntry(value: unknown): value is ReviewPatchEntry {
 	}
 	if (!hasCompact) return true;
 	const compact = value.compact;
+	const hasContentKind = isRecord(compact) && Object.prototype.hasOwnProperty.call(compact, "content_kind");
 	if (!isRecord(compact) || !exactFields(compact, [
+		...(hasContentKind ? ["content_kind"] : []),
 		"git_status", "size_bytes", "digest", "digest_kind", "digest_max_bytes", "digest_matches_after",
 		"generator_equality", "head_preview", "tail_preview", "head_lines", "tail_lines", "head_partial_line",
 		"tail_partial_line", "head_bytes", "tail_bytes", "content_truncated",
 	])) return false;
-	return typeof compact.git_status === "string" && compact.git_status.length <= 4 &&
+	const commonValid = typeof compact.git_status === "string" && compact.git_status.length <= 4 &&
 		Number.isSafeInteger(compact.size_bytes) && Number(compact.size_bytes) >= 0 &&
 		typeof compact.digest === "string" && /^[a-f0-9]{64}(?::\d+)?$/.test(compact.digest) &&
 		(compact.digest_kind === "sha256" || compact.digest_kind === "sha256-prefix+size") &&
@@ -737,6 +739,12 @@ function validReviewPatchEntry(value: unknown): value is ReviewPatchEntry {
 		[compact.head_lines, compact.tail_lines, compact.head_bytes, compact.tail_bytes].every((item) => Number.isSafeInteger(item) && Number(item) >= 0) &&
 		typeof compact.head_partial_line === "boolean" && typeof compact.tail_partial_line === "boolean" &&
 		typeof compact.content_truncated === "boolean";
+	if (!commonValid) return false;
+	if (!hasContentKind) return true;
+	return compact.content_kind === "binary" && compact.head_preview === '"(binary preview omitted)"' &&
+		compact.tail_preview === '"(binary preview omitted)"' && compact.head_lines === 0 && compact.tail_lines === 0 &&
+		compact.head_bytes === 0 && compact.tail_bytes === 0 && compact.head_partial_line === false &&
+		compact.tail_partial_line === false && compact.content_truncated === (Number(compact.size_bytes) > 0);
 }
 
 function validReviewPresentationProgress(value: unknown): value is ReviewPresentationProgress[] {

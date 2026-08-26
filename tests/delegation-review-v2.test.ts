@@ -44,6 +44,10 @@ import {
 	preflightSemanticReviewEnvelopeV1,
 	type ReviewPresentationProgress,
 } from "../extensions/workbench-runtime/core/diff-review.ts";
+import {
+	buildSemanticReviewEnvelopeV1,
+	estimateSemanticReviewRecordBytesV1,
+} from "../extensions/workbench-runtime/core/semantic-review-envelope.ts";
 import { collectReviewRelevanceV2 } from "../extensions/workbench-runtime/core/review-relevance-v2.ts";
 import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { beginWriteJournalOperation, completeWriteJournalOperation } from "../extensions/workbench-runtime/core/write-journal.ts";
@@ -123,17 +127,20 @@ async function setupReviewFixture(
 	withExtendedReason = false,
 	workerContent: (path: string) => string | Buffer = (path) => `worker:${path}\n`,
 	reportedPaths?: readonly string[],
+	newPaths: readonly string[] = [],
 ): Promise<ReviewFixture> {
 	const root = await mkdtemp(join(tmpdir(), "delegation-review-v2-"));
 	await git(root, ["init"]);
 	await git(root, ["config", "user.email", "review-v2@example.invalid"]);
 	await git(root, ["config", "user.name", "Review V2 Test"]);
+	const newPathSet = new Set(newPaths);
+	const baselinePaths = paths.filter((path) => !newPathSet.has(path));
 	for (const path of paths) {
 		await mkdir(dirname(join(root, path)), { recursive: true });
-		await writeFile(join(root, path), `baseline:${path}\n`);
+		if (!newPathSet.has(path)) await writeFile(join(root, path), `baseline:${path}\n`);
 	}
-	await git(root, ["add", "--", ...paths]);
-	await git(root, ["commit", "-m", "baseline"]);
+	if (baselinePaths.length > 0) await git(root, ["add", "--", ...baselinePaths]);
+	await git(root, ["commit", "--allow-empty", "-m", "baseline"]);
 	if (preDirtyPath !== undefined) {
 		await mkdir(dirname(join(root, preDirtyPath)), { recursive: true });
 		await writeFile(join(root, preDirtyPath), "pre-dirty\n");
@@ -260,6 +267,66 @@ async function setupReviewFixture(
 	assert.equal(committed.ok, true);
 	if (!committed.ok) throw new Error("generation commit failed");
 	return { root, state: committed.value, records };
+}
+
+async function replaceCommittedEnvelopeWithLegacyBinaryPaging(
+	fixture: ReviewFixture,
+	path: string,
+	tamperStreamHash = false,
+): Promise<void> {
+	const afterPath = generationPath(fixture.root, "after.json");
+	const scopePath = generationPath(fixture.root, "scope.json");
+	const after = JSON.parse(await readFile(afterPath, "utf8")) as Record<string, any>;
+	const scope = JSON.parse(await readFile(scopePath, "utf8")) as Record<string, any>;
+	const relevance = await collectReviewRelevanceV2({
+		project_root: fixture.root,
+		delegation_id: ID,
+		contract_hash: fixture.state.contract_hash,
+		after_guard: after.workspace_guard,
+		change_set: scope.change_set,
+		exec: spawnExec,
+	});
+	assert.equal(relevance.ok, true, relevance.ok ? "" : relevance.error.code);
+	if (!relevance.ok) throw new Error("legacy envelope relevance failed");
+	const legacyText = (await readFile(join(fixture.root, path))).toString("utf8");
+	const streamBytes = Buffer.byteLength(legacyText, "utf8");
+	const streams = [{
+		path,
+		source: "file-content" as const,
+		stream_bytes: streamBytes,
+		stream_sha256: tamperStreamHash
+			? "0".repeat(64)
+			: createHash("sha256").update(legacyText, "utf8").digest("hex"),
+		page_count: streamBytes === 0 ? 0 : 1,
+	}];
+	const projected = estimateSemanticReviewRecordBytesV1({
+		worker_paths: [path],
+		allowed_paths: fixture.state.allowed_paths,
+		streams,
+		relevance_projection: relevance.value.projection,
+	});
+	assert.notEqual(projected, undefined);
+	const legacy = buildSemanticReviewEnvelopeV1({
+		streams,
+		projected_review_record_bytes: projected!,
+		relevance_projection_hash: relevance.value.binding.projection_hash,
+	});
+	assert.equal(legacy.ok, true, legacy.ok ? "" : legacy.code);
+	if (!legacy.ok) throw new Error("legacy envelope build failed");
+	after.review_envelope = legacy.value;
+	await writeFile(afterPath, `${JSON.stringify(after, null, 2)}\n`);
+
+	const compiled = new Map<any, Uint8Array>();
+	for (const name of COMMITTED_RECORD_NAMES) compiled.set(name, await readFile(generationPath(fixture.root, name)));
+	const transaction = JSON.parse(await readFile(transactionPath(fixture.root), "utf8")) as Record<string, any>;
+	const { commit_marker: _oldMarker, ...proofWithoutMarker } = transaction.committed_proof;
+	proofWithoutMarker.content_hash = hashDelegationCommittedRecords(compiled);
+	transaction.committed_proof = {
+		...proofWithoutMarker,
+		commit_marker: delegationCommitMarker(proofWithoutMarker),
+	};
+	await writeFile(generationPath(fixture.root, "commit-marker.json"), `${JSON.stringify(transaction.committed_proof, null, 2)}\n`);
+	await writeFile(transactionPath(fixture.root), `${JSON.stringify(transaction, null, 2)}\n`);
 }
 
 test("review v2 fixture: reverse journal order builds, commits, and strict-reads canonical W digests", async () => {
@@ -750,6 +817,115 @@ test("review v2: strict compact SVG/JSON fact packets can terminate through Sol 
 		if (durable.ok) assert.equal(durable.value.status, "PENDING_REVIEW");
 	} finally {
 		await cleanup(sourceFixture);
+	}
+});
+
+test("review v2: known and unknown-extension binaries are complete size/digest compact packets and can terminate through bound Sol ACCEPT", async () => {
+	const path = "src/authority-data.zip";
+	const largePath = "src/large-model.bin";
+	const opaquePath = "src/opaque.payload";
+	const textPath = "src/text.payload";
+	const zipBytes = Buffer.concat([
+		Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0xff, 0xfe, 0x00]),
+		Buffer.alloc(8_192, 0xa5),
+	]);
+	const largeBytes = Buffer.concat([Buffer.from([0x00, 0xff]), Buffer.alloc(4 * 1024 * 1024 + 257, 0x82)]);
+	const opaqueBytes = Buffer.concat([Buffer.from([0x00, 0xff, 0xfe, 0xfd]), Buffer.alloc(2_048, 0x81)]);
+	const validUtf8Text = `${"a".repeat(8_191)}😀${"b".repeat(500)}`;
+	const fixture = await setupReviewFixture(
+		[path, largePath, opaquePath, textPath], undefined, [path, largePath, opaquePath, textPath], false, false,
+		(candidate) => candidate === path ? zipBytes
+			: candidate === largePath ? largeBytes
+				: candidate === opaquePath ? opaqueBytes : validUtf8Text,
+		undefined, [path, largePath, opaquePath, textPath],
+	);
+	try {
+		const presented = await reviewDelegationV2({
+			projectRoot: fixture.root, delegationId: ID, exec: spawnExec, now: at(4),
+		});
+		assert.equal(presented.ok, true, presented.ok ? "" : JSON.stringify(presented.error));
+		if (!presented.ok || presented.review.record === undefined) return;
+		const entries = new Map(presented.review.record.patch.map((entry) => [entry.path, entry]));
+		const entry = entries.get(path)!;
+		assert.equal(entry.source, "compact");
+		assert.equal(entry.compact?.content_kind, "binary");
+		assert.equal(entry.compact?.size_bytes, zipBytes.length);
+		assert.equal(entry.compact?.digest_kind, "sha256");
+		assert.equal(entry.compact?.digest_matches_after, true);
+		assert.equal(entry.compact?.head_bytes, 0);
+		assert.equal(entry.compact?.tail_bytes, 0);
+		assert.match(entry.text, /binary bytes are not decoded or paged as UTF-8/u);
+		assert.doesNotMatch(entry.text, /�/u, "binary bytes never enter the text presentation");
+		const opaque = entries.get(opaquePath)!;
+		assert.equal(opaque.source, "compact", "bounded byte inspection detects binary content without a known extension");
+		assert.equal(opaque.compact?.content_kind, "binary");
+		assert.equal(opaque.compact?.size_bytes, opaqueBytes.length);
+		const large = entries.get(largePath)!;
+		assert.equal(large.source, "compact");
+		assert.equal(large.compact?.content_kind, "binary");
+		assert.equal(large.compact?.size_bytes, largeBytes.length);
+		assert.equal(large.compact?.digest_kind, "sha256", "guard-v2 keeps the full streaming digest beyond the legacy 4 MiB display threshold");
+		assert.equal(large.compact?.digest_matches_after, true);
+		const text = entries.get(textPath)!;
+		assert.equal(text.source, "file-content", "a valid UTF-8 scalar split at the bounded head window is not misclassified as binary");
+		assert.equal(text.compact, undefined);
+		assert.equal(presented.review.record.presentation_complete, true);
+		const accepted = await acceptPresentedReview(fixture, presented.review.record.bound_diff_hash, 5);
+		assert.equal(accepted.ok, true, accepted.ok ? "" : JSON.stringify(accepted.error));
+		if (accepted.ok) assert.equal(accepted.transaction.status, "REVIEWED");
+	} finally {
+		await cleanup(fixture);
+	}
+});
+
+test("review v2: a pre-upgrade binary paging envelope can migrate in place to compact evidence and publish REPAIR", async () => {
+	const path = "src/legacy-authority.zip";
+	const zipBytes = Buffer.concat([
+		Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0xff, 0xfe, 0x00]),
+		Buffer.alloc(4_096, 0x93),
+	]);
+	const fixture = await setupReviewFixture(
+		[path], undefined, [path], false, false, () => zipBytes, undefined, [path],
+	);
+	try {
+		await replaceCommittedEnvelopeWithLegacyBinaryPaging(fixture, path, true);
+		const strict = await readDelegationCommittedGenerationV2(fixture.root, ID);
+		assert.equal(strict.ok, true, strict.ok ? "" : JSON.stringify(strict.error));
+
+		const presented = await reviewDelegationV2({
+			projectRoot: fixture.root, delegationId: ID, exec: spawnExec, includePaths: [path], now: at(4),
+		});
+		assert.equal(presented.ok, true, presented.ok ? "" : JSON.stringify(presented.error));
+		if (!presented.ok || presented.review.record === undefined) return;
+		assert.equal(presented.review.record.patch[0]?.source, "compact");
+		assert.equal(presented.review.record.patch[0]?.compact?.content_kind, "binary");
+		assert.equal(presented.review.record.presentation_complete, true);
+		const refused = await repairPresentedReview(
+			fixture,
+			presented.review.record.bound_diff_hash,
+			"This must remain blocked because the legacy envelope stream hash does not match current bytes.",
+			5,
+		);
+		assert.equal(refused.ok, false, "legacy compatibility never accepts a merely well-formed but non-reproducible envelope");
+		if (!refused.ok) assert.equal(refused.error.code, "review_invalid");
+
+		await replaceCommittedEnvelopeWithLegacyBinaryPaging(fixture, path);
+		const recovered = await reviewDelegationV2({
+			projectRoot: fixture.root, delegationId: ID, exec: spawnExec, includePaths: [path], now: at(6),
+		});
+		assert.equal(recovered.ok, true, recovered.ok ? "" : JSON.stringify(recovered.error));
+		if (!recovered.ok || recovered.review.record === undefined) return;
+
+		const repaired = await repairPresentedReview(
+			fixture,
+			recovered.review.record.bound_diff_hash,
+			"Rebuild the sealed ZIP from the corrected authority inputs and re-run its independent artifact checks.",
+			7,
+		);
+		assert.equal(repaired.ok, true, repaired.ok ? "" : JSON.stringify(repaired.error));
+		if (repaired.ok) assert.equal(repaired.semantic_authority, "repair_required");
+	} finally {
+		await cleanup(fixture);
 	}
 });
 

@@ -186,7 +186,7 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 
 test("v0.10.0 public tool surface has the intentional structured-Git transition hash", () => {
 	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
-	const currentHash = "9dc21686794d0b4f53377c0142fc758f6088b68ae9a68e39baae007605a9123a";
+	const currentHash = "5d53ec9369af0a573666d131192ff6e4a91c45c6f37d3db65310afbdbff97251";
 	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
 	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the documented 0.10.0 hash");
 });
@@ -683,7 +683,7 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.equal(
 		canonicalHash(workbenchToolMetadataOrdered()),
-		"1cf5a3aecbdc44b659b2dec060c2f5c1297ccd7a10cfaf23198861b6c6952299",
+		"fc3ec1a5944513ef3f864cf54506242c9b1bf409094f99d754faba843969a726",
 		"current public catalog hash is machine-pinned after full authority recovery was added",
 	);
 });
@@ -698,7 +698,7 @@ test("delegation review metadata separates provisional inspection from explicit 
 	assert.deepEqual(meta.promptGuidelines, [
 		"First call without semantic fields and normally without delegation_id; the runtime selects the durable latest delegation and returns its exact id. This provisional presentation cannot finalize review.",
 		"Only after Sol inspects the complete packet, call with that exact delegation_id plus semantic_decision=ACCEPT or REPAIR and its exact expected_bound_diff_hash. REPAIR also requires repair_reason, stays Gate-blocking, and permits only exact repair_of. For an explicitly reported historical migration, only ACCEPT is valid and also requires expected_migration_binding_hash. Never guess an id or hash.",
-		"include_paths changes presentation only. When one ordinary source path remains, repeat that single path until its hash-bound page range reaches the total; never accept after drift, incomplete packet coverage, unresolved semantic risk, or an unverified hash.",
+		"include_paths changes presentation only. Binary/container paths are complete bounded size/digest packets and require independent artifact validation; when one ordinary source path remains, repeat that single path until its hash-bound page range reaches the total. Never accept after drift, incomplete packet coverage, unresolved semantic risk, or an unverified hash.",
 		"Review authority never substitutes for final verification or Gate authority.",
 	]);
 	assert.match(meta.description, /only provisional presentation/);
@@ -708,6 +708,8 @@ test("delegation review metadata separates provisional inspection from explicit 
 	assert.match(meta.description, /enables only an exact fresh repair_of lineage/);
 	assert.match(meta.description, /REPAIR never grants Gate authority/);
 	assert.match(meta.description, /Historical migration supports ACCEPT only/);
+	assert.match(meta.description, /Binary\/container changes use bounded size\/digest compact packets/);
+	assert.match(meta.description, /upgrade recovery for already-pending v1 paging envelopes/);
 	assert.match(meta.description, /resumes the next contiguous UTF-8 page/);
 	assert.match(meta.description, /redacted-stream hashes/);
 	assert.match(meta.description, /Workspace drift invalidates either decision/);
@@ -740,7 +742,7 @@ test("delegation review metadata separates provisional inspection from explicit 
 	assert.match(repairReason?.description ?? "", /never grants Gate authority/);
 	assert.equal(
 		canonicalHash(meta),
-		"80a8f9242431c26eb8700cc24b8b2d48c9fce2e98b89007045d719fee034b4e4",
+		"ecbfece6a6d60c9da84b82d1b4bdc063faba6c27a98086369a4bfd75f7c1be80",
 		"current review metadata hash is pinned after ACCEPT/REPAIR and page-continuation guidance",
 	);
 	assert.equal(
