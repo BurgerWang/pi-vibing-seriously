@@ -184,6 +184,7 @@ function lifecycle(
 	contractHash: string,
 	beforeFacts: Readonly<GitFacts>,
 	afterFacts: Readonly<AfterFacts>,
+	options: Readonly<{ gitIgnoredWorkerPath?: boolean; failedFirstOperation?: boolean }> = {},
 ): Readonly<FinalizedDelegationChangeSetLifecycleV2> {
 	const path = "src/changed.ts";
 	const missing: StreamingPathIdentity = { schema_version: 2, kind: "missing", path };
@@ -195,6 +196,10 @@ function lifecycle(
 		...present, byte_size: 5, sha256: "3".repeat(64),
 		stat: { ...present.stat, mtime_ns: "2", ctime_ns: "2" },
 	};
+	const original: StreamingPathIdentity = {
+		...present, byte_size: 6, sha256: "4".repeat(64),
+		stat: { ...present.stat, mtime_ns: "1", ctime_ns: "1" },
+	};
 	const limits = {
 		max_unique_paths: 500, max_operations: 1000, max_identity_paths: 500,
 		max_total_bytes: 256 * 1024 * 1024, max_file_bytes: 64 * 1024 * 1024, max_serialized_bytes: 4 * 1024 * 1024,
@@ -203,7 +208,16 @@ function lifecycle(
 		schema_version: 2, delegation_id: ID, contract_hash: contractHash, state: "OPEN", revision: 0,
 		limits, meter: { paths_attempted: 0, paths_completed: 0, bytes_read: 0 }, operations: [], journal_hash: null,
 	};
-	const operations = kind === "implementation" ? [
+	const operations = kind !== "implementation" ? [] : options.failedFirstOperation ? [
+		{
+			sequence: 1, operation_id: "1".repeat(64), kind: "edit" as const, path, status: "completed" as const,
+			before: original, after: original, outcome: "failed" as const,
+		},
+		{
+			sequence: 2, operation_id: "2".repeat(64), kind: "edit" as const, path, status: "completed" as const,
+			before: original, after: present, outcome: "succeeded" as const,
+		},
+	] : [
 		{
 			sequence: 1, operation_id: "1".repeat(64), kind: "write" as const, path, status: "completed" as const,
 			before: missing, after: middle, outcome: "succeeded" as const,
@@ -212,17 +226,24 @@ function lifecycle(
 			sequence: 2, operation_id: "2".repeat(64), kind: "edit" as const, path, status: "completed" as const,
 			before: middle, after: present, outcome: "succeeded" as const,
 		},
-	] : [];
+	];
 	const sealedBase: WorkerWriteJournalRecord = {
 		...open, state: "SEALED", revision: kind === "implementation" ? 5 : 1,
 		meter: kind === "implementation"
-			? { paths_attempted: 4, paths_completed: 4, bytes_read: 17 }
+			? { paths_attempted: 4, paths_completed: 4, bytes_read: options.failedFirstOperation ? 25 : 17 }
 			: { paths_attempted: 0, paths_completed: 0, bytes_read: 0 },
 		operations, journal_hash: "0".repeat(64),
 	};
 	const sealed = { ...sealedBase, journal_hash: computeWorkerWriteJournalHash(sealedBase) };
-	const beforeGuard = guard(beforeFacts, present);
-	const afterGuard = guard(afterFacts, present);
+	const withoutWorkerPath = (facts: Readonly<GitFacts>): GitFacts => ({
+		gitHead: facts.gitHead,
+		gitDirty: facts.changedPaths.some((candidate) => candidate !== path),
+		changedPaths: facts.changedPaths.filter((candidate) => candidate !== path),
+		pathStatuses: Object.fromEntries(Object.entries(facts.pathStatuses).filter(([candidate]) => candidate !== path)),
+		pathDigests: Object.fromEntries(Object.entries(facts.pathDigests).filter(([candidate]) => candidate !== path)),
+	});
+	const beforeGuard = guard(options.gitIgnoredWorkerPath ? withoutWorkerPath(beforeFacts) : beforeFacts, present);
+	const afterGuard = guard(options.gitIgnoredWorkerPath ? withoutWorkerPath(afterFacts) : afterFacts, present);
 	const computed = computeChangeSet({
 		delegation_id: ID, contract_hash: contractHash, journal_hash: sealed.journal_hash!, journal: sealed,
 		before_guard: beforeGuard, after_guard: afterGuard, dependency_paths: beforeFacts.changedPaths,
@@ -248,6 +269,7 @@ function committing(
 	reportComplete: boolean,
 	afterFacts = after(kind),
 	budgetProfile: DelegationBoundedTaskContractPayloadV2["budget_profile"] = "standard",
+	lifecycleOptions: Readonly<{ gitIgnoredWorkerPath?: boolean; failedFirstOperation?: boolean }> = {},
 ): {
 	state: DelegationTransactionRecord;
 	contract: ReturnType<typeof bindDelegationBoundedTaskContractV2> & { ok: true };
@@ -286,7 +308,7 @@ function committing(
 			pathStatuses: Object.fromEntries(afterFacts.changedPaths.filter((path) => !afterFacts.changedSinceBefore.includes(path)).map((path) => [path, afterFacts.pathStatuses[path]!])),
 			pathDigests: Object.fromEntries(afterFacts.changedPaths.filter((path) => !afterFacts.changedSinceBefore.includes(path)).map((path) => [path, afterFacts.pathDigests[path]!])),
 		};
-	const changeSetLifecycle = lifecycle(kind, contract.value.contract_hash, beforeFacts, afterFacts);
+	const changeSetLifecycle = lifecycle(kind, contract.value.contract_hash, beforeFacts, afterFacts, lifecycleOptions);
 	const outcome: DelegationTerminalOutcome = {
 		delegation_id: ID,
 		task_kind: kind,
@@ -357,6 +379,45 @@ test("artifact v2: implementation builds deterministic exact records without mut
 	const usage = first.value.records["usage.json"] as Record<string, unknown>;
 	assert.deepEqual(usage.spend, first.value.workerSummary.spend, "usage and summary share the same input-derived spend facts");
 	assert.deepEqual(usage.usage, first.value.workerSummary.usage);
+});
+
+test("artifact v2: sealed journal binds a Git-ignored path after a failed then successful edit", () => {
+	const facts = after("implementation");
+	const { state, contract, changeSetLifecycle } = committing(
+		"implementation",
+		true,
+		facts,
+		"standard",
+		{ gitIgnoredWorkerPath: true, failedFirstOperation: true },
+	);
+	const workspace = artifactWorkspaceFacts(changeSetLifecycle);
+	assert.deepEqual(changeSetLifecycle.prepared.before_guard.entries, []);
+	assert.deepEqual(changeSetLifecycle.after_guard.entries, []);
+	assert.deepEqual(workspace.after.changedSinceBefore, ["src/changed.ts"]);
+	assert.deepEqual(changeSetLifecycle.sealed_journal.operations.map((operation) =>
+		operation.status === "completed" ? operation.outcome : operation.status), ["failed", "succeeded"]);
+
+	const result = buildDelegationCommittedArtifactsV2({
+		transaction: state,
+		contract: contract.value,
+		...workspace,
+		changeSetLifecycle,
+		worker: worker(),
+		reportText: completeReport(),
+	});
+	assert.equal(result.ok, true);
+
+	const unboundDrift = buildDelegationCommittedArtifactsV2({
+		transaction: state,
+		contract: contract.value,
+		before: workspace.before,
+		after: { ...workspace.after, changedSinceBefore: ["foreign.ts", "src/changed.ts"] },
+		changeSetLifecycle,
+		worker: worker(),
+		reportText: completeReport(),
+	});
+	assert.equal(unboundDrift.ok, false, "a path absent from the guards, conflicts, and worker delta still fails closed");
+	if (!unboundDrift.ok) assert.equal(unboundDrift.error.code, "invalid_facts");
 });
 
 test("artifact v2: tagged W file digests require exact ChangeSet keys and bytes", () => {

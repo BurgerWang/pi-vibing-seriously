@@ -724,13 +724,19 @@ function buildDelegationCommittedArtifactsUnchecked(
 		(!validateSemanticReviewEnvelopeV1(input.reviewEnvelope) || input.reviewEnvelope.path_count !== changedPaths.length)) {
 		return fail("review_envelope_exceeded", "delegation semantic review cannot be closed inside the versioned capacity envelope");
 	}
-	const beforeOrAfterPaths = new Set([
+	const authorityBoundPaths = new Set([
+		// A journal-attributed path can be intentionally absent from both Git
+		// guards (for example, a project-local ignored runtime recipe). Its
+		// first/final streaming identities are already bound by the sealed
+		// journal and ChangeSet, so requiring a duplicate Git-visible entry
+		// would reject a valid delivery after the worker has written it.
+		...changedPaths,
 		...lifecycle.prepared.before_guard.entries.map((entry) => entry.path),
 		...lifecycle.after_guard.entries.map((entry) => entry.path),
 		...changeSet.conflicts.map((entry) => entry.path),
 	]);
-	if (!input.after.changedSinceBefore.every((path) => beforeOrAfterPaths.has(path))) {
-		return fail("invalid_facts", "delegation actual changed paths are not bound to the before/after snapshots");
+	if (!input.after.changedSinceBefore.every((path) => authorityBoundPaths.has(path))) {
+		return fail("invalid_facts", "delegation actual changed paths are not bound to the snapshots or worker delta");
 	}
 	const outcome = transaction.terminal_outcome;
 	const successfulWriteCount = lifecycle.sealed_journal.operations.filter((operation) =>
