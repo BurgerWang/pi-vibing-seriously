@@ -59,8 +59,10 @@ publication, `/reload`, or measured live provider cache improvement is claimed.
   or guessed `delegation_id` to the durable latest transaction and drops the
   stale selector's `include_paths`. Semantic `ACCEPT`/`REPAIR` remains strict
   exact-id/hash authority. Explicit not-latest/rejected-selector diagnostics no
-  longer become delegation execution claims, and a claim rejection reuses a
-  fresh status observation instead of prescribing another redundant query.
+  longer become delegation or run execution claims, including when a real run
+  outcome follows the diagnostic in the same sentence. That real run still
+  requires its own committed authority. A claim rejection reuses a fresh status
+  observation instead of prescribing another redundant query.
 - The pre-release single-slice local-commit draft is replaced by one structured
   `workbench_git` surface. `action=checkpoint` binds directly to sealed reviewed
   path bytes, batches every compatible semantic-ACCEPT slice into one commit,

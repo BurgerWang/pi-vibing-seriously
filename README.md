@@ -78,9 +78,10 @@ delegation authority instead of relying only on prose word order. New guard
 messages use the `[workbench-delegation-claim-guard-v2]` envelope and include
 `binding_revision: authority-resolved-v2` plus bounded claim/authority counts.
 The counts diagnose missing authority without echoing an untrusted id. If the
-header still says `workbench-delegation-claim-guard-v1`, or the binding revision
-line is absent after updating, the Pi process still has older extension code
-loaded and must be `/reload`ed before starting the next conversation.
+header still says `workbench-delegation-claim-guard-v1`, the binding revision
+line is absent, or `fresh_status_facts` is absent after updating, the Pi process
+still has older extension code loaded and must be `/reload`ed before starting
+the next conversation.
 
 Diff review is optimized for continuity: call `workbench_review_worker_diff`
 without `delegation_id` or semantic fields to inspect the durable latest

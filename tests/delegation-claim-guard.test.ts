@@ -501,6 +501,25 @@ test("rejected or unavailable review selectors remain reportable diagnostics", (
 	);
 });
 
+test("failed review-selector diagnostics cannot masquerade as run failures", () => {
+	const committedRun = "20260826-074831-xb5p";
+	const inspection = inspectDelegationClaims(assistant(
+		`workbench_review_worker_diff failed: delegation ${FAKE_IDS[0]} is not the latest delegation (${REAL_ID}), but run_id ${committedRun} completed SUCCESS.`,
+	));
+	assert.ok(inspection);
+	assert.deepEqual(inspection.ids, [], "unavailable review selectors never enter delegation or fallback run resolution");
+	assert.deepEqual(inspection.runIds, [committedRun], "the separately stated committed run remains guarded");
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(), [], [{ id: committedRun, outcome: "SUCCESS" }]),
+		{ ok: true },
+	);
+	assert.deepEqual(
+		validateDelegationClaims(inspection, evidence(), [], []),
+		{ ok: false, code: "missing_run_authority" },
+		"the diagnostic exemption cannot authorize the real run claim",
+	);
+});
+
 test("mixed negation cannot erase an affirmative success claim in the same sentence", () => {
 	const english = inspectDelegationClaims(assistant(
 		`delegation ${REAL_ID} did not fail, but completed successfully.`,

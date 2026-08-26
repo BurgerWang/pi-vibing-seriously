@@ -377,7 +377,9 @@ function inspectWorkbenchRunClaims(text: string): {
 		else if (trimmed.length > 0 && !listItem) runSection = false;
 		const contextualLine = runSection && listItem ? `run ${rawLine}` : rawLine;
 		const visible = contextualLine.replace(INLINE_CODE_RE, (_whole, inline: string) => inline);
-		for (const segment of visible.split(/[.;；。!?！？]+/u)) {
+		for (const rawSegment of visible.split(/[.;；。!?！？]+/u)) {
+			const segment = runEvidenceAfterUnavailableDelegationDiagnostic(rawSegment);
+			if (segment.length === 0) continue;
 			const outcomes = indexedRunOutcomes(segment);
 			const hasSuccess = outcomes.some((outcome) => outcome.outcome === "SUCCESS");
 			const hasFailure = outcomes.some((outcome) => outcome.outcome === "FAILURE");
@@ -480,6 +482,15 @@ function isUnavailableDelegationDiagnostic(clause: string): boolean {
 		&& !REVIEW_PASS_FINAL_RE.test(evidence);
 }
 
+function runEvidenceAfterUnavailableDelegationDiagnostic(segment: string): string {
+	const diagnosticBoundary = segment.search(/[,，]/u);
+	if (
+		diagnosticBoundary >= 0
+		&& isUnavailableDelegationDiagnostic(segment.slice(0, diagnosticBoundary))
+	) return segment.slice(diagnosticBoundary + 1).trim();
+	return isUnavailableDelegationDiagnostic(segment) ? "" : segment;
+}
+
 function strictLegacyStatus(ledger: DelegationLedger, id: string): DelegationClaimAuthorityStatus | undefined {
 	if (
 		ledger.manifest.schema_version !== DELEGATION_SCHEMA_VERSION
@@ -555,7 +566,6 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 
 	for (const rawClause of claimClauses(text)) {
 		const clause = rawClause.replace(BLOCKED_EXECUTION_SCAN_RE, " ");
-		const hasDelegationSubject = DELEGATION_WORD_RE.test(clause) || WORKER_WORD_RE.test(clause);
 		let affirmativeClause = clause.replace(new RegExp(NEGATED_CLAIM_SCAN_RE.source, "gi"), " ");
 		const diagnosticBoundary = clause.search(/[,，]/u);
 		if (diagnosticBoundary >= 0 && isUnavailableDelegationDiagnostic(clause.slice(0, diagnosticBoundary))) {
@@ -566,6 +576,8 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 			sawNegativeDelegation = true;
 			continue;
 		}
+		const hasDelegationSubject = DELEGATION_WORD_RE.test(affirmativeClause)
+			|| WORKER_WORD_RE.test(affirmativeClause);
 		const negative = hasDelegationSubject && (NEGATED_WORD_RE.test(clause) || affirmativeClause !== clause);
 		if (negative) {
 			sawNegativeDelegation = true;
@@ -649,7 +661,11 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 			expectedStatuses.get(latestIds[0]!)!.push(...claim.statuses);
 		} else if (ids.length > 1) ambiguousStatusBinding = true;
 	}
-	const negativeOnly = sawNegativeDelegation && ids.length === 0 && !executionClaim && !successClaim;
+	const negativeOnly = sawNegativeDelegation
+		&& ids.length === 0
+		&& runClaims.ids.length === 0
+		&& !executionClaim
+		&& !successClaim;
 	if (ids.length === 0 && runClaims.ids.length === 0 && !overflow && !executionClaim && !successClaim && !negativeOnly) return undefined;
 	const explicitSameRunStartIds = [...sameRunStartIds].filter((id) => ids.includes(id));
 	const boundSameRunStartIds = explicitSameRunStartIds.length > 0
