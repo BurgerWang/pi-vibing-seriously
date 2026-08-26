@@ -17,6 +17,8 @@ import { dirname, join, posix, resolve } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import { canonicalHash } from "../cache/canonical-hash.ts";
+import { validateChangeSet, type ChangeSetRecord } from "./change-set.ts";
+import { readDelegationCommittedGenerationV2 } from "./delegation-transaction-storage.ts";
 import {
 	DELEGATION_TRANSACTION_HASH_RE,
 	DELEGATION_TRANSACTION_ID_RE,
@@ -24,6 +26,15 @@ import {
 	type DelegationTransactionRecord,
 } from "./delegation-transaction.ts";
 import { validateWorkspaceGuard, type WorkspaceGuardRecord } from "./workspace-guard.ts";
+import {
+	captureStreamingIdentities,
+	type StreamingPathIdentity,
+} from "./streaming-identity.ts";
+import {
+	readWorkerWriteJournal,
+	validateWorkerWriteJournalRecord,
+	type WorkerWriteJournalRecord,
+} from "./write-journal.ts";
 
 const BLOCKER_DIR_NAME = "blocker-closures-v2";
 const QUARANTINE_DIR_NAME = "delegation-authority-quarantine-v1";
@@ -226,6 +237,165 @@ export function inactiveBlockerRelevantPathsV2(transaction: DelegationTransactio
 	return sorted.length > 0 && sorted.length <= 500 ? sorted : undefined;
 }
 
+function exactAllowedFallbackPathsV2(transaction: DelegationTransactionRecord): string[] | undefined {
+	const exact = exactDelegationRepairAllowedPathsV1(transaction.allowed_paths);
+	if (exact === undefined) return undefined;
+	const paths = new Set<string>([
+		...exact,
+		...(transaction.repair_lineage?.carried_paths ?? []),
+	]);
+	const sorted = [...paths].sort(byteCompare);
+	return sorted.length > 0 && sorted.length <= 500 ? sorted : undefined;
+}
+
+interface ResolvedInactiveBlockerPathsV2 {
+	paths: string[];
+	journal_before: StreamingPathIdentity[];
+}
+
+function journalRelevantPathsV2(
+	transaction: DelegationTransactionRecord,
+	journal: WorkerWriteJournalRecord,
+	changeSet?: ChangeSetRecord,
+): ResolvedInactiveBlockerPathsV2 | undefined {
+	if (!validateWorkerWriteJournalRecord(journal) || journal.state !== "SEALED" || journal.journal_hash === null ||
+		journal.delegation_id !== transaction.delegation_id || journal.contract_hash !== transaction.contract_hash) return undefined;
+	const successfulWrites = journal.operations.filter((operation) =>
+		operation.status === "completed" && operation.outcome === "succeeded").length;
+	if (transaction.terminal_outcome !== null && transaction.terminal_outcome.successful_write_count !== successfulWrites) return undefined;
+	const touchedPaths = new Set(journal.operations.map((operation) => operation.path));
+	const beforeByPath = new Map<string, StreamingPathIdentity>();
+	for (const operation of journal.operations) {
+		if (!beforeByPath.has(operation.path)) beforeByPath.set(operation.path, operation.before);
+	}
+	if (changeSet !== undefined) {
+		if (transaction.terminal_outcome === null || !validateChangeSet(changeSet) ||
+			changeSet.delegation_id !== transaction.delegation_id ||
+			changeSet.contract_hash !== transaction.contract_hash || changeSet.journal_hash !== journal.journal_hash ||
+			changeSet.status !== transaction.terminal_outcome.change_set_status ||
+			changeSet.counts.touched_paths !== touchedPaths.size ||
+			changeSet.worker_delta.some((entry) => !touchedPaths.has(entry.path)) ||
+			changeSet.conflicts.some((entry) => !touchedPaths.has(entry.path))) return undefined;
+	}
+	for (const path of transaction.repair_lineage?.carried_paths ?? []) touchedPaths.add(path);
+	const sorted = [...touchedPaths].sort(byteCompare);
+	if (sorted.length > 500) return undefined;
+	return {
+		paths: sorted,
+		journal_before: [...beforeByPath.entries()]
+			.sort(([left], [right]) => byteCompare(left, right))
+			.map(([, identity]) => identity),
+	};
+}
+
+function evidenceReadFailure(code: string): DelegationAuthorityClosureResult<ResolvedInactiveBlockerPathsV2> {
+	return {
+		ok: false,
+		error: {
+			code: code === "storage_failure" ? "storage_failure" : code === "not_found" ? "not_found" : "invalid_record",
+		},
+	};
+}
+
+async function committedJournalRelevantPathsV2(
+	projectRoot: string,
+	transaction: DelegationTransactionRecord,
+): Promise<DelegationAuthorityClosureResult<ResolvedInactiveBlockerPathsV2>> {
+	const committed = await readDelegationCommittedGenerationV2(projectRoot, transaction.delegation_id);
+	if (!committed.ok) return evidenceReadFailure(committed.error.code);
+	if (canonicalHash(committed.value.state) !== canonicalHash(transaction)) {
+		return { ok: false, error: { code: "conflict" } };
+	}
+	const scope = committed.value.records["scope.json"];
+	if (!isRecord(scope) || !validateWorkerWriteJournalRecord(scope.write_journal) || !validateChangeSet(scope.change_set)) {
+		return { ok: false, error: { code: "invalid_record" } };
+	}
+	const paths = journalRelevantPathsV2(transaction, scope.write_journal, scope.change_set);
+	return paths === undefined
+		? { ok: false, error: { code: "invalid_record" } }
+		: { ok: true, value: paths };
+}
+
+/** Resolve exact discarded-delta paths from transaction, generation, or sealed journal authority. */
+async function resolveInactiveBlockerRelevantPathsV2(
+	projectRoot: string,
+	transaction: DelegationTransactionRecord,
+): Promise<DelegationAuthorityClosureResult<ResolvedInactiveBlockerPathsV2>> {
+	const outcome = transaction.terminal_outcome;
+	if (outcome === null || !outcome.terminal_facts_complete || !outcome.scope_complete) {
+		if (transaction.committed_proof === null) {
+			const journal = await readWorkerWriteJournal({
+				project_root: projectRoot,
+				delegation_id: transaction.delegation_id,
+				contract_hash: transaction.contract_hash,
+			});
+			if (journal.ok) {
+				const evidence = journalRelevantPathsV2(transaction, journal.value);
+				if (evidence !== undefined) return { ok: true, value: evidence };
+			}
+		}
+		const fallback = exactAllowedFallbackPathsV2(transaction);
+		return fallback === undefined
+			? { ok: false, error: { code: "invalid_input" } }
+			: { ok: true, value: { paths: fallback, journal_before: [] } };
+	}
+	if (outcome.change_set_status === "CONFLICT") {
+		if (transaction.committed_proof !== null) {
+			return committedJournalRelevantPathsV2(projectRoot, transaction);
+		}
+		const journal = await readWorkerWriteJournal({
+			project_root: projectRoot,
+			delegation_id: transaction.delegation_id,
+			contract_hash: transaction.contract_hash,
+		});
+		if (journal.ok) {
+			const evidence = journalRelevantPathsV2(transaction, journal.value);
+			if (evidence !== undefined) return { ok: true, value: evidence };
+		}
+		const fallback = exactAllowedFallbackPathsV2(transaction);
+		if (fallback !== undefined) return { ok: true, value: { paths: fallback, journal_before: [] } };
+		return journal.ok
+			? { ok: false, error: { code: "invalid_record" } }
+			: evidenceReadFailure(journal.error.code);
+	}
+	const direct = inactiveBlockerRelevantPathsV2(transaction);
+	if (direct !== undefined) return { ok: true, value: { paths: direct, journal_before: [] } };
+	if (transaction.committed_proof === null && outcome.changed_paths.length === 0) {
+		const journal = await readWorkerWriteJournal({
+			project_root: projectRoot,
+			delegation_id: transaction.delegation_id,
+			contract_hash: transaction.contract_hash,
+		});
+		if (journal.ok) {
+			const evidence = journalRelevantPathsV2(transaction, journal.value);
+			if (evidence !== undefined) return { ok: true, value: evidence };
+		}
+	}
+	const fallback = exactAllowedFallbackPathsV2(transaction);
+	return fallback === undefined
+		? { ok: false, error: { code: "invalid_input" } }
+		: { ok: true, value: { paths: fallback, journal_before: [] } };
+}
+
+function sameContentIdentity(left: StreamingPathIdentity, right: StreamingPathIdentity): boolean {
+	if (left.kind !== right.kind) return false;
+	if (left.kind === "missing" || right.kind === "missing") return left.kind === right.kind;
+	return left.byte_size === right.byte_size && left.sha256 === right.sha256;
+}
+
+async function journalBaselineRestoredV2(
+	projectRoot: string,
+	baseline: readonly StreamingPathIdentity[],
+): Promise<boolean> {
+	if (baseline.length === 0) return true;
+	const current = await captureStreamingIdentities({
+		project_root: projectRoot,
+		paths: baseline.map((identity) => identity.path),
+	});
+	return current.ok && current.identities.length === baseline.length &&
+		current.identities.every((identity, index) => sameContentIdentity(identity, baseline[index]!));
+}
+
 function isInactiveClosableStatus(transaction: DelegationTransactionRecord): boolean {
 	if (["PREPARED", "RUNNING", "COMMITTING", "FINISHED", "REVIEWED"].includes(transaction.status)) return false;
 	if (transaction.status === "ABORTED") return transaction.repair_lineage !== undefined;
@@ -239,9 +409,9 @@ function blockerPayloadHash(value: Omit<DelegationInactiveBlockerClosureV2, "clo
 function normalizeBlocker(
 	value: unknown,
 	transaction: DelegationTransactionRecord,
+	relevantPaths: readonly string[],
 ): DelegationInactiveBlockerClosureV2 | undefined {
-	const relevantPaths = inactiveBlockerRelevantPathsV2(transaction);
-	if (relevantPaths === undefined || !isInactiveClosableStatus(transaction) || !isRecord(value) ||
+	if (!isInactiveClosableStatus(transaction) || !isRecord(value) ||
 		!exactFields(value, BLOCKER_FIELDS) || value.schema_version !== 2 ||
 		value.kind !== "inactive-delegation-blocker-closure-v2" || value.delegation_id !== transaction.delegation_id ||
 		value.contract_hash !== transaction.contract_hash || value.generation !== transaction.generation ||
@@ -277,7 +447,13 @@ export async function readDelegationInactiveBlockerClosureV2(
 		const bytes = await readBoundedFile(path, RECEIPT_MAX_BYTES);
 		let decoded: unknown;
 		try { decoded = JSON.parse(bytes.toString("utf8")); } catch { return { ok: false, error: { code: "invalid_record" } }; }
-		const record = normalizeBlocker(decoded, transaction);
+		const legacyPaths = inactiveBlockerRelevantPathsV2(transaction);
+		let record = legacyPaths === undefined ? undefined : normalizeBlocker(decoded, transaction, legacyPaths);
+		if (record === undefined) {
+			const resolved = await resolveInactiveBlockerRelevantPathsV2(projectRoot, transaction);
+			if (!resolved.ok) return resolved;
+			record = normalizeBlocker(decoded, transaction, resolved.value.paths);
+		}
 		const canonical = record === undefined ? undefined : encode(record);
 		return record !== undefined && canonical !== undefined && canonical.equals(bytes)
 			? { ok: true, value: record }
@@ -296,14 +472,22 @@ export async function publishDelegationInactiveBlockerClosureV2(input: {
 	now: string;
 }): Promise<DelegationAuthorityClosureResult<DelegationInactiveBlockerClosureV2>> {
 	const path = blockerPath(input.project_root, input.transaction.delegation_id, canonicalHash(input.transaction));
-	const relevantPaths = inactiveBlockerRelevantPathsV2(input.transaction);
-	if (path === undefined || relevantPaths === undefined || !isInactiveClosableStatus(input.transaction) ||
+	if (path === undefined || !isInactiveClosableStatus(input.transaction) ||
 		!validateWorkspaceGuard(input.workspace_guard) || input.workspace_guard.git_head === null ||
 		!validSol(input.closed_by) || !isCanonicalTime(input.now)) {
 		return { ok: false, error: { code: "invalid_input" } };
 	}
+	const existing = await readDelegationInactiveBlockerClosureV2(input.project_root, input.transaction);
+	if (!existing.ok) return existing;
+	if (existing.value !== undefined) return { ok: true, value: existing.value };
+	const resolved = await resolveInactiveBlockerRelevantPathsV2(input.project_root, input.transaction);
+	if (!resolved.ok) return resolved;
+	const relevantPaths = resolved.value.paths;
 	const relevant = new Set(relevantPaths);
 	if (input.workspace_guard.entries.some((entry) => relevant.has(entry.path))) {
+		return { ok: false, error: { code: "not_recoverable" } };
+	}
+	if (!await journalBaselineRestoredV2(input.project_root, resolved.value.journal_before)) {
 		return { ok: false, error: { code: "not_recoverable" } };
 	}
 	const payload: Omit<DelegationInactiveBlockerClosureV2, "closure_hash"> = {
@@ -330,12 +514,9 @@ export async function publishDelegationInactiveBlockerClosureV2(input: {
 		closed_at: input.now,
 	};
 	const desired: DelegationInactiveBlockerClosureV2 = { ...payload, closure_hash: blockerPayloadHash(payload) };
-	if (normalizeBlocker(desired, input.transaction) === undefined) return { ok: false, error: { code: "invalid_input" } };
+	if (normalizeBlocker(desired, input.transaction, relevantPaths) === undefined) return { ok: false, error: { code: "invalid_input" } };
 	const bytes = encode(desired);
 	if (bytes === undefined) return { ok: false, error: { code: "invalid_input" } };
-	const existing = await readDelegationInactiveBlockerClosureV2(input.project_root, input.transaction);
-	if (!existing.ok) return existing;
-	if (existing.value !== undefined) return { ok: true, value: existing.value };
 	const published = await publishNoClobber(path, bytes, "blocker-closure");
 	if (published === "failed") return { ok: false, error: { code: "storage_failure" } };
 	const final = await readDelegationInactiveBlockerClosureV2(input.project_root, input.transaction);

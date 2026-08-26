@@ -562,6 +562,32 @@ test("only an exact proof-null artifact failure with a sealed journal is recover
 	});
 });
 
+test("a proof-null inactive recovery closes from its sealed empty journal under directory scope", async () => {
+	await withTempDir(async (root) => {
+		assert.equal((await spawnExec("git", ["init", "-q"], { cwd: root })).code, 0);
+		await writeFile(join(root, "README.md"), "baseline\n", "utf8");
+		assert.equal((await spawnExec("git", ["add", "README.md"], { cwd: root })).code, 0);
+		assert.equal((await spawnExec("git", ["-c", "user.name=Workbench Test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "baseline"], { cwd: root })).code, 0);
+		const id = "20260820-100003-rp02";
+		const recovery = await recoverableUnpublished(root, id);
+		assert.equal(recovery.status, "RECOVERY_REQUIRED");
+		assert.equal(recovery.committed_proof, null);
+		await writeFile(join(root, "notes.txt"), "unrelated user work\n", "utf8");
+
+		const closed = await closeInactiveProjectDelegationBlockerV2({
+			project_root: root,
+			expected_delegation_id: id,
+			now: at(4),
+			exec: spawnExec,
+			closed_by: { provider: "openai", model: "gpt-5.6-sol" },
+		});
+		assert.equal(closed.ok, true, closed.ok ? "" : closed.code);
+		if (closed.ok) assert.deepEqual(closed.value.relevant_paths, []);
+		assert.equal(await readFile(join(root, "notes.txt"), "utf8"), "unrelated user work\n");
+		assert.deepEqual(await readProjectDelegationBlockerV2(root), { ok: true, value: null });
+	});
+});
+
 test("reconcile releases a provably dead terminal owner before exposing unpublished repair authority", async () => {
 	await withTempDir(async (root) => {
 		const id = "20260820-100003-own1";

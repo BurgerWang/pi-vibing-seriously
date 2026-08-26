@@ -36,7 +36,11 @@ import {
 	readDelegationCommittedGenerationV2,
 	readDelegationTransactionV2,
 } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
-import { readRecoverableUnpublishedDelegationV2 } from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
+import {
+	closeInactiveProjectDelegationBlockerV2,
+	readProjectDelegationBlockerV2,
+	readRecoverableUnpublishedDelegationV2,
+} from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
 import { readWorkerRepairCapsule } from "../extensions/workbench-runtime/core/worker-repair-authority.ts";
 import { SEMANTIC_REVIEW_ENVELOPE_MAX_STREAM_BYTES_V1 } from "../extensions/workbench-runtime/core/semantic-review-envelope.ts";
 import type { DelegationTaskKind } from "../extensions/workbench-runtime/core/delegation-transaction.ts";
@@ -776,12 +780,20 @@ test("execution v2: WORKSPACE_DRIFT and CONFLICT commit immutable FAILED ChangeS
 	for (const scenario of ["WORKSPACE_DRIFT", "CONFLICT"] as const) {
 		const projectRoot = await root(t);
 		const delegationId = id(scenario === "WORKSPACE_DRIFT" ? 37 : 38);
+		if (scenario === "CONFLICT") {
+			await writeFile(join(projectRoot, ".gitignore"), "src/changed.ts\n");
+			assert.equal((await realExec("git", ["add", "--", ".gitignore"], { cwd: projectRoot })).code, 0);
+			assert.equal((await realExec("git", ["-c", "user.name=Execution V2", "-c", "user.email=execution@example.invalid", "commit", "-q", "-m", "ignore conflict fixture"], { cwd: projectRoot })).code, 0);
+		}
 		const bound = contract("implementation");
 		const report = completeReport(["src/changed.ts"]);
 		const executionInput = await input(projectRoot, delegationId, "implementation", after(["src/changed.ts"]), worker(report), {
 			contract: bound,
 			runWorker: async () => {
-				const completed = await journalWorker(projectRoot, delegationId, bound.contract_hash, ["src/changed.ts"], worker(report));
+				const journalPaths = scenario === "CONFLICT"
+					? Array.from({ length: 74 }, () => "src/changed.ts")
+					: ["src/changed.ts"];
+				const completed = await journalWorker(projectRoot, delegationId, bound.contract_hash, journalPaths, worker(report));
 				if (scenario === "WORKSPACE_DRIFT") await writeFile(join(projectRoot, "unowned-drift.txt"), "drift\n");
 				else await writeFile(join(projectRoot, "src/changed.ts"), "post-journal-conflict\n");
 				return completed;
@@ -803,6 +815,34 @@ test("execution v2: WORKSPACE_DRIFT and CONFLICT commit immutable FAILED ChangeS
 		assert.equal(afterRecord.worker_delta_hash, scope.change_set.worker_delta_hash);
 		assert.equal(afterRecord.workspace_guard_hash, scope.change_set.workspace_guard_hash);
 		assert.equal(afterRecord.change_set_hash, scope.change_set.change_set_hash);
+		if (scenario === "CONFLICT") {
+			assert.equal(committed.value.state.terminal_outcome?.successful_write_count, 74);
+			assert.deepEqual(committed.value.state.terminal_outcome?.changed_paths, []);
+			assert.equal((await collectGitFacts(projectRoot, realExec)).gitDirty, false, "ignored worker residue is Git-clean but not discarded");
+			const stillDirty = await closeInactiveProjectDelegationBlockerV2({
+				project_root: projectRoot,
+				expected_delegation_id: delegationId,
+				now: "2026-08-17T18:11:00.000Z",
+				exec: realExec,
+				closed_by: { provider: "openai", model: "gpt-5.6-sol" },
+			});
+			assert.equal(stillDirty.ok, false);
+			if (!stillDirty.ok) assert.equal(stillDirty.code, "relevant_paths_not_clean");
+
+			await rm(join(projectRoot, "src", "changed.ts"));
+			await writeFile(join(projectRoot, "unrelated-user-work.txt"), "preserve me\n");
+			const closed = await closeInactiveProjectDelegationBlockerV2({
+				project_root: projectRoot,
+				expected_delegation_id: delegationId,
+				now: "2026-08-17T18:11:01.000Z",
+				exec: realExec,
+				closed_by: { provider: "openai", model: "gpt-5.6-sol" },
+			});
+			assert.equal(closed.ok, true, closed.ok ? "" : closed.code);
+			if (closed.ok) assert.deepEqual(closed.value.relevant_paths, ["src/changed.ts"]);
+			assert.equal(await readFile(join(projectRoot, "unrelated-user-work.txt"), "utf8"), "preserve me\n");
+			assert.deepEqual(await readProjectDelegationBlockerV2(projectRoot), { ok: true, value: null });
+		}
 	}
 });
 

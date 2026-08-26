@@ -186,7 +186,7 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 
 test("v0.10.0 public tool surface has the intentional structured-Git transition hash", () => {
 	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
-	const currentHash = "b168980c9c76410c771fd515d6ad68722e88d164ee0f943a82e4030006c62b96";
+	const currentHash = "9dc21686794d0b4f53377c0142fc758f6088b68ae9a68e39baae007605a9123a";
 	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
 	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the documented 0.10.0 hash");
 });
@@ -658,7 +658,7 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	assert.deepEqual(meta.promptGuidelines, [
 		"Successful non-zero implementation delivery returns a provisional scope/integrity packet and stays PENDING_REVIEW; after inspecting a complete unchanged packet, use workbench_review_worker_diff for hash-bound Sol ACCEPT. Use status only for diagnostics or recovery.",
 		"If a complete packet is wrong, publish semantic_decision=REPAIR with the exact bound hash and a bounded reason, then follow only the exact repair_of shown by status. REPAIR and every unresolved lineage remain Gate-blocking.",
-		"If rejected changes were deliberately discarded, use the exact close_inactive_blocker action reported by status. It checks only the delegation's changed/carried paths, preserves unrelated work, never accepts rejected code, and must not be replaced with a new worktree.",
+		"If rejected changes were deliberately discarded, use the exact close_inactive_blocker action reported by status. It checks only the delegation's changed, journal-touched, or carried paths, preserves unrelated work, never accepts rejected code, and must not be replaced with a new worktree.",
 		"When STALE is backed by strict v2 FINAL/PASS plus explicit Sol semantic authority, follow the reported successor action instead of retrying immutable review; a mechanical FINAL/PASS remains blocked and VERIFY stays blocked until a valid successor is reviewed.",
 		"In the TUI, WF:LOCKED means routine writes belong to Luna, WF:LEASE means a bounded temporary Sol write exception is active, and WF:REVIEW means recovery review is outstanding.",
 	], "current status guidelines keep routine work out of the recovery chain");
@@ -673,7 +673,7 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	assert.doesNotMatch(meta.description, /real git diff \(any change after REVIEWED turns it STALE\)/);
 	assert.equal(
 		canonicalHash(meta),
-		"f96ee59dfc769ec52a954f3bacd0d013645bcf1416122681f24e27a9da45270d",
+		"2fe79f026100c5887729f90dcd78844a2dc475ede38ead9bad74b43f8d10163a",
 		"current status metadata hash is machine-pinned after full authority recovery",
 	);
 	assert.equal(
@@ -683,7 +683,7 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.equal(
 		canonicalHash(workbenchToolMetadataOrdered()),
-		"1c4b4e65e9ebeed867127e1062dc02fa0c4f2c2d8ed9151d03bf6642cc9b1159",
+		"1cf5a3aecbdc44b659b2dec060c2f5c1297ccd7a10cfaf23198861b6c6952299",
 		"current public catalog hash is machine-pinned after full authority recovery was added",
 	);
 });
