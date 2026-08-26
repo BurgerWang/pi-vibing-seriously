@@ -8,6 +8,11 @@ import {
 	commitLatestReviewedDelegationV1,
 	type LocalReviewedCommitServicesV1,
 } from "./local-commit.ts";
+import type {
+	abandonCleanProjectDelegationRepairV1,
+	closeInactiveProjectDelegationBlockerV2,
+	quarantineProjectDelegationAuthorityV1,
+} from "./delegation-project-authority.ts";
 import type { WorkbenchMode } from "./mode-policy.ts";
 import { WORKBENCH_TOOL_METADATA, WORKBENCH_TOOL_PARAMETERS } from "./tool-catalog.ts";
 import { detectActorRole, type ActorFacts } from "./write-authority.ts";
@@ -26,6 +31,9 @@ export interface GitToolController {
 
 export interface LocalCommitToolServices {
 	now(): Date;
+	abandonCleanRepair: typeof abandonCleanProjectDelegationRepairV1;
+	closeInactiveBlocker: typeof closeInactiveProjectDelegationBlockerV2;
+	quarantineUnreadableAuthority: typeof quarantineProjectDelegationAuthorityV1;
 	commitReviewed: typeof commitLatestReviewedDelegationV1;
 	commitServices: LocalReviewedCommitServicesV1;
 	pushCurrent: typeof pushCurrentBranchV1;
@@ -54,13 +62,127 @@ export function registerGitTool(controller: GitToolController): void {
 					details: { ok: false, code: "untrusted_project" },
 				};
 			}
-			if (controller.getMode() !== "DEV" || detectActorRole(controller.getIdentity()) !== "sol-commander") {
+			const identity = controller.getIdentity();
+			const mode = controller.getMode();
+			const recoveryAction = params.action === "close_clean_repair" || params.action === "close_inactive_blocker" ||
+				params.action === "quarantine_unreadable_authority";
+			if ((mode !== "DEV" && !(mode === "VERIFY" && recoveryAction)) || detectActorRole(identity) !== "sol-commander") {
 				return {
-					content: [{ type: "text" as const, text: "workbench_git: permission_denied; Git checkpoint/push requires the approved Sol commander in DEV" }],
+					content: [{ type: "text" as const, text: "workbench_git: permission_denied; authority recovery requires the approved Sol commander in DEV or VERIFY, while checkpoint/push remain DEV-only" }],
 					details: { ok: false, code: "permission_denied" },
 				};
 			}
 			const projectRoot = await controller.projectRootFor(ctx);
+			if (params.action === "close_inactive_blocker") {
+				if ((identity.provider !== "openai" && identity.provider !== "openai-codex") || identity.model !== "gpt-5.6-sol") {
+					return { content: [{ type: "text" as const, text: "workbench_git: permission_denied" }], details: { ok: false, code: "permission_denied" } };
+				}
+				const result = await controller.services.closeInactiveBlocker({
+					project_root: projectRoot,
+					expected_delegation_id: params.delegation_id,
+					now: controller.services.now().toISOString(),
+					exec: controller.exec,
+					closed_by: { provider: identity.provider, model: identity.model },
+				});
+				if (!result.ok) {
+					return {
+						content: [{ type: "text" as const, text: `workbench_git: ${result.code}; Git mutation=NONE; unrelated work preserved` }],
+						details: { ok: false, action: "close_inactive_blocker", code: result.code, ...(result.delegation_id === undefined ? {} : { delegation_id: result.delegation_id }) },
+					};
+				}
+				await controller.reconcileProjectAuthority(projectRoot, controller.services.now().toISOString());
+				await controller.refreshStatus(ctx);
+				return {
+					content: [{ type: "text" as const, text: `workbench_git: inactive blocker closed; delegation=${result.value.delegation_id}; relevant_paths=${result.value.relevant_paths.length}; unrelated work=PRESERVED; Git mutation=NONE; authority=NOT_ACCEPTED${result.remaining_blocker_id === undefined ? "; next_action=continue in this worktree" : "; next_action=close the remaining blocker reported by status"}` }],
+					details: {
+						ok: true,
+						action: "close_inactive_blocker",
+						delegation_id: result.value.delegation_id,
+						relevant_path_count: result.value.relevant_paths.length,
+						closure_hash: result.value.closure_hash,
+						git_mutation: "NONE",
+						authority: "NOT_ACCEPTED",
+						unrelated_work: "PRESERVED",
+						...(result.remaining_blocker_id === undefined ? {} : { remaining_blocker_id: result.remaining_blocker_id }),
+					},
+				};
+			}
+			if (params.action === "quarantine_unreadable_authority") {
+				if ((identity.provider !== "openai" && identity.provider !== "openai-codex") || identity.model !== "gpt-5.6-sol") {
+					return { content: [{ type: "text" as const, text: "workbench_git: permission_denied" }], details: { ok: false, code: "permission_denied" } };
+				}
+				const result = await controller.services.quarantineUnreadableAuthority({
+					project_root: projectRoot,
+					delegation_id: params.delegation_id,
+					now: controller.services.now().toISOString(),
+					quarantined_by: { provider: identity.provider, model: identity.model },
+				});
+				if (!result.ok) {
+					return {
+						content: [{ type: "text" as const, text: `workbench_git: ${result.code}; source authority and Git were not changed` }],
+						details: { ok: false, action: "quarantine_unreadable_authority", code: result.code, ...(result.delegation_id === undefined ? {} : { delegation_id: result.delegation_id }) },
+					};
+				}
+				await controller.reconcileProjectAuthority(projectRoot, controller.services.now().toISOString());
+				await controller.refreshStatus(ctx);
+				return {
+					content: [{ type: "text" as const, text: `workbench_git: unreadable authority quarantined; delegation=${result.value.delegation_id}; inventory_entries=${result.value.inventory_entry_count}; source bytes=PRESERVED; Git mutation=NONE; authority=NOT_ACCEPTED; next_action=continue in this worktree` }],
+					details: {
+						ok: true,
+						action: "quarantine_unreadable_authority",
+						delegation_id: result.value.delegation_id,
+						inventory_entry_count: result.value.inventory_entry_count,
+						quarantine_hash: result.value.quarantine_hash,
+						source_bytes: "PRESERVED",
+						git_mutation: "NONE",
+						authority: "NOT_ACCEPTED",
+					},
+				};
+			}
+			if (params.action === "close_clean_repair") {
+				if ((identity.provider !== "openai" && identity.provider !== "openai-codex") || identity.model !== "gpt-5.6-sol") {
+					return {
+						content: [{ type: "text" as const, text: "workbench_git: permission_denied" }],
+						details: { ok: false, code: "permission_denied" },
+					};
+				}
+				const result = await controller.services.abandonCleanRepair({
+					project_root: projectRoot,
+					now: controller.services.now().toISOString(),
+					exec: controller.exec,
+					abandoned_by: { provider: identity.provider, model: identity.model },
+				});
+				if (!result.ok) {
+					return {
+						content: [{ type: "text" as const, text: `workbench_git: ${result.code}; no Git files or refs were changed` }],
+						details: {
+							ok: false,
+							action: "close_clean_repair",
+							code: result.code,
+							...(result.delegation_id === undefined ? {} : { delegation_id: result.delegation_id }),
+						},
+					};
+				}
+				await controller.reconcileProjectAuthority(projectRoot, controller.services.now().toISOString());
+				await controller.refreshStatus(ctx);
+				return {
+					content: [{
+						type: "text" as const,
+						text: `workbench_git: clean repair closed; delegation=${result.value.delegation_id}; git_head=${result.value.clean_git_head}; Git mutation=NONE; rejected authority=NOT_ACCEPTED; next_action=continue delegation in this worktree`,
+					}],
+					details: {
+						ok: true,
+						action: "close_clean_repair",
+						delegation_id: result.value.delegation_id,
+						git_head: result.value.clean_git_head,
+						workspace_guard_hash: result.value.clean_workspace_guard_hash,
+						abandonment_hash: result.value.abandonment_hash,
+						git_mutation: "NONE",
+						rejected_authority: "NOT_ACCEPTED",
+						next_action: "CONTINUE_DELEGATION_IN_CURRENT_WORKTREE",
+					},
+				};
+			}
 			if (params.action === "push") {
 				const result = await controller.services.pushCurrent({
 					project_root: projectRoot,

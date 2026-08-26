@@ -304,6 +304,62 @@ async function singleRunDir(root: string): Promise<string> {
 // Registered model-tool surface: workbench_run_recipe
 // --------------------------------------------------------------------------
 
+test("workbench_run_recipe missing declaration gives the commander an agent-owned recovery action", async () => {
+	await withTempDir(async (root) => {
+		await setupProject(root, "recipes: []\n");
+		const stub = makeStub();
+		workbenchRuntime(stub);
+		const tool = stub.tools.get("workbench_run_recipe") as unknown as RecipeTool;
+		assert.ok(tool, "workbench_run_recipe registered");
+		const result = await tool.execute("missing-recipe", { recipe: "gate:a5-1" }, undefined, undefined, trustedCtx(root) as never);
+		const text = toolText(result);
+		assert.equal(result.details.ok, false);
+		assert.equal(result.details.error, "recipe_not_found");
+		assert.equal(result.details.requested_recipe, "gate:a5-1");
+		assert.match(text, /workbench_delegate_worker in DEV or VERIFY/);
+		assert.match(text, /workbench_project_inspect with recipe=gate:a5-1/);
+		assert.match(text, /review the config delta/);
+		assert.deepEqual(await runsEntries(root), [], "a missing declaration never creates guessed run authority");
+	});
+});
+
+test("workbench_project_inspect performs an exact recipe lookup beyond the bounded overview", async () => {
+	await withTempDir(async (root) => {
+		const recipes = Array.from({ length: 55 }, (_, index) => [
+			`  - name: recipe-${String(index).padStart(2, "0")}`,
+			"    command: [node, --version]",
+			"    mutation: none",
+		].join("\n"));
+		await setupProject(root, `recipes:\n${recipes.join("\n")}\n`);
+		const stub = makeStub();
+		workbenchRuntime(stub);
+		const tool = stub.tools.get("workbench_project_inspect") as {
+			execute: (id: string, params: { recipe?: string }, signal: unknown, update: unknown, ctx: ExtensionContext) => Promise<{ content: Array<{ type: string; text: string }>; details: Record<string, unknown> }>;
+		};
+		const found = await tool.execute("inspect-exact-found", { recipe: "recipe-54" }, undefined, undefined, trustedCtx(root) as never);
+		assert.equal(found.details.recipe_query, "recipe-54");
+		assert.equal(found.details.recipe_found, true);
+		assert.match(toolText(found), /exact recipe: recipe-54 found=yes/);
+		const missing = await tool.execute("inspect-exact-missing", { recipe: "recipe-99" }, undefined, undefined, trustedCtx(root) as never);
+		assert.equal(missing.details.recipe_found, false);
+		assert.match(toolText(missing), /exact recipe: recipe-99 found=no/);
+	});
+});
+
+test("workbench_run_recipe distinguishes malformed configuration from a missing declaration", async () => {
+	await withTempDir(async (root) => {
+		await setupProject(root, "recipes: [\n");
+		const stub = makeStub();
+		workbenchRuntime(stub);
+		const tool = stub.tools.get("workbench_run_recipe") as unknown as RecipeTool;
+		const result = await tool.execute("invalid-recipe-config", { recipe: "unit" }, undefined, undefined, trustedCtx(root) as never);
+		assert.equal(result.details.error, "config_invalid");
+		assert.equal(result.details.source_path, ".pi/workbench/recipes.yaml");
+		assert.match(toolText(result), /issue_count:/);
+		assert.deepEqual(await runsEntries(root), []);
+	});
+});
+
 test("workbench_run_recipe success summary: status/run id/log paths/TAP totals; raw stdout never inlined; full log on disk", async () => {
 	await withTempDir(async (root) => {
 		await setupProject(root, GREEN_RECIPES);
@@ -449,6 +505,44 @@ test("workbench_run_gate failure summary: gate status/record path, FAIL facts, n
 			const record = await readFile(join(runDir, file), "utf8");
 			assert.ok(record.length > 0, `${file} persisted on disk`);
 		}
+	});
+});
+
+test("workbench_run_gate returns structured recovery for a missing declared recipe", async () => {
+	await withTempDir(async (root) => {
+		await setupProject(root, "recipes: []\n", [
+			"gates:",
+			"  - id: gm",
+			"    title: Missing recipe recovery",
+			"    checks:",
+			'      - { id: gm.1, title: Missing recipe, kind: recipe, recipe: gate:missing }',
+			"",
+		].join("\n"));
+		const stub = makeStub();
+		workbenchRuntime(stub);
+		const tool = stub.tools.get("workbench_run_gate") as unknown as GateTool;
+		const result = await tool.execute("gate-missing-recipe", { gates: "gm" }, undefined, undefined, trustedCtx(root) as never);
+		const recovery = result.details.recovery as Record<string, unknown>;
+		assert.equal(recovery.code, "recipe_not_found");
+		assert.deepEqual(recovery.missing_recipes, ["gate:missing"]);
+		assert.equal(recovery.source_path, ".pi/workbench/recipes.yaml");
+		assert.match(toolText(result), /recovery\s+: recipe_not_found/);
+		assert.match(String(recovery.next_action), /DEV and VERIFY/);
+	});
+});
+
+test("workbench_run_gate preserves a bounded setup error instead of collapsing it to runtime_error", async () => {
+	await withTempDir(async (root) => {
+		await setupProject(root, "recipes: []\n", "gates: [\n");
+		const stub = makeStub();
+		workbenchRuntime(stub);
+		const tool = stub.tools.get("workbench_run_gate") as unknown as GateTool;
+		const result = await tool.execute("gate-invalid-config", { gates: "all" }, undefined, undefined, trustedCtx(root) as never);
+		assert.equal(result.details.error, "gate_config_invalid");
+		assert.equal(result.details.source_path, ".pi/workbench/gates.yaml");
+		assert.match(String(result.details.setup_error), /gates.yaml/);
+		assert.match(toolText(result), /workbench_delegate_worker/);
+		assert.deepEqual(await runsEntries(root), []);
 	});
 });
 

@@ -26,7 +26,6 @@ import {
 	type GitFacts,
 } from "./delegation-ledger.ts";
 import {
-	MAX_PROJECT_DELEGATION_ENTRIES_V2,
 	readDelegationAuthorityObservationV2,
 	readLatestProjectDelegationTransactionV2,
 } from "./delegation-project-authority.ts";
@@ -106,7 +105,6 @@ export async function listLocalCommitCandidateDelegationIdsV1(
 			? { ok: true, value: [] }
 			: { ok: false };
 	}
-	if (entries.length > MAX_PROJECT_DELEGATION_ENTRIES_V2) return { ok: false };
 	const ids: string[] = [];
 	for (const entry of entries) {
 		if (!isValidDelegationId(entry.name)) continue;

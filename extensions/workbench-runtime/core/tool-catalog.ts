@@ -162,7 +162,14 @@ export const WORKBENCH_REVIEW_WORKER_DIFF_V1_PARAMETERS = Type.Object(WORKBENCH_
  * for their execute handlers. Key order here is source order (stable).
  */
 export const WORKBENCH_TOOL_PARAMETERS = {
-	workbench_project_inspect: Type.Object({}),
+	workbench_project_inspect: Type.Object({
+		recipe: Type.Optional(Type.String({
+			description: "Optional exact recipe name lookup; returns an authoritative found/not-found result even when the project has more recipes than the bounded overview can display",
+			minLength: 1,
+			maxLength: 200,
+			pattern: "^[^\\r\\n\\u0000-\\u001f\\u007f]+$",
+		})),
+	}),
 	workbench_run_recipe: Type.Object({
 		recipe: Type.String({ description: "Name of a declared recipe in .pi/workbench/recipes.yaml" }),
 		params: Type.Optional(
@@ -297,6 +304,27 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 		),
 	}),
 	workbench_git: Type.Union([
+		Type.Object({
+			action: Type.Literal("close_clean_repair"),
+		}),
+		Type.Object({
+			action: Type.Literal("close_inactive_blocker"),
+			delegation_id: Type.String({
+				description: "Exact blocker id returned by workbench_delegation_status",
+				minLength: 20,
+				maxLength: 20,
+				pattern: "^\\d{8}-\\d{6}-[A-Za-z0-9]{4}$",
+			}),
+		}),
+		Type.Object({
+			action: Type.Literal("quarantine_unreadable_authority"),
+			delegation_id: Type.String({
+				description: "Exact unreadable or incomplete v2 authority id returned by workbench_delegation_status",
+				minLength: 20,
+				maxLength: 20,
+				pattern: "^\\d{8}-\\d{6}-[A-Za-z0-9]{4}$",
+			}),
+		}),
 		Type.Object({
 			action: Type.Literal("checkpoint"),
 			message: Type.String({
@@ -440,10 +468,10 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 		name: "workbench_project_inspect",
 		label: "Workbench project inspect",
 		description:
-			"Inspect the current project's workbench setup: project root, git state, detected language/package manager, workbench profile, declared recipes, and configuration errors. Never outputs secrets.",
+			"Inspect the current project's workbench setup: project root, git state, detected language/package manager, workbench profile, declared recipes, and configuration errors. Pass recipe for an exact found/not-found lookup that is never hidden by bounded overview omissions. Never outputs secrets.",
 		promptSnippet: "Inspect workbench project configuration (root, git, stack, profile, recipes, config errors)",
 		promptGuidelines: [
-			"Use workbench_project_inspect before running or designing recipes to learn the project profile and available recipe names.",
+			"Use workbench_project_inspect before running or designing recipes. When checking one name, pass recipe for an exact lookup instead of relying on the bounded overview.",
 		],
 	},
 	workbench_run_recipe: {
@@ -455,6 +483,7 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 		promptGuidelines: [
 			"Use workbench_run_recipe instead of bash for project commands that are declared as recipes — the model must not improvise shell commands in VERIFY mode.",
 			"Only pass parameters declared in the recipe's params schema.",
+			"recipe_not_found and config_invalid return a structured agent-owned next action. Use the narrow review-gated recipes.yaml maintenance delegation in DEV or VERIFY; do not ask the user to edit the file or change worktrees.",
 		],
 	},
 	workbench_read_run: {
@@ -480,6 +509,7 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 			"Use workbench_list_gates or /q-gates to see the gates available for the current profile.",
 			"manual_evidence on this model-callable tool is advisory only and never creates human authority; ask the user to invoke /q-gate with manual:<check-id>=<evidence> for formal human checks.",
 			"Phase 3B: pass preflight:true (or /q-gate <selector> --preflight) to check required manual-evidence readiness READ-ONLY before a formal run — it never creates a run, executes a recipe, assigns a gate status or returns a run id; omit it (or false) to run the gate formally.",
+			"Gate setup, selector, missing-recipe, and invalid-config failures return structured recovery facts. recipes.yaml/gates.yaml maintenance may be delegated in VERIFY only on those exact paths and remains blocked until semantic review completes.",
 		],
 	},
 	workbench_read_gate: {
@@ -516,7 +546,7 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 	workbench_delegate_worker: {
 		...WORKBENCH_DELEGATE_WORKER_V1_METADATA,
 		description:
-			"Run one bounded delegation-v2 task on pinned GPT-5.6 Luna xhigh. Implementation may write only approved paths; diagnosis is strictly read-only. New contracts are canonicalized, verification names only declared mutation:none recipes, and contracts above 12 KiB require explicit extended budget plus extended_reason; 64 KiB is absolute. The worker runs in a fresh no-session process and cannot delegate, use free-form bash, or run final Gates. Immutable transaction, ChangeSet, journal, report and usage facts are retained; ambiguous authority fails closed. Exact repair_of can consume strict terminal failure authority or a PENDING_REVIEW implementation with an immutable Sol REPAIR decision. Its lineage preserves rejected W/D paths, exact scope, root plan identity, and the latest continuation decision while a project lock prevents sibling starts. It never resumes a session or imports prior prose, and stays Gate-blocking until the corrected implementation receives strict semantic acceptance. Sol retains architecture, semantic review, final verification, Gates and verdict authority.",
+			"Run one bounded delegation-v2 task on pinned GPT-5.6 Luna xhigh. Implementation may write only approved paths; diagnosis is strictly read-only. New contracts are canonicalized, verification names only declared mutation:none recipes, and contracts above 12 KiB require explicit extended budget plus extended_reason; 64 KiB is absolute. The worker runs in a fresh no-session process and cannot delegate, use free-form bash, or run final Gates. Immutable transaction, ChangeSet, journal, report and usage facts are retained; ambiguous authority fails closed. Exact repair_of can consume strict terminal failure authority or a PENDING_REVIEW implementation with an immutable Sol REPAIR decision. Its lineage preserves rejected W/D paths, exact scope, root plan identity, and the latest continuation decision while a project lock prevents sibling starts. In VERIFY, only exact recipes.yaml/gates.yaml maintenance with verification omitted is admitted, and its delta still requires normal semantic review before Gate execution resumes. It never resumes a session or imports prior prose, and stays Gate-blocking until the corrected implementation receives strict semantic acceptance. Sol retains architecture, semantic review, final verification, Gates and verdict authority.",
 		promptSnippet:
 			"Run one bounded Luna xhigh implementation or read-only diagnosis under an immutable contract",
 		promptGuidelines: [
@@ -541,10 +571,11 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 	workbench_delegation_status: {
 		...WORKBENCH_DELEGATION_STATUS_V1_METADATA,
 		description:
-				"Show the write-authority and delegation-review state: actor, write policy, lease status, latest delegation, review status (PENDING_REVIEW/REVIEWED/STALE), current and reviewed hashes, blocked writes, latest verdict, and durable semantic-repair state. REPAIR_REQUIRED reports one exact repair_of action only while its bound workspace is fresh; active, recovery, forked, missing-continuation, or corrupt lineages remain visibly blocked. New tagged v2 uses the W/D/S relevance binding; historical untagged v2/v1 retains the complete diff binding. Baseline unrelated dirt and recognized workbench artifacts do not stale tagged v2, while Git HEAD, W/D/S, unknown-origin, or repair-authority drift fails closed. Emits an explicit CONTEXT RISK line when the latest handoff is too large for safe compaction.",
+				"Show the write-authority and delegation-review state: actor, write policy, lease status, latest delegation, review status, current and reviewed hashes, blocked writes, latest verdict, and durable repair state. REPAIR_REQUIRED reports exact repair_of only while fresh. An inactive discarded blocker reports close_inactive_blocker, which requires only its exact changed/carried paths clean, preserves unrelated work, writes immutable non-acceptance, and is available in DEV or VERIFY. An incomplete or unreadable ownerless v2 envelope reports quarantine_unreadable_authority; its source bytes remain in place, and later bytes re-block until the new stable inventory is explicitly quarantined. Active execution and ambiguous/corrupt recovery remain fail-closed. Tagged v2 uses W/D/S relevance; historical v2/v1 retains complete-diff binding. Emits an explicit CONTEXT RISK line when the latest handoff is too large for safe context compaction.",
 		promptGuidelines: [
 			"Successful non-zero implementation delivery returns a provisional scope/integrity packet and stays PENDING_REVIEW; after inspecting a complete unchanged packet, use workbench_review_worker_diff for hash-bound Sol ACCEPT. Use status only for diagnostics or recovery.",
 			"If a complete packet is wrong, publish semantic_decision=REPAIR with the exact bound hash and a bounded reason, then follow only the exact repair_of shown by status. REPAIR and every unresolved lineage remain Gate-blocking.",
+			"If rejected changes were deliberately discarded, use the exact close_inactive_blocker action reported by status. It checks only the delegation's changed/carried paths, preserves unrelated work, never accepts rejected code, and must not be replaced with a new worktree.",
 			"When STALE is backed by strict v2 FINAL/PASS plus explicit Sol semantic authority, follow the reported successor action instead of retrying immutable review; a mechanical FINAL/PASS remains blocked and VERIFY stays blocked until a valid successor is reviewed.",
 			"In the TUI, WF:LOCKED means routine writes belong to Luna, WF:LEASE means a bounded temporary Sol write exception is active, and WF:REVIEW means recovery review is outstanding.",
 		],
@@ -562,17 +593,44 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 	},
 	workbench_git: {
 		name: "workbench_git",
-		label: "Workbench Git checkpoint or push",
+		label: "Workbench Git recovery, checkpoint or push",
 		description:
-			"Complete bounded Git work without a shell. checkpoint batches every still-present finalized semantic ACCEPT slice whose exact sealed path bytes remain compatible, even when unrelated worktree/index state or path-disjoint descendant commits exist; it preserves unrelated staged entries and verifies the commit. push requires an exact expected current HEAD, pushes only HEAD to the same named branch on an existing remote with ordinary non-force semantics, then verifies the remote ref. Available only to the approved Sol commander in DEV. It cannot reset, clean, stash, amend, force-push, delete refs, switch branches, accept checkpoint paths, or bypass semantic review.",
-		promptSnippet: "Checkpoint all compatible reviewed paths locally, or push an explicitly authorized exact current HEAD without force",
+			"Complete bounded recovery and Git work without a shell. close_inactive_blocker writes immutable non-acceptance for the exact newest inactive blocker after only its changed/carried paths are clean; unrelated work is preserved. quarantine_unreadable_authority binds the complete bounded bytes of an ownerless unreadable v2 envelope without moving them; later changes re-block until explicitly quarantined again. close_clean_repair remains a strict-clean compatibility action. All three recovery actions are Sol-only in DEV or VERIFY and never change Git. checkpoint batches compatible finalized semantic ACCEPT slices and preserves unrelated staged entries. push requires an exact current HEAD and ordinary non-force semantics. Checkpoint/push remain Sol-only DEV. No action can reset, clean, stash, amend, force-push, delete refs, switch branches, accept arbitrary paths, or bypass semantic review.",
+		promptSnippet: "Recover an inactive or unreadable delegation without changing Git, checkpoint reviewed paths, or push an authorized exact HEAD",
 		promptGuidelines: [
+			"When status reports an inactive discarded blocker, call close_inactive_blocker with its exact id. When it reports incomplete/unreadable ownerless authority, call quarantine_unreadable_authority with its exact id. Both work in DEV or VERIFY, preserve source/Git bytes, and never accept code.",
 			"After non-zero implementation diffs have complete semantic ACCEPT authority and relevant checks are done, call action=checkpoint once with a concise message. The runtime batches every compatible reviewed slice and preserves unrelated dirty or staged work.",
 			"Call action=push only after the user explicitly requests publication and the exact current HEAD is known. Pass that hash as expected_head; ordinary push can fail on non-fast-forward and never permits force or ref deletion.",
 			"A checkpoint or push never grants review, release, Gate, Formal, or production authority. Remaining changes after checkpoint need review or belong to unrelated work; do not loop blindly.",
 		],
 	},
 };
+
+/** Frozen v1 inspect metadata/schema; exact lookup is a current additive field. */
+const WORKBENCH_PROJECT_INSPECT_V1_METADATA = Object.freeze({
+	name: "workbench_project_inspect",
+	label: "Workbench project inspect",
+	description:
+		"Inspect the current project's workbench setup: project root, git state, detected language/package manager, workbench profile, declared recipes, and configuration errors. Never outputs secrets.",
+	promptSnippet: "Inspect workbench project configuration (root, git, stack, profile, recipes, config errors)",
+	promptGuidelines: Object.freeze([
+		"Use workbench_project_inspect before running or designing recipes to learn the project profile and available recipe names.",
+	]),
+});
+
+const WORKBENCH_PROJECT_INSPECT_V1_PARAMETERS = Type.Object({});
+
+const WORKBENCH_RUN_RECIPE_V1_METADATA = Object.freeze({
+	name: "workbench_run_recipe",
+	label: "Workbench run recipe",
+	description:
+		"Run a declared recipe from .pi/workbench/recipes.yaml by name with schema-approved parameters. Only declared recipes run — arbitrary commands are never accepted. Full output is written to the run directory; a truncated summary is returned. Use workbench_project_inspect to list recipes.",
+	promptSnippet: "Run a declared workbench recipe by name (controlled execution)",
+	promptGuidelines: Object.freeze([
+		"Use workbench_run_recipe instead of bash for project commands that are declared as recipes — the model must not improvise shell commands in VERIFY mode.",
+		"Only pass parameters declared in the recipe's params schema.",
+	]),
+});
 
 /** Frozen v1 Gate-tool metadata and schema; repaired human provenance must not rewrite history. */
 const WORKBENCH_RUN_GATE_V1_METADATA = Object.freeze({
@@ -620,7 +678,17 @@ export function workbenchToolMetadataOrdered(): readonly (WorkbenchToolMeta & { 
 /** Frozen governance-v1 catalog view; current additive fields never rewrite history. */
 export function workbenchToolMetadataV1Ordered(): readonly (WorkbenchToolMeta & { parameters: unknown })[] {
 	return WORKBENCH_TOOL_NAMES_V1.map((name) => ({
-		...(name === "workbench_delegate_worker"
+		...(name === "workbench_project_inspect"
+			? {
+				...WORKBENCH_PROJECT_INSPECT_V1_METADATA,
+				promptGuidelines: [...WORKBENCH_PROJECT_INSPECT_V1_METADATA.promptGuidelines],
+			}
+			: name === "workbench_run_recipe"
+				? {
+					...WORKBENCH_RUN_RECIPE_V1_METADATA,
+					promptGuidelines: [...WORKBENCH_RUN_RECIPE_V1_METADATA.promptGuidelines],
+				}
+			: name === "workbench_delegate_worker"
 			? {
 				...WORKBENCH_DELEGATE_WORKER_V1_METADATA,
 				promptGuidelines: [...WORKBENCH_DELEGATE_WORKER_V1_METADATA.promptGuidelines],
@@ -646,7 +714,9 @@ export function workbenchToolMetadataV1Ordered(): readonly (WorkbenchToolMeta & 
 								promptGuidelines: [...WORKBENCH_LIST_GATES_V1_METADATA.promptGuidelines],
 							}
 							: (WORKBENCH_TOOL_METADATA[name] as WorkbenchToolMeta)),
-		parameters: name === "workbench_delegate_worker"
+		parameters: name === "workbench_project_inspect"
+			? WORKBENCH_PROJECT_INSPECT_V1_PARAMETERS
+			: name === "workbench_delegate_worker"
 			? WORKBENCH_DELEGATE_WORKER_V1_PARAMETERS
 			: name === "workbench_review_worker_diff"
 				? WORKBENCH_REVIEW_WORKER_DIFF_V1_PARAMETERS

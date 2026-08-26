@@ -168,6 +168,9 @@ export interface InspectToolDetails {
 	stacks: StringListDetails;
 	profile: string | undefined;
 	recipes: StringListDetails;
+	/** Exact lookup result when workbench_project_inspect receives recipe. */
+	recipe_query?: string;
+	recipe_found?: boolean;
 	/**
 	 * Phase 2B: recipe name -> the recipe's exact declared validation
 	 * components. The FULL deterministic map — every recipe is a key,
@@ -317,6 +320,7 @@ export function renderInspectLines(d: InspectToolDetails, expanded: boolean): st
 		...configFiles.items.map((item) => `  - ${boundedBytes(item, 256)}`),
 		`config errors (${errors.original}; shown=${errors.shown}; omitted=${errors.omitted}):`,
 		...(errors.items.length > 0 ? errors.items.map((item) => `  - ${boundedBytes(item, 512)}`) : ["  (none)"]),
+		...(d.recipe_query === undefined ? [] : [`exact recipe: ${boundedBytes(d.recipe_query, 200)} found=${d.recipe_found === true ? "yes" : "no"}`]),
 		`recipes (${recipes.original}; shown=${recipes.shown}; omitted=${recipes.omitted}):`,
 		...(recipes.items.length > 0 ? recipes.items.map((item) => `  - ${boundedBytes(item, 256)}`) : ["  (none)"]),
 		...coverageLines,

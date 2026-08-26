@@ -114,6 +114,21 @@ test("failed reconcile append adopts a dirty blocking mirror and next call heals
 	assert.equal(controller.isStrictMirrorDirty(), false);
 });
 
+test("reconcile null durably clears an obsolete blocking session mirror", async () => {
+	const appended: unknown[] = [];
+	const controller = createDelegationSessionController({
+		exec: async () => ({ code: 0, stdout: "", stderr: "", killed: false }),
+		appendEntry: (_customType, data) => { appended.push(data); },
+		onStateChanged: () => {},
+	}, services({ reconcileProjectAuthority: async () => ({ ok: true, state: null }) }));
+	controller.setState(PENDING);
+
+	assert.equal(await controller.reconcileProjectAuthority("/project", PENDING.updatedAt), true);
+	assert.equal(controller.getState().latestId, undefined);
+	assert.equal(controller.getState().status, "PENDING_REVIEW", "empty state has no latest id and therefore does not block");
+	assert.equal(appended.length, 1, "the cleared mirror is persisted for reload/compaction continuity");
+});
+
 test("current binding and terminal review projection use only injected services", async () => {
 	const calls: unknown[] = [];
 	const controller = createDelegationSessionController({

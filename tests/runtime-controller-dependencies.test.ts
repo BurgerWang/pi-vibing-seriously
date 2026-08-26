@@ -239,6 +239,115 @@ test("Git controller pushes only the exact authorized HEAD without semantic reco
 	assert.equal(reconciliations, 0);
 });
 
+test("Git controller closes one clean discarded repair in VERIFY without mutating Git", async () => {
+	let reconciliations = 0;
+	let refreshed = 0;
+	const controller = {
+		services: {
+			now: () => new Date("2026-08-25T12:00:00.000Z"),
+			abandonCleanRepair: async (input: { abandoned_by: unknown }) => ({
+				ok: true as const,
+				value: {
+					delegation_id: "20260825-120000-abcd",
+					clean_git_head: "c".repeat(40),
+					clean_workspace_guard_hash: "d".repeat(64),
+					abandonment_hash: "e".repeat(64),
+					abandoned_by: input.abandoned_by,
+				},
+			}),
+			commitReviewed: async () => { throw new Error("must not checkpoint"); },
+			commitServices: {} as never,
+			pushCurrent: async () => { throw new Error("must not push"); },
+		},
+		exec: async () => ({ code: 0, stdout: "", stderr: "", killed: false }),
+		trustedOrError: () => undefined,
+		projectRootFor: async () => "/project",
+		getMode: () => "VERIFY" as const,
+		getIdentity: () => ({ provider: "openai-codex", model: "gpt-5.6-sol" }),
+		reconcileProjectAuthority: async () => { reconciliations += 1; return true; },
+		refreshStatus: async () => { refreshed += 1; },
+	} as unknown as Omit<GitToolController, "pi">;
+	const tool = captureRegistration(registerGitTool, controller);
+	const result = await tool.execute("close-1", { action: "close_clean_repair" }, undefined, undefined, context());
+
+	assert.equal(result.details.ok, true);
+	assert.equal(result.details.action, "close_clean_repair");
+	assert.equal(result.details.git_mutation, "NONE");
+	assert.equal(result.details.rejected_authority, "NOT_ACCEPTED");
+	assert.equal(result.details.next_action, "CONTINUE_DELEGATION_IN_CURRENT_WORKTREE");
+	assert.equal(reconciliations, 1);
+	assert.equal(refreshed, 1);
+});
+
+test("Git controller exposes only non-acceptance recovery in VERIFY", async () => {
+	let inactiveCalls = 0;
+	let quarantineCalls = 0;
+	let commitCalls = 0;
+	const controller = {
+		services: {
+			now: () => new Date("2026-08-25T12:00:00.000Z"),
+			closeInactiveBlocker: async () => {
+				inactiveCalls += 1;
+				return {
+					ok: true as const,
+					value: {
+						delegation_id: "20260825-120000-abcd",
+						relevant_paths: ["src/a.ts"],
+						closure_hash: "a".repeat(64),
+					},
+				};
+			},
+			quarantineUnreadableAuthority: async () => {
+				quarantineCalls += 1;
+				return {
+					ok: true as const,
+					value: {
+						delegation_id: "20260825-120001-efgh",
+						inventory_entry_count: 3,
+						quarantine_hash: "b".repeat(64),
+					},
+				};
+			},
+			commitReviewed: async () => { commitCalls += 1; throw new Error("must not checkpoint"); },
+			commitServices: {} as never,
+			pushCurrent: async () => { throw new Error("must not push"); },
+		},
+		exec: async () => ({ code: 0, stdout: "", stderr: "", killed: false }),
+		trustedOrError: () => undefined,
+		projectRootFor: async () => "/project",
+		getMode: () => "VERIFY" as const,
+		getIdentity: () => ({ provider: "openai-codex", model: "gpt-5.6-sol" }),
+		reconcileProjectAuthority: async () => true,
+		refreshStatus: async () => {},
+	} as unknown as Omit<GitToolController, "pi">;
+	const tool = captureRegistration(registerGitTool, controller);
+
+	const inactive = await tool.execute("close-verify", {
+		action: "close_inactive_blocker",
+		delegation_id: "20260825-120000-abcd",
+	}, undefined, undefined, context());
+	assert.equal(inactive.details.ok, true);
+	assert.equal(inactive.details.git_mutation, "NONE");
+	assert.equal(inactive.details.unrelated_work, "PRESERVED");
+
+	const quarantine = await tool.execute("quarantine-verify", {
+		action: "quarantine_unreadable_authority",
+		delegation_id: "20260825-120001-efgh",
+	}, undefined, undefined, context());
+	assert.equal(quarantine.details.ok, true);
+	assert.equal(quarantine.details.source_bytes, "PRESERVED");
+	assert.equal(quarantine.details.authority, "NOT_ACCEPTED");
+
+	const checkpoint = await tool.execute("checkpoint-verify", {
+		action: "checkpoint",
+		message: "must remain denied",
+	}, undefined, undefined, context());
+	assert.equal(checkpoint.details.code, "permission_denied");
+	assert.equal(inactiveCalls, 1);
+	assert.equal(quarantineCalls, 1);
+	assert.equal(commitCalls, 0);
+});
+
 test("review controller refuses corrupt v2 authority and never falls back to legacy", async () => {
 	let legacyCalls = 0;
 	const fixed = new Date("2026-08-21T01:02:03.000Z");
@@ -575,10 +684,13 @@ test("delegate controller preflights recipe references before authority work and
 			extended_reason: "Cross-module evidence is intentionally retained.",
 		};
 
-		await assert.rejects(
-			tool.execute("delegate-preflight", params, undefined, undefined, context()),
-			/verification recipe_mutates; recipe=unit/,
-		);
+		const refused = await tool.execute("delegate-preflight", params, undefined, undefined, context()) as {
+			content: Array<{ text: string }>;
+			details: Record<string, unknown>;
+		};
+		assert.equal(refused.details.error, "verification_recipe_mutates");
+		assert.equal(refused.details.recipe, "unit");
+		assert.match(refused.content.map((entry) => entry.text).join("\n"), /correct the verification contract/);
 		assert.equal(reconcileCalls, 0, "invalid requested recipe stops before authority reconciliation");
 		assert.equal(executionCalls, 0, "invalid requested recipe stops before transaction execution");
 
@@ -756,6 +868,7 @@ test("production controller service bundle is immutable and complete", () => {
 	assert.equal(typeof RUNTIME_CONTROLLER_SERVICES.review.reviewV2, "function");
 	assert.equal(typeof RUNTIME_CONTROLLER_SERVICES.compare.compareRuns, "function");
 	assert.equal(typeof RUNTIME_CONTROLLER_SERVICES.recovery.recoverReceipt, "function");
+	assert.equal(typeof RUNTIME_CONTROLLER_SERVICES.git.abandonCleanRepair, "function");
 	assert.equal(typeof RUNTIME_CONTROLLER_SERVICES.git.commitReviewed, "function");
 	assert.equal(typeof RUNTIME_CONTROLLER_SERVICES.git.pushCurrent, "function");
 });

@@ -80,7 +80,10 @@ test("binding conflict and project-chain invalidity never advertise an executabl
 		binding: { status: "conflict", hash: "e".repeat(64), kind: "changeset-relevance-v2", code: "binding_conflict" },
 	});
 	assert.equal(conflict.kind, "repair_required");
-	assert.doesNotMatch(delegationNextActionTextV1(state, conflict) ?? "", /start the exact semantic repair/);
+	const conflictAction = delegationNextActionTextV1(state, conflict) ?? "";
+	assert.doesNotMatch(conflictAction, /start the exact semantic repair/);
+	assert.match(conflictAction, new RegExp(`workbench_git action=close_inactive_blocker delegation_id=${ID}`));
+	assert.match(conflictAction, /no new worktree is required/);
 
 	let capsuleReads = 0;
 	const invalid = await readDelegationRepairStatusV1("/tmp/project", state, (async () => {

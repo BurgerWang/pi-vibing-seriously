@@ -1897,7 +1897,6 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		bindTrustedIngressAuthority: transientState.bindTrustedIngressAuthority,
 		rememberTrustedIngressAuthority: transientState.rememberTrustedIngressAuthority,
 	});
-
 	registerDelegateTool({
 		pi,
 		services: RUNTIME_CONTROLLER_SERVICES.delegate,
@@ -1905,6 +1904,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		secrets,
 		trustedOrError,
 		projectRootFor,
+		getMode: () => mode,
 		reconcileProjectAuthority: delegationSession.reconcileProjectAuthority,
 		getProjectAuthorityBlockReason: delegationSession.projectAuthorityBlockReason,
 		collectCurrentDelegationBinding: delegationSession.collectCurrentBinding,

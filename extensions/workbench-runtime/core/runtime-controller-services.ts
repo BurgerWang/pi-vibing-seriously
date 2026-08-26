@@ -9,7 +9,10 @@ import { reviewDelegationV2 } from "./delegation-review-v2.ts";
 import { readDelegationCommittedGenerationV2, readDelegationTransactionV2 } from "./delegation-transaction-storage.ts";
 import { reviewDelegation } from "./diff-review.ts";
 import {
+	abandonCleanProjectDelegationRepairV1,
+	closeInactiveProjectDelegationBlockerV2,
 	collectCurrentDelegationBindingV2,
+	quarantineProjectDelegationAuthorityV1,
 	readRecoverableUnpublishedDelegationV2,
 	reconcileProjectDelegationAuthorityV2,
 } from "./delegation-project-authority.ts";
@@ -50,6 +53,9 @@ const review = Object.freeze({
 const recovery = Object.freeze({ recoverReceipt }) satisfies RecoveryToolServices;
 const git = Object.freeze({
 	now,
+	abandonCleanRepair: abandonCleanProjectDelegationRepairV1,
+	closeInactiveBlocker: closeInactiveProjectDelegationBlockerV2,
+	quarantineUnreadableAuthority: quarantineProjectDelegationAuthorityV1,
 	commitReviewed: commitLatestReviewedDelegationV1,
 	commitServices: LOCAL_REVIEWED_COMMIT_SERVICES_V1,
 	pushCurrent: pushCurrentBranchV1,

@@ -27,6 +27,19 @@ import {
 	type DelegationSemanticRepairDecisionV1,
 	type DelegationTransactionStorageErrorCode,
 } from "./delegation-transaction-storage.ts";
+import {
+	publishDelegationCleanRepairAbandonmentV1,
+	readDelegationCleanRepairAbandonmentV1,
+	type DelegationCleanRepairAbandonmentV1,
+} from "./delegation-repair-abandonment.ts";
+import {
+	publishDelegationAuthorityQuarantineV1,
+	publishDelegationInactiveBlockerClosureV2,
+	readDelegationAuthorityQuarantineV1,
+	readDelegationInactiveBlockerClosureV2,
+	type DelegationAuthorityQuarantineV1,
+	type DelegationInactiveBlockerClosureV2,
+} from "./delegation-authority-closure.ts";
 import { exactDelegationRepairAllowedPathsV1, type DelegationRepairLineageV1, type DelegationTransactionRecord } from "./delegation-transaction.ts";
 import { DELEGATION_WORKSPACE_DIFF_IDENTITY_KIND_V2 } from "./delegation-workspace-v2.ts";
 import {
@@ -48,18 +61,28 @@ import {
 	computeReviewRelevanceConflictHashV2,
 	REVIEW_RELEVANCE_KIND_V2,
 } from "./review-relevance-v2.ts";
-import { validateWorkspaceGuard, type WorkspaceGuardRecord } from "./workspace-guard.ts";
+import { collectWorkspaceGuard, validateWorkspaceGuard, type WorkspaceGuardRecord } from "./workspace-guard.ts";
 import { readWorkerWriteJournal, type WorkerWriteJournalRecord } from "./write-journal.ts";
 import { collectHistoricalSemanticMigration } from "./historical-semantic-migration.ts";
 import { planReferenceHash } from "./plan-reference.ts";
+import { acquireProjectDelegationStartLockV1, releaseProjectDelegationStartLockV1 } from "./delegation-start-lock.ts";
 
-/** Bound discovery work so a hostile artifacts directory cannot stall startup. */
+/**
+ * Legacy compatibility constant retained for downstream imports. Discovery no
+ * longer turns this threshold into a permanent project blocker: a trusted
+ * project's complete history is audited, while individual records and files
+ * remain strictly size-bounded.
+ */
 export const MAX_PROJECT_DELEGATION_ENTRIES_V2 = 10_000 as const;
 
 export type ProjectDelegationAuthorityErrorCodeV2 =
 	| "invalid_project_authority"
 	| "storage_failure"
 	| "too_many_delegations";
+
+export type ProjectDelegationAuthorityCauseV2 = DelegationTransactionStorageErrorCode
+	| "authority_quarantine_invalid"
+	| "authority_not_quarantinable";
 
 export type LatestProjectDelegationTransactionV2Result =
 	| { ok: true; value: DelegationTransactionRecord | null }
@@ -68,7 +91,7 @@ export type LatestProjectDelegationTransactionV2Result =
 		error: {
 			code: ProjectDelegationAuthorityErrorCodeV2;
 			delegation_id?: string;
-			cause?: DelegationTransactionStorageErrorCode;
+			cause?: ProjectDelegationAuthorityCauseV2;
 		};
 	};
 
@@ -129,6 +152,22 @@ export type ReconcileProjectDelegationAuthorityV2Result =
 	| { ok: false; issue: ProjectDelegationAuthorityIssueV2 }
 	| { ok: true; state: DelegationState | null };
 
+export type AbandonCleanProjectDelegationRepairV1Result =
+	| { ok: true; value: DelegationCleanRepairAbandonmentV1 }
+	| { ok: false; code: string; delegation_id?: string };
+
+export type CloseInactiveProjectDelegationBlockerV2Result =
+	| { ok: true; value: DelegationInactiveBlockerClosureV2; remaining_blocker_id?: string }
+	| { ok: false; code: string; delegation_id?: string };
+
+export type QuarantineProjectDelegationAuthorityV1Result =
+	| { ok: true; value: DelegationAuthorityQuarantineV1 }
+	| { ok: false; code: string; delegation_id?: string };
+
+export type ProjectDelegationBlockerV2Result =
+	| { ok: true; value: DelegationTransactionRecord | null }
+	| { ok: false; issue: ProjectDelegationAuthorityIssueV2 };
+
 export type RecoverableUnpublishedDelegationV2Result =
 	| {
 		ok: true;
@@ -154,7 +193,7 @@ const RECOVERABLE_ARTIFACT_FAILURE_REASONS = new Set([
 function failure(
 	code: ProjectDelegationAuthorityErrorCodeV2,
 	delegationId?: string,
-	cause?: DelegationTransactionStorageErrorCode,
+	cause?: ProjectDelegationAuthorityCauseV2,
 ): LatestProjectDelegationTransactionV2Result {
 	return {
 		ok: false,
@@ -168,6 +207,23 @@ function failure(
 
 function descendingAscii(left: string, right: string): number {
 	return left === right ? 0 : left < right ? 1 : -1;
+}
+
+async function authorityIsQuarantinedV1(
+	projectRoot: string,
+	delegationId: string,
+): Promise<{ ok: true; value: boolean } | { ok: false; issue: ProjectDelegationAuthorityIssueV2 }> {
+	const quarantine = await readDelegationAuthorityQuarantineV1(projectRoot, delegationId);
+	if (!quarantine.ok) {
+		return {
+			ok: false,
+			issue: {
+				code: quarantine.error.code === "invalid_record" ? "authority_quarantine_invalid" : quarantine.error.code,
+				delegationId,
+			},
+		};
+	}
+	return { ok: true, value: quarantine.value !== undefined };
 }
 
 function repairObservation(
@@ -222,7 +278,6 @@ export async function readLatestProjectDelegationTransactionV2(
 		return failure("storage_failure");
 	}
 
-	if (entries.length > MAX_PROJECT_DELEGATION_ENTRIES_V2) return failure("too_many_delegations");
 	const candidates: string[] = [];
 	for (const entry of entries) {
 		if (!isValidDelegationId(entry.name)) continue;
@@ -259,9 +314,16 @@ export async function readLatestProjectDelegationTransactionV2(
 				found.push(transaction.value);
 				continue;
 			}
-			if (transaction.error.code !== "not_found") {
-				return failure("invalid_project_authority", delegationId, transaction.error.code);
+			const quarantine = await authorityIsQuarantinedV1(projectRoot, delegationId);
+			if (!quarantine.ok) {
+				const cause: ProjectDelegationAuthorityCauseV2 = quarantine.issue.code === "authority_quarantine_invalid"
+					? "authority_quarantine_invalid"
+					: quarantine.issue.code === "not_recoverable" ? "authority_not_quarantinable"
+						: quarantine.issue.code === "storage_failure" ? "storage_failure" : "invalid_record";
+				return failure("invalid_project_authority", delegationId, cause);
 			}
+			if (quarantine.value) continue;
+			if (transaction.error.code !== "not_found") return failure("invalid_project_authority", delegationId, transaction.error.code);
 		}
 		if (found.length > 0) {
 			found.sort((left, right) => {
@@ -424,6 +486,9 @@ async function isStrictNonBlockingUnrelatedTransactionV2(
 	projectRoot: string,
 	transaction: DelegationTransactionRecord,
 ): Promise<boolean> {
+	const closed = await readDelegationInactiveBlockerClosureV2(projectRoot, transaction);
+	if (!closed.ok) return false;
+	if (closed.value !== undefined) return true;
 	if (transaction.repair_lineage !== undefined) return false;
 	if (transaction.status === "ABORTED") return true;
 	if (transaction.status === "FINISHED") {
@@ -467,9 +532,6 @@ export async function readProjectDelegationRepairClosureV1(
 			? { ok: true, unresolvedTipId: null, rootCount: 0, lineageCount: 0 }
 			: { ok: false, issue: { code: "storage_failure" } };
 	}
-	if (entries.length > MAX_PROJECT_DELEGATION_ENTRIES_V2) {
-		return { ok: false, issue: { code: "too_many_delegations" } };
-	}
 	const transactions = new Map<string, DelegationTransactionRecord>();
 	for (const entry of entries) {
 		if (!isValidDelegationId(entry.name)) continue;
@@ -481,9 +543,13 @@ export async function readProjectDelegationRepairClosureV1(
 		else if (transaction.ok) {
 			return { ok: false, issue: { code: "repair_lineage_identity_mismatch", delegationId: entry.name } };
 		}
-		else if (transaction.error.code !== "not_found") {
-			return { ok: false, issue: { code: transaction.error.code, delegationId: entry.name } };
-		} else {
+		else {
+			const quarantine = await authorityIsQuarantinedV1(projectRoot, entry.name);
+			if (!quarantine.ok) return { ok: false, issue: quarantine.issue };
+			if (quarantine.value) continue;
+			if (transaction.error.code !== "not_found") {
+				return { ok: false, issue: { code: transaction.error.code, delegationId: entry.name } };
+			}
 			try {
 				const v2 = await lstat(join(root, entry.name, "v2"));
 				if (v2.isDirectory() || v2.isFile() || v2.isSymbolicLink()) {
@@ -620,10 +686,35 @@ export async function readProjectDelegationRepairClosureV1(
 			if (child === undefined) return { ok: false, issue: { code: "repair_lineage_edge_invalid", delegationId: next } };
 			current = child;
 		}
-		let closed = false;
+		const rootDecision = decisions.get(rootTransaction.delegation_id);
+		if (rootDecision === undefined) {
+			return { ok: false, issue: { code: "repair_lineage_root_invalid", delegationId: rootTransaction.delegation_id } };
+		}
+		const abandonment = await readDelegationCleanRepairAbandonmentV1(projectRoot, current, rootDecision);
+		if (!abandonment.ok) {
+			return {
+				ok: false,
+				issue: {
+					code: abandonment.error.code === "invalid_record" ? "repair_abandonment_invalid" : abandonment.error.code,
+					delegationId: current.delegation_id,
+				},
+			};
+		}
+		let closed = abandonment.value !== undefined;
+		const inactiveClosure = await readDelegationInactiveBlockerClosureV2(projectRoot, current);
+		if (!inactiveClosure.ok) {
+			return {
+				ok: false,
+				issue: {
+					code: inactiveClosure.error.code === "invalid_record" ? "blocker_closure_invalid" : inactiveClosure.error.code,
+					delegationId: current.delegation_id,
+				},
+			};
+		}
+		closed ||= inactiveClosure.value !== undefined;
 		if (current.repair_lineage !== undefined && current.status === "REVIEWED") {
 			const review = await readDelegationReviewV2(projectRoot, current.delegation_id);
-			closed = review.ok && hasDelegationSemanticReviewAuthorityV2(review.value);
+			closed ||= review.ok && hasDelegationSemanticReviewAuthorityV2(review.value);
 		}
 		if (!closed) unresolved.push(current.delegation_id);
 	}
@@ -657,6 +748,85 @@ export async function readProjectDelegationRepairClosureV1(
 		rootCount: roots.size,
 		lineageCount: lineaged.size,
 	};
+}
+
+/**
+ * Return the newest unresolved project blocker, including ordinary failed or
+ * pending transactions that are outside a semantic-repair chain. A valid
+ * non-acceptance closure removes only its exact inactive transaction from the
+ * blocking set; malformed closures continue to fail closed.
+ */
+export async function readProjectDelegationBlockerV2(
+	projectRoot: string,
+): Promise<ProjectDelegationBlockerV2Result> {
+	const repair = await readProjectDelegationRepairClosureV1(projectRoot);
+	if (!repair.ok) {
+		if (repair.issue.code === "additional_unresolved_authority" && repair.issue.delegationId !== undefined) {
+			const additional = await readDelegationTransactionV2(projectRoot, repair.issue.delegationId);
+			return additional.ok
+				? { ok: true, value: additional.value }
+				: { ok: false, issue: { code: additional.error.code, delegationId: repair.issue.delegationId } };
+		}
+		return { ok: false, issue: repair.issue };
+	}
+	if (repair.unresolvedTipId !== null) {
+		const tip = await readDelegationTransactionV2(projectRoot, repair.unresolvedTipId);
+		return tip.ok
+			? { ok: true, value: tip.value }
+			: { ok: false, issue: { code: tip.error.code, delegationId: repair.unresolvedTipId } };
+	}
+
+	const root = delegationsDir(projectRoot);
+	let entries: Dirent<string>[];
+	try {
+		const stat = await lstat(root);
+		if (!stat.isDirectory() || stat.isSymbolicLink()) return { ok: false, issue: { code: "invalid_project_authority" } };
+		entries = await readdir(root, { withFileTypes: true, encoding: "utf8" });
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "ENOENT"
+			? { ok: true, value: null }
+			: { ok: false, issue: { code: "storage_failure" } };
+	}
+	const blockers: DelegationTransactionRecord[] = [];
+	for (const entry of entries) {
+		if (!isValidDelegationId(entry.name)) continue;
+		if (!entry.isDirectory() || entry.isSymbolicLink()) {
+			return { ok: false, issue: { code: "invalid_project_authority", delegationId: entry.name } };
+		}
+		const read = await readDelegationTransactionV2(projectRoot, entry.name);
+		if (!read.ok) {
+			const quarantine = await authorityIsQuarantinedV1(projectRoot, entry.name);
+			if (!quarantine.ok) return { ok: false, issue: quarantine.issue };
+			if (quarantine.value || read.error.code === "not_found") continue;
+			return { ok: false, issue: { code: read.error.code, delegationId: entry.name } };
+		}
+		const transaction = read.value;
+		// A fully validated semantic-repair graph with no unresolved tip has
+		// already proved all of its root/lineage records closed.
+		if (transaction.repair_lineage !== undefined) continue;
+		if (transaction.status === "PENDING_REVIEW") {
+			const decision = await readDelegationSemanticRepairDecisionV1(projectRoot, transaction.delegation_id);
+			if (!decision.ok) return { ok: false, issue: { code: decision.error.code, delegationId: transaction.delegation_id } };
+			if (decision.value !== undefined) continue;
+		}
+		if (!projectDelegationDispositionV2(transaction).blocking) continue;
+		const closure = await readDelegationInactiveBlockerClosureV2(projectRoot, transaction);
+		if (!closure.ok) {
+			return {
+				ok: false,
+				issue: {
+					code: closure.error.code === "invalid_record" ? "blocker_closure_invalid" : closure.error.code,
+					delegationId: transaction.delegation_id,
+				},
+			};
+		}
+		if (closure.value === undefined) blockers.push(transaction);
+	}
+	blockers.sort((left, right) => {
+		const time = descendingAscii(left.created_at, right.created_at);
+		return time !== 0 ? time : descendingAscii(left.delegation_id, right.delegation_id);
+	});
+	return { ok: true, value: blockers[0] ?? null };
 }
 
 /** Map durable transaction state to the session-level blocking disposition. */
@@ -919,6 +1089,215 @@ function sameDelegationMirror(left: DelegationState, right: DelegationState): bo
 		&& left.blockedWriteAttempts === right.blockedWriteAttempts;
 }
 
+async function readTransactionRepairAbandonmentV1(
+	projectRoot: string,
+	transaction: DelegationTransactionRecord,
+): Promise<
+	| { ok: true; value: DelegationCleanRepairAbandonmentV1 | undefined }
+	| { ok: false; issue: ProjectDelegationAuthorityIssueV2 }
+> {
+	const rootDelegationId = transaction.repair_lineage?.root_delegation_id ?? transaction.delegation_id;
+	const decision = await readDelegationSemanticRepairDecisionV1(projectRoot, rootDelegationId);
+	if (!decision.ok) {
+		return { ok: false, issue: { code: decision.error.code, delegationId: rootDelegationId } };
+	}
+	if (decision.value === undefined) return { ok: true, value: undefined };
+	const abandonment = await readDelegationCleanRepairAbandonmentV1(projectRoot, transaction, decision.value);
+	if (!abandonment.ok) {
+		return {
+			ok: false,
+			issue: {
+				code: abandonment.error.code === "invalid_record" ? "repair_abandonment_invalid" : abandonment.error.code,
+				delegationId: transaction.delegation_id,
+			},
+		};
+	}
+	return abandonment;
+}
+
+/**
+ * Close the exact newest inactive blocker after proving only its relevant
+ * paths are clean. Unrelated worktree/index changes are retained untouched.
+ */
+export async function closeInactiveProjectDelegationBlockerV2(input: {
+	project_root: string;
+	expected_delegation_id?: string;
+	now: string;
+	exec: ExecFn;
+	closed_by: DelegationInactiveBlockerClosureV2["closed_by"];
+}): Promise<CloseInactiveProjectDelegationBlockerV2Result> {
+	const initial = await readProjectDelegationBlockerV2(input.project_root);
+	if (!initial.ok) return { ok: false, code: initial.issue.code, ...(initial.issue.delegationId === undefined ? {} : { delegation_id: initial.issue.delegationId }) };
+	if (initial.value === null) return { ok: false, code: "no_unresolved_blocker" };
+	if (input.expected_delegation_id !== undefined && input.expected_delegation_id !== initial.value.delegation_id) {
+		return { ok: false, code: "blocker_changed", delegation_id: initial.value.delegation_id };
+	}
+	if (["PREPARED", "RUNNING", "COMMITTING"].includes(initial.value.status)) {
+		return { ok: false, code: "blocker_execution_active", delegation_id: initial.value.delegation_id };
+	}
+	const initialId = initial.value.delegation_id;
+	const acquired = await acquireProjectDelegationStartLockV1({
+		project_root: input.project_root,
+		delegation_id: initialId,
+		now: input.now,
+	});
+	if (!acquired.ok) return { ok: false, code: `start_lock_${acquired.error.code}`, delegation_id: initialId };
+
+	const outcome = await (async (): Promise<CloseInactiveProjectDelegationBlockerV2Result> => {
+		const current = await readProjectDelegationBlockerV2(input.project_root);
+		if (!current.ok) return { ok: false, code: current.issue.code, ...(current.issue.delegationId === undefined ? {} : { delegation_id: current.issue.delegationId }) };
+		if (current.value === null || current.value.delegation_id !== initialId) {
+			return { ok: false, code: "blocker_changed", ...(current.value === null ? {} : { delegation_id: current.value.delegation_id }) };
+		}
+		if (["PREPARED", "RUNNING", "COMMITTING"].includes(current.value.status)) {
+			return { ok: false, code: "blocker_execution_active", delegation_id: initialId };
+		}
+		const owner = await readDelegationExecutionOwnerV2(input.project_root, current.value);
+		if (owner.ok) return { ok: false, code: "execution_owner_present", delegation_id: initialId };
+		if (owner.error.code !== "not_found") return { ok: false, code: owner.error.code, delegation_id: initialId };
+		const guard = await collectWorkspaceGuard({ project_root: input.project_root, exec: input.exec });
+		if (!guard.ok) return { ok: false, code: `workspace_${guard.error.code}`, delegation_id: initialId };
+		const published = await publishDelegationInactiveBlockerClosureV2({
+			project_root: input.project_root,
+			transaction: current.value,
+			workspace_guard: guard.guard,
+			closed_by: input.closed_by,
+			now: input.now,
+		});
+		if (!published.ok) {
+			const code = published.error.code === "not_recoverable" ? "relevant_paths_not_clean" : `blocker_closure_${published.error.code}`;
+			return { ok: false, code, delegation_id: initialId };
+		}
+		const verified = await readProjectDelegationBlockerV2(input.project_root);
+		if (!verified.ok) return { ok: false, code: verified.issue.code, ...(verified.issue.delegationId === undefined ? {} : { delegation_id: verified.issue.delegationId }) };
+		if (verified.value?.delegation_id === initialId) return { ok: false, code: "blocker_closure_not_effective", delegation_id: initialId };
+		return {
+			ok: true,
+			value: published.value,
+			...(verified.value === null ? {} : { remaining_blocker_id: verified.value.delegation_id }),
+		};
+	})();
+	const released = await releaseProjectDelegationStartLockV1(acquired.value);
+	if (!released.ok) return { ok: false, code: `start_lock_release_${released.error.code}`, delegation_id: initialId };
+	return outcome;
+}
+
+/**
+ * Quarantine one stable unreadable v2 envelope without moving/deleting it or
+ * accepting any project delta. Receipts are inventory-versioned: later bytes
+ * re-block until Sol explicitly quarantines the new stable inventory.
+ */
+export async function quarantineProjectDelegationAuthorityV1(input: {
+	project_root: string;
+	delegation_id: string;
+	now: string;
+	quarantined_by: DelegationAuthorityQuarantineV1["quarantined_by"];
+}): Promise<QuarantineProjectDelegationAuthorityV1Result> {
+	const initial = await readDelegationTransactionV2(input.project_root, input.delegation_id);
+	if (initial.ok) return { ok: false, code: "authority_is_readable", delegation_id: input.delegation_id };
+	if (initial.error.code === "not_found") {
+		try {
+			const v2 = await lstat(join(delegationsDir(input.project_root), input.delegation_id, "v2"));
+			if (!v2.isDirectory() || v2.isSymbolicLink()) return { ok: false, code: "authority_not_recoverable", delegation_id: input.delegation_id };
+		} catch {
+			return { ok: false, code: "authority_not_found", delegation_id: input.delegation_id };
+		}
+	}
+	const issueCode = initial.error.code === "not_found" ? "incomplete_v2_authority" : initial.error.code;
+	const acquired = await acquireProjectDelegationStartLockV1({
+		project_root: input.project_root,
+		delegation_id: input.delegation_id,
+		now: input.now,
+	});
+	if (!acquired.ok) return { ok: false, code: `start_lock_${acquired.error.code}`, delegation_id: input.delegation_id };
+	const outcome = await (async (): Promise<QuarantineProjectDelegationAuthorityV1Result> => {
+		const current = await readDelegationTransactionV2(input.project_root, input.delegation_id);
+		if (current.ok || current.error.code !== initial.error.code) {
+			return { ok: false, code: "authority_changed", delegation_id: input.delegation_id };
+		}
+		const published = await publishDelegationAuthorityQuarantineV1({
+			project_root: input.project_root,
+			delegation_id: input.delegation_id,
+			issue_code: issueCode,
+			quarantined_by: input.quarantined_by,
+			now: input.now,
+		});
+		if (!published.ok) return { ok: false, code: `authority_quarantine_${published.error.code}`, delegation_id: input.delegation_id };
+		const verified = await readDelegationAuthorityQuarantineV1(input.project_root, input.delegation_id);
+		if (!verified.ok || verified.value === undefined) {
+			return { ok: false, code: verified.ok ? "authority_quarantine_not_effective" : `authority_quarantine_${verified.error.code}`, delegation_id: input.delegation_id };
+		}
+		return { ok: true, value: published.value };
+	})();
+	const released = await releaseProjectDelegationStartLockV1(acquired.value);
+	if (!released.ok) return { ok: false, code: `start_lock_release_${released.error.code}`, delegation_id: input.delegation_id };
+	return outcome;
+}
+
+/**
+ * Close one exact unresolved semantic repair after Sol observes a strictly
+ * clean Git workspace. No project file or Git ref is changed; the old rejected
+ * transaction remains immutable and is closed only by the new bound receipt.
+ */
+export async function abandonCleanProjectDelegationRepairV1(input: {
+	project_root: string;
+	now: string;
+	exec: ExecFn;
+	abandoned_by: DelegationCleanRepairAbandonmentV1["abandoned_by"];
+}): Promise<AbandonCleanProjectDelegationRepairV1Result> {
+	const initial = await readProjectDelegationRepairClosureV1(input.project_root);
+	if (!initial.ok) return { ok: false, code: initial.issue.code, ...(initial.issue.delegationId === undefined ? {} : { delegation_id: initial.issue.delegationId }) };
+	if (initial.unresolvedTipId === null) return { ok: false, code: "no_unresolved_repair" };
+	const initialTipId = initial.unresolvedTipId;
+	const acquired = await acquireProjectDelegationStartLockV1({
+		project_root: input.project_root,
+		delegation_id: initialTipId,
+		now: input.now,
+	});
+	if (!acquired.ok) return { ok: false, code: `start_lock_${acquired.error.code}`, delegation_id: initialTipId };
+
+	const outcome = await (async (): Promise<AbandonCleanProjectDelegationRepairV1Result> => {
+		const closure = await readProjectDelegationRepairClosureV1(input.project_root);
+		if (!closure.ok) return { ok: false, code: closure.issue.code, ...(closure.issue.delegationId === undefined ? {} : { delegation_id: closure.issue.delegationId }) };
+		if (closure.unresolvedTipId !== initialTipId) {
+			return { ok: false, code: "repair_authority_changed", ...(closure.unresolvedTipId === null ? {} : { delegation_id: closure.unresolvedTipId }) };
+		}
+		const tip = await readDelegationTransactionV2(input.project_root, initialTipId);
+		if (!tip.ok) return { ok: false, code: tip.error.code, delegation_id: initialTipId };
+		const rootDelegationId = tip.value.repair_lineage?.root_delegation_id ?? tip.value.delegation_id;
+		const rootDecision = await readDelegationSemanticRepairDecisionV1(input.project_root, rootDelegationId);
+		if (!rootDecision.ok || rootDecision.value === undefined) {
+			return { ok: false, code: rootDecision.ok ? "repair_decision_missing" : rootDecision.error.code, delegation_id: rootDelegationId };
+		}
+		const guard = await collectWorkspaceGuard({ project_root: input.project_root, exec: input.exec });
+		if (!guard.ok) return { ok: false, code: `workspace_${guard.error.code}`, delegation_id: tip.value.delegation_id };
+		if (guard.guard.entries.length !== 0 || guard.guard.git_head === null) {
+			return { ok: false, code: "workspace_not_clean", delegation_id: tip.value.delegation_id };
+		}
+		const published = await publishDelegationCleanRepairAbandonmentV1({
+			project_root: input.project_root,
+			tip: tip.value,
+			root_decision: rootDecision.value,
+			clean_guard: guard.guard,
+			abandoned_by: input.abandoned_by,
+			now: input.now,
+		});
+		if (!published.ok) return { ok: false, code: `repair_abandonment_${published.error.code}`, delegation_id: tip.value.delegation_id };
+		const verified = await readProjectDelegationRepairClosureV1(input.project_root);
+		if (!verified.ok || verified.unresolvedTipId !== null) {
+			return {
+				ok: false,
+				code: verified.ok ? "repair_abandonment_not_closed" : verified.issue.code,
+				...(verified.ok || verified.issue.delegationId === undefined ? {} : { delegation_id: verified.issue.delegationId }),
+			};
+		}
+		return { ok: true, value: published.value };
+	})();
+	const released = await releaseProjectDelegationStartLockV1(acquired.value);
+	if (!released.ok) return { ok: false, code: `start_lock_release_${released.error.code}`, delegation_id: initialTipId };
+	return outcome;
+}
+
 /** Pure-result reconciliation over strict project authority; persistence remains caller-owned. */
 export async function reconcileProjectDelegationAuthorityV2(input: {
 	project_root: string;
@@ -952,14 +1331,16 @@ export async function reconcileProjectDelegationAuthorityV2(input: {
 				issue: { code: "invalid_project_authority", delegationId: repairClosure.unresolvedTipId },
 			};
 		}
-		// A restored legacy session mirror cannot retain REVIEWED authority merely
-		// because an old mechanical review exists (or its review is unavailable).
-		// Keep the record readable, but project it back to the existing blocking
-		// review state so only an exact bounded repair can advance development.
-		if (input.current_state.latestId !== undefined && input.current_state.status === "REVIEWED") {
+		// A v1-only delegation is represented by the durable legacy ledger plus
+		// the session mirror.  Absence of a v2 transaction is therefore not proof
+		// that the mirror is disposable: clearing PENDING_REVIEW/STALE here makes
+		// the registered legacy review tool lose its exact target on reload.
+		if (input.current_state.latestId !== undefined) {
+			const quarantine = await authorityIsQuarantinedV1(input.project_root, input.current_state.latestId);
+			if (!quarantine.ok) return { ok: false, issue: quarantine.issue };
+			if (quarantine.value) return { ok: true, state: null };
 			const legacy = await readDelegationAuthorityObservationV2(input.project_root, input.current_state.latestId);
-			if (legacy.kind === "legacy" &&
-				(legacy.review === null || !legacy.zeroDelta || !isStrictSemanticAcceptedOrZeroDelta(legacy.review))) {
+			if (legacy.kind === "legacy") {
 				const binding = await collectCurrentDelegationBindingV2(
 					input.project_root,
 					input.current_state.latestId,
@@ -968,16 +1349,26 @@ export async function reconcileProjectDelegationAuthorityV2(input: {
 				if (binding.status === "unavailable") {
 					return { ok: false, issue: { code: "binding_unavailable", delegationId: input.current_state.latestId } };
 				}
-				return {
-					ok: true,
-					state: {
-						latestId: input.current_state.latestId,
-						status: "PENDING_REVIEW",
-						currentDiffHash: binding.hash,
-						blockedWriteAttempts: input.current_state.blockedWriteAttempts,
-						updatedAt: input.now,
-					},
-				};
+				// Historical mechanical REVIEWED is not semantic authority for a
+				// non-zero delta.  Demote only that unsafe projection; otherwise retain
+				// the legacy lifecycle and refresh its exact current binding.
+				if (input.current_state.status === "REVIEWED" &&
+					(legacy.review === null || !legacy.zeroDelta || !isStrictSemanticAcceptedOrZeroDelta(legacy.review))) {
+					return {
+						ok: true,
+						state: {
+							latestId: input.current_state.latestId,
+							status: "PENDING_REVIEW",
+							currentDiffHash: binding.hash,
+							blockedWriteAttempts: input.current_state.blockedWriteAttempts,
+							updatedAt: input.now,
+						},
+					};
+				}
+				return { ok: true, state: observeDiffChange(input.current_state, binding.hash, input.now) };
+			}
+			if (legacy.kind === "invalid-v2") {
+				return { ok: false, issue: { code: legacy.code, delegationId: input.current_state.latestId } };
 			}
 		}
 		return { ok: true, state: null };
@@ -1020,13 +1411,13 @@ export async function reconcileProjectDelegationAuthorityV2(input: {
 			}
 		}
 	}
-	if (!repairClosure.ok) return { ok: false, issue: repairClosure.issue };
-	if (repairClosure.unresolvedTipId !== null && repairClosure.unresolvedTipId !== transaction.delegation_id) {
-		const unresolved = await readDelegationTransactionV2(input.project_root, repairClosure.unresolvedTipId);
-		if (!unresolved.ok) {
-			return { ok: false, issue: { code: unresolved.error.code, delegationId: repairClosure.unresolvedTipId } };
-		}
-		transaction = unresolved.value;
+	if (!repairClosure.ok && repairClosure.issue.code !== "additional_unresolved_authority") {
+		return { ok: false, issue: repairClosure.issue };
+	}
+	const projectBlocker = await readProjectDelegationBlockerV2(input.project_root);
+	if (!projectBlocker.ok) return { ok: false, issue: projectBlocker.issue };
+	if (projectBlocker.value !== null && projectBlocker.value.delegation_id !== transaction.delegation_id) {
+		transaction = projectBlocker.value;
 		const interruption = await recoverInterruptedDelegationV2({
 			project_root: input.project_root,
 			transaction,
@@ -1036,7 +1427,32 @@ export async function reconcileProjectDelegationAuthorityV2(input: {
 				: { options: input.interruption_recovery_options }),
 		});
 		if (interruption.status === "recovered") transaction = interruption.transaction;
+		if (!["PREPARED", "RUNNING", "COMMITTING"].includes(transaction.status)) {
+			const cleanup = await releaseOrphanedTerminalExecutionOwnerV2(
+				input.project_root,
+				transaction,
+				input.interruption_recovery_options,
+			);
+			if (cleanup.status === "active") return { ok: false, issue: { code: "execution_owner_active", delegationId: transaction.delegation_id } };
+			if (cleanup.status === "blocked") return { ok: false, issue: { code: cleanup.code, delegationId: transaction.delegation_id } };
+		}
 	}
+	if (repairClosure.ok && repairClosure.unresolvedTipId === null) {
+		const abandonment = await readTransactionRepairAbandonmentV1(input.project_root, transaction);
+		if (!abandonment.ok) return { ok: false, issue: abandonment.issue };
+		if (abandonment.value !== undefined) return { ok: true, state: null };
+	}
+	const inactiveClosure = await readDelegationInactiveBlockerClosureV2(input.project_root, transaction);
+	if (!inactiveClosure.ok) {
+		return {
+			ok: false,
+			issue: {
+				code: inactiveClosure.error.code === "invalid_record" ? "blocker_closure_invalid" : inactiveClosure.error.code,
+				delegationId: transaction.delegation_id,
+			},
+		};
+	}
+	if (inactiveClosure.value !== undefined) return { ok: true, state: null };
 	const authority = await readDelegationAuthorityObservationV2(input.project_root, transaction.delegation_id);
 	if (authority.kind === "invalid-v2") {
 		return { ok: false, issue: { code: authority.code, delegationId: transaction.delegation_id } };

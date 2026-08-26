@@ -186,7 +186,7 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 
 test("v0.10.0 public tool surface has the intentional structured-Git transition hash", () => {
 	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
-	const currentHash = "b212fe63aa889f77442559420709beb938c26cc841347e59b459c04b9a1e7e20";
+	const currentHash = "b168980c9c76410c771fd515d6ad68722e88d164ee0f943a82e4030006c62b96";
 	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
 	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the documented 0.10.0 hash");
 });
@@ -594,15 +594,15 @@ test("NRO N1/N2 transition: override metadata/schemas shift the schema/mode fing
 	assert.deepEqual(currentFind.parameters, builtinFind.parameters, "find parameter schema byte-identical to the Pi 0.83.0 built-in");
 });
 
-test("mode matrix is exactly the P6-B spec matrix (P8b appends the read-only recovery tool)", () => {
+test("mode matrix keeps AUDIT read-only and adds only guarded recovery/config maintenance to VERIFY", () => {
 	assert.deepEqual(MODE_TOOLS.AUDIT, ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_read_run", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs", "workbench_recover_tool_result"]);
-	assert.deepEqual(MODE_TOOLS.VERIFY, ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_run_recipe", "workbench_read_run", "workbench_run_gate", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs", "workbench_recover_tool_result"]);
+	assert.deepEqual(MODE_TOOLS.VERIFY, ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_run_recipe", "workbench_read_run", "workbench_run_gate", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs", "workbench_delegate_worker", "workbench_review_worker_diff", "workbench_delegation_status", "workbench_git", "workbench_recover_tool_result"]);
 	assert.deepEqual(MODE_TOOLS.DEV, ["read", "grep", "find", "ls", "bash", "edit", "write", ...WORKBENCH_TOOLS]);
 	// AUDIT has no mutating tools; VERIFY has no free bash/edit/write
 	for (const forbidden of ["bash", "edit", "write", "workbench_run_recipe", "workbench_run_gate", "workbench_delegate_worker"]) {
 		assert.ok(!AUDIT_TOOLS.includes(forbidden), `AUDIT must not contain ${forbidden}`);
 	}
-	for (const forbidden of ["bash", "edit", "write", "workbench_delegate_worker"]) {
+	for (const forbidden of ["bash", "edit", "write"]) {
 		assert.ok(!VERIFY_TOOLS.includes(forbidden), `VERIFY must not contain ${forbidden}`);
 	}
 });
@@ -658,21 +658,23 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	assert.deepEqual(meta.promptGuidelines, [
 		"Successful non-zero implementation delivery returns a provisional scope/integrity packet and stays PENDING_REVIEW; after inspecting a complete unchanged packet, use workbench_review_worker_diff for hash-bound Sol ACCEPT. Use status only for diagnostics or recovery.",
 		"If a complete packet is wrong, publish semantic_decision=REPAIR with the exact bound hash and a bounded reason, then follow only the exact repair_of shown by status. REPAIR and every unresolved lineage remain Gate-blocking.",
+		"If rejected changes were deliberately discarded, use the exact close_inactive_blocker action reported by status. It checks only the delegation's changed/carried paths, preserves unrelated work, never accepts rejected code, and must not be replaced with a new worktree.",
 		"When STALE is backed by strict v2 FINAL/PASS plus explicit Sol semantic authority, follow the reported successor action instead of retrying immutable review; a mechanical FINAL/PASS remains blocked and VERIFY stays blocked until a valid successor is reviewed.",
 		"In the TUI, WF:LOCKED means routine writes belong to Luna, WF:LEASE means a bounded temporary Sol write exception is active, and WF:REVIEW means recovery review is outstanding.",
 	], "current status guidelines keep routine work out of the recovery chain");
-	assert.match(meta.description, /durable semantic-repair state/);
-	assert.match(meta.description, /REPAIR_REQUIRED reports one exact repair_of action only while its bound workspace is fresh/);
-	assert.match(meta.description, /active, recovery, forked, missing-continuation, or corrupt lineages remain visibly blocked/);
-	assert.match(meta.description, /New tagged v2 uses the W\/D\/S relevance binding/);
-	assert.match(meta.description, /historical untagged v2\/v1 retains the complete diff binding/);
-	assert.match(meta.description, /Baseline unrelated dirt and recognized workbench artifacts do not stale tagged v2/);
-	assert.match(meta.description, /Git HEAD, W\/D\/S, unknown-origin, or repair-authority drift fails closed/);
+	assert.match(meta.description, /durable repair state/);
+	assert.match(meta.description, /REPAIR_REQUIRED reports exact repair_of only while fresh/);
+	assert.match(meta.description, /close_inactive_blocker/);
+	assert.match(meta.description, /preserves unrelated work/);
+	assert.match(meta.description, /quarantine_unreadable_authority/);
+	assert.match(meta.description, /source bytes remain in place/);
+	assert.match(meta.description, /Tagged v2 uses W\/D\/S relevance/);
+	assert.match(meta.description, /historical v2\/v1 retains complete-diff binding/);
 	assert.doesNotMatch(meta.description, /real git diff \(any change after REVIEWED turns it STALE\)/);
 	assert.equal(
 		canonicalHash(meta),
-		"c69030ba3e01c704cb32ee41f52c0b14931200bdfa0d66396a164eaf876a2c1d",
-		"current status metadata hash is machine-pinned after semantic-repair projection",
+		"f96ee59dfc769ec52a954f3bacd0d013645bcf1416122681f24e27a9da45270d",
+		"current status metadata hash is machine-pinned after full authority recovery",
 	);
 	assert.equal(
 		canonicalHash(WORKBENCH_TOOL_PARAMETERS.workbench_delegation_status),
@@ -681,8 +683,8 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.equal(
 		canonicalHash(workbenchToolMetadataOrdered()),
-		"09a9f327341cf5bd3c9490e1f873c46a34cafeb0ee91cc3d5cc6d47065d4c003",
-		"current public catalog hash is machine-pinned after structured Git completion was added",
+		"1c4b4e65e9ebeed867127e1062dc02fa0c4f2c2d8ed9151d03bf6642cc9b1159",
+		"current public catalog hash is machine-pinned after full authority recovery was added",
 	);
 });
 

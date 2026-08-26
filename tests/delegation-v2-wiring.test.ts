@@ -2,7 +2,7 @@
 
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { cp, mkdir, readFile, readdir, rename, utimes, writeFile } from "node:fs/promises";
+import { cp, mkdir, readFile, readdir, rename, unlink, utimes, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -179,6 +179,12 @@ function delegationStatusTool(stub: StubAPI): RuntimeTool {
 
 function reviewTool(stub: StubAPI): RuntimeTool {
 	const tool = stub.tools.get("workbench_review_worker_diff");
+	assert.ok(tool);
+	return tool as RuntimeTool;
+}
+
+function gitTool(stub: StubAPI): RuntimeTool {
+	const tool = stub.tools.get("workbench_git");
 	assert.ok(tool);
 	return tool as RuntimeTool;
 }
@@ -1257,6 +1263,119 @@ test("an exact semantic REPAIR sidecar launches one bounded implementation linea
 		const forked = await readProjectDelegationRepairClosureV1(root);
 		assert.equal(forked.ok, false);
 		if (!forked.ok) assert.equal(forked.issue.code, "repair_lineage_fork");
+	});
+});
+
+test("a deliberately discarded repair closes on a clean repository and the same worktree accepts the next delegation", async () => {
+	await withTempDir(async (root) => {
+		await initializeProject(root);
+		await writeFile(join(root, ".gitignore"), [
+			`${CONFIG_DIR_NAME}/workbench/delegations/`,
+			`${CONFIG_DIR_NAME}/workbench/tool-results/`,
+			`${CONFIG_DIR_NAME}/workbench/runs/`,
+			`${CONFIG_DIR_NAME}/workbench/delegation-start.lock`,
+			"fake-worker-*.cjs",
+			"",
+		].join("\n"), "utf8");
+		assert.equal((await spawnExec("git", ["add", ".gitignore", `${CONFIG_DIR_NAME}/workbench/project.yaml`], { cwd: root })).code, 0);
+		const committed = await spawnExec("git", [
+			"-c", "user.name=Workbench Test", "-c", "user.email=workbench@example.invalid",
+			"commit", "-q", "-m", "test baseline",
+		], { cwd: root });
+		assert.equal(committed.code, 0, committed.stderr);
+
+		const rejectedPath = "src/discarded-repair.ts";
+		const rejectedScript = await writeFakeWorker(root, { changedPath: rejectedPath, body: "rejected\n" });
+		const repairScript = await writeFakeWorker(root, { changedPath: rejectedPath, body: "fixed\n" });
+		const nextScript = await writeFakeWorker(root, { changedPath: "src/next.ts", body: "next\n" });
+		const stub = commanderRuntime();
+		const ctx = commanderContext(root, "semantic-repair-clean-close");
+		await startSession(stub, ctx);
+		const initial = await withFakeWorker(rejectedScript, () => delegateTool(stub).execute(
+			"clean-close-parent",
+			delegateParams({ task_kind: "implementation", allowed_paths: [rejectedPath] }),
+			undefined,
+			undefined,
+			ctx,
+		));
+		const parentId = delegationId(initial);
+		await requireCurrentSemanticRepair(
+			root,
+			stub,
+			ctx,
+			parentId,
+			"The rejected delta will be discarded rather than repaired.",
+		);
+
+		const dirtyRefusal = await gitTool(stub).execute(
+			"clean-close-dirty",
+			{ action: "close_clean_repair" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		assert.equal(dirtyRefusal.details.ok, false);
+		assert.equal(dirtyRefusal.details.code, "workspace_not_clean");
+		const stillOpen = await readProjectDelegationRepairClosureV1(root);
+		assert.equal(stillOpen.ok, true);
+		if (stillOpen.ok) assert.equal(stillOpen.unresolvedTipId, parentId);
+
+		await unlink(join(root, rejectedPath));
+		const cleanStatus = await spawnExec("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: root });
+		assert.equal(cleanStatus.code, 0, cleanStatus.stderr);
+		assert.equal(cleanStatus.stdout, "", cleanStatus.stdout);
+		const closed = await gitTool(stub).execute(
+			"clean-close-success",
+			{ action: "close_clean_repair" },
+			undefined,
+			undefined,
+			ctx,
+		);
+		assert.equal(closed.details.ok, true, resultText(closed));
+		assert.equal(closed.details.action, "close_clean_repair");
+		assert.equal(closed.details.delegation_id, parentId);
+		assert.equal(closed.details.git_mutation, "NONE");
+		assert.equal(closed.details.rejected_authority, "NOT_ACCEPTED");
+		assert.match(String(closed.details.abandonment_hash), /^[0-9a-f]{64}$/u);
+		assert.deepEqual(await readProjectDelegationRepairClosureV1(root), {
+			ok: true,
+			unresolvedTipId: null,
+			rootCount: 1,
+			lineageCount: 0,
+		});
+		await writeFile(join(root, rejectedPath), "rejected\n", "utf8");
+		await assert.rejects(
+			withFakeWorker(repairScript, () => delegateTool(stub).execute(
+				"clean-close-cannot-reopen",
+				delegateParams({ task_kind: "implementation", repair_of: parentId, allowed_paths: [rejectedPath] }),
+				undefined,
+				undefined,
+				ctx,
+			)),
+			/durably closed after the rejected delta was discarded/,
+		);
+		await unlink(join(root, rejectedPath));
+
+		const next = await withFakeWorker(nextScript, () => delegateTool(stub).execute(
+			"clean-close-next",
+			delegateParams({ task_kind: "implementation", allowed_paths: ["src/next.ts"] }),
+			undefined,
+			undefined,
+			ctx,
+		));
+		assert.notEqual(delegationId(next), parentId);
+		assert.equal(next.details.review_status, "PENDING_REVIEW");
+
+		const receiptDirectory = join(root, CONFIG_DIR_NAME, "workbench", "delegations", parentId, "v2", "repair-abandonments-v1");
+		const receiptNames = await readdir(receiptDirectory);
+		assert.equal(receiptNames.length, 1);
+		const receiptPath = join(receiptDirectory, receiptNames[0]!);
+		const receipt = JSON.parse(await readFile(receiptPath, "utf8")) as Record<string, unknown>;
+		receipt.abandonment_hash = "f".repeat(64);
+		await writeFile(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, "utf8");
+		const corruptClosure = await readProjectDelegationRepairClosureV1(root);
+		assert.equal(corruptClosure.ok, false);
+		if (!corruptClosure.ok) assert.equal(corruptClosure.issue.code, "repair_abandonment_invalid");
 	});
 });
 

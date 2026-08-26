@@ -70,7 +70,7 @@ export function registerRecipeTools<TIngress>(controller: RecipeToolsController<
 	controller.pi.registerTool({
 		...WORKBENCH_TOOL_METADATA.workbench_project_inspect,
 		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_project_inspect,
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			try {
 				const trustError = controller.trustedOrError(ctx);
 				if (trustError) return fixedToolFailure("workbench_project_inspect", "untrusted_project");
@@ -78,6 +78,10 @@ export function registerRecipeTools<TIngress>(controller: RecipeToolsController<
 				const result = await inspectProject(projectRoot, { trusted: true, exec: controller.exec });
 				const stacks = result.stacks.map((stack) => `${stack.language}${stack.package_manager ? ` (${stack.package_manager})` : ""}`);
 				const errors = result.config_errors.map((error) => `${error.file}: ${error.message}`);
+				const recipeQuery = params.recipe === undefined ? undefined : boundedInlineDetail(params.recipe, 200);
+				const selectedRecipes = recipeQuery === undefined
+					? result.recipes
+					: result.recipes.filter((recipe) => recipe.name === recipeQuery);
 				const details: InspectToolDetails = {
 					project_root: boundedInlineDetail(result.project_root, 512),
 					effective_project_root: boundedInlineDetail(result.effective_project_root, 512),
@@ -89,8 +93,9 @@ export function registerRecipeTools<TIngress>(controller: RecipeToolsController<
 					},
 					stacks: boundedDetailsList(stacks, 24, 256),
 					profile: result.profile ? boundedInlineDetail(result.profile, 128) : undefined,
-					recipes: boundedDetailsList(result.recipes.map((recipe) => recipe.name), 24, 256),
-					recipe_validation_components: boundedCoverageMap(result.recipes),
+					recipes: boundedDetailsList(selectedRecipes.map((recipe) => recipe.name), recipeQuery === undefined ? 64 : 1, 256),
+					...(recipeQuery === undefined ? {} : { recipe_query: recipeQuery, recipe_found: selectedRecipes.length === 1 }),
+					recipe_validation_components: boundedCoverageMap(selectedRecipes),
 					config_errors: boundedDetailsList(errors, 24, 512),
 					config_files_present: boundedDetailsList(result.config_files_present, 24, 256),
 				};
@@ -112,11 +117,40 @@ export function registerRecipeTools<TIngress>(controller: RecipeToolsController<
 				const trustError = controller.trustedOrError(ctx);
 				if (trustError) return fixedToolFailure("workbench_run_recipe", "untrusted_project");
 				const projectRoot = await controller.projectRootFor(ctx);
+				const config = await loadProjectConfig(projectRoot, { trusted: true });
+				const recipeIssues = config.issues.filter((issue) => issue.file === "recipes.yaml");
+				if (recipeIssues.length > 0) {
+					const nextAction = `call workbench_project_inspect with recipe=${boundedInlineDetail(params.recipe, 200)}, then use a narrow workbench_delegate_worker config repair on ${CONFIG_DIR_NAME}/workbench/recipes.yaml with verification omitted; this lane is available in DEV and VERIFY`;
+					return {
+						content: [{ type: "text" as const, text: boundedCommandText(`workbench_run_recipe: config_invalid\nsource: ${CONFIG_DIR_NAME}/workbench/recipes.yaml\nissue_count: ${recipeIssues.length}\nnext_action: ${nextAction}`) }],
+						details: {
+							ok: false,
+							error: "config_invalid",
+							requested_recipe: boundedInlineDetail(params.recipe, 200),
+							issue_count: recipeIssues.length,
+							source_path: `${CONFIG_DIR_NAME}/workbench/recipes.yaml`,
+							next_action: nextAction,
+						},
+					};
+				}
+				const declaredRecipe = config.recipes.find((candidate) => candidate.name === params.recipe);
+				if (declaredRecipe === undefined) {
+					const requested = boundedInlineDetail(params.recipe, 200);
+					const nextAction = `call workbench_project_inspect with recipe=${requested}, then use workbench_delegate_worker in DEV or VERIFY with allowed_paths=[\"${CONFIG_DIR_NAME}/workbench/recipes.yaml\"] and verification omitted, review the config delta, and retry`;
+					return {
+						content: [{ type: "text" as const, text: boundedCommandText(`workbench_run_recipe: recipe_not_found\nrequested_recipe: ${requested}\nsource: ${CONFIG_DIR_NAME}/workbench/recipes.yaml\nnext_action: ${nextAction}`) }],
+						details: {
+							ok: false,
+							error: "recipe_not_found",
+							requested_recipe: requested,
+							source_path: `${CONFIG_DIR_NAME}/workbench/recipes.yaml`,
+							next_action: nextAction,
+						},
+					};
+				}
 				const identity = controller.getIdentity();
 				if (identity.role === "worker") {
-					const config = await loadProjectConfig(projectRoot, { trusted: true });
-					const recipe = config.recipes.find((candidate) => candidate.name === params.recipe);
-					const roleError = recipe ? workerRecipeBlockReason(identity.role, recipe.name, recipe.writes) : undefined;
+					const roleError = workerRecipeBlockReason(identity.role, declaredRecipe.name, declaredRecipe.writes);
 					if (roleError) return fixedToolFailure("workbench_run_recipe", "execution_denied");
 				}
 				onUpdate?.({

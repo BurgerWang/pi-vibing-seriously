@@ -1356,6 +1356,41 @@ test("storage v2: exclusive lock write failure after file creation cleans only i
 	}
 });
 
+test("storage v2: transaction lock recovers when the numeric PID was reused by a different process incarnation", async () => {
+	const root = await tempProject();
+	try {
+		await mkdir(transactionDir(root), { recursive: true });
+		const bootId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+		await writeFile(lockPath(root), `${JSON.stringify({
+			schema_version: 2,
+			delegation_id: ID,
+			token: "e".repeat(32),
+			process_id: 424_242,
+			process_start_ticks: "100",
+			boot_id: bootId,
+			created_at: at(0),
+		})}\n`, { flag: "wx", mode: 0o600 });
+		const base = createNodeDelegationTransactionStorageAdapter();
+		const adapter: DelegationTransactionStorageAdapter = {
+			...base,
+			processId: 424_242,
+			isProcessAlive: () => true,
+			readBootId: async () => bootId,
+			readProcessStartTicks: async () => "200",
+		};
+		const prepared = await persistPreparedDelegationTransaction(root, {
+			delegation_id: ID, task_kind: "diagnosis", contract_hash: HASH, allowed_paths: ["src/**"],
+			worker_identity: { ...IDENTITY }, generation: 1, now: at(1),
+		}, { adapter });
+		assert.equal(prepared.ok, true, prepared.ok ? "" : prepared.error.code);
+		assert.equal((await readDelegationTransactionV2(root, ID)).ok, true);
+		await assert.rejects(readFile(lockPath(root), "utf8"), (error: unknown) =>
+			(error as NodeJS.ErrnoException).code === "ENOENT");
+	} finally {
+		await cleanup(root);
+	}
+});
+
 test("storage v2: terminal publish release fault stays successful and best-effort cleanup permits locked follow-up", async () => {
 	const root = await tempProject();
 	try {

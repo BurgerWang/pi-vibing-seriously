@@ -66,8 +66,8 @@ test("DEV tool set contains all local development tools plus all workbench tools
 	}
 });
 
-test("VERIFY tool set has no bash/edit/write/delegation and keeps verification tools (P8b adds workbench_recover_tool_result)", () => {
-	const expected = ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_run_recipe", "workbench_read_run", "workbench_run_gate", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs", "workbench_recover_tool_result"];
+test("VERIFY tool set has no free writes and exposes only guarded delegation/authority recovery", () => {
+	const expected = ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_run_recipe", "workbench_read_run", "workbench_run_gate", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs", "workbench_delegate_worker", "workbench_review_worker_diff", "workbench_delegation_status", "workbench_git", "workbench_recover_tool_result"];
 	assert.deepEqual(VERIFY_TOOLS, expected);
 	for (const tool of expected) {
 		assert.ok(isToolAllowedInMode("VERIFY", tool), `VERIFY should allow ${tool}`);
@@ -75,7 +75,7 @@ test("VERIFY tool set has no bash/edit/write/delegation and keeps verification t
 	assert.ok(!isToolAllowedInMode("VERIFY", "bash"));
 	assert.ok(!isToolAllowedInMode("VERIFY", "edit"));
 	assert.ok(!isToolAllowedInMode("VERIFY", "write"));
-	assert.ok(!isToolAllowedInMode("VERIFY", "workbench_delegate_worker"));
+	assert.ok(isToolAllowedInMode("VERIFY", "workbench_delegate_worker"));
 });
 
 // ---------------------------------------------------------------------------
@@ -104,7 +104,28 @@ test("VERIFY hard-denies bash, edit and write (no free bash in P1)", () => {
 	assert.equal(checkToolCall("VERIFY", "workbench_read_run", {}).allowed, true);
 	assert.equal(checkToolCall("VERIFY", "workbench_read_gate", {}).allowed, true);
 	assert.equal(checkToolCall("VERIFY", "workbench_list_gates", {}).allowed, true);
+	assert.equal(checkToolCall("VERIFY", "workbench_review_worker_diff", {}).allowed, true);
+	assert.equal(checkToolCall("VERIFY", "workbench_delegation_status", {}).allowed, true);
 	assert.equal(checkToolCall("VERIFY", "workbench_delegate_worker", {}).allowed, false);
+	assert.equal(checkToolCall("VERIFY", "workbench_delegate_worker", {
+		task_kind: "implementation",
+		allowed_paths: [".pi/workbench/recipes.yaml"],
+		verification: [],
+	}).allowed, true);
+	assert.equal(checkToolCall("VERIFY", "workbench_delegate_worker", {
+		task_kind: "implementation",
+		allowed_paths: ["src/**"],
+	}).allowed, false);
+	assert.equal(checkToolCall("VERIFY", "workbench_git", {
+		action: "close_inactive_blocker",
+		delegation_id: "20260820-100000-test",
+	}).allowed, true);
+	assert.equal(checkToolCall("VERIFY", "workbench_git", { action: "close_clean_repair" }).allowed, true);
+	assert.equal(checkToolCall("VERIFY", "workbench_git", {
+		action: "quarantine_unreadable_authority",
+		delegation_id: "20260820-100000-test",
+	}).allowed, true);
+	assert.equal(checkToolCall("VERIFY", "workbench_git", { action: "checkpoint", message: "x" }).allowed, false);
 });
 
 test("DEV hard-denies nothing", () => {
@@ -241,8 +262,8 @@ test("DEV keeps non-managed custom tools from other extensions", () => {
 test("AUDIT and VERIFY tool sets are strict — only their declared tools are kept", () => {
 	const active = ["read", "bash", "workbench_run_recipe", "workbench_gate_check"];
 	assert.deepEqual(computeActiveTools("AUDIT", active), ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_read_run", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs", "workbench_recover_tool_result"]);
-	assert.deepEqual(computeActiveTools("VERIFY", active), ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_run_recipe", "workbench_read_run", "workbench_run_gate", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs", "workbench_recover_tool_result"]);
-	assert.ok(!computeActiveTools("VERIFY", active).includes("workbench_delegate_worker"));
+	assert.deepEqual(computeActiveTools("VERIFY", active), ["read", "grep", "find", "ls", "workbench_project_inspect", "workbench_run_recipe", "workbench_read_run", "workbench_run_gate", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs", "workbench_delegate_worker", "workbench_review_worker_diff", "workbench_delegation_status", "workbench_git", "workbench_recover_tool_result"]);
+	assert.ok(computeActiveTools("VERIFY", active).includes("workbench_delegate_worker"));
 });
 
 test("mode tool sets are deduplicated", () => {

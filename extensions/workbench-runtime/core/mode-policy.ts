@@ -15,8 +15,8 @@
  *            all workbench_* tools, including controlled worker delegation).
  *            Keeps any other non-managed custom tools that are currently active.
  *   VERIFY — read-only built-ins plus verification workbench tools. NO free
- *            bash/edit/write and NO worker delegation: the Sol commander runs
- *            declared recipes/gates and owns final judgment.
+ *            bash/edit/write; only exact review-gated recipes/gates config
+ *            maintenance may delegate. Sol owns review and final judgment.
  *
  * Second-layer protection (P1 + P5): see core/command-guard.ts (token-based
  * destructive-command detection) and core/path-policy.ts (protected
@@ -99,6 +99,16 @@ export const VERIFY_TOOLS: readonly string[] = [
 	"workbench_read_gate",
 	"workbench_list_gates",
 	"workbench_compare_runs",
+	// Narrow Sol/Luna configuration maintenance remains review-gated and is
+	// the only worker delegation admitted during VERIFY.
+	"workbench_delegate_worker",
+	// The maintenance result and any pre-existing blocker can be inspected and
+	// semantically resolved without leaving VERIFY.
+	"workbench_review_worker_diff",
+	"workbench_delegation_status",
+	// The controller and hard guard admit only immutable non-acceptance
+	// recovery actions; checkpoint and push remain DEV-only.
+	"workbench_git",
 	// P8b: the read-only recovery tool joins the VERIFY read-only set.
 	"workbench_recover_tool_result",
 ];
@@ -221,6 +231,22 @@ export interface ToolCallCheck {
 	reason?: string;
 }
 
+const VERIFY_CONFIG_MAINTENANCE_PATHS = new Set([
+	".pi/workbench/recipes.yaml",
+	".pi/workbench/gates.yaml",
+]);
+
+/** Exact, review-gated config maintenance lane allowed while VERIFY is blocked. */
+export function isVerifyConfigMaintenanceDelegation(input: unknown): boolean {
+	if (typeof input !== "object" || input === null || Array.isArray(input)) return false;
+	const record = input as Record<string, unknown>;
+	if (record.task_kind !== undefined && record.task_kind !== "implementation") return false;
+	if (!Array.isArray(record.allowed_paths) || record.allowed_paths.length === 0 ||
+		!record.allowed_paths.every((path) => typeof path === "string" && VERIFY_CONFIG_MAINTENANCE_PATHS.has(path))) return false;
+	if (record.verification !== undefined && (!Array.isArray(record.verification) || record.verification.length !== 0)) return false;
+	return true;
+}
+
 /**
  * Decide whether a tool call may execute.
  * 1. Hard mode denial (mutation/run/delegation in AUDIT;
@@ -231,7 +257,13 @@ export interface ToolCallCheck {
  *    credential files, per-mode read/write rules, see core/path-policy.ts.
  */
 export function checkToolCall(mode: WorkbenchMode, toolName: string, input: unknown): ToolCallCheck {
-	if (isToolHardDenied(mode, toolName)) {
+	const verifyAuthorityRecovery = mode === "VERIFY" && toolName === "workbench_git" &&
+		typeof input === "object" && input !== null && "action" in input &&
+		((input as { action?: unknown }).action === "close_clean_repair" ||
+			(input as { action?: unknown }).action === "close_inactive_blocker" ||
+			(input as { action?: unknown }).action === "quarantine_unreadable_authority");
+	const verifyConfigMaintenance = mode === "VERIFY" && toolName === WORKER_TOOL_NAME && isVerifyConfigMaintenanceDelegation(input);
+	if (!verifyAuthorityRecovery && !verifyConfigMaintenance && isToolHardDenied(mode, toolName)) {
 		return { allowed: false, reason: `Workbench ${mode} mode blocks tool "${toolName}"` };
 	}
 	if (toolName === "bash") {

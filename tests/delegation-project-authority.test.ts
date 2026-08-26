@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
-import { mkdir, readFile, symlink, utimes, writeFile } from "node:fs/promises";
+import { mkdir, readFile, symlink, unlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import test from "node:test";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import {
+	closeInactiveProjectDelegationBlockerV2,
 	projectDelegationDispositionV2,
+	quarantineProjectDelegationAuthorityV1,
+	readProjectDelegationBlockerV2,
 	readProjectDelegationRepairClosureV1,
 	readLatestProjectDelegationTransactionV2,
 	readRecoverableUnpublishedDelegationV2,
@@ -34,7 +37,7 @@ import {
 } from "../extensions/workbench-runtime/core/delegation-transaction.ts";
 import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { createWorkerWriteJournal, sealWorkerWriteJournal } from "../extensions/workbench-runtime/core/write-journal.ts";
-import { withTempDir } from "./helpers.ts";
+import { spawnExec, withTempDir } from "./helpers.ts";
 
 const HASH = "a".repeat(64);
 
@@ -190,6 +193,123 @@ test("reconcile never treats an incomplete v2-only project as having no delegati
 			assert.equal(reconciled.issue.code, "incomplete_v2_authority");
 			assert.equal(reconciled.issue.delegationId, incompleteId);
 		}
+	});
+});
+
+test("an unreadable ownerless v2 envelope can be quarantined without deleting it and later bytes require a new receipt", async () => {
+	await withTempDir(async (root) => {
+		const id = "20260820-100000-qrn1";
+		const v2 = join(root, CONFIG_DIR_NAME, "workbench", "delegations", id, "v2");
+		await mkdir(v2, { recursive: true });
+		const before = await readProjectDelegationRepairClosureV1(root);
+		assert.equal(before.ok, false);
+		if (!before.ok) assert.equal(before.issue.code, "incomplete_v2_authority");
+
+		const quarantined = await quarantineProjectDelegationAuthorityV1({
+			project_root: root,
+			delegation_id: id,
+			now: at(1),
+			quarantined_by: { provider: "openai", model: "gpt-5.6-sol" },
+		});
+		assert.equal(quarantined.ok, true, quarantined.ok ? "" : quarantined.code);
+		assert.equal(quarantined.ok && (await readFile(join(
+			root, CONFIG_DIR_NAME, "workbench", "delegation-authority-quarantine-v1", id,
+			`${quarantined.value.inventory_hash}.json`,
+		), "utf8")).includes(id), true);
+		assert.deepEqual(await readLatestProjectDelegationTransactionV2(root), { ok: true, value: null });
+		assert.deepEqual(await readProjectDelegationRepairClosureV1(root), {
+			ok: true, unresolvedTipId: null, rootCount: 0, lineageCount: 0,
+		});
+
+		await writeFile(join(v2, "late.tmp"), "changed after quarantine\n", "utf8");
+		const changed = await readProjectDelegationRepairClosureV1(root);
+		assert.equal(changed.ok, false);
+		if (!changed.ok) assert.equal(changed.issue.code, "incomplete_v2_authority");
+		const requarantined = await quarantineProjectDelegationAuthorityV1({
+			project_root: root,
+			delegation_id: id,
+			now: at(2),
+			quarantined_by: { provider: "openai", model: "gpt-5.6-sol" },
+		});
+		assert.equal(requarantined.ok, true, requarantined.ok ? "" : requarantined.code);
+		assert.equal(requarantined.ok && quarantined.ok && requarantined.value.inventory_hash !== quarantined.value.inventory_hash, true);
+		assert.deepEqual(await readLatestProjectDelegationTransactionV2(root), { ok: true, value: null });
+	});
+});
+
+test("an unreadable envelope with an active lock stays fail-closed and is never advertised as quarantinable", async () => {
+	await withTempDir(async (root) => {
+		const id = "20260820-100000-qact";
+		const v2 = join(root, CONFIG_DIR_NAME, "workbench", "delegations", id, "v2");
+		await mkdir(v2, { recursive: true });
+		await writeFile(join(v2, "transaction.lock"), "{}\n", "utf8");
+		const latest = await readLatestProjectDelegationTransactionV2(root);
+		assert.equal(latest.ok, false);
+		if (!latest.ok) assert.equal(latest.error.cause, "authority_not_quarantinable");
+		const quarantined = await quarantineProjectDelegationAuthorityV1({
+			project_root: root,
+			delegation_id: id,
+			now: at(1),
+			quarantined_by: { provider: "openai", model: "gpt-5.6-sol" },
+		});
+		assert.deepEqual(quarantined, { ok: false, code: "authority_quarantine_not_recoverable", delegation_id: id });
+	});
+});
+
+test("inactive blocker closure requires only its exact changed paths clean and preserves unrelated dirt", async () => {
+	await withTempDir(async (root) => {
+		assert.equal((await spawnExec("git", ["init", "-q"], { cwd: root })).code, 0);
+		await writeFile(join(root, "README.md"), "baseline\n", "utf8");
+		assert.equal((await spawnExec("git", ["add", "README.md"], { cwd: root })).code, 0);
+		assert.equal((await spawnExec("git", ["-c", "user.name=Workbench Test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "baseline"], { cwd: root })).code, 0);
+		const id = "20260820-100000-cls1";
+		const initial = await prepared(root, id, 0);
+		const journal = await createWorkerWriteJournal({ project_root: root, delegation_id: id, contract_hash: initial.contract_hash });
+		assert.equal(journal.ok, true, journal.ok ? "" : journal.error.code);
+		if (!journal.ok) return;
+		const running = await persistRunningDelegationTransaction(root, {
+			delegation_id: id, contract_hash: initial.contract_hash, worker_identity: initial.worker_identity,
+			expected_generation: initial.generation, expected_revision: initial.revision, now: at(1),
+		});
+		assert.equal(running.ok, true, running.ok ? "" : running.error.code);
+		if (!running.ok) return;
+		const committing = await persistCommittingDelegationTransaction(root, {
+			delegation_id: id, contract_hash: running.value.contract_hash, worker_identity: running.value.worker_identity,
+			expected_generation: running.value.generation, expected_revision: running.value.revision, now: at(2),
+			outcome: {
+				delegation_id: id, task_kind: "implementation", worker_identity: running.value.worker_identity,
+				provider_success: true, exit_code: 0, report_complete: true, terminal_facts_complete: true,
+				scope_complete: true, change_set_status: "ATTRIBUTED", changed_paths: ["src/rejected.ts"],
+				successful_write_count: 1, denied_write_count: 0, delta_hash: "d".repeat(64),
+			},
+		});
+		assert.equal(committing.ok, true, committing.ok ? "" : committing.error.code);
+		if (!committing.ok) return;
+		const recovery = await persistRecoveryRequiredDelegationTransaction(root, {
+			delegation_id: id, contract_hash: committing.value.contract_hash, worker_identity: committing.value.worker_identity,
+			expected_generation: committing.value.generation, expected_revision: committing.value.revision,
+			now: at(3), reason: "committed artifact construction failed",
+		});
+		assert.equal(recovery.ok, true, recovery.ok ? "" : recovery.error.code);
+		await mkdir(join(root, "src"), { recursive: true });
+		await writeFile(join(root, "src", "rejected.ts"), "discard me\n", "utf8");
+		await writeFile(join(root, "notes.txt"), "unrelated user work\n", "utf8");
+
+		const dirty = await closeInactiveProjectDelegationBlockerV2({
+			project_root: root, expected_delegation_id: id, now: at(4), exec: spawnExec,
+			closed_by: { provider: "openai", model: "gpt-5.6-sol" },
+		});
+		assert.equal(dirty.ok, false);
+		if (!dirty.ok) assert.equal(dirty.code, "relevant_paths_not_clean");
+
+		await unlink(join(root, "src", "rejected.ts"));
+		const closed = await closeInactiveProjectDelegationBlockerV2({
+			project_root: root, expected_delegation_id: id, now: at(5), exec: spawnExec,
+			closed_by: { provider: "openai", model: "gpt-5.6-sol" },
+		});
+		assert.equal(closed.ok, true, closed.ok ? "" : closed.code);
+		assert.equal(await readFile(join(root, "notes.txt"), "utf8"), "unrelated user work\n");
+		assert.deepEqual(await readProjectDelegationBlockerV2(root), { ok: true, value: null });
 	});
 });
 

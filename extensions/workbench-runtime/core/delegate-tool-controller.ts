@@ -3,6 +3,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import type { ExecFn } from "./config.ts";
+import { boundedCommandText, boundedInlineDetail } from "./command-output.ts";
 import { validateChangeSet, type ChangeSetRecord } from "./change-set.ts";
 import type { completeDefaultDelegationDeliveryV2 } from "./delegation-default-delivery.ts";
 import type { executeDelegationV2 } from "./delegation-execution-v2.ts";
@@ -12,6 +13,7 @@ import {
 	isStrictRetryableEmptyRepairRecoveryV2,
 } from "./delegation-execution-owner.ts";
 import type { makeDelegationId, readDelegationLedger } from "./delegation-ledger.ts";
+import { isVerifyConfigMaintenanceDelegation, type WorkbenchMode } from "./mode-policy.ts";
 import {
 	observeDiffChange,
 	recordDelegation,
@@ -38,6 +40,8 @@ import {
 	type DelegationCommittedGenerationV2,
 	type readDelegationCommittedGenerationV2,
 } from "./delegation-transaction-storage.ts";
+import { readDelegationInactiveBlockerClosureV2 } from "./delegation-authority-closure.ts";
+import { readDelegationCleanRepairAbandonmentV1 } from "./delegation-repair-abandonment.ts";
 import {
 	bindDelegationRepairLineageV1,
 	exactDelegationRepairAllowedPathsV1,
@@ -173,6 +177,7 @@ export interface DelegateToolController<TIngress> {
 	secrets: readonly string[];
 	trustedOrError(ctx: ExtensionContext): string | undefined;
 	projectRootFor(ctx: ExtensionContext): Promise<string>;
+	getMode?(): WorkbenchMode;
 	reconcileProjectAuthority(projectRoot: string, now: string): Promise<unknown>;
 	getProjectAuthorityBlockReason(action: "delegation"): string | undefined;
 	collectCurrentDelegationBinding(projectRoot: string, delegationId?: string): Promise<CurrentDelegationBinding>;
@@ -228,6 +233,9 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 				if (trustError) throw new Error(`workbench_delegate_worker: ${trustError}`);
 				const commanderError = commanderBlockReason(ctx.model?.provider, ctx.model?.id);
 				if (commanderError) throw new Error(commanderError);
+				if ((controller.getMode?.() ?? "DEV") === "VERIFY" && !isVerifyConfigMaintenanceDelegation(params)) {
+					throw new Error("workbench_delegate_worker: VERIFY permits only review-gated maintenance of exact recipes.yaml/gates.yaml paths with verification omitted");
+				}
 				const taskKind = resolveWorkerTaskKind(params.task_kind);
 				if (!taskKind.ok) throw new Error(`workbench_delegate_worker: ${taskKind.error}`);
 				const contract = normalizeDelegationBoundedTaskContractV2({
@@ -248,6 +256,27 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 				if (verificationRecipes === undefined) {
 					throw new Error("workbench_delegate_worker: invalid verification recipe reference");
 				}
+				const initialVerification = await validateWorkerVerificationRecipes(projectRoot, verificationRecipes);
+				if (!initialVerification.ok) {
+					const recipe = initialVerification.recipe === undefined ? undefined : boundedInlineDetail(initialVerification.recipe, 200);
+					const configRepair = initialVerification.code === "config_invalid" || initialVerification.code === "recipe_missing";
+					const nextAction = configRepair
+						? `retry workbench_delegate_worker with allowed_paths=[\".pi/workbench/recipes.yaml\"] and verification omitted to repair only the recipe declaration, review that delta, then retry the original delegation; this lane is available in DEV and VERIFY`
+						: "correct the verification contract to reference an existing write-free, parameter-free recipe, then retry";
+					return {
+						content: [{
+							type: "text" as const,
+							text: boundedCommandText(`workbench_delegate_worker: verification_${initialVerification.code}${recipe === undefined ? "" : `\nrecipe: ${recipe}`}\nnext_action: ${nextAction}`),
+						}],
+						details: {
+							ok: false,
+							error: `verification_${initialVerification.code}`,
+							...(recipe === undefined ? {} : { recipe }),
+							...(initialVerification.issue_count === undefined ? {} : { issue_count: initialVerification.issue_count }),
+							next_action: nextAction,
+						},
+					};
+				}
 				const verifyRecipesBeforeLaunch = async (): Promise<void> => {
 					const preflight = await validateWorkerVerificationRecipes(projectRoot, verificationRecipes);
 					if (!preflight.ok) {
@@ -255,7 +284,6 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 						throw new Error(`workbench_delegate_worker: verification ${preflight.code}${recipe}`);
 					}
 				};
-				await verifyRecipesBeforeLaunch();
 				if (contract.value.plan_ref !== undefined) {
 					const currentPlan = await verifyCurrentPlanReference(projectRoot, contract.value.plan_ref);
 					if (!currentPlan.ok) throw new Error(`workbench_delegate_worker: plan_ref ${currentPlan.error.code}`);
@@ -293,12 +321,32 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					return root.ok && hasDelegationSemanticRepairAuthorityV2(root.value) &&
 						root.value.semantic_repair!.decision_hash === state.repair_lineage.root_decision_hash;
 				};
+				const repairWasDurablyClosed = async (state: DelegationTransactionRecord): Promise<boolean> => {
+					const inactiveClosure = await readDelegationInactiveBlockerClosureV2(projectRoot, state);
+					if (!inactiveClosure.ok) {
+						throw new Error(`workbench_delegate_worker: repair_of ${state.delegation_id} blocker closure is ${inactiveClosure.error.code}`);
+					}
+					if (inactiveClosure.value !== undefined) return true;
+					const rootId = state.repair_lineage?.root_delegation_id ?? state.delegation_id;
+					const root = await readReview(projectRoot, rootId);
+					if (!root.ok || !hasDelegationSemanticRepairAuthorityV2(root.value)) return false;
+					const closed = await readDelegationCleanRepairAbandonmentV1(
+						projectRoot,
+						state,
+						root.value.semantic_repair!,
+					);
+					if (!closed.ok) throw new Error(`workbench_delegate_worker: repair_of ${state.delegation_id} clean-repair closure is ${closed.error.code}`);
+					return closed.value !== undefined;
+				};
 				let v2RepairAuthority: V2RepairAuthority | undefined;
 				if (contract.value.repair_of !== undefined) {
 					const repairId = contract.value.repair_of;
 					const priorV2 = await controller.services.readCommittedGeneration(projectRoot, repairId);
 					if (priorV2.ok) {
 						const parent = priorV2.value.state;
+						if (await repairWasDurablyClosed(parent)) {
+							throw new Error(`workbench_delegate_worker: repair_of ${repairId} was durably closed after the rejected delta was discarded; start an ordinary delegation`);
+						}
 						if (!await hasStrictLineageRoot(parent)) {
 							throw new Error(`workbench_delegate_worker: repair_of ${repairId} repair lineage root authority is invalid`);
 						}
@@ -368,6 +416,9 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 						}
 					} else if (priorV2.error.code === "invalid_record") {
 						const raw = await readTransaction(projectRoot, repairId);
+						if (raw.ok && await repairWasDurablyClosed(raw.value)) {
+							throw new Error(`workbench_delegate_worker: repair_of ${repairId} was durably closed after the rejected delta was discarded; start an ordinary delegation`);
+						}
 						const rawLineageRetryable = raw.ok && raw.value.repair_lineage !== undefined &&
 							(await isStrictRetryableAbortedRepairV2(projectRoot, raw.value) ||
 								await isStrictRetryableEmptyRepairRecoveryV2(projectRoot, raw.value));

@@ -1523,7 +1523,10 @@ test("leaving DEV, model change and session end revoke the lease and reapply loc
 	await runCmd(stubA, "q-mode-verify", "", { hasUI: true });
 	assert.match(await leaseStatusLine(stubA), /WRITE-LEASE revoked/);
 	assert.ok(!stubA.activeTools.includes("edit") && !stubA.activeTools.includes("write"));
-	assert.ok(!stubA.activeTools.includes("workbench_delegate_worker"), "VERIFY set applied");
+	assert.ok(stubA.activeTools.includes("workbench_delegate_worker"), "VERIFY exposes the guarded config-maintenance delegation lane");
+	assert.ok(stubA.activeTools.includes("workbench_review_worker_diff"), "VERIFY can review the maintenance result without changing mode");
+	assert.ok(stubA.activeTools.includes("workbench_delegation_status"), "VERIFY can diagnose the exact authority blocker");
+	assert.ok(stubA.activeTools.includes("workbench_git"), "VERIFY exposes only controller-guarded authority recovery actions");
 	await runCmd(stubA, "q-mode-dev", "", { hasUI: true });
 	assert.deepEqual(stubA.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST], "back to exact 16 after re-entering DEV");
 	// Model change: the lease is bound to GPT-5.6 Sol — it is revoked and the

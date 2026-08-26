@@ -247,6 +247,9 @@ export function delegationNextActionTextV1(
 ): string | undefined {
 	if (repair.kind === "authority_invalid") {
 		const subject = repair.delegationId === null ? "project delegation" : `delegation ${repair.delegationId}`;
+		if (repair.delegationId !== null && ["incomplete_v2_authority", "invalid_record", "unsupported_version"].includes(repair.code)) {
+			return `${subject} authority is ${repair.code}; call workbench_git action=quarantine_unreadable_authority delegation_id=${repair.delegationId} in DEV or VERIFY; source bytes and Git remain preserved`;
+		}
 		return `${subject} authority is ${repair.code}; repair, delegation, and VERIFY remain fail-closed`;
 	}
 	if (repair.kind === "delegation_active") {
@@ -255,21 +258,21 @@ export function delegationNextActionTextV1(
 	if (repair.kind === "delegation_retry") {
 		return repair.binding === "fresh"
 			? `continue with workbench_delegate_worker repair_of=${repair.delegationId}; do not retry review`
-			: `delegation ${repair.delegationId} is ${repair.transactionStatus}, but its binding is ${repair.binding}; inspect status before repair`;
+			: `delegation ${repair.delegationId} is ${repair.transactionStatus}, but its binding is ${repair.binding}; if its delta was discarded call workbench_git action=close_inactive_blocker delegation_id=${repair.delegationId}; unrelated work is preserved`;
 	}
 	if (repair.kind === "delegation_recovery") {
-		return `delegation ${repair.delegationId} is ${repair.transactionStatus}; query workbench_delegation_status for the recovery action; do not retry review`;
+		return `delegation ${repair.delegationId} is ${repair.transactionStatus}; if execution is inactive and its delta was discarded call workbench_git action=close_inactive_blocker delegation_id=${repair.delegationId}; do not retry review`;
 	}
 	if (repair.kind === "repair_required" || repair.kind === "repair_retry") {
 		if (repair.binding !== "fresh") {
-			return `delegation ${repair.delegationId} has REPAIR_REQUIRED authority but its current binding is ${repair.binding}; do not delegate until the exact bound workspace is restored`;
+			return `delegation ${repair.delegationId} has REPAIR_REQUIRED authority but its current binding is ${repair.binding}; restore the exact bound workspace to repair, or if the rejected delta was deliberately discarded call workbench_git action=close_inactive_blocker delegation_id=${repair.delegationId}; unrelated work is preserved and no new worktree is required`;
 		}
 		return `start the exact semantic repair with workbench_delegate_worker repair_of=${repair.delegationId}`;
 	}
 	if (repair.kind === "repair_terminal_retry") {
 		return repair.binding === "fresh"
 			? `continue the unresolved semantic repair with workbench_delegate_worker repair_of=${repair.delegationId}`
-			: `repair delegation ${repair.delegationId} is retryable but its current binding is ${repair.binding}; restore the exact workspace before retry`;
+			: `repair delegation ${repair.delegationId} is retryable but its current binding is ${repair.binding}; restore the exact workspace to retry, or if the rejected delta was deliberately discarded call workbench_git action=close_inactive_blocker delegation_id=${repair.delegationId}; unrelated work is preserved and no new worktree is required`;
 	}
 	if (repair.kind === "repair_review") {
 		return `review repair delegation ${repair.delegationId}; explicitly ACCEPT the corrected delta or issue another REPAIR`;

@@ -6,7 +6,7 @@ import { boundedCommandText, boundedInlineDetail } from "./command-output.ts";
 import type { ExecFn } from "./config.ts";
 import { blocksVerify, type DelegationState } from "./delegation-state.ts";
 import { gateParentSummaryLines } from "./gate-commands.ts";
-import { loadGates, preflightGateManualEvidence, runGates } from "./gate-engine.ts";
+import { GateSetupError, loadGates, preflightGateManualEvidence, runGates } from "./gate-engine.ts";
 import type { GateStatus, WorkerFirstGateFacts } from "./gate-schema.ts";
 import type { WorkbenchMode } from "./mode-policy.ts";
 import {
@@ -109,8 +109,35 @@ export function registerGateTools<TIngress>(controller: GateToolsController<TIng
 					workerFirstFacts,
 					actorFacts: controller.getIdentity(),
 				});
-				const text = boundedCommandText(gateParentSummaryLines(result, projectRoot).join("\n"));
-				const details = boundedGateDetails(result, projectRoot);
+				const missingRecipes = [...new Set(result.gates.flatMap((gate) => gate.checks)
+					.filter((check) => check.kind === "recipe" && check.failure_reason?.startsWith("no declared recipe among: "))
+					.flatMap((check) => check.failure_reason!.slice("no declared recipe among: ".length).split(", ")))]
+					.slice(0, 24)
+					.map((recipe) => boundedInlineDetail(recipe, 200));
+				const configInvalid = result.gates.flatMap((gate) => gate.checks)
+					.some((check) => check.kind === "config" && check.failure_reason?.startsWith("workbench config has issues:"));
+				const recovery = missingRecipes.length > 0
+					? {
+						code: "recipe_not_found",
+						missing_recipes: missingRecipes,
+						source_path: `${CONFIG_DIR_NAME}/workbench/recipes.yaml`,
+						next_action: `use workbench_delegate_worker with allowed_paths=[\"${CONFIG_DIR_NAME}/workbench/recipes.yaml\"] and verification omitted, review the config delta, then retry this Gate; this lane is available in DEV and VERIFY`,
+					}
+					: configInvalid
+						? {
+							code: "config_invalid",
+							source_path: `${CONFIG_DIR_NAME}/workbench`,
+							next_action: "use the narrow review-gated configuration maintenance delegation in the current DEV or VERIFY mode, then retry this Gate",
+						}
+						: undefined;
+				const text = boundedCommandText([
+					...gateParentSummaryLines(result, projectRoot),
+					...(recovery === undefined ? [] : [`recovery   : ${recovery.code}; next_action=${recovery.next_action}`]),
+				].join("\n"));
+				const details = {
+					...boundedGateDetails(result, projectRoot),
+					...(recovery === undefined ? {} : { recovery }),
+				};
 				onUpdate?.({ content: [{ type: "text", text }], details: { ...details } });
 				const toolResult = { content: [{ type: "text" as const, text }], details };
 				const authority = await buildTrustedRecoveryAuthority({
@@ -127,7 +154,21 @@ export function registerGateTools<TIngress>(controller: GateToolsController<TIng
 				});
 				trustedIngress = controller.bindTrustedIngressAuthority(authority, toolResult.content);
 				return toolResult;
-			} catch {
+			} catch (error) {
+				if (error instanceof GateSetupError) {
+					const setupError = boundedInlineDetail(error.message, 512);
+					const code = error.message.startsWith("selector ") || error.message.includes("gate(s) not available")
+						? "gate_selector_invalid"
+						: "gate_config_invalid";
+					const sourcePath = code === "gate_config_invalid" ? `${CONFIG_DIR_NAME}/workbench/gates.yaml` : `${CONFIG_DIR_NAME}/workbench`;
+					const nextAction = code === "gate_config_invalid"
+						? `use workbench_delegate_worker with allowed_paths=[\"${CONFIG_DIR_NAME}/workbench/gates.yaml\"] and verification omitted, review the config delta, then retry; this lane is available in DEV and VERIFY`
+						: "call workbench_list_gates, select an available exact gate id, then retry";
+					return {
+						content: [{ type: "text" as const, text: boundedCommandText(`workbench_run_gate: ${code}\nsetup_error: ${setupError}\nsource: ${sourcePath}\nnext_action: ${nextAction}`) }],
+						details: { ok: false, error: code, setup_error: setupError, source_path: sourcePath, next_action: nextAction },
+					};
+				}
 				return fixedToolFailure("workbench_run_gate", "runtime_error");
 			} finally {
 				controller.rememberTrustedIngressAuthority(toolCallId, "workbench_run_gate", trustedIngress);

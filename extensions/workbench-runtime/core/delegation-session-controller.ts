@@ -135,7 +135,19 @@ export function createDelegationSessionController(
 				return false;
 			}
 			projectAuthorityIssue = undefined;
-			if (reconciled.state === null || (reconciled.state === state && !strictMirrorDirty)) return true;
+			if (reconciled.state === null) {
+				if (state.latestId === undefined && !strictMirrorDirty) return true;
+				const cleared = emptyDelegationState();
+				try {
+					persistStrict(cleared);
+				} catch {
+					state = cleared;
+					strictMirrorDirty = true;
+					changed();
+				}
+				return true;
+			}
+			if (reconciled.state === state && !strictMirrorDirty) return true;
 			try {
 				persistStrict(reconciled.state);
 			} catch {

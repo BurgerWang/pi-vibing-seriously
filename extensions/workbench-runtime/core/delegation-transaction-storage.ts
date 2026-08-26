@@ -8,7 +8,7 @@
  */
 
 import { createHash, randomBytes } from "node:crypto";
-import { open, lstat, mkdir, readdir, rename, unlink, writeFile } from "node:fs/promises";
+import { open, lstat, mkdir, readFile, readdir, rename, unlink, writeFile } from "node:fs/promises";
 import { join, posix, resolve } from "node:path";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
@@ -175,6 +175,8 @@ export interface DelegationTransactionStorageAdapter {
 	randomToken(): string;
 	processId: number;
 	isProcessAlive(processId: number): boolean;
+	readBootId?(): Promise<string | null>;
+	readProcessStartTicks?(processId: number): Promise<string | null>;
 	fault?(point: DelegationTransactionStorageFaultPoint, bytes?: Readonly<Uint8Array>):
 		void | Uint8Array | Promise<void | Uint8Array>;
 }
@@ -205,6 +207,28 @@ async function nodeReadBounded(path: string, maxBytes: number): Promise<Uint8Arr
 		return buffer;
 	} finally {
 		await handle.close().catch(() => undefined);
+	}
+}
+
+async function nodeReadBootId(): Promise<string | null> {
+	try {
+		const value = (await readFile("/proc/sys/kernel/random/boot_id", "utf8")).trim().toLowerCase();
+		return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(value) ? value : null;
+	} catch {
+		return null;
+	}
+}
+
+async function nodeReadProcessStartTicks(processId: number): Promise<string | null> {
+	if (!Number.isSafeInteger(processId) || processId <= 0) return null;
+	try {
+		const raw = await readFile(`/proc/${processId}/stat`, "utf8");
+		const commandEnd = raw.lastIndexOf(")");
+		if (commandEnd < 0) return null;
+		const value = raw.slice(commandEnd + 1).trim().split(/\s+/u)[19];
+		return value !== undefined && /^(0|[1-9][0-9]*)$/u.test(value) ? value : null;
+	} catch {
+		return null;
 	}
 }
 
@@ -244,6 +268,8 @@ export function createNodeDelegationTransactionStorageAdapter(
 				return (error as NodeJS.ErrnoException).code === "EPERM";
 			}
 		},
+		readBootId: nodeReadBootId,
+		readProcessStartTicks: nodeReadProcessStartTicks,
 		fault,
 	};
 }
@@ -478,10 +504,12 @@ export function computeHistoricalSemanticMigrationBindingHashV2(
 }
 
 interface DelegationLockOwner {
-	schema_version: 1;
+	schema_version: 1 | 2;
 	delegation_id: string;
 	token: string;
 	process_id: number;
+	process_start_ticks?: string | null;
+	boot_id?: string | null;
 	created_at: string;
 }
 
@@ -490,7 +518,10 @@ interface HeldLock {
 	token: string;
 }
 
-const LOCK_FIELDS = ["schema_version", "delegation_id", "token", "process_id", "created_at"] as const;
+const LOCK_FIELDS_V1 = ["schema_version", "delegation_id", "token", "process_id", "created_at"] as const;
+const LOCK_FIELDS_V2 = ["schema_version", "delegation_id", "token", "process_id", "process_start_ticks", "boot_id", "created_at"] as const;
+const PROCESS_START_TICKS_RE = /^(0|[1-9]\d*)$/u;
+const BOOT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const IDENTITY_RECORD_FIELDS = [
 	"schema_version", "delegation_id", "task_kind", "contract_hash", "generation", "revision", "worker_identity",
 ] as const;
@@ -1125,11 +1156,54 @@ async function ensureLayout(
 }
 
 function parseLockOwner(raw: unknown, delegationId: string): DelegationLockOwner | undefined {
-	if (!isRecord(raw) || !exactFields(raw, LOCK_FIELDS)) return undefined;
-	if (raw.schema_version !== 1 || raw.delegation_id !== delegationId) return undefined;
+	if (!isRecord(raw) || (raw.schema_version === 1
+		? !exactFields(raw, LOCK_FIELDS_V1)
+		: raw.schema_version === 2 ? !exactFields(raw, LOCK_FIELDS_V2) : true)) return undefined;
+	if ((raw.schema_version !== 1 && raw.schema_version !== 2) || raw.delegation_id !== delegationId) return undefined;
 	if (typeof raw.token !== "string" || !/^[a-f0-9]{32}$/.test(raw.token)) return undefined;
 	if (!Number.isSafeInteger(raw.process_id) || Number(raw.process_id) <= 0 || !isCanonicalTime(raw.created_at)) return undefined;
+	if (raw.schema_version === 2 &&
+		!(raw.process_start_ticks === null || (typeof raw.process_start_ticks === "string" && PROCESS_START_TICKS_RE.test(raw.process_start_ticks)))) return undefined;
+	if (raw.schema_version === 2 &&
+		!(raw.boot_id === null || (typeof raw.boot_id === "string" && BOOT_ID_RE.test(raw.boot_id)))) return undefined;
 	return raw as unknown as DelegationLockOwner;
+}
+
+async function readLockBootId(adapter: DelegationTransactionStorageAdapter): Promise<string | null> {
+	try {
+		const value = await (adapter.readBootId ?? nodeReadBootId)();
+		return value !== null && BOOT_ID_RE.test(value) ? value : null;
+	} catch {
+		return null;
+	}
+}
+
+async function readLockProcessStartTicks(adapter: DelegationTransactionStorageAdapter, processId: number): Promise<string | null> {
+	try {
+		const value = await (adapter.readProcessStartTicks ?? nodeReadProcessStartTicks)(processId);
+		return value !== null && PROCESS_START_TICKS_RE.test(value) ? value : null;
+	} catch {
+		return null;
+	}
+}
+
+async function lockOwnerIsLive(owner: DelegationLockOwner, adapter: DelegationTransactionStorageAdapter): Promise<boolean> {
+	if (!adapter.isProcessAlive(owner.process_id)) return false;
+	// Historical v1 owners contain no process-incarnation facts. They retain
+	// the prior conservative PID-only behavior while every newly written v2
+	// lock is protected against PID reuse and reboot.
+	if (owner.schema_version === 1) return true;
+	if (owner.boot_id !== null) {
+		const currentBoot = await readLockBootId(adapter);
+		if (currentBoot === null) return true;
+		if (currentBoot !== owner.boot_id) return false;
+	}
+	if (owner.process_start_ticks !== null) {
+		const currentStart = await readLockProcessStartTicks(adapter, owner.process_id);
+		if (currentStart === null) return true;
+		if (currentStart !== owner.process_start_ticks) return false;
+	}
+	return true;
 }
 
 async function readBytesAtPoint(
@@ -1151,14 +1225,18 @@ async function acquireLock(
 	adapter: DelegationTransactionStorageAdapter,
 ): Promise<DelegationTransactionStorageResult<HeldLock>> {
 	if (!isCanonicalTime(now)) return failure("invalid_input", "lock time must be canonical ISO-8601");
+	const ownerBootId = await readLockBootId(adapter);
+	const ownerProcessStartTicks = await readLockProcessStartTicks(adapter, adapter.processId);
 	for (let attempt = 0; attempt <= DELEGATION_TRANSACTION_LOCK_RECOVERY_ATTEMPTS; attempt += 1) {
 		const token = storageToken(adapter);
 		if (token === undefined) return failure("storage_failure", "storage random token is invalid", "lock.acquire");
 		const owner: DelegationLockOwner = {
-			schema_version: 1,
+			schema_version: 2,
 			delegation_id: delegationId,
 			token,
 			process_id: adapter.processId,
+			process_start_ticks: ownerProcessStartTicks,
+			boot_id: ownerBootId,
 			created_at: now,
 		};
 		const encoded = encodeJson(owner, DELEGATION_TRANSACTION_LOCK_MAX_BYTES);
@@ -1173,7 +1251,8 @@ async function acquireLock(
 			created = true;
 			const read = await readBytesAtPoint(adapter, paths.lock, DELEGATION_TRANSACTION_LOCK_MAX_BYTES, "lock.owner.read");
 			const parsed = parseLockOwner(decodeJson(read), delegationId);
-			if (parsed === undefined || parsed.token !== token || parsed.process_id !== adapter.processId) {
+			if (parsed === undefined || parsed.token !== token || parsed.process_id !== adapter.processId ||
+				parsed.process_start_ticks !== ownerProcessStartTicks || parsed.boot_id !== ownerBootId) {
 				await releaseOwnedLockFile(paths.lock, token, adapter, false).catch(() => undefined);
 				return failure("storage_failure", "lock owner readback failed", "lock.owner.read");
 			}
@@ -1195,7 +1274,7 @@ async function acquireLock(
 		} catch {
 			existing = undefined;
 		}
-		if (existing !== undefined && adapter.isProcessAlive(existing.process_id)) {
+		if (existing !== undefined && await lockOwnerIsLive(existing, adapter)) {
 			return failure("conflict", "delegation transaction is locked by an active owner", "lock.acquire");
 		}
 		if (attempt >= DELEGATION_TRANSACTION_LOCK_RECOVERY_ATTEMPTS) {
