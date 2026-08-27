@@ -24,7 +24,7 @@ import {
 import {
 	hasDelegationSemanticRepairAuthorityV2,
 	hasDelegationSemanticReviewAuthorityV2,
-	isDelegationTerminalNegativeReviewEligibleV1,
+	isDelegationTerminalNegativeReviewEligibleFromCommittedV1,
 	readDelegationCommittedGenerationV2,
 	readDelegationReviewV2,
 	readDelegationSemanticRepairDecisionV1,
@@ -589,8 +589,13 @@ export async function readProjectDelegationRepairClosureV1(
 			if (read.value !== undefined) decisions.set(transaction.delegation_id, read.value);
 			continue;
 		}
-		if (transaction.repair_lineage !== undefined ||
-			!isDelegationTerminalNegativeReviewEligibleV1(transaction)) continue;
+		if (transaction.repair_lineage !== undefined
+			|| (transaction.status !== "FAILED" && transaction.status !== "INTERRUPTED")) continue;
+		const committed = await readDelegationCommittedGenerationV2(projectRoot, transaction.delegation_id);
+		if (!committed.ok) {
+			return { ok: false, issue: { code: committed.error.code, delegationId: transaction.delegation_id } };
+		}
+		if (!isDelegationTerminalNegativeReviewEligibleFromCommittedV1(transaction, committed.value.records)) continue;
 		const read = await readDelegationTerminalNegativeSolAuthorityV1(projectRoot, transaction.delegation_id);
 		if (read.ok) {
 			decisions.set(transaction.delegation_id, read.value.decision);
@@ -1069,7 +1074,8 @@ export async function readDelegationAuthorityObservationV2(
 	const transaction = committed.value.state;
 	if (transaction.status === "FAILED" || transaction.status === "INTERRUPTED") {
 		let terminalNegativeDecision: DelegationSemanticRepairDecisionV1 | undefined;
-		if (transaction.repair_lineage === undefined && isDelegationTerminalNegativeReviewEligibleV1(transaction)) {
+		if (transaction.repair_lineage === undefined
+			&& isDelegationTerminalNegativeReviewEligibleFromCommittedV1(transaction, committed.value.records)) {
 			const terminalNegative = await readDelegationTerminalNegativeSolAuthorityV1(projectRoot, delegationId);
 			if (terminalNegative.ok) terminalNegativeDecision = terminalNegative.value.decision;
 			else if (terminalNegative.error.code !== "not_found") {
@@ -1146,7 +1152,15 @@ async function readRepairRootDecisionV1(
 	if (!root.ok) {
 		return { ok: false, issue: { code: root.error.code, delegationId: rootDelegationId } };
 	}
-	if (root.value.repair_lineage === undefined && isDelegationTerminalNegativeReviewEligibleV1(root.value)) {
+	if (root.value.repair_lineage === undefined
+		&& (root.value.status === "FAILED" || root.value.status === "INTERRUPTED")) {
+		const committed = await readDelegationCommittedGenerationV2(projectRoot, rootDelegationId);
+		if (!committed.ok) {
+			return { ok: false, issue: { code: committed.error.code, delegationId: rootDelegationId } };
+		}
+		if (!isDelegationTerminalNegativeReviewEligibleFromCommittedV1(root.value, committed.value.records)) {
+			return { ok: true, value: undefined };
+		}
 		const terminal = await readDelegationTerminalNegativeSolAuthorityV1(projectRoot, rootDelegationId);
 		if (terminal.ok) return { ok: true, value: terminal.value.decision };
 		if (terminal.error.code === "not_found") return { ok: true, value: undefined };

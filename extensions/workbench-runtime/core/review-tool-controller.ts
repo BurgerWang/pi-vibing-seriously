@@ -2,6 +2,11 @@
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
+import {
+	delegationStatusToolActionV1,
+	repairDelegationToolActionV1,
+} from "./agent-next-action.ts";
+
 import type { ExecFn } from "./config.ts";
 import {
 	demoteReviewedToPending,
@@ -54,7 +59,7 @@ function semanticReviewHeader(
 ): string[] {
 	return [
 		`review kind: scope_integrity (mechanical evidence; never Gate authority)${selectorRecovered ? "; selector: RECOVERED_DURABLE_LATEST (stale provisional id/path hints ignored)" : ""}`,
-		`semantic review: ${semanticReview.toUpperCase()}${semanticReview === "accepted" ? ` — explicit Sol ACCEPT bound ${boundDiffHash}` : semanticReview === "repair_required" ? ` — explicit Sol REPAIR bound ${boundDiffHash}; run deterministic /q-repair ${repairOf ?? "20260823-000000-xxxx"}` : semanticReview === "required" ? ` — inspect the complete packet, then call again with semantic_decision=ACCEPT or REPAIR and expected_bound_diff_hash=${boundDiffHash}; REPAIR also requires repair_reason` : " — zero actual delta"}`,
+		`semantic review: ${semanticReview.toUpperCase()}${semanticReview === "accepted" ? ` — explicit Sol ACCEPT bound ${boundDiffHash}` : semanticReview === "repair_required" ? ` — explicit Sol REPAIR bound ${boundDiffHash}; ${repairDelegationToolActionV1(repairOf ?? "20260823-000000-xxxx")}` : semanticReview === "required" ? ` — inspect the complete packet, then call again with semantic_decision=ACCEPT or REPAIR and expected_bound_diff_hash=${boundDiffHash}; REPAIR also requires repair_reason` : " — zero actual delta"}`,
 	];
 }
 
@@ -171,10 +176,10 @@ export function registerReviewTool(controller: ReviewToolController): void {
 			const repairRequired = (delegationId: string, deterministicLineage = false) => ({
 				content: [{
 					type: "text" as const,
-					text: reviewText(
-						deterministicLineage
-							? `workbench_review_worker_diff: repair_required; delegation ${delegationId} cannot be completed by review; run /q-repair ${delegationId}; do not retry review`
-							: `workbench_review_worker_diff: repair_required; delegation ${delegationId} cannot be completed by review, but deterministic /q-repair authority is unavailable; call workbench_delegation_status and do not retry review`,
+						text: reviewText(
+							deterministicLineage
+								? `workbench_review_worker_diff: repair_required; delegation ${delegationId} cannot be completed by review; ${repairDelegationToolActionV1(delegationId)}; do not retry review`
+								: `workbench_review_worker_diff: repair_required; delegation ${delegationId} cannot be completed by review, but deterministic repair authority is unavailable; ${delegationStatusToolActionV1()} and do not retry review`,
 					),
 				}],
 				details: {
@@ -182,8 +187,9 @@ export function registerReviewTool(controller: ReviewToolController): void {
 					error: "repair_required",
 					authority_version: 2,
 					repair_of: delegationId,
-					next_action: deterministicLineage ? "q_repair_command" : "workbench_delegation_status",
-					...(deterministicLineage ? { next_action_command: `/q-repair ${delegationId}` } : {}),
+					next_action: deterministicLineage
+						? repairDelegationToolActionV1(delegationId)
+						: delegationStatusToolActionV1(),
 				},
 			});
 			if (packetMaxBytes <= 0 || packetMaxLines <= 0) {
@@ -207,7 +213,7 @@ export function registerReviewTool(controller: ReviewToolController): void {
 			if (initialState.latestId === undefined) {
 				return {
 					content: [{ type: "text", text: reviewText("workbench_review_worker_diff: no delegation to review; start a worker delegation first") }],
-					details: { ok: false, error: "no_delegation", next_action: "workbench_delegate_worker" },
+					details: { ok: false, error: "no_delegation", next_action: "call workbench_delegate_worker with a bounded ordinary contract" },
 				};
 			}
 			const selectorRecovered = !semanticDecisionSupplied
@@ -222,7 +228,7 @@ export function registerReviewTool(controller: ReviewToolController): void {
 						error: "not_latest_delegation",
 						delegation_id: delegationId,
 						latest_delegation_id: initialState.latestId,
-						next_action: "retry_without_delegation_id",
+						next_action: "call workbench_review_worker_diff without delegation_id",
 					},
 				};
 			}
@@ -312,7 +318,7 @@ export function registerReviewTool(controller: ReviewToolController): void {
 								review_kind: "scope_integrity",
 								gate_authority: false,
 								...(v2Result.binding_hash === undefined ? {} : { binding_hash: v2Result.binding_hash }),
-								...(migrationBlocked ? { next_action: "workbench_review_worker_diff", delegation_id: delegationId } : {}),
+								...(migrationBlocked ? { next_action: `call workbench_review_worker_diff with delegation_id=${delegationId}`, delegation_id: delegationId } : {}),
 						},
 					};
 				}
@@ -395,7 +401,7 @@ export function registerReviewTool(controller: ReviewToolController): void {
 				if (semanticDecisionSupplied) {
 					return {
 						content: [{ type: "text", text: reviewText("workbench_review_worker_diff: semantic ACCEPT requires strict v2 provisional authority; legacy review is read-only compatibility evidence and must use bounded repair") }],
-						details: { ok: false, error: "semantic_accept_requires_v2", authority_version: 1, review_kind: "scope_integrity", gate_authority: false, next_action: "workbench_delegate_worker_repair_of" },
+						details: { ok: false, error: "semantic_accept_requires_v2", authority_version: 1, review_kind: "scope_integrity", gate_authority: false, next_action: delegationStatusToolActionV1() },
 					};
 				}
 				result = await controller.services.reviewLegacy({
@@ -478,8 +484,7 @@ export function registerReviewTool(controller: ReviewToolController): void {
 					...(semanticReview === "repair_required"
 						? {
 							repair_of: delegationId,
-							next_action: "q_repair_command",
-							next_action_command: `/q-repair ${delegationId}`,
+							next_action: repairDelegationToolActionV1(delegationId),
 							...(repairDecisionHash === undefined ? {} : { repair_decision_hash: repairDecisionHash }),
 							...(repairReasonHash === undefined ? {} : { repair_reason_hash: repairReasonHash }),
 						}

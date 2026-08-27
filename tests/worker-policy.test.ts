@@ -147,6 +147,7 @@ test("diagnosis and invalid workers have a read-only advertised matrix", () => {
 test("worker-role filtering still hides recursion/final-gate tools from the strict Sol DEV allowlist (P7)", () => {
 	const workerTools = computeRoleActiveTools(STRICT_SOL_DEV_ALLOWLIST, WORKER_ROLE);
 	assert.ok(!workerTools.includes("workbench_delegate_worker"), "workers can never recursively delegate");
+	assert.ok(!workerTools.includes("workbench_repair_delegation"), "workers can never start or replay an exact repair successor");
 	assert.ok(!workerTools.includes("workbench_run_gate"), "workers can never run final gates");
 	assert.ok(!workerTools.includes("workbench_git"), "workers can never checkpoint or publish Git state");
 	assert.ok(workerTools.includes("read"));
@@ -156,6 +157,7 @@ test("worker-role filtering still hides recursion/final-gate tools from the stri
 test("worker role blocks recursion, free bash, final gates, and out-of-scope writes", () => {
 	const context = { role: WORKER_ROLE, projectRoot: "/repo", allowedPaths: ["src/**", "tests/new.test.ts"] };
 	assert.match(workerRoleToolCallBlockReason(context, "workbench_delegate_worker", {}) ?? "", /recursively/);
+	assert.match(workerRoleToolCallBlockReason(context, "workbench_repair_delegation", {}) ?? "", /Sol commander/);
 	assert.match(workerRoleToolCallBlockReason(context, "bash", { command: "npm test" }) ?? "", /declared workbench recipes/);
 	assert.match(workerRoleToolCallBlockReason(context, "workbench_run_gate", {}) ?? "", /Sol commander/);
 	assert.match(workerRoleToolCallBlockReason(context, "workbench_git", {}) ?? "", /Sol commander/);
@@ -425,8 +427,9 @@ test("worker-delegation documentation defines fixed Sol/Luna boundaries and stri
 	assert.match(doc, /at most one worker writes to a worktree at any time/);
 	// Current worker-first write authority and the single public v2 transaction.
 	assert.match(doc, /## Fixed Sol -> Luna write authority \(current; legacy id P7\)/);
-	assert.match(doc, /fixed 16-tool\s+read\/control\/delegation\/Git-completion surface/);
+	assert.match(doc, /fixed 17-tool\s+read\/control\/delegation\/Git-completion\/exact-repair surface/);
 	assert.match(doc, /`workbench_git`/);
+	assert.match(doc, /`workbench_repair_delegation`/);
 	assert.match(doc, /Only current HEAD to the same named branch on an existing remote is allowed/);
 	assert.match(doc, /cannot amend, reset, clean, stash, switch branches, delete refs,\s+force-push/);
 	assert.match(doc, /routine source,\s+test, and documentation edits are delegated to Luna/);

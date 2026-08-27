@@ -3,6 +3,10 @@
 import type { ExtensionAPI, ExtensionContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 
 import { canonicalHash } from "../cache/canonical-hash.ts";
+import {
+	repairDelegationToolActionV1,
+	reviewDelegationToolActionV1,
+} from "./agent-next-action.ts";
 import type { ExecFn } from "./config.ts";
 import { boundedCommandText, boundedInlineDetail } from "./command-output.ts";
 import { validateChangeSet, type ChangeSetRecord } from "./change-set.ts";
@@ -50,7 +54,6 @@ import {
 	delegationGenerationRecordRelativePathV2,
 	hasDelegationSemanticRepairAuthorityV2,
 	hasDelegationSemanticReviewAuthorityV2,
-	isDelegationTerminalNegativeReviewEligibleV1,
 	readDelegationTerminalNegativeSolAuthorityV1,
 	readDelegationTransactionV2,
 	readDelegationReviewV2,
@@ -143,7 +146,7 @@ interface V2RepairAuthority {
 	expectedBindingHash: string;
 	bindingKind: "exact" | "terminal-rebase";
 	repairLineage?: DelegationRepairLineageV1;
-	/** Present only for the in-process `/q-repair` bridge. Never model-derived. */
+	/** Present only for an exact repair service bridge. Never model-derived. */
 	exactCommandAuthority?: ExactRepairCommandAuthorityV1;
 }
 
@@ -304,6 +307,12 @@ export interface DelegateToolController<TIngress> {
 	rememberTrustedIngressAuthority(toolCallId: unknown, toolName: unknown, bound: TIngress | undefined): void;
 	/** Lease acquired by the ordered tool_call barrier before receipt creation. */
 	checkoutOperationForToolCall?(toolCallId: string, projectRoot: string): ProjectCheckoutOperationLeaseV1 | undefined;
+	/**
+	 * Safe compatibility router for historical model calls that supplied
+	 * repair_of on this broad tool. It consumes only the id and recovers the
+	 * complete executable contract from immutable authority.
+	 */
+	executeModelRepairAlias?: DelegateWorkerExecuteV1;
 }
 
 export interface DelegateToolServices {
@@ -418,7 +427,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					throw new Error("workbench_delegate_worker: in-process exact repair authority binding is invalid");
 				}
 				if (contract.value.repair_of !== undefined && exactRepairAuthority === undefined) {
-					throw new Error(`workbench_delegate_worker: model-supplied repair_of ${contract.value.repair_of} has no exact in-process authority; run /q-repair ${contract.value.repair_of}`);
+					throw new Error(`workbench_delegate_worker: unbound repair_of ${contract.value.repair_of} reached the delegation kernel`);
 				}
 				const projectRoot = await controller.projectRootFor(ctx);
 				const guardedCheckoutOperation = controller.checkoutOperationForToolCall?.(toolCallId, projectRoot);
@@ -573,7 +582,8 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					const rootId = state.repair_lineage.root_delegation_id;
 					const rootState = await readTransaction(projectRoot, rootId);
 					if (!rootState.ok) return false;
-					if (isDelegationTerminalNegativeReviewEligibleV1(rootState.value)) {
+					if (rootState.value.repair_lineage === undefined
+						&& (rootState.value.status === "FAILED" || rootState.value.status === "INTERRUPTED")) {
 						const terminal = await readTerminalNegativeRepair(projectRoot, rootId);
 						return terminal.ok && terminal.value.decision.decision_hash === state.repair_lineage.root_decision_hash;
 					}
@@ -600,7 +610,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 							throw new Error(`workbench_delegate_worker: repair_of ${state.delegation_id} root closure is ${rootState.error.code}`);
 						}
 						if (rootState.value.repair_lineage === undefined &&
-							isDelegationTerminalNegativeReviewEligibleV1(rootState.value)) {
+							(rootState.value.status === "FAILED" || rootState.value.status === "INTERRUPTED")) {
 							const terminalRoot = await readTerminalNegativeRepair(projectRoot, rootId);
 							if (terminalRoot.ok) rootDecision = terminalRoot.value.decision;
 							else if (terminalRoot.error.code !== "not_found") {
@@ -1322,7 +1332,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					const deterministicTerminalRepair = ["FAILED", "RECOVERY_REQUIRED"].includes(status)
 						&& durableExecutionState?.repair_lineage !== undefined;
 					const nextAction = deterministicTerminalRepair
-						? `; next_action=run /q-repair ${delegationId}`
+						? `; next_action=${repairDelegationToolActionV1(delegationId)}`
 						: "; next_action=call workbench_delegation_status";
 					const mirrorWarning = sessionMirrorWarnings.length === 0
 						? ""
@@ -1386,7 +1396,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 						reviewPostprocessing = {
 							status: "RETRYABLE_FAILURE",
 							code: delivery.review_error ?? delivery.code,
-							next_action: delivery.next_action ?? `/q-review ${delegationId}`,
+							next_action: delivery.next_action ?? reviewDelegationToolActionV1(delegationId),
 						};
 					} else {
 						automaticSemanticReview = delivery.automatic_semantic_review;
@@ -1485,8 +1495,15 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 				}
 			}
 			};
-	const execute: DelegateWorkerExecuteV1 = (toolCallId, params, signal, onUpdate, ctx) =>
-		executeKernel(toolCallId, params, signal, onUpdate, ctx);
+	const execute: DelegateWorkerExecuteV1 = async (toolCallId, params, signal, onUpdate, ctx) => {
+		if (params.repair_of !== undefined) {
+			if (controller.executeModelRepairAlias === undefined) {
+				throw new Error("workbench_delegate_worker: exact repair compatibility router is unavailable");
+			}
+			return controller.executeModelRepairAlias(toolCallId, params, signal, onUpdate, ctx);
+		}
+		return executeKernel(toolCallId, params, signal, onUpdate, ctx);
+	};
 	const executeExactRepair: DelegateExactRepairExecuteV1 = (authority, signal, onUpdate, ctx) =>
 		executeKernel(authority.tool_call_id, authority.arguments, signal, onUpdate, ctx, authority);
 	controller.pi.registerTool({

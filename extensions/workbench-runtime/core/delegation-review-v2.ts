@@ -47,6 +47,7 @@ import {
 	hasDelegationSemanticRepairAuthorityV2,
 	hasDelegationSemanticReviewAuthorityV2,
 	hasDelegationTerminalNegativeSemanticRepairAuthorityV1,
+	isDelegationTerminalNegativeReviewEligibleFromCommittedV1,
 	isDelegationTerminalNegativeReviewEligibleV1,
 	persistDelegationReviewProvisionalV2,
 	persistDelegationTerminalNegativeReviewProvisionalV1,
@@ -319,7 +320,7 @@ interface GenerationReviewAuthority {
 function authorityFromGeneration(generation: DelegationCommittedGenerationV2): GenerationReviewAuthority | undefined {
 	const state = generation.state;
 	const ordinaryReview = state.status === "PENDING_REVIEW" || state.status === "REVIEWED";
-	const terminalNegativeReview = isDelegationTerminalNegativeReviewEligibleV1(state);
+	const terminalNegativeReview = isDelegationTerminalNegativeReviewEligibleFromCommittedV1(state, generation.records);
 	if (state.task_kind !== "implementation" || state.terminal_outcome === null || state.committed_proof === null ||
 		(!ordinaryReview && !terminalNegativeReview)) return undefined;
 	const before = generation.records["before.json"];
@@ -505,8 +506,9 @@ function committedStructuredReviewAuthorityForLifecycleV2(
 		const info = authorityFromGeneration(generation as DelegationCommittedGenerationV2);
 		const lifecycleMatches = lifecycle === "pending"
 			? generation.state.status === "PENDING_REVIEW" && reviewAuthority.state.status === "PENDING_REVIEW"
-			: isDelegationTerminalNegativeReviewEligibleV1(generation.state)
-				&& isDelegationTerminalNegativeReviewEligibleV1(reviewAuthority.state);
+			: isDelegationTerminalNegativeReviewEligibleFromCommittedV1(generation.state, generation.records)
+				&& (isDelegationTerminalNegativeReviewEligibleV1(reviewAuthority.state)
+					|| reviewAuthority.terminal_negative_legacy_clean_command === true);
 		if (info === undefined || !lifecycleMatches
 			|| reviewAuthority.state.delegation_id !== generation.state.delegation_id
 			|| reviewAuthority.state.contract_hash !== generation.state.contract_hash
@@ -638,7 +640,7 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 		const generation = await readDelegationCommittedGenerationV2(input.projectRoot, input.delegationId, input.storage);
 		if (!generation.ok) return fail("authority_invalid", "delegation committed-generation authority is unavailable");
 		const state = generation.value.state;
-		const terminalNegative = isDelegationTerminalNegativeReviewEligibleV1(state);
+		const terminalNegative = isDelegationTerminalNegativeReviewEligibleFromCommittedV1(state, generation.value.records);
 		if (acceptDecision && terminalNegative) {
 			return fail("invalid_state", "terminal-negative delegations can never publish semantic ACCEPT or ordinary REVIEWED authority", { transaction: state });
 		}

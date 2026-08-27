@@ -8,8 +8,8 @@
  *   commander (S) — assistant message usage, additionally grouped per
  *                   `${provider}/${responseModel ?? model}` (same key Pi's
  *                   getUsageCostBreakdown uses)
- *   worker    (W) — toolResult usage whose toolName is
- *                   `workbench_delegate_worker`
+ *   worker    (W) — toolResult usage whose toolName is a worker-launching
+ *                   delegate or exact-repair tool
  *   other     (O) — every other toolResult usage plus branch_summary and
  *                   compaction usage (Pi's "Tools/summaries" bucket)
  *
@@ -58,6 +58,10 @@
 
 /** The tool whose toolResult usage is attributed to the worker bucket. */
 export const WORKER_TOOL_NAME = "workbench_delegate_worker";
+export const WORKER_TOOL_NAMES: ReadonlySet<string> = new Set([
+	WORKER_TOOL_NAME,
+	"workbench_repair_delegation",
+]);
 
 export type CostBucketName = "commander" | "worker" | "other";
 
@@ -190,7 +194,7 @@ function classifyEntry(entry: unknown): ClassifiedEntry | null {
 		const usage = extractUsage(m);
 		// Pi counts a toolResult only when it carries usage.
 		if (!usage) return null;
-		return { bucket: m.toolName === WORKER_TOOL_NAME ? "worker" : "other", usage, compaction: false };
+		return { bucket: typeof m.toolName === "string" && WORKER_TOOL_NAMES.has(m.toolName) ? "worker" : "other", usage, compaction: false };
 	}
 	return null;
 }
@@ -618,7 +622,7 @@ export function renderCostBreakdown(breakdown: CostBreakdown, options?: CostBrea
 	const lines = [
 		"session cost breakdown (from session entries):",
 		row("commander", breakdown.commander, "(assistant usage)"),
-		row("worker", breakdown.worker, "(workbench_delegate_worker tool results)"),
+		row("worker", breakdown.worker, "(delegate and exact-repair worker tool results)"),
 		row("other", breakdown.other, "(other tool results + branch summaries/compaction)"),
 		row("total", breakdown.total, "(commander + worker + other, exact)"),
 		"commander by model:",

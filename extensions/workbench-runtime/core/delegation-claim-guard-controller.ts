@@ -3,6 +3,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { sha256Hex } from "../cache/canonical-hash.ts";
+import { repairDelegationToolActionV1 } from "./agent-next-action.ts";
 import {
 	exactRepairToolArgumentsV1,
 	type ExactRepairToolArgumentsV1,
@@ -200,10 +201,10 @@ function exactRepairDirectiveContentV1(
 ): string {
 	return [
 		`[${EXACT_REPAIR_DIRECTIVE_SCHEMA}]`,
-		"Compatibility notice only: this raw prompt did not execute a repair.",
-		`The deterministic user-only route is /q-repair ${repairOf}; it invokes the same delegate execution service without an agent turn.`,
-		"Do not call workbench_delegate_worker with repair_of: model-supplied repair parameters are intentionally rejected.",
-		"Do not report an attempt or persistence failure; no delegate execution occurred in this turn.",
+		"The raw repair pointer is compatibility input, not executable contract authority.",
+		`Required action: ${repairDelegationToolActionV1(repairOf)}.`,
+		"Pass only the delegation id. The tool recovers the complete immutable contract and replays an existing successor idempotently.",
+		"Do not report an attempt or persistence failure until the tool returns durable successor facts.",
 	].join("\n");
 }
 
@@ -980,7 +981,7 @@ function claimGuardNextAction(
 		if (facts.attemptedDelegateCalls === 0 && facts.freshStatusFacts.length === 1) {
 			const observed = facts.freshStatusFacts[0]!;
 			if (observed.transaction_status === "PENDING_REVIEW" && observed.session_status === "PENDING_REVIEW") {
-				return `${noDelegateCall}use deterministic /q-repair ${observed.delegation_id}; it validates strict durable repair authority and fails closed before worker start when unavailable; never call workbench_delegate_worker with raw repair_of or guess a receipt id`;
+				return `${noDelegateCall}${repairDelegationToolActionV1(observed.delegation_id)}; it validates strict durable repair authority and fails closed before worker start when unavailable; never guess a receipt id`;
 			}
 		}
 		return `${noDelegateCall}do not claim a current-turn worker attempt or completion; query workbench_delegation_status and follow its persisted next action`;
@@ -989,7 +990,7 @@ function claimGuardNextAction(
 		if (facts.durableAttemptFacts.length === 1) {
 			const attempt = facts.durableAttemptFacts[0]!;
 			if (attempt.transaction_status === "FAILED") {
-				return `discard guessed delegation ids; current-turn durable delegation ${attempt.delegation_id} is FAILED; run /q-repair ${attempt.delegation_id} for the deterministic authority check, which fails closed before worker start without a strict terminal-negative decision; never call raw repair_of`;
+				return `discard guessed delegation ids; current-turn durable delegation ${attempt.delegation_id} is FAILED; ${repairDelegationToolActionV1(attempt.delegation_id)} for the deterministic authority check, which fails closed before worker start without a strict terminal-negative decision`;
 			}
 			return `discard guessed delegation ids; current-turn durable delegation ${attempt.delegation_id} is ${attempt.transaction_status}; query workbench_delegation_status and follow its persisted next action`;
 		}
@@ -1150,10 +1151,9 @@ export function registerDelegationClaimGuard(controller: DelegationClaimGuardCon
 		baselineCaptured = true;
 	};
 
-	// Legacy raw repair prose is compatibility input only.  Confirm that strict
-	// durable semantic authority exists, then point to the deterministic
-	// user-command route.  The model is never instructed to replay raw
-	// repair_of parameters, which the production delegate controller rejects.
+	// Legacy raw repair prose is compatibility input only. Confirm that strict
+	// durable semantic authority exists, then point the commander at the
+	// id-only model tool. No prompt-derived contract fields become authority.
 	controller.pi.on("before_agent_start", async (event, ctx) => {
 		if (!controller.isCommander()) return undefined;
 		try {
@@ -1210,12 +1210,15 @@ export function registerDelegationClaimGuard(controller: DelegationClaimGuardCon
 			}
 			return;
 		}
-		if (event.toolName !== "workbench_delegate_worker" || event.isError) return;
+		if ((event.toolName !== "workbench_delegate_worker" && event.toolName !== "workbench_repair_delegation") || event.isError) return;
 		const result = ownDataValue(event, "result");
 		const details = ownDataValue(result, "details");
 		const id = ownDataValue(details, "delegation_id");
 		const status = ownDataValue(details, "status");
-		if (typeof id === "string" && DELEGATION_TRANSACTION_ID_RE.test(id) && status === "success") {
+		const successorStatus = ownDataValue(details, "successor_status");
+		const successfulRepairSuccessor = successorStatus === "PENDING_REVIEW" || successorStatus === "REVIEWED" || successorStatus === "FINISHED";
+		if (typeof id === "string" && DELEGATION_TRANSACTION_ID_RE.test(id) &&
+			(status === "success" || successfulRepairSuccessor)) {
 			successfulResultIds.add(id);
 		}
 	});
@@ -1231,7 +1234,8 @@ export function registerDelegationClaimGuard(controller: DelegationClaimGuardCon
 				const block = ownDataValue(content, String(index));
 				if (ownDataValue(block, "type") !== "toolCall") continue;
 				hasToolCall = true;
-				if (ownDataValue(block, "name") !== "workbench_delegate_worker") continue;
+				const toolName = ownDataValue(block, "name");
+				if (toolName !== "workbench_delegate_worker" && toolName !== "workbench_repair_delegation") continue;
 				const id = validToolCallId(ownDataValue(block, "id"));
 				if (id) attemptedCallIds.add(id);
 			}

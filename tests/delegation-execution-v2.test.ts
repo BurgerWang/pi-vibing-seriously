@@ -13,6 +13,10 @@ import {
 	type DelegationBoundedTaskContractBindingV2,
 } from "../extensions/workbench-runtime/core/delegation-transaction-artifacts.ts";
 import {
+	beginRecipeCommandEffectCapture,
+	completeRecipeCommandEffectCapture,
+} from "../extensions/workbench-runtime/core/command-effect.ts";
+import {
 	executeDelegationV2,
 	type ExecuteDelegationV2Input,
 } from "../extensions/workbench-runtime/core/delegation-execution-v2.ts";
@@ -33,6 +37,7 @@ import {
 } from "../extensions/workbench-runtime/core/delegation-ledger.ts";
 import {
 	createNodeDelegationTransactionStorageAdapter,
+	isDelegationTerminalNegativeReviewEligibleV1,
 	readDelegationCommittedGenerationV2,
 	readDelegationTransactionV2,
 } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
@@ -48,6 +53,7 @@ import type { ExecFn } from "../extensions/workbench-runtime/core/config.ts";
 import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { EMPTY_WORKER_WRITE_JOURNAL_RUNTIME_OBSERVATION } from "../extensions/workbench-runtime/core/worker-write-journal-runtime.ts";
 import { beginWriteJournalOperation, completeWriteJournalOperation } from "../extensions/workbench-runtime/core/write-journal.ts";
+import { beginRunTransaction, commitRunTransaction } from "../extensions/workbench-runtime/core/run-transaction.ts";
 import type { WorkerRunResult } from "../extensions/workbench-runtime/worker/runner.ts";
 
 const HEAD = "1".repeat(40);
@@ -242,6 +248,75 @@ async function createThenEditWorker(
 	};
 }
 
+async function commitFailedCleanWorkerRecipe(
+	projectRoot: string,
+	delegationId: string,
+	contractHash: string,
+): Promise<void> {
+	const runId = "20260827-185440-tf01";
+	const startedAt = "2026-08-27T11:54:40.123Z";
+	const finishedAt = "2026-08-27T11:54:40.193Z";
+	const started = await beginRecipeCommandEffectCapture({
+		project_root: projectRoot,
+		exec: realExec,
+		declared_writes: [],
+	});
+	const effect = await completeRecipeCommandEffectCapture({
+		project_root: projectRoot,
+		exec: realExec,
+		started,
+		run_id: runId,
+		recipe: "expected-no-write-check",
+		actor: "worker",
+		worker_delegation_id: delegationId,
+		worker_contract_hash: contractHash,
+		mutation_declaration: "none",
+		declared_writes: [],
+	});
+	assert.equal(effect.status, "CLEAN");
+	const transaction = await beginRunTransaction(projectRoot, runId);
+	const manifest = {
+		schema_version: 2,
+		run_id: runId,
+		recipe: effect.recipe,
+		profile: "generic",
+		started_at: startedAt,
+		finished_at: finishedAt,
+		duration_ms: 70,
+		cwd: projectRoot,
+		argv: ["fixture-check"],
+		exit_code: 2,
+		timed_out: false,
+		cancelled: false,
+		git_commit: null,
+		git_dirty: true,
+		artifact_paths: [],
+		stdout_truncated: false,
+		stderr_truncated: false,
+		mode: "DEV",
+		expected_exit_codes: [0],
+		declared_writes: [],
+		environment_names: [],
+		validation_components: [],
+		cache_request_mode: "no-cache",
+		run_transaction_schema_version: 2,
+		run_outcome: "PROCESS_FAILED",
+		command_effect_path: "command-effect.json",
+		command_effect_hash: effect.command_effect_hash,
+		command_effect_status: effect.status,
+	};
+	await Promise.all([
+		writeFile(join(transaction.stagingDir, "manifest.json"), JSON.stringify(manifest), "utf8"),
+		writeFile(join(transaction.stagingDir, "command-effect.json"), JSON.stringify(effect), "utf8"),
+		writeFile(join(transaction.stagingDir, "command.json"), "{}", "utf8"),
+		writeFile(join(transaction.stagingDir, "environment.json"), "{}", "utf8"),
+		writeFile(join(transaction.stagingDir, "summary.json"), "{}", "utf8"),
+		writeFile(join(transaction.stagingDir, "stdout.log"), "expected validation failure\n", "utf8"),
+		writeFile(join(transaction.stagingDir, "stderr.log"), "", "utf8"),
+	]);
+	await commitRunTransaction(transaction, new Date(finishedAt));
+}
+
 async function input(
 	projectRoot: string,
 	delegationId: string,
@@ -334,6 +409,54 @@ test("execution v2: implementation commits PENDING_REVIEW and strict reader retu
 		workerIdentity: executionInput.workerIdentity,
 		secrets: executionInput.secrets,
 	});
+});
+
+test("execution v2: a failed CLEAN recipe fails the worker without inventing workspace drift", async (t) => {
+	const projectRoot = await root(t);
+	const delegationId = id(52);
+	const path = "src/command-failure.ts";
+	const report = [
+		"## Completed",
+		"- Completed the bounded source change.",
+		"## Files Changed",
+		`- \`${path}\``,
+		"## Verification",
+		"- expected-no-write-check — failed because a later promotion has not run",
+		"## Remaining Risks",
+		"- Promotion remains pending.",
+	].join("\n");
+	const executionInput = await input(projectRoot, delegationId, "implementation", after([path]), worker(report));
+	executionInput.runWorker = async () => {
+		const result = await journalWorker(
+			projectRoot,
+			delegationId,
+			executionInput.contract.contract_hash,
+			[path],
+			worker(report),
+		);
+		await commitFailedCleanWorkerRecipe(projectRoot, delegationId, executionInput.contract.contract_hash);
+		return result;
+	};
+	const result = await executeDelegationV2(executionInput);
+	assert.equal(result.ok, false);
+	if (result.ok) return;
+	assert.equal(result.code, "postconditions_failed");
+	assert.equal(result.durable_state?.status, "FAILED");
+	assert.deepEqual(result.durable_state?.postcondition_reasons, ["WORKER_RUN_FAILED"]);
+	assert.equal(result.durable_state?.terminal_outcome?.worker_success, false);
+	assert.equal(result.durable_state?.terminal_outcome?.worker_failure_code, "COMMAND_EFFECT_RUN_FAILED");
+	assert.equal(result.durable_state?.terminal_outcome?.change_set_status, "ATTRIBUTED");
+	assert.equal(result.worker_failure_code, "COMMAND_EFFECT_RUN_FAILED");
+
+	const committed = await readDelegationCommittedGenerationV2(projectRoot, delegationId);
+	assert.equal(committed.ok, true, committed.ok ? "" : committed.error.code);
+	if (!committed.ok) return;
+	assert.equal(isDelegationTerminalNegativeReviewEligibleV1(committed.value.state), true);
+	const scope = committed.value.records["scope.json"] as Record<string, any>;
+	assert.equal(scope.change_set.status, "ATTRIBUTED");
+	assert.equal(scope.command_provenance.effective_status, "ATTRIBUTED");
+	assert.deepEqual(scope.command_provenance.remaining_workspace_drift, []);
+	assert.deepEqual(scope.command_provenance.terminal_reasons, ["COMMAND_EFFECT_RUN_FAILED"]);
 });
 
 test("execution v2: an over-envelope delivery never enters PENDING and exposes strict repair_of recovery authority", async (t) => {

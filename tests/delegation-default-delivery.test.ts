@@ -296,7 +296,7 @@ test("scope/integrity FAIL returns its packet without closing or replaying", asy
 	assert.equal(result.state.status, "PENDING_REVIEW");
 	assert.equal(result.automatic_semantic_review?.status, "RETRYABLE_FAILURE");
 	assert.equal(result.automatic_semantic_review?.code, "MECHANICAL_SCOPE_INTEGRITY_FAILED");
-	assert.equal(result.automatic_semantic_review?.next_action, `/q-review ${ID}`);
+	assert.equal(result.automatic_semantic_review?.next_action, `call workbench_review_worker_diff with delegation_id=${ID}`);
 	assert.equal(calls, 1);
 	assert.deepEqual(persisted, [result.state]);
 });
@@ -550,7 +550,7 @@ test("automatic semantic REPAIR stays worker-success/PENDING and routes only to 
 			receipt_hash: "e".repeat(64),
 			nested_usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 			mechanical_page_calls: 0,
-			next_action: `/q-repair ${ID}`,
+			next_action: `call workbench_repair_delegation with delegation_id=${ID}`,
 			review_result: successfulReview({}, false),
 		})) as never,
 	});
@@ -558,7 +558,7 @@ test("automatic semantic REPAIR stays worker-success/PENDING and routes only to 
 	if (!result.ok) return;
 	assert.equal(result.state.status, "PENDING_REVIEW");
 	assert.equal(result.semantic_review, "repair_required");
-	assert.equal(result.automatic_semantic_review?.next_action, `/q-repair ${ID}`);
+	assert.equal(result.automatic_semantic_review?.next_action, `call workbench_repair_delegation with delegation_id=${ID}`);
 });
 
 test("automatic model failure preserves worker-success/PENDING and exact q-review recovery", async () => {
@@ -580,12 +580,12 @@ test("automatic model failure preserves worker-success/PENDING and exact q-revie
 			bound_diff_hash: REVIEW_HASH,
 			nested_usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 			mechanical_page_calls: 0,
-			next_action: `/q-review ${ID}`,
+			next_action: `call workbench_review_worker_diff with delegation_id=${ID}`,
 		})) as never,
 	});
 	assert.equal(result.ok, true);
 	if (!result.ok) return;
 	assert.equal(result.state.status, "PENDING_REVIEW");
 	assert.equal(result.semantic_review, "required");
-	assert.equal(result.automatic_semantic_review?.next_action, `/q-review ${ID}`);
+	assert.equal(result.automatic_semantic_review?.next_action, `call workbench_review_worker_diff with delegation_id=${ID}`);
 });

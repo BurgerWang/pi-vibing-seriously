@@ -39,6 +39,7 @@ export const WORKER_HIDDEN_TOOLS: ReadonlySet<string> = new Set([
 	"bash",
 	"workbench_run_gate",
 	"workbench_git",
+	"workbench_repair_delegation",
 	WORKER_TOOL_NAME,
 ]);
 const WORKER_READ_ONLY_HIDDEN_TOOLS: ReadonlySet<string> = new Set(["edit", "write"]);
@@ -198,6 +199,7 @@ export function workerRoleToolCallBlockReason(
 ): string | undefined {
 	if (context.role !== WORKER_ROLE) return undefined;
 	if (toolName === WORKER_TOOL_NAME) return "Delegated workers cannot recursively delegate another worker";
+	if (toolName === "workbench_repair_delegation") return "Delegated workers cannot start or replay repair successors; the Sol commander owns exact repair execution";
 	if (toolName === "workbench_run_gate") return "Delegated workers cannot run final validation gates; the Sol commander owns verification";
 	if (toolName === "workbench_git") return "Delegated workers cannot checkpoint or publish Git state; the Sol commander owns Git completion";
 	if (toolName === "bash") return "Delegated workers cannot use free-form bash; use declared workbench recipes for project commands";

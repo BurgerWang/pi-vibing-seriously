@@ -140,7 +140,7 @@ function repairReview(delegationId = ID): AutomaticSemanticReviewResult {
 		replayed: false,
 		nested_usage: zeroUsage,
 		mechanical_page_calls: 1,
-		next_action: `/q-repair ${delegationId}`,
+		next_action: `call workbench_repair_delegation with delegation_id=${delegationId}`,
 	};
 }
 
@@ -563,13 +563,13 @@ test("agent follow-up and next_action use only the strict durable successor disp
 		nextAction: string | null;
 	}> = [
 		{ status: "REVIEWED", disposition: "CHAIN_CLOSED", triggerTurn: true, nextAction: null },
-		{ status: "REVIEWED", disposition: "BLOCKED", serviceStatus: "SUCCESSOR_BLOCKED", triggerTurn: false, nextAction: "/q-delegation-status" },
-		{ status: "FINISHED", disposition: "BLOCKED", serviceStatus: "SUCCESSOR_BLOCKED", triggerTurn: false, nextAction: "/q-delegation-status" },
-		{ status: "PENDING_REVIEW", disposition: "REVIEW_PENDING", triggerTurn: false, nextAction: `/q-review ${CHILD}` },
-		{ status: "PENDING_REVIEW", disposition: "REPAIR_PENDING", triggerTurn: false, nextAction: `/q-repair ${CHILD}` },
-		{ status: "FAILED", disposition: "EXACT_REPAIR_PENDING", serviceStatus: "EXACT_REPAIR_PENDING", triggerTurn: false, nextAction: `/q-repair ${CHILD}` },
-		{ status: "PREPARED", disposition: "ACTIVE", serviceStatus: "SUCCESSOR_ACTIVE", triggerTurn: false, nextAction: "/q-delegation-status" },
-		{ status: "ABORTED", disposition: "BLOCKED", serviceStatus: "SUCCESSOR_BLOCKED", triggerTurn: false, nextAction: "/q-delegation-status" },
+		{ status: "REVIEWED", disposition: "BLOCKED", serviceStatus: "SUCCESSOR_BLOCKED", triggerTurn: false, nextAction: "call workbench_delegation_status" },
+		{ status: "FINISHED", disposition: "BLOCKED", serviceStatus: "SUCCESSOR_BLOCKED", triggerTurn: false, nextAction: "call workbench_delegation_status" },
+		{ status: "PENDING_REVIEW", disposition: "REVIEW_PENDING", triggerTurn: false, nextAction: `call workbench_review_worker_diff with delegation_id=${CHILD}` },
+		{ status: "PENDING_REVIEW", disposition: "REPAIR_PENDING", triggerTurn: false, nextAction: `call workbench_repair_delegation with delegation_id=${CHILD}` },
+		{ status: "FAILED", disposition: "EXACT_REPAIR_PENDING", serviceStatus: "EXACT_REPAIR_PENDING", triggerTurn: false, nextAction: `call workbench_repair_delegation with delegation_id=${CHILD}` },
+		{ status: "PREPARED", disposition: "ACTIVE", serviceStatus: "SUCCESSOR_ACTIVE", triggerTurn: false, nextAction: "call workbench_delegation_status" },
+		{ status: "ABORTED", disposition: "BLOCKED", serviceStatus: "SUCCESSOR_BLOCKED", triggerTurn: false, nextAction: "call workbench_delegation_status" },
 	];
 	for (const entry of cases) {
 		const h = harness({

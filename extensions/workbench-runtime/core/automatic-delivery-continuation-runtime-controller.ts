@@ -11,6 +11,12 @@
 
 import { types as utilTypes } from "node:util";
 
+import {
+	delegationStatusToolActionV1,
+	repairDelegationToolActionV1,
+	reviewDelegationToolActionV1,
+} from "./agent-next-action.ts";
+
 import type {
 	BeforeAgentStartEventResult,
 	ExtensionAPI,
@@ -287,17 +293,17 @@ function chainNextAction(chain: DeliveryChainCoordinatorResultV1): string | null
 	const successor = chain.repair.successor;
 	switch (successor.disposition) {
 		case "CHAIN_CLOSED":
-			return successor.status === "REVIEWED" ? null : "/q-delegation-status";
+			return successor.status === "REVIEWED" ? null : delegationStatusToolActionV1();
 		case "REVIEW_PENDING":
 			return successor.status === "PENDING_REVIEW"
-				? `/q-review ${successor.delegation_id}`
-				: "/q-delegation-status";
+				? reviewDelegationToolActionV1(successor.delegation_id)
+				: delegationStatusToolActionV1();
 		case "REPAIR_PENDING":
 		case "EXACT_REPAIR_PENDING":
-			return `/q-repair ${successor.delegation_id}`;
+			return repairDelegationToolActionV1(successor.delegation_id);
 		case "ACTIVE":
 		case "BLOCKED":
-			return "/q-delegation-status";
+			return delegationStatusToolActionV1();
 	}
 }
 
@@ -330,7 +336,7 @@ function projection(result: AutomaticDeliveryContinuationLifecycleResultV1): Aut
 		successor_delegation_id: successor?.delegation_id ?? null,
 		successor_status: successor?.status ?? null,
 		successor_disposition: successor?.disposition ?? null,
-		next_action: chain === undefined ? (result.status === "BLOCKED" ? "/q-delegation-status" : null) : chainNextAction(chain),
+		next_action: chain === undefined ? (result.status === "BLOCKED" ? delegationStatusToolActionV1() : null) : chainNextAction(chain),
 		nested_usage: usage === undefined ? null : Object.freeze({
 			input: usage.input,
 			output: usage.output,

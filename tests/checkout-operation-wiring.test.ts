@@ -143,6 +143,25 @@ test("delegate guard acquires the exact lifecycle lane before beginning any rece
 	assert.equal(harness.pending.get("delegate-call")?.delegation_id, DELEGATION_ID);
 });
 
+test("exact repair routers skip only the outer lane and still create receipts", async () => {
+	for (const [toolCallId, toolName, input] of [
+		["repair-tool", "workbench_repair_delegation", { delegation_id: DELEGATION_ID }],
+		["repair-alias", "workbench_delegate_worker", {
+			task: "ignored",
+			allowed_paths: ["ignored.ts"],
+			acceptance_criteria: ["ignored"],
+			repair_of: DELEGATION_ID,
+		}],
+	] as const) {
+		const harness = guardHarness();
+		const result = await harness.handler({ toolCallId, toolName, input }, context());
+		assert.equal(result, undefined);
+		assert.deepEqual(harness.order, ["receipt"], `${toolName} outer router must not deadlock the private delegation lane`);
+		assert.equal(harness.acquisitions.length, 0);
+		assert.equal(harness.pending.size, 0);
+	}
+});
+
 test("review presentation and unknown custom tools both require the closed checkout lane", async () => {
 	for (const [toolCallId, toolName] of [
 		["review-call", "workbench_review_worker_diff"],

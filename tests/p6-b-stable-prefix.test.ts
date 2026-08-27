@@ -184,11 +184,11 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 	assert.equal(a.toolOrderHash, canonicalHash(VERIFY_TOOLS), "order hash = canonical hash of the explicit MODE_TOOLS order");
 });
 
-test("v0.10.0 public tool surface has the intentional structured-Git transition hash", () => {
+test("current public tool surface has the intentional exact-repair transition hash", () => {
 	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
-	const currentHash = "ed864c3e9bbf65d6ed57da63e6b343fbf23fa63e72286dc61b34f7221eb9e3f9";
+	const currentHash = "500227ecb3461a35028bfda935d070f17547f24329ff4bd2c5ef2b2e3452fe39";
 	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
-	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the documented 0.10.0 hash");
+	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the exact-repair transition hash");
 });
 
 test("the stable-zone contract constants are explicit and disjoint", () => {
@@ -394,7 +394,7 @@ test("workbench_delegate_worker metadata is static, compact, and preserves autho
 	// advances for the additive optional task_kind field, while the separately
 	// retained governance-v1 schema remains pinned to its repair_of baseline.
 	assert.equal(meta.name, "workbench_delegate_worker");
-	assert.equal(WORKBENCH_TOOL_NAMES.indexOf("workbench_delegate_worker"), WORKBENCH_TOOL_NAMES.length - 5, "delegate tool keeps its registration position (seven existing → delegate → review → status → recovery → local commit)");
+	assert.equal(WORKBENCH_TOOL_NAMES.indexOf("workbench_delegate_worker"), 7, "delegate tool keeps its established registration position");
 	// The canonical schema object itself (not only its hash): budget_profile
 	// stays OPTIONAL — absent from `required` — and its nested union carries
 	// the JSON Schema `default: "standard"` annotation plus the exact
@@ -618,9 +618,9 @@ test("computeActiveTools: DEV foreign-tool order is deterministic (sorted by nam
 	assert.deepEqual(a, computeActiveTools("DEV", ["read", "bash", ...foreign]));
 });
 
-test("P7/P8b order stays fixed and structured Git completion is appended last", () => {
+test("P7/P8b order stays fixed and exact repair is appended additively", () => {
 	const names = [...WORKBENCH_TOOL_NAMES];
-	assert.equal(names.length, 12, "twelve workbench custom tools after structured Git completion");
+	assert.equal(names.length, 13, "thirteen workbench custom tools after exact repair routing");
 	assert.deepEqual(
 		names.slice(0, 7),
 		["workbench_project_inspect", "workbench_run_recipe", "workbench_read_run", "workbench_run_gate", "workbench_read_gate", "workbench_list_gates", "workbench_compare_runs"],
@@ -632,7 +632,7 @@ test("P7/P8b order stays fixed and structured Git completion is appended last", 
 		"the three P7 tools follow in strict delegate → review → status order",
 	);
 	assert.deepEqual(names.slice(10, 11), ["workbench_recover_tool_result"], "the P8b recovery tool keeps its position");
-	assert.deepEqual(names.slice(11), ["workbench_git"], "structured Git completion is appended LAST");
+	assert.deepEqual(names.slice(11), ["workbench_git", "workbench_repair_delegation"], "exact repair is an additive stable-prefix transition after structured Git");
 	// Every P7/P8b tool's metadata stays free of dynamic values (no dates,
 	// times, hashes, absolute paths, or concrete run/gate/task ids).
 	for (const name of names.slice(7)) {
@@ -684,8 +684,8 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.equal(
 		canonicalHash(workbenchToolMetadataOrdered()),
-		"97468f141695ae59a81eef17b15e42e72b3457106f07503fe17e39ba9f7375b8",
-		"current public catalog hash is machine-pinned after full authority recovery was added",
+		"6e624d8e5df34ab0c79f87909d5f956f9271491f48c508098af88797e8b472fb",
+		"current public catalog hash is machine-pinned after model-callable exact repair was added",
 	);
 });
 
@@ -1277,11 +1277,12 @@ test("no dynamic tool loader: tools are registered statically — the three fixe
 	const delegateController = await readFile(new URL("core/delegate-tool-controller.ts", EXTENSION_DIR), "utf8");
 	const recoveryController = await readFile(new URL("core/recovery-tool-controller.ts", EXTENSION_DIR), "utf8");
 	const localCommitController = await readFile(new URL("core/local-commit-tool-controller.ts", EXTENSION_DIR), "utf8");
+	const exactRepairToolController = await readFile(new URL("core/exact-repair-tool-controller.ts", EXTENSION_DIR), "utf8");
 	// exactly one setActiveTools call site (applyModeTools) — the tool set is
 	// swapped only on mode switches / session_start, never per turn
 	assert.equal(index.split("setActiveTools(").length - 1, 1, "setActiveTools called from exactly one place");
-	// exactly the three fixed native overrides + the 12 workbench catalog
-	// tools are registered (15 total), in the fixed order
+	// exactly the three fixed native overrides + the 13 workbench catalog
+	// tools are registered (16 total), in the fixed order
 	const indexRegistrations = index.split("pi.registerTool({").slice(1);
 	const registrations = [
 		...nativeController.split("controller.pi.registerTool({").slice(1),
@@ -1293,12 +1294,13 @@ test("no dynamic tool loader: tools are registered statically — the three fixe
 		...delegationStatusController.split("controller.pi.registerTool({").slice(1),
 		...recoveryController.split("controller.pi.registerTool({").slice(1),
 		...localCommitController.split("controller.pi.registerTool({").slice(1),
+		...exactRepairToolController.split("controller.pi.registerTool({").slice(1),
 		...indexRegistrations,
 	];
 	assert.equal(
 		registrations.length,
 		NATIVE_OVERRIDE_NAMES.length + WORKBENCH_TOOL_NAMES.length,
-		"one registerTool per native override and catalog tool (3 + 12 = 15)",
+		"one registerTool per native override and catalog tool (3 + 13 = 16)",
 	);
 	const registered: string[] = [];
 	for (const block of registrations) {
@@ -1321,7 +1323,7 @@ test("no dynamic tool loader: tools are registered statically — the three fixe
 		"registration order == NATIVE_OVERRIDE_NAMES + WORKBENCH_TOOL_NAMES (WORKBENCH_TOOL_NAMES itself unchanged)",
 	);
 	// no registerTool inside any loop construct (static registration only)
-	for (const line of `${nativeController}\n${recipeController}\n${gateController}\n${compareController}\n${delegateController}\n${reviewController}\n${delegationStatusController}\n${recoveryController}\n${localCommitController}\n${index}`.split("\n")) {
+	for (const line of `${nativeController}\n${recipeController}\n${gateController}\n${compareController}\n${delegateController}\n${reviewController}\n${delegationStatusController}\n${recoveryController}\n${localCommitController}\n${exactRepairToolController}\n${index}`.split("\n")) {
 		if (line.includes("registerTool")) {
 			assert.ok(!/(for|while|forEach|\.map)\(/.test(line), `registerTool must not appear in a loop: ${line.trim()}`);
 		}

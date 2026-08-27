@@ -7,8 +7,8 @@
  *    "extension direct-load smoke test" as a repeatable unit test.
  * 2. Inventory: the registered command set must be exact and deterministic
  *    deterministic workbench commands, the registered tool surface exactly
- *    the 14 tools (three fixed native read/grep/find overrides first, then
- *    the 11 workbench catalog tools), and the 7 prompt templates — no
+ *    the 16 tools (three fixed native read/grep/find overrides first, then
+ *    the 13 workbench catalog tools), and the 7 prompt templates — no
  *    missing, extra, or colliding names. The P7 lease commands and the P5
  *    milestone handoff are user-only: they are commands, never model tools.
  */
@@ -88,6 +88,8 @@ export const EXPECTED_TOOLS = [
 	"workbench_recover_tool_result",
 	// Structured Git completion is the additive final catalog tool.
 	"workbench_git",
+	// Exact repair is appended after Git and accepts only a delegation id.
+	"workbench_repair_delegation",
 ] as const;
 
 export const EXPECTED_PROMPTS = ["q-audit", "q-plan", "q-build", "q-debug", "q-verify", "q-optimize", "q-code-review"] as const;
@@ -131,7 +133,7 @@ test("extension module direct-loads and registers the exact deterministic comman
 	);
 });
 
-test("extension registers exactly 15 tools: the three fixed native overrides first, then the 12 workbench catalog tools", () => {
+test("extension registers exactly 16 tools: the three fixed native overrides first, then the 13 workbench catalog tools", () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	const tools = stub.tools as Map<string, unknown>;
@@ -140,7 +142,7 @@ test("extension registers exactly 15 tools: the three fixed native overrides fir
 	assert.deepEqual(
 		[...tools.keys()],
 		[...NATIVE_OVERRIDE_NAMES, ...EXPECTED_TOOLS],
-		"native read/grep/find fixed first, then the 12 catalog tools in order (15 total)",
+		"native read/grep/find fixed first, then the 13 catalog tools in order (16 total)",
 	);
 	const catalogTools = [...tools.keys()].filter((n) => n.startsWith("workbench_"));
 	assert.deepEqual(catalogTools, [...EXPECTED_TOOLS], "catalog subset matches the current additive inventory");

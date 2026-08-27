@@ -5,6 +5,7 @@ import { createHash } from "node:crypto";
 import { canonicalHash } from "../cache/canonical-hash.ts";
 import { validateChangeSet, type ChangeSetRecord } from "./change-set.ts";
 import {
+	isDelegationCommandScopeAttributedV1,
 	validateDelegationCommandProvenance,
 	type DelegationCommandProvenanceRecord,
 } from "./delegation-command-effect-provenance.ts";
@@ -238,7 +239,10 @@ function strictCommittedRepairScopeV1(
 		!Array.isArray(scopeAllowedPaths) || !scopeAllowedPaths.every((path): path is string => typeof path === "string") ||
 		!sameStrings(scopeChangedPaths, effectivePaths) || !sameStrings(scopeAllowedPaths, state.allowed_paths) ||
 		!sameStrings(outcome.changed_paths, effectivePaths) || outcome.change_set_status !== effectiveStatus ||
-		effectiveStatus !== "ATTRIBUTED" || outcome.delta_hash !== effectiveHash ||
+		(commandProvenance === undefined
+			? effectiveStatus !== "ATTRIBUTED"
+			: !isDelegationCommandScopeAttributedV1(commandProvenance, changeSet)) ||
+		outcome.delta_hash !== effectiveHash ||
 		outcome.terminal_facts_complete !== true || outcome.scope_complete !== true) return undefined;
 	if (commandProvenance !== undefined &&
 		(commandProvenance.delegation_id !== state.delegation_id ||

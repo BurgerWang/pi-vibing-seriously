@@ -23,7 +23,10 @@ import {
 } from "./delegation-command-effect-provenance.ts";
 import type { DelegationSessionController } from "./delegation-session-controller.ts";
 import { registerDelegationStatusTool } from "./delegation-status-tool-controller.ts";
-import { registerDelegateTool } from "./delegate-tool-controller.ts";
+import {
+	registerDelegateTool,
+	type DelegateWorkerExecuteV1,
+} from "./delegate-tool-controller.ts";
 import {
 	readDelegationCommittedGenerationV2,
 	readDelegationReviewV2,
@@ -33,6 +36,7 @@ import {
 import { registerExactRepairCommandV1 } from "./exact-repair-command.ts";
 import { runExactRepairServiceV1 } from "./exact-repair-service.ts";
 import { readExactRepairSuccessorV1 } from "./exact-repair-successor.ts";
+import { registerExactRepairToolV1 } from "./exact-repair-tool-controller.ts";
 import { registerGateTools } from "./gate-tools-controller.ts";
 import type { WorkerFirstGateFacts } from "./gate-schema.ts";
 import { registerGitTool } from "./local-commit-tool-controller.ts";
@@ -168,6 +172,7 @@ export function registerRuntimeWorkbenchToolsV1(
 		bindTrustedIngressAuthority: controller.transientState.bindTrustedIngressAuthority,
 		rememberTrustedIngressAuthority: controller.transientState.rememberTrustedIngressAuthority,
 	});
+	let executeModelRepairAlias: DelegateWorkerExecuteV1 | undefined;
 	const delegateExecution = registerDelegateTool({
 		pi: controller.pi,
 		services: RUNTIME_CONTROLLER_SERVICES.delegate,
@@ -192,6 +197,12 @@ export function registerRuntimeWorkbenchToolsV1(
 		checkoutOperationForToolCall: (toolCallId, projectRoot) => {
 			const lease = pendingCheckoutOperationHandles.get(toolCallId);
 			return lease?.project_root === projectRoot ? lease : undefined;
+		},
+		executeModelRepairAlias: (...args) => {
+			if (executeModelRepairAlias === undefined) {
+				throw new Error("workbench_delegate_worker: exact repair compatibility router is unavailable");
+			}
+			return executeModelRepairAlias(...args);
 		},
 	});
 	const automaticDeliveryContinuation = createAutomaticDeliveryContinuationRuntimeControllerV1({
@@ -334,6 +345,24 @@ export function registerRuntimeWorkbenchToolsV1(
 		reconcileProjectAuthority: controller.delegationSession.reconcileProjectAuthority,
 		refreshStatus: controller.refreshStatus,
 	});
+	const exactRepairToolExecution = registerExactRepairToolV1({
+		pi: controller.pi,
+		execution: delegateExecution,
+		serviceDependencies: {
+			collectCurrentBinding: controller.delegationSession.collectCurrentBinding,
+			readCommittedGeneration: readDelegationCommittedGenerationV2,
+			readReview: readDelegationReviewV2,
+			readTerminalNegativeRepair: readDelegationTerminalNegativeSolAuthorityV1,
+			readSuccessor: readExactRepairSuccessorV1,
+			readTransaction: readDelegationTransactionV2,
+		},
+		trustedOrError: controller.trustedOrError,
+		projectRootFor: controller.projectRootFor,
+		getMode: controller.getMode,
+		runtimeCurrentOrError: () => runtimeFreshnessError(true),
+		reconcileProjectAuthority: controller.delegationSession.reconcileProjectAuthority,
+	});
+	executeModelRepairAlias = exactRepairToolExecution.executeDelegateAlias;
 	automaticDeliveryContinuation.registerToolResultLocatorCaptureBeforeMiddleware();
 	registerToolResultMiddleware({
 		pi: controller.pi,

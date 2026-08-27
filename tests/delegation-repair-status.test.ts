@@ -86,13 +86,13 @@ test("repair status projects a fresh negative decision into one exact next actio
 	});
 	assert.equal(status.kind, "repair_required");
 	assert.equal(delegationNextActionTextV1(state, status),
-		`run /q-repair ${ID} to execute the exact semantic repair directly from strict durable authority`);
+		`call workbench_repair_delegation with delegation_id=${ID} to execute the exact semantic repair directly from strict durable authority`);
 	assert.match(delegationRepairStatusLinesV1(status).join("\n"), /REPAIR_REQUIRED/);
-	assert.match(delegationRepairStatusLinesV1(status).join("\n"), new RegExp(`/q-repair ${ID}`));
+	assert.match(delegationRepairStatusLinesV1(status).join("\n"), new RegExp(`workbench_repair_delegation with delegation_id=${ID}`));
 	assert.doesNotMatch(delegationRepairStatusLinesV1(status).join("\n"), /call workbench_delegate_worker/u);
 	assert.equal(
 		delegationExactRepairRouteLineV1(status),
-		`repair route : ALLOWED — ordinary/new delegations remain blocked; run deterministic /q-repair ${ID}`,
+		`repair route : ALLOWED — ordinary/new delegations remain blocked; call workbench_repair_delegation with delegation_id=${ID}`,
 	);
 });
 
@@ -122,10 +122,10 @@ test("strict terminal-negative sidecars survive status reload and route directly
 		});
 		assert.equal(projected.kind, "repair_required");
 		assert.equal(capsuleReads, 0, "terminal-negative sidecar authority must not depend on a legacy retry capsule");
-		assert.match(delegationNextActionTextV1(state, projected) ?? "", new RegExp(`/q-repair ${ID}`));
+		assert.match(delegationNextActionTextV1(state, projected) ?? "", new RegExp(`workbench_repair_delegation with delegation_id=${ID}`));
 		assert.match(delegationRepairStatusLinesV1(projected).join("\n"), /REPAIR_REQUIRED/u);
 		assert.equal(delegationExactRepairRouteLineV1(projected),
-			`repair route : ALLOWED — ordinary/new delegations remain blocked; run deterministic /q-repair ${ID}`);
+			`repair route : ALLOWED — ordinary/new delegations remain blocked; call workbench_repair_delegation with delegation_id=${ID}`);
 	}
 });
 
@@ -141,7 +141,7 @@ test("eligible terminal-negative authority without a sidecar routes to q-review,
 		throw new Error("unused");
 	}) as ExecFn, services);
 	assert.equal(missing.kind, "terminal_negative_review");
-	assert.match(delegationNextActionTextV1(state, missing) ?? "", new RegExp(`/q-review ${ID}`));
+	assert.match(delegationNextActionTextV1(state, missing) ?? "", new RegExp(`workbench_review_worker_diff with delegation_id=${ID}`));
 	assert.match(delegationRepairStatusLinesV1(missing).join("\n"), /REPAIR-only Sol review/u);
 
 	const corrupt = await readDelegationRepairStatusV1("/tmp/project", state, (async () => {
@@ -257,7 +257,7 @@ test("durable unresolved tip overrides a stale cached latest id and project issu
 	assert.equal(projected.kind, "repair_required");
 	if (projected.kind === "repair_required") assert.equal(projected.delegationId, hiddenTip);
 	assert.deepEqual(readIds, [hiddenTip, hiddenTip]);
-	assert.match(delegationNextActionTextV1(state, projected) ?? "", new RegExp(`/q-repair ${hiddenTip}`));
+	assert.match(delegationNextActionTextV1(state, projected) ?? "", new RegExp(`workbench_repair_delegation with delegation_id=${hiddenTip}`));
 	assert.doesNotMatch(delegationNextActionTextV1(state, projected) ?? "", /start the next delegation/);
 	assert.deepEqual(delegationProjectIssueRepairStatusV1({ code: "binding_unavailable" }), {
 		kind: "authority_invalid", delegationId: null, code: "binding_unavailable",
@@ -276,13 +276,13 @@ test("readable historical multiplicity is not projected as corrupt authority", a
 		assert.match(lines, /strict full-project path-lane admission/u);
 		assert.match(lines, /overlap or unknown authority remains BLOCKED/u);
 		assert.match(lines, /VERIFY remains BLOCKED/u);
-		assert.match(lines, new RegExp(`/q-repair ${tip}`, "u"));
+		assert.match(lines, new RegExp(`workbench_repair_delegation with delegation_id=${tip}`, "u"));
 		assert.doesNotMatch(lines, /INVALID/u);
 		assert.match(next, /ordinary delegation requires strict full-project path-lane admission/u);
 		assert.match(next, /VERIFY remains blocked/u);
 		assert.equal(
 			delegationExactRepairRouteLineV1(projected),
-			`repair route : run deterministic /q-repair ${tip} only for that strict current tip; ordinary delegation requires path-lane admission and VERIFY remains blocked`,
+			`repair route : call workbench_repair_delegation with delegation_id=${tip} only for that strict current tip; ordinary delegation requires path-lane admission and VERIFY remains blocked`,
 		);
 	}
 });
@@ -325,13 +325,13 @@ test("lineaged terminal retry, active execution, and pending review have distinc
 		retryable: true,
 	});
 	assert.equal(failed.kind, "repair_terminal_retry");
-	assert.match(delegationNextActionTextV1(state, failed) ?? "", new RegExp(`/q-repair ${ID}`));
-	assert.match(delegationRepairStatusLinesV1(failed).join("\n"), new RegExp(`/q-repair ${ID}`));
+	assert.match(delegationNextActionTextV1(state, failed) ?? "", new RegExp(`workbench_repair_delegation with delegation_id=${ID}`));
+	assert.match(delegationRepairStatusLinesV1(failed).join("\n"), new RegExp(`workbench_repair_delegation with delegation_id=${ID}`));
 
 	const staleFailed = { ...failed, binding: "conflict" as const };
 	assert.match(delegationNextActionTextV1(state, staleFailed) ?? "", /lineage-contained terminal rebase eligibility/u);
 	assert.match(delegationRepairStatusLinesV1(staleFailed).join("\n"), /lineage-contained terminal rebase eligibility/u);
-	assert.match(delegationRepairStatusLinesV1(staleFailed).join("\n"), new RegExp(`/q-repair ${ID}`));
+	assert.match(delegationRepairStatusLinesV1(staleFailed).join("\n"), new RegExp(`workbench_repair_delegation with delegation_id=${ID}`));
 	assert.doesNotMatch(delegationRepairStatusLinesV1(staleFailed).join("\n"), /restore the exact/u);
 
 	const active = classifyDelegationRepairStatusV1({

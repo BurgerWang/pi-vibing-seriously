@@ -24,6 +24,7 @@ import {
 	hasDelegationSemanticRepairAuthorityV2,
 	hasDelegationSemanticReviewAuthorityV2,
 	hasDelegationTerminalNegativeSemanticRepairAuthorityV1,
+	isDelegationTerminalNegativeReviewEligibleFromCommittedV1,
 	isDelegationTerminalNegativeReviewEligibleV1,
 	persistAbortedDelegationTransaction,
 	persistCommittingDelegationTransaction,
@@ -67,6 +68,11 @@ import {
 } from "../extensions/workbench-runtime/core/delegation-transaction.ts";
 import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { computeChangeSet, type ChangeSetRecord } from "../extensions/workbench-runtime/core/change-set.ts";
+import {
+	isDelegationCommandScopeAttributedV1,
+	validateDelegationCommandProvenance,
+	type DelegationCommandProvenanceRecord,
+} from "../extensions/workbench-runtime/core/delegation-command-effect-provenance.ts";
 import type { StreamingPathIdentity } from "../extensions/workbench-runtime/core/streaming-identity.ts";
 import { computeWorkspaceGuardHash, type WorkspaceGuardRecord } from "../extensions/workbench-runtime/core/workspace-guard.ts";
 import { computeWorkerWriteJournalHash, type WorkerWriteJournalRecord } from "../extensions/workbench-runtime/core/write-journal.ts";
@@ -1004,6 +1010,86 @@ test("storage v2 terminal-negative eligibility rejects missing proof, empty delt
 			{ ...state, terminal_outcome: { ...state.terminal_outcome!, change_set_status: "WORKSPACE_DRIFT" } },
 		];
 		for (const candidate of variants) assert.equal(isDelegationTerminalNegativeReviewEligibleV1(candidate), false);
+	} finally {
+		await cleanup(root);
+	}
+});
+
+test("storage v2 terminal-negative compatibility accepts only a strictly proven historical failed CLEAN recipe", async () => {
+	const root = await tempProject();
+	try {
+		await completeProvisionalSemanticReview(root, "FAILED");
+		const committed = await readDelegationCommittedGenerationV2(root, ID);
+		assert.equal(committed.ok, true, committed.ok ? "" : committed.error.code);
+		if (!committed.ok) return;
+		const state = structuredClone(committed.value.state);
+		const records = structuredClone(committed.value.records);
+		const scope = records["scope.json"] as Record<string, unknown>;
+		const changeSet = scope.change_set as ChangeSetRecord;
+		const receipt = {
+			run_id: "20260817-150004-cln1",
+			recipe: "focused-check",
+			started_at: at(1),
+			finished_at: at(2),
+			run_outcome: "PROCESS_FAILED" as const,
+			manifest_sha256: "4".repeat(64),
+			command_effect_file_sha256: "5".repeat(64),
+			command_effect_hash: "6".repeat(64),
+			command_effect_status: "CLEAN" as const,
+		};
+		const withoutHash: Omit<DelegationCommandProvenanceRecord, "command_provenance_hash"> = {
+			schema_version: 1,
+			delegation_id: ID,
+			contract_hash: state.contract_hash,
+			base_change_set_hash: changeSet.change_set_hash,
+			worker_delta_hash: changeSet.worker_delta_hash,
+			runtime_observation: {
+				state: "observed",
+				code: "none",
+				entries: [{
+					schema: "workbench-worker-command-effect-v1",
+					kind: "committed",
+					delegation_id: ID,
+					contract_hash: state.contract_hash,
+					...receipt,
+					failure_code: null,
+				}],
+			},
+			receipts: [receipt],
+			command_delta: [],
+			remaining_workspace_drift: [],
+			terminal_reasons: ["COMMAND_EFFECT_RUN_FAILED"],
+			effective_status: "WORKSPACE_DRIFT",
+			effective_paths: changeSet.worker_delta.map((entry) => entry.path),
+			finalization_meter: { paths_attempted: 0, paths_completed: 0, bytes_read: 0 },
+			effective_delta_hash: changeSet.worker_delta_hash,
+		};
+		const provenance: DelegationCommandProvenanceRecord = {
+			...withoutHash,
+			command_provenance_hash: createHash("sha256").update(JSON.stringify(withoutHash)).digest("hex"),
+		};
+		assert.equal(validateDelegationCommandProvenance(provenance, changeSet), true);
+		assert.equal(isDelegationCommandScopeAttributedV1(provenance, changeSet), true);
+		scope.command_provenance = provenance;
+		const after = records["after.json"] as Record<string, unknown>;
+		after.change_set_status = "WORKSPACE_DRIFT";
+		after.command_provenance_hash = provenance.command_provenance_hash;
+		after.effective_delta_hash = provenance.effective_delta_hash;
+		state.terminal_outcome = {
+			...state.terminal_outcome!,
+			change_set_status: "WORKSPACE_DRIFT",
+		};
+
+		assert.equal(isDelegationTerminalNegativeReviewEligibleV1(state), false,
+			"a state label alone never grants compatibility authority");
+		assert.equal(isDelegationTerminalNegativeReviewEligibleFromCommittedV1(state, records), true,
+			"the complete committed generation proves the historical label was only a failed CLEAN recipe");
+
+		const tampered = structuredClone(records);
+		(tampered["scope.json"] as { command_provenance: DelegationCommandProvenanceRecord })
+			.command_provenance.terminal_reasons = ["COMMAND_EFFECT_PROTOCOL_INVALID"];
+		assert.equal(isDelegationTerminalNegativeReviewEligibleFromCommittedV1(state, tampered), false,
+			"any provenance inconsistency keeps the historical record fail-closed");
 	} finally {
 		await cleanup(root);
 	}

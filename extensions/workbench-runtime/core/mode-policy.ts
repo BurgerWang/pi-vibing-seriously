@@ -159,11 +159,13 @@ export function isToolHardDenied(mode: WorkbenchMode, toolName: string): boolean
 			toolName === "workbench_run_recipe" ||
 			toolName === "workbench_run_gate" ||
 			toolName === WORKER_TOOL_NAME ||
+			toolName === "workbench_repair_delegation" ||
 			toolName === "workbench_git"
 		);
 	}
 	if (mode === "VERIFY") {
 		return toolName === "bash" || toolName === "edit" || toolName === "write" || toolName === WORKER_TOOL_NAME
+			|| toolName === "workbench_repair_delegation"
 			|| toolName === "workbench_git";
 	}
 	return false;

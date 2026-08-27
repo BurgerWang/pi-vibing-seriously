@@ -83,7 +83,11 @@ export function exactRepairResultRequiresReconcileV1(result: ExactRepairServiceR
 		(result.status === "RAW_SUCCESSOR_REPLAY" && result.successor.disposition === "ACTIVE");
 }
 
-function exactRepairServiceLines(result: ExactRepairServiceResultV1): string[] {
+/** Shared bounded rendering for the user command and model-callable tool. */
+export function exactRepairServiceLinesV1(
+	result: ExactRepairServiceResultV1,
+	entrypoint = "/q-repair",
+): string[] {
 	switch (result.status) {
 		case "AUTHORITY_UNAVAILABLE": {
 			const label = result.source === "committed"
@@ -93,17 +97,17 @@ function exactRepairServiceLines(result: ExactRepairServiceResultV1): string[] {
 					: result.source === "terminal-negative-repair"
 						? "terminal-negative Sol repair authority"
 						: "raw-lineage repair authority";
-			return [`/q-repair: ${label} unavailable (${result.code})`, `repair_of: ${result.repair_of}`];
+			return [`${entrypoint}: ${label} unavailable (${result.code})`, `repair_of: ${result.repair_of}`];
 		}
 		case "RECOVERY_REFUSED":
 			return [
-				`/q-repair: deterministic parameter recovery refused (${result.code})`,
+				`${entrypoint}: deterministic parameter recovery refused (${result.code})`,
 				`repair_of: ${result.repair_of}`,
 				"no delegation transaction was started",
 			];
 		case "IDEMPOTENCY_REFUSED":
 			return [
-				`/q-repair: durable idempotency refused (${result.code})`,
+				`${entrypoint}: durable idempotency refused (${result.code})`,
 				`repair_of: ${result.repair_of}`,
 				`idempotency_key: ${result.authority.idempotency_key}`,
 				...(result.conflicting_delegation === undefined ? [] : [`conflicting_delegation: ${result.conflicting_delegation}`]),
@@ -111,14 +115,14 @@ function exactRepairServiceLines(result: ExactRepairServiceResultV1): string[] {
 			];
 		case "CURRENT_BINDING_CHANGED":
 			return [
-				"/q-repair: deterministic parameter recovery refused (CURRENT_BINDING_CHANGED)",
+				`${entrypoint}: deterministic parameter recovery refused (CURRENT_BINDING_CHANGED)`,
 				`repair_of: ${result.repair_of}`,
 				"no delegation transaction was started",
 			];
 		case "SUCCESSOR_RECORDED":
 			if (result.replayed) {
 				return [
-					"/q-repair: durable replay — returning the existing exact successor",
+					`${entrypoint}: durable replay — returning the existing exact successor`,
 					`repair_of: ${result.repair_of}`,
 					`authority_kind: ${result.authority.authority_kind}`,
 					`idempotency_key: ${result.authority.idempotency_key}`,
@@ -129,14 +133,14 @@ function exactRepairServiceLines(result: ExactRepairServiceResultV1): string[] {
 			}
 			if (result.execution_outcome === "threw") {
 				return [
-					`/q-repair: shared delegate execution failed after recording one durable successor — ${boundedInlineDetail(result.execution_error ?? "unknown failure", 1_024)}`,
+					`${entrypoint}: shared delegate execution failed after recording one durable successor — ${boundedInlineDetail(result.execution_error ?? "unknown failure", 1_024)}`,
 					...recoveredLines(result),
 					...successorLines(result.successor),
 					...successorNextActionLines(result.successor),
 				];
 			}
 			return [
-				`/q-repair: shared delegate execution ${result.execution_status ?? "completed"}`,
+				`${entrypoint}: shared delegate execution ${result.execution_status ?? "completed"}`,
 				...recoveredLines(result),
 				...successorLines(result.successor),
 				...successorNextActionLines(result.successor),
@@ -144,21 +148,21 @@ function exactRepairServiceLines(result: ExactRepairServiceResultV1): string[] {
 			];
 		case "SUCCESSOR_ACTIVE":
 			return [
-				"/q-repair: exact successor already active; no second worker was started",
+				`${entrypoint}: exact successor already active; no second worker was started`,
 				...recoveredLines(result),
 				...successorLines(result.successor),
 				...successorNextActionLines(result.successor),
 			];
 		case "EXACT_REPAIR_PENDING":
 			return [
-				"/q-repair: prior successor ended before writes and has strict deterministic continuation authority",
+				`${entrypoint}: prior successor ended before writes and has strict deterministic continuation authority`,
 				...recoveredLines(result),
 				...successorLines(result.successor),
 				...successorNextActionLines(result.successor),
 			];
 		case "SUCCESSOR_BLOCKED":
 			return [
-				"/q-repair: existing successor is not safely replayable or continuable",
+				`${entrypoint}: existing successor is not safely replayable or continuable`,
 				...recoveredLines(result),
 				...successorLines(result.successor),
 				...successorNextActionLines(result.successor),
@@ -166,7 +170,7 @@ function exactRepairServiceLines(result: ExactRepairServiceResultV1): string[] {
 			];
 		case "RAW_SUCCESSOR_REPLAY":
 			return [
-				"/q-repair: immutable raw-lineage replay — returning the existing exact successor",
+				`${entrypoint}: immutable raw-lineage replay — returning the existing exact successor`,
 				`repair_of: ${result.repair_of}`,
 				`immutable_authority_hash: ${result.immutable_authority_hash}`,
 				...successorLines(result.successor),
@@ -175,27 +179,27 @@ function exactRepairServiceLines(result: ExactRepairServiceResultV1): string[] {
 			];
 		case "EXECUTION_REFUSED":
 			return [
-				"/q-repair: shared delegate execution refused",
+				`${entrypoint}: shared delegate execution refused`,
 				...recoveredLines(result),
 				...renderedExecution(result.execution_result),
 			];
 		case "EXECUTION_READBACK_FAILED":
 			return [
-				`/q-repair: shared delegate execution returned but durable idempotency is ${result.code === "SUCCESSOR_MISSING" ? "missing" : result.code}`,
+				`${entrypoint}: shared delegate execution returned but durable idempotency is ${result.code === "SUCCESSOR_MISSING" ? "missing" : result.code}`,
 				`repair_of: ${result.repair_of}`,
 				`idempotency_key: ${result.authority.idempotency_key}`,
 				"result is not reported as a completed repair without a strict successor transaction",
 			];
 		case "EXECUTION_FAILED":
 			return [
-				`/q-repair: shared delegate execution failed — ${boundedInlineDetail(result.error, 1_024)}`,
+				`${entrypoint}: shared delegate execution failed — ${boundedInlineDetail(result.error, 1_024)}`,
 				...recoveredLines(result),
 				result.successor_readback.status === "none"
 					? "durable_idempotency: no successor transaction was recorded"
 					: `durable_idempotency: ${result.successor_readback.code}`,
 			];
 		case "UNEXPECTED_ERROR":
-			return [`/q-repair: authority recovery failed — ${boundedInlineDetail(result.error, 1_024)}`];
+			return [`${entrypoint}: authority recovery failed — ${boundedInlineDetail(result.error, 1_024)}`];
 	}
 }
 
@@ -272,7 +276,7 @@ export function registerExactRepairCommandV1(controller: ExactRepairCommandContr
 					await controller.reconcileProjectAuthority(projectRoot, new Date().toISOString());
 					result = await runExactRepairServiceV1(serviceInput, serviceDependencies);
 				}
-				controller.output(ctx, exactRepairServiceLines(result));
+				controller.output(ctx, exactRepairServiceLinesV1(result));
 			} catch (error) {
 				controller.output(ctx, [`/q-repair: authority recovery failed — ${boundedInlineDetail((error as Error).message, 1_024)}`]);
 			}

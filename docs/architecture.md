@@ -294,11 +294,13 @@ GPT-5.6 Sol parent in DEV
        receipt hash are returned. Model/protocol/drift failures preserve worker
        success + PENDING and return exact /q-review <id>
   → /q-review <id> runs that durable service directly without a commander
-       model turn; manual workbench_review_worker_diff remains the bounded
+       model turn; machine next_action uses workbench_review_worker_diff and
+       manual review remains the bounded
        route for legacy, oversized, mechanical FAIL, or authority gaps
-  → REPAIR leaves PENDING_REVIEW/Gates blocked and enables exact /q-repair
-       <id>, which strict-reads authority and idempotently executes/returns the
-       single successor without using session-latest state
+  → REPAIR leaves PENDING_REVIEW/Gates blocked and enables exact
+       workbench_repair_delegation(delegation_id), which strict-reads authority
+       and idempotently executes/returns the single successor without using
+       session-latest state; /q-repair is the user-only convenience command
   → a closed failed implementation with attributed partial work publishes
        INTERRUPTED. Eligible INTERRUPTED/legacy FAILED presentation permits
        only a distinct terminal-negative Sol REPAIR sidecar; ACCEPT and

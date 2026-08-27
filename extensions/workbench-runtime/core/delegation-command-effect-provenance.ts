@@ -829,10 +829,11 @@ export async function finalizeDelegationCommandProvenance(
 		...input.change_set.worker_delta.map((entry) => entry.path),
 		...commandDelta.map((entry) => entry.path),
 	]);
+	const hasSpatialFailure = [...reasons].some((reason) => reason !== "COMMAND_EFFECT_RUN_FAILED");
 	const effectiveStatus = input.change_set.conflicts.length > 0 || reasons.has("COMMAND_EFFECT_BINDING_CONFLICT")
 		|| reasons.has("COMMAND_EFFECT_PROTOCOL_INVALID")
 		? "CONFLICT"
-		: remainingDrift.length > 0 || reasons.size > 0
+		: remainingDrift.length > 0 || hasSpatialFailure
 			? "WORKSPACE_DRIFT"
 			: "ATTRIBUTED";
 	const deltaHash = effectiveDeltaHash(input.delegation_id, input.contract_hash, input.change_set.worker_delta_hash, commandDelta, receipts);
@@ -978,6 +979,8 @@ export function validateDelegationCommandProvenance(
 			|| receipts[receiptIndex]!.command_effect_status === "EVIDENCE_UNAVAILABLE";
 	}))) return false;
 	const terminal = new Set(record.terminal_reasons as DelegationCommandProvenanceTerminalReason[]);
+	const hasFailedRun = receipts.some((receipt) => receipt.run_outcome !== "SUCCESS");
+	if (terminal.has("COMMAND_EFFECT_RUN_FAILED") !== hasFailedRun) return false;
 	for (const receipt of receipts) {
 		if (receipt.run_outcome !== "SUCCESS" && !terminal.has("COMMAND_EFFECT_RUN_FAILED")) return false;
 		const required = receipt.command_effect_status === "RECIPE_DECLARATION_VIOLATION" ? "RECIPE_DECLARATION_VIOLATION"
@@ -1020,13 +1023,21 @@ export function validateDelegationCommandProvenance(
 		if (JSON.stringify(durable) !== JSON.stringify(observedReceipt)
 			&& !terminal.has("COMMAND_EFFECT_BINDING_CONFLICT")) return false;
 	}
+	const hasSpatialFailure = [...terminal].some((reason) => reason !== "COMMAND_EFFECT_RUN_FAILED");
 	const expectedStatus = terminal.has("COMMAND_EFFECT_BINDING_CONFLICT") || terminal.has("COMMAND_EFFECT_PROTOCOL_INVALID")
 		|| changeSet?.status === "CONFLICT"
 		? "CONFLICT"
-		: (record.remaining_workspace_drift as unknown[]).length > 0 || terminal.size > 0
+		: (record.remaining_workspace_drift as unknown[]).length > 0 || hasSpatialFailure
 			? "WORKSPACE_DRIFT"
 			: "ATTRIBUTED";
-	if (record.effective_status !== expectedStatus) return false;
+	// v1 initially collapsed a clean PROCESS_FAILED receipt into
+	// WORKSPACE_DRIFT.  Preserve strict read compatibility for those immutable
+	// records while every newly finalized record keeps spatial attribution and
+	// carries the process failure separately in terminal_reasons.
+	const legacyCleanRunFailure = expectedStatus === "ATTRIBUTED" && record.effective_status === "WORKSPACE_DRIFT"
+		&& terminal.size === 1 && terminal.has("COMMAND_EFFECT_RUN_FAILED")
+		&& (record.remaining_workspace_drift as unknown[]).length === 0;
+	if (record.effective_status !== expectedStatus && !legacyCleanRunFailure) return false;
 	if (changeSet !== undefined) {
 		if (changeSet.delegation_id !== record.delegation_id || changeSet.contract_hash !== record.contract_hash
 			|| changeSet.change_set_hash !== record.base_change_set_hash || changeSet.worker_delta_hash !== record.worker_delta_hash) return false;
@@ -1042,6 +1053,27 @@ export function validateDelegationCommandProvenance(
 	if (record.effective_delta_hash !== expectedDeltaHash) return false;
 	const { command_provenance_hash: _ignored, ...withoutHash } = record as unknown as DelegationCommandProvenanceRecord;
 	return record.command_provenance_hash === canonicalHash(provenanceProjection(withoutHash));
+}
+
+/**
+ * True only when command provenance proves a completely attributed spatial
+ * delta.  A failed command may make the worker attempt fail, but it is not
+ * workspace drift when its effect is CLEAN/attributed and every receipt is
+ * durably bound.  The WORKSPACE_DRIFT branch is read-only compatibility for
+ * immutable v1 records produced before that distinction was enforced.
+ */
+export function isDelegationCommandScopeAttributedV1(
+	value: unknown,
+	changeSet: Readonly<ChangeSetRecord>,
+): value is DelegationCommandProvenanceRecord {
+	if (!validateDelegationCommandProvenance(value, changeSet)) return false;
+	const record = value as DelegationCommandProvenanceRecord;
+	const onlyRunFailure = record.terminal_reasons.every((reason) => reason === "COMMAND_EFFECT_RUN_FAILED");
+	const legacyCleanRunFailure = record.effective_status === "WORKSPACE_DRIFT"
+		&& record.terminal_reasons.length === 1
+		&& record.terminal_reasons[0] === "COMMAND_EFFECT_RUN_FAILED";
+	return changeSet.status === "ATTRIBUTED" && record.remaining_workspace_drift.length === 0 && onlyRunFailure
+		&& (record.effective_status === "ATTRIBUTED" || legacyCleanRunFailure);
 }
 
 interface AttributedEffectStep {

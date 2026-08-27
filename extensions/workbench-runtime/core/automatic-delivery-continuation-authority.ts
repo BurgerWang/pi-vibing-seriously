@@ -35,7 +35,7 @@ import {
 } from "./exact-repair-authority.ts";
 import {
 	hasDelegationSemanticRepairAuthorityV2,
-	isDelegationTerminalNegativeReviewEligibleV1,
+	isDelegationTerminalNegativeReviewEligibleFromCommittedV1,
 	readDelegationCommittedGenerationV2,
 	readDelegationReviewV2,
 	readDelegationTerminalNegativeSolAuthorityV1,
@@ -273,7 +273,20 @@ async function readDescriptor(
 		return { status: "DESCRIPTOR", descriptor: { kind: "semantic-repair", transaction, review: review.value } };
 	}
 
-	if (!isDelegationTerminalNegativeReviewEligibleV1(transaction)) {
+	if (transaction.status !== "FAILED" && transaction.status !== "INTERRUPTED") {
+		return { status: "NONE", missing_sidecar: false };
+	}
+	const terminalCommitted = await readers.readCommittedGeneration(projectRoot, delegationId);
+	if (!terminalCommitted.ok) {
+		return readFailure(terminalCommitted.error.code, "TRANSACTION_AUTHORITY_INVALID");
+	}
+	if (canonicalHash(terminalCommitted.value.state) !== canonicalHash(transaction)) {
+		return { status: "BLOCKED", code: "TRANSACTION_AUTHORITY_INVALID" };
+	}
+	if (!isDelegationTerminalNegativeReviewEligibleFromCommittedV1(
+		transaction,
+		terminalCommitted.value.records,
+	)) {
 		// RECOVERY_REQUIRED/proof-null and incomplete/zero-delta terminal shapes
 		// can remain path blockers, but they never become continuation authority.
 		return { status: "NONE", missing_sidecar: false };

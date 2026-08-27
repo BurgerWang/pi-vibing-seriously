@@ -10,6 +10,7 @@
  */
 
 import type { ExecFn } from "./config.ts";
+import { reviewDelegationToolActionV1 } from "./agent-next-action.ts";
 import {
 	reviewDelegationV2,
 	type DelegationReviewV2ErrorCode,
@@ -150,7 +151,7 @@ async function persistProjected(
 			code: "session_persistence_failed",
 			state: input.state,
 			recovery: "retryable",
-			next_action: `/q-review ${input.delegationId}`,
+			next_action: reviewDelegationToolActionV1(input.delegationId),
 		};
 	}
 }
@@ -192,7 +193,7 @@ export async function completeDefaultDelegationDeliveryV2(
 		if (persistenceFailure !== undefined) {
 			return "ok" in persistenceFailure
 				? persistenceFailure
-				: { ok: false, code: "session_persistence_failed", state: input.state, recovery: "retryable", next_action: `/q-review ${input.delegationId}` };
+				: { ok: false, code: "session_persistence_failed", state: input.state, recovery: "retryable", next_action: reviewDelegationToolActionV1(input.delegationId) };
 		}
 		const authorityError = review.error.code === "authority_invalid" || review.error.code === "invalid_state";
 		return {
@@ -201,13 +202,13 @@ export async function completeDefaultDelegationDeliveryV2(
 			state: projected,
 			review_error: review.error.code,
 			recovery: authorityError ? "authority_error" : "retryable",
-			...(authorityError ? {} : { next_action: `/q-review ${input.delegationId}` }),
+			...(authorityError ? {} : { next_action: reviewDelegationToolActionV1(input.delegationId) }),
 		};
 	}
 	let effectiveReview = review;
 	let record = review.review.record;
 	if (!review.review.ok || record === undefined) {
-		return { ok: false, code: "review_failed", state: projected, review_path: review.review_path, recovery: "retryable", next_action: `/q-review ${input.delegationId}` };
+		return { ok: false, code: "review_failed", state: projected, review_path: review.review_path, recovery: "retryable", next_action: reviewDelegationToolActionV1(input.delegationId) };
 	}
 	projected = observeDiffChange(input.state, record.bound_diff_hash, input.now);
 	const semantic = classifySemanticReviewRisk(record.checked_paths);
@@ -228,7 +229,7 @@ export async function completeDefaultDelegationDeliveryV2(
 				cost: Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }),
 			}),
 			mechanical_page_calls: 0,
-			next_action: `/q-review ${input.delegationId}`,
+			next_action: reviewDelegationToolActionV1(input.delegationId),
 		};
 	} else if (semantic.required && input.modelRegistry !== undefined
 		&& record.semantic_review !== "accepted") {

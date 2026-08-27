@@ -114,14 +114,19 @@ function changeSet(contractHash: string, workerPaths: readonly string[], depende
 	return { ...withoutHash, change_set_hash: computeChangeSetHash(withoutHash) };
 }
 
-function commandProvenance(change: ChangeSetRecord, commandPath: string): DelegationCommandProvenanceRecord {
+function commandProvenance(
+	change: ChangeSetRecord,
+	commandPath: string,
+	options: { legacyCleanRunFailure?: boolean } = {},
+): DelegationCommandProvenanceRecord {
 	const runId = "20260827-010204-cmd1";
+	const runOutcome = options.legacyCleanRunFailure ? "PROCESS_FAILED" as const : "SUCCESS" as const;
 	const receipt = {
 		run_id: runId,
 		recipe: "generate-exact",
 		started_at: NOW,
 		finished_at: DECIDED,
-		run_outcome: "SUCCESS" as const,
+		run_outcome: runOutcome,
 		manifest_sha256: "4".repeat(64),
 		command_effect_file_sha256: "5".repeat(64),
 		command_effect_hash: "6".repeat(64),
@@ -168,8 +173,8 @@ function commandProvenance(change: ChangeSetRecord, commandPath: string): Delega
 		receipts: [receipt],
 		command_delta: commandDelta,
 		remaining_workspace_drift: [],
-		terminal_reasons: [],
-		effective_status: "ATTRIBUTED",
+		terminal_reasons: options.legacyCleanRunFailure ? ["COMMAND_EFFECT_RUN_FAILED"] : [],
+		effective_status: options.legacyCleanRunFailure ? "WORKSPACE_DRIFT" : "ATTRIBUTED",
 		effective_paths: effectivePaths,
 		finalization_meter: { paths_attempted: 1, paths_completed: 1, bytes_read: 1 },
 		effective_delta_hash: effectiveDeltaHash,
@@ -194,7 +199,7 @@ function commandProvenance(change: ChangeSetRecord, commandPath: string): Delega
 			run_ids: [...entry.run_ids],
 		})),
 		remaining_workspace_drift: [],
-		terminal_reasons: [],
+		terminal_reasons: [...withoutHash.terminal_reasons],
 		effective_status: withoutHash.effective_status,
 		effective_paths: [...withoutHash.effective_paths],
 		finalization_meter: { ...withoutHash.finalization_meter },
@@ -226,6 +231,7 @@ interface CommittedOptions {
 	workerPaths?: readonly string[];
 	dependencyPaths?: readonly string[];
 	commandPath?: string;
+	legacyCleanRunFailure?: boolean;
 	withLineage?: boolean;
 	legacyOutcome?: boolean;
 	stateContractHash?: string;
@@ -238,7 +244,9 @@ function committed(options: CommittedOptions = {}): DelegationCommittedGeneratio
 	const persistedContract = contract(options.allowedPaths);
 	const stateContractHash = options.stateContractHash ?? persistedContract.contract_hash;
 	const change = changeSet(stateContractHash, options.workerPaths ?? ["src/worker.ts"], options.dependencyPaths ?? ["src/dependency.ts"]);
-	const command = options.commandPath === undefined ? undefined : commandProvenance(change, options.commandPath);
+	const command = options.commandPath === undefined
+		? undefined
+		: commandProvenance(change, options.commandPath, { legacyCleanRunFailure: options.legacyCleanRunFailure });
 	const effectivePaths = command?.effective_paths ?? change.worker_delta.map((entry) => entry.path);
 	const effectiveHash = command?.effective_delta_hash ?? change.worker_delta_hash;
 	const boundDiffHash = options.boundDiffHash ?? "9".repeat(64);
@@ -264,12 +272,16 @@ function committed(options: CommittedOptions = {}): DelegationCommittedGeneratio
 		task_kind: "implementation" as const,
 		worker_identity: { provider: "openai" as const, model: "gpt-5.6-luna" as const, worker_id: "worker:test" },
 		provider_success: true,
-		...(options.legacyOutcome ? {} : { worker_success: false, worker_failure_code: "TURN_LIMIT" as const }),
+		...(options.legacyOutcome
+			? {}
+			: options.legacyCleanRunFailure
+				? { worker_success: true, worker_failure_code: null }
+				: { worker_success: false, worker_failure_code: "TURN_LIMIT" as const }),
 		exit_code: 0,
 		report_complete: true,
 		terminal_facts_complete: true,
 		scope_complete: true,
-		change_set_status: "ATTRIBUTED" as const,
+		change_set_status: command?.effective_status ?? "ATTRIBUTED" as const,
 		changed_paths: [...effectivePaths],
 		successful_write_count: change.worker_delta.length,
 		denied_write_count: 0,
@@ -287,7 +299,9 @@ function committed(options: CommittedOptions = {}): DelegationCommittedGeneratio
 		revision: 3,
 		created_at: NOW,
 		updated_at: NOW,
-		postcondition_reasons: ["WORKER_RUN_FAILED" as const],
+		postcondition_reasons: options.legacyCleanRunFailure
+			? ["WORKSPACE_DRIFT_DETECTED" as const]
+			: ["WORKER_RUN_FAILED" as const],
 		terminal_outcome: outcome,
 		committed_proof: { ...proof, content_hash: options.stateProofHash ?? proof.content_hash },
 		review: null,
@@ -363,6 +377,40 @@ test("lineaged terminal recovery preserves subtree rules and binds proof plus th
 	const rebound = recoverExactRepairCommandAuthorityV1({ repairOf: ID, committed: differentProof });
 	assert.equal(rebound.ok, true);
 	if (rebound.ok) assert.notEqual(rebound.value.idempotency_key, idempotencyKey);
+});
+
+test("lineaged recovery accepts only the legacy CLEAN command-failure shape as attributed scope", () => {
+	const source = committed({
+		status: "FAILED",
+		commandPath: "src/generated.ts",
+		legacyCleanRunFailure: true,
+	});
+	const scope = source.records["scope.json"] as {
+		change_set: ChangeSetRecord;
+		command_provenance: DelegationCommandProvenanceRecord;
+	};
+	assert.equal(scope.change_set.status, "ATTRIBUTED");
+	assert.deepEqual(scope.command_provenance.remaining_workspace_drift, []);
+	assert.deepEqual(scope.command_provenance.terminal_reasons, ["COMMAND_EFFECT_RUN_FAILED"]);
+	assert.equal(scope.command_provenance.effective_status, "WORKSPACE_DRIFT");
+	assert.equal(source.state.terminal_outcome?.change_set_status, "WORKSPACE_DRIFT");
+
+	const recovered = recoverExactRepairCommandAuthorityV1({ repairOf: ID, committed: source });
+	assert.equal(recovered.ok, true, recovered.ok ? "" : recovered.code);
+	if (recovered.ok) {
+		assert.deepEqual(recovered.value.successor_lineage.carried_paths, [
+			"src/dependency.ts", "src/generated.ts", "src/root.ts", "src/worker.ts",
+		]);
+	}
+
+	const corrupted = structuredClone(source);
+	const provenance = (corrupted.records["scope.json"] as typeof scope).command_provenance;
+	provenance.terminal_reasons = ["COMMAND_EFFECT_RUN_FAILED", "COMMAND_EFFECT_EVIDENCE_UNAVAILABLE"];
+	provenance.effective_status = "WORKSPACE_DRIFT";
+	assert.deepEqual(recoverExactRepairCommandAuthorityV1({ repairOf: ID, committed: corrupted }), {
+		ok: false,
+		code: "INVALID_COMMITTED_SCOPE",
+	}, "evidence loss remains fail-closed and is never treated as the legacy CLEAN exception");
 });
 
 test("lineaged terminal recovery does not reinterpret carried review dependencies as write scope", () => {

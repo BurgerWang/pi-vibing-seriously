@@ -824,7 +824,7 @@ test("model-callable delegate params cannot forge terminal-negative exact repair
 				undefined,
 				context() as never,
 			),
-				/model-supplied repair_of .* has no exact in-process authority; run \/q-repair/u,
+				/exact repair compatibility router is unavailable/u,
 		);
 		assert.equal(executionCalls, 0);
 	});

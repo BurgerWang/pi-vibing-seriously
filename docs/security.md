@@ -112,8 +112,8 @@ cannot overwrite the active projection.
 
 ### Fixed Sol -> Luna write authority (current; legacy id P7)
 
-Approved GPT-5.6 Sol in DEV receives the fixed 16-tool
-read/control/delegation/Git-completion surface; `bash`, `edit`, `write`, and
+Approved GPT-5.6 Sol in DEV receives the fixed 17-tool
+read/control/delegation/Git-completion/exact-repair surface; `bash`, `edit`, `write`, and
 foreign tools stay unavailable by
 default. The serialized `worker-first-strict` policy id describes the active
 product behavior: routine development is implemented by Luna. Actor identity comes only from the
@@ -311,14 +311,19 @@ scope/conflict/unknown-origin evidence, stale binding, and
 `terminal-negative-repair-decision.json` binds the parent state/failure proof,
 review and diff hashes without rewriting the terminal transaction. Status and
 reload project an eligible published sidecar as `repair_required` with exact
-`/q-repair <id>`; an eligible terminal without the sidecar points to exact
-`/q-review <id>`; malformed authority remains fail-closed.
+`workbench_repair_delegation` input; an eligible terminal without the sidecar
+points to `workbench_review_worker_diff`; malformed authority remains
+fail-closed. The model-callable repair tool accepts only a delegation id and
+recovers the complete immutable contract. Legacy broad `repair_of` calls are
+safe aliases whose caller-supplied contract fields are ignored.
 
-Both commands are direct and exact-id bound. `/q-review` runs the shared durable
+Both slash commands are direct and exact-id bound. `/q-review` runs the shared durable
 service without `sendUserMessage` or a commander model turn. `/q-repair`
 strict-reads ordinary or terminal-negative authority and the current binding,
 then returns an existing idempotent successor or executes the shared delegate
-kernel; it never selects the session's latest id.
+kernel; it never selects the session's latest id. Machine-facing results use
+the corresponding callable tools instead of instructing the model to invoke a
+user-only slash command.
 
 Production uses v2 filesystem records plus a singleton checkout-wide writer
 lease. Strict historical path-lane admission is wired into delegation and is

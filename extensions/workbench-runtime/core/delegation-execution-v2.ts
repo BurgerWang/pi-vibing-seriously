@@ -617,9 +617,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 			RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerIdentityInvalid);
 		return failure("worker_identity_invalid", checked, input, { durable_state: state });
 	}
-	const workerFailure = workerRunFailure(worker);
-	const succeeded = workerFailure === undefined;
-	const workerFailureCode = workerFailure?.code ?? null;
+	const runnerFailure = workerRunFailure(worker);
 	// Provider transport/identity success is independent from the overall
 	// worker outcome. A locally enforced budget/timeout/report failure after
 	// verified Luna assistant messages must never become PROVIDER_NOT_SUCCESS.
@@ -649,6 +647,11 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 	const before = workspaceFacts.value.before;
 	const after = workspaceFacts.value.after;
 	const commandProvenance = changeSetLifecycle.command_provenance;
+	const workerFailureCode: WorkerRunFailureCode | null = runnerFailure?.code ??
+		(commandProvenance.terminal_reasons.includes("COMMAND_EFFECT_RUN_FAILED")
+			? "COMMAND_EFFECT_RUN_FAILED"
+			: null);
+	const succeeded = workerFailureCode === null;
 
 	let report: ReturnType<typeof deriveDelegationPersistedReportV2>;
 	try {
@@ -809,7 +812,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 		after: cloneAfter(after),
 		result,
 		workerSummary: structuredClone(artifacts.value.workerSummary),
-		...(workerFailure === undefined ? {} : { worker_failure_code: workerFailure.code }),
+		...(workerFailureCode === null ? {} : { worker_failure_code: workerFailureCode }),
 	};
 	const expectedSuccess = checked.contract.task_kind === "implementation" ? "PENDING_REVIEW" : "FINISHED";
 	if (succeeded && state.status === expectedSuccess) {

@@ -1,5 +1,10 @@
 /** Read-only projection of durable semantic-repair authority for status and compact guidance. */
 
+import {
+	repairDelegationToolActionV1,
+	reviewDelegationToolActionV1,
+} from "./agent-next-action.ts";
+
 import type { ExecFn } from "./config.ts";
 import {
 	collectCurrentDelegationBindingV2,
@@ -14,7 +19,7 @@ import {
 	type DelegationPathLaneBypassableProjectIssueV1,
 } from "./delegation-path-lane-admission.ts";
 import {
-	isDelegationTerminalNegativeReviewEligibleV1,
+	isDelegationTerminalNegativeReviewEligibleFromCommittedV1,
 	readDelegationCommittedGenerationV2,
 	readDelegationTerminalNegativeSolAuthorityV1,
 } from "./delegation-transaction-storage.ts";
@@ -317,7 +322,10 @@ export async function readDelegationRepairStatusV1(
 				committed.value.state.status !== authority.transactionStatus || committed.value.state.repair_lineage !== undefined) {
 				return { kind: "authority_invalid", delegationId, code: committed.ok ? "terminal_negative_authority_mismatch" : committed.error.code };
 			}
-			terminalNegativeReviewEligible = isDelegationTerminalNegativeReviewEligibleV1(committed.value.state);
+			terminalNegativeReviewEligible = isDelegationTerminalNegativeReviewEligibleFromCommittedV1(
+				committed.value.state,
+				committed.value.records,
+			);
 		}
 			const retryable = !terminalNegativeReviewEligible && authority.kind === "v2" &&
 				["ABORTED", "FAILED", "INTERRUPTED", "RECOVERY_REQUIRED"].includes(authority.transactionStatus)
@@ -349,8 +357,8 @@ export function delegationNextActionTextV1(
 	}
 	if (repair.kind === "historical_multiplicity") {
 		const exactTip = repair.delegationId === null
-			? "select an exact current repair tip before /q-repair"
-			: `run /q-repair ${repair.delegationId} only when selecting that strict current repair tip`;
+			? "select an exact current repair tip before calling workbench_repair_delegation"
+			: `${repairDelegationToolActionV1(repair.delegationId)} only when selecting that strict current repair tip`;
 		return `project has readable historical blocker multiplicity (${repair.code}); ordinary delegation requires strict full-project path-lane admission proving every blocker known and non-overlapping; overlap or unknown authority remains blocked; ${exactTip}; VERIFY remains blocked`;
 	}
 	if (repair.kind === "delegation_active") {
@@ -358,23 +366,23 @@ export function delegationNextActionTextV1(
 	}
 	if (repair.kind === "delegation_retry") {
 		return repair.binding === "fresh"
-			? `delegation ${repair.delegationId} is ${repair.transactionStatus}, but has no committed repair lineage for deterministic /q-repair; inspect strict recovery authority before any compatibility repair and do not retry review`
+			? `delegation ${repair.delegationId} is ${repair.transactionStatus}, but has no committed repair lineage for deterministic exact repair; inspect strict recovery authority before any compatibility repair and do not retry review`
 			: `delegation ${repair.delegationId} is ${repair.transactionStatus}, but its binding is ${repair.binding}; if its delta was discarded call workbench_git action=close_inactive_blocker delegation_id=${repair.delegationId}; unrelated work is preserved`;
 	}
 	if (repair.kind === "delegation_recovery") {
 		return `delegation ${repair.delegationId} is ${repair.transactionStatus}; if execution is inactive and its delta was discarded call workbench_git action=close_inactive_blocker delegation_id=${repair.delegationId}; do not retry review`;
 	}
 	if (repair.kind === "terminal_negative_review") {
-		return `run /q-review ${repair.delegationId} to publish the strict REPAIR-only Sol decision for the committed ${repair.transactionStatus} delta`;
+		return `${reviewDelegationToolActionV1(repair.delegationId)} to publish the strict REPAIR-only Sol decision for the committed ${repair.transactionStatus} delta`;
 	}
 	if (repair.kind === "repair_required" || repair.kind === "repair_retry") {
 		if (repair.binding !== "fresh") {
 			return `delegation ${repair.delegationId} has REPAIR_REQUIRED authority but its current binding is ${repair.binding}; restore the exact bound workspace to repair, or if the rejected delta was deliberately discarded call workbench_git action=close_inactive_blocker delegation_id=${repair.delegationId}; unrelated work is preserved and no new worktree is required`;
 		}
-		return `run /q-repair ${repair.delegationId} to execute the exact semantic repair directly from strict durable authority`;
+		return `${repairDelegationToolActionV1(repair.delegationId)} to execute the exact semantic repair directly from strict durable authority`;
 	}
 	if (repair.kind === "repair_terminal_retry") {
-		return `run /q-repair ${repair.delegationId} for the deterministic lineaged terminal repair${repair.binding === "fresh" ? "" : `; current binding is ${repair.binding}, so the command will perform strict lineage-contained terminal rebase eligibility checks`}; it fails closed before worker start if authority or rebase is invalid`;
+		return `${repairDelegationToolActionV1(repair.delegationId)} for the deterministic lineaged terminal repair${repair.binding === "fresh" ? "" : `; current binding is ${repair.binding}, so the tool will perform strict lineage-contained terminal rebase eligibility checks`}; it fails closed before worker start if authority or rebase is invalid`;
 	}
 	if (repair.kind === "repair_review") {
 		return `review repair delegation ${repair.delegationId}; explicitly ACCEPT the corrected delta or issue another REPAIR`;
@@ -406,8 +414,8 @@ export function delegationRepairStatusLinesV1(status: DelegationRepairStatusV1):
 			`repair state : HISTORICAL_MULTIPLICITY (${status.code}); authority corruption is not inferred`,
 			"delegation   : ordinary starts require strict full-project path-lane admission; overlap or unknown authority remains BLOCKED",
 			status.delegationId === null
-				? "exact repair : select a strict current repair tip before /q-repair"
-				: `exact repair : run /q-repair ${status.delegationId} only for that strict current repair tip`,
+				? "exact repair : select a strict current repair tip before calling workbench_repair_delegation"
+				: `exact repair : ${repairDelegationToolActionV1(status.delegationId)} only for that strict current repair tip`,
 			"verify block : VERIFY remains BLOCKED while any historical blocker is unresolved",
 		];
 	}
@@ -421,7 +429,7 @@ export function delegationRepairStatusLinesV1(status: DelegationRepairStatusV1):
 		return [
 			`completion v2: ${status.transactionStatus} — review is not the recovery path`,
 			status.binding === "fresh"
-				? "next action  : inspect strict recovery authority; deterministic /q-repair requires a committed repair lineage"
+				? "next action  : inspect strict recovery authority; deterministic exact repair requires a committed repair lineage"
 				: `next action  : binding is ${status.binding}; inspect status before repair`,
 		];
 	}
@@ -434,7 +442,7 @@ export function delegationRepairStatusLinesV1(status: DelegationRepairStatusV1):
 	if (status.kind === "terminal_negative_review") {
 		return [
 			`completion v2: ${status.transactionStatus} — committed attributed delta requires REPAIR-only Sol review`,
-			`next action  : run /q-review ${status.delegationId}`,
+			`next action  : ${reviewDelegationToolActionV1(status.delegationId)}`,
 		];
 	}
 	if (status.kind === "repair_required" || status.kind === "repair_retry") {
@@ -446,7 +454,7 @@ export function delegationRepairStatusLinesV1(status: DelegationRepairStatusV1):
 		];
 		if (status.kind === "repair_retry") lines.push(`repair lineage: depth ${status.depth} ${status.lineageHash}`);
 		lines.push(status.binding === "fresh"
-			? `next action  : run /q-repair ${status.delegationId}`
+			? `next action  : ${repairDelegationToolActionV1(status.delegationId)}`
 			: "next action  : restore the exact reviewed binding; repair delegation remains fail-closed");
 		return lines;
 	}
@@ -456,8 +464,8 @@ export function delegationRepairStatusLinesV1(status: DelegationRepairStatusV1):
 			`repair lineage: depth ${status.depth} ${status.lineageHash}`,
 			`root decision : ${status.rootDecisionHash}`,
 			status.binding === "fresh"
-				? `next action  : run /q-repair ${status.delegationId}`
-				: `next action  : run /q-repair ${status.delegationId}; current binding is ${status.binding}, so strict lineage-contained terminal rebase eligibility will be checked before worker start`,
+				? `next action  : ${repairDelegationToolActionV1(status.delegationId)}`
+				: `next action  : ${repairDelegationToolActionV1(status.delegationId)}; current binding is ${status.binding}, so strict lineage-contained terminal rebase eligibility will be checked before worker start`,
 		];
 	}
 	const lines = [
@@ -480,8 +488,8 @@ export function delegationRepairStatusLinesV1(status: DelegationRepairStatusV1):
 /** Clarify the exact semantic-repair exception to the ordinary pending-review blocker. */
 export function delegationExactRepairRouteLineV1(status: DelegationRepairStatusV1): string | undefined {
 	if (status.kind === "historical_multiplicity" && status.delegationId !== null) {
-		return `repair route : run deterministic /q-repair ${status.delegationId} only for that strict current tip; ordinary delegation requires path-lane admission and VERIFY remains blocked`;
+		return `repair route : ${repairDelegationToolActionV1(status.delegationId)} only for that strict current tip; ordinary delegation requires path-lane admission and VERIFY remains blocked`;
 	}
 	if ((status.kind !== "repair_required" && status.kind !== "repair_retry") || status.binding !== "fresh") return undefined;
-	return `repair route : ALLOWED — ordinary/new delegations remain blocked; run deterministic /q-repair ${status.delegationId}`;
+	return `repair route : ALLOWED — ordinary/new delegations remain blocked; ${repairDelegationToolActionV1(status.delegationId)}`;
 }

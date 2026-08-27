@@ -53,7 +53,7 @@ function durableReview(status: "ACCEPT" | "REPAIR"): AutomaticSemanticReviewResu
 		replayed: false,
 		nested_usage: zeroUsage,
 		mechanical_page_calls: 1,
-		...(status === "REPAIR" ? { next_action: `/q-repair ${ID}` } : {}),
+		...(status === "REPAIR" ? { next_action: `call workbench_repair_delegation with delegation_id=${ID}` } : {}),
 	};
 }
 
@@ -85,7 +85,7 @@ function recorded(kind: "semantic-repair" | "terminal-negative-repair"): ExactRe
 		execution_status: "completed",
 		execution_result: {
 			content: [{ type: "text", text: "untrusted child text" }],
-			details: { ok: true, next_action: `/q-repair ${CHILD}` },
+			details: { ok: true, next_action: `call workbench_repair_delegation with delegation_id=${CHILD}` },
 		},
 	};
 }
@@ -183,7 +183,7 @@ test("ACCEPT and retryable review never inspect settled authority or invoke exac
 			delegation_id: ID,
 			nested_usage: zeroUsage,
 			mechanical_page_calls: 0,
-			next_action: `/q-review ${ID}`,
+			next_action: `call workbench_review_worker_diff with delegation_id=${ID}`,
 		} as AutomaticSemanticReviewResult,
 	]) {
 		let confirmations = 0;
@@ -223,7 +223,7 @@ test("active lane or mismatched settled-authority proof starts zero children", a
 		});
 		assert.equal(result.status, "REPAIR_PENDING");
 		assert.equal(result.successor_attempts_used, 0);
-		if (result.status === "REPAIR_PENDING") assert.equal(result.next_action, `/q-repair ${ID}`);
+		if (result.status === "REPAIR_PENDING") assert.equal(result.next_action, `call workbench_repair_delegation with delegation_id=${ID}`);
 		assert.equal(repairs, 0);
 	}
 });
@@ -250,9 +250,9 @@ test("an exact service failure consumes the one automatic attempt and is never r
 
 test("strict child disposition controls the retry route without trusting raw transaction status", async () => {
 	for (const entry of [
-		{ result: strictDisposition("SUCCESSOR_ACTIVE", "ACTIVE"), next: "/q-delegation-status" },
-		{ result: strictDisposition("EXACT_REPAIR_PENDING", "EXACT_REPAIR_PENDING"), next: `/q-repair ${CHILD}` },
-		{ result: strictDisposition("SUCCESSOR_BLOCKED", "BLOCKED"), next: "/q-delegation-status" },
+		{ result: strictDisposition("SUCCESSOR_ACTIVE", "ACTIVE"), next: "call workbench_delegation_status" },
+		{ result: strictDisposition("EXACT_REPAIR_PENDING", "EXACT_REPAIR_PENDING"), next: `call workbench_repair_delegation with delegation_id=${CHILD}` },
+		{ result: strictDisposition("SUCCESSOR_BLOCKED", "BLOCKED"), next: "call workbench_delegation_status" },
 	] as const) {
 		const result = await coordinateDeliveryChainV1(input(), {
 			review: async () => durableReview("REPAIR"),

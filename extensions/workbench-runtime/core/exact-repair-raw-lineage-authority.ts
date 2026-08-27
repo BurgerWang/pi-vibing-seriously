@@ -13,7 +13,7 @@ import { readProjectDelegationRepairClosureV1 } from "./delegation-project-autho
 import { bindDelegationBoundedTaskContractV2 } from "./delegation-transaction-artifacts.ts";
 import {
 	hasDelegationSemanticRepairAuthorityV2,
-	isDelegationTerminalNegativeReviewEligibleV1,
+	isDelegationTerminalNegativeReviewEligibleFromCommittedV1,
 	readDelegationCommittedGenerationV2,
 	readDelegationReviewV2,
 	readDelegationTerminalNegativeSolAuthorityV1,
@@ -120,7 +120,9 @@ async function readCommittedDecision(input: {
 			canonicalHash(review.value.state) !== canonicalHash(state)) return { ok: false, storage: false };
 		return { ok: true, kind: "semantic-repair", decision: review.value.semantic_repair };
 	}
-	if (!isDelegationTerminalNegativeReviewEligibleV1(state)) return { ok: false, storage: false };
+	if (!isDelegationTerminalNegativeReviewEligibleFromCommittedV1(state, input.committed.records)) {
+		return { ok: false, storage: false };
+	}
 	const terminal = await input.readers.readTerminalNegative(input.projectRoot, state.delegation_id);
 	if (!terminal.ok) return { ok: false, storage: terminal.error.code === "storage_failure" };
 	if (canonicalHash(terminal.value.state) !== canonicalHash(state)) return { ok: false, storage: false };

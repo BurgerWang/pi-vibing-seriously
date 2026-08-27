@@ -605,7 +605,7 @@ test("historical mechanical FINAL migrates by complete Sol presentation plus two
 		assert.match(text(status), /review v2\s+: PASS .*\(FINAL\)/);
 		assert.match(text(status), /semantic v2\s+: MISSING .*not hash-bound Sol ACCEPT/);
 		assert.match(text(status), /call workbench_review_worker_diff without a decision/);
-		await assert.rejects(tool(stub, "workbench_delegate_worker").execute(
+		const historicalRepair = await tool(stub, "workbench_delegate_worker").execute(
 			"historical-mechanical-repair-refused",
 			{
 				task: "Do not erase an unaccepted historical review.",
@@ -619,7 +619,10 @@ test("historical mechanical FINAL migrates by complete Sol presentation plus two
 			undefined,
 			undefined,
 			ctx,
-		), /model-supplied repair_of .* has no exact in-process authority; run \/q-repair/);
+		);
+		assert.equal(historicalRepair.details.ok, false);
+		assert.equal(historicalRepair.details.caller_contract_ignored, true);
+		assert.match(text(historicalRepair), /recovery refused|authority unavailable/u);
 
 		const reviewTool = tool(stub, "workbench_review_worker_diff");
 		const presented = await reviewTool.execute(
@@ -863,11 +866,10 @@ test("registered semantic REPAIR exposes deterministic q-repair guidance while s
 		assert.equal(repair.details.semantic_review, "repair_required");
 		assert.equal(repair.details.gate_authority, false);
 		assert.equal(repair.details.repair_of, fixture.id);
-		assert.equal(repair.details.next_action, "q_repair_command");
-		assert.equal(repair.details.next_action_command, `/q-repair ${fixture.id}`);
+		assert.equal(repair.details.next_action, `call workbench_repair_delegation with delegation_id=${fixture.id}`);
 		assert.match(String(repair.details.repair_decision_hash), /^[0-9a-f]{64}$/u);
 		assert.match(String(repair.details.repair_reason_hash), /^[0-9a-f]{64}$/u);
-		assert.match(text(repair), new RegExp(`/q-repair ${fixture.id}`));
+		assert.match(text(repair), new RegExp(`workbench_repair_delegation with delegation_id=${fixture.id}`));
 		assert.equal(latestState(stub).status, "PENDING_REVIEW");
 
 		const strict = await readDelegationReviewV2(root, fixture.id);
@@ -883,8 +885,8 @@ test("registered semantic REPAIR exposes deterministic q-repair guidance while s
 		const repairStatus = await tool(stub, "workbench_delegation_status").execute(
 			"v2-repair-status", {}, undefined, undefined, ctx,
 		);
-		assert.match(text(repairStatus), new RegExp(`next action\\s+: run /q-repair ${fixture.id}`));
-		assert.match(text(repairStatus), new RegExp(`repair route\\s+: ALLOWED .*run deterministic /q-repair ${fixture.id}`));
+		assert.match(text(repairStatus), new RegExp(`next action\\s+: call workbench_repair_delegation with delegation_id=${fixture.id}`));
+		assert.match(text(repairStatus), new RegExp(`repair route\\s+: ALLOWED .*workbench_repair_delegation with delegation_id=${fixture.id}`));
 		assert.doesNotMatch(text(repairStatus), /call workbench_delegate_worker with repair_of/u);
 		assert.doesNotMatch(text(repairStatus), /blocked\s+: Starting a new worker delegation/u);
 

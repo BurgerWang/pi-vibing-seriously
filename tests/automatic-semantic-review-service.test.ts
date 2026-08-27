@@ -261,7 +261,7 @@ test("automatic service persists a semantic REPAIR and exposes exact q-repair ro
 	const h = harness({ decision: "REPAIR" });
 	const result = await runAutomaticSemanticReview(input, h.dependencies);
 	assert.equal(result.status, "REPAIR");
-	assert.equal(result.next_action, `/q-repair ${ID}`);
+	assert.equal(result.next_action, `call workbench_repair_delegation with delegation_id=${ID}`);
 	assert.equal(result.nested_usage.totalTokens, usage.totalTokens);
 });
 
@@ -271,7 +271,7 @@ test("model unavailability and presentation drift remain retryable PENDING outco
 		const result = await runAutomaticSemanticReview(input, h.dependencies);
 		assert.equal(result.status, "RETRYABLE_FAILURE");
 		if (result.status === "RETRYABLE_FAILURE") assert.equal(result.code, code);
-		assert.equal(result.next_action, `/q-review ${ID}`);
+		assert.equal(result.next_action, `call workbench_review_worker_diff with delegation_id=${ID}`);
 		assert.equal(h.facts().decisionCalls, 0);
 	}
 });
@@ -374,7 +374,7 @@ test("eligible terminal-negative service completes paging, publishes only REPAIR
 		const h = terminalHarness({ status, lostResponse: true });
 		const result = await runAutomaticSemanticReview(input, h.dependencies);
 		assert.equal(result.status, "REPAIR");
-		assert.equal(result.next_action, `/q-repair ${ID}`);
+		assert.equal(result.next_action, `call workbench_repair_delegation with delegation_id=${ID}`);
 		assert.equal(result.receipt_hash, "6".repeat(64));
 		assert.deepEqual(h.facts(), { pageCalls: 1, decisionCalls: 1, coordinateCalls: 1 });
 		assert.equal((h.generation.state as { status: string }).status, status, "service never rewrites the terminal parent");

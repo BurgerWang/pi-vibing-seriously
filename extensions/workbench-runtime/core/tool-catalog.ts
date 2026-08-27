@@ -20,6 +20,7 @@
  */
 
 import { Type } from "typebox";
+import { EXACT_REPAIR_TOOL_NAME_V1 } from "./agent-next-action.ts";
 
 /**
  * Explicit registration order of the workbench custom tools (P6-B). The
@@ -50,6 +51,10 @@ export const WORKBENCH_TOOL_NAMES = [
 	// established tool. It checkpoints sealed reviewed paths and may perform
 	// an exact-HEAD ordinary push; history rewriting remains impossible.
 	"workbench_git",
+	// Exact repair is a model-callable control surface. It accepts only the
+	// rejected delegation id and recovers every executable argument from
+	// immutable authority; /q-repair remains a human convenience alias.
+	EXACT_REPAIR_TOOL_NAME_V1,
 ] as const;
 
 /** P8b: the public read-only tool-result recovery tool. */
@@ -349,6 +354,15 @@ export const WORKBENCH_TOOL_PARAMETERS = {
 			})),
 		}),
 	]),
+	workbench_repair_delegation: Type.Object({
+		delegation_id: Type.String({
+			description:
+				"Exact rejected or lineaged terminal delegation id. The runtime recovers the complete successor contract from immutable authority; no caller-supplied task, path, acceptance, budget, or repair content is accepted.",
+			minLength: 20,
+			maxLength: 20,
+			pattern: "^\\d{8}-\\d{6}-[A-Za-z0-9]{4}$",
+		}),
+	}),
 	workbench_delegate_worker: Type.Object({
 		...WORKBENCH_DELEGATE_WORKER_V1_PROPERTIES,
 		verification: Type.Optional(Type.Array(Type.String({
@@ -603,6 +617,18 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 			"After non-zero implementation diffs have complete semantic ACCEPT authority and relevant checks are done, call action=checkpoint once with a concise message. The runtime batches every compatible reviewed slice and preserves unrelated dirty or staged work.",
 			"Call action=push only after the user explicitly requests publication and the exact current HEAD is known. Pass that hash as expected_head; ordinary push can fail on non-fast-forward and never permits force or ref deletion.",
 			"A checkpoint or push never grants review, release, Gate, Formal, or production authority. Remaining changes after checkpoint need review or belong to unrelated work; do not loop blindly.",
+		],
+	},
+	workbench_repair_delegation: {
+		name: EXACT_REPAIR_TOOL_NAME_V1,
+		label: "Workbench repair delegation",
+		description:
+			"Execute or replay one exact repair successor from strict durable authority. The only input is the rejected delegation id. The runtime recovers the immutable task, exact paths, acceptance criteria, verification, budget, plan binding, repair reason and lineage; model-supplied replacements are impossible. Existing successors are replayed idempotently and a fresh worker is started at most once. Available only to the approved Sol commander in DEV. Every resulting delta still requires ordinary semantic review and final verification. /q-repair is the equivalent user-only convenience command.",
+		promptSnippet: "Execute or replay the exact authority-bound repair for one delegation id",
+		promptGuidelines: [
+			"Use this tool whenever a review, status, failure, or continuation result reports an exact repair action. Pass only that returned delegation_id; never reconstruct the rejected task or paths.",
+			"A replayed existing successor is not a second attempt. Follow the returned machine-callable next_action and never infer success without the durable successor disposition.",
+			"Repair execution preserves the original scope and lineage and grants no semantic, Gate, release, production, or profitability authority.",
 		],
 	},
 };

@@ -105,12 +105,12 @@ test("raw exact-repair prose receives only a compatibility notice for the determ
 	};
 	assert.equal(directive.message.customType, "workbench-exact-repair-directive-v1");
 	assert.equal(directive.message.display, false);
-	assert.match(directive.message.content, /Compatibility notice only/u);
-	assert.match(directive.message.content, new RegExp(`/q-repair ${REAL_ID}`, "u"));
-	assert.match(directive.message.content, /without an agent turn/u);
-	assert.match(directive.message.content, /Do not call workbench_delegate_worker with repair_of/u);
+	assert.match(directive.message.content, /compatibility input, not executable contract authority/u);
+	assert.match(directive.message.content, new RegExp(`workbench_repair_delegation with delegation_id=${REAL_ID}`, "u"));
+	assert.match(directive.message.content, /tool recovers the complete immutable contract/u);
+	assert.match(directive.message.content, /Pass only the delegation id/u);
 	assert.doesNotMatch(directive.message.content, /tool_arguments_json/u);
-	assert.match(directive.message.content, /no delegate execution occurred/u);
+	assert.match(directive.message.content, /Do not report an attempt/u);
 });
 
 test("pending automatic continuation suppresses only the legacy raw-repair compatibility notice", async () => {
@@ -1138,8 +1138,8 @@ test("controller rejects the incident's exact repair execution claim when only s
 	assert.match(text, /reason: missing_attempt_authority/u);
 	assert.match(text, /delegate_calls_this_turn: 0/u);
 	assert.match(text, /persistence_assessment: NOT_APPLICABLE_NO_DELEGATE_CALL/u);
-	assert.match(text, new RegExp(`use deterministic /q-repair ${REAL_ID}`, "u"));
-	assert.match(text, /never call workbench_delegate_worker with raw repair_of/u);
+	assert.match(text, new RegExp(`workbench_repair_delegation with delegation_id=${REAL_ID}`, "u"));
+	assert.match(text, /never guess a receipt id/u);
 });
 
 test("controller permits an explicit statement that exact repair was not executed", async () => {
@@ -1499,8 +1499,8 @@ test("a guessed id is rejected while the same-turn durable FAILED attempt remain
 	assert.match(text, /claimed_run_count: 8/u);
 	assert.match(text, /verified_run_authority_count: 8/u);
 	assert.match(text, new RegExp(`durable_attempt_facts: .*${failedId}.*FAILED`, "u"));
-	assert.match(text, new RegExp(`/q-repair ${failedId}`, "u"));
-	assert.match(text, /never call raw repair_of/u);
+	assert.match(text, new RegExp(`workbench_repair_delegation with delegation_id=${failedId}`, "u"));
+	assert.match(text, /fails closed before worker start/u);
 	assert.equal(text.includes(guessedId), false, "the rejected guessed id is never repeated");
 });
 

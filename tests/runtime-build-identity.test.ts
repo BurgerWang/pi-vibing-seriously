@@ -80,6 +80,7 @@ test("runtime doctor compares the immutable load snapshot with the current sourc
 	};
 	assert.match(workbenchRuntimeDoctorLinesV1(stale).join("\n"), /run \/reload/);
 	assert.match(workbenchRuntimeMutationBlockReasonV1("workbench_delegate_worker", stale) ?? "", /runtime is stale/);
+	assert.match(workbenchRuntimeMutationBlockReasonV1("workbench_repair_delegation", stale) ?? "", /runtime is stale/);
 	assert.match(workbenchRuntimeMutationBlockReasonV1("third_party_unknown_writer", stale) ?? "", /runtime is stale/);
 	assert.match(workbenchRuntimeMutationBlockReasonV1(undefined, stale) ?? "", /runtime is stale/);
 	assert.equal(workbenchRuntimeMutationBlockReasonV1("workbench_delegation_status", stale), undefined);

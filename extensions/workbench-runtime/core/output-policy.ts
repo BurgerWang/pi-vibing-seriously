@@ -164,6 +164,7 @@ export function resolveToolOutputPolicy(input: ResolveToolOutputPolicyInput): To
 		case "workbench_list_gates": return POLICY.gateList;
 		case "workbench_compare_runs": return POLICY.compare;
 		case "workbench_delegate_worker": return POLICY.workerHandoff;
+		case "workbench_repair_delegation": return POLICY.workerHandoff;
 		case "workbench_review_worker_diff": return POLICY.diffReview;
 		case "workbench_recover_tool_result": return POLICY.recovery;
 		default: return POLICY.default;

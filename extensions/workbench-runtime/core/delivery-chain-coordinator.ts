@@ -1,6 +1,12 @@
 /** One-review/one-successor delivery-chain coordinator. */
 
 import {
+	delegationStatusToolActionV1,
+	repairDelegationToolActionV1,
+	reviewDelegationToolActionV1,
+} from "./agent-next-action.ts";
+
+import {
 	runAutomaticSemanticReview,
 	type AutomaticSemanticReviewInput,
 	type AutomaticSemanticReviewDurableResult,
@@ -120,11 +126,11 @@ export type DeliveryChainCoordinatorResultV1 =
 const SHA256_RE = /^[a-f0-9]{64}$/u;
 
 function qReview(delegationId: string): string {
-	return `/q-review ${delegationId}`;
+	return reviewDelegationToolActionV1(delegationId);
 }
 
 function qRepair(delegationId: string): string {
-	return `/q-repair ${delegationId}`;
+	return repairDelegationToolActionV1(delegationId);
 }
 
 function exactRepairDispositionNextAction(
@@ -133,7 +139,7 @@ function exactRepairDispositionNextAction(
 ): string {
 	if (repair.status === "EXACT_REPAIR_PENDING") return qRepair(repair.successor.delegation_id);
 	if (repair.status === "SUCCESSOR_ACTIVE" || repair.status === "SUCCESSOR_BLOCKED") {
-		return "/q-delegation-status";
+		return delegationStatusToolActionV1();
 	}
 	return qRepair(parentDelegationId);
 }
@@ -159,7 +165,7 @@ function isRepairResult(result: AutomaticSemanticReviewResult): result is Automa
 /**
  * Run at most one automatic successor attempt. The exact repair execution
  * includes the child's normal delivery/review path, but this coordinator never
- * recurses: a second durable REPAIR remains an explicit child `/q-repair`.
+ * recurses: a second durable REPAIR remains an explicit child repair-tool call.
  */
 export async function coordinateDeliveryChainV1(
 	input: DeliveryChainCoordinatorInputV1,

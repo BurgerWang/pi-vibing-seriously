@@ -1023,7 +1023,7 @@ test("Sol DEV exposes the fixed worker-first surface on session_start", async ()
 	});
 	await handlers[0]!({ type: "session_start", reason: "resume" } as never, ctx as never);
 	assert.deepEqual(stub.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST], "exactly the fixed allowlist in canonical order");
-	assert.equal(stub.activeTools.length, 16, "16 tools: reviewed local commit is available while edit/write/bash/foreign stay locked");
+	assert.equal(stub.activeTools.length, 17, "17 tools: structured Git and exact repair are available while edit/write/bash/foreign stay locked");
 	assert.ok(!stub.activeTools.includes("edit"));
 	assert.ok(!stub.activeTools.includes("write"));
 	for (const tool of ["bash", "web_search"]) {
@@ -1329,7 +1329,7 @@ test("non-TUI unlock issues a pending lease, emits two distinct bounded token pa
 	assert.ok(issued.output.includes("BLOCKED until confirmed"));
 	// Pending lease does not alter the locked worker-first surface.
 	assert.deepEqual(stub.activeTools, [...CURRENT_SOL_DEV_ALLOWLIST]);
-	assert.equal(stub.activeTools.length, 16);
+	assert.equal(stub.activeTools.length, 17);
 	const pendingOrdinary = await guardCall(stub, "edit", { path: "src/main.ts" });
 	assert.ok(pendingOrdinary && pendingOrdinary.block === true);
 	assert.match(String(pendingOrdinary.reason), /lease pending/);
@@ -1363,7 +1363,7 @@ test("non-TUI confirmation requires BOTH exact parts on the same command; mismat
 	const ok = await runCmd(stub, "q-commander-write-unlock", `confirm ${partA} ${partB}`);
 	assert.ok(ok.output.includes("CONFIRMED and active"));
 	assert.deepEqual(stub.activeTools, ACTIVE_SOL_DEV_ALLOWLIST);
-	assert.equal(stub.activeTools.length, 18);
+	assert.equal(stub.activeTools.length, 19);
 	assert.equal(await guardCall(stub, "edit", { path: "src/main.ts" }), undefined, "authorized edit passes the guard");
 	// The lease-id form confirms too, and a wrong id is refused.
 	const id = /pending lease (\S+)/.exec(issued.output)?.[1];
@@ -1476,7 +1476,7 @@ test("only authorized leased edit/write consumes calls; exhaustion restores the 
 	workbenchRuntime(stub);
 	await solSession(stub);
 	await issueAndConfirm(stub, "user-directed --paths package.json --calls 1 --minutes 10");
-	assert.equal(stub.activeTools.length, 18);
+	assert.equal(stub.activeTools.length, 19);
 	// A path outside the lease is blocked BEFORE consumption: the call stays available.
 	const outOfScope = await guardCall(stub, "edit", { path: ".github/workflows/ci.yml" });
 	assert.ok(outOfScope && outOfScope.block === true);
@@ -1587,7 +1587,7 @@ test("/q-commander-write-lock revokes the exception and restores the worker-firs
 	workbenchRuntime(stub);
 	await solSession(stub);
 	await issueAndConfirm(stub);
-	assert.equal(stub.activeTools.length, 18);
+	assert.equal(stub.activeTools.length, 19);
 	const locked = await runCmd(stub, "q-commander-write-lock", "");
 	assert.match(locked.output, /revoked/);
 	assert.match(locked.output, /user-directed lock/);
@@ -1619,7 +1619,7 @@ test("leaving DEV, model change and session end revoke the lease and reapply loc
 	workbenchRuntime(stubA);
 	await solSession(stubA);
 	await issueAndConfirm(stubA);
-	assert.equal(stubA.activeTools.length, 18);
+	assert.equal(stubA.activeTools.length, 19);
 	await runCmd(stubA, "q-mode-verify", "", { hasUI: true });
 	assert.match(await leaseStatusLine(stubA), /WRITE-LEASE revoked/);
 	assert.ok(!stubA.activeTools.includes("edit") && !stubA.activeTools.includes("write"));
@@ -1679,7 +1679,7 @@ test("a confirmed lease is audit-restored but re-locks across session replacemen
 	await solSession(stubA);
 	await issueAndConfirm(stubA, "user-directed --paths package.json,.github/workflows/ci.yml --calls 2 --minutes 10");
 	assert.equal(await guardCall(stubA, "edit", { path: "package.json" }), undefined, "one authorized high-risk write");
-	assert.equal(stubA.activeTools.length, 18, "still active with one call left");
+	assert.equal(stubA.activeTools.length, 19, "still active with one call left");
 	// Runtime B restores audit facts but requires a fresh user grant. This
 	// prevents a failed revoke/consume append from reviving older authority.
 	const stubB = makeStub();

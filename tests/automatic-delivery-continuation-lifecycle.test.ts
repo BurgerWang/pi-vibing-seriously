@@ -121,7 +121,7 @@ function repairPending(delegationId = ID): DeliveryChainCoordinatorResultV1 {
 		max_successor_attempts: DELIVERY_CHAIN_MAX_SUCCESSOR_ATTEMPTS_V1,
 		successor_attempts_used: 0,
 		review: {} as never,
-		next_action: `/q-repair ${delegationId}`,
+		next_action: `call workbench_repair_delegation with delegation_id=${delegationId}`,
 	};
 }
 
@@ -133,7 +133,7 @@ function attemptedRepairPending(delegationId = ID): DeliveryChainCoordinatorResu
 		max_successor_attempts: DELIVERY_CHAIN_MAX_SUCCESSOR_ATTEMPTS_V1,
 		successor_attempts_used: 1,
 		review: {} as never,
-		next_action: `/q-repair ${delegationId}`,
+		next_action: `call workbench_repair_delegation with delegation_id=${delegationId}`,
 	};
 }
 
@@ -144,7 +144,7 @@ function reviewRetryable(delegationId = ID): DeliveryChainCoordinatorResultV1 {
 		max_successor_attempts: DELIVERY_CHAIN_MAX_SUCCESSOR_ATTEMPTS_V1,
 		successor_attempts_used: 0,
 		review: {} as never,
-		next_action: `/q-review ${delegationId}`,
+		next_action: `call workbench_review_worker_diff with delegation_id=${delegationId}`,
 	};
 }
 
@@ -155,7 +155,7 @@ function authorityError(delegationId = ID): DeliveryChainCoordinatorResultV1 {
 		delegation_id: delegationId,
 		max_successor_attempts: DELIVERY_CHAIN_MAX_SUCCESSOR_ATTEMPTS_V1,
 		successor_attempts_used: 0,
-		next_action: `/q-review ${delegationId}`,
+		next_action: `call workbench_review_worker_diff with delegation_id=${delegationId}`,
 	};
 }
 

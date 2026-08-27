@@ -13,6 +13,7 @@ import {
 	buildWorkerCommandEffectEntryFromToolResult,
 	EMPTY_WORKER_COMMAND_EFFECT_RUNTIME_OBSERVATION,
 	finalizeDelegationCommandProvenance,
+	isDelegationCommandScopeAttributedV1,
 	observeWorkerCommandEffectRuntimeEntry,
 	revalidateDelegationCommandProvenanceReceipts,
 	validateDelegationCommandProvenance,
@@ -144,8 +145,12 @@ async function commitEffectRun(
 	effect: Readonly<CommandEffectRecord>,
 	startedAt: string,
 	finishedAt: string,
+	runOutcome?: "SUCCESS" | "PROCESS_FAILED",
 ): Promise<void> {
 	const transaction = await beginRunTransaction(root, effect.run_id);
+	const resolvedRunOutcome = runOutcome ?? (effect.status === "CLEAN" || effect.status === "COMMAND_ATTRIBUTED"
+		? "SUCCESS"
+		: "COMMAND_EFFECT_FAILED");
 	const manifest = {
 		schema_version: 2,
 		run_id: effect.run_id,
@@ -156,7 +161,7 @@ async function commitEffectRun(
 		duration_ms: Date.parse(finishedAt) - Date.parse(startedAt),
 		cwd: root,
 		argv: ["fixture"],
-		exit_code: 0,
+		exit_code: resolvedRunOutcome === "SUCCESS" ? 0 : 2,
 		timed_out: false,
 		cancelled: false,
 		git_commit: null,
@@ -171,9 +176,7 @@ async function commitEffectRun(
 		validation_components: [],
 		cache_request_mode: "no-cache",
 		run_transaction_schema_version: 2,
-		run_outcome: effect.status === "CLEAN" || effect.status === "COMMAND_ATTRIBUTED"
-			? "SUCCESS"
-			: "COMMAND_EFFECT_FAILED",
+		run_outcome: resolvedRunOutcome,
 		command_effect_path: "command-effect.json",
 		command_effect_hash: effect.command_effect_hash,
 		command_effect_status: effect.status,
@@ -189,6 +192,78 @@ async function commitEffectRun(
 	]);
 	await commitRunTransaction(transaction, new Date(finishedAt));
 }
+
+test("a failed CLEAN recipe remains spatially ATTRIBUTED and is a separate worker failure fact", async () => {
+	await withTempDir(async (root) => {
+		await initIgnoredOutputRepo(root);
+		const contract = bindDelegationBoundedTaskContractV2({
+			task_kind: "implementation",
+			task: "Preserve an attributed source delta when a no-write validation command fails.",
+			allowed_paths: ["src/**"],
+			acceptance_criteria: ["Command failure is not relabelled as workspace drift."],
+			verification: [],
+			timeout_seconds: 600,
+			budget_profile: "standard",
+		});
+		assert.equal(contract.ok, true);
+		if (!contract.ok) return;
+		const prepared = await prepareDelegationChangeSetLifecycleV2({
+			project_root: root,
+			delegation_id: DELEGATION_ID,
+			contract_hash: contract.value.contract_hash,
+			dependency_paths: [],
+			exec: spawnExec,
+		});
+		assert.equal(prepared.ok, true);
+		if (!prepared.ok) return;
+		const started = await beginRecipeCommandEffectCapture({
+			project_root: root,
+			exec: spawnExec,
+			declared_writes: [],
+		});
+		const effect = await completeRecipeCommandEffectCapture({
+			project_root: root,
+			exec: spawnExec,
+			started,
+			run_id: "20260827-120003-cm03",
+			recipe: "expected-no-write-check",
+			actor: "worker",
+			worker_delegation_id: DELEGATION_ID,
+			worker_contract_hash: contract.value.contract_hash,
+			mutation_declaration: "none",
+			declared_writes: [],
+		});
+		assert.equal(effect.status, "CLEAN");
+		await commitEffectRun(
+			root,
+			effect,
+			"2026-08-27T12:00:03.000Z",
+			"2026-08-27T12:00:03.001Z",
+			"PROCESS_FAILED",
+		);
+		const finalized = await finalizeDelegationChangeSetLifecycleV2({
+			prepared: prepared.value,
+			observation: { state: "empty", tool: "none", outcome: "none", code: "none", revision: 0 },
+			exec: spawnExec,
+		});
+		assert.equal(finalized.ok, true, finalized.ok ? "" : finalized.error.code);
+		if (!finalized.ok || finalized.value.command_provenance === undefined) return;
+		const provenance = finalized.value.command_provenance;
+		assert.deepEqual(provenance.terminal_reasons, ["COMMAND_EFFECT_RUN_FAILED"]);
+		assert.deepEqual(provenance.remaining_workspace_drift, []);
+		assert.equal(provenance.effective_status, "ATTRIBUTED");
+		assert.equal(validateDelegationCommandProvenance(provenance, finalized.value.change_set), true);
+		assert.equal(isDelegationCommandScopeAttributedV1(provenance, finalized.value.change_set), true);
+
+		const legacy = structuredClone(provenance) as DelegationCommandProvenanceRecord;
+		legacy.effective_status = "WORKSPACE_DRIFT";
+		resign(legacy);
+		assert.equal(validateDelegationCommandProvenance(legacy, finalized.value.change_set), true,
+			"immutable v1 clean-run-failure records remain readable");
+		assert.equal(isDelegationCommandScopeAttributedV1(legacy, finalized.value.change_set), true,
+			"legacy process failure remains safe repair scope, not write drift");
+	});
+});
 
 async function commandRun(
 	root: string,

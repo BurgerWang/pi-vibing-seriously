@@ -1443,12 +1443,12 @@ test("model-supplied repair_of cannot supersede a committed FAILED delegation wi
 		assert.equal(await readFile(transactionPath, "utf8"), transactionBefore, "status and review guidance preserve committed FAILED evidence");
 
 		const beforeRawRepair = await delegationDirectories(root);
-		await assert.rejects(
-			withFakeWorker(repairScript, () => delegateTool(stub).execute(
+		const refusedRawRepair = await withFakeWorker(repairScript, () => delegateTool(stub).execute(
 				"committed-failed-repair", delegateParams({ task_kind: "diagnosis", repair_of: failedId }), undefined, undefined, ctx,
-			)),
-			new RegExp(`model-supplied repair_of ${failedId} has no exact in-process authority; run /q-repair ${failedId}`, "u"),
-		);
+			));
+		assert.equal(refusedRawRepair.details.ok, false);
+		assert.equal(refusedRawRepair.details.caller_contract_ignored, true);
+		assert.match(resultText(refusedRawRepair), /authority unavailable|recovery refused/u);
 		assert.deepEqual(await delegationDirectories(root), beforeRawRepair, "raw repair parameters never allocate a successor");
 		assert.equal(await readFile(transactionPath, "utf8"), transactionBefore, "the committed FAILED authority remains immutable");
 	});
@@ -1498,7 +1498,7 @@ test("q-repair directly advances semantic and terminal-lineage transactions with
 		assert.equal(failed.value.state.repair_lineage?.repair_of, parentId);
 		assert.match(notices.at(-1) ?? "", /authority_kind: semantic-repair/u);
 		assert.match(notices.at(-1) ?? "", /prior successor ended before writes and has strict deterministic continuation authority/u);
-		assert.match(notices.at(-1) ?? "", new RegExp(`next_action: \/q-repair ${failedId}`, "u"));
+		assert.match(notices.at(-1) ?? "", new RegExp(`next_action: call workbench_repair_delegation with delegation_id=${failedId}`, "u"));
 		// Model a lost command response after the durable child was committed.
 		// Replay must recover that child from project authority alone.
 		notices.length = 0;
@@ -1508,7 +1508,7 @@ test("q-repair directly advances semantic and terminal-lineage transactions with
 		await assert.rejects(readFile(replayLaunchMarker, "utf8"), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
 		assert.match(notices.at(-1) ?? "", /prior successor ended before writes and has strict deterministic continuation authority/u);
 		assert.match(notices.at(-1) ?? "", new RegExp(`successor: ${failedId}`, "u"));
-		assert.match(notices.at(-1) ?? "", new RegExp(`next_action: \/q-repair ${failedId}`, "u"));
+		assert.match(notices.at(-1) ?? "", new RegExp(`next_action: call workbench_repair_delegation with delegation_id=${failedId}`, "u"));
 
 		const beforeTerminalRepair = await delegationDirectories(root);
 		await withFakeWorker(terminalRepairScript, () => command.handler(failedId, commandCtx));
@@ -1644,7 +1644,7 @@ test("q-repair replays a matching PREPARED successor after a pre-launch crash wi
 		assert.match(notices.at(-1) ?? "", new RegExp(`successor: ${preparedId}`, "u"));
 		assert.match(notices.at(-1) ?? "", /successor_status: PREPARED/u);
 		assert.match(notices.at(-1) ?? "", /successor_disposition: ACTIVE/u);
-		assert.match(notices.at(-1) ?? "", /next_action: \/q-delegation-status/u);
+		assert.match(notices.at(-1) ?? "", /next_action: call workbench_delegation_status/u);
 
 		const aborted = await persistAbortedDelegationTransaction(root, {
 			delegation_id: prepared.value.delegation_id,
@@ -1661,7 +1661,7 @@ test("q-repair replays a matching PREPARED successor after a pre-launch crash wi
 			"q-repair-prepared-aborted-status", {}, undefined, undefined, toolCtx,
 		));
 		assert.match(abortedStatus, new RegExp(`latest\\s+: ${preparedId} ABORTED`, "u"));
-		assert.match(abortedStatus, new RegExp(`next action\\s+: run /q-repair ${preparedId}`, "u"));
+		assert.match(abortedStatus, new RegExp(`next action\\s+: call workbench_repair_delegation with delegation_id=${preparedId}`, "u"));
 		assert.equal((abortedStatus.match(/next action\s+:/gu) ?? []).length, 1);
 		const rawAuthority = await recoverRawLineageExactRepairAuthorityV1({
 			project_root: root,
@@ -1816,34 +1816,34 @@ test("an exact semantic REPAIR sidecar launches one bounded implementation linea
 		}
 
 		const beforeBroadRefusal = await delegationDirectories(root);
-		await assert.rejects(
-			withFakeWorker(repairScript, () => delegateTool(stub).execute(
-				"semantic-repair-broad-refused",
+		const broadAlias = await withFakeWorker(repairScript, () => delegateTool(stub).execute(
+				"semantic-repair-broad-alias",
 				delegateParams({ task_kind: "implementation", repair_of: parentId, allowed_paths: ["src/**"] }),
 				undefined,
 				undefined,
 				ctx,
-			)),
-			/model-supplied repair_of .* has no exact in-process authority; run \/q-repair/u,
-		);
-		await assert.rejects(
-			withFakeWorker(repairScript, () => delegateTool(stub).execute(
-				"semantic-repair-exact-raw-refused",
+			));
+		assert.equal(broadAlias.details.caller_contract_ignored, true);
+		assert.equal(broadAlias.details.status, "SUCCESSOR_RECORDED");
+		const afterBroadAlias = await delegationDirectories(root);
+		assert.equal(afterBroadAlias.length, beforeBroadRefusal.length + 1);
+		const exactAliasReplay = await withFakeWorker(repairScript, () => delegateTool(stub).execute(
+				"semantic-repair-exact-alias-replay",
 				delegateParams({ task_kind: "implementation", repair_of: parentId, allowed_paths: [rejectedPath] }),
 				undefined,
 				undefined,
 				ctx,
-			)),
-			/model-supplied repair_of .* has no exact in-process authority; run \/q-repair/u,
-		);
-		assert.deepEqual(await delegationDirectories(root), beforeBroadRefusal, "model repair parameters refuse before allocating a child");
+			));
+		assert.equal(exactAliasReplay.details.caller_contract_ignored, true);
+		assert.equal(exactAliasReplay.details.replayed, true);
+		assert.deepEqual(await delegationDirectories(root), afterBroadAlias, "compatibility replay never allocates a sibling child");
 
 		const repairNotices: string[] = [];
 		await withFakeWorker(repairScript, () => exactRepairCommand(stub).handler(
 			parentId,
 			exactRepairCommandContext(root, "semantic-repair-exact-command", repairNotices, () => {}),
 		));
-		assert.match(repairNotices.at(-1) ?? "", /shared delegate execution completed/u);
+		assert.match(repairNotices.at(-1) ?? "", /durable replay/u);
 		const repairId = (await delegationDirectories(root)).find((id) => !beforeBroadRefusal.includes(id));
 		assert.equal(typeof repairId, "string");
 		if (repairId === undefined) return;
@@ -2104,7 +2104,7 @@ test("a deliberately discarded repair closes on a clean repository and the same 
 	});
 });
 
-test("two sessions cannot use raw repair_of or replay one q-repair authority into sibling children", async () => {
+test("two sessions route raw repair_of through one idempotent exact successor", async () => {
 	await withTempDir(async (root) => {
 		await initializeProject(root);
 		const rejectedPath = "src/concurrent-rejected.ts";
@@ -2150,19 +2150,20 @@ test("two sessions cannot use raw repair_of or replay one q-repair authority int
 				secondContext,
 			),
 		]));
-		assert.equal(attempts.filter((attempt) => attempt.status === "fulfilled").length, 0);
-		assert.equal(attempts.filter((attempt) => attempt.status === "rejected").length, 2);
+		assert.equal(attempts.filter((attempt) => attempt.status === "fulfilled").length, 2);
+		assert.equal(attempts.filter((attempt) => attempt.status === "rejected").length, 0);
 		for (const attempt of attempts) {
-			if (attempt.status === "rejected") assert.match(String(attempt.reason), /model-supplied repair_of .* has no exact in-process authority/u);
+			if (attempt.status === "fulfilled") assert.equal(attempt.value.details.caller_contract_ignored, true);
 		}
-		assert.deepEqual(await delegationDirectories(root), [parentId], "raw model parameters never allocate a repair child");
+		assert.equal((await delegationDirectories(root)).length, 2, "raw compatibility calls converge on one repair child");
+		assert.equal((await readFile(launchMarkerPath, "utf8")).trim().split("\n").length, 1, "concurrent compatibility calls start one worker");
 
 		const firstNotices: string[] = [];
 		await withFakeWorker(repairScript, () => exactRepairCommand(first).handler(
 			parentId,
 			exactRepairCommandContext(root, "semantic-repair-concurrency-q-a", firstNotices, () => {}),
 		));
-		assert.match(firstNotices.at(-1) ?? "", /shared delegate execution completed/u);
+		assert.match(firstNotices.at(-1) ?? "", /durable replay/u);
 		const secondNotices: string[] = [];
 		await withFakeWorker(repairScript, () => exactRepairCommand(second).handler(
 			parentId,
@@ -2530,7 +2531,7 @@ test("an unpublished artifact failure refuses model-supplied repair_of and remai
 		assert.equal(latestSessionState(stub).status, "PENDING_REVIEW");
 		const status = await delegationStatusTool(stub).execute("artifact-repair-status", {}, undefined, undefined, ctx);
 		assert.match(resultText(status), /RECOVERABLE_UNPUBLISHED/);
-		assert.match(resultText(status), /committed proof is absent, so deterministic \/q-repair is unavailable/u);
+		assert.match(resultText(status), /committed proof is absent, so deterministic workbench_repair_delegation is unavailable/u);
 		assert.doesNotMatch(resultText(status), /repair_of=/u, "proofless recovery cannot advertise deterministic exact repair");
 		assert.doesNotMatch(resultText(status), /authority v2\s+: INVALID/);
 		const refusedReview = await reviewTool(stub).execute(
@@ -2538,24 +2539,24 @@ test("an unpublished artifact failure refuses model-supplied repair_of and remai
 		);
 		assert.equal(refusedReview.details.error, "repair_required");
 		assert.equal(refusedReview.details.repair_of, brokenId);
-		assert.equal(refusedReview.details.next_action, "workbench_delegation_status");
-		assert.match(resultText(refusedReview), /deterministic \/q-repair authority is unavailable/u);
+		assert.equal(refusedReview.details.next_action, "call workbench_delegation_status");
+		assert.match(resultText(refusedReview), /deterministic repair authority is unavailable/u);
 		assert.doesNotMatch(resultText(refusedReview), /repair_of=/u, "proofless recovery is never advertised as a raw model repair call");
 		assert.match(resultText(refusedReview), /do not retry review/);
 		assert.equal(await readFile(transactionPath, "utf8"), transactionBefore, "status and review guidance never rewrite recovery evidence");
 
 		const script = await writeFakeWorker(root, {});
 		const beforeRawRepair = await delegationDirectories(root);
-		await assert.rejects(
-			withFakeWorker(script, () => delegateTool(stub).execute(
+		const refusedRaw = await withFakeWorker(script, () => delegateTool(stub).execute(
 				"artifact-repair-call",
 				delegateParams({ task_kind: "diagnosis", repair_of: brokenId }),
 				undefined,
 				undefined,
 				ctx,
-			)),
-			new RegExp(`model-supplied repair_of ${brokenId} has no exact in-process authority; run /q-repair ${brokenId}`, "u"),
-		);
+			));
+		assert.equal(refusedRaw.details.ok, false);
+		assert.equal(refusedRaw.details.caller_contract_ignored, true);
+		assert.match(resultText(refusedRaw), /recovery refused|authority unavailable/u);
 		assert.deepEqual(await delegationDirectories(root), beforeRawRepair);
 		assert.equal(await readFile(transactionPath, "utf8"), transactionBefore, "the unpublished recovery evidence remains immutable");
 	});

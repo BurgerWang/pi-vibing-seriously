@@ -71,6 +71,7 @@ import {
 import { validateSemanticReviewEnvelopeV1 } from "./semantic-review-envelope.ts";
 import { validateChangeSet, type ChangeSetRecord } from "./change-set.ts";
 import {
+	isDelegationCommandScopeAttributedV1,
 	validateDelegationCommandProvenance,
 	type DelegationCommandProvenanceRecord,
 } from "./delegation-command-effect-provenance.ts";
@@ -486,6 +487,13 @@ export interface DelegationReviewAuthorityV2 {
 	semantic_migration?: DelegationSemanticMigrationV1;
 	/** Optional immutable Sol decision that rejects this provisional delta for repair. */
 	semantic_repair?: DelegationSemanticRepairDecisionV1;
+	/**
+	 * Read-time compatibility proof for immutable records that predate the
+	 * separation of a failed CLEAN recipe from spatial workspace drift. This
+	 * bit is derived only from a fully verified committed generation and is
+	 * never persisted or accepted as caller authority by itself.
+	 */
+	terminal_negative_legacy_clean_command?: true;
 }
 
 export interface PublishDelegationReviewV2Input extends DelegationCasInput {
@@ -1269,7 +1277,7 @@ function encodeSemanticRepairDecision(value: DelegationSemanticRepairDecisionV1)
 	return encodeJson(value, DELEGATION_SEMANTIC_REPAIR_DECISION_MAX_BYTES);
 }
 
-export function isDelegationTerminalNegativeReviewEligibleV1(
+function isDelegationTerminalNegativeReviewStateCandidateV1(
 	state: Readonly<DelegationTransactionRecord>,
 ): state is DelegationTransactionRecord & { status: DelegationTerminalNegativeStatusV1 } {
 	const outcome = state.terminal_outcome;
@@ -1277,9 +1285,41 @@ export function isDelegationTerminalNegativeReviewEligibleV1(
 		&& (state.status === "INTERRUPTED" || state.status === "FAILED")
 		&& state.revision === 3 && state.committed_proof !== null && state.committed_proof.revision === 2
 		&& state.review === null && outcome !== null && outcome.terminal_facts_complete === true
-		&& outcome.scope_complete === true && outcome.change_set_status === "ATTRIBUTED"
+		&& outcome.scope_complete === true
 		&& outcome.changed_paths.length > 0 && outcome.delta_hash !== null
 		&& outcome.changed_paths.every((path) => delegationPathAllowedV2(path, state.allowed_paths));
+}
+
+export function isDelegationTerminalNegativeReviewEligibleV1(
+	state: Readonly<DelegationTransactionRecord>,
+): state is DelegationTransactionRecord & { status: DelegationTerminalNegativeStatusV1 } {
+	return isDelegationTerminalNegativeReviewStateCandidateV1(state)
+		&& state.terminal_outcome!.change_set_status === "ATTRIBUTED";
+}
+
+/**
+ * Strict read compatibility for the historical failed-CLEAN-recipe defect.
+ * The stale WORKSPACE_DRIFT label is accepted only after the complete
+ * committed generation revalidates and its command provenance proves an
+ * attributed spatial delta with no remaining drift or conflict.
+ */
+export function isDelegationTerminalNegativeReviewEligibleFromCommittedV1(
+	state: Readonly<DelegationTransactionRecord>,
+	records: DelegationCommittedRecords,
+): state is DelegationTransactionRecord & { status: DelegationTerminalNegativeStatusV1 } {
+	if (isDelegationTerminalNegativeReviewEligibleV1(state)) return true;
+	if (!isDelegationTerminalNegativeReviewStateCandidateV1(state)
+		|| state.terminal_outcome!.change_set_status !== "WORKSPACE_DRIFT"
+		|| !validateCommittedRecordBindings(state, records, true)) return false;
+	const scope = records["scope.json"];
+	if (!isRecord(scope)) return false;
+	const changeSet = scope.change_set;
+	const command = scope.command_provenance;
+	if (!isRecord(changeSet) || !isDelegationCommandScopeAttributedV1(command, changeSet as unknown as ChangeSetRecord)) {
+		return false;
+	}
+	return sameJson(state.terminal_outcome!.changed_paths, command.effective_paths)
+		&& state.terminal_outcome!.delta_hash === command.effective_delta_hash;
 }
 
 function terminalNegativeFailureFactsHash(state: Readonly<DelegationTransactionRecord>): string {
@@ -1293,7 +1333,8 @@ function terminalNegativeFailureFactsHash(state: Readonly<DelegationTransactionR
 }
 
 function terminalNegativeDecisionEligible(authority: DelegationReviewAuthorityV2): authority is DelegationTerminalNegativeReviewAuthorityV1 {
-	return isDelegationTerminalNegativeReviewEligibleV1(authority.state) && !authority.finalized
+	return (isDelegationTerminalNegativeReviewEligibleV1(authority.state)
+		|| authority.terminal_negative_legacy_clean_command === true) && !authority.finalized
 		&& authority.artifact.schema_version === 2 && authority.artifact.transaction_revision === 3
 		&& authority.review.schema_version === 2 && authority.review.checked_paths.length > 0
 		&& authority.review.verdict === "PASS" && authority.review.mismatch === false
@@ -1715,12 +1756,14 @@ async function readReviewArtifactAt(
 		}
 		const reviewHash = hashBytes(bytes);
 		let finalized = false;
+		let terminalNegativeLegacyCleanCommand = false;
 		if (state.status === "PENDING_REVIEW") {
 			if (state.revision !== 3 || state.review !== null) return failure("invalid_record", "pending review state is inconsistent", point);
 		} else if (state.status === "INTERRUPTED" || state.status === "FAILED") {
-			if (!isDelegationTerminalNegativeReviewEligibleV1(state)) {
+			if (!isDelegationTerminalNegativeReviewEligibleFromCommittedV1(state, records)) {
 				return failure("invalid_record", "terminal-negative review state is ineligible or incomplete", point);
 			}
+			terminalNegativeLegacyCleanCommand = !isDelegationTerminalNegativeReviewEligibleV1(state);
 		} else if (state.status === "REVIEWED") {
 			const review = state.review;
 			if (state.revision !== 4 || review === null || review.delegation_id !== state.delegation_id ||
@@ -1741,6 +1784,7 @@ async function readReviewArtifactAt(
 				review_hash: reviewHash,
 				review_path: delegationReviewRelativePathV2(state.delegation_id)!,
 				finalized,
+				...(terminalNegativeLegacyCleanCommand ? { terminal_negative_legacy_clean_command: true as const } : {}),
 				bytes: Uint8Array.from(bytes),
 			},
 		};
@@ -2533,7 +2577,7 @@ export async function readDelegationTerminalNegativeReviewV1(
 ): Promise<DelegationTransactionStorageResult<DelegationTerminalNegativeReviewAuthorityV1>> {
 	const generation = await readDelegationCommittedGenerationV2(projectRoot, delegationId, options);
 	if (!generation.ok) return generation;
-	if (!isDelegationTerminalNegativeReviewEligibleV1(generation.value.state)) {
+	if (!isDelegationTerminalNegativeReviewEligibleFromCommittedV1(generation.value.state, generation.value.records)) {
 		return failure("invalid_record", "delegation is not an eligible committed terminal-negative implementation");
 	}
 	const paths = transactionPaths(projectRoot, delegationId);
@@ -2924,7 +2968,7 @@ export async function publishDelegationTerminalNegativeRepairDecisionV1(
 		const currentResult = await readStateAt(paths.transaction, adapter);
 		if (!currentResult.ok) return currentResult;
 		const current = currentResult.value;
-		if (!isDelegationTerminalNegativeReviewEligibleV1(current)
+		if (!isDelegationTerminalNegativeReviewStateCandidateV1(current)
 			|| current.generation !== input.expected_generation || current.revision !== input.expected_revision
 			|| current.contract_hash !== input.contract_hash || !sameIdentity(current.worker_identity, input.worker_identity)
 			|| input.now < current.updated_at) {
@@ -2937,6 +2981,9 @@ export async function publishDelegationTerminalNegativeRepairDecisionV1(
 		}, adapter);
 		if (!verified.ok || !sameJson(verified.value.inventory.proof, current.committed_proof)) {
 			return failure("invalid_record", "terminal-negative repair conflicts with the committed generation");
+		}
+		if (!isDelegationTerminalNegativeReviewEligibleFromCommittedV1(current, verified.value.records)) {
+			return failure("invalid_record", "terminal-negative repair has no strictly attributed committed scope");
 		}
 		const baseRead = await readReviewArtifactAt(paths, current, verified.value.records, adapter);
 		if (!baseRead.ok) return baseRead;
@@ -3202,7 +3249,7 @@ export async function persistDelegationTerminalNegativeReviewProvisionalV1(
 		const currentResult = await readStateAt(paths.transaction, adapter);
 		if (!currentResult.ok) return currentResult;
 		const current = currentResult.value;
-		if (!isDelegationTerminalNegativeReviewEligibleV1(current) || current.generation !== input.expected_generation
+		if (!isDelegationTerminalNegativeReviewStateCandidateV1(current) || current.generation !== input.expected_generation
 			|| current.revision !== input.expected_revision || current.contract_hash !== input.contract_hash
 			|| !sameIdentity(current.worker_identity, input.worker_identity) || input.now !== input.artifact.reviewed_at) {
 			return failure("conflict", "terminal-negative provisional review CAS, identity, or lifecycle check failed");
@@ -3220,6 +3267,9 @@ export async function persistDelegationTerminalNegativeReviewProvisionalV1(
 		if (!verified.ok || !sameJson(verified.value.inventory.proof, current.committed_proof)
 			|| !reviewArtifactBindsGeneration(artifact, verified.value.records, current)) {
 			return failure("invalid_record", "terminal-negative provisional review conflicts with the committed generation");
+		}
+		if (!isDelegationTerminalNegativeReviewEligibleFromCommittedV1(current, verified.value.records)) {
+			return failure("invalid_record", "terminal-negative provisional review has no strictly attributed committed scope");
 		}
 		for (const frozenPath of [paths.semanticRepair, paths.semanticMigration, paths.terminalNegativeRepair]) {
 			try {

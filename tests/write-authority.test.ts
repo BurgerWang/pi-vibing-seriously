@@ -182,7 +182,7 @@ test("canIssueLease is true exactly for the worker-first-strict policy", () => {
 // strict Sol DEV allowlist
 // ---------------------------------------------------------------------------
 
-test("strict Sol DEV allowlist is exactly the fixed 16-tool order, no bash/edit/write, no foreign tools", () => {
+test("strict Sol DEV allowlist is exactly the fixed 17-tool order, no bash/edit/write, no foreign tools", () => {
 	assert.deepEqual(STRICT_SOL_DEV_ALLOWLIST, [
 		"read",
 		"grep",
@@ -201,6 +201,7 @@ test("strict Sol DEV allowlist is exactly the fixed 16-tool order, no bash/edit/
 		// P8b recovery remains before the additive local-commit tool.
 		"workbench_recover_tool_result",
 		"workbench_git",
+		"workbench_repair_delegation",
 	]);
 	assert.equal(new Set(STRICT_SOL_DEV_ALLOWLIST).size, STRICT_SOL_DEV_ALLOWLIST.length, "no duplicates");
 	for (const tool of STRICT_SOL_DEV_ALLOWLIST) {
@@ -217,6 +218,7 @@ test("strict Sol DEV allowlist is exactly the fixed 16-tool order, no bash/edit/
 	assert.equal(isInStrictAllowlist("workbench_review_worker_diff"), true);
 	assert.equal(isInStrictAllowlist("workbench_delegation_status"), true);
 	assert.equal(isInStrictAllowlist("workbench_recover_tool_result"), true);
+	assert.equal(isInStrictAllowlist("workbench_repair_delegation"), true);
 });
 
 test("foreign removal helper keeps only allowlist tools in the fixed canonical order", () => {

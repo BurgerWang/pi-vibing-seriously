@@ -136,14 +136,19 @@ persists only a hash-bound `ACCEPT` or `REPAIR`; model/protocol/drift failure
 leaves durable worker success intact and returns `/q-review <id>` for direct,
 idempotent recovery. `/q-review` and `/q-repair` execute their exact durable
 services without asking the commander model to choose or reconstruct a tool
-call. Manual `workbench_review_worker_diff` remains available for legacy,
+call. Machine-facing results instead return callable
+`workbench_review_worker_diff` or `workbench_repair_delegation` actions, so an
+agent never deadlocks on a user-only slash command. Manual
+`workbench_review_worker_diff` remains available for legacy,
 oversized, mechanically failed, or authority-gap cases.
 
 A closed implementation failure with attributable partial work is persisted as
 `INTERRUPTED`, not as reviewable success. Strictly eligible `INTERRUPTED` (and
 compatible committed `FAILED`) evidence may receive only a terminal-negative
 Sol `REPAIR` sidecar; `ACCEPT` and ordinary `REVIEWED` are forbidden before an
-exact `/q-repair` successor is reviewed normally.
+exact repair successor is reviewed normally. The canonical model route is
+`workbench_repair_delegation` with only the rejected delegation id;
+`/q-repair` is the equivalent human convenience command.
 
 All mutation-capable Workbench tools and commands share one checkout writer
 lane, including delegation, recipes, Git completion, review/repair publication,

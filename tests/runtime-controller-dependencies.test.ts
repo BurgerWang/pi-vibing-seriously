@@ -606,7 +606,7 @@ test("delegate controller refuses model-supplied repair before authority reads o
 			repair_of: "20260820-130000-W1r2",
 		}, undefined, undefined, context()),
 		(error: unknown) => {
-			assert.match(String(error), /model-supplied repair_of .* has no exact in-process authority; run \/q-repair/);
+			assert.match(String(error), /exact repair compatibility router is unavailable/);
 			assert.doesNotMatch(String(error), /private disk path/);
 			return true;
 		},
@@ -913,7 +913,7 @@ test("delegate controller keeps durable worker success when review postprocessin
 					review_error: "storage_failure",
 					state,
 					recovery: "retryable",
-					next_action: `/q-review ${delegationId}`,
+					next_action: `call workbench_review_worker_diff with delegation_id=${delegationId}`,
 				}),
 				buildTrustedRecoveryAuthority: async () => ({ kind: "trusted" }),
 			},
@@ -935,9 +935,9 @@ test("delegate controller keeps durable worker success when review postprocessin
 		}, undefined, undefined, context());
 		assert.equal(result.details.status, "success");
 		assert.deepEqual(result.details.review_postprocessing, {
-			status: "RETRYABLE_FAILURE", code: "storage_failure", next_action: `/q-review ${delegationId}`,
+			status: "RETRYABLE_FAILURE", code: "storage_failure", next_action: `call workbench_review_worker_diff with delegation_id=${delegationId}`,
 		});
-		assert.equal(result.details.next_action, `/q-review ${delegationId}`);
+		assert.equal(result.details.next_action, `call workbench_review_worker_diff with delegation_id=${delegationId}`);
 		assert.match(resultText(result), /review recovery: RETRYABLE_FAILURE/u);
 	});
 });

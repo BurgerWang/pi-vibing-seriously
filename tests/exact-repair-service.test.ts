@@ -219,7 +219,7 @@ test("raw-lineage replay is immutable-first and never re-enters live recovery or
 	assert.equal(result.status, "RAW_SUCCESSOR_REPLAY");
 	if (result.status === "RAW_SUCCESSOR_REPLAY") {
 		assert.equal(result.successor.disposition, "EXACT_REPAIR_PENDING");
-		assert.equal(result.next_action, `/q-repair ${rawSuccessor.delegation_id}`);
+		assert.equal(result.next_action, `call workbench_repair_delegation with delegation_id=${rawSuccessor.delegation_id}`);
 		assert.equal(result.execution_attempted, false);
 	}
 	assert.deepEqual({ immutableReads, replayReads, liveRecoveries, transactionReads, bindingReads, successorReads, executions }, {
@@ -274,7 +274,7 @@ test("a successor published during raw live recovery is replayed instead of repo
 	assert.equal(result.status, "RAW_SUCCESSOR_REPLAY");
 	if (result.status === "RAW_SUCCESSOR_REPLAY") {
 		assert.equal(result.successor.delegation_id, rawSuccessor.delegation_id);
-		assert.equal(result.next_action, `/q-repair ${rawSuccessor.delegation_id}`);
+		assert.equal(result.next_action, `call workbench_repair_delegation with delegation_id=${rawSuccessor.delegation_id}`);
 	}
 	assert.deepEqual({ replayReads, liveRecoveries, transactionReads, executions }, {
 		replayReads: 2,
@@ -287,12 +287,12 @@ test("a successor published during raw live recovery is replayed instead of repo
 test("successor dispositions expose only executable deterministic next actions", () => {
 	const id = successor().delegation_id;
 	for (const [disposition, expected] of [
-		["ACTIVE", "/q-delegation-status"],
-		["REVIEW_PENDING", `/q-review ${id}`],
-		["REPAIR_PENDING", `/q-repair ${id}`],
+		["ACTIVE", "call workbench_delegation_status"],
+		["REVIEW_PENDING", `call workbench_review_worker_diff with delegation_id=${id}`],
+		["REPAIR_PENDING", `call workbench_repair_delegation with delegation_id=${id}`],
 		["CHAIN_CLOSED", null],
-		["EXACT_REPAIR_PENDING", `/q-repair ${id}`],
-		["BLOCKED", "/q-delegation-status"],
+		["EXACT_REPAIR_PENDING", `call workbench_repair_delegation with delegation_id=${id}`],
+		["BLOCKED", "call workbench_delegation_status"],
 	] as const) {
 		assert.equal(exactRepairSuccessorNextActionV1(successor("PREPARED", disposition)), expected, disposition);
 	}

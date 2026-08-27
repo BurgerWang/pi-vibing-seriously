@@ -31,3 +31,15 @@ export function workbenchToolRequiresCheckoutLaneV1(toolName: unknown, input?: u
 	if (typeof toolName !== "string") return true;
 	return !(WORKBENCH_CHECKOUT_READ_ONLY_TOOLS_V1 as readonly string[]).includes(toolName);
 }
+
+/**
+ * Exact-repair public calls are control routers, not checkout writers by
+ * themselves. Their private authority-bound delegation kernel acquires the
+ * real delegation lane. Skipping only the outer lane prevents self-deadlock;
+ * runtime freshness and receipt checks still classify both tools as mutating.
+ */
+export function workbenchToolRoutesExactRepairV1(toolName: unknown, input: unknown): boolean {
+	if (toolName === "workbench_repair_delegation") return true;
+	return toolName === "workbench_delegate_worker" && typeof input === "object" && input !== null &&
+		"repair_of" in input && typeof (input as { repair_of?: unknown }).repair_of === "string";
+}

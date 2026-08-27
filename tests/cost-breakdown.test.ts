@@ -119,12 +119,15 @@ test("assistant usage lands in the commander bucket; provider/responseModel-or-m
 	);
 });
 
-test("workbench_delegate_worker toolResult usage lands in the worker bucket", () => {
-	const entries = [toolResult(WORKER_TOOL_NAME, usage(5000, 300, 10000, 0, 0.063))];
+test("delegate and exact-repair toolResult usage land in the worker bucket", () => {
+	const entries = [
+		toolResult(WORKER_TOOL_NAME, usage(5000, 300, 10000, 0, 0.063)),
+		toolResult("workbench_repair_delegation", usage(1000, 100, 2000, 0, 0.012)),
+	];
 	const b = buildCostBreakdown(entries);
-	assert.equal(b.worker.cost, 0.063);
-	assert.equal(b.worker.input, 5000);
-	assert.equal(b.worker.cacheRead, 10000);
+	assert.equal(b.worker.cost, 0.075);
+	assert.equal(b.worker.input, 6000);
+	assert.equal(b.worker.cacheRead, 12000);
 	assert.equal(b.commander.cost, 0);
 	assert.equal(b.other.cost, 0);
 });

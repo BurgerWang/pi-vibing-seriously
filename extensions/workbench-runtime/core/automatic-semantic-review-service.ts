@@ -1,6 +1,10 @@
 /** Durable, idempotent orchestration for automatic Sol semantic review. */
 
 import type { Usage } from "@earendil-works/pi-ai";
+import {
+	repairDelegationToolActionV1,
+	reviewDelegationToolActionV1,
+} from "./agent-next-action.ts";
 
 import {
 	DEFAULT_REVIEW_MAX_BYTES,
@@ -20,7 +24,7 @@ import {
 	hasDelegationSemanticRepairAuthorityV2,
 	hasDelegationSemanticReviewAuthorityV2,
 	hasDelegationTerminalNegativeSemanticRepairAuthorityV1,
-	isDelegationTerminalNegativeReviewEligibleV1,
+	isDelegationTerminalNegativeReviewEligibleFromCommittedV1,
 	readDelegationCommittedGenerationV2,
 	readDelegationReviewV2,
 	readDelegationTerminalNegativeReviewV1,
@@ -37,7 +41,7 @@ import {
 } from "./structured-sol-review-coordinator.ts";
 import type { ExecFn } from "./config.ts";
 
-export const AUTOMATIC_SEMANTIC_REVIEW_NEXT_ACTION = "/q-review" as const;
+export const AUTOMATIC_SEMANTIC_REVIEW_NEXT_ACTION = "workbench_review_worker_diff" as const;
 
 export type AutomaticSemanticReviewRetryCode =
 	| StructuredSolReviewCoordinatorFailureCode
@@ -132,7 +136,7 @@ function zeroUsage(): Readonly<Usage> {
 }
 
 function nextAction(delegationId: string): string {
-	return `${AUTOMATIC_SEMANTIC_REVIEW_NEXT_ACTION} ${delegationId}`;
+	return reviewDelegationToolActionV1(delegationId);
 }
 
 function retryNextAction(code: AutomaticSemanticReviewRetryCode, delegationId: string): string {
@@ -208,7 +212,7 @@ function durableDecision(
 			...(receiptHash === undefined ? {} : { receipt_hash: receiptHash }),
 			nested_usage: usage,
 			mechanical_page_calls: mechanicalPageCalls,
-			next_action: `/q-repair ${delegationId}`,
+			next_action: repairDelegationToolActionV1(delegationId),
 			...(reviewResult === undefined ? {} : { review_result: reviewResult }),
 		};
 	}
@@ -235,7 +239,7 @@ function terminalNegativeDurableDecision(
 		...(receiptHash === undefined ? {} : { receipt_hash: receiptHash }),
 		nested_usage: usage,
 		mechanical_page_calls: mechanicalPageCalls,
-		next_action: `/q-repair ${delegationId}`,
+		next_action: repairDelegationToolActionV1(delegationId),
 		...(reviewResult === undefined ? {} : { review_result: reviewResult }),
 	};
 }
@@ -496,7 +500,7 @@ export async function runAutomaticSemanticReview(
 	if (!generation.ok) {
 		return { status: "AUTHORITY_ERROR", code: "COMMITTED_AUTHORITY_UNAVAILABLE", delegation_id: input.delegation_id, nested_usage: empty, mechanical_page_calls: 0, next_action: action };
 	}
-	if (isDelegationTerminalNegativeReviewEligibleV1(generation.value.state)) {
+	if (isDelegationTerminalNegativeReviewEligibleFromCommittedV1(generation.value.state, generation.value.records)) {
 		return runAutomaticTerminalNegativeSemanticReview(input, generation.value, dependencies);
 	}
 

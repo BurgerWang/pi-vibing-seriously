@@ -120,7 +120,10 @@ const TOOL_FIELDS: Readonly<Record<string, readonly string[]>> = Object.freeze({
 		"delegation_id", "status", "report_path", "changed_paths", "provider", "model", "turns", "exit_code",
 		"stop_reason", "usage", "cache_hit_ratio", "max_context_tokens", "max_context_ratio",
 		"soft_budget_reached", "hard_budget_exceeded", "compaction_count", "compaction_reasons", "review_status",
-		"failure_message", "spend", "phase", "totalTokens", "outputTokens", "spendBand",
+		"failure_message", "spend", "phase", "totalTokens", "outputTokens", "spendBand", "ok",
+		"repair_of", "successor_status", "successor_disposition", "successor_transaction_hash", "next_action",
+		"authority_kind", "idempotency_key", "execution_attempted", "replayed", "compatibility_alias",
+		"caller_contract_ignored",
 	],
 	workbench_review_worker_diff: [
 		"ok", "delegation_id", "verdict", "review_status", "bound_diff_hash", "recorded_after_hash", "mismatch",
@@ -140,6 +143,11 @@ const TOOL_FIELDS: Readonly<Record<string, readonly string[]>> = Object.freeze({
 		"ok", "action", "code", "delegation_id", "delegation_ids", "commit", "branch", "remote",
 		"verification", "path_count", "authority_binding", "preserved_staged_count", "remaining_changed_count",
 		"next_action", "push", "lock_release",
+	],
+	workbench_repair_delegation: [
+		"ok", "status", "repair_of", "delegation_id", "successor_status", "successor_disposition",
+		"successor_transaction_hash", "authority_kind", "idempotency_key", "execution_attempted", "replayed",
+		"next_action",
 	],
 });
 

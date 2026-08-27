@@ -155,6 +155,12 @@ same structured reviewer is constrained to `REPAIR` only.
 `/q-repair DELEGATION_ID` strict-reads the resulting ordinary or terminal-negative repair
 authority, recovers exact arguments, and idempotently returns or creates the
 single successor without relying on the session's latest item.
+`workbench_repair_delegation` exposes the same service to the Sol commander and
+accepts only `delegation_id`. Machine `next_action` fields always name that
+callable tool; slash commands remain user-only conveniences. Historical
+`workbench_delegate_worker` calls carrying `repair_of` are compatibility
+aliases: every caller-supplied task, path, criterion, verification and budget
+field is ignored, and the immutable contract is recovered from the id.
 
 Immediately before launch, the runtime derives an at-most-8-KiB machine-fact
 capsule from strict authority. For an unresolved semantic repair it carries the
@@ -361,8 +367,8 @@ the delegation and performing late writes.
 
 ## Fixed Sol -> Luna write authority (current; legacy id P7)
 
-Approved GPT-5.6 Sol in DEV receives the fixed 16-tool
-read/control/delegation/Git-completion surface. `bash`, `edit`, `write`, and foreign tools
+Approved GPT-5.6 Sol in DEV receives the fixed 17-tool
+read/control/delegation/Git-completion/exact-repair surface. `bash`, `edit`, `write`, and foreign tools
 remain unavailable by default. The persisted policy id
 `worker-first-strict` describes the active product behavior: routine source,
 test, and documentation edits are delegated to Luna.
@@ -421,7 +427,7 @@ Consequences for the commander workflow:
   status or compact summaries.
 - Expiry (30 min), exhaustion (10 calls) and revocation (leaving DEV, model/
   provider change, session end, or `/q-commander-write-lock`) restore the
-  locked 16-tool Sol surface. Concurrent edit/write requests consume the
+  locked 17-tool Sol surface. Concurrent edit/write requests consume the
   bounded call count serially, and a consume is authorized only after its
   updated lease entry is durably appended. A reload/session replacement never
   reactivates a previously confirmed lease; a fresh human grant is required.

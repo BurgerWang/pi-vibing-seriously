@@ -1,6 +1,11 @@
 /** UI-free execution of one exact semantic or terminal repair. */
 
 import { canonicalHash } from "../cache/canonical-hash.ts";
+import {
+	delegationStatusToolActionV1,
+	repairDelegationToolActionV1,
+	reviewDelegationToolActionV1,
+} from "./agent-next-action.ts";
 import type {
 	DelegateExactRepairExecuteV1,
 } from "./delegate-tool-controller.ts";
@@ -176,12 +181,12 @@ function executionWasRefused(result: ExactRepairExecutionResultV1): boolean {
 }
 
 export function exactRepairSuccessorNextActionV1(successor: ExactRepairExistingSuccessorV1): string | null {
-	if (successor.disposition === "REVIEW_PENDING") return `/q-review ${successor.delegation_id}`;
+	if (successor.disposition === "REVIEW_PENDING") return reviewDelegationToolActionV1(successor.delegation_id);
 	if (successor.disposition === "REPAIR_PENDING" || successor.disposition === "EXACT_REPAIR_PENDING") {
-		return `/q-repair ${successor.delegation_id}`;
+		return repairDelegationToolActionV1(successor.delegation_id);
 	}
-	if (successor.disposition === "ACTIVE") return "/q-delegation-status";
-	if (successor.disposition === "BLOCKED") return "/q-delegation-status";
+	if (successor.disposition === "ACTIVE") return delegationStatusToolActionV1();
+	if (successor.disposition === "BLOCKED") return delegationStatusToolActionV1();
 	return null;
 }
 

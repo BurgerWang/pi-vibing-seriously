@@ -26,7 +26,7 @@ import {
 import { delegationsDir, isValidDelegationId } from "./delegation-ledger.ts";
 import {
 	hasDelegationSemanticReviewAuthorityV2,
-	isDelegationTerminalNegativeReviewEligibleV1,
+	isDelegationTerminalNegativeReviewEligibleFromCommittedV1,
 	readDelegationCommittedGenerationV2,
 	readDelegationReviewV2,
 	readDelegationSemanticRepairDecisionV1,
@@ -269,7 +269,18 @@ const DEFAULT_READERS: DelegationPathLaneAdmissionReadersV1 = {
 	readTransaction: async (projectRoot, delegationId) => readDelegationTransactionV2(projectRoot, delegationId),
 	readSemanticRepairDecision: async (projectRoot, delegationId) => readDelegationSemanticRepairDecisionV1(projectRoot, delegationId),
 	readTerminalNegativeRepairDecision: async (projectRoot, transaction) => {
-		if (!isDelegationTerminalNegativeReviewEligibleV1(transaction)) return { ok: true, value: undefined };
+		if (transaction.repair_lineage !== undefined
+			|| (transaction.status !== "FAILED" && transaction.status !== "INTERRUPTED")) {
+			return { ok: true, value: undefined };
+		}
+		const committed = await readDelegationCommittedGenerationV2(projectRoot, transaction.delegation_id);
+		if (!committed.ok) return committed;
+		if (canonicalHash(committed.value.state) !== canonicalHash(transaction)) {
+			return { ok: false, error: { code: "invalid_record" } };
+		}
+		if (!isDelegationTerminalNegativeReviewEligibleFromCommittedV1(transaction, committed.value.records)) {
+			return { ok: true, value: undefined };
+		}
 		const read = await readDelegationTerminalNegativeSolAuthorityV1(projectRoot, transaction.delegation_id);
 		if (!read.ok) return read.error.code === "not_found" ? { ok: true, value: undefined } : read;
 		return canonicalHash(read.value.state) === canonicalHash(transaction)
@@ -366,7 +377,8 @@ async function scanAuthority(
 		let read: AuthorityRead<DelegationSemanticRepairDecisionV1 | undefined>;
 		if (transaction.status === "PENDING_REVIEW") {
 			read = await readers.readSemanticRepairDecision(projectRoot, transaction.delegation_id);
-		} else if (isDelegationTerminalNegativeReviewEligibleV1(transaction)) {
+		} else if (transaction.repair_lineage === undefined
+			&& (transaction.status === "FAILED" || transaction.status === "INTERRUPTED")) {
 			read = await readers.readTerminalNegativeRepairDecision(projectRoot, transaction);
 		} else {
 			continue;

@@ -742,8 +742,38 @@ branch-switch, Gate, Formal, and production authority remain unavailable.
 This pre-release replacement supersedes the earlier local-only single-slice
 draft rather than creating a second overlapping Git tool. After reload,
 same-mode builds are stable again. The current ordered workbench catalog hash
-is `09a9f327341cf5bd3c9490e1f873c46a34cafeb0ee91cc3d5cc6d47065d4c003`;
+for that 12-tool transition was
+`09a9f327341cf5bd3c9490e1f873c46a34cafeb0ee91cc3d5cc6d47065d4c003`;
 the frozen governance-v1 catalog remains unchanged.
+
+### Model-callable exact-repair additive transition
+
+The current catalog appends `workbench_repair_delegation` after
+`workbench_git`, preserving the complete historical 12-tool prefix. The new
+tool accepts only `delegation_id` and routes through the same strict,
+idempotent service as `/q-repair`; it cannot accept replacement task, path,
+criteria, verification, budget, plan or lineage fields. Historical
+`workbench_delegate_worker` calls with `repair_of` remain accepted only as a
+safe alias that ignores all caller contract fields and recovers immutable
+authority from the id. Machine `next_action` values now name callable tools,
+while `/q-review` and `/q-repair` remain user-only conveniences. This is an
+intentional one-time additive fingerprint transition: the current catalog is
+13 tools, strict Sol DEV is 17 tools (19 with an active edit/write lease), the
+ordered catalog hash is
+`6e624d8e5df34ab0c79f87909d5f956f9271491f48c508098af88797e8b472fb`,
+and the current public tool-surface hash is
+`500227ecb3461a35028bfda935d070f17547f24329ff4bd2c5ef2b2e3452fe39`.
+AUDIT and VERIFY hard-deny exact repair, and Luna workers neither see nor may
+invoke it.
+
+Historical immutable generations produced before failed recipe outcome was
+separated from spatial attribution may contain the exact legacy combination
+`change_set.status=ATTRIBUTED`, command provenance with only
+`COMMAND_EFFECT_RUN_FAILED`, no remaining drift, and a terminal
+`WORKSPACE_DRIFT` label. Current readers treat that combination as eligible
+for REPAIR-only terminal review only after the entire committed generation and
+command provenance revalidate. The state label alone is never sufficient;
+missing, conflicting, spatial-drift or malformed evidence remains fail-closed.
 
 An existing project-root `AGENTS.md` is intentionally never rewritten during
 package update. If it came from the pre-release draft and still references

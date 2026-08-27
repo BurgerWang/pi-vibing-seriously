@@ -20,7 +20,10 @@ import {
 	type ProjectCheckoutOperationLeaseV1,
 } from "./project-checkout-operation.ts";
 import { boundedGuardReason } from "./runtime-output-controller.ts";
-import { workbenchToolRequiresCheckoutLaneV1 } from "./checkout-tool-classification.ts";
+import {
+	workbenchToolRequiresCheckoutLaneV1,
+	workbenchToolRoutesExactRepairV1,
+} from "./checkout-tool-classification.ts";
 import { isWorkerPathAllowedRealpath } from "../worker/path-scope.ts";
 import {
 	workerRoleToolCallBlockReason,
@@ -178,7 +181,8 @@ export function registerToolCallGuard(controller: ToolCallGuardController): void
 			};
 		}
 
-		if (workbenchToolRequiresCheckoutLaneV1(event.toolName, event.input)) {
+		if (workbenchToolRequiresCheckoutLaneV1(event.toolName, event.input) &&
+			!workbenchToolRoutesExactRepairV1(event.toolName, event.input)) {
 			let projectRoot: string;
 			const inheritedToken = process.env[WORKBENCH_CHECKOUT_OPERATION_TOKEN_ENV];
 			const inheritedDelegationId = workerRoleContext.role === "worker"

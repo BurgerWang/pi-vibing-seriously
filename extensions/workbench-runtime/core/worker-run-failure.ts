@@ -15,6 +15,8 @@ export const WORKER_RUN_FAILURE_CODES = [
 	"STOP_REASON_FAILURE",
 	"PROVIDER_RESPONSE_UNVERIFIED",
 	"FINAL_OUTPUT_MISSING",
+	/** A durable worker recipe failed even though its command effect was fully classified. */
+	"COMMAND_EFFECT_RUN_FAILED",
 ] as const;
 
 export type WorkerRunFailureCode = (typeof WORKER_RUN_FAILURE_CODES)[number];

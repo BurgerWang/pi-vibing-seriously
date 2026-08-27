@@ -157,6 +157,9 @@ export const STRICT_SOL_DEV_ALLOWLIST: readonly string[] = [
 	// exact-HEAD ordinary push; no bash, force, ref deletion, or caller-selected
 	// checkpoint paths.
 	"workbench_git",
+	// Model-callable exact repair; the tool accepts only a delegation id and
+	// recovers every executable argument from strict immutable authority.
+	"workbench_repair_delegation",
 ];
 
 export const STRICT_ALLOWLIST_SET: ReadonlySet<string> = new Set(STRICT_SOL_DEV_ALLOWLIST);

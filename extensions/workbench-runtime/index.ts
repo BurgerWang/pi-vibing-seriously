@@ -972,7 +972,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 						"authority v2 : RECOVERABLE_UNPUBLISHED (RECOVERY_REQUIRED; committed proof absent)",
 					);
 					if (latestRepairStatus.kind !== "delegation_retry") {
-						lines.push("recovery note: committed proof is absent, so deterministic /q-repair is unavailable; inspect strict unpublished recovery authority and do not retry review");
+						lines.push("recovery note: committed proof is absent, so deterministic workbench_repair_delegation is unavailable; inspect strict unpublished recovery authority and do not retry review");
 					}
 				} else {
 					lines.push(`authority v2 : INVALID (${authority.code}) — legacy fallback refused`);
@@ -990,7 +990,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				if (recoverable?.ok) {
 					lines.push("authority v2 : RECOVERABLE_UNPUBLISHED (RECOVERY_REQUIRED; committed proof absent)");
 					if (latestRepairStatus.kind !== "delegation_retry") {
-						lines.push("recovery note: committed proof is absent, so deterministic /q-repair is unavailable; inspect strict unpublished recovery authority and do not retry review");
+						lines.push("recovery note: committed proof is absent, so deterministic workbench_repair_delegation is unavailable; inspect strict unpublished recovery authority and do not retry review");
 					}
 				} else {
 					lines.push(`authority v2 : transaction ${authority.transactionStatus}`);
