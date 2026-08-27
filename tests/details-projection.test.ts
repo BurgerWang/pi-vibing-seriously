@@ -57,10 +57,13 @@ test("per-tool DTO drops full records and rebuilds security facts only from trus
 	};
 	const result = projectToolResultDetails({
 		toolName: "workbench_run_recipe",
-		details: {
-			ok: true,
-			run_id: "20260812-000000-abcd",
-			recipe: "check",
+			details: {
+				ok: true,
+				run_id: "20260812-000000-abcd",
+				recipe: "check",
+				command_effect_status: "RECIPE_DECLARATION_VIOLATION",
+				command_effect_path: ".pi/workbench/runs/20260812-000000-abcd/command-effect.json",
+				command_effect_warning: "COMMAND_EFFECT_EVIDENCE_UNAVAILABLE",
 			record: { secret: "full-record" },
 			stdout: "raw stdout",
 			output_envelope: { policy: "compare", shownTextBytes: 999_999 },
@@ -74,6 +77,9 @@ test("per-tool DTO drops full records and rebuilds security facts only from trus
 	assert.equal(details.ok, true);
 	assert.equal(details.run_id, "20260812-000000-abcd");
 	assert.equal(details.recipe, "check");
+	assert.equal(details.command_effect_status, "RECIPE_DECLARATION_VIOLATION");
+	assert.equal(details.command_effect_path, ".pi/workbench/runs/20260812-000000-abcd/command-effect.json");
+	assert.equal(details.command_effect_warning, "COMMAND_EFFECT_EVIDENCE_UNAVAILABLE");
 	assert.equal(Object.hasOwn(details, "record"), false);
 	assert.equal(Object.hasOwn(details, "stdout"), false);
 	assert.equal(Object.hasOwn(details, "unknown_field"), false);

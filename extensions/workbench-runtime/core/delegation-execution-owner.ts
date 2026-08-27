@@ -12,9 +12,12 @@ import { dirname, join, resolve } from "node:path";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
+import { canonicalHash } from "../cache/canonical-hash.ts";
 import {
 	createNodeDelegationTransactionStorageAdapter,
 	persistAbortedDelegationTransaction,
+	persistRecoveryRequiredDelegationTransaction,
+	readDelegationTransactionV2,
 	type DelegationTransactionStorageAdapter,
 	type DelegationTransactionStorageOptions,
 } from "./delegation-transaction-storage.ts";
@@ -31,12 +34,19 @@ import {
 	type ProjectDelegationStartLockLeaseV1,
 	type ProjectDelegationStartLockOptionsV1,
 } from "./delegation-start-lock.ts";
+import {
+	releaseProjectCheckoutOperationV1,
+	settledProjectCheckoutOperationLeaseV1,
+	type ProjectCheckoutOperationLeaseV1,
+} from "./project-checkout-operation.ts";
 
 export const DELEGATION_EXECUTION_OWNER_FILE_V2 = "execution-owner.json" as const;
 export const DELEGATION_EXECUTION_OWNER_SCHEMA_VERSION_V2 = 1 as const;
 export const DELEGATION_EXECUTION_OWNER_MAX_BYTES_V2 = 4_096 as const;
 export const INTERRUPTED_BEFORE_WORKER_WRITE_REASON_V2 =
 	"runtime interrupted before any worker write; execution owner is no longer live" as const;
+export const SAME_PROCESS_SETTLED_RECOVERY_REASON_V2 =
+	"runtime operation settled with worker evidence before terminal publication" as const;
 export const RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2 = Object.freeze({
 	executionOwnerTimeUnavailable: "execution owner time was unavailable before worker launch",
 	executionOwnerClaimFailed: "execution owner could not be established before worker launch",
@@ -118,6 +128,28 @@ export type DelegationExecutionOwnerResultV2<T> =
 	| { ok: true; value: T }
 	| { ok: false; error: { code: DelegationExecutionOwnerErrorCodeV2; owner_absent?: true } };
 
+export interface StrictRetryableRawRepairEvidenceV1 {
+	readonly schema_version: 1;
+	readonly kind: "strict-retryable-raw-repair-evidence-v1";
+	readonly retry_kind: "ABORTED" | "EMPTY_RECOVERY";
+	readonly delegation_id: string;
+	readonly contract_hash: string;
+	readonly transaction_hash: string;
+	readonly owner_absent: true;
+	readonly journal_present: boolean;
+	readonly journal_record_hash: string | null;
+	readonly inventory: readonly string[];
+	readonly inventory_hash: string;
+	readonly evidence_hash: string;
+}
+
+export type StrictRetryableRawRepairEvidenceResultV1 =
+	| { readonly ok: true; readonly value: Readonly<StrictRetryableRawRepairEvidenceV1> }
+	| {
+		readonly ok: false;
+		readonly code: "NOT_RETRYABLE" | "AUTHORITY_CHANGED" | "STORAGE_FAILURE";
+	};
+
 export type InterruptedDelegationRecoveryV2 =
 	| { status: "not_applicable" | "active" | "unproven"; transaction: DelegationTransactionRecord }
 	| {
@@ -171,6 +203,23 @@ function sameStartLockLease(
 		&& left.delegation_id === right.delegation_id && left.token === right.token
 		&& left.process_id === right.process_id && left.process_start_ticks === right.process_start_ticks
 		&& left.boot_id === right.boot_id && left.acquired_at === right.acquired_at;
+}
+
+async function settledOperationForTransaction(
+	projectRoot: string,
+	transaction: DelegationTransactionRecord,
+	options?: DelegationExecutionOwnerOptionsV2,
+): Promise<ProjectCheckoutOperationLeaseV1 | undefined> {
+	const start = await inspectProjectDelegationStartLockV1(projectRoot, options?.start_lock_options);
+	if (!start.ok || start.value.status !== "live"
+		|| start.value.owner.delegation_id !== transaction.delegation_id) return undefined;
+	const settled = settledProjectCheckoutOperationLeaseV1(
+		start.value.lease.project_root,
+		transaction.delegation_id,
+	);
+	return settled !== undefined && sameStartLockLease(settled.start_lock_lease, start.value.lease)
+		? settled
+		: undefined;
 }
 
 function parseOwner(value: unknown, transaction: DelegationTransactionRecord): DelegationExecutionOwnerRecordV2 | undefined {
@@ -411,15 +460,29 @@ export async function releaseOrphanedTerminalExecutionOwnerV2(
 		return { status: "blocked", code: "invalid_owner" };
 	}
 	const owner = await readDelegationExecutionOwnerV2(projectRoot, transaction, options);
+	const settledOperation = await settledOperationForTransaction(projectRoot, transaction, options);
 	if (!owner.ok) {
-		if (owner.error.code === "not_found") return { status: "absent" };
+		if (owner.error.code === "not_found") {
+			if (settledOperation === undefined) return { status: "absent" };
+			const released = await releaseProjectCheckoutOperationV1(settledOperation, options?.start_lock_options);
+			return released.ok
+				? { status: "released" }
+				: { status: "blocked", code: released.error.code === "storage_failure" ? "storage_failure" : "release_conflict" };
+		}
 		return { status: "blocked", code: owner.error.code === "storage_failure" ? "storage_failure" : "invalid_owner" };
 	}
-	if (await executionOwnerIsLive(owner.value, options)) return { status: "active" };
+	if (await executionOwnerIsLive(owner.value, options) && settledOperation === undefined) return { status: "active" };
 	const released = await releaseDelegationExecutionOwnerV2(projectRoot, transaction, owner.value.token, options);
-	return released.ok || released.error.code === "not_found"
-		? { status: "released" }
-		: { status: "blocked", code: released.error.code === "storage_failure" ? "storage_failure" : "release_conflict" };
+	if (!released.ok && released.error.code !== "not_found") {
+		return { status: "blocked", code: released.error.code === "storage_failure" ? "storage_failure" : "release_conflict" };
+	}
+	if (settledOperation !== undefined) {
+		const laneReleased = await releaseProjectCheckoutOperationV1(settledOperation, options?.start_lock_options);
+		if (!laneReleased.ok) {
+			return { status: "blocked", code: laneReleased.error.code === "storage_failure" ? "storage_failure" : "release_conflict" };
+		}
+	}
+	return { status: "released" };
 }
 
 function emptyRecoveryJournal(journal: WorkerWriteJournalRecord): boolean {
@@ -520,6 +583,100 @@ export async function isStrictRetryableEmptyRepairRecoveryV2(
 		contract_hash: transaction.contract_hash,
 	});
 	return journal.ok && emptyRecoveryJournal(journal.value);
+}
+
+/**
+ * Return the complete immutable evidence used by deterministic `/q-repair`
+ * for a no-write raw lineage tip.  The boolean helpers above remain useful to
+ * callers that only classify state; this reader additionally binds the exact
+ * journal and v2 inventory and detects transaction movement across the read.
+ */
+export async function readStrictRetryableRawRepairEvidenceV1(
+	projectRoot: string,
+	transaction: DelegationTransactionRecord,
+	options?: DelegationExecutionOwnerOptionsV2,
+): Promise<StrictRetryableRawRepairEvidenceResultV1> {
+	const retryKind = await isStrictRetryableAbortedRepairV2(projectRoot, transaction, options)
+		? "ABORTED" as const
+		: await isStrictRetryableEmptyRepairRecoveryV2(projectRoot, transaction, options)
+			? "EMPTY_RECOVERY" as const
+			: undefined;
+	if (retryKind === undefined) return { ok: false, code: "NOT_RETRYABLE" };
+
+	const owner = await readDelegationExecutionOwnerV2(projectRoot, transaction, options);
+	if (owner.ok) return { ok: false, code: "NOT_RETRYABLE" };
+	if (owner.error.code !== "not_found") {
+		return { ok: false, code: owner.error.code === "storage_failure" ? "STORAGE_FAILURE" : "NOT_RETRYABLE" };
+	}
+	const journal = await readWorkerWriteJournal({
+		project_root: projectRoot,
+		delegation_id: transaction.delegation_id,
+		contract_hash: transaction.contract_hash,
+	});
+	const journalMissing = !journal.ok && journal.error.code === "not_found";
+	if (retryKind === "ABORTED") {
+		if (journalMissing ? transaction.revision !== 1 : !journal.ok || !pristineJournal(journal.value)) {
+			return { ok: false, code: !journal.ok && journal.error.code === "storage_failure" ? "STORAGE_FAILURE" : "NOT_RETRYABLE" };
+		}
+	} else if (!journal.ok || !emptyRecoveryJournal(journal.value)) {
+		return { ok: false, code: !journal.ok && journal.error.code === "storage_failure" ? "STORAGE_FAILURE" : "NOT_RETRYABLE" };
+	}
+
+	const path = v2Path(projectRoot, transaction.delegation_id);
+	if (path === undefined) return { ok: false, code: "NOT_RETRYABLE" };
+	const adapter = adapterOf(options);
+	let inventory: string[];
+	try {
+		const stat = await adapter.inspect(path);
+		if (stat.kind !== "directory") return { ok: false, code: "NOT_RETRYABLE" };
+		const entries = await adapter.list(path);
+		inventory = entries.map((entry) => `${entry.name}:${entry.kind}`).sort();
+		if (retryKind === "ABORTED") {
+			const expected = journal.ok
+				? ["transaction.json:file", "write-journal.json:file"]
+				: ["transaction.json:file"];
+			if (inventory.length !== expected.length || inventory.some((entry, index) => entry !== expected[index])) {
+				return { ok: false, code: "NOT_RETRYABLE" };
+			}
+		} else {
+			const expected = new Set(["transaction.json:file", "write-journal.json:file"]);
+			for (const entry of inventory) {
+				if (expected.has(entry)) continue;
+				if (entry !== "generations:directory" || (await adapter.list(join(path, "generations"))).length !== 0) {
+					return { ok: false, code: "NOT_RETRYABLE" };
+				}
+			}
+			if (![...expected].every((entry) => inventory.includes(entry))) return { ok: false, code: "NOT_RETRYABLE" };
+		}
+	} catch {
+		return { ok: false, code: "STORAGE_FAILURE" };
+	}
+
+	const transactionHash = canonicalHash(transaction);
+	const reread = await readDelegationTransactionV2(projectRoot, transaction.delegation_id, options?.storage_options);
+	if (!reread.ok) {
+		return { ok: false, code: reread.error.code === "storage_failure" ? "STORAGE_FAILURE" : "AUTHORITY_CHANGED" };
+	}
+	if (canonicalHash(reread.value) !== transactionHash) return { ok: false, code: "AUTHORITY_CHANGED" };
+	const journalRecordHash = journal.ok ? canonicalHash(journal.value) : null;
+	const inventoryHash = canonicalHash(inventory);
+	const projection = {
+		schema_version: 1 as const,
+		kind: "strict-retryable-raw-repair-evidence-v1" as const,
+		retry_kind: retryKind,
+		delegation_id: transaction.delegation_id,
+		contract_hash: transaction.contract_hash,
+		transaction_hash: transactionHash,
+		owner_absent: true as const,
+		journal_present: journal.ok,
+		journal_record_hash: journalRecordHash,
+		inventory,
+		inventory_hash: inventoryHash,
+	};
+	return {
+		ok: true,
+		value: Object.freeze({ ...projection, evidence_hash: canonicalHash(projection) }),
+	};
 }
 
 async function safeIncompleteInventory(
@@ -684,9 +841,12 @@ export async function recoverInterruptedDelegationV2(input: {
 	const owner = await readDelegationExecutionOwnerV2(input.project_root, transaction, input.options);
 	let legacyProof = false;
 	let startLockLease: ProjectDelegationStartLockLeaseV1 | undefined;
+	let sameProcessSettled: ProjectCheckoutOperationLeaseV1 | undefined;
 	if (owner.ok) {
 		if (await executionOwnerIsLive(owner.value, input.options)) {
-			return { status: "active", transaction };
+			sameProcessSettled = await settledOperationForTransaction(input.project_root, transaction, input.options);
+			if (sameProcessSettled === undefined) return { status: "active", transaction };
+			startLockLease = sameProcessSettled.start_lock_lease;
 		}
 	} else if (owner.error.code === "not_found") {
 		if (transaction.status === "PREPARED") {
@@ -695,7 +855,16 @@ export async function recoverInterruptedDelegationV2(input: {
 				return { status: "blocked", transaction, code: start.error.code === "storage_failure" ? "storage_failure" : "invalid_owner" };
 			}
 			if (start.value.status !== "absent" && start.value.owner.delegation_id === transaction.delegation_id) {
-				if (start.value.status === "live") return { status: "active", transaction };
+				if (start.value.status === "live") {
+					sameProcessSettled = settledProjectCheckoutOperationLeaseV1(
+						start.value.lease.project_root,
+						transaction.delegation_id,
+					);
+					if (sameProcessSettled === undefined
+						|| !sameStartLockLease(sameProcessSettled.start_lock_lease, start.value.lease)) {
+						return { status: "active", transaction };
+					}
+				}
 				startLockLease = start.value.lease;
 			}
 		}
@@ -725,7 +894,7 @@ export async function recoverInterruptedDelegationV2(input: {
 			code: journal.error.code === "storage_failure" ? "storage_failure" : "invalid_journal",
 		};
 	}
-	if (journal.ok && !pristineJournal(journal.value)) {
+	if (journal.ok && !pristineJournal(journal.value) && sameProcessSettled === undefined) {
 		return { status: "blocked", transaction, code: "nonempty_journal" };
 	}
 	const inventory = await safeIncompleteInventory(
@@ -742,28 +911,45 @@ export async function recoverInterruptedDelegationV2(input: {
 			code: inventory === "storage_failure" ? "storage_failure" : "unsafe_artifacts",
 		};
 	}
-	const aborted = await persistAbortedDelegationTransaction(input.project_root, {
+	const stopInput = {
 		delegation_id: transaction.delegation_id,
 		contract_hash: transaction.contract_hash,
 		worker_identity: transaction.worker_identity,
 		expected_generation: transaction.generation,
 		expected_revision: transaction.revision,
 		now: input.now,
-		reason: INTERRUPTED_BEFORE_WORKER_WRITE_REASON_V2,
-	}, input.options?.storage_options).catch(() => undefined);
-	if (aborted === undefined || !aborted.ok) {
+		reason: sameProcessSettled !== undefined && journal.ok && !pristineJournal(journal.value)
+			? SAME_PROCESS_SETTLED_RECOVERY_REASON_V2
+			: INTERRUPTED_BEFORE_WORKER_WRITE_REASON_V2,
+	};
+	const stopped = await (sameProcessSettled !== undefined && journal.ok && !pristineJournal(journal.value)
+		? persistRecoveryRequiredDelegationTransaction(input.project_root, stopInput, input.options?.storage_options)
+		: persistAbortedDelegationTransaction(input.project_root, stopInput, input.options?.storage_options))
+		.catch(() => undefined);
+	if (stopped === undefined || !stopped.ok) {
 		return { status: "blocked", transaction, code: "abort_conflict" };
 	}
 	if (owner.ok) {
-		await releaseDelegationExecutionOwnerV2(
+		const ownerReleased = await releaseDelegationExecutionOwnerV2(
 			input.project_root,
-			aborted.value,
+			stopped.value,
 			owner.value.token,
 			input.options,
 		).catch(() => undefined);
+		if (ownerReleased === undefined || (!ownerReleased.ok && ownerReleased.error.code !== "not_found")) {
+			return { status: "blocked", transaction: stopped.value, code: "storage_failure" };
+		}
 	}
-	if (startLockLease !== undefined) {
+	if (sameProcessSettled !== undefined) {
+		const released = await releaseProjectCheckoutOperationV1(
+			sameProcessSettled,
+			input.options?.start_lock_options,
+		).catch(() => undefined);
+		if (released === undefined || !released.ok) {
+			return { status: "blocked", transaction: stopped.value, code: "storage_failure" };
+		}
+	} else if (startLockLease !== undefined) {
 		await releaseProjectDelegationStartLockV1(startLockLease, input.options?.start_lock_options).catch(() => undefined);
 	}
-	return { status: "recovered", transaction: aborted.value, legacy_reboot_proof: legacyProof };
+	return { status: "recovered", transaction: stopped.value, legacy_reboot_proof: legacyProof };
 }

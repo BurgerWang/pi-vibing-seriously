@@ -200,7 +200,7 @@ export function decideWorkerProfile(evidence: WorkerRoutingEvidence): WorkerRout
 	const requested = evidence.requested_profile === "standard" || evidence.requested_profile === "extended"
 		? evidence.requested_profile
 		: undefined;
-	const effective: ActiveWorkerProfile = requested ?? "extended";
+	const effective: ActiveWorkerProfile = requested ?? "standard";
 	const taskKind = evidence.task_kind === "implementation" || evidence.task_kind === "diagnosis"
 		? evidence.task_kind
 		: undefined;

@@ -1,6 +1,6 @@
 /** Tool-result envelope, receipt and bounded-details middleware pipeline. */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import { projectToolResultDetails, type BoundedReceiptFacts } from "./details-projection.ts";
 import {
@@ -25,6 +25,12 @@ import {
 	WORKER_WRITE_JOURNAL_RUNTIME_RESULT_ERROR_TEXT,
 	type WorkerWriteJournalRuntime,
 } from "./worker-write-journal-runtime.ts";
+import {
+	inspectProcessCheckoutOperationSettlementV1,
+	markProjectCheckoutOperationSettledV1,
+	releaseProjectCheckoutOperationV1,
+	type ProjectCheckoutOperationLeaseV1,
+} from "./project-checkout-operation.ts";
 
 export interface PendingReceiptHandle {
 	readonly handle: ReceiptHandle;
@@ -44,14 +50,50 @@ export interface ToolResultMiddlewareController {
 	observeOutputEnvelope(toolName: unknown, facts: unknown): void;
 	rememberProcessedNormalResult(toolCallId: unknown, toolName: unknown): void;
 	pendingReceiptHandles: Map<string, PendingReceiptHandle>;
+	pendingCheckoutOperationHandles: Map<string, ProjectCheckoutOperationLeaseV1>;
+	releaseCheckoutOperation?: typeof releaseProjectCheckoutOperationV1;
 	secrets: readonly string[];
+	/**
+	 * Worker-only machine observation of a completed recipe run. The callback
+	 * must derive authority from the committed run receipt, never result text.
+	 */
+	observeWorkerRecipeCommandEffect?: (event: Readonly<{
+		toolName: unknown;
+		details: unknown;
+	}>) => Promise<void>;
 }
 
 /** Register the ordered tool_result middleware chain. */
 export function registerToolResultMiddleware(controller: ToolResultMiddlewareController): void {
+	const releaseCheckoutOperation = controller.releaseCheckoutOperation ?? releaseProjectCheckoutOperationV1;
 	const outputEnvelopeFactsByEvent = new WeakMap<object, OutputEnvelopeFacts>();
 	const receiptFactsByEvent = new WeakMap<object, BoundedReceiptFacts>();
 	const ingressProjectionFactsByEvent = new WeakMap<object, ToolResultIngressProjectionMetadata>();
+	const checkoutReleaseFactsByEvent = new WeakMap<object, { status: "recovery_required"; code: string }>();
+	const settlePendingCheckoutOperations = async (_event: unknown, ctx: ExtensionContext): Promise<void> => {
+		// `session_shutdown` can be emitted for signal/reload teardown. Never mark
+		// an operation settled or unlink its lane while Pi still reports active
+		// execution: the child/tool may still be mutating the checkout. A real
+		// `agent_settled`, or an idle shutdown after all tool promises settled,
+		// supplies the required lifecycle proof. Non-idle process exit leaves the
+		// fixed owner for ordinary dead-process recovery.
+		let idle = false;
+		try { idle = ctx.isIdle(); } catch { idle = false; }
+		if (!idle) return;
+		for (const [toolCallId, pending] of [...controller.pendingCheckoutOperationHandles]) {
+			try {
+				const observed = inspectProcessCheckoutOperationSettlementV1(pending.project_root, pending.token);
+				if (observed === "active") markProjectCheckoutOperationSettledV1(pending, "generic_release");
+				if (inspectProcessCheckoutOperationSettlementV1(pending.project_root, pending.token) === "generic_release") {
+					await releaseCheckoutOperation(pending).catch(() => undefined);
+				}
+			} finally {
+				controller.pendingCheckoutOperationHandles.delete(toolCallId);
+			}
+		}
+	};
+	controller.pi.on("agent_settled", settlePendingCheckoutOperations);
+	controller.pi.on("session_shutdown", settlePendingCheckoutOperations);
 
 	if (controller.workerJournalActive) {
 		controller.pi.on("tool_result", async (event) => {
@@ -63,6 +105,25 @@ export function registerToolResultMiddleware(controller: ToolResultMiddlewareCon
 			});
 			if (completed.ok) return undefined;
 			return { content: [{ type: "text", text: WORKER_WRITE_JOURNAL_RUNTIME_RESULT_ERROR_TEXT }], isError: true };
+		});
+	}
+
+	if (controller.observeWorkerRecipeCommandEffect !== undefined) {
+		controller.pi.on("tool_result", async (event) => {
+			if (event.toolName !== "workbench_run_recipe") return undefined;
+			try {
+				await controller.observeWorkerRecipeCommandEffect!({
+					toolName: event.toolName,
+					details: event.details,
+				});
+				return undefined;
+			} catch {
+				// Session custom entries are advisory only. The parent recovers the
+				// authoritative receipt set from atomically committed project runs;
+				// mirror failure must never turn a durable recipe success into an
+				// error or invite a duplicate retry.
+				return undefined;
+			}
 		});
 	}
 
@@ -174,6 +235,37 @@ export function registerToolResultMiddleware(controller: ToolResultMiddlewareCon
 		return undefined;
 	});
 
+	controller.pi.on("tool_result", async (event) => {
+		const pending = controller.pendingCheckoutOperationHandles.get(event.toolCallId);
+		if (pending === undefined) return undefined;
+		try {
+			const observed = inspectProcessCheckoutOperationSettlementV1(pending.project_root, pending.token);
+			if (observed === "delegation_cas") {
+				checkoutReleaseFactsByEvent.set(event, {
+					status: "recovery_required",
+					code: "settled_delegation_retained_for_cas_recovery",
+				});
+				return undefined;
+			}
+			if (observed === "active" && !markProjectCheckoutOperationSettledV1(pending, "generic_release")) {
+				checkoutReleaseFactsByEvent.set(event, { status: "recovery_required", code: "settlement_conflict" });
+				return undefined;
+			}
+			const released = await releaseCheckoutOperation(pending);
+			if (!released.ok) {
+				// The tool outcome is already real. Lock cleanup failure is surfaced
+				// as recovery-required metadata and never inverts success or invites
+				// a duplicate mutation retry.
+				checkoutReleaseFactsByEvent.set(event, { status: "recovery_required", code: released.error.code });
+			}
+		} catch {
+			checkoutReleaseFactsByEvent.set(event, { status: "recovery_required", code: "storage_failure" });
+		} finally {
+			controller.pendingCheckoutOperationHandles.delete(event.toolCallId);
+		}
+		return undefined;
+	});
+
 	controller.pi.on("tool_result", (event) => {
 		try {
 			const envelope = outputEnvelopeFactsByEvent.get(event) ?? runtimeFailureEnvelope().facts;
@@ -181,13 +273,23 @@ export function registerToolResultMiddleware(controller: ToolResultMiddlewareCon
 			const ingressProjection = ingressProjectionFactsByEvent.get(event);
 			let details: unknown;
 			try { details = event.details; } catch { details = undefined; }
+			const projected = projectToolResultDetails({ toolName: event.toolName, details, envelope, receipt, ingressProjection }).details;
+			const checkoutRelease = checkoutReleaseFactsByEvent.get(event);
 			return {
-				details: projectToolResultDetails({ toolName: event.toolName, details, envelope, receipt, ingressProjection }).details,
+				details: checkoutRelease === undefined
+					? projected
+					: {
+						...(typeof projected === "object" && projected !== null && !Array.isArray(projected)
+							? projected
+							: {}),
+						checkout_operation_release: checkoutRelease,
+					},
 			};
 		} finally {
 			outputEnvelopeFactsByEvent.delete(event);
 			receiptFactsByEvent.delete(event);
 			ingressProjectionFactsByEvent.delete(event);
+			checkoutReleaseFactsByEvent.delete(event);
 		}
 	});
 }

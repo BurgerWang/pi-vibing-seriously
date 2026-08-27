@@ -29,6 +29,11 @@ import {
 	readWorkerWriteJournal,
 	workerWriteJournalRelativePath,
 } from "../extensions/workbench-runtime/core/write-journal.ts";
+import {
+	WORKBENCH_CHECKOUT_OPERATION_TOKEN_ENV,
+	acquireProjectCheckoutOperationV1,
+	releaseProjectCheckoutOperationV1,
+} from "../extensions/workbench-runtime/core/project-checkout-operation.ts";
 import { spawnExec } from "./helpers.ts";
 
 const DELEGATION_ID = "20260820-130000-W1r2";
@@ -156,36 +161,61 @@ const ENV_NAMES = [
 	WORKER_ALLOWED_PATHS_ENV,
 	WORKER_DELEGATION_ID_ENV,
 	WORKER_CONTRACT_HASH_ENV,
+	WORKBENCH_CHECKOUT_OPERATION_TOKEN_ENV,
 ] as const;
 
-function instantiateRuntime(root: string, options?: {
+async function instantiateRuntime(root: string, options?: {
 	role?: "worker" | "other";
 	allowedPaths?: readonly string[];
 	omitDelegation?: boolean;
-}): StubAPI & ExtensionAPI {
+}): Promise<{ stub: StubAPI & ExtensionAPI; cleanup: () => Promise<void> }> {
 	const previous = new Map(ENV_NAMES.map((name) => [name, process.env[name]]));
+	let parentOperation: Awaited<ReturnType<typeof acquireProjectCheckoutOperationV1>> | undefined;
 	try {
-		if ((options?.role ?? "worker") === "worker") process.env[WORKER_ROLE_ENV] = "worker";
+		const workerRole = (options?.role ?? "worker") === "worker";
+		if (workerRole) process.env[WORKER_ROLE_ENV] = "worker";
 		else delete process.env[WORKER_ROLE_ENV];
 		process.env[WORKER_TASK_KIND_ENV] = "implementation";
 		process.env[WORKER_PROJECT_ROOT_ENV] = root;
 		process.env[WORKER_ALLOWED_PATHS_ENV] = JSON.stringify(options?.allowedPaths ?? ["tracked.txt", "new.txt"]);
-		if (options?.omitDelegation) {
+		if (!workerRole || options?.omitDelegation) {
 			delete process.env[WORKER_DELEGATION_ID_ENV];
 			delete process.env[WORKER_CONTRACT_HASH_ENV];
+			delete process.env[WORKBENCH_CHECKOUT_OPERATION_TOKEN_ENV];
 		} else {
 			process.env[WORKER_DELEGATION_ID_ENV] = DELEGATION_ID;
 			process.env[WORKER_CONTRACT_HASH_ENV] = CONTRACT_HASH;
+			parentOperation = await acquireProjectCheckoutOperationV1({
+				project_root: root,
+				operation_kind: "delegation",
+				operation_id: `delegation:${DELEGATION_ID}`,
+				delegation_id: DELEGATION_ID,
+				now: new Date().toISOString(),
+			});
+			if (!parentOperation.ok) throw new Error(`worker fixture checkout authority unavailable: ${parentOperation.error.code}`);
+			process.env[WORKBENCH_CHECKOUT_OPERATION_TOKEN_ENV] = parentOperation.value.token;
 		}
 		const stub = makeStub();
 		workbenchRuntime(stub);
-		return stub;
-	} finally {
+		return {
+			stub,
+			cleanup: async () => {
+				if (parentOperation?.ok) await releaseProjectCheckoutOperationV1(parentOperation.value);
+				for (const name of ENV_NAMES) {
+					const value = previous.get(name);
+					if (value === undefined) delete process.env[name];
+					else process.env[name] = value;
+				}
+			},
+		};
+	} catch (error) {
+		if (parentOperation?.ok) await releaseProjectCheckoutOperationV1(parentOperation.value);
 		for (const name of ENV_NAMES) {
 			const value = previous.get(name);
 			if (value === undefined) delete process.env[name];
 			else process.env[name] = value;
 		}
+		throw error;
 	}
 }
 
@@ -221,10 +251,12 @@ function textOf(content: Array<Record<string, unknown>>): string {
 
 test("allowed worker edit/write calls begin before mutation and complete from original outcomes", async () => {
 	const root = await mkdtemp(join(tmpdir(), "worker-write-journal-wiring-positive-"));
+	let runtime: Awaited<ReturnType<typeof instantiateRuntime>> | undefined;
 	try {
 		await createJournal(root);
 		await writeFile(join(root, "tracked.txt"), "before", "utf8");
-		const stub = instantiateRuntime(root);
+		runtime = await instantiateRuntime(root);
+		const stub = runtime.stub;
 		const ctx = trustedContext(root);
 
 		const editGuard = await emitToolCall(stub, ctx, {
@@ -265,17 +297,20 @@ test("allowed worker edit/write calls begin before mutation and complete from or
 			["complete", "write", "failed", 4],
 		]);
 	} finally {
+		await runtime?.cleanup();
 		await rm(root, { recursive: true, force: true });
 	}
 });
 
 test("parallel write calls block only the later call and allow a sequential retry", async () => {
 	const root = await mkdtemp(join(tmpdir(), "worker-write-journal-wiring-parallel-"));
+	let runtime: Awaited<ReturnType<typeof instantiateRuntime>> | undefined;
 	try {
 		await createJournal(root);
 		await writeFile(join(root, "alpha.txt"), "alpha=before\n", "utf8");
 		await writeFile(join(root, "beta.txt"), "beta=before\n", "utf8");
-		const stub = instantiateRuntime(root, { allowedPaths: ["alpha.txt", "beta.txt"] });
+		runtime = await instantiateRuntime(root, { allowedPaths: ["alpha.txt", "beta.txt"] });
+		const stub = runtime.stub;
 		const ctx = trustedContext(root);
 
 		assert.equal((await emitToolCall(stub, ctx, {
@@ -313,17 +348,21 @@ test("parallel write calls block only the later call and allow a sequential retr
 			["begin", 1], ["complete", 2], ["begin", 3], ["complete", 4],
 		]);
 	} finally {
+		await runtime?.cleanup();
 		await rm(root, { recursive: true, force: true });
 	}
 });
 
 test("existing worker guards deny before journaling and missing v2 identity blocks before execution", async () => {
 	const root = await mkdtemp(join(tmpdir(), "worker-write-journal-wiring-guards-"));
+	let deniedRuntime: Awaited<ReturnType<typeof instantiateRuntime>> | undefined;
+	let missingRuntime: Awaited<ReturnType<typeof instantiateRuntime>> | undefined;
 	try {
 		await createJournal(root);
 		await writeFile(join(root, "tracked.txt"), "before", "utf8");
 		await writeFile(join(root, "outside.txt"), "outside", "utf8");
-		const denied = instantiateRuntime(root, { allowedPaths: ["tracked.txt"] });
+		deniedRuntime = await instantiateRuntime(root, { allowedPaths: ["tracked.txt"] });
+		const denied = deniedRuntime.stub;
 		const ctx = trustedContext(root);
 		const deniedGuard = await emitToolCall(denied, ctx, {
 			type: "tool_call", toolCallId: "wire-denied", toolName: "edit", input: { path: "outside.txt" },
@@ -332,24 +371,31 @@ test("existing worker guards deny before journaling and missing v2 identity bloc
 		assert.equal((await readJournal(root)).revision, 0);
 		assert.deepEqual(journalTelemetry(denied), []);
 
-		const missingIdentity = instantiateRuntime(root, { allowedPaths: ["tracked.txt"], omitDelegation: true });
+		await deniedRuntime.cleanup();
+		deniedRuntime = undefined;
+		missingRuntime = await instantiateRuntime(root, { allowedPaths: ["tracked.txt"], omitDelegation: true });
+		const missingIdentity = missingRuntime.stub;
 		const missingGuard = await emitToolCall(missingIdentity, ctx, {
 			type: "tool_call", toolCallId: "wire-missing-id", toolName: "edit", input: { path: "tracked.txt" },
 		});
-		assert.deepEqual(missingGuard, { block: true, reason: "Worker write journal unavailable" });
+		assert.deepEqual(missingGuard, { block: true, reason: "Delegated worker checkout mutation requires the exact inherited parent operation token" });
 		assert.equal((await readJournal(root)).revision, 0, "missing identity cannot reach journal begin or tool execution");
-		assert.deepEqual(journalTelemetry(missingIdentity).map((entry) => entry.code), ["invalid_context"]);
+		assert.deepEqual(journalTelemetry(missingIdentity), []);
 	} finally {
+		await missingRuntime?.cleanup();
+		await deniedRuntime?.cleanup();
 		await rm(root, { recursive: true, force: true });
 	}
 });
 
 test("completion failure becomes one bounded error on the same event and poisons future writes", async () => {
 	const root = await mkdtemp(join(tmpdir(), "worker-write-journal-wiring-complete-fail-"));
+	let runtime: Awaited<ReturnType<typeof instantiateRuntime>> | undefined;
 	try {
 		await createJournal(root);
 		await writeFile(join(root, "tracked.txt"), "before", "utf8");
-		const stub = instantiateRuntime(root, { allowedPaths: ["tracked.txt", "new.txt"] });
+		runtime = await instantiateRuntime(root, { allowedPaths: ["tracked.txt", "new.txt"] });
+		const stub = runtime.stub;
 		const ctx = trustedContext(root);
 		assert.equal((await emitToolCall(stub, ctx, {
 			type: "tool_call", toolCallId: "wire-complete-fail", toolName: "edit", input: { path: "tracked.txt" },
@@ -381,15 +427,18 @@ test("completion failure becomes one bounded error on the same event and poisons
 		});
 		assert.deepEqual(future, { block: true, reason: "Worker write journal unavailable" });
 	} finally {
+		await runtime?.cleanup();
 		await rm(root, { recursive: true, force: true });
 	}
 });
 
 test("non-worker edit/write calls and results remain behaviorally unaffected", async () => {
 	const root = await mkdtemp(join(tmpdir(), "worker-write-journal-wiring-nonworker-"));
+	let runtime: Awaited<ReturnType<typeof instantiateRuntime>> | undefined;
 	try {
 		await writeFile(join(root, "tracked.txt"), "before", "utf8");
-		const stub = instantiateRuntime(root, { role: "other", allowedPaths: [] });
+		runtime = await instantiateRuntime(root, { role: "other", allowedPaths: [] });
+		const stub = runtime.stub;
 		const ctx = trustedContext(root);
 		const guard = await emitToolCall(stub, ctx, {
 			type: "tool_call", toolCallId: "wire-nonworker", toolName: "edit", input: { path: "tracked.txt" },
@@ -403,6 +452,7 @@ test("non-worker edit/write calls and results remain behaviorally unaffected", a
 		assert.equal(textOf(result.content), "ordinary result");
 		assert.deepEqual(journalTelemetry(stub), []);
 	} finally {
+		await runtime?.cleanup();
 		await rm(root, { recursive: true, force: true });
 	}
 });
@@ -428,7 +478,7 @@ test("source order pins journal completion before envelope and begin after every
 		"commanderToolCallBlockReason({",
 		"controller.authorizeOutput(event.toolCallId",
 		"controller.workerWriteJournalRuntime.beginToolCall({",
-		"beginReceipt({",
+		"controller.beginToolReceipt ?? beginReceipt",
 		"consumeLeaseCall(",
 	];
 	const positions = markers.map((marker) => guard.indexOf(marker));

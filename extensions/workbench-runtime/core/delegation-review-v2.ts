@@ -23,30 +23,45 @@ import {
 } from "./diff-review.ts";
 import { computeDiffHash, type GitFacts } from "./delegation-ledger.ts";
 import { validateChangeSet, type ChangeSetRecord } from "./change-set.ts";
+import {
+	validateDelegationCommandProvenance,
+	type DelegationCommandProvenanceRecord,
+} from "./delegation-command-effect-provenance.ts";
 import { DELEGATION_WORKSPACE_DIFF_IDENTITY_KIND_V2 } from "./delegation-workspace-v2.ts";
 import {
 	collectReviewRelevanceV2,
 	computeReviewRelevanceConflictHashV2,
+	computeReviewRelevanceProjectionHashV2,
 	REVIEW_RELEVANCE_KIND_V2,
 	validateReviewRelevanceProjectionV2,
 	type CollectedReviewRelevanceV2,
 	type ReviewRelevanceProjectionV2,
 } from "./review-relevance-v2.ts";
 import { validateWorkspaceGuard, type WorkspaceGuardRecord } from "./workspace-guard.ts";
-import { bindDelegationBoundedTaskContractV2 } from "./delegation-transaction-artifacts.ts";
+import {
+	bindDelegationBoundedTaskContractV2,
+	type DelegationBoundedTaskContractBindingV2,
+} from "./delegation-transaction-artifacts.ts";
 import {
 	delegationReviewRelativePathV2,
 	hasDelegationSemanticRepairAuthorityV2,
 	hasDelegationSemanticReviewAuthorityV2,
+	hasDelegationTerminalNegativeSemanticRepairAuthorityV1,
+	isDelegationTerminalNegativeReviewEligibleV1,
 	persistDelegationReviewProvisionalV2,
+	persistDelegationTerminalNegativeReviewProvisionalV1,
 	publishDelegationSemanticRepairDecisionV1,
+	publishDelegationTerminalNegativeRepairDecisionV1,
 	publishHistoricalSemanticMigrationAcceptanceV2,
 	publishHistoricalSemanticMigrationPresentationV2,
 	publishDelegationReviewV2,
 	readDelegationCommittedGenerationV2,
 	readDelegationReviewV2,
+	readDelegationTerminalNegativeReviewV1,
 	type DelegationCommittedGenerationV2,
+	type DelegationReviewAuthorityV2,
 	type DelegationReviewArtifactV2,
+	type DelegationTerminalNegativeReviewAuthorityV1,
 	type DelegationTransactionStorageOptions,
 } from "./delegation-transaction-storage.ts";
 import {
@@ -55,6 +70,7 @@ import {
 } from "./historical-semantic-migration.ts";
 import {
 	DELEGATION_TRANSACTION_HASH_RE,
+	isCurrentDelegationTerminalOutcome,
 	type DelegationTransactionRecord,
 } from "./delegation-transaction.ts";
 import type { ExecFn } from "./config.ts";
@@ -73,6 +89,9 @@ const AFTER_FIELDS = [
 ] as const;
 const AFTER_FIELDS_GUARD_V2 = [...AFTER_FIELDS, "diff_identity_kind"] as const;
 const AFTER_FIELDS_GUARD_V2_ENVELOPE = [...AFTER_FIELDS_GUARD_V2, "review_envelope"] as const;
+const AFTER_FIELDS_GUARD_V2_COMMAND = [...AFTER_FIELDS_GUARD_V2, "command_provenance_hash", "effective_delta_hash"] as const;
+const AFTER_FIELDS_GUARD_V2_COMMAND_ENVELOPE = [...AFTER_FIELDS_GUARD_V2_COMMAND, "review_envelope"] as const;
+const AFTER_WORKER_OUTCOME_FIELDS = ["worker_success", "worker_failure_code"] as const;
 const BEFORE_FIELDS = [
 	"schema_version", "delegation_id", "recorded_at", "contract", "git_head", "git_dirty",
 	"diff_hash", "changed_paths", "path_statuses", "path_digests", "workspace_guard",
@@ -89,6 +108,7 @@ const SCOPE_FIELDS = [
 	"schema_version", "delegation_id", "task_kind", "contract_hash", "allowed_paths", "changed_paths",
 	"write_journal", "change_set",
 ] as const;
+const SCOPE_FIELDS_WITH_COMMAND = [...SCOPE_FIELDS, "command_provenance"] as const;
 
 export type DelegationReviewV2ErrorCode =
 	| "authority_invalid"
@@ -105,7 +125,7 @@ export interface DelegationReviewV2Success {
 	review_hash: string;
 	review_path: string;
 	finalized: boolean;
-	semantic_authority?: "embedded" | "migration_presented" | "migration_accepted" | "not_required" | "repair_required";
+	semantic_authority?: "embedded" | "migration_presented" | "migration_accepted" | "not_required" | "repair_required" | "terminal_repair_required";
 	migration_binding_hash?: string;
 	repair_decision_hash?: string;
 	repair_reason_hash?: string;
@@ -288,30 +308,57 @@ function validAfterGitRecord(value: Record<string, unknown>): GitFacts | undefin
 
 interface GenerationReviewAuthority {
 	kind: "legacy-v2" | "guard-v2";
+	contract: DelegationBoundedTaskContractBindingV2;
 	authority: ReviewAuthorityFacts;
 	after_guard: WorkspaceGuardRecord;
 	change_set: ChangeSetRecord;
+	command_provenance?: DelegationCommandProvenanceRecord;
 	review_envelope?: SemanticReviewEnvelopeV1;
 }
 
 function authorityFromGeneration(generation: DelegationCommittedGenerationV2): GenerationReviewAuthority | undefined {
 	const state = generation.state;
+	const ordinaryReview = state.status === "PENDING_REVIEW" || state.status === "REVIEWED";
+	const terminalNegativeReview = isDelegationTerminalNegativeReviewEligibleV1(state);
 	if (state.task_kind !== "implementation" || state.terminal_outcome === null || state.committed_proof === null ||
-		(state.status !== "PENDING_REVIEW" && state.status !== "REVIEWED")) return undefined;
+		(!ordinaryReview && !terminalNegativeReview)) return undefined;
 	const before = generation.records["before.json"];
 	const after = generation.records["after.json"];
 	const identity = generation.records["identity.json"];
 	const scope = generation.records["scope.json"];
 	if (!isRecord(before) || !isRecord(after) ||
-		!isRecord(identity) || !exactFields(identity, IDENTITY_FIELDS) || !isRecord(scope) || !exactFields(scope, SCOPE_FIELDS)) return undefined;
+		!isRecord(identity) || !exactFields(identity, IDENTITY_FIELDS) || !isRecord(scope)
+		|| !(exactFields(scope, SCOPE_FIELDS) || exactFields(scope, SCOPE_FIELDS_WITH_COMMAND))) return undefined;
 	const guardV2 = before.diff_identity_kind === DELEGATION_WORKSPACE_DIFF_IDENTITY_KIND_V2 ||
 		after.diff_identity_kind === DELEGATION_WORKSPACE_DIFF_IDENTITY_KIND_V2;
 	const envelopeTagged = guardV2 && Object.prototype.hasOwnProperty.call(after, "review_envelope");
+	const commandTagged = guardV2 && Object.prototype.hasOwnProperty.call(after, "command_provenance_hash");
+	const hasWorkerSuccess = Object.prototype.hasOwnProperty.call(after, "worker_success");
+	const hasWorkerFailure = Object.prototype.hasOwnProperty.call(after, "worker_failure_code");
+	const currentOutcome = isCurrentDelegationTerminalOutcome(state.terminal_outcome);
+	// Fresh generations close worker execution independently from provider
+	// transport success. Historical generations remain readable only in their
+	// exact legacy shape: both fields absent, never one field or a forged pair.
+	if (hasWorkerSuccess !== hasWorkerFailure || hasWorkerSuccess !== currentOutcome) return undefined;
+	const baseAfterFields = guardV2
+		? commandTagged
+			? (envelopeTagged ? AFTER_FIELDS_GUARD_V2_COMMAND_ENVELOPE : AFTER_FIELDS_GUARD_V2_COMMAND)
+			: (envelopeTagged ? AFTER_FIELDS_GUARD_V2_ENVELOPE : AFTER_FIELDS_GUARD_V2)
+		: AFTER_FIELDS;
+	const expectedAfterFields = hasWorkerSuccess
+		? [...baseAfterFields, ...AFTER_WORKER_OUTCOME_FIELDS]
+		: baseAfterFields;
 	if (guardV2
-		? (!exactFields(before, BEFORE_FIELDS_GUARD_V2) || !exactFields(after, envelopeTagged ? AFTER_FIELDS_GUARD_V2_ENVELOPE : AFTER_FIELDS_GUARD_V2)
+		? (!exactFields(before, BEFORE_FIELDS_GUARD_V2) || !exactFields(after, expectedAfterFields)
 			|| before.diff_identity_kind !== DELEGATION_WORKSPACE_DIFF_IDENTITY_KIND_V2
 			|| after.diff_identity_kind !== DELEGATION_WORKSPACE_DIFF_IDENTITY_KIND_V2)
-		: (!exactFields(before, BEFORE_FIELDS) || !exactFields(after, AFTER_FIELDS))) return undefined;
+		: (!exactFields(before, BEFORE_FIELDS) || !exactFields(after, expectedAfterFields))) return undefined;
+	if (currentOutcome && (typeof after.worker_success !== "boolean" ||
+		!(after.worker_failure_code === null || typeof after.worker_failure_code === "string") ||
+		after.worker_success !== (after.worker_failure_code === null) ||
+		after.worker_success !== state.terminal_outcome.worker_success ||
+		after.worker_failure_code !== state.terminal_outcome.worker_failure_code ||
+		after.status !== (after.worker_success ? "success" : "failure"))) return undefined;
 	if (before.schema_version !== 2 || before.delegation_id !== state.delegation_id || !isCanonicalTime(before.recorded_at) ||
 		after.schema_version !== 2 || after.delegation_id !== state.delegation_id || !isCanonicalTime(after.recorded_at) ||
 		after.review_status !== "PENDING_REVIEW" || !validByteSortedPaths(after.changed_paths) ||
@@ -353,12 +400,21 @@ function authorityFromGeneration(generation: DelegationCommittedGenerationV2): G
 		!sameJson(scope.changed_paths, state.terminal_outcome.changed_paths) ||
 		!isRecord(scope.write_journal) || !isRecord(scope.change_set) || !validateChangeSet(scope.change_set)) return undefined;
 	const changeSet = scope.change_set as ChangeSetRecord;
+	const commandProvenance = Object.prototype.hasOwnProperty.call(scope, "command_provenance")
+		? scope.command_provenance as DelegationCommandProvenanceRecord
+		: undefined;
+	if (commandTagged !== (commandProvenance !== undefined)
+		|| (commandProvenance !== undefined && (!validateDelegationCommandProvenance(commandProvenance, changeSet)
+			|| after.command_provenance_hash !== commandProvenance.command_provenance_hash
+			|| after.effective_delta_hash !== commandProvenance.effective_delta_hash))) return undefined;
 	if (!validateWorkspaceGuard(after.workspace_guard)) return undefined;
 	const afterGuard = after.workspace_guard as unknown as WorkspaceGuardRecord;
 	return {
 		kind: guardV2 ? "guard-v2" : "legacy-v2",
+		contract: structuredClone(canonicalContract.value),
 		after_guard: afterGuard,
 		change_set: changeSet,
+		...(commandProvenance === undefined ? {} : { command_provenance: commandProvenance }),
 		...(envelopeTagged ? { review_envelope: structuredClone(after.review_envelope as SemanticReviewEnvelopeV1) } : {}),
 		authority: {
 			delegation_id: state.delegation_id,
@@ -380,7 +436,7 @@ function projectionFromReview(review: ReviewRecord | null): ReviewRelevanceProje
 
 function authorityWithRelevance(
 	base: ReviewAuthorityFacts,
-	relevance: Readonly<CollectedReviewRelevanceV2>,
+	relevance: Readonly<Pick<CollectedReviewRelevanceV2, "binding" | "projection" | "worker_paths">>,
 ): ReviewAuthorityFacts {
 	const worker = new Set(relevance.worker_paths);
 	const pathStatuses: Record<string, string> = {};
@@ -405,6 +461,113 @@ function authorityWithRelevance(
 		relevance_binding: relevance.binding,
 		relevance_projection: relevance.projection,
 	};
+}
+
+export type CommittedStructuredReviewAuthorityV2Result =
+	| {
+		ok: true;
+		value: {
+			contract: Readonly<DelegationBoundedTaskContractBindingV2>;
+			authority: Readonly<ReviewAuthorityFacts>;
+			review: Readonly<DelegationReviewArtifactV2["review"]>;
+		};
+	}
+	| { ok: false; code: "INVALID_COMMITTED_AUTHORITY" | "LEGACY_REVIEW_REQUIRES_MIGRATION" | "LINEAGE_PRESENTATION_GAP" | "PROVISIONAL_REVIEW_INVALID" };
+
+/**
+ * A repair successor may close carried rejected paths that it did not touch
+ * again. W/C is sufficient only when every carried path is present there;
+ * generic D entries cannot prove rejected-lineage ownership.
+ */
+export function missingRepairLineageStructuredPresentationPathsV2(
+	repairLineage: Readonly<DelegationTransactionRecord["repair_lineage"]>,
+	projection: Readonly<ReviewRelevanceProjectionV2>,
+): string[] | undefined {
+	if (!validateReviewRelevanceProjectionV2(projection)) return undefined;
+	if (repairLineage === undefined) return [];
+	const presented = new Set(projection.entries
+		.filter((entry) => entry.roles.includes("W") || entry.roles.includes("C"))
+		.map((entry) => entry.path));
+	return repairLineage.carried_paths.filter((path) => !presented.has(path));
+}
+
+/**
+ * Reconstruct the storage-independent structured-review input exclusively
+ * from a strictly verified committed generation and its strict durable
+ * provisional review. This performs no I/O and grants no semantic authority.
+ */
+function committedStructuredReviewAuthorityForLifecycleV2(
+	generation: Readonly<DelegationCommittedGenerationV2>,
+	reviewAuthority: Readonly<DelegationReviewAuthorityV2>,
+	lifecycle: "pending" | "terminal-negative",
+): CommittedStructuredReviewAuthorityV2Result {
+	try {
+		const info = authorityFromGeneration(generation as DelegationCommittedGenerationV2);
+		const lifecycleMatches = lifecycle === "pending"
+			? generation.state.status === "PENDING_REVIEW" && reviewAuthority.state.status === "PENDING_REVIEW"
+			: isDelegationTerminalNegativeReviewEligibleV1(generation.state)
+				&& isDelegationTerminalNegativeReviewEligibleV1(reviewAuthority.state);
+		if (info === undefined || !lifecycleMatches
+			|| reviewAuthority.state.delegation_id !== generation.state.delegation_id
+			|| reviewAuthority.state.contract_hash !== generation.state.contract_hash
+			|| reviewAuthority.finalized) return { ok: false, code: "INVALID_COMMITTED_AUTHORITY" };
+		if (info.kind !== "guard-v2") return { ok: false, code: "LEGACY_REVIEW_REQUIRES_MIGRATION" };
+		const record = reviewAuthority.review;
+		const binding = record.relevance_binding;
+		const projection = record.relevance_projection;
+		const envelope = record.review_envelope;
+		if (record.schema_version !== 2 || record.delegation_id !== generation.state.delegation_id
+			|| record.semantic_review !== "required" || record.semantic_acceptance !== undefined
+			|| !validateReviewRelevanceProjectionV2(projection)
+			|| projection.delegation_id !== generation.state.delegation_id
+			|| projection.contract_hash !== generation.state.contract_hash
+			|| binding === undefined || binding.projection_hash !== computeReviewRelevanceProjectionHashV2(projection)
+			|| record.bound_diff_hash !== binding.projection_hash
+			|| !validateSemanticReviewEnvelopeV1(envelope)
+			|| envelope.relevance_projection_hash !== binding.projection_hash
+			|| info.review_envelope === undefined || canonicalHash(info.review_envelope) !== canonicalHash(envelope)) {
+			return { ok: false, code: "PROVISIONAL_REVIEW_INVALID" };
+		}
+		const effectivePaths = [...new Set(projection.entries
+			.filter((entry) => entry.roles.includes("W") || entry.roles.includes("C"))
+			.map((entry) => entry.path))]
+			.sort((left, right) => Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8")));
+		const lineageGap = missingRepairLineageStructuredPresentationPathsV2(generation.state.repair_lineage, projection);
+		if (lineageGap === undefined) return { ok: false, code: "PROVISIONAL_REVIEW_INVALID" };
+		if (lineageGap.length > 0) return { ok: false, code: "LINEAGE_PRESENTATION_GAP" };
+		if (!sameJson(effectivePaths, info.authority.worker_paths) || !sameJson(effectivePaths, record.checked_paths)
+			|| envelope.path_count !== effectivePaths.length) return { ok: false, code: "PROVISIONAL_REVIEW_INVALID" };
+		const authority = authorityWithRelevance(info.authority, {
+			binding,
+			projection,
+			worker_paths: effectivePaths,
+		});
+		return {
+			ok: true,
+			value: {
+				contract: Object.freeze(structuredClone(info.contract)),
+				authority: Object.freeze({ ...authority, worker_paths: Object.freeze([...effectivePaths]) }),
+				review: Object.freeze(structuredClone(record)),
+			},
+		};
+	} catch {
+		return { ok: false, code: "INVALID_COMMITTED_AUTHORITY" };
+	}
+}
+
+export function committedStructuredReviewAuthorityV2(
+	generation: Readonly<DelegationCommittedGenerationV2>,
+	reviewAuthority: Readonly<DelegationReviewAuthorityV2>,
+): CommittedStructuredReviewAuthorityV2Result {
+	return committedStructuredReviewAuthorityForLifecycleV2(generation, reviewAuthority, "pending");
+}
+
+/** REPAIR-only structured authority for a committed terminal-negative parent. */
+export function committedTerminalNegativeStructuredReviewAuthorityV1(
+	generation: Readonly<DelegationCommittedGenerationV2>,
+	reviewAuthority: Readonly<DelegationTerminalNegativeReviewAuthorityV1>,
+): CommittedStructuredReviewAuthorityV2Result {
+	return committedStructuredReviewAuthorityForLifecycleV2(generation, reviewAuthority, "terminal-negative");
 }
 
 function relevanceConflictHash(
@@ -475,8 +638,12 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 		const generation = await readDelegationCommittedGenerationV2(input.projectRoot, input.delegationId, input.storage);
 		if (!generation.ok) return fail("authority_invalid", "delegation committed-generation authority is unavailable");
 		const state = generation.value.state;
-		if (repairDecision && state.status !== "PENDING_REVIEW") {
-			return fail("invalid_state", "semantic REPAIR is valid only for a current provisional implementation review", { transaction: state });
+		const terminalNegative = isDelegationTerminalNegativeReviewEligibleV1(state);
+		if (acceptDecision && terminalNegative) {
+			return fail("invalid_state", "terminal-negative delegations can never publish semantic ACCEPT or ordinary REVIEWED authority", { transaction: state });
+		}
+		if (repairDecision && state.status !== "PENDING_REVIEW" && !terminalNegative) {
+			return fail("invalid_state", "semantic REPAIR requires a current provisional or eligible terminal-negative implementation", { transaction: state });
 		}
 		const authorityInfo = authorityFromGeneration(generation.value);
 		if (authorityInfo === undefined) return fail("invalid_state", "delegation is not a strictly bound implementation review", { transaction: state });
@@ -673,6 +840,9 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 					contract_hash: state.contract_hash,
 					after_guard: authorityInfo.after_guard,
 					change_set: authorityInfo.change_set,
+					...(authorityInfo.command_provenance === undefined ? {} : {
+						command_provenance: authorityInfo.command_provenance,
+					}),
 					exec: input.exec,
 					expected_projection: expected,
 				});
@@ -713,9 +883,15 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 			};
 		}
 
-		const priorRead = await readDelegationReviewV2(input.projectRoot, state.delegation_id, input.storage);
+		const priorRead = terminalNegative
+			? await readDelegationTerminalNegativeReviewV1(input.projectRoot, state.delegation_id, input.storage)
+			: await readDelegationReviewV2(input.projectRoot, state.delegation_id, input.storage);
 		let priorReview: ReviewRecord | null = null;
-		let priorRepairDecision = priorRead.ok ? priorRead.value.semantic_repair : undefined;
+		let priorRepairDecision = priorRead.ok
+			? terminalNegative
+				? (priorRead.value as DelegationTerminalNegativeReviewAuthorityV1).terminal_negative_repair?.decision
+				: priorRead.value.semantic_repair
+			: undefined;
 		if (priorRead.ok) {
 			if (priorRead.value.finalized) return fail("review_conflict", "pending transaction conflicts with a finalized review", { transaction: state });
 			priorReview = priorRead.value.review;
@@ -771,6 +947,9 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 			contract_hash: state.contract_hash,
 			after_guard: authorityInfo.after_guard,
 			change_set: authorityInfo.change_set,
+			...(authorityInfo.command_provenance === undefined ? {} : {
+				command_provenance: authorityInfo.command_provenance,
+			}),
 			exec: input.exec,
 			...(expectedProjection === undefined ? {} : { expected_projection: expectedProjection }),
 		});
@@ -806,7 +985,7 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 				return fail("review_invalid", "semantic decision presentation proof no longer matches the current authoritative redacted source streams", { transaction: state });
 			}
 			if (repairDecision) {
-				const decided = await publishDelegationSemanticRepairDecisionV1(input.projectRoot, {
+				const decisionInput = {
 					delegation_id: state.delegation_id,
 					contract_hash: state.contract_hash,
 					worker_identity: { ...state.worker_identity },
@@ -819,10 +998,24 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 					reviewer: {
 						provider: input.reviewer!.provider as "openai" | "openai-codex",
 						model: COMMANDER_MODEL_ID,
-					},
-				}, input.storage);
-				if (!decided.ok) {
-					return fail(decided.error.code === "storage_failure" ? "storage_failure" : "review_conflict", decided.error.message, { transaction: state });
+					} as const,
+				};
+				let repairDecisionHash: string;
+				let repairReasonHash: string;
+				if (terminalNegative) {
+					const decided = await publishDelegationTerminalNegativeRepairDecisionV1(input.projectRoot, decisionInput, input.storage);
+					if (!decided.ok) {
+						return fail(decided.error.code === "storage_failure" ? "storage_failure" : "review_conflict", decided.error.message, { transaction: state });
+					}
+					repairDecisionHash = decided.value.decision.decision_hash;
+					repairReasonHash = decided.value.decision.repair_reason_hash;
+				} else {
+					const decided = await publishDelegationSemanticRepairDecisionV1(input.projectRoot, decisionInput, input.storage);
+					if (!decided.ok) {
+						return fail(decided.error.code === "storage_failure" ? "storage_failure" : "review_conflict", decided.error.message, { transaction: state });
+					}
+					repairDecisionHash = decided.value.decision_hash;
+					repairReasonHash = decided.value.repair_reason_hash;
 				}
 				return {
 					ok: true,
@@ -835,9 +1028,9 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 					review_hash: priorRead.ok ? priorRead.value.review_hash : "",
 					review_path: reviewPath,
 					finalized: false,
-					semantic_authority: "repair_required",
-					repair_decision_hash: decided.value.decision_hash,
-					repair_reason_hash: decided.value.repair_reason_hash,
+					semantic_authority: terminalNegative ? "terminal_repair_required" : "repair_required",
+					repair_decision_hash: repairDecisionHash,
+					repair_reason_hash: repairReasonHash,
 				};
 			}
 			const acceptedRecord: ReviewRecord = {
@@ -859,7 +1052,11 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 				record: acceptedRecord,
 				lines: renderReviewLines(acceptedRecord, { maxBytes: input.maxBytes, maxLines: input.maxLines }),
 			};
-		} else if (priorRead.ok && priorRepairDecision !== undefined && hasDelegationSemanticRepairAuthorityV2(priorRead.value)) {
+		} else if (priorRead.ok && priorRepairDecision !== undefined && (
+			terminalNegative
+				? hasDelegationTerminalNegativeSemanticRepairAuthorityV1(priorRead.value as DelegationTerminalNegativeReviewAuthorityV1)
+				: hasDelegationSemanticRepairAuthorityV2(priorRead.value)
+		)) {
 			review = {
 				ok: true,
 				record: priorReview!,
@@ -889,7 +1086,7 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 				review_hash: priorRead.ok ? priorRead.value.review_hash : "",
 				review_path: reviewPath,
 				finalized: false,
-				semantic_authority: "repair_required",
+				semantic_authority: terminalNegative ? "terminal_repair_required" : "repair_required",
 				repair_decision_hash: priorRepairDecision.decision_hash,
 				repair_reason_hash: priorRepairDecision.repair_reason_hash,
 			};
@@ -904,10 +1101,12 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 			now: reviewedAt,
 			artifact,
 		};
-		const mayFinalize = isStrictSemanticAcceptedOrZeroDelta(review.record);
-		const persisted = mayFinalize
-			? await publishDelegationReviewV2(input.projectRoot, cas, input.storage)
-			: await persistDelegationReviewProvisionalV2(input.projectRoot, cas, input.storage);
+		const mayFinalize = !terminalNegative && isStrictSemanticAcceptedOrZeroDelta(review.record);
+		const persisted = terminalNegative
+			? await persistDelegationTerminalNegativeReviewProvisionalV1(input.projectRoot, cas, input.storage)
+			: mayFinalize
+				? await publishDelegationReviewV2(input.projectRoot, cas, input.storage)
+				: await persistDelegationReviewProvisionalV2(input.projectRoot, cas, input.storage);
 		if (!persisted.ok) {
 			const point = persisted.error.point === undefined ? "" : ` at ${persisted.error.point}`;
 			return fail("storage_failure", `delegation v2 review persistence failed (${persisted.error.code}${point}): ${persisted.error.message}`, { review, transaction: state });

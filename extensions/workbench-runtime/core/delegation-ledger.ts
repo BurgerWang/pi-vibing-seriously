@@ -69,6 +69,7 @@ import type {
 	WorkerSpendReason,
 	WorkerSpendState,
 } from "./worker-spend.ts";
+import type { WorkerRunFailureCode } from "./worker-run-failure.ts";
 import { resolveWorkerBudgetProfile, resolveWorkerRepairOf } from "./worker-policy.ts";
 import { readJsonFileBounded, type BoundedFileIoHooks } from "./bounded-file-io.ts";
 import {
@@ -192,7 +193,7 @@ export interface LedgerContract {
 	/**
 	 * Phase 3 (worker token-budget repair): the resolved cumulative
 	 * spend-budget profile (additive, optional). Omitted resolves to
-	 * `extended` in boundLedgerContract — new before records always carry
+	 * `standard` in boundLedgerContract — new before records always carry
 	 * the resolved literal.
 	 */
 	budgetProfile?: WorkerSpendProfile;
@@ -248,6 +249,10 @@ export interface LedgerWorkerFacts {
 	provider: string | null;
 	model: string | null;
 	status: "success" | "failure";
+	/** Current v2 machine outcome; absent only for historical/legacy callers. */
+	workerSuccess?: boolean;
+	/** Current v2 closed failure category; null iff workerSuccess is true. */
+	workerFailureCode?: WorkerRunFailureCode | null;
 	exitCode: number | null;
 	turns: number;
 	stopReason: string | null;
@@ -313,7 +318,7 @@ export interface LedgerBeforeRecord {
 		 * records genuinely omit it — reads of those expose `undefined` and
 		 * they are never rewritten (additive, no migration). New before
 		 * records ALWAYS carry the resolved literal: boundLedgerContract
-		 * resolves omitted to `extended` before any write.
+		 * resolves omitted to `standard` before any write.
 		 */
 		budget_profile?: string;
 		/**
@@ -338,6 +343,8 @@ export interface LedgerAfterRecord {
 	delegation_id: string;
 	recorded_at: string;
 	status: "success" | "failure";
+	worker_success?: boolean;
+	worker_failure_code?: WorkerRunFailureCode | null;
 	exit_code: number | null;
 	pinned_identity: {
 		pinned_provider: string;
@@ -385,6 +392,8 @@ export interface LedgerWorkerSummaryRecord {
 	provider: string | null;
 	model: string | null;
 	status: "success" | "failure";
+	worker_success?: boolean;
+	worker_failure_code?: WorkerRunFailureCode | null;
 	exit_code: number | null;
 	turns: number;
 	stop_reason: string | null;
@@ -429,6 +438,8 @@ export interface DelegationUsageRecord {
 	provider: string | null;
 	model: string | null;
 	status: "success" | "failure";
+	worker_success?: boolean;
+	worker_failure_code?: WorkerRunFailureCode | null;
 	exit_code: number | null;
 	turns: number;
 	stop_reason: string | null;
@@ -1003,7 +1014,7 @@ export function boundLedgerContract(raw: LedgerContract): { ok: true; contract: 
 		.slice(0, MAX_VERIFICATION_STEPS);
 	const timeoutSeconds = Number.isInteger(raw.timeoutSeconds) && raw.timeoutSeconds >= 60 && raw.timeoutSeconds <= 3600 ? raw.timeoutSeconds : 1800;
 	// Phase 3: resolve the spend-budget profile deterministically — omitted
-	// resolves to `extended`; any other value must be exactly one of the two
+	// resolves to `standard`; any other value must be exactly one of the two
 	// active literals or the contract FAILS CLOSED (retired low/unknown/empty/wrong-
 	// typed profile must never reach a ledger record or a child launch).
 	const profile = resolveWorkerBudgetProfile(raw.budgetProfile);
@@ -1198,6 +1209,8 @@ export async function finishDelegationLedger(
 		delegation_id: delegationId,
 		recorded_at: input.now,
 		status: input.worker.status,
+		...(input.worker.workerSuccess === undefined ? {} : { worker_success: input.worker.workerSuccess }),
+		...(input.worker.workerFailureCode === undefined ? {} : { worker_failure_code: input.worker.workerFailureCode }),
 		exit_code: input.worker.exitCode,
 		pinned_identity: {
 			pinned_provider: "deepseek",
@@ -1232,6 +1245,8 @@ export async function finishDelegationLedger(
 		provider: input.worker.provider,
 		model: input.worker.model,
 		status: input.worker.status,
+		...(input.worker.workerSuccess === undefined ? {} : { worker_success: input.worker.workerSuccess }),
+		...(input.worker.workerFailureCode === undefined ? {} : { worker_failure_code: input.worker.workerFailureCode }),
 		exit_code: input.worker.exitCode,
 		turns: input.worker.turns,
 		stop_reason: input.worker.stopReason ? input.worker.stopReason.slice(0, MAX_STOP_REASON_CHARS) : null,
@@ -1258,6 +1273,8 @@ export async function finishDelegationLedger(
 		provider: input.worker.provider,
 		model: input.worker.model,
 		status: input.worker.status,
+		...(input.worker.workerSuccess === undefined ? {} : { worker_success: input.worker.workerSuccess }),
+		...(input.worker.workerFailureCode === undefined ? {} : { worker_failure_code: input.worker.workerFailureCode }),
 		exit_code: input.worker.exitCode,
 		turns: input.worker.turns,
 		stop_reason: input.worker.stopReason ? input.worker.stopReason.slice(0, MAX_STOP_REASON_CHARS) : null,

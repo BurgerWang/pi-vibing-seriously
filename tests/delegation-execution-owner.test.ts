@@ -11,6 +11,7 @@ import {
 	INTERRUPTED_BEFORE_WORKER_WRITE_REASON_V2,
 	isStrictRetryableEmptyRepairRecoveryV2,
 	isStrictRetryableAbortedRepairV2,
+	readStrictRetryableRawRepairEvidenceV1,
 	releaseDelegationExecutionOwnerV2,
 	releaseOrphanedTerminalExecutionOwnerV2,
 	RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2,
@@ -37,6 +38,11 @@ import {
 	acquireProjectDelegationStartLockV1,
 	releaseProjectDelegationStartLockV1,
 } from "../extensions/workbench-runtime/core/delegation-start-lock.ts";
+import {
+	acquireProjectCheckoutOperationV1,
+	inspectProcessCheckoutOperationV1,
+	markProjectCheckoutOperationSettledV1,
+} from "../extensions/workbench-runtime/core/project-checkout-operation.ts";
 import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { beginWriteJournalOperation, createWorkerWriteJournal } from "../extensions/workbench-runtime/core/write-journal.ts";
 import { withTempDir } from "./helpers.ts";
@@ -152,6 +158,93 @@ test("execution owner is exclusive, strictly bound, live while its process lives
 		assert.equal(recovered.transaction.status, "ABORTED");
 		assert.equal(recovered.transaction.abort_reason, INTERRUPTED_BEFORE_WORKER_WRITE_REASON_V2);
 		assert.equal((await readDelegationExecutionOwnerV2(root, recovered.transaction, options)).ok, false);
+	});
+});
+
+test("same-PID settled pristine RUNNING is CAS-aborted and releases both owner and checkout lane", async () => {
+	await withTempDir(async (root) => {
+		const id = "20260822-172343-smp1";
+		const operation = await acquireProjectCheckoutOperationV1({
+			project_root: root,
+			operation_kind: "delegation",
+			operation_id: `delegation:${id}`,
+			delegation_id: id,
+			now: time(39),
+		});
+		assert.equal(operation.ok, true);
+		if (!operation.ok) return;
+		const initial = await prepared(root, id);
+		const owner = await claimDelegationExecutionOwnerV2(root, initial, time(41));
+		assert.equal(owner.ok, true);
+		const state = await persistRunningDelegationTransaction(root, {
+			delegation_id: id,
+			contract_hash: CONTRACT,
+			worker_identity: initial.worker_identity,
+			expected_generation: 1,
+			expected_revision: 0,
+			now: time(42),
+		});
+		assert.equal(state.ok, true);
+		if (!state.ok) return;
+		assert.equal(markProjectCheckoutOperationSettledV1(operation.value), true);
+		const recovered = await recoverInterruptedDelegationV2({
+			project_root: root,
+			transaction: state.value,
+			now: time(44),
+		});
+		assert.equal(recovered.status, "recovered");
+		assert.equal(recovered.transaction.status, "ABORTED");
+		assert.equal(inspectProcessCheckoutOperationV1(root, operation.value.token), "absent");
+		assert.equal((await readDelegationExecutionOwnerV2(root, recovered.transaction)).ok, false);
+		await assert.rejects(readFile(join(root, CONFIG_DIR_NAME, "workbench", "delegation-start.lock")), { code: "ENOENT" });
+	});
+});
+
+test("same-PID settled RUNNING with worker evidence becomes RECOVERY_REQUIRED and releases the lane", async () => {
+	await withTempDir(async (root) => {
+		const id = "20260822-172343-smp2";
+		const operation = await acquireProjectCheckoutOperationV1({
+			project_root: root,
+			operation_kind: "delegation",
+			operation_id: `delegation:${id}`,
+			delegation_id: id,
+			now: time(39),
+		});
+		assert.equal(operation.ok, true);
+		if (!operation.ok) return;
+		const initial = await prepared(root, id);
+		const owner = await claimDelegationExecutionOwnerV2(root, initial, time(41));
+		assert.equal(owner.ok, true);
+		const state = await persistRunningDelegationTransaction(root, {
+			delegation_id: id,
+			contract_hash: CONTRACT,
+			worker_identity: initial.worker_identity,
+			expected_generation: 1,
+			expected_revision: 0,
+			now: time(42),
+		});
+		assert.equal(state.ok, true);
+		if (!state.ok) return;
+		const begun = await beginWriteJournalOperation({
+			project_root: root,
+			delegation_id: id,
+			contract_hash: CONTRACT,
+			expected_revision: 0,
+			operation_id: "a".repeat(64),
+			kind: "write",
+			path: "src/worker.ts",
+		});
+		assert.equal(begun.ok, true);
+		assert.equal(markProjectCheckoutOperationSettledV1(operation.value), true);
+		const recovered = await recoverInterruptedDelegationV2({
+			project_root: root,
+			transaction: state.value,
+			now: time(44),
+		});
+		assert.equal(recovered.status, "recovered");
+		assert.equal(recovered.transaction.status, "RECOVERY_REQUIRED");
+		assert.equal(inspectProcessCheckoutOperationV1(root, operation.value.token), "absent");
+		await assert.rejects(readFile(join(root, CONFIG_DIR_NAME, "workbench", "delegation-start.lock")), { code: "ENOENT" });
 	});
 });
 
@@ -377,9 +470,21 @@ test("only the exact before-write lineaged ABORTED shape is retryable", async ()
 		});
 		assert.equal(recovered.status, "recovered");
 		assert.equal(await isStrictRetryableAbortedRepairV2(root, recovered.transaction), true);
+		const evidence = await readStrictRetryableRawRepairEvidenceV1(root, recovered.transaction);
+		assert.equal(evidence.ok, true, evidence.ok ? "" : evidence.code);
+		if (evidence.ok) {
+			assert.equal(evidence.value.retry_kind, "ABORTED");
+			assert.equal(evidence.value.journal_present, false);
+			assert.deepEqual(evidence.value.inventory, ["transaction.json:file"]);
+			assert.match(evidence.value.evidence_hash, /^[a-f0-9]{64}$/u);
+		}
 		await writeFile(join(paths(root, id).v2, "unexpected.json"), "{}\n", "utf8");
 		assert.equal(await isStrictRetryableAbortedRepairV2(root, recovered.transaction), false,
 			"extra artifacts revoke retry authority");
+		assert.deepEqual(await readStrictRetryableRawRepairEvidenceV1(root, recovered.transaction), {
+			ok: false,
+			code: "NOT_RETRYABLE",
+		});
 	});
 	await withTempDir(async (root) => {
 		const rootId = "20260822-172342-root";
@@ -459,9 +564,21 @@ test("lineaged empty recovery requires released owner, known reason, and exact i
 			"a dead but not yet released owner remains blocking");
 		assert.deepEqual(await releaseOrphanedTerminalExecutionOwnerV2(root, recovery.value, options), { status: "released" });
 		assert.equal(await isStrictRetryableEmptyRepairRecoveryV2(root, recovery.value, options), true);
+		const evidence = await readStrictRetryableRawRepairEvidenceV1(root, recovery.value, options);
+		assert.equal(evidence.ok, true, evidence.ok ? "" : evidence.code);
+		if (evidence.ok) {
+			assert.equal(evidence.value.retry_kind, "EMPTY_RECOVERY");
+			assert.equal(evidence.value.journal_present, true);
+			assert.deepEqual(evidence.value.inventory, ["transaction.json:file", "write-journal.json:file"]);
+			assert.match(evidence.value.evidence_hash, /^[a-f0-9]{64}$/u);
+		}
 		await writeFile(join(paths(root, id).v2, "unexpected.json"), "{}\n", "utf8");
 		assert.equal(await isStrictRetryableEmptyRepairRecoveryV2(root, recovery.value, options), false,
 			"extra recovery artifacts revoke retry authority");
+		assert.deepEqual(await readStrictRetryableRawRepairEvidenceV1(root, recovery.value, options), {
+			ok: false,
+			code: "NOT_RETRYABLE",
+		});
 	});
 });
 

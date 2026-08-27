@@ -98,7 +98,7 @@ function workerRuntime(spendProfile?: string): RuntimeStub & ExtensionAPI {
 	}
 }
 
-test("worker child env retires low by enforcing the extended soft-turn boundary", async () => {
+test("worker child env retires low by enforcing the standard soft-turn boundary", async () => {
 	const stub = workerRuntime("low");
 	const ctx = context([]);
 	const event = {
@@ -112,15 +112,15 @@ test("worker child env retires low by enforcing the extended soft-turn boundary"
 			usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { total: 0 } },
 		},
 	};
-	for (let turn = 0; turn < 63; turn += 1) await emitRuntimeEvent(stub, "message_end", event, ctx);
+	for (let turn = 0; turn < 31; turn += 1) await emitRuntimeEvent(stub, "message_end", event, ctx);
 	const spendSteers = () => stub.sentMessages.filter(({ message }) =>
 		(message as { customType?: unknown }).customType === WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE);
 	assert.equal(spendSteers().length, 0, "retired low does not spend-steer at its historical 8-turn threshold");
 	await emitRuntimeEvent(stub, "message_end", event, ctx);
-	assert.equal(spendSteers().length, 1, "extended soft threshold steers at turn 64");
+	assert.equal(spendSteers().length, 1, "standard soft threshold steers at turn 32");
 	const message = spendSteers()[0]!.message as { content?: unknown; details?: Record<string, unknown> };
-	assert.match(String(message.content), /profile extended/);
-	assert.equal(message.details?.profile, "extended");
+	assert.match(String(message.content), /profile standard/);
+	assert.equal(message.details?.profile, "standard");
 });
 
 function context(entries: readonly unknown[]): ExtensionContext {

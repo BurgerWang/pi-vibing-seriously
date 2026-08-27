@@ -11,11 +11,13 @@ import {
 import { applyInit, planInit, renderInitPlan, retainInitContentSnapshot } from "./init.ts";
 import { captureInitFileIdentity, safelyWriteInitFile, type InitFileIdentity } from "./init-safe-write.ts";
 import { INIT_PROFILES, isSupportedInitProfile } from "./templates.ts";
+import { runProjectCheckoutOperationV1 } from "./project-checkout-operation.ts";
 
 export interface InitCommandController {
 	pi: Pick<ExtensionAPI, "registerCommand">;
 	trustedOrError(ctx: ExtensionCommandContext): string | undefined;
 	projectRootFor(ctx: ExtensionCommandContext): Promise<string>;
+	reconcileProjectAuthority(projectRoot: string, now: string): Promise<boolean>;
 	output(ctx: ExtensionCommandContext, lines: string[]): void;
 }
 
@@ -72,32 +74,52 @@ export function registerInitCommand(controller: InitCommandController): void {
 				}
 			}
 
-			const currentActions = await planInit(projectRoot, profile, {
-				exists,
-				confirmOverwrite: async (file) => overwrite.has(file),
+			if (!await controller.reconcileProjectAuthority(projectRoot, new Date().toISOString())) {
+				controller.output(ctx, ["/q-init: checkout authority recovery is unavailable"]);
+				return;
+			}
+			const operation = await runProjectCheckoutOperationV1({
+				project_root: projectRoot,
+				operation_kind: "command",
+				operation_id: `command:q-init:${profile}`,
+				now: new Date().toISOString(),
+			}, async () => {
+				const currentActions = await planInit(projectRoot, profile, {
+					exists,
+					confirmOverwrite: async (file) => overwrite.has(file),
+				});
+				// Refresh only create/skip/overwrite decisions after confirmation. The
+				// bytes shown in the preview stay authoritative even if package/stack
+				// detection changes while the user is deciding.
+				const plan = retainInitContentSnapshot(currentActions, preview);
+				await applyInit(plan, {
+					exists,
+					write: async (path, content, action) => {
+						await safelyWriteInitFile({
+							projectRoot,
+							path,
+							content,
+							action,
+							...(action === "overwrite" ? { expectedIdentity: overwriteIdentity.get(path) } : {}),
+						});
+					},
+				});
+				return plan;
 			});
-			// Refresh only create/skip/overwrite decisions after confirmation. The
-			// bytes shown in the preview stay authoritative even if package/stack
-			// detection changes while the user is deciding.
-			const plan = retainInitContentSnapshot(currentActions, preview);
-			await applyInit(plan, {
-				exists,
-				write: async (path, content, action) => {
-					await safelyWriteInitFile({
-						projectRoot,
-						path,
-						content,
-						action,
-						...(action === "overwrite" ? { expectedIdentity: overwriteIdentity.get(path) } : {}),
-					});
-				},
-			});
+			if (!operation.ok) {
+				controller.output(ctx, [`/q-init: checkout writer lane ${operation.error.code}`]);
+				return;
+			}
+			const plan = operation.value;
 
 			const written = plan.entries.filter((entry) => entry.action !== "skip").length;
 			const skipped = plan.entries.filter((entry) => entry.action === "skip").length;
 			controller.output(ctx, [
 				`Workbench initialized for profile "${profile}" in ${projectRoot}`,
 				`${written} file(s) written, ${skipped} existing file(s) left untouched`,
+				...(operation.release === "recovery_required"
+					? ["Warning: initialization completed but checkout lock cleanup requires recovery."]
+					: []),
 				"",
 				"Next steps:",
 				"  1. Exit Pi",

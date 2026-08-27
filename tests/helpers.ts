@@ -73,6 +73,21 @@ export async function writeConfigFile(projectRoot: string, file: string, content
 	await writeFile(path, content, "utf8");
 }
 
+/** Initialize a committed Git authority for integration fixtures that execute recipes. */
+export async function initializeGitFixture(projectRoot: string): Promise<void> {
+	await writeFile(join(projectRoot, ".gitignore"), `${CONFIG_DIR_NAME}/\n`, "utf8");
+	for (const args of [
+		["init", "-q"],
+		["config", "user.email", "workbench-test@example.com"],
+		["config", "user.name", "Workbench Test"],
+		["add", "-A"],
+		["commit", "-qm", "fixture baseline"],
+	] as const) {
+		const result = await spawnExec("git", [...args], { cwd: projectRoot });
+		if (result.code !== 0) throw new Error(`git fixture setup failed: ${result.stderr || result.stdout}`);
+	}
+}
+
 /** A quant-result artifact that conforms to the contract (unless mutated). */
 export function makeValidQuantResult(overrides: Record<string, unknown> = {}): Record<string, unknown> {
 	return {

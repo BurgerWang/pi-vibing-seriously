@@ -133,8 +133,8 @@ const WORKBENCH_DELEGATE_WORKER_V1_PROPERTIES = {
 const WORKBENCH_DELEGATE_WORKER_CURRENT_BUDGET_PROFILE = Type.Optional(
 	Type.Union([Type.Literal("standard"), Type.Literal("extended")], {
 		description:
-			"Luna xhigh cumulative spend profile. standard: soft at 32 turns / 5,440,000 total / 160,000 output; advisory turn marker 64, hard total 10,880,000, hard output 320,000. extended: soft at 64 turns / 10,880,000 total / 320,000 output; advisory turn marker 96, hard total 17,408,000, hard output 512,000. Soft steer asks for a coherent handoff in the current Sol session. A turn marker remains observable but never kills healthy tool-heavy work by itself; total/output limits, per-message context, timeout, compaction rejection, and identity checks remain fail-closed. extended is the safe default; standard is explicit for clearly bounded slices. The retired low literal is rejected for new delegations.",
-		default: "extended",
+			"Luna xhigh cumulative spend profile. standard (default): soft at 32 turns / 5,440,000 total / 160,000 output and hard stop at 64 turns / 10,880,000 total / 320,000 output. extended (explicit only): soft at 64 turns / 10,880,000 total / 320,000 output and hard stop at 96 turns / 17,408,000 total / 512,000 output. Soft steer requests a coherent handoff in the current Sol session; every hard turn/total/output boundary terminates the bounded attempt with retained evidence. The retired low literal is rejected for new delegations.",
+		default: "standard",
 	}),
 );
 
@@ -551,7 +551,7 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 			"Run one bounded Luna xhigh implementation or read-only diagnosis under an immutable contract",
 		promptGuidelines: [
 			"Delegate one coherent slice with the smallest useful allowed_paths and observable criteria; use diagnosis only when the root cause or scope is genuinely unknown.",
-			"Verification entries are exact recipe:<declared-name> references. Omit budget_profile for the normal extended default; a contract above 12 KiB must explicitly set extended and provide extended_reason.",
+			"Verification entries are exact recipe:<declared-name> references. Omit budget_profile for the bounded standard default; choose extended explicitly only for a justified larger slice. A contract above 12 KiB must set extended and provide extended_reason.",
 			"For a complete current PENDING_REVIEW packet that is known wrong, first use workbench_review_worker_diff with semantic_decision=REPAIR, the exact shown bound hash, and repair_reason; then use only the exact repair_of action reported by status. Historical mechanical FINAL remains ACCEPT-migration-only. The fresh worker receives bounded immutable repair/lineage facts, not the old session or report.",
 			"Treat worker output as implementation evidence only. Sol owns semantic acceptance, final verification, Gates, permissions and the final verdict.",
 		],
@@ -574,7 +574,8 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 				"Show the write-authority and delegation-review state: actor, write policy, lease status, latest delegation, review status, current and reviewed hashes, blocked writes, latest verdict, and durable repair state. REPAIR_REQUIRED reports exact repair_of only while fresh. An inactive discarded blocker reports close_inactive_blocker, which requires only its exact changed, journal-touched, or carried paths clean, preserves unrelated work, writes immutable non-acceptance, and is available in DEV or VERIFY. An incomplete or unreadable ownerless v2 envelope reports quarantine_unreadable_authority; its source bytes remain in place, and later bytes re-block until the new stable inventory is explicitly quarantined. Active execution and ambiguous/corrupt recovery remain fail-closed. Tagged v2 uses W/D/S relevance; historical v2/v1 retains complete-diff binding. Emits an explicit CONTEXT RISK line when the latest handoff is too large for safe context compaction.",
 		promptGuidelines: [
 			"Successful non-zero implementation delivery returns a provisional scope/integrity packet and stays PENDING_REVIEW; after inspecting a complete unchanged packet, use workbench_review_worker_diff for hash-bound Sol ACCEPT. Use status only for diagnostics or recovery.",
-			"If a complete packet is wrong, publish semantic_decision=REPAIR with the exact bound hash and a bounded reason, then follow only the exact repair_of shown by status. REPAIR and every unresolved lineage remain Gate-blocking.",
+			"If a complete packet is wrong, publish semantic_decision=REPAIR with the exact bound hash and a bounded reason, then follow only the exact repair_of shown by status. A fresh exact repair route is executable even though ordinary/new delegations and VERIFY remain blocked; call it next without repeating status/review. REPAIR and every unresolved lineage remain Gate-blocking.",
+			"Use workbench_recover_tool_result only with an exact receipt id returned by a real tool result. If no workbench_delegate_worker call occurred, never describe the unchanged delegation state as a registry reload or persistence failure.",
 			"If rejected changes were deliberately discarded, use the exact close_inactive_blocker action reported by status. It checks only the delegation's changed, journal-touched, or carried paths, preserves unrelated work, never accepts rejected code, and must not be replaced with a new worktree.",
 			"When STALE is backed by strict v2 FINAL/PASS plus explicit Sol semantic authority, follow the reported successor action instead of retrying immutable review; a mechanical FINAL/PASS remains blocked and VERIFY stays blocked until a valid successor is reviewed.",
 			"In the TUI, WF:LOCKED means routine writes belong to Luna, WF:LEASE means a bounded temporary Sol write exception is active, and WF:REVIEW means recovery review is outstanding.",

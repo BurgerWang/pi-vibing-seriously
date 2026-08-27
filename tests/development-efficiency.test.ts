@@ -32,12 +32,12 @@ test("routing recommends standard only from complete bounded evidence without ch
 		verification_count: 1,
 	});
 	assert.equal(bounded.recommended_profile, "standard");
-	assert.equal(bounded.effective_profile, "extended", "advisory routing does not change the compatible default");
+	assert.equal(bounded.effective_profile, "standard", "advisory routing does not change the bounded runtime default");
 	assert.equal(bounded.recommendation_status, "evidence_complete");
 
 	const unknown = decideWorkerProfile({ task_kind: "implementation" });
 	assert.equal(unknown.recommended_profile, "extended");
-	assert.equal(unknown.effective_profile, "extended");
+	assert.equal(unknown.effective_profile, "standard");
 	assert.equal(unknown.recommendation_status, "insufficient_evidence");
 	assert.ok(unknown.missing_evidence.includes("risk"));
 	const malformed = decideWorkerProfile({

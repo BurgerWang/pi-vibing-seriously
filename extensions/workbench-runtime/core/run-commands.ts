@@ -20,6 +20,7 @@ import { buildRecipeParentSummary } from "./result-summary.ts";
 import { isValidRunId, listRuns, readLogSnippet, readManifest } from "./runs.ts";
 import { renderCompareLines } from "./render.ts";
 import type { RecipeMutationFacts } from "./worker-policy.ts";
+import { runProjectCheckoutOperationV1 } from "./project-checkout-operation.ts";
 
 export interface RunCommandController {
 	pi: Pick<ExtensionAPI, "registerCommand">;
@@ -28,6 +29,7 @@ export interface RunCommandController {
 	exec: ExecFn;
 	trustedOrError(ctx: ExtensionCommandContext): string | undefined;
 	projectRootFor(ctx: ExtensionCommandContext): Promise<string>;
+	reconcileProjectAuthority(projectRoot: string, now: string): Promise<boolean>;
 	output(ctx: ExtensionCommandContext, lines: string[]): void;
 	refreshStatus(ctx: ExtensionCommandContext): void | Promise<void>;
 	refreshWidget(ctx: ExtensionCommandContext): void | Promise<void>;
@@ -78,7 +80,16 @@ export function registerRunCommands(controller: RunCommandController): void {
 			}
 			const projectRoot = await controller.projectRootFor(ctx);
 			try {
-				const result = await runRecipe({
+				if (!await controller.reconcileProjectAuthority(projectRoot, new Date().toISOString())) {
+					controller.output(ctx, ["/q-run: checkout authority recovery is unavailable"]);
+					return;
+				}
+				const operation = await runProjectCheckoutOperationV1({
+					project_root: projectRoot,
+					operation_kind: "command",
+					operation_id: `command:q-run:${recipe}`.slice(0, 256),
+					now: new Date().toISOString(),
+				}, async () => runRecipe({
 					projectRoot,
 					recipeName: recipe,
 					params,
@@ -87,7 +98,12 @@ export function registerRunCommands(controller: RunCommandController): void {
 					signal: ctx.signal,
 					cacheMode,
 					actorFacts: controller.getActorFacts(),
-				});
+				}));
+				if (!operation.ok) {
+					controller.output(ctx, [`/q-run: checkout writer lane ${operation.error.code}`]);
+					return;
+				}
+				const result = operation.value;
 				if (!result.ok && result.error && !result.summary) {
 					controller.output(ctx, [`/q-run: ${result.error}`]);
 					return;
@@ -117,9 +133,15 @@ export function registerRunCommands(controller: RunCommandController): void {
 				});
 				controller.output(
 					ctx,
-					result.error
-						? [`error      : ${boundedInlineDetail(result.error, 128)}`, ...parentSummary.lines]
-						: parentSummary.lines,
+					[
+						...(result.error ? [`error      : ${boundedInlineDetail(result.error, 128)}`] : []),
+						...(result.record?.command_effect_status
+							? [`cmd effect : ${boundedInlineDetail(result.record.command_effect_status, 128)}; semantic_acceptance=NOT_GRANTED`]
+							: []),
+						...(result.warnings?.[0] ? [`warning    : ${boundedInlineDetail(result.warnings[0], 128)}`] : []),
+						...(operation.release === "recovery_required" ? ["warning    : checkout operation completed but lock cleanup requires recovery"] : []),
+						...parentSummary.lines,
+					],
 				);
 				void controller.refreshStatus(ctx);
 				void controller.refreshWidget(ctx);

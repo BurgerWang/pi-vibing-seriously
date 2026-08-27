@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
@@ -18,7 +18,50 @@ import { makeRunId, isValidRunId, type RunRecord } from "../extensions/workbench
 import { DEFAULT_RECIPE, type Recipe } from "../extensions/workbench-runtime/core/recipe-schema.ts";
 import { executedArgvHash } from "../extensions/workbench-runtime/core/validation-evidence.ts";
 import type { ExecFn } from "../extensions/workbench-runtime/core/config.ts";
+import { validateCommandEffectRecord } from "../extensions/workbench-runtime/core/command-effect.ts";
+import {
+	WORKER_ALLOWED_PATHS_ENV,
+	WORKER_CONTRACT_HASH_ENV,
+	WORKER_DELEGATION_ID_ENV,
+	WORKER_PROJECT_ROOT_ENV,
+	WORKER_ROLE,
+	WORKER_TASK_KIND_ENV,
+} from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
+
+const WORKER_ACTOR = { role: WORKER_ROLE, provider: "openai-codex", model: "gpt-5.6-luna" } as const;
+const WORKER_ID = "20260827-130000-r3C4";
+const WORKER_CONTRACT = "d".repeat(64);
+
+async function withWorkerRecipeEnvironment<T>(
+	projectRoot: string,
+	allowedPaths: readonly string[],
+	taskKind: "implementation" | "diagnosis",
+	operation: () => Promise<T>,
+): Promise<T> {
+	const names = [
+		WORKER_DELEGATION_ID_ENV,
+		WORKER_CONTRACT_HASH_ENV,
+		WORKER_PROJECT_ROOT_ENV,
+		WORKER_ALLOWED_PATHS_ENV,
+		WORKER_TASK_KIND_ENV,
+	] as const;
+	const prior = new Map(names.map((name) => [name, process.env[name]] as const));
+	process.env[WORKER_DELEGATION_ID_ENV] = WORKER_ID;
+	process.env[WORKER_CONTRACT_HASH_ENV] = WORKER_CONTRACT;
+	process.env[WORKER_PROJECT_ROOT_ENV] = projectRoot;
+	process.env[WORKER_ALLOWED_PATHS_ENV] = JSON.stringify(allowedPaths);
+	process.env[WORKER_TASK_KIND_ENV] = taskKind;
+	try {
+		return await operation();
+	} finally {
+		for (const name of names) {
+			const value = prior.get(name);
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		}
+	}
+}
 
 const BASE_RECIPES = [
 	"recipes:",
@@ -91,21 +134,23 @@ test("allowed_modes gates recipe execution", async () => {
 // P7 slice 3: direct recipe execution applies the shared mutation policy
 // ---------------------------------------------------------------------------
 
-test("direct recipe calls enforce the mutation policy: strict Sol denies source, workers run only none", async () => {
+test("direct recipe calls enforce strict Sol policy and exact in-scope worker mutation authority", async () => {
 	await withTempDir(async (dir) => {
 		await writeConfigFile(
 			dir,
 			"recipes.yaml",
 			[
 				"recipes:",
-				'  - { name: fmt, command: ["node", "-e", "process.exit(0)"], mutation: source, writes: ["src/"] }',
-				'  - { name: build, command: ["node", "-e", "process.exit(0)"], mutation: artifacts, artifacts: ["dist/**"] }',
+				'  - { name: fmt, command: ["node", "-e", "process.exit(0)"], mutation: source, writes: ["src/result.ts"] }',
+				'  - { name: build, command: ["node", "-e", "process.exit(0)"], mutation: artifacts, writes: ["dist/result.json"], artifacts: ["dist/**"] }',
 				'  - { name: verify, command: ["node", "-e", "process.exit(0)"], mutation: none }',
 				"",
 			].join("\n"),
 		);
+		await gitBacked(dir);
+		await mkdir(join(dir, "src"), { recursive: true });
+		await mkdir(join(dir, "dist"), { recursive: true });
 		const sol = { role: undefined, provider: "openai-codex", model: "gpt-5.6-sol" };
-		const worker = { role: "worker", provider: "deepseek", model: "deepseek-v4-flash" };
 
 		// Strict Sol: mutation:source is denied; none/artifacts run.
 		const solSource = await runRecipe({ projectRoot: dir, recipeName: "fmt", mode: "DEV", exec: spawnExec, actorFacts: sol });
@@ -114,14 +159,17 @@ test("direct recipe calls enforce the mutation policy: strict Sol denies source,
 		assert.equal((await runRecipe({ projectRoot: dir, recipeName: "build", mode: "DEV", exec: spawnExec, actorFacts: sol })).ok, true);
 		assert.equal((await runRecipe({ projectRoot: dir, recipeName: "verify", mode: "DEV", exec: spawnExec, actorFacts: sol })).ok, true);
 
-		// Delegated worker: only mutation:none runs (artifacts included).
-		const workerSource = await runRecipe({ projectRoot: dir, recipeName: "fmt", mode: "DEV", exec: spawnExec, actorFacts: worker });
-		assert.equal(workerSource.ok, false);
-		assert.ok(workerSource.error?.includes("mutation: source"));
-		const workerBuild = await runRecipe({ projectRoot: dir, recipeName: "build", mode: "DEV", exec: spawnExec, actorFacts: worker });
-		assert.equal(workerBuild.ok, false);
-		assert.ok(workerBuild.error?.includes("mutation: artifacts"));
-		assert.equal((await runRecipe({ projectRoot: dir, recipeName: "verify", mode: "DEV", exec: spawnExec, actorFacts: worker })).ok, true);
+		// Delegated implementation worker: exact in-scope source/artifact
+		// outputs and mutation:none run under command-effect capture.
+		await withWorkerRecipeEnvironment(dir, ["src/**", "dist/result.json"], "implementation", async () => {
+			const workerSource = await runRecipe({ projectRoot: dir, recipeName: "fmt", mode: "DEV", exec: spawnExec, actorFacts: WORKER_ACTOR });
+			assert.equal(workerSource.ok, true, workerSource.error);
+			assert.equal(workerSource.record?.cache_request_mode, "no-cache");
+			const workerBuild = await runRecipe({ projectRoot: dir, recipeName: "build", mode: "DEV", exec: spawnExec, actorFacts: WORKER_ACTOR });
+			assert.equal(workerBuild.ok, true, workerBuild.error);
+			assert.equal(workerBuild.record?.cache_request_mode, "no-cache");
+			assert.equal((await runRecipe({ projectRoot: dir, recipeName: "verify", mode: "DEV", exec: spawnExec, actorFacts: WORKER_ACTOR })).ok, true);
+		});
 
 		// Other controllers and fact-less callers keep prior behavior.
 		const other = { role: undefined, provider: "anthropic", model: "claude-sonnet" };
@@ -138,6 +186,220 @@ test("direct recipe calls enforce the mutation policy: strict Sol denies source,
 		const legacy = await runRecipe({ projectRoot: dir, recipeName: "legacy-fmt", mode: "DEV", exec: spawnExec, actorFacts: sol });
 		assert.equal(legacy.ok, false);
 		assert.ok(legacy.error?.includes("mutation: source"), "legacy non-empty writes infer source");
+	});
+});
+
+test("worker recipe identity is required before any command or evidence process can run", async () => {
+	await withTempDir(async (dir) => {
+		await writeConfigFile(dir, "recipes.yaml", [
+			"recipes:",
+			'  - { name: verify, command: ["node", "-e", "process.exit(0)"], mutation: none }',
+			"",
+		].join("\n"));
+		const priorId = process.env[WORKER_DELEGATION_ID_ENV];
+		const priorHash = process.env[WORKER_CONTRACT_HASH_ENV];
+		delete process.env[WORKER_DELEGATION_ID_ENV];
+		delete process.env[WORKER_CONTRACT_HASH_ENV];
+		let execCalls = 0;
+		try {
+			const result = await runRecipe({
+				projectRoot: dir,
+				recipeName: "verify",
+				mode: "DEV",
+				exec: async () => {
+					execCalls += 1;
+					return { stdout: "", stderr: "", code: 0, killed: false };
+				},
+				actorFacts: WORKER_ACTOR,
+			});
+			assert.equal(result.ok, false);
+			assert.equal(result.error, "WORKER_COMMAND_EFFECT_IDENTITY_INVALID");
+			assert.equal(execCalls, 0);
+		} finally {
+			if (priorId === undefined) delete process.env[WORKER_DELEGATION_ID_ENV];
+			else process.env[WORKER_DELEGATION_ID_ENV] = priorId;
+			if (priorHash === undefined) delete process.env[WORKER_CONTRACT_HASH_ENV];
+			else process.env[WORKER_CONTRACT_HASH_ENV] = priorHash;
+		}
+	});
+});
+
+test("diagnosis, glob writes and outputs outside allowed_paths are denied before recipe exec", async () => {
+	await withTempDir(async (dir) => {
+		await writeConfigFile(dir, "recipes.yaml", [
+			"recipes:",
+			'  - { name: exact, command: ["node", "-e", "process.exit(0)"], mutation: source, writes: ["src/result.ts"] }',
+			'  - { name: broad, command: ["node", "-e", "process.exit(0)"], mutation: source, writes: ["src/**"] }',
+			'  - { name: outside, command: ["node", "-e", "process.exit(0)"], mutation: source, writes: ["other/result.ts"] }',
+			"",
+		].join("\n"));
+		let processCalls = 0;
+		const exec: ExecFn = async (command, args, options) => {
+			if (command === "node") processCalls += 1;
+			return spawnExec(command, args, options);
+		};
+		const diagnosis = await withWorkerRecipeEnvironment(dir, ["src/**"], "diagnosis", () => runRecipe({
+			projectRoot: dir, recipeName: "exact", mode: "DEV", exec, actorFacts: WORKER_ACTOR,
+		}));
+		assert.match(diagnosis.error ?? "", /Diagnosis worker/u);
+		const broad = await withWorkerRecipeEnvironment(dir, ["src/**"], "implementation", () => runRecipe({
+			projectRoot: dir, recipeName: "broad", mode: "DEV", exec, actorFacts: WORKER_ACTOR,
+		}));
+		assert.match(broad.error ?? "", /not one exact/u);
+		const outside = await withWorkerRecipeEnvironment(dir, ["src/**"], "implementation", () => runRecipe({
+			projectRoot: dir, recipeName: "outside", mode: "DEV", exec, actorFacts: WORKER_ACTOR,
+		}));
+		assert.match(outside.error ?? "", /outside delegation allowed_paths/u);
+		assert.equal(processCalls, 0);
+	});
+});
+
+test("worker mutating recipe rejects a symlink hop outside the allowed subtree before recipe exec", async () => {
+	await withTempDir(async (dir) => {
+		await mkdir(join(dir, "src"), { recursive: true });
+		await mkdir(join(dir, "other"), { recursive: true });
+		await symlink(join(dir, "other"), join(dir, "src", "other-link"));
+		await writeConfigFile(dir, "recipes.yaml", [
+			"recipes:",
+			'  - { name: escaped, command: ["node", "-e", "process.exit(0)"], mutation: source, writes: ["src/other-link/result.ts"] }',
+			"",
+		].join("\n"));
+		let processCalls = 0;
+		const exec: ExecFn = async (command, args, options) => {
+			if (command === "node") processCalls += 1;
+			return spawnExec(command, args, options);
+		};
+		const result = await withWorkerRecipeEnvironment(dir, ["src/**"], "implementation", () => runRecipe({
+			projectRoot: dir,
+			recipeName: "escaped",
+			mode: "DEV",
+			exec,
+			actorFacts: WORKER_ACTOR,
+		}));
+		assert.equal(result.ok, false);
+		assert.match(result.error ?? "", /resolves outside delegation allowed_paths/u);
+		assert.equal(processCalls, 0);
+	});
+});
+
+test("unavailable before evidence persists EVIDENCE_UNAVAILABLE and never starts the recipe process", async () => {
+	await withTempDir(async (dir) => {
+		await writeConfigFile(dir, "recipes.yaml", [
+			"recipes:",
+			'  - { name: exact, command: ["node", "-e", "require(\\"fs\\").writeFileSync(\\"src/result.ts\\", \\"after\\")"], mutation: source, writes: ["src/result.ts"] }',
+			"",
+		].join("\n"));
+		await mkdir(join(dir, "src"), { recursive: true });
+		await gitBacked(dir);
+		let processCalls = 0;
+		const exec: ExecFn = async (command, args, options) => {
+			if (command === "node") processCalls += 1;
+			if (command === "git" && args.includes("--porcelain=v1")) {
+				return { stdout: "", stderr: "injected guard failure", code: 1, killed: false };
+			}
+			return spawnExec(command, args, options);
+		};
+		const result = await withWorkerRecipeEnvironment(dir, ["src/result.ts"], "implementation", () => runRecipe({
+			projectRoot: dir,
+			recipeName: "exact",
+			mode: "DEV",
+			exec,
+			actorFacts: WORKER_ACTOR,
+		}));
+		assert.equal(processCalls, 0, "pre-capture failure must precede the recipe executable");
+		assert.equal(result.ok, false);
+		assert.equal(result.error, "COMMAND_EFFECT_EVIDENCE_UNAVAILABLE");
+		assert.equal(result.record?.run_outcome, "PROCESS_FAILED");
+		assert.equal(result.record?.exit_code, null);
+		assert.equal(result.commandEffect?.capture_error, "BEFORE_GUARD_UNAVAILABLE");
+		assert.equal(result.commandEffect?.status, "EVIDENCE_UNAVAILABLE");
+		assert.equal(result.commandEffect?.worker_delegation_id, WORKER_ID);
+		assert.equal(result.commandEffect?.worker_contract_hash, WORKER_CONTRACT);
+		await assert.rejects(readFile(join(dir, "src/result.ts"), "utf8"), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+		const persistedEffect = JSON.parse(await readFile(join(result.runDir!, "command-effect.json"), "utf8"));
+		assert.equal(validateCommandEffectRecord(persistedEffect), true);
+		assert.equal(persistedEffect.status, "EVIDENCE_UNAVAILABLE");
+		const persistedManifest = JSON.parse(await readFile(join(result.runDir!, "manifest.json"), "utf8"));
+		assert.equal(persistedManifest.run_outcome, "PROCESS_FAILED");
+		assert.equal(persistedManifest.command_effect_status, "EVIDENCE_UNAVAILABLE");
+	});
+});
+
+test("worker mutation:none subprocess writes fail closed with a durable declaration-violation receipt", async () => {
+	await withTempDir(async (dir) => {
+		await writeFile(join(dir, "tracked.txt"), "before\n", "utf8");
+		await writeConfigFile(
+			dir,
+			"recipes.yaml",
+			[
+				"recipes:",
+				'  - name: dishonest-verify',
+				'    command: ["node", "-e", "require(\\"fs\\").writeFileSync(\\"tracked.txt\\", \\"after\\\\n\\")"]',
+				"    mutation: none",
+				"    writes: []",
+				"",
+			].join("\n"),
+		);
+		await gitBacked(dir);
+		const result = await withWorkerRecipeEnvironment(dir, ["tracked.txt"], "implementation", () => runRecipe({
+			projectRoot: dir,
+			recipeName: "dishonest-verify",
+			mode: "DEV",
+			exec: spawnExec,
+			actorFacts: WORKER_ACTOR,
+		}));
+		assert.equal(result.ok, false);
+		assert.equal(result.error, "RECIPE_DECLARATION_VIOLATION");
+		assert.equal(result.record?.run_outcome, "COMMAND_EFFECT_FAILED");
+		assert.equal(result.record?.command_effect_status, "RECIPE_DECLARATION_VIOLATION");
+		assert.equal(result.commandEffect?.observed_changes[0]?.path, "tracked.txt");
+		assert.equal(result.commandEffect?.observed_changes[0]?.classification, "RECIPE_DECLARATION_VIOLATION");
+		assert.equal(result.commandEffect?.semantic_acceptance, "NOT_GRANTED");
+		assert.equal(result.commandEffect?.worker_delegation_id, WORKER_ID);
+		assert.equal(result.commandEffect?.worker_contract_hash, WORKER_CONTRACT);
+		const persisted = JSON.parse(await readFile(join(result.runDir!, "command-effect.json"), "utf8"));
+		assert.equal(validateCommandEffectRecord(persisted), true);
+		assert.equal(persisted.command_effect_hash, result.record?.command_effect_hash);
+		const commit = JSON.parse(await readFile(join(result.runDir!, "run-commit.json"), "utf8"));
+		assert.ok(commit.files.some((entry: { path: string }) => entry.path === "command-effect.json"));
+	});
+});
+
+test("worker exact ignored output is command-attributed inside allowed_paths but never semantically accepted", async () => {
+	await withTempDir(async (dir) => {
+		await writeConfigFile(
+			dir,
+			"recipes.yaml",
+			[
+				"recipes:",
+				'  - name: exact-output',
+				'    command: ["node", "-e", "require(\\"fs\\").writeFileSync(\\"generated.json\\", \\"{}\\")"]',
+				"    mutation: artifacts",
+				"    writes: [generated.json]",
+				"",
+			].join("\n"),
+		);
+		await gitBacked(dir);
+		await writeFile(join(dir, ".gitignore"), ".pi/\ngenerated.json\n", "utf8");
+		const result = await withWorkerRecipeEnvironment(dir, ["generated.json"], "implementation", () => runRecipe({
+			projectRoot: dir,
+			recipeName: "exact-output",
+			mode: "DEV",
+			exec: spawnExec,
+			actorFacts: WORKER_ACTOR,
+		}));
+		assert.equal(result.ok, true, result.error);
+		assert.equal(result.record?.command_effect_status, "COMMAND_ATTRIBUTED");
+		assert.equal(result.commandEffect?.observed_changes[0]?.classification, "COMMAND_ATTRIBUTED");
+		assert.equal(result.commandEffect?.observed_changes[0]?.before, null, "ignored output is absent from Git guard evidence");
+		assert.equal(result.commandEffect?.observed_changes[0]?.after, null, "ignored output is absent from Git guard evidence");
+		assert.equal(result.commandEffect?.observed_changes[0]?.before_exact_output?.kind, "missing");
+		assert.equal(result.commandEffect?.observed_changes[0]?.after_exact_output?.kind, "file");
+		assert.equal(result.commandEffect?.before_exact_output_evidence.meter.bytes_read, 0);
+		assert.equal(result.commandEffect?.after_exact_output_evidence.meter.bytes_read, 2);
+		assert.equal(result.commandEffect?.semantic_acceptance, "NOT_GRANTED");
+		assert.equal(result.commandEffect?.worker_delegation_id, WORKER_ID);
+		assert.equal(result.commandEffect?.worker_contract_hash, WORKER_CONTRACT);
 	});
 });
 
@@ -500,8 +762,9 @@ test("P4a: failed exec run persists an unsuccessful binding without altering the
 test("P4a: spawn failure persists incomplete evidence and still surfaces the error", async () => {
 	await withTempDir(async (dir) => {
 		await setupProject(dir);
-		const exec: ExecFn = async (cmd) => {
-			if (cmd === "git") return { stdout: "", stderr: "", code: 0, killed: false };
+		await gitBacked(dir);
+		const exec: ExecFn = async (cmd, args, options) => {
+			if (cmd === "git") return spawnExec(cmd, args, options);
 			throw new Error("boom: cannot spawn");
 		};
 		await assert.rejects(runRecipe({ projectRoot: dir, recipeName: "hello", mode: "DEV", exec, actorFacts: SOL_FACTS }), /failed to spawn/);
@@ -548,7 +811,7 @@ test("P4a: validation evidence never contains raw argv or env secret values", as
 	});
 });
 
-test("P4a: capture-unavailable persists bounded unavailable evidence without masking the recipe outcome", async () => {
+test("command provenance capture-unavailable fails closed while preserving bounded validation evidence", async () => {
 	await withTempDir(async (dir) => {
 		await setupProject(dir);
 		const failingGit: ExecFn = async (cmd, args) => {
@@ -556,12 +819,19 @@ test("P4a: capture-unavailable persists bounded unavailable evidence without mas
 			return { stdout: "", stderr: "", code: 0, killed: false };
 		};
 		const result = await runRecipe({ projectRoot: dir, recipeName: "hello", mode: "DEV", exec: failingGit, params: { msg: "x" }, actorFacts: SOL_FACTS });
-		assert.equal(result.ok, true, "the recipe outcome is never masked by a capture failure");
-		assert.equal(result.record?.exit_code, 0);
+		assert.equal(result.ok, false, "production recipe provenance is fail-closed when guards are unavailable");
+		assert.equal(result.error, "COMMAND_EFFECT_EVIDENCE_UNAVAILABLE");
+		assert.equal(result.record?.exit_code, null, "the recipe process never started");
+		assert.equal(result.record?.run_outcome, "PROCESS_FAILED");
+		assert.equal(result.record?.command_effect_status, "EVIDENCE_UNAVAILABLE");
+		assert.deepEqual(result.warnings, ["COMMAND_EFFECT_EVIDENCE_UNAVAILABLE"]);
 		const persisted = await persistedManifest(result.runDir as string);
 		assert.equal(persisted.validation_evidence.binding, null);
 		assert.ok(persisted.validation_evidence.unavailable_reason.includes("capture failed"), persisted.validation_evidence.unavailable_reason ?? "");
 		assert.deepEqual(persisted.validation_evidence, result.record?.validation_evidence, "returned and persisted unavailable blocks agree");
+		const effect = JSON.parse(await readFile(join(result.runDir!, "command-effect.json"), "utf8"));
+		assert.equal(effect.status, "EVIDENCE_UNAVAILABLE");
+		assert.equal(effect.semantic_acceptance, "NOT_GRANTED");
 	});
 });
 

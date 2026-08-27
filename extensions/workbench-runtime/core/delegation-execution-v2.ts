@@ -62,6 +62,7 @@ import {
 	DELEGATION_TRANSACTION_ID_RE,
 	DELEGATION_TRANSACTION_WORKER_ID_RE,
 	delegationPathAllowedV2,
+	isDelegationInterruptedCandidateV2,
 	parseDelegationRepairLineageV1,
 	type DelegationRepairLineageV1,
 	type DelegationTransactionRecord,
@@ -74,13 +75,13 @@ import {
 	type WorkerTaskContract,
 } from "./worker-policy.ts";
 import type { WorkerSpendProfile } from "./worker-spend.ts";
+import type { WorkerRunFailureCode } from "./worker-run-failure.ts";
 import { isStrictStreamingIdentityPath } from "./streaming-identity.ts";
 import { truncateUtf8 } from "../worker/handoff.ts";
 import {
 	runPinnedWorker,
 	workerRunFailure,
 	type RunWorkerOptions,
-	type WorkerRunFailureCode,
 	type WorkerProgress,
 	type WorkerRunResult,
 } from "../worker/runner.ts";
@@ -146,6 +147,8 @@ export interface ExecuteDelegationV2Input {
 	signal?: AbortSignal;
 	onProgress?: (progress: WorkerProgress) => void;
 	clock: () => string;
+	/** Exact checkout-lane token inherited by the pinned child runtime. */
+	checkoutOperationToken?: string;
 	onPrepared?: (
 		state: DelegationTransactionRecord,
 		before: Readonly<DelegationWorkspaceGitFactsV2>,
@@ -250,7 +253,8 @@ function checkInput(input: ExecuteDelegationV2Input): CheckedInput | undefined {
 		(repairLineage !== undefined && (rebound.value.task_kind !== "implementation" ||
 			!sameByteSortedPaths(dependencyPaths, repairLineage.carried_paths))) ||
 		(input.secrets !== undefined &&
-		(!Array.isArray(input.secrets) || !input.secrets.every((secret) => typeof secret === "string")))) return undefined;
+		(!Array.isArray(input.secrets) || !input.secrets.every((secret) => typeof secret === "string"))) ||
+		(input.checkoutOperationToken !== undefined && !/^[a-f0-9]{32}$/u.test(input.checkoutOperationToken))) return undefined;
 	return {
 		projectRoot: input.projectRoot,
 		delegationId: input.delegationId,
@@ -310,7 +314,7 @@ function fixedWorkerIdentity(result: WorkerRunResult): boolean {
 
 function ledgerWorkerFacts(
 	result: WorkerRunResult,
-	succeeded: boolean,
+	failureCode: WorkerRunFailureCode | null,
 	reportSummary: string,
 	secrets: readonly string[],
 ): LedgerWorkerFacts {
@@ -323,7 +327,9 @@ function ledgerWorkerFacts(
 	return {
 		provider: result.provider ?? null,
 		model: result.model ?? null,
-		status: succeeded ? "success" : "failure",
+		status: failureCode === null ? "success" : "failure",
+		workerSuccess: failureCode === null,
+		workerFailureCode: failureCode,
 		exitCode: result.exitCode,
 		turns: result.turns,
 		stopReason,
@@ -592,6 +598,9 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 			runtimeIdentity: {
 				delegationId: checked.delegationId,
 				contractHash: checked.contract.contract_hash,
+				...(input.checkoutOperationToken === undefined
+					? {}
+					: { checkoutOperationToken: input.checkoutOperationToken }),
 			},
 			timeoutMs: checked.contract.timeout_seconds * 1_000,
 			signal: input.signal,
@@ -610,6 +619,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 	}
 	const workerFailure = workerRunFailure(worker);
 	const succeeded = workerFailure === undefined;
+	const workerFailureCode = workerFailure?.code ?? null;
 	// Provider transport/identity success is independent from the overall
 	// worker outcome. A locally enforced budget/timeout/report failure after
 	// verified Luna assistant messages must never become PROVIDER_NOT_SUCCESS.
@@ -619,6 +629,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 		const finalizedLifecycle = await finalizeDelegationChangeSetLifecycleV2({
 			prepared: changeSetPrepared,
 			observation: worker.writeJournalObservation,
+			command_effect_observation: worker.commandEffectObservation,
 			exec: input.exec,
 		});
 		if (!finalizedLifecycle.ok) throw new Error("change set finalize failed");
@@ -630,13 +641,14 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 	}
 
 	const workspaceFacts = deriveFinalizedDelegationWorkspaceFactsV2(changeSetLifecycle);
-	if (!workspaceFacts.ok) {
+	if (!workspaceFacts.ok || changeSetLifecycle.command_provenance === undefined) {
 		state = await attemptRecovery(checked, state, input.clock, storageOptions,
 			RETRYABLE_EMPTY_RECOVERY_REASONS_V2.afterFactsConflict);
 		return failure("after_failed", checked, input, { durable_state: state });
 	}
 	const before = workspaceFacts.value.before;
 	const after = workspaceFacts.value.after;
+	const commandProvenance = changeSetLifecycle.command_provenance;
 
 	let report: ReturnType<typeof deriveDelegationPersistedReportV2>;
 	try {
@@ -651,9 +663,9 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 			RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerReportInvalid);
 		return failure("report_invalid", checked, input, { durable_state: state });
 	}
-	const changedPaths = changeSetLifecycle.change_set.worker_delta.map((entry) => entry.path);
+	const changedPaths = [...commandProvenance.effective_paths];
 	const deltaHash = checked.contract.task_kind === "implementation"
-		? changeSetLifecycle.change_set.worker_delta_hash
+		? commandProvenance.effective_delta_hash
 		: null;
 	const successfulWriteCount = changeSetLifecycle.sealed_journal.operations.filter((operation) =>
 		operation.status === "completed" && operation.outcome === "succeeded").length;
@@ -676,11 +688,13 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 			task_kind: checked.contract.task_kind,
 			worker_identity: { ...checked.workerIdentity },
 			provider_success: providerSucceeded,
+			worker_success: succeeded,
+			worker_failure_code: workerFailureCode,
 			exit_code: worker.exitCode,
 			report_complete: report.value.report_complete,
 			terminal_facts_complete: true,
 			scope_complete: scopeComplete,
-			change_set_status: changeSetLifecycle.change_set.status,
+			change_set_status: commandProvenance.effective_status,
 			changed_paths: changedPaths,
 			successful_write_count: successfulWriteCount,
 			denied_write_count: worker.deniedWriteCount,
@@ -696,14 +710,16 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 
 	let reviewEnvelope: SemanticReviewEnvelopeV1 | undefined;
 	if (checked.contract.task_kind === "implementation" && changedPaths.length > 0 &&
-		state.postcondition_reasons.length === 0 && state.terminal_outcome?.terminal_facts_complete === true &&
-		state.terminal_outcome.scope_complete === true) {
+		(state.postcondition_reasons.length === 0 || (state.terminal_outcome !== null &&
+			isDelegationInterruptedCandidateV2(state, state.terminal_outcome))) &&
+		state.terminal_outcome?.terminal_facts_complete === true && state.terminal_outcome.scope_complete === true) {
 		const relevance = await collectReviewRelevanceV2({
 			project_root: checked.projectRoot,
 			delegation_id: checked.delegationId,
 			contract_hash: checked.contract.contract_hash,
 			after_guard: changeSetLifecycle.after_guard,
 			change_set: changeSetLifecycle.change_set,
+			command_provenance: commandProvenance,
 			exec: input.exec,
 		}).catch(() => undefined);
 		const envelope = relevance?.ok
@@ -733,7 +749,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 
 	let artifacts: ReturnType<typeof buildDelegationCommittedArtifactsV2>;
 	try {
-		const ledgerWorker = ledgerWorkerFacts(worker, succeeded, report.value.persisted_text, checked.secrets);
+		const ledgerWorker = ledgerWorkerFacts(worker, workerFailureCode, report.value.persisted_text, checked.secrets);
 		artifacts = buildDelegationCommittedArtifactsV2({
 			transaction: state,
 			contract: checked.contract,
@@ -805,7 +821,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 			...common,
 		};
 	}
-	if (state.status === "FAILED" || state.status === "RECOVERY_REQUIRED") {
+	if (state.status === "INTERRUPTED" || state.status === "FAILED" || state.status === "RECOVERY_REQUIRED") {
 		return failure("postconditions_failed", checked, input, common);
 	}
 	return failure("unexpected_terminal_state", checked, input, common);

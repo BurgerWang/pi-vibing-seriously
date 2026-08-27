@@ -74,7 +74,7 @@ export const EXPECTED_PROMPTS = [
 	"q-debug",
 	"q-verify",
 	"q-optimize",
-	"q-review",
+	"q-code-review",
 ] as const;
 
 const NAME_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;

@@ -135,10 +135,13 @@ test("recovery controller uses injected storage and reports missing without file
 test("Git controller checkpoints all compatible reviewed slices and reports remaining work", async () => {
 	let reconciliations = 0;
 	let refreshed = 0;
+	let commitInput: Record<string, unknown> | undefined;
 	const controller = {
 		services: {
 			now: () => new Date("2026-08-25T12:00:00.000Z"),
-			commitReviewed: async () => ({
+			commitReviewed: async (input: Record<string, unknown>) => {
+				commitInput = input;
+				return ({
 				ok: true as const,
 				delegation_id: "20260825-120000-abcd",
 				delegation_ids: ["20260825-120000-abcd", "20260825-110000-wxyz"],
@@ -149,7 +152,8 @@ test("Git controller checkpoints all compatible reviewed slices and reports rema
 				authority_binding: "sealed_review_paths" as const,
 				preserved_staged_paths: 1,
 				lock_release: "released" as const,
-			}),
+				});
+			},
 			commitServices: {} as never,
 			pushCurrent: async () => { throw new Error("must not push"); },
 		},
@@ -158,6 +162,7 @@ test("Git controller checkpoints all compatible reviewed slices and reports rema
 		projectRootFor: async () => "/project",
 		getMode: () => "DEV" as const,
 		getIdentity: () => ({ provider: "openai-codex", model: "gpt-5.6-sol" }),
+		checkoutOperationForToolCall: () => ({ token: "e".repeat(32) }),
 		reconcileProjectAuthority: async () => { reconciliations += 1; return true; },
 		refreshStatus: async () => { refreshed += 1; },
 	} as unknown as Omit<GitToolController, "pi">;
@@ -175,6 +180,7 @@ test("Git controller checkpoints all compatible reviewed slices and reports rema
 	assert.match(resultText(result), /all compatible accepted slices were checkpointed/);
 	assert.equal(reconciliations, 2);
 	assert.equal(refreshed, 1);
+	assert.equal(commitInput?.checkout_operation_token, "e".repeat(32), "checkpoint reuses the guard-owned exact lane token");
 });
 
 test("Git controller denies non-Sol identity before checkpoint or push", async () => {
@@ -501,7 +507,7 @@ test("review controller reserves the outer semantic header before rendering a co
 	);
 
 	assert.ok(packetMaxBytes > 0 && packetMaxBytes < 4_096, "semantic header bytes are removed from the packet budget");
-	assert.equal(packetMaxLines, 54, "the two semantic header lines are removed from the packet line budget");
+	assert.equal(packetMaxLines, 53, "semantic headers plus the optional mirror-warning line are removed from the packet line budget");
 	assert.equal(resultText(result).split("\n").at(-1), packetText, "the outer clamp presents the complete saturated packet");
 	assert.ok(Buffer.byteLength(resultText(result), "utf8") <= 4_096);
 	assert.equal(result.details.presentation_complete, true);
@@ -544,7 +550,7 @@ test("review controller rejects active durable transactions with one actionable 
 	assert.match(resultText(result), /wait for the worker to finish/);
 });
 
-test("delegate controller refuses unavailable repair authority before execution", async () => {
+test("delegate controller refuses model-supplied repair before authority reads or execution", async () => {
 	const fixed = new Date("2026-08-21T02:03:04.000Z");
 	let legacyCalls = 0;
 	let executionCalls = 0;
@@ -600,12 +606,12 @@ test("delegate controller refuses unavailable repair authority before execution"
 			repair_of: "20260820-130000-W1r2",
 		}, undefined, undefined, context()),
 		(error: unknown) => {
-			assert.match(String(error), /v2 authority is storage_failure/);
+			assert.match(String(error), /model-supplied repair_of .* has no exact in-process authority; run \/q-repair/);
 			assert.doesNotMatch(String(error), /private disk path/);
 			return true;
 		},
 	);
-	assert.equal(reconcileTime, fixed.toISOString());
+	assert.equal(reconcileTime, "", "raw model repair is rejected before project mutation or reconciliation");
 	assert.equal(legacyCalls, 0);
 	assert.equal(executionCalls, 0);
 });
@@ -708,6 +714,7 @@ test("delegate controller preflights recipe references before authority work and
 });
 
 test("delegate controller exposes only the bounded artifact builder category", async () => {
+	await withTempDir(async (projectRoot) => {
 	const fixed = new Date("2026-08-21T03:04:05.000Z");
 	const controller = {
 		services: {
@@ -729,7 +736,7 @@ test("delegate controller exposes only the bounded artifact builder category", a
 		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
 		secrets: [],
 		trustedOrError: () => undefined,
-		projectRootFor: async () => "/project",
+		projectRootFor: async () => projectRoot,
 		reconcileProjectAuthority: async () => true,
 		getProjectAuthorityBlockReason: () => undefined,
 		collectCurrentDelegationBinding: async () => ({ status: "fresh", hash: "a".repeat(64) }),
@@ -762,9 +769,11 @@ test("delegate controller exposes only the bounded artifact builder category", a
 			return true;
 		},
 	);
+	});
 });
 
 test("delegate controller distinguishes a local legacy turn stop from provider availability", async () => {
+	await withTempDir(async (projectRoot) => {
 	const fixed = new Date("2026-08-21T03:05:06.000Z");
 	const controller = {
 		services: {
@@ -816,7 +825,7 @@ test("delegate controller distinguishes a local legacy turn stop from provider a
 		exec: async () => ({ code: 0, stdout: "", stderr: "" }),
 		secrets: [],
 		trustedOrError: () => undefined,
-		projectRootFor: async () => "/project",
+		projectRootFor: async () => projectRoot,
 		reconcileProjectAuthority: async () => true,
 		getProjectAuthorityBlockReason: () => undefined,
 		collectCurrentDelegationBinding: async () => ({ status: "fresh", hash: "a".repeat(64) }),
@@ -850,7 +859,8 @@ test("delegate controller distinguishes a local legacy turn stop from provider a
 			assert.match(message, /worker_report=\.pi\/workbench\/delegations\/20260821-030506-W1r2\/v2\/generations\/g00000001\/worker-report\.md/);
 			assert.match(message, /changed_paths=0/);
 			assert.match(message, /assistant_turns=64; spend_profile=standard; spend_total_tokens=3; spend_output_tokens=1; exit_code=143/);
-			assert.match(message, /next_action=call workbench_delegation_status, then call workbench_delegate_worker with repair_of=20260821-030506-W1r2/);
+			assert.match(message, /next_action=call workbench_delegation_status/);
+			assert.doesNotMatch(message, /repair_of=|\/q-repair/u, "an ordinary FAILED transaction has no lineaged q-repair authority");
 			assert.doesNotMatch(message, /PROVIDER_NOT_SUCCESS|private|remaining_risks|worker prose|stderr/);
 			assert.ok(Buffer.byteLength(message, "utf8") <= 2_048, message);
 			const orderedFields = ["delegation_id=", "durable_status=", "postconditions=", "worker_failure=", "worker_report=", "changed_paths=", "assistant_turns=", "next_action="];
@@ -858,6 +868,78 @@ test("delegate controller distinguishes a local legacy turn stop from provider a
 			return true;
 		},
 	);
+	});
+});
+
+test("delegate controller keeps durable worker success when review postprocessing is retryable", async () => {
+	await withTempDir(async (projectRoot) => {
+		const fixed = new Date("2026-08-27T06:00:00.000Z");
+		const delegationId = "20260827-060000-rtry";
+		const beforeHash = "a".repeat(64);
+		const afterHash = "b".repeat(64);
+		let state = emptyDelegationState();
+		const controller = {
+			services: {
+				now: () => fixed,
+				makeDelegationId: () => delegationId,
+				...testStartLockServices,
+				readCommittedGeneration: async () => ({ ok: false, error: { code: "not_found" } }),
+				readRecoverableUnpublished: async () => ({ ok: false, error: { code: "not_recoverable" } }),
+				readLegacyLedger: async () => null,
+				executeDelegation: async (input: { onPrepared?: (transaction: unknown, before: { diffHash: string }) => Promise<void> }) => {
+					await input.onPrepared?.({}, { diffHash: beforeHash });
+					return {
+						ok: true,
+						durable_state: { status: "PENDING_REVIEW" },
+						after: { diffHash: afterHash },
+						result: {
+							provider: "openai-codex", model: "gpt-5.6-luna", status: "success", turns: 2,
+							exitCode: 0, stopReason: "stop", cacheHitRatio: 0.5,
+							usage: { input: 10, output: 5, cacheRead: 2, cacheWrite: 0, totalTokens: 17, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+							budget: { maxContextTokens: 100, maxContextRatio: 0.1, softBudgetReached: false, hardBudgetExceeded: false, compactionCount: 0, compactionReasons: [] },
+							spend: { profile: "standard", turns: 2, totalTokens: 17, outputTokens: 5, band: "ok", softReached: { turns: false, totalTokens: false, outputTokens: false }, hardExceeded: { turns: false, totalTokens: false, outputTokens: false }, reasons: [] },
+						},
+						workerSummary: {
+							report_path: `.pi/workbench/delegations/${delegationId}/v2/generations/g00000001/worker-report.md`,
+							changed_paths: ["src/a.ts"], completed: [], verification_commands: [], verification_observations: [], remaining_risks: [],
+							parse_warning: null, parse_reliable: true, truncated_items: false,
+							spend: { profile: "standard", turns: 2, totalTokens: 17, outputTokens: 5, band: "ok", softReached: { turns: false, totalTokens: false, outputTokens: false }, hardExceeded: { turns: false, totalTokens: false, outputTokens: false }, reasons: [] },
+						},
+					};
+				},
+				completeDefaultDelivery: async () => ({
+					ok: false,
+					code: "review_failed",
+					review_error: "storage_failure",
+					state,
+					recovery: "retryable",
+					next_action: `/q-review ${delegationId}`,
+				}),
+				buildTrustedRecoveryAuthority: async () => ({ kind: "trusted" }),
+			},
+			exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+			secrets: [], trustedOrError: () => undefined, projectRootFor: async () => projectRoot,
+			reconcileProjectAuthority: async () => true, getProjectAuthorityBlockReason: () => undefined,
+			collectCurrentDelegationBinding: async () => ({ status: "fresh", hash: afterHash }),
+			projectTerminalReviewedBinding: async () => null,
+			getDelegationState: () => state,
+			setDelegationState: (next: typeof state) => { state = next; },
+			persistDelegationState: () => {},
+			persistDelegationStateStrict: (next: typeof state) => { state = next; },
+			markTerminalMirrorBlocked: () => {}, refreshStatus: async () => {},
+			bindTrustedIngressAuthority: () => undefined, rememberTrustedIngressAuthority: () => {},
+		} as unknown as Omit<DelegateToolController<unknown>, "pi">;
+		const result = await captureRegistration(registerDelegateTool, controller).execute("delegate-retryable-review", {
+			task: "Implement the bounded change.", task_kind: "implementation", allowed_paths: ["src/**"],
+			acceptance_criteria: ["The change is implemented."], verification: [], timeout_seconds: 60,
+		}, undefined, undefined, context());
+		assert.equal(result.details.status, "success");
+		assert.deepEqual(result.details.review_postprocessing, {
+			status: "RETRYABLE_FAILURE", code: "storage_failure", next_action: `/q-review ${delegationId}`,
+		});
+		assert.equal(result.details.next_action, `/q-review ${delegationId}`);
+		assert.match(resultText(result), /review recovery: RETRYABLE_FAILURE/u);
+	});
 });
 
 test("production controller service bundle is immutable and complete", () => {

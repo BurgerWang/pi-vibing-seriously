@@ -9,7 +9,7 @@ standalone agent framework, daemon, queue, or background service.
 | Role | Model | Authority |
 | --- | --- | --- |
 | Commander | `openai-codex/gpt-5.6-sol` or `openai/gpt-5.6-sol` | Requirements, cross-cutting architecture, bounded worker contracts, review, high-risk decisions, final verification |
-| Worker | `openai-codex/gpt-5.6-luna:xhigh` | Routine local implementation decisions inside the approved contract: concrete design, naming, file structure within scope, production source changes, tests, docs, write-free recipe checks, in-scope repair |
+| Worker | `openai-codex/gpt-5.6-luna:xhigh` | Routine local implementation decisions inside the approved contract: concrete design, naming, file structure within scope, production source changes, tests, docs, and declared recipe effects confined to exact approved paths |
 
 The worker report is never acceptance evidence. Its Verification section
 records only commands and observed results; it must not label an acceptance
@@ -24,11 +24,11 @@ requires it.
 | Requirements and acceptance criteria | Concrete design and naming choices |
 | Cross-cutting architecture and scope | File structure within the approved paths |
 | Delegation contract, cross-cutting decisions, exceptional lease decision, and final verdict | Production source changes, tests, and docs in a bounded task |
-| Risk-proportionate final verification and the verdict | Investigation, write-free recipe checks, in-scope repair |
+| Risk-proportionate final verification and the verdict | Investigation, declared in-scope recipe checks/effects, in-scope repair |
 
 The worker is expected to implement the complete delegated slice — relevant
-investigation, production source changes, tests, docs, requested write-free
-recipe checks when available, and repair of in-scope defects it finds —
+investigation, production source changes, tests, docs, requested recipe checks
+or exact declared effects when available, and repair of in-scope defects it finds —
 rather than stopping after a narrow code edit. Everything outside the
 approved contract, and every final judgment, belongs to Sol.
 
@@ -135,6 +135,27 @@ then may the exact reported `repair_of` start a fresh implementation. The
 immutable decision grants no review or Gate authority and the project remains
 blocked until a corrected descendant receives strict semantic acceptance.
 
+A closed implementation attempt that fails after producing a nonempty,
+attributed, in-scope delta is committed as `INTERRUPTED` rather than being
+misreported as `PENDING_REVIEW` or worker success. A strictly presentable
+`INTERRUPTED` record, and a compatible historical `FAILED` record with closed
+failure proof, may receive only a terminal-negative structured Sol `REPAIR`.
+`ACCEPT` and ordinary `REVIEWED` transitions are rejected by schema and storage.
+The immutable `v2/terminal-negative-repair-decision.json` sidecar binds the
+terminal state, failure facts, proof/content hashes, review hash, and current
+diff binding without rewriting the terminal transaction. Missing proof, empty
+delta, scope/conflict/unknown-origin evidence, `RECOVERY_REQUIRED`, or a stale
+binding remains blocked.
+
+`/q-review DELEGATION_ID` calls the durable review service directly after
+idle/trust/DEV/Sol/runtime-freshness checks; it never asks the commander model
+to choose a tool. For ordinary successful implementations it resumes complete
+presentation and `ACCEPT|REPAIR`; for eligible terminal-negative authority the
+same structured reviewer is constrained to `REPAIR` only.
+`/q-repair DELEGATION_ID` strict-reads the resulting ordinary or terminal-negative repair
+authority, recovers exact arguments, and idempotently returns or creates the
+single successor without relying on the session's latest item.
+
 Immediately before launch, the runtime derives an at-most-8-KiB machine-fact
 capsule from strict authority. For an unresolved semantic repair it carries the
 rejected W/D closure, exact approved files, root plan presence and identity,
@@ -177,9 +198,15 @@ It is never a session resume:
   hash, and latest continuation-decision hash. They still inherit no prior
   report prose, transcript, log, error text, or session and never resume the
   old worker.
-- **Concurrency and closure:** a project-wide start lock binds OS boot, PID,
-  and process-start identity and serializes authority revalidation through
-  durable `PREPARED` publication. Reload, status, Gate projection, and
+- **Concurrency and closure:** the historically named project-wide start lock
+  is a full delegation-lifecycle single-writer lease for the shared checkout.
+  It binds OS boot, PID, and process-start identity and is held from the first
+  admission-authority check through durable `PREPARED`, Luna execution,
+  generation publication, and mechanical delivery. Exact or path-disjoint
+  scopes do not permit parallel writers. A recovery-only unlocked prepass may
+  consume the old exact dead-owner lock solely to close its pristine
+  `PREPARED` crash window; its observations are never accepted as admission
+  authority, which is recomputed under the new lease. Reload, status, Gate projection, and
   delegation scan the complete repair graph under a fixed 10,000-record cap,
   a lineage-depth counter saturated at 16, and a 500-carried-path cap. Hitting
   a hard cap,
@@ -225,18 +252,35 @@ result. Read-time validation assessment rechecks both the current plan bytes
 and selector coverage before returning `REUSABLE`. Historical no-plan runs
 remain compatible when no current delegation plan exists.
 
-## One writing worker per worktree
+## One mutation-capable operation per worktree
 
-The delegation tool executes sequentially and a worker can never delegate,
-so at most one worker writes to a worktree at any time. Sol never starts a
-second delegation that could write the same worktree before the first has
-returned and its diff has been reviewed. `PENDING_REVIEW` remains a hard
-block. A `STALE` mirror is also blocking unless strict v2 authority proves the
-old transaction already has immutable FINAL/PASS plus explicit Sol semantic
-acceptance (embedded or in a valid migration receipt); only then may an
-ordinary fresh successor atomically adopt the current workspace as its new
-baseline after live revalidation. Parallel reads are fine; parallel writes are
-not supported and must never be attempted.
+The delegation tool executes sequentially and a worker can never delegate, so
+at most one worker writes to a worktree at any time. The same fixed
+`.pi/workbench/delegation-start.lock` now backs one checkout-wide writer lane
+for every mutation-capable Workbench tool and command, not only workers:
+delegation, mutating recipes/gates, review or repair publication, Git
+checkpoint/push, and project/config/cache writes cannot overlap. Unknown and
+third-party tools default to mutation-capable; only the closed read-only list
+may bypass the lane. An exact token may be borrowed by nested work, but a
+same-PID record alone is never reentrancy authority because the fixed durable
+owner is reread. The worker mutation guard additionally requires the strict
+worker project root, delegation id, and exact checkout token supplied by its
+parent; a missing token fails closed and never falls back to acquiring its own
+exclusive lane.
+
+A generic tool/command operation is recoverable only after its callback is
+known settled in the same process and the process-global record plus fixed lock
+match byte-for-byte (or the lock is already durably absent). There is no TTL,
+PID guess, or cross-process generic unlock. Delegation recovery remains the
+stricter transaction-aware CAS path. Parallel reads are fine; parallel writes
+in one checkout are not supported.
+
+`PENDING_REVIEW` remains blocking. A `STALE` session mirror is not authority.
+The production controller uses strict historical path-lane admission before
+and after acquiring the singleton checkout lease: known non-overlapping
+history may proceed, while overlap, unknown provenance, corrupt authority, or
+an active writer still block. Exact repair additionally requires durable Sol
+REPAIR authority and an idempotent successor identity.
 
 ## Pi-native lifecycle
 
@@ -276,10 +320,10 @@ One invocation:
 8. accumulates the cumulative delegation-spend state after every assistant
     message (pure `core/worker-spend.ts` policy — turns / total tokens /
     output tokens per the active profile) and terminates the child fail-closed
-    when cumulative total/output reaches a hard limit; turn markers only steer
-    and remain observable (see below);
+    when any cumulative turn/total/output dimension reaches a hard limit; the
+    hard turn boundary forces oversized work into a bounded continuation;
 9. terminates the child on completion, timeout, parent abort, hard-budget
-    stop (context or cumulative total/output spend), or a compaction attempt;
+    stop (context or cumulative turn/total/output spend), or a compaction attempt;
 10. advances to `COMMITTING`, evaluates fixed machine postconditions, and
     stages one immutable generation at
     `.pi/workbench/delegations/<id>/v2/generations/g########/` containing
@@ -288,15 +332,25 @@ One invocation:
     `worker-summary.json` — plus `commit-marker.json`; publication requires
     the exact record inventory and a full-byte content-hash/marker proof;
 11. publishes a complete successful generation as `PENDING_REVIEW` for an
-    implementation or `FINISHED` for a diagnosis. A fully evidenced worker
-    or postcondition failure publishes `FAILED`; missing terminal,
-    persistence, identity, or generation facts require
+    implementation or `FINISHED` for a diagnosis. A closed worker failure with
+    a nonempty attributed implementation delta publishes `INTERRUPTED`; other
+    fully evidenced worker/postcondition failures publish `FAILED`. Missing
+    terminal, persistence, identity, or generation facts require
     `RECOVERY_REQUIRED`, never a business-success state;
 12. returns a STRICTLY bounded structured summary to the parent session
     (delegation id, provider/model, status, actual changed paths, bounded
     parsed section items, usage/cache/budget facts, durable report path,
     parse/review warnings) — never the worker's report text, patch, or
     test logs.
+
+Steps 3–12 run under the same project-wide checkout writer lease. The lease is
+released only after terminal delivery/result construction, or from the common
+finally path after an explicit abort, failure, or pre-`PREPARED` throw. Once
+the durable `PREPARED` callback has run, an outer throw first re-reads the exact
+transaction and attempts the same exact-lease closure CAS. A proven terminal
+replacement releases; unreadable authority or `PREPARED`/`RUNNING`/`COMMITTING`
+retains the exact live lease as crash evidence. Dead-owner recovery remains
+bound to boot id, PID, and process-start ticks.
 
 There is no persistent worker process. The child inherits the user's OS
 permissions and provider authentication, just like any other Pi process.
@@ -336,7 +390,12 @@ Consequences for the commander workflow:
   unrelated staged index is captured and verified unchanged. No per-commit
   user confirmation or manual staging is needed. A staged rename is one atomic
   reviewed pair: both the source deletion and destination must be sealed; a
-  legacy destination-only record fails closed before Git creates a commit.
+  legacy destination-only record fails closed before Git creates a commit. A
+  zero-change diagnosis or unrelated pending record no longer hides older
+  accepted work. An invalid historical candidate is skipped only when a newer
+  valid review fully covers every dirty path it claimed; partial coverage or
+  an invalid newest authority still fails closed instead of poisoning or
+  silently laundering the backlog.
 - When the user explicitly requests publication, Sol may call
   `workbench_git` with `action=push` and the exact current `expected_head`.
   Only current HEAD to the same named branch on an existing remote is allowed;
@@ -374,11 +433,20 @@ Consequences for the commander workflow:
   subcommand) prints the actor, the fixed policy, the lock/lease status and a
   bounded lease summary — never any token part.
 - Recipe mutation policy (P7): every recipe declares
-  `mutation: none | artifacts | source`; strict Sol runs only
-  `none`/`artifacts` recipes and delegated workers only `none` (write-free)
-  recipes — `source`-mutating recipes are denied to both (legacy inference
-  maps non-empty declared `writes` to `source`; other controllers are
-  unaffected).
+  `mutation: none | artifacts | source`. Strict Sol runs only
+  `none`/`artifacts` recipes. A delegated implementation worker may run a
+  mutating recipe only when every declared output is one exact project path
+  inside its immutable `allowed_paths`; diagnosis remains read-only. The
+  runtime captures a stable before guard before spawning, refuses to spawn when
+  required evidence is unavailable, and records before/after command effects
+  by run id. Every exact declared output receives bounded streaming SHA-256 and
+  size identity even when Git ignores it. Only those exact paths can be
+  `COMMAND_ATTRIBUTED`; `mutation:none` changes are
+  `RECIPE_DECLARATION_VIOLATION`, broad declarations remain
+  `UNKNOWN_ORIGIN`, and undeclared/out-of-contract paths are `OUT_OF_SCOPE`.
+  All except clean or exact attributed effects fail closed. Attribution never
+  grants semantic acceptance. Legacy inference maps non-empty declared
+  `writes` to `source`; other controllers are unaffected.
 
 ## Delegation transaction and review lifecycle (P7)
 
@@ -397,6 +465,7 @@ The normal transaction paths are:
 ```
 implementation: PREPARED → RUNNING → COMMITTING → PENDING_REVIEW → REVIEWED
 diagnosis:      PREPARED → RUNNING → COMMITTING → FINISHED
+partial failure: PREPARED → RUNNING → COMMITTING → INTERRUPTED
 ```
 
 An implementation can reach `PENDING_REVIEW` only with a nonempty actual
@@ -406,9 +475,10 @@ write attempts, zero denied write attempts, and a complete report. Both
 successful paths also require provider success, exit code 0, a complete
 report, complete terminal facts, and the exact pinned/observed worker
 identity. Provider success, exit code 0, or reassuring worker prose cannot
-bypass any other postcondition. A fully recorded worker/postcondition failure
-becomes `FAILED`; incomplete terminal or generation facts become
-`RECOVERY_REQUIRED`.
+bypass any other postcondition. A fully recorded implementation failure with
+nonempty attributed partial work becomes `INTERRUPTED`; other closed
+worker/postcondition failures become `FAILED`. Incomplete terminal or
+generation facts become `RECOVERY_REQUIRED`.
 
 `PREPARED` and `RUNNING` also carry a separate bounded
 `v2/execution-owner.json` while the owning Pi process is executing. The owner
@@ -448,7 +518,18 @@ Positive implementation review authority is written only to
 `.pi/workbench/delegations/<id>/v2/review.json`; negative semantic repair
 authority is a separate immutable
 `.pi/workbench/delegations/<id>/v2/repair-decision.json` sidecar and is never
-review or Gate authority. Review is strict v2-first: the immutable committed
+review or Gate authority. Publishing that sidecar deliberately leaves the
+rejected transaction `PENDING_REVIEW`; the status projection reports
+`REPAIR_REQUIRED` and permits exactly one fresh `repair_of=<id>` route while
+ordinary/new delegations and VERIFY remain blocked. This is not a missing
+transaction write. If no `workbench_delegate_worker` call occurred in the
+turn, an unchanged transaction cannot be diagnosed as a registry reload or
+persistence failure, and tool-result recovery must not be attempted with a
+guessed receipt id. The direct `/q-repair <id>` command recovers the exact
+validated task contract from committed authority, rebinds only its repair
+pointer, and invokes the shared delegate execution handle without creating a
+commander model turn; neither scope nor criteria are reconstructed from old
+prose. Review is strict v2-first: the immutable committed
 generation is validated before either artifact is read. A segmented
 provisional PASS, incomplete coverage, or any FAIL may persist bounded evidence
 but never grants authority and never moves the transaction to `REVIEWED`. Every
@@ -471,19 +552,46 @@ current diff for historical untagged v2/v1. A relevant/unknown-origin conflict
 or a legacy full-diff change projects the session mirror to blocking `STALE`
 without changing the immutable final artifact.
 
-Session lifecycle (single latest-delegation mirror, persisted as the
+Session UI lifecycle (single latest-delegation mirror, persisted as the
 `workbench-delegation-state` custom entry):
 
 ```
 PENDING_REVIEW → REVIEWED → (versioned binding conflicts) → STALE
 ```
 
+This custom entry is never project or review authority. The runtime restores
+only entries on Pi's selected branch via `sessionManager.getBranch()` (the
+`getEntries()` fallback is legacy/test compatibility), then reconciles that
+projection from strict v2 filesystem authority. Durable transaction/review
+success is not rolled back when `appendEntry` fails; the caller receives a
+bounded warning and a later read/reload can rebuild the mirror.
+
+The runtime source identity is separately captured once at extension load from
+the byte-sorted relative `.ts` paths and exact source bytes. `/q-runtime-doctor`
+compares that immutable loaded hash with disk. Read-only diagnosis remains
+available when stale, but every mutation boundary fails closed until this Pi
+session runs `/reload` or restarts and reports `CURRENT`; `/new` is not reload.
+
 - **Default implementation delivery:** after a successful worker result, the
   same `workbench_delegate_worker` call reads the current workspace guard and
   persists exactly one provisional, globally bounded scope/integrity packet
-  (5 KiB / 56 lines in the handoff). Every non-zero delta stays
-  `PENDING_REVIEW`; the packet is implementation evidence, not semantic or
-  Gate authority.
+  (5 KiB / 56 lines in the handoff), then deterministically completes its durable pages
+  before automatic semantic review. Automatic review is capped at 32 pages;
+  each page and the final cross-page call use the strict
+  `openai-codex/gpt-5.6-sol` complete API, a single closed TypeBox tool call,
+  hash-bound raw content, and aggregated nested usage. The final call sees all
+  raw pages as well as page assessments under the 1 MiB aggregate bound.
+  Only the existing review API may persist the resulting hash-bound `ACCEPT`
+  or `REPAIR`.
+
+  Mechanical FAIL, more than 32 pages, legacy page-count authority, lineage
+  presentation gaps, drift, model/protocol errors, and persistence/readback
+  failures never fabricate `ACCEPT` or semantic `REPAIR`. Worker durable
+  success stays success and review stays pending/retryable with an exact
+  `/q-review <id>` or bounded manual route. `REPAIR` readback points to exact
+  `/q-repair <id>`. The structured receipt binds page/content/model-response
+  and usage hashes, but the durable semantic artifact remains the review
+  authority and still grants no Gate authority.
 - **`workbench_review_worker_diff`** (DEV-only review path): reads the current
   workspace guard and strict v2 authority, scope-checks EVERY worker path
   against the parent-approved `allowed_paths` with a realpath/symlink-safe check
@@ -513,14 +621,14 @@ PENDING_REVIEW → REVIEWED → (versioned binding conflicts) → STALE
   immutable negative sidecar; it does not finalize the review, change the
   transaction from `PENDING_REVIEW`, or grant Gate authority. Status then
   exposes one exact `repair_of` action while the binding remains current.
-  `FAIL` (any out-of-scope path) keeps the transaction PENDING_REVIEW. The v2 review artifact binds
-  the versioned current binding. The session mirror is prospective:
-  `REVIEWED` unlocks in the current call only after its append succeeds. An
-  append failure is returned as a persistence failure; a later tool call first
-  reconciles the strict durable FINAL artifact and may safely rebuild the
-  session mirror if freshness still holds. A failed blocking
-  `STALE` append remains a hard in-memory/compact block and is never reported
-  as durably persisted.
+  `FAIL` (any out-of-scope path) keeps the transaction PENDING_REVIEW. The v2
+  review artifact binds the versioned current binding. Once durable semantic
+  review succeeds, it is authoritative even if the session mirror append
+  fails; the tool returns success plus an explicit warning after durable
+  readback. A later call safely rebuilds the projection if freshness still
+  holds. A failed `STALE` projection append cannot be described as durable
+  state, so the in-memory/compact view remains conservatively blocking until
+  reconciliation.
 - **`workbench_delegation_status`** (and `/q-delegation-status`): actor,
   fixed policy, lease status (bounded summary — never token parts), latest
   delegation, review status, current/reviewed diff hashes, blocked write
@@ -904,20 +1012,21 @@ landed; Phase 5 (task-contract profile wording and delegation-granularity
 guidance) landed.** The runner accumulates the cumulative
 spend state after every assistant message (same pure policy), records the
 final profile/state/band/reasons facts on every run result, and terminates
-the child fail-closed whenever cumulative total/output reaches a hard limit
-(`>=`, deterministic hard-stop message). Turn thresholds remain persisted
-steering/diagnostic markers and never terminate a healthy worker by themselves.
+the child fail-closed whenever a cumulative turn/total/output dimension reaches
+a hard limit (`>=`, deterministic hard-stop message). The hard turn boundary is
+an enforced slice limit; partial evidence remains available for a bounded
+continuation rather than allowing a single worker to grow without bound.
 The worker-role lifecycle reads the
 spend profile from the fixed child env contract
 (`WORKBENCH_WORKER_SPEND_PROFILE` — the runner writes `standard` or
 `extended`; retired `low` and malformed/missing child env fall back to
-`extended` defensively), accumulates its own independent spend state
+`standard` defensively), accumulates its own independent spend state
 on assistant `message_end` events, and sends exactly one hidden cumulative
 soft steer when the band first becomes soft or hard. **Phase 3 status:
 public selection, contract validation, v2 generation persistence and handoff
 rendering landed.** The optional `budget_profile` tool parameter (closed
-literal union `standard | extended`, default `extended`; `standard` is
-explicit for clearly small bounded slices) is resolved by the strict contract validation in
+literal union `standard | extended`, default `standard`; `extended` is
+explicit only for justified larger bounded slices) is resolved by the strict contract validation in
 `core/worker-policy.ts` BEFORE any v2 transaction preparation or child launch, the
 resolved profile is recorded in the before contract
 (`before.json` → `contract.budget_profile`) and passed to the runner (the
@@ -927,21 +1036,22 @@ is persisted additively in `usage.json` / `worker-summary.json` on every
 finished success and failure and rendered into the bounded parent handoff.
 Per-message context safety (above) is unchanged.
 
-| Profile | Soft turns | Soft total | Soft output | Turn marker | Hard total | Hard output |
+| Profile | Soft turns | Soft total | Soft output | Hard turns | Hard total | Hard output |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `standard` (explicit small slice) | 32 | 5,440,000 | 160,000 | 64 | 10,880,000 | 320,000 |
-| `extended` (safe default) | 64 | 10,880,000 | 320,000 | 96 | 17,408,000 | 512,000 |
+| `standard` (bounded default) | 32 | 5,440,000 | 160,000 | 64 | 10,880,000 | 320,000 |
+| `extended` (explicit larger slice) | 64 | 10,880,000 | 320,000 | 96 | 17,408,000 | 512,000 |
 
-These are the current `gpt-5.6-luna-xhigh-continuation-v1` limits. Total-token
+These are the current `gpt-5.6-luna-xhigh-continuation-v2` limits. Total-token
 thresholds are fixed multiples of Luna's Pi-advertised 272,000-token context
 window: standard 20×/40×, extended 40×/64× (soft/hard).
 The interval between soft and hard is an intentional continuation reserve:
 soft does not terminate the worker and must not direct the user to open a new
 Sol session. It asks the worker to finish the coherent change and hand back
 remaining work for a bounded follow-up delegation in the current Sol session.
-Hard total/output consumption remains a fail-closed runaway ceiling. The turn
-marker is advisory because tool-heavy development can use many low-cost turns;
-the independent timeout still bounds wall-clock execution.
+Every hard dimension is a fail-closed attempt boundary. Tool-heavy work may use
+the soft-to-hard continuation reserve, but work still incomplete at the hard
+turn limit must resume as another bounded slice. The independent timeout also
+bounds wall-clock execution.
 
 - **Per-message totals** reuse the context-budget semantics: a positive
   `totalTokens` is authoritative; otherwise the non-negative
@@ -961,7 +1071,7 @@ the independent timeout still bounds wall-clock execution.
   reached (`>=`) → `hard` (hard wins over soft, always); else any soft
   dimension reached → `soft`; else `ok`. Triggered reasons are listed in
   the fixed order `turns`, `total_tokens`, `output_tokens`. This persisted
-  telemetry classification does not make the turn marker an enforcement path.
+  classification is also the runner's hard-boundary enforcement input.
 - **Soft steer (wired):** at most one hidden cumulative soft steer per
   delegation (`WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE =
   "workbench-worker-spend-soft-steer"`, `display: false`,
@@ -971,30 +1081,30 @@ the independent timeout still bounds wall-clock execution.
   dimension(s) in the fixed reason order, and current vs. limit values; a
   send failure is swallowed and never breaks a model request. The steer is
   a request, not an enforcement.
-- **Hard stop (wired):** when cumulative total or output reaches a hard limit
+- **Hard stop (wired):** when cumulative turns, total or output reaches a hard limit
   the runner terminates the child and the invocation fails closed
   (`assertWorkerSucceeded`), naming the winning dimension(s) and
   current/limit values via the deterministic hard-stop formatter; the
   outcome is committed as `FAILED` when its terminal facts and immutable
   generation are complete; incomplete persistence requires
-  `RECOVERY_REQUIRED`. Crossing only the persisted turn marker does not
-  terminate or fail an otherwise healthy worker. The 60-minute timeout remains
-  an independent failure path.
-- **Profiles:** `extended` is the deterministic safe default for every
-  delegation without an explicit request; `standard` is selected explicitly
-  only for a clearly small bounded slice. The public
+  `RECOVERY_REQUIRED`. The hard turn boundary deliberately terminates an
+  oversized attempt so it can continue as a bounded, idempotent slice. The
+  60-minute timeout remains an independent failure path.
+- **Profiles:** `standard` is the deterministic bounded default for every
+  delegation without an explicit request; `extended` must be selected
+  explicitly for a justified larger bounded slice. The public
   `budget_profile` tool parameter (optional, closed literal union
   `standard | extended`, default
-  `extended`) is validated by the pure contract check in
-  `core/worker-policy.ts` — omitted resolves to `extended`; unknown,
+  `standard`) is validated by the pure contract check in
+  `core/worker-policy.ts` — omitted resolves to `standard`; unknown,
   empty, wrong-type and case-variant values fail closed with a bounded
   error before the v2 transaction is prepared or the child starts. The pure
-  resolver defaults to `extended` only where a default is explicitly
+  resolver defaults to `standard` only where a default is explicitly
   requested, while strict validation rejects unknown values.
 - **Historical compatibility:** committed v1/v2 records carrying `low`
   remain strictly readable and hash-verifiable, but `low` is rejected for
   every new public contract and committed artifact. Direct/internal runner
-  input and child env `low` resolve defensively to `extended`.
+  input and child env `low` resolve defensively to `standard`.
 
 ### Development-efficiency observation and advisory routing (unreleased)
 
@@ -1155,10 +1265,10 @@ Semantic acceptance is review authority only; it never grants a Gate PASS.
 `mechanical`, case variants, unknown strings, and wrong types fail closed.
 
 `budget_profile` is optional and selects the cumulative delegation-spend
-profile (`standard | extended`; omitted resolves to `extended`). The profile
+profile (`standard | extended`; omitted resolves to `standard`). The profile
 bounds cumulative spend only — it never expands the approved paths or scope.
-`extended` is the deterministic safe default; `standard` is explicit only
-for a clearly small bounded slice. The worker task text carries the resolved profile as one
+`standard` is the deterministic bounded default; `extended` is explicit only
+for a justified larger bounded slice. The worker task text carries the resolved profile as one
 informational line; enforcement is the runner's fixed child-env contract,
 never task prose.
 
@@ -1391,8 +1501,8 @@ The tool fails rather than silently falling back when:
 - an assistant event reports another provider/model;
 - an assistant event reaches the 244,800-token (90%) hard context budget;
 - any cumulative spend dimension reaches its hard limit (turns / total
-  tokens / output tokens per the active profile — `extended` by default,
-  `standard` as the explicit small-slice selection via the optional `budget_profile`
+  tokens / output tokens per the active profile — `standard` by default,
+  `extended` as the explicit larger-slice selection via the optional `budget_profile`
   parameter);
 - the child emits any `compaction_start` event (a compaction attempt);
 - the child exits non-zero, times out, or is aborted;

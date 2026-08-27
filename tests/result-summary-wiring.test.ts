@@ -45,7 +45,7 @@ import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionCommandContext, type 
 import workbenchRuntime from "../extensions/workbench-runtime/index.ts";
 import { WORKER_ALLOWED_PATHS_ENV, WORKER_PROJECT_ROOT_ENV, WORKER_ROLE_ENV } from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { WORKER_SPEND_PROFILE_ENV } from "../extensions/workbench-runtime/core/worker-spend.ts";
-import { spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
+import { initializeGitFixture, spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
 
 // ------------------------------------------------------------------- caps
 
@@ -194,6 +194,7 @@ async function setupProject(root: string, recipesYaml?: string, gatesYaml?: stri
 	await writeConfigFile(root, "project.yaml", "name: wiring-test\nprofile: generic\n");
 	if (recipesYaml !== undefined) await writeConfigFile(root, "recipes.yaml", recipesYaml);
 	if (gatesYaml !== undefined) await writeConfigFile(root, "gates.yaml", gatesYaml);
+	await initializeGitFixture(root);
 }
 
 /** A successful recipe with a raw marker, 60 noise lines and the Node spec-reporter block. */
@@ -243,18 +244,18 @@ const GATES_FAIL_YAML = [
 
 // ---------------------------------------------------------------- Phase 3B
 
-/** Root marker the preflight fixture's recipe check writes ONLY when executed. */
-const PREFLIGHT_MARKER = "PREFLIGHT-MARKER.txt";
+/** Log marker emitted only when the formal gate executes its recipe check. */
+const PREFLIGHT_MARKER = "PREFLIGHT-RECIPE-EXECUTED";
 
 /** Distinctive raw manual-evidence note that must never surface in preflight output. */
 const TOP_SECRET_NOTE = "TOP-SECRET-AUDIT-NOTE-77";
 
-/** Declared read-only (mutation: none) recipe that writes a root marker if executed. */
+/** Truly read-only recipe whose persisted stdout proves formal execution. */
 const PREFLIGHT_RECIPES = [
 	"recipes:",
 	"  - name: mark",
 	"    mutation: none",
-	'    command: ["node", "-e", "require(\\"fs\\").writeFileSync(\\"PREFLIGHT-MARKER.txt\\", \\"executed\\")"]',
+	`    command: ["node", "-e", "console.log('${PREFLIGHT_MARKER}')"]`,
 	"",
 ].join("\n");
 
@@ -673,7 +674,6 @@ test("Phase 3B preflight is read-only and exact: model {preflight:true} and /q-g
 		// zero streaming updates, zero run records, recipe check never executed
 		assert.equal(updates.length, 0, "preflight never sends a streaming update");
 		assert.deepEqual(await runsEntries(root), before, "model preflight creates no run record");
-		await assert.rejects(readFile(join(root, PREFLIGHT_MARKER), "utf8"), { code: "ENOENT" }, "model preflight never executes the recipe check");
 
 		// ---- slash command: /q-gate g1 --preflight manual:g1.1=... ----------
 		const def = stub.commands.get("q-gate") as { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> };
@@ -691,7 +691,6 @@ test("Phase 3B preflight is read-only and exact: model {preflight:true} and /q-g
 			assert.ok(!notify.includes(token), `notification must not contain ${JSON.stringify(token)}`);
 		}
 		assert.deepEqual(await runsEntries(root), before, "slash preflight creates no run record");
-		await assert.rejects(readFile(join(root, PREFLIGHT_MARKER), "utf8"), { code: "ENOENT" }, "slash preflight never executes the recipe check");
 
 		// ---- formal call: same tool, NO preflight, NO manual evidence -------
 		const formalUpdates: unknown[] = [];
@@ -723,8 +722,13 @@ test("Phase 3B preflight is read-only and exact: model {preflight:true} and /q-g
 		const gateManifests = manifests.filter((m) => m.recipe === "gate");
 		assert.equal(gateManifests.length, 1, "exactly one gate run record");
 		assert.equal(gateManifests[0]!.run_id, formalDetails.run_id, "details.run_id identifies the persisted gate run");
-		assert.equal(manifests.filter((m) => m.recipe === "mark").length, 1, "the recipe check ran and persisted its run record");
-		assert.equal(await readFile(join(root, PREFLIGHT_MARKER), "utf8"), "executed", "recipe check actually executed in the formal run");
+		const markManifest = manifests.find((m) => m.recipe === "mark");
+		assert.ok(markManifest, "the recipe check ran and persisted its run record");
+		assert.equal(
+			(await readFile(join(runsDir(root), markManifest.run_id, "stdout.log"), "utf8")).trim(),
+			PREFLIGHT_MARKER,
+			"persisted recipe stdout proves the formal check executed without mutating source",
+		);
 	});
 });
 

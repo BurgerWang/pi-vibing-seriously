@@ -126,6 +126,8 @@ function worker(report = completeReport()): LedgerWorkerFacts {
 		provider: WORKER_PROVIDER,
 		model: WORKER_MODEL_ID,
 		status: "success",
+		workerSuccess: true,
+		workerFailureCode: null,
 		exitCode: 0,
 		turns: 3,
 		stopReason: "end_turn",
@@ -314,6 +316,8 @@ function committing(
 		task_kind: kind,
 		worker_identity: { ...IDENTITY },
 		provider_success: true,
+		worker_success: true,
+		worker_failure_code: null,
 		exit_code: 0,
 		report_complete: reportComplete,
 		terminal_facts_complete: true,
@@ -578,7 +582,7 @@ test("artifact v2: public contract normalizer trims and defaults before strict b
 	assert.deepEqual(normalized.value.acceptance_criteria, ["First criterion.", "Second criterion."]);
 	assert.deepEqual(normalized.value.verification, ["recipe:unit-test", "recipe:typecheck"]);
 	assert.equal(normalized.value.timeout_seconds, 1_800);
-	assert.equal(normalized.value.budget_profile, "extended");
+	assert.equal(normalized.value.budget_profile, "standard");
 	assert.equal(Object.prototype.hasOwnProperty.call(normalized.value, "repair_of"), false);
 	assert.deepEqual(bindDelegationBoundedTaskContractV2({
 		task_kind: "implementation",
@@ -587,7 +591,7 @@ test("artifact v2: public contract normalizer trims and defaults before strict b
 		acceptance_criteria: ["First criterion.", "Second criterion."],
 		verification: ["recipe:unit-test", "recipe:typecheck"],
 		timeout_seconds: 1_800,
-		budget_profile: "extended",
+		budget_profile: "standard",
 	}), normalized);
 });
 
@@ -669,7 +673,7 @@ test("artifact v2: 12 KiB soft limit requires explicit extended plus reason; 64 
 		acceptance_criteria: largeCriteria,
 		verification: ["recipe:unit-test"],
 	};
-	assert.equal(normalizeDelegationBoundedTaskContractV2(base).ok, false, "default extended is not an explicit size exception");
+	assert.equal(normalizeDelegationBoundedTaskContractV2(base).ok, false, "default standard is not an implicit size exception");
 	assert.equal(normalizeDelegationBoundedTaskContractV2({ ...base, budget_profile: "extended" }).ok, false, "explicit extended still needs a reason");
 	assert.equal(normalizeDelegationBoundedTaskContractV2({ ...base, extended_reason: "large but bounded" }).ok, false, "a reason still needs explicit extended");
 	const accepted = normalizeDelegationBoundedTaskContractV2({
@@ -894,6 +898,8 @@ test("artifact v2: worker identity, profile, counters, and derived spend facts a
 		["reason mismatch", { ...validWorker, spendReasons: ["turns"] }],
 		["soft flag mismatch", { ...validWorker, spendSoftReached: { ...validWorker.spendSoftReached!, turns: true } }],
 		["hard flag mismatch", { ...validWorker, spendHardExceeded: { ...validWorker.spendHardExceeded!, outputTokens: true } }],
+		["missing worker failure code", { ...validWorker, workerFailureCode: undefined }],
+		["contradictory closed worker outcome", { ...validWorker, workerSuccess: false }],
 	];
 	for (const [name, workerFacts] of cases) {
 		const input = { transaction: state, contract: contract.value, ...artifactWorkspaceFacts(changeSetLifecycle), changeSetLifecycle, worker: workerFacts, reportText: report };
@@ -910,10 +916,24 @@ test("artifact v2: verified provider response remains true when the overall work
 	assert.ok(state.terminal_outcome);
 	const failedState: DelegationTransactionRecord = {
 		...state,
-		terminal_outcome: { ...state.terminal_outcome, exit_code: 7, provider_success: true },
-		postcondition_reasons: ["EXIT_CODE_NOT_ZERO"],
+		status: "COMMITTING",
+		terminal_outcome: {
+			...state.terminal_outcome,
+			worker_success: false,
+			worker_failure_code: "EXIT_CODE_NONZERO",
+			exit_code: 7,
+			provider_success: true,
+		},
+		postcondition_reasons: ["WORKER_RUN_FAILED", "EXIT_CODE_NOT_ZERO"],
 	};
-	const failedWorker = { ...worker(report), status: "failure" as const, exitCode: 7, errorMessage: "bounded local failure" };
+	const failedWorker = {
+		...worker(report),
+		status: "failure" as const,
+		workerSuccess: false,
+		workerFailureCode: "EXIT_CODE_NONZERO" as const,
+		exitCode: 7,
+		errorMessage: "bounded local failure",
+	};
 	const result = buildDelegationCommittedArtifactsV2({
 		transaction: failedState,
 		contract: contract.value,
@@ -925,12 +945,15 @@ test("artifact v2: verified provider response remains true when the overall work
 	assert.equal(result.ok, true, result.ok ? "" : result.error.code);
 	if (!result.ok) return;
 	assert.equal(result.value.workerSummary.status, "failure");
+	assert.equal(result.value.workerSummary.worker_failure_code, "EXIT_CODE_NONZERO");
+	assert.equal((result.value.records["after.json"] as Record<string, unknown>).worker_failure_code, "EXIT_CODE_NONZERO");
+	assert.equal((result.value.records["usage.json"] as Record<string, unknown>).worker_failure_code, "EXIT_CODE_NONZERO");
 
 	const falseProviderFailure = buildDelegationCommittedArtifactsV2({
 		transaction: {
 			...failedState,
 			terminal_outcome: { ...failedState.terminal_outcome, provider_success: false },
-			postcondition_reasons: ["PROVIDER_NOT_SUCCESS", "EXIT_CODE_NOT_ZERO"],
+			postcondition_reasons: ["PROVIDER_NOT_SUCCESS", "WORKER_RUN_FAILED", "EXIT_CODE_NOT_ZERO"],
 		} as DelegationTransactionRecord,
 		contract: contract.value,
 		...artifactWorkspaceFacts(changeSetLifecycle),
@@ -939,6 +962,18 @@ test("artifact v2: verified provider response remains true when the overall work
 		reportText: report,
 	});
 	assert.equal(falseProviderFailure.ok, false, "completed verified turns cannot be rebound as provider failure");
+
+	const legacyState = structuredClone(state) as DelegationTransactionRecord;
+	delete legacyState.terminal_outcome!.worker_success;
+	delete legacyState.terminal_outcome!.worker_failure_code;
+	assert.equal(buildDelegationCommittedArtifactsV2({
+		transaction: legacyState,
+		contract: contract.value,
+		...artifactWorkspaceFacts(changeSetLifecycle),
+		changeSetLifecycle,
+		worker: worker(report),
+		reportText: report,
+	}).ok, false, "legacy terminal shapes are read-only and cannot build a fresh generation");
 });
 
 test("artifact v2: fallback spend and raw aggregate usage remain distinct persisted facts", () => {

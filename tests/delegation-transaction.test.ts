@@ -112,6 +112,8 @@ function terminalOutcome(
 		task_kind: state.task_kind,
 		worker_identity: state.worker_identity,
 		provider_success: true,
+		worker_success: true,
+		worker_failure_code: null,
 		exit_code: 0,
 		report_complete: true,
 		terminal_facts_complete: true,
@@ -220,6 +222,45 @@ test("implementation follows PREPARED → RUNNING → COMMITTING → PENDING_REV
 	assert.deepEqual(states.map((state) => state.revision), [0, 1, 2, 3, 4]);
 	assert.equal(states[3]!.committed_proof?.contract_hash, CONTRACT_HASH, "published proof binds the approved contract");
 	assert.equal(states[4]!.review?.transaction_revision, 3);
+});
+
+test("closed worker failure facts publish attributed partial work as non-reviewable INTERRUPTED", () => {
+	for (const worker_failure_code of ["SPEND_TURN_LIMIT", "TIMED_OUT", "COMPACTION_REJECTED"] as const) {
+		const committingState = committing("implementation", {
+			worker_success: false,
+			worker_failure_code,
+			exit_code: 0,
+		});
+		assert.deepEqual(committingState.postcondition_reasons, ["WORKER_RUN_FAILED"]);
+		const interrupted = publish(committingState);
+		assert.equal(interrupted.status, "INTERRUPTED", worker_failure_code);
+		assert.equal(interrupted.terminal_outcome?.worker_failure_code, worker_failure_code);
+		assert.equal(reviewDelegationTransaction(interrupted, {
+			...cas(interrupted, T4),
+			review_hash: REVIEW_HASH,
+		}).ok, false, "unreviewed interrupted evidence grants no ACCEPT authority");
+	}
+});
+
+test("closed worker outcome is exact while immutable legacy outcomes remain read-compatible", () => {
+	const state = running();
+	assert.equal(beginDelegationCommit(state, {
+		...cas(state, T2),
+		outcome: { ...terminalOutcome(state), worker_success: false, worker_failure_code: null },
+	}).ok, false);
+	assert.equal(beginDelegationCommit(state, {
+		...cas(state, T2),
+		outcome: { ...terminalOutcome(state), worker_failure_code: "UNKNOWN" as never },
+	}).ok, false);
+
+	const current = publish(committing());
+	const legacy = structuredClone(current) as unknown as Record<string, unknown>;
+	const legacyOutcome = legacy.terminal_outcome as Record<string, unknown>;
+	delete legacyOutcome.worker_success;
+	delete legacyOutcome.worker_failure_code;
+	const parsed = parseDelegationTransaction(legacy);
+	assert.equal(parsed.ok, true, parsed.ok ? "" : parsed.error);
+	assert.equal(parsed.ok && Object.prototype.hasOwnProperty.call(parsed.state.terminal_outcome, "worker_success"), false);
 });
 
 test("diagnosis succeeds only as FINISHED with zero delta, zero successful writes and zero denied writes", () => {

@@ -186,7 +186,7 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 
 test("v0.10.0 public tool surface has the intentional structured-Git transition hash", () => {
 	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
-	const currentHash = "5d53ec9369af0a573666d131192ff6e4a91c45c6f37d3db65310afbdbff97251";
+	const currentHash = "ed864c3e9bbf65d6ed57da63e6b343fbf23fa63e72286dc61b34f7221eb9e3f9";
 	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
 	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the documented 0.10.0 hash");
 });
@@ -397,7 +397,7 @@ test("workbench_delegate_worker metadata is static, compact, and preserves autho
 	assert.equal(WORKBENCH_TOOL_NAMES.indexOf("workbench_delegate_worker"), WORKBENCH_TOOL_NAMES.length - 5, "delegate tool keeps its registration position (seven existing → delegate → review → status → recovery → local commit)");
 	// The canonical schema object itself (not only its hash): budget_profile
 	// stays OPTIONAL — absent from `required` — and its nested union carries
-	// the JSON Schema `default: "extended"` annotation plus the exact
+	// the JSON Schema `default: "standard"` annotation plus the exact
 	// closed alternatives in the fixed standard|extended order. This
 	// inspects the real serialized shape so the pin below can never pass on
 	// a self-comparison or a drifted-but-self-consistent schema.
@@ -410,7 +410,7 @@ test("workbench_delegate_worker metadata is static, compact, and preserves autho
 	assert.ok(!(delegateParameters.required ?? []).includes("budget_profile"), "budget_profile stays optional — no required-list regression");
 	const budgetProfileSchema = delegateParameters.properties.budget_profile;
 	assert.ok(budgetProfileSchema, "budget_profile is present in the serialized parameter schema");
-	assert.equal(budgetProfileSchema.default, "extended", "the nested budget_profile schema carries the JSON Schema safe default annotation extended");
+	assert.equal(budgetProfileSchema.default, "standard", "the nested budget_profile schema carries the bounded default annotation standard");
 	assert.deepEqual(
 		(budgetProfileSchema.anyOf ?? []).map((alternative) => alternative.const),
 		["standard", "extended"],
@@ -419,9 +419,9 @@ test("workbench_delegate_worker metadata is static, compact, and preserves autho
 	assert.doesNotMatch(budgetProfileSchema.description ?? "", /low =/);
 	assert.match(budgetProfileSchema.description ?? "", /retired low literal is rejected/);
 	assert.match(budgetProfileSchema.description ?? "", /Luna xhigh cumulative spend profile/);
-	assert.match(budgetProfileSchema.description ?? "", /standard: soft at 32 turns \/ 5,440,000 total \/ 160,000 output/);
-	assert.match(budgetProfileSchema.description ?? "", /advisory turn marker 64, hard total 10,880,000, hard output 320,000/);
-	assert.match(budgetProfileSchema.description ?? "", /never kills healthy tool-heavy work by itself/);
+	assert.match(budgetProfileSchema.description ?? "", /standard \(default\): soft at 32 turns \/ 5,440,000 total \/ 160,000 output and hard stop at 64 turns \/ 10,880,000 total \/ 320,000 output/);
+	assert.match(budgetProfileSchema.description ?? "", /extended \(explicit only\): soft at 64 turns \/ 10,880,000 total \/ 320,000 output and hard stop at 96 turns \/ 17,408,000 total \/ 512,000 output/);
+	assert.match(budgetProfileSchema.description ?? "", /every hard turn\/total\/output boundary terminates the bounded attempt/);
 	assert.match(budgetProfileSchema.description ?? "", /current Sol session/);
 	// The current surface retains Phase 4A's public shape while strengthening
 	// its authority semantics: repair_of stays OPTIONAL —
@@ -477,7 +477,7 @@ test("workbench_delegate_worker metadata is static, compact, and preserves autho
 	);
 	assert.equal(
 		canonicalHash(WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker),
-		"fc20b3d36eb2f43f78bb2012635eb1906d96845aeafdacd130a70630a2a8dffd",
+		"c718ef6cd8dbb1e8c624350b5884c2feacddefcc83dc8a4df7d2a1eae5674572",
 		"current delegate parameter schema hash is pinned after semantic-repair continuity",
 	);
 });
@@ -657,7 +657,8 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.deepEqual(meta.promptGuidelines, [
 		"Successful non-zero implementation delivery returns a provisional scope/integrity packet and stays PENDING_REVIEW; after inspecting a complete unchanged packet, use workbench_review_worker_diff for hash-bound Sol ACCEPT. Use status only for diagnostics or recovery.",
-		"If a complete packet is wrong, publish semantic_decision=REPAIR with the exact bound hash and a bounded reason, then follow only the exact repair_of shown by status. REPAIR and every unresolved lineage remain Gate-blocking.",
+		"If a complete packet is wrong, publish semantic_decision=REPAIR with the exact bound hash and a bounded reason, then follow only the exact repair_of shown by status. A fresh exact repair route is executable even though ordinary/new delegations and VERIFY remain blocked; call it next without repeating status/review. REPAIR and every unresolved lineage remain Gate-blocking.",
+		"Use workbench_recover_tool_result only with an exact receipt id returned by a real tool result. If no workbench_delegate_worker call occurred, never describe the unchanged delegation state as a registry reload or persistence failure.",
 		"If rejected changes were deliberately discarded, use the exact close_inactive_blocker action reported by status. It checks only the delegation's changed, journal-touched, or carried paths, preserves unrelated work, never accepts rejected code, and must not be replaced with a new worktree.",
 		"When STALE is backed by strict v2 FINAL/PASS plus explicit Sol semantic authority, follow the reported successor action instead of retrying immutable review; a mechanical FINAL/PASS remains blocked and VERIFY stays blocked until a valid successor is reviewed.",
 		"In the TUI, WF:LOCKED means routine writes belong to Luna, WF:LEASE means a bounded temporary Sol write exception is active, and WF:REVIEW means recovery review is outstanding.",
@@ -673,7 +674,7 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	assert.doesNotMatch(meta.description, /real git diff \(any change after REVIEWED turns it STALE\)/);
 	assert.equal(
 		canonicalHash(meta),
-		"2fe79f026100c5887729f90dcd78844a2dc475ede38ead9bad74b43f8d10163a",
+		"e3f677c97fd4d2922f38b7035e5170dfb132539e3985f69a426ce649f2259aa0",
 		"current status metadata hash is machine-pinned after full authority recovery",
 	);
 	assert.equal(
@@ -683,7 +684,7 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.equal(
 		canonicalHash(workbenchToolMetadataOrdered()),
-		"fc3ec1a5944513ef3f864cf54506242c9b1bf409094f99d754faba843969a726",
+		"97468f141695ae59a81eef17b15e42e72b3457106f07503fe17e39ba9f7375b8",
 		"current public catalog hash is machine-pinned after full authority recovery was added",
 	);
 });
@@ -1351,12 +1352,19 @@ test("child runtime threads the strict task-kind env through advertised tools an
 test("slash commands are not registered as model-callable tools", async () => {
 	const sources = await extensionSources();
 	const registrations = Object.values(sources).join("\n");
+	const commandConstants = new Map(
+		[...registrations.matchAll(/(?:export\s+)?const\s+([A-Za-z_$][\w$]*)\s*=\s*"([^"]+)"\s+as\s+const/g)]
+			.map((match) => [match[1]!, match[2]!] as const),
+	);
 	// every registerCommand name starts with "q-" and none of the workbench
 	// tool names appear as a command
 	const commandNames = registrations
 		.split("registerCommand(")
 		.slice(1)
-		.map((block) => /"([^"]+)"/.exec(block)?.[1])
+		.map((block) => {
+			const argument = /^\s*(?:"([^"]+)"|([A-Za-z_$][\w$]*))/.exec(block);
+			return argument?.[1] ?? (argument?.[2] === undefined ? undefined : commandConstants.get(argument[2]));
+		})
 		.filter((n): n is string => Boolean(n));
 	assert.ok(commandNames.length >= 15, `expected the /q-* command set, got ${commandNames.length}`);
 	for (const name of commandNames) assert.ok(name.startsWith("q-"), name);
@@ -1385,19 +1393,29 @@ test("delegate wiring uses one v2 execution path and whole-lineage repair author
 	assert.ok(block.includes("hasDelegationSemanticRepairAuthorityV2"), "PENDING_REVIEW repair requires immutable semantic REPAIR authority");
 	assert.ok(block.includes("isStrictRetryableAbortedRepairV2"), "lineaged ABORTED retry uses the strict before-write envelope");
 	assert.ok(block.includes("isStrictRetryableEmptyRepairRecoveryV2"), "empty lineaged recovery uses the strict released-owner envelope");
-	assert.ok(block.split("controller.reconcileProjectAuthority(projectRoot").length - 1 >= 2, "every start audits project authority before and inside the lock");
-	assert.ok(block.includes("controller.services.acquireStartLock({"), "project repair starts are serialized by the durable start lock");
+	assert.ok(block.split("controller.reconcileProjectAuthority(projectRoot").length - 1 >= 2,
+		"every start performs a recovery-only prepass and recomputes admission authority inside the lock");
+	assert.ok(block.includes("await acquireProjectCheckoutOperationV1({"), "project repair starts enter the shared checkout writer operation");
+	assert.ok(block.includes("acquire_start_lock: controller.services.acquireStartLock"), "the shared operation delegates to the durable start lock seam");
 	assert.ok(block.includes("repair lineage cannot be advanced safely"), "unsafe lineage advancement fails closed");
-	assert.ok(block.includes("abortPristinePreparedDelegationUnderStartLockV2({"),
-		"an exact owned start lock closes an ownerless pristine PREPARED result before release");
-	assert.ok(block.indexOf("abortPristinePreparedDelegationUnderStartLockV2({") < block.indexOf("preserveStartLock = durableExecutionState?.status === \"PREPARED\""),
-		"controller attempts exact same-process PREPARED closure before deciding to preserve the lock");
+	assert.ok(block.split("abortPristinePreparedDelegationUnderStartLockV2({").length - 1 >= 2,
+		"both returned PREPARED and post-PREPARED throws attempt exact same-process closure before release");
+	assert.ok(block.includes("const durable = await readTransaction(projectRoot, delegationId);"),
+		"a post-PREPARED execution throw re-reads the exact durable transaction before release");
 	for (const forbidden of ["createDelegationLedger", "finishDelegationLedger", "runPinnedWorker("]) {
 		assert.equal(block.includes(forbidden), false, `${forbidden} is absent from the public v2 handler`);
 	}
 	assert.equal(block.split("controller.services.executeDelegation({").length - 1, 1, "one injected execution service owns the lifecycle");
 	assert.equal(block.split("controller.services.completeDefaultDelivery({").length - 1, 1, "one injected delivery service owns ordinary review close");
 	assert.ok(block.indexOf(execute) < block.indexOf(complete), "delivery review follows successful execution");
+	const preparedCallback = block.slice(block.indexOf("onPrepared:"), block.indexOf("onProgress:"));
+	assert.equal(preparedCallback.includes("releaseStartLock"), false,
+		"PREPARED publication never releases the shared-checkout writer lease");
+	assert.ok(preparedCallback.includes("preserveStartLock = true;"),
+		"durable PREPARED publication makes every subsequent throw fail-closed until exact terminal readback");
+	const finalRelease = "await releaseStartLock();";
+	assert.ok(block.indexOf(complete) < block.lastIndexOf(finalRelease),
+		"the common finally release remains after worker execution and mechanical delivery");
 	assert.match(adapters, /readCommittedGeneration: readDelegationCommittedGenerationV2/);
 	assert.match(adapters, /readLegacyLedger: readDelegationLedger/);
 	assert.match(adapters, /executeDelegation: executeDelegationV2/);

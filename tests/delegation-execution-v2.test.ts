@@ -309,11 +309,20 @@ test("execution v2: implementation commits PENDING_REVIEW and strict reader retu
 	assert.equal(committed.ok, true);
 	if (!committed.ok) return;
 	assert.equal(committed.value.state.status, "PENDING_REVIEW");
+	assert.equal(committed.value.state.terminal_outcome?.worker_success, true);
+	assert.equal(committed.value.state.terminal_outcome?.worker_failure_code, null);
 	assert.deepEqual(committed.value.records["worker-summary.json"], result.workerSummary);
 	assert.equal(committed.value.records["worker-report.md"], report);
 	assert.deepEqual((committed.value.records["usage.json"] as { usage: unknown }).usage, result.workerSummary.usage);
 	const scope = committed.value.records["scope.json"] as Record<string, any>;
 	const afterRecord = committed.value.records["after.json"] as Record<string, any>;
+	const usageRecord = committed.value.records["usage.json"] as Record<string, any>;
+	assert.equal(afterRecord.worker_success, true);
+	assert.equal(afterRecord.worker_failure_code, null);
+	assert.equal(usageRecord.worker_success, true);
+	assert.equal(usageRecord.worker_failure_code, null);
+	assert.equal(result.workerSummary.worker_success, true);
+	assert.equal(result.workerSummary.worker_failure_code, null);
 	assert.equal(scope.write_journal.state, "SEALED");
 	assert.equal(scope.change_set.status, "ATTRIBUTED");
 	assert.equal(afterRecord.worker_delta_hash, scope.change_set.worker_delta_hash);
@@ -476,7 +485,7 @@ test("execution v2: ambiguous owner prepublication failure is closed under the e
 	if (retry.ok) assert.equal((await releaseProjectDelegationStartLockV1(retry.value)).ok, true);
 });
 
-test("execution v2: a turn-only marker remains a successful committed delegation", async (t) => {
+test("execution v2: a hard turn boundary with exit 0 commits INTERRUPTED, never PENDING_REVIEW", async (t) => {
 	const projectRoot = await root(t);
 	const delegationId = id(46);
 	const report = completeReport(["src/changed.ts"]);
@@ -495,14 +504,23 @@ test("execution v2: a turn-only marker remains a successful committed delegation
 		after(["src/changed.ts"]),
 		markedWorker,
 	));
-	assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result));
-	if (!result.ok) return;
-	assert.equal(result.status, "PENDING_REVIEW");
-	assert.deepEqual(result.durable_state.postcondition_reasons, []);
-	assert.equal(result.durable_state.terminal_outcome?.provider_success, true);
-	assert.equal(result.workerSummary.status, "success");
-	assert.equal(result.workerSummary.spend?.band, "hard");
-	assert.deepEqual(result.workerSummary.spend?.reasons, ["turns"]);
+	assert.equal(result.ok, false);
+	if (result.ok) return;
+	assert.equal(result.code, "postconditions_failed");
+	assert.equal(result.worker_failure_code, "SPEND_TURN_LIMIT");
+	assert.equal(result.durable_state?.status, "INTERRUPTED");
+	assert.deepEqual(result.durable_state?.postcondition_reasons, ["WORKER_RUN_FAILED"]);
+	assert.equal(result.durable_state?.terminal_outcome?.provider_success, true);
+	assert.equal(result.durable_state?.terminal_outcome?.worker_success, false);
+	const committed = await readDelegationCommittedGenerationV2(projectRoot, delegationId);
+	assert.equal(committed.ok, true, committed.ok ? "" : committed.error.code);
+	if (!committed.ok) return;
+	assert.equal(committed.value.state.status, "INTERRUPTED");
+	for (const name of ["after.json", "usage.json", "worker-summary.json"] as const) {
+		const record = committed.value.records[name] as Record<string, unknown>;
+		assert.equal(record.worker_success, false, name);
+		assert.equal(record.worker_failure_code, "SPEND_TURN_LIMIT", name);
+	}
 });
 
 test("execution v2: create then edit the same new file commits with missing pre-worker authority", async (t) => {
@@ -610,7 +628,7 @@ test("execution v2: complete machine facts commit postcondition failures as fail
 		reason: string;
 		absentReason?: string;
 		workerFailureCode?: string;
-		expectedStatus?: "FAILED" | "RECOVERY_REQUIRED";
+		expectedStatus?: "FAILED" | "INTERRUPTED" | "RECOVERY_REQUIRED";
 	}> = [
 		{
 			name: "zero-delta implementation",
@@ -648,6 +666,7 @@ test("execution v2: complete machine facts commit postcondition failures as fail
 			reason: "EXIT_CODE_NOT_ZERO",
 			absentReason: "PROVIDER_NOT_SUCCESS",
 			workerFailureCode: "EXIT_CODE_NONZERO",
+			expectedStatus: "INTERRUPTED",
 		},
 		{
 			name: "legacy local turn stop is not a provider failure",
@@ -665,7 +684,31 @@ test("execution v2: complete machine facts commit postcondition failures as fail
 			}),
 			reason: "EXIT_CODE_NOT_ZERO",
 			absentReason: "PROVIDER_NOT_SUCCESS",
-			workerFailureCode: "SPEND_TURN_LIMIT_LEGACY",
+			workerFailureCode: "SPEND_TURN_LIMIT",
+			expectedStatus: "INTERRUPTED",
+		},
+		{
+			name: "timeout with exit zero",
+			kind: "implementation",
+			after: after(["src/changed.ts"]),
+			worker: worker(completeReport(["src/changed.ts"]), { timedOut: true }),
+			reason: "WORKER_RUN_FAILED",
+			absentReason: "EXIT_CODE_NOT_ZERO",
+			workerFailureCode: "TIMED_OUT",
+			expectedStatus: "INTERRUPTED",
+		},
+		{
+			name: "compaction with exit zero",
+			kind: "implementation",
+			after: after(["src/changed.ts"]),
+			worker: worker(completeReport(["src/changed.ts"]), {
+				compactionCount: 1,
+				compactionReasons: ["context pressure"],
+			}),
+			reason: "WORKER_RUN_FAILED",
+			absentReason: "EXIT_CODE_NOT_ZERO",
+			workerFailureCode: "COMPACTION_REJECTED",
+			expectedStatus: "INTERRUPTED",
 		},
 		{
 			name: "out-of-scope implementation change",
@@ -694,6 +737,15 @@ test("execution v2: complete machine facts commit postcondition failures as fail
 			const committed = await readDelegationCommittedGenerationV2(projectRoot, delegationId);
 			assert.equal(committed.ok, true);
 			assert.equal(committed.ok && committed.value.state.status, item.expectedStatus ?? "FAILED");
+			if (committed.ok && item.workerFailureCode !== undefined) {
+				assert.equal(committed.value.state.terminal_outcome?.worker_success, false);
+				assert.equal(committed.value.state.terminal_outcome?.worker_failure_code, item.workerFailureCode);
+				for (const name of ["after.json", "usage.json", "worker-summary.json"] as const) {
+					const record = committed.value.records[name] as Record<string, unknown>;
+					assert.equal(record.worker_success, false, name);
+					assert.equal(record.worker_failure_code, item.workerFailureCode, name);
+				}
+			}
 		});
 	}
 });

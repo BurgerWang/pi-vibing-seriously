@@ -13,9 +13,10 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdir, readFile, readdir, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { before, test } from "node:test";
+import { after, before, test } from "node:test";
 
 import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionContext, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
@@ -65,7 +66,14 @@ import {
 	WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE,
 } from "../extensions/workbench-runtime/core/worker-spend.ts";
 import { WORKER_NO_PROGRESS_STEER_MESSAGE_TYPE } from "../extensions/workbench-runtime/core/development-efficiency.ts";
+import {
+	acquireProjectCheckoutOperationV1,
+	releaseProjectCheckoutOperationV1,
+	WORKBENCH_CHECKOUT_OPERATION_TOKEN_ENV,
+} from "../extensions/workbench-runtime/core/project-checkout-operation.ts";
 import { spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
+
+let defaultProjectRoot = "";
 
 interface StubAPI {
 	commands: Map<string, unknown>;
@@ -122,7 +130,8 @@ function fakeCtx(entries: StubAPI["entries"], overrides: Partial<ExtensionContex
 	return {
 		mode: "tui",
 		hasUI: false,
-		cwd: "/tmp/workbench-project",
+		cwd: defaultProjectRoot,
+		isIdle: () => true,
 		isProjectTrusted: () => false,
 		sessionManager: {
 			getEntries: () => entries.map((e) => ({ type: e.type, customType: e.customType, data: e.data })),
@@ -223,6 +232,15 @@ before(() => {
 	delete process.env[WORKER_DELEGATION_ID_ENV];
 	delete process.env[WORKER_CONTRACT_HASH_ENV];
 	delete process.env[WORKER_SPEND_PROFILE_ENV];
+	delete process.env[WORKBENCH_CHECKOUT_OPERATION_TOKEN_ENV];
+});
+
+before(async () => {
+	defaultProjectRoot = await mkdtemp(join(tmpdir(), "pi-p5-state-"));
+});
+
+after(async () => {
+	if (defaultProjectRoot !== "") await rm(defaultProjectRoot, { recursive: true, force: true });
 });
 
 // ---------------------------------------------------------------------------
@@ -264,6 +282,30 @@ test("session_start restores mode and compact state from custom entries (resume/
 	const note = stub.messages[0]?.content ?? "";
 	assert.ok(note.includes("verify gate q3"));
 	assert.ok(note.includes("q3 (run 20260801-120000-abcd)"));
+});
+
+test("session lifecycle restores only the active Pi branch and reloads it after tree navigation", async () => {
+	const stub = makeStub();
+	workbenchRuntime(stub);
+	const wholeTree = [
+		entry(MODE_ENTRY_TYPE, { mode: "DEV" }),
+		entry(MODE_ENTRY_TYPE, { mode: "AUDIT" }),
+	];
+	let branch = [entry(MODE_ENTRY_TYPE, { mode: "DEV" })];
+	const ctx = fakeCtx(wholeTree, {
+		sessionManager: {
+			getEntries: () => wholeTree,
+			getBranch: () => branch,
+			getSessionFile: () => "/tmp/workbench-project/session.jsonl",
+			getSessionId: () => "branch-session-id",
+		} as unknown as ExtensionContext["sessionManager"],
+	});
+	await stub.events.get("session_start")![0]!({ type: "session_start", reason: "resume" } as never, ctx as never);
+	assert.equal(stub.activeTools.includes("bash"), true, "a later sibling AUDIT entry cannot override the selected DEV branch");
+
+	branch = [entry(MODE_ENTRY_TYPE, { mode: "AUDIT" })];
+	await stub.events.get("session_tree")![0]!({ type: "session_tree", newLeafId: "audit", oldLeafId: "dev" } as never, ctx as never);
+	assert.equal(stub.activeTools.includes("bash"), false, "tree navigation reloads the newly selected branch instead of retaining DEV memory");
 });
 
 test("fresh session (reason=new) falls back to the DEV default", async () => {
@@ -695,7 +737,7 @@ test("worker role sends exactly one hidden soft-budget steer at/above 80%", asyn
 
 	// At the soft threshold (80%): exactly one hidden CONTEXT steer. The
 	// independent cumulative spend state (435,199) stays below the Luna
-	// default extended soft total (10,880,000), so no spend steer fires yet.
+	// default standard soft total (5,440,000), so no spend steer fires yet.
 	await handler(messageEndEvent(WORKER_SOFT_BUDGET), ctx);
 	assert.equal(messagesOfType(stub, WORKER_SOFT_STEER_MESSAGE_TYPE).length, 1);
 	const steer = messagesOfType(stub, WORKER_SOFT_STEER_MESSAGE_TYPE)[0]!;
@@ -708,11 +750,11 @@ test("worker role sends exactly one hidden soft-budget steer at/above 80%", asyn
 
 	// The context steer is one-shot: further per-message soft/hard context
 	// never re-sends it. The INDEPENDENT spend steer fires exactly once when
-	// the cumulative total first crosses the default extended soft limit.
-	// Fifty-two 200,000-token messages keep it at 10,835,199; the next reaches
-	// 11,035,199.
-	for (let i = 0; i < 52; i++) await handler(messageEndEvent(200_000), ctx);
-	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 0, "cumulative spend (10,835,199) still below the extended soft total");
+	// the cumulative total first crosses the default standard soft limit.
+	// Twenty-five 200,000-token messages keep it at 5,435,199; the next reaches
+	// 5,635,199.
+	for (let i = 0; i < 25; i++) await handler(messageEndEvent(200_000), ctx);
+	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 0, "cumulative spend (5,435,199) still below the standard soft total");
 	await handler(messageEndEvent(200_000), ctx);
 	assert.equal(messagesOfType(stub, WORKER_SOFT_STEER_MESSAGE_TYPE).length, 1);
 	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 1);
@@ -723,8 +765,8 @@ test("worker role sends exactly one hidden soft-budget steer at/above 80%", asyn
 	const spend = spendSteers[0]!;
 	assert.equal(spend.display, false, "spend steer is hidden from the TUI");
 	assert.deepEqual(spend.options, { deliverAs: "steer" });
-	assert.match(spend.content, /profile extended/);
-	assert.match(spend.content, /total_tokens 11035199\/10880000/);
+	assert.match(spend.content, /profile standard/);
+	assert.match(spend.content, /total_tokens 5635199\/5440000/);
 	assert.match(spend.content, /current Sol session/);
 
 	// One-shot again: another soft/hard message re-sends neither steer.
@@ -780,7 +822,7 @@ test("worker role sends exactly one hidden cumulative spend steer at the standar
 	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 1, "the spend steer is one-shot");
 });
 
-test("worker role maps retired low to extended and steers at the exact soft-turn boundary", async () => {
+test("worker role maps retired low to standard and steers at the exact soft-turn boundary", async () => {
 	const stub = makeStub();
 	withWorkerRoleAndSpendProfile("low", () => workbenchRuntime(stub));
 	const messageEnd = stub.events.get("message_end");
@@ -788,18 +830,18 @@ test("worker role maps retired low to extended and steers at the exact soft-turn
 	const handler = (event: never, ctx: never) => fireMessageEnd(stub, event, ctx);
 	const ctx = fakeCtx([]) as never;
 
-	// Retired low resolves to extended: 63 turns stay below its soft limit (64).
-	for (let i = 0; i < 63; i++) await handler(messageEndEvent(100), ctx);
+	// Retired low resolves to standard: 31 turns stay below its soft limit (32).
+	for (let i = 0; i < 31; i++) await handler(messageEndEvent(100), ctx);
 	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 0);
 
-	// The 64th turn reaches the extended soft turns limit exactly: one steer
+	// The 32nd turn reaches the standard soft turns limit exactly: one steer
 	// naming the resolved profile and the turns dimension.
 	await handler(messageEndEvent(100), ctx);
 	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 1);
 	const steer = messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE)[0]!;
 	assert.equal(steer.customType, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE);
-	assert.match(steer.content, /profile extended/);
-	assert.match(steer.content, /turns 64\/64/);
+	assert.match(steer.content, /profile standard/);
+	assert.match(steer.content, /turns 32\/32/);
 
 	// One-shot: two more turns re-send nothing.
 	await handler(messageEndEvent(100), ctx);
@@ -831,10 +873,10 @@ test("worker role spend steer fires on the output dimension at the exact soft bo
 	assert.equal(messagesOfType(stub, WORKER_NO_PROGRESS_STEER_MESSAGE_TYPE).length, 0, "same-interval safety-budget steering wins arbitration");
 });
 
-test("retired low fallback keeps the extended spend steer one-shot from soft through hard", async () => {
+test("retired low fallback keeps the standard spend steer one-shot from soft through hard", async () => {
 	const stub = makeStub();
-	// Retired low resolves to extended: soft total 10,880,000, hard total
-	// 17,408,000. Per-message totals stay below 217,600 so the context steer
+	// Retired low resolves to standard: soft total 5,440,000, hard total
+	// 10,880,000. Per-message totals stay below 217,600 so the context steer
 	// never fires.
 	withWorkerRoleAndSpendProfile("low", () => workbenchRuntime(stub));
 	const messageEnd = stub.events.get("message_end");
@@ -842,24 +884,24 @@ test("retired low fallback keeps the extended spend steer one-shot from soft thr
 	const handler = (event: never, ctx: never) => fireMessageEnd(stub, event, ctx);
 	const ctx = fakeCtx([]) as never;
 
-	// Fifty-four messages at 200,000: below the extended soft total — band ok,
+	// Twenty-seven messages at 200,000: below the standard soft total — band ok,
 	// no steer.
-	for (let i = 0; i < 54; i++) await handler(messageEndEvent(200_000), ctx);
+	for (let i = 0; i < 27; i++) await handler(messageEndEvent(200_000), ctx);
 	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 0);
 
-	// The 55th message reaches 11,000,000: the first non-ok band is SOFT and
+	// The 28th message reaches 5,600,000: the first non-ok band is SOFT and
 	// triggers one steer.
 	await handler(messageEndEvent(200_000), ctx);
 	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 1);
 	const steer = messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE)[0]!;
 	assert.equal(steer.customType, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE);
-	assert.match(steer.content, /profile extended/);
-	assert.match(steer.content, /total_tokens 11000000\/10880000/, "the steer text renders soft-limit denominators");
-	for (let i = 0; i < 33; i++) await handler(messageEndEvent(200_000), ctx);
+	assert.match(steer.content, /profile standard/);
+	assert.match(steer.content, /total_tokens 5600000\/5440000/, "the steer text renders soft-limit denominators");
+	for (let i = 0; i < 28; i++) await handler(messageEndEvent(200_000), ctx);
 	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 1, "one-shot even after the band becomes hard");
 });
 
-test("malformed spend-profile env falls back to extended defensively", async () => {
+test("malformed spend-profile env falls back to standard defensively", async () => {
 	const stub = makeStub();
 	withWorkerRoleAndSpendProfile("bogus-profile", () => workbenchRuntime(stub));
 	const messageEnd = stub.events.get("message_end");
@@ -867,10 +909,10 @@ test("malformed spend-profile env falls back to extended defensively", async () 
 	const handler = (event: never, ctx: never) => fireMessageEnd(stub, event, ctx);
 	const ctx = fakeCtx([]) as never;
 
-	// 64 x 170,000 = 10,880,000: the EXTENDED soft total boundary.
-	for (let i = 0; i < 64; i++) await handler(messageEndEvent(170_000), ctx);
+	// 32 x 170,000 = 5,440,000: the STANDARD soft total boundary.
+	for (let i = 0; i < 32; i++) await handler(messageEndEvent(170_000), ctx);
 	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 1);
-	assert.match(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE)[0]!.content, /profile extended/);
+	assert.match(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE)[0]!.content, /profile standard/);
 });
 
 test("commander session never receives the spend steer even with a profile env set", async () => {
@@ -940,6 +982,23 @@ test("/q-status reports the path policy and command guard", async () => {
 	assert.ok(outputText.includes("path policy"), "q-status mentions the path policy");
 	assert.ok(outputText.includes("command guard"), "q-status mentions the command guard");
 	assert.ok(outputText.includes("workbench mode"), "q-status works in print mode (stdout fallback)");
+	assert.ok(outputText.includes("extension source"), "q-status exposes the loaded runtime fingerprint");
+});
+
+test("/q-runtime-doctor reports whether this session matches the source tree on disk", async () => {
+	const stub = makeStub();
+	workbenchRuntime(stub);
+	const def = stub.commands.get("q-runtime-doctor") as { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> };
+	let outputText = "";
+	const ctx = {
+		...fakeCtx([]),
+		hasUI: true,
+		ui: { notify: (text: string) => { outputText = text; }, confirm: async () => false, setStatus: () => {}, setWidget: () => {} },
+	} as unknown as ExtensionCommandContext;
+	await def.handler("", ctx);
+	assert.match(outputText, /runtime status\s+: CURRENT/);
+	assert.match(outputText, /loaded source\s+: sha256:[0-9a-f]{64}/);
+	assert.match(outputText, /disk source\s+: sha256:[0-9a-f]{64}/);
 });
 
 // ---------------------------------------------------------------------------
@@ -1048,15 +1107,26 @@ test("worker role keeps its edit/write path scope in the P7 tool_call guard", as
 			taskKind: process.env[WORKER_TASK_KIND_ENV],
 			delegationId: process.env[WORKER_DELEGATION_ID_ENV],
 			contractHash: process.env[WORKER_CONTRACT_HASH_ENV],
+			checkoutToken: process.env[WORKBENCH_CHECKOUT_OPERATION_TOKEN_ENV],
 		};
 		const delegationId = "20260820-130000-W1r2";
 		const contractHash = "b".repeat(64);
+		const parentOperation = await acquireProjectCheckoutOperationV1({
+			project_root: root,
+			operation_kind: "delegation",
+			operation_id: `delegation:${delegationId}`,
+			delegation_id: delegationId,
+			now: new Date().toISOString(),
+		});
+		assert.equal(parentOperation.ok, true, "parent checkout writer operation acquired");
+		if (!parentOperation.ok) return;
 		process.env[WORKER_ROLE_ENV] = "worker";
 		process.env[WORKER_PROJECT_ROOT_ENV] = root;
 		process.env[WORKER_ALLOWED_PATHS_ENV] = JSON.stringify(["src/**"]);
 		process.env[WORKER_TASK_KIND_ENV] = "implementation";
 		process.env[WORKER_DELEGATION_ID_ENV] = delegationId;
 		process.env[WORKER_CONTRACT_HASH_ENV] = contractHash;
+		process.env[WORKBENCH_CHECKOUT_OPERATION_TOKEN_ENV] = parentOperation.value.token;
 		try {
 			const created = await createWorkerWriteJournal({
 				project_root: root,
@@ -1067,9 +1137,17 @@ test("worker role keeps its edit/write path scope in the P7 tool_call guard", as
 			const stub = makeStub();
 			workbenchRuntime(stub);
 			type GuardResult = { block?: boolean; reason?: string } | undefined;
-			const inScope = (await guardCall(stub, "edit", { path: "src/main.ts" })) as GuardResult;
+			delete process.env[WORKBENCH_CHECKOUT_OPERATION_TOKEN_ENV];
+			const missingToken = (await guardCall(stub, "edit", { path: "src/main.ts" }, fakeCtx([], { cwd: root }))) as GuardResult;
+			assert.ok(missingToken?.block, "worker mutation without the exact parent token fails closed");
+			assert.match(String(missingToken.reason), /exact inherited parent operation token/);
+			process.env[WORKBENCH_CHECKOUT_OPERATION_TOKEN_ENV] = parentOperation.value.token;
+			const wrongContextRoot = (await guardCall(stub, "edit", { path: "src/main.ts" })) as GuardResult;
+			assert.ok(wrongContextRoot?.block, "worker mutation with a different session root fails closed");
+			assert.match(String(wrongContextRoot.reason), /project root is unavailable/);
+			const inScope = (await guardCall(stub, "edit", { path: "src/main.ts" }, fakeCtx([], { cwd: root }))) as GuardResult;
 			assert.equal(inScope, undefined, "in-scope worker edit passes");
-			const outOfScope = (await guardCall(stub, "edit", { path: "README.md" })) as GuardResult;
+			const outOfScope = (await guardCall(stub, "edit", { path: "README.md" }, fakeCtx([], { cwd: root }))) as GuardResult;
 			assert.ok(outOfScope && outOfScope.block === true, "out-of-scope worker edit blocked");
 			assert.match(String(outOfScope.reason), /outside the parent-approved scope/);
 		} finally {
@@ -1086,6 +1164,9 @@ test("worker role keeps its edit/write path scope in the P7 tool_call guard", as
 			else process.env[WORKER_DELEGATION_ID_ENV] = previous.delegationId;
 			if (previous.contractHash === undefined) delete process.env[WORKER_CONTRACT_HASH_ENV];
 			else process.env[WORKER_CONTRACT_HASH_ENV] = previous.contractHash;
+			if (previous.checkoutToken === undefined) delete process.env[WORKBENCH_CHECKOUT_OPERATION_TOKEN_ENV];
+			else process.env[WORKBENCH_CHECKOUT_OPERATION_TOKEN_ENV] = previous.checkoutToken;
+			await releaseProjectCheckoutOperationV1(parentOperation.value);
 		}
 	});
 });
@@ -1161,6 +1242,7 @@ async function guardCall(
 	context: ExtensionContext = fakeCtx([]),
 ): Promise<{ block?: boolean; reason?: string } | undefined> {
 	const serial = ++guardTurnSerial;
+	const toolCallId = `p5-state-guard-${serial}`;
 	const ctx = context as never;
 	for (const handler of stub.events.get("turn_start") ?? []) {
 		await handler({ type: "turn_start", turnIndex: serial } as never, ctx);
@@ -1168,11 +1250,29 @@ async function guardCall(
 	for (const guard of stub.events.get("tool_call") ?? []) {
 		const result = (await guard({
 			type: "tool_call",
-			toolCallId: `p5-state-guard-${serial}`,
+			toolCallId,
 			toolName,
 			input,
 		} as never, ctx)) as { block?: boolean; reason?: string } | undefined;
 		if (result !== undefined) return result;
+	}
+	// An allowed guard represents one completed tool call in these policy
+	// tests.  Drive the real result middleware so its exact checkout borrower
+	// or owner is released before the next independent assertion.
+	let resultEvent: unknown = {
+		type: "tool_result",
+		toolCallId,
+		toolName,
+		input,
+		content: [{ type: "text", text: "ok" }],
+		isError: false,
+		output: "ok",
+	};
+	for (const handler of stub.events.get("tool_result") ?? []) {
+		resultEvent = (await handler(resultEvent as never, ctx)) ?? resultEvent;
+	}
+	for (const handler of stub.events.get("agent_settled") ?? []) {
+		await handler({ type: "agent_settled" } as never, ctx);
 	}
 	return undefined;
 }

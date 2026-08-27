@@ -8,7 +8,11 @@ import test from "node:test";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import { reviewDelegationV2 } from "../extensions/workbench-runtime/core/delegation-review-v2.ts";
-import { reconcileProjectDelegationAuthorityV2 } from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
+import {
+	readDelegationAuthorityObservationV2,
+	reconcileProjectDelegationAuthorityV2,
+} from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
+import { readCurrentDelegationPlanAuthority } from "../extensions/workbench-runtime/core/delegation-plan-reference.ts";
 import { deriveFinalizedDelegationWorkspaceFactsV2 } from "../extensions/workbench-runtime/core/delegation-workspace-v2.ts";
 import { bindDelegationBoundedTaskContractV2, buildDelegationCommittedArtifactsV2 } from "../extensions/workbench-runtime/core/delegation-transaction-artifacts.ts";
 import { finalizeDelegationChangeSetLifecycleV2, prepareDelegationChangeSetLifecycleV2 } from "../extensions/workbench-runtime/core/delegation-change-set-lifecycle.ts";
@@ -21,8 +25,10 @@ import {
 	persistRunningDelegationTransaction,
 	readDelegationCommittedGenerationV2,
 	readDelegationReviewV2,
+	readDelegationTerminalNegativeReviewV1,
 	hasDelegationSemanticRepairAuthorityV2,
 	hasDelegationSemanticReviewAuthorityV2,
+	hasDelegationTerminalNegativeSemanticRepairAuthorityV1,
 	readDelegationTransactionV2,
 	hashDelegationCommittedRecords,
 	type DelegationCommittedRecords,
@@ -38,7 +44,10 @@ import type {
 	DelegationTransactionRecord,
 	DelegationWorkerIdentity,
 } from "../extensions/workbench-runtime/core/delegation-transaction.ts";
-import { delegationCommitMarker } from "../extensions/workbench-runtime/core/delegation-transaction.ts";
+import {
+	bindDelegationRepairLineageV1,
+	delegationCommitMarker,
+} from "../extensions/workbench-runtime/core/delegation-transaction.ts";
 import {
 	REVIEW_PAGE_SOURCE_MAX_BYTES,
 	preflightSemanticReviewEnvelopeV1,
@@ -106,10 +115,18 @@ interface ReviewFixture {
 	records: DelegationCommittedRecords;
 }
 
-function workerFacts(report: string, spendProfile: "standard" | "extended" = "standard"): LedgerWorkerFacts {
+
+function workerFacts(
+	report: string,
+	spendProfile: "standard" | "extended" = "standard",
+	terminalStatus?: "FAILED" | "INTERRUPTED",
+): LedgerWorkerFacts {
+	const workerSuccess = terminalStatus === undefined;
 	return {
-		provider: WORKER_PROVIDER, model: WORKER_MODEL_ID, status: "success", exitCode: 0, turns: 1,
-		stopReason: "end_turn", errorMessage: null,
+		provider: WORKER_PROVIDER, model: WORKER_MODEL_ID, status: workerSuccess ? "success" : "failure", exitCode: 0, turns: 1,
+		workerSuccess,
+		workerFailureCode: workerSuccess ? null : terminalStatus === "INTERRUPTED" ? "TIMED_OUT" : "MODEL_IDENTITY_MISMATCH",
+		stopReason: workerSuccess ? "end_turn" : "error", errorMessage: workerSuccess ? null : "bounded worker failure",
 		usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 		cacheHitRatio: 0,
 		budget: { maxContextTokens: 15, maxContextRatio: 0.001, softBudgetReached: false, hardBudgetExceeded: false, compactionCount: 0, compactionReasons: [] },
@@ -128,6 +145,7 @@ async function setupReviewFixture(
 	workerContent: (path: string) => string | Buffer = (path) => `worker:${path}\n`,
 	reportedPaths?: readonly string[],
 	newPaths: readonly string[] = [],
+	terminalStatus?: "FAILED" | "INTERRUPTED",
 ): Promise<ReviewFixture> {
 	const root = await mkdtemp(join(tmpdir(), "delegation-review-v2-"));
 	await git(root, ["init"]);
@@ -227,6 +245,10 @@ async function setupReviewFixture(
 		task_kind: "implementation",
 		worker_identity: { ...IDENTITY },
 		provider_success: true,
+		worker_success: terminalStatus === undefined,
+		worker_failure_code: terminalStatus === undefined
+			? null
+			: terminalStatus === "INTERRUPTED" ? "TIMED_OUT" : "MODEL_IDENTITY_MISMATCH",
 		exit_code: 0,
 		report_complete: true,
 		terminal_facts_complete: true,
@@ -243,7 +265,8 @@ async function setupReviewFixture(
 	const report = `## Completed\n- changed fixture files\n## Files Changed\n${(reportedPaths ?? workerPaths).map((path) => `- ${path}`).join("\n")}\n## Verification\n- facts\n## Remaining Risks\n- none\n`;
 	const relevance = await collectReviewRelevanceV2({
 		project_root: root, delegation_id: ID, contract_hash: contract.value.contract_hash,
-		after_guard: lifecycle.value.after_guard, change_set: lifecycle.value.change_set, exec: spawnExec,
+		after_guard: lifecycle.value.after_guard, change_set: lifecycle.value.change_set,
+		command_provenance: lifecycle.value.command_provenance, exec: spawnExec,
 	});
 	assert.equal(relevance.ok, true);
 	if (!relevance.ok) throw new Error("review relevance setup failed");
@@ -257,7 +280,9 @@ async function setupReviewFixture(
 	if (!envelope.ok) throw new Error("review envelope setup failed");
 	const built = buildDelegationCommittedArtifactsV2({
 		transaction: committing.value, contract: contract.value, before: workspace.value.before, after: workspace.value.after,
-		changeSetLifecycle: lifecycle.value, worker: workerFacts(report, withExtendedReason ? "extended" : "standard"), reportText: report,
+		changeSetLifecycle: lifecycle.value,
+		worker: workerFacts(report, withExtendedReason ? "extended" : "standard", terminalStatus),
+		reportText: report,
 		reviewEnvelope: envelope.value,
 	});
 	assert.equal(built.ok, true);
@@ -284,6 +309,7 @@ async function replaceCommittedEnvelopeWithLegacyBinaryPaging(
 		contract_hash: fixture.state.contract_hash,
 		after_guard: after.workspace_guard,
 		change_set: scope.change_set,
+		...(scope.command_provenance === undefined ? {} : { command_provenance: scope.command_provenance }),
 		exec: spawnExec,
 	});
 	assert.equal(relevance.ok, true, relevance.ok ? "" : relevance.error.code);
@@ -329,6 +355,88 @@ async function replaceCommittedEnvelopeWithLegacyBinaryPaging(
 	await writeFile(transactionPath(fixture.root), `${JSON.stringify(transaction, null, 2)}\n`);
 }
 
+async function rewriteCommittedAfterRecord(
+	fixture: ReviewFixture,
+	mutate: (after: Record<string, unknown>) => void,
+): Promise<void> {
+	const afterPath = generationPath(fixture.root, "after.json");
+	const after = JSON.parse(await readFile(afterPath, "utf8")) as Record<string, unknown>;
+	mutate(after);
+	await writeFile(afterPath, `${JSON.stringify(after, null, 2)}\n`);
+
+	const compiled = new Map<any, Uint8Array>();
+	for (const name of COMMITTED_RECORD_NAMES) compiled.set(name, await readFile(generationPath(fixture.root, name)));
+	const transaction = JSON.parse(await readFile(transactionPath(fixture.root), "utf8")) as Record<string, any>;
+	const { commit_marker: _oldMarker, ...proofWithoutMarker } = transaction.committed_proof;
+	proofWithoutMarker.content_hash = hashDelegationCommittedRecords(compiled);
+	transaction.committed_proof = {
+		...proofWithoutMarker,
+		commit_marker: delegationCommitMarker(proofWithoutMarker),
+	};
+	await writeFile(generationPath(fixture.root, "commit-marker.json"), `${JSON.stringify(transaction.committed_proof, null, 2)}\n`);
+	await writeFile(transactionPath(fixture.root), `${JSON.stringify(transaction, null, 2)}\n`);
+}
+
+async function rewriteCommittedTerminalOutcomeAsLegacy(fixture: ReviewFixture): Promise<void> {
+	const transaction = JSON.parse(await readFile(transactionPath(fixture.root), "utf8")) as Record<string, any>;
+	delete transaction.terminal_outcome.worker_success;
+	delete transaction.terminal_outcome.worker_failure_code;
+	transaction.terminal_outcome.provider_success = false;
+	transaction.postcondition_reasons = ["PROVIDER_NOT_SUCCESS"];
+	for (const name of ["after.json", "usage.json", "worker-summary.json"] as const) {
+		const path = generationPath(fixture.root, name);
+		const record = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+		delete record.worker_success;
+		delete record.worker_failure_code;
+		await writeFile(path, `${JSON.stringify(record, null, 2)}\n`);
+	}
+	const compiled = new Map<any, Uint8Array>();
+	for (const name of COMMITTED_RECORD_NAMES) compiled.set(name, await readFile(generationPath(fixture.root, name)));
+	const { commit_marker: _oldMarker, ...proofWithoutMarker } = transaction.committed_proof;
+	proofWithoutMarker.content_hash = hashDelegationCommittedRecords(compiled);
+	transaction.committed_proof = {
+		...proofWithoutMarker,
+		commit_marker: delegationCommitMarker(proofWithoutMarker),
+	};
+	await writeFile(generationPath(fixture.root, "commit-marker.json"), `${JSON.stringify(transaction.committed_proof, null, 2)}\n`);
+	await writeFile(transactionPath(fixture.root), `${JSON.stringify(transaction, null, 2)}\n`);
+}
+
+async function rewriteCommittedDiffSchemaAsLegacy(fixture: ReviewFixture): Promise<void> {
+	const current = await collectGitFacts(fixture.root, spawnExec);
+	const beforePath = generationPath(fixture.root, "before.json");
+	const afterPath = generationPath(fixture.root, "after.json");
+	const scopePath = generationPath(fixture.root, "scope.json");
+	const before = JSON.parse(await readFile(beforePath, "utf8")) as Record<string, any>;
+	const after = JSON.parse(await readFile(afterPath, "utf8")) as Record<string, any>;
+	const scope = JSON.parse(await readFile(scopePath, "utf8")) as Record<string, any>;
+	delete before.diff_identity_kind;
+	before.path_digests = {};
+	before.diff_hash = computeDiffHash(before.changed_paths, before.path_digests, before.path_statuses);
+	delete after.diff_identity_kind;
+	delete after.review_envelope;
+	delete after.command_provenance_hash;
+	delete after.effective_delta_hash;
+	delete scope.command_provenance;
+	after.path_digests = { ...current.pathDigests };
+	after.diff_hash = computeDiffHash(current.changedPaths, current.pathDigests, current.pathStatuses);
+	await writeFile(beforePath, `${JSON.stringify(before, null, 2)}\n`);
+	await writeFile(afterPath, `${JSON.stringify(after, null, 2)}\n`);
+	await writeFile(scopePath, `${JSON.stringify(scope, null, 2)}\n`);
+
+	const compiled = new Map<any, Uint8Array>();
+	for (const name of COMMITTED_RECORD_NAMES) compiled.set(name, await readFile(generationPath(fixture.root, name)));
+	const transaction = JSON.parse(await readFile(transactionPath(fixture.root), "utf8")) as Record<string, any>;
+	const { commit_marker: _oldMarker, ...proofWithoutMarker } = transaction.committed_proof;
+	proofWithoutMarker.content_hash = hashDelegationCommittedRecords(compiled);
+	transaction.committed_proof = {
+		...proofWithoutMarker,
+		commit_marker: delegationCommitMarker(proofWithoutMarker),
+	};
+	await writeFile(generationPath(fixture.root, "commit-marker.json"), `${JSON.stringify(transaction.committed_proof, null, 2)}\n`);
+	await writeFile(transactionPath(fixture.root), `${JSON.stringify(transaction, null, 2)}\n`);
+}
+
 test("review v2 fixture: reverse journal order builds, commits, and strict-reads canonical W digests", async () => {
 	const fixture = await setupReviewFixture(["src/a.ts", "src/b.ts"], undefined, ["src/b.ts", "src/a.ts"]);
 	try {
@@ -339,8 +447,52 @@ test("review v2 fixture: reverse journal order builds, commits, and strict-reads
 		assert.deepEqual(Object.keys(after.path_digests), ["src/a.ts", "src/b.ts"]);
 		const strict = await readDelegationCommittedGenerationV2(fixture.root, ID);
 		assert.equal(strict.ok, true, strict.ok ? "" : JSON.stringify(strict.error));
+		assert.equal(after.worker_success, true);
+		assert.equal(after.worker_failure_code, null);
+		const reviewed = await reviewDelegationV2({
+			projectRoot: fixture.root,
+			delegationId: ID,
+			exec: spawnExec,
+			now: at(4),
+		});
+		assert.equal(reviewed.ok, true, reviewed.ok ? "" : JSON.stringify(reviewed.error));
 	} finally {
 		await cleanup(fixture);
+	}
+});
+
+test("review v2: fresh worker outcome fields reject a forged pair and either single-field shape", async () => {
+	const corruptions: ReadonlyArray<{
+		name: string;
+		mutate: (after: Record<string, unknown>) => void;
+	}> = [
+		{
+			name: "forged pair",
+			mutate: (after) => {
+				after.worker_success = false;
+				after.worker_failure_code = "TIMED_OUT";
+			},
+		},
+		{ name: "worker_success only", mutate: (after) => { delete after.worker_failure_code; } },
+		{ name: "worker_failure_code only", mutate: (after) => { delete after.worker_success; } },
+	];
+	for (const corruption of corruptions) {
+		const fixture = await setupReviewFixture();
+		try {
+			await rewriteCommittedAfterRecord(fixture, corruption.mutate);
+			const strict = await readDelegationCommittedGenerationV2(fixture.root, ID);
+			assert.equal(strict.ok, false, corruption.name);
+			const reviewed = await reviewDelegationV2({
+				projectRoot: fixture.root,
+				delegationId: ID,
+				exec: spawnExec,
+				now: at(4),
+			});
+			assert.equal(reviewed.ok, false, corruption.name);
+			if (!reviewed.ok) assert.equal(reviewed.error.code, "authority_invalid", corruption.name);
+		} finally {
+			await cleanup(fixture);
+		}
 	}
 });
 
@@ -757,6 +909,202 @@ test("review v2: complete Sol REPAIR is immutable negative authority, remains Ga
 	}
 });
 
+test("review v2 terminal-negative: complete W/C packet permits only immutable Sol REPAIR and never ACCEPT or REVIEWED", async () => {
+	for (const status of ["FAILED", "INTERRUPTED"] as const) {
+		const fixture = await setupReviewFixture(
+			["src/a.ts"], undefined, ["src/a.ts"], false, false, undefined, undefined, [], status,
+		);
+		try {
+			assert.equal(fixture.state.status, status);
+			const presented = await reviewDelegationV2({
+				projectRoot: fixture.root, delegationId: ID, exec: spawnExec, now: at(4),
+			});
+			assert.equal(presented.ok, true, presented.ok ? "" : JSON.stringify(presented.error));
+			if (!presented.ok || presented.review.record === undefined) continue;
+			assert.equal(presented.finalized, false);
+			assert.equal(presented.transaction.status, status);
+			assert.equal(presented.review.record.presentation_complete, true);
+			const boundHash = presented.review.record.bound_diff_hash;
+
+			const accept = await acceptPresentedReview(fixture, boundHash, 5);
+			assert.equal(accept.ok, false);
+			if (!accept.ok) assert.equal(accept.error.code, "invalid_state");
+
+			const repairReason = `Repair the exact ${status} worker outcome without accepting its delta.`;
+			const repaired = await repairPresentedReview(fixture, boundHash, repairReason, 5);
+			assert.equal(repaired.ok, true, repaired.ok ? "" : JSON.stringify(repaired.error));
+			if (!repaired.ok) continue;
+			assert.equal(repaired.semantic_authority, "terminal_repair_required");
+			assert.equal(repaired.transaction.status, status);
+			assert.equal(repaired.finalized, false);
+
+			const ordinary = await readDelegationReviewV2(fixture.root, ID);
+			assert.equal(ordinary.ok, false, "terminal sidecar never masquerades as ordinary review authority");
+			const strict = await readDelegationTerminalNegativeReviewV1(fixture.root, ID);
+			assert.equal(strict.ok, true, strict.ok ? "" : JSON.stringify(strict.error));
+			if (strict.ok) {
+				assert.equal(strict.value.state.status, status);
+				assert.equal(strict.value.terminal_negative_repair?.decision.repair_reason, repairReason);
+				assert.equal(hasDelegationTerminalNegativeSemanticRepairAuthorityV1(strict.value), true);
+				assert.equal(hasDelegationSemanticReviewAuthorityV2(strict.value), false);
+			}
+			const durable = await readDelegationTransactionV2(fixture.root, ID);
+			assert.equal(durable.ok, true);
+			if (durable.ok) {
+				assert.equal(durable.value.status, status);
+				assert.equal(durable.value.revision, 3);
+				assert.equal(durable.value.review, null);
+			}
+		} finally {
+			await cleanup(fixture);
+		}
+	}
+});
+
+test("root observation and its reconciliation/plan consumers use the strict on-disk terminal-negative sidecar", async () => {
+	const fixture = await setupReviewFixture(
+		["src/a.ts"], undefined, ["src/a.ts"], false, false, undefined, undefined, [], "INTERRUPTED",
+	);
+	try {
+		const presented = await reviewDelegationV2({
+			projectRoot: fixture.root, delegationId: ID, exec: spawnExec, now: at(4),
+		});
+		assert.equal(presented.ok, true, presented.ok ? "" : JSON.stringify(presented.error));
+		if (!presented.ok || presented.review.record === undefined) return;
+		const beforeDecision = await readDelegationAuthorityObservationV2(fixture.root, ID);
+		assert.equal(beforeDecision.kind, "v2");
+		if (beforeDecision.kind === "v2") assert.equal(beforeDecision.semanticRepair, undefined);
+		const repaired = await repairPresentedReview(
+			fixture,
+			presented.review.record.bound_diff_hash,
+			"Repair the interrupted root through its immutable terminal-negative authority.",
+			5,
+		);
+		assert.equal(repaired.ok, true, repaired.ok ? "" : JSON.stringify(repaired.error));
+		const strict = await readDelegationTerminalNegativeReviewV1(fixture.root, ID);
+		assert.equal(strict.ok, true, strict.ok ? "" : JSON.stringify(strict.error));
+		if (!strict.ok || strict.value.terminal_negative_repair === undefined) return;
+		const decision = strict.value.terminal_negative_repair.decision;
+		const observedRoot = await readDelegationAuthorityObservationV2(fixture.root, ID);
+		assert.equal(observedRoot.kind, "v2");
+		if (observedRoot.kind === "v2") {
+			assert.equal(observedRoot.transactionStatus, "INTERRUPTED");
+			assert.equal(observedRoot.semanticRepair?.decisionHash, decision.decision_hash);
+			assert.equal(observedRoot.semanticRepair?.reasonHash, decision.repair_reason_hash);
+			assert.equal(observedRoot.semanticRepair?.expectedBindingHash, decision.expected_bound_diff_hash);
+		}
+		assert.deepEqual(await readCurrentDelegationPlanAuthority(fixture.root, ID), { status: "absent" });
+		const reconciledRoot = await reconcileProjectDelegationAuthorityV2({
+			project_root: fixture.root,
+			current_state: { status: "REVIEWED", blockedWriteAttempts: 0, updatedAt: at(5) },
+			now: at(6),
+			exec: spawnExec,
+		});
+		assert.equal(reconciledRoot.ok, true, reconciledRoot.ok ? "" : JSON.stringify(reconciledRoot.issue));
+		if (reconciledRoot.ok) assert.equal(reconciledRoot.state?.latestId, ID);
+		const lineage = bindDelegationRepairLineageV1({
+			schema_version: 1,
+			kind: "semantic-repair-lineage-v1",
+			root_delegation_id: ID,
+			repair_of: ID,
+			root_decision_hash: decision.decision_hash,
+			continuation_decision_delegation_id: ID,
+			continuation_decision_hash: decision.decision_hash,
+			parent_lineage_hash: null,
+			depth: 1,
+			carried_paths: ["src/a.ts"],
+		});
+		assert.notEqual(lineage, undefined);
+		const childId = "20260817-170006-chld";
+		const child = await persistPreparedDelegationTransaction(fixture.root, {
+			delegation_id: childId,
+			task_kind: "implementation",
+			contract_hash: fixture.state.contract_hash,
+			allowed_paths: ["src/**"],
+			worker_identity: { ...IDENTITY, worker_id: `worker:${childId}` },
+			generation: 1,
+			now: at(6),
+			repair_lineage: lineage!,
+		});
+		assert.equal(child.ok, true, child.ok ? "" : child.error.code);
+
+		const observed = await readDelegationAuthorityObservationV2(fixture.root, childId);
+		assert.equal(observed.kind, "v2");
+		if (observed.kind === "v2") {
+			assert.equal(observed.transactionStatus, "PREPARED");
+			assert.equal(observed.repairLineage?.rootDelegationId, ID);
+			assert.equal(observed.repairLineage?.rootDecisionHash, decision.decision_hash);
+		}
+
+		await writeFile(join(transactionDir(fixture.root), "terminal-negative-repair-decision.json"), "{}\n");
+		const corruptedRoot = await readDelegationAuthorityObservationV2(fixture.root, ID);
+		assert.equal(corruptedRoot.kind, "invalid-v2");
+		const corrupted = await readDelegationAuthorityObservationV2(fixture.root, childId);
+		assert.equal(corrupted.kind, "invalid-v2");
+		assert.deepEqual(await readCurrentDelegationPlanAuthority(fixture.root, ID), {
+			status: "blocked",
+			reason: "plan-generation-invalid",
+			planReferenceHash: null,
+			requiredGateIds: [],
+		});
+		const corruptedReconcile = await reconcileProjectDelegationAuthorityV2({
+			project_root: fixture.root,
+			current_state: { latestId: ID, status: "PENDING_REVIEW", currentDiffHash: decision.expected_bound_diff_hash, blockedWriteAttempts: 0, updatedAt: at(6) },
+			now: at(7),
+			exec: spawnExec,
+		});
+		assert.equal(corruptedReconcile.ok, false);
+		if (!corruptedReconcile.ok) assert.equal(corruptedReconcile.issue.code, "invalid_record");
+	} finally {
+		await cleanup(fixture);
+	}
+});
+
+test("review v2 terminal-negative: historical FAILED outcome without worker fields remains reviewable", async () => {
+	const fixture = await setupReviewFixture(
+		["src/a.ts"], undefined, ["src/a.ts"], false, false, undefined, undefined, [], "FAILED",
+	);
+	try {
+		await rewriteCommittedTerminalOutcomeAsLegacy(fixture);
+		const committed = await readDelegationCommittedGenerationV2(fixture.root, ID);
+		assert.equal(committed.ok, true, committed.ok ? "" : JSON.stringify(committed.error));
+		if (committed.ok) {
+			assert.equal(committed.value.state.status, "FAILED");
+			assert.equal(Object.hasOwn(committed.value.state.terminal_outcome!, "worker_success"), false);
+			assert.equal(Object.hasOwn(committed.value.records["after.json"] as object, "worker_success"), false);
+		}
+		const presented = await reviewDelegationV2({
+			projectRoot: fixture.root, delegationId: ID, exec: spawnExec, now: at(4),
+		});
+		assert.equal(presented.ok, true, presented.ok ? "" : JSON.stringify(presented.error));
+		if (presented.ok) {
+			assert.equal(presented.transaction.status, "FAILED");
+			assert.equal(presented.review.record?.presentation_complete, true);
+		}
+	} finally {
+		await cleanup(fixture);
+	}
+});
+
+test("review v2 terminal-negative: historical untagged diff schema is read-only and cannot start automatic terminal review", async () => {
+	const fixture = await setupReviewFixture(
+		["src/a.ts"], undefined, ["src/a.ts"], false, false, undefined, undefined, [], "FAILED",
+	);
+	try {
+		await rewriteCommittedDiffSchemaAsLegacy(fixture);
+		const committed = await readDelegationCommittedGenerationV2(fixture.root, ID);
+		assert.equal(committed.ok, true, committed.ok ? "" : JSON.stringify(committed.error));
+		const refused = await reviewDelegationV2({
+			projectRoot: fixture.root, delegationId: ID, exec: spawnExec, now: at(4),
+		});
+		assert.equal(refused.ok, false);
+		if (!refused.ok) assert.equal(refused.error.code, "authority_invalid");
+		await assert.rejects(readFile(reviewPath(fixture.root)), /ENOENT/u, "legacy diff terminal publishes no provisional packet");
+	} finally {
+		await cleanup(fixture);
+	}
+});
+
 test("review v2: strict compact SVG/JSON fact packets can terminate through Sol ACCEPT while ordinary truncated source cannot", async () => {
 	const compactFixture = await setupReviewFixture(
 		["src/large.svg", "src/bundle.json"],
@@ -1159,17 +1507,23 @@ test("review v2: historical untagged schema1 authority is full-diff replay-only 
 
 		const beforePath = generationPath(fixture.root, "before.json");
 		const afterPath = generationPath(fixture.root, "after.json");
+		const scopePath = generationPath(fixture.root, "scope.json");
 		const before = JSON.parse(await readFile(beforePath, "utf8")) as Record<string, any>;
 		const after = JSON.parse(await readFile(afterPath, "utf8")) as Record<string, any>;
+		const scope = JSON.parse(await readFile(scopePath, "utf8")) as Record<string, any>;
 		delete before.diff_identity_kind;
 		before.path_digests = {};
 		before.diff_hash = computeDiffHash(before.changed_paths, before.path_digests, before.path_statuses);
 		delete after.diff_identity_kind;
 		delete after.review_envelope;
+		delete after.command_provenance_hash;
+		delete after.effective_delta_hash;
+		delete scope.command_provenance;
 		after.path_digests = { ...current.pathDigests };
 		after.diff_hash = legacyHash;
 		await writeFile(beforePath, `${JSON.stringify(before, null, 2)}\n`);
 		await writeFile(afterPath, `${JSON.stringify(after, null, 2)}\n`);
+		await writeFile(scopePath, `${JSON.stringify(scope, null, 2)}\n`);
 
 		const compiled = new Map<any, Uint8Array>();
 		for (const name of COMMITTED_RECORD_NAMES) {

@@ -30,6 +30,15 @@ How pi-dev-workbench is built, and why. Companion docs:
    renderers read each run's own JSON records (`manifest.json`, `gates.json`,
    run-attributed `artifacts/*quant-result.json` snapshots). Renderers never
    recompute business metrics.
+5. **One durable authority, advisory session mirrors.** Delegation v2
+   transactions, immutable generations, reviews and repair sidecars under the
+   project are authoritative. Pi custom entries mirror bounded UI/recovery
+   state only; append failure after a durable transition produces a warning,
+   not reversal of the committed result.
+6. **One checkout mutation lane.** Every tool not in the closed read-only list
+   and every mutating slash command shares the fixed project lock. Nested work
+   needs the exact live token; generic cleanup is same-process exact recovery,
+   while delegation uses its transaction-aware CAS recovery.
 
 ## Module map
 
@@ -94,6 +103,10 @@ extensions/workbench-runtime/
 	│                        #   hash binding invariants, delegation/VERIFY blocking (pure)
 	├── delegation-execution-owner.ts # v2 PREPARED/RUNNING owner identity +
 	│                        #   fail-closed crash/reboot orphan reconciliation
+    ├── project-checkout-operation.ts # one shared-checkout writer lane for all
+    │                        #   production mutations + exact-token recovery
+    ├── runtime-build-identity.ts # immutable load-time source-tree hash,
+    │                        #   on-disk comparison and stale-mutation block
     ├── diff-review.ts       # P7 workbench_review_worker_diff service: real-diff scope
     │                        #   check over EVERY worker path, bound hash vs recorded
     │                        #   after hash, drift, bounded redacted patch, displayed-
@@ -122,11 +135,20 @@ extensions/workbench-runtime/
     │                        #   source session path; every truncation mode
     │                        #   marked inside the caps) and the fail-closed
     │                        #   restore/load (pure)
-    ├── state.ts             # mode persistence via Pi custom session entries
+    ├── state.ts             # mode/UI persistence via Pi custom session entries;
+    │                        #   never project delegation authority
     ├── config.ts            # project root detection, config loading, trust gate,
     │                        #   safe project_dir → effective project root resolution (P8)
     ├── recipe-schema.ts     # strict recipe validation, argv construction
     ├── recipe-runner.ts     # the single execution service (tools + commands)
+    ├── command-effect.ts    # before/after command provenance, including
+    │                        #   content identities for ignored exact outputs
+    ├── structured-sol-review*.ts # hash-bound paged Sol assessment + final
+    │                        #   cross-page decision and immutable receipt
+    ├── automatic-semantic-review-*.ts # durable idempotent review service and
+    │                        #   direct /q-review command
+    ├── exact-repair-*.ts    # strict repair authority, successor idempotency,
+    │                        #   and direct /q-repair command
     ├── runs.ts              # run ids, manifests, bounded log reads, immutable
     │                        #   Gate-attempt markers + identity-checked catalog
     ├── plan-reference.ts    # strict bounded plan_ref schema, current-byte hash
@@ -190,12 +212,21 @@ extensions/workbench-runtime/
 ```
 /q-mode-*  →  setMode()  →  pi.appendEntry("workbench-mode")   (persist)
               →  applyModeTools()  →  pi.setActiveTools(...)   (layer 1)
-session_start  →  loadModeFromEntries(entries)                 (restore)
+session_start  →  sessionManager.getBranch()                   (selected branch)
+               →  restore bounded UI/session projections
+               →  reconcile delegation projection from v2 project authority
 every tool call  →  checkToolCall(mode, tool, input)           (layer 2)
                     ├─ mode hard-denial  (AUDIT/VERIFY tool sets)
                     ├─ command guard     (bash input, token-based)
                     └─ path policy       (protected files, per mode)
+mutation boundary → compare immutable loaded source hash with disk
+                    └─ STALE → block write; /reload + /q-runtime-doctor
 ```
+
+`getEntries()` remains a read-only fallback for older test/compatibility
+contexts only. It is not the production branch-selection rule. A session
+custom entry may restore presentation preferences, but it cannot override a
+v2 transaction, generation, review, or repair sidecar.
 
 ### Controlled worker delegation
 
@@ -215,9 +246,10 @@ GPT-5.6 Sol parent in DEV
        semantic authority permits a fresh successor after live revalidation;
        VERIFY always stays blocked)
   → reconcile the bounded whole-project authority/repair graph
-  → acquire the project start lock (OS boot + PID + process-start identity),
-       re-reconcile inside it, and retain it through durable PREPARED + mirror
-       publication so sibling starts and the pre-owner crash window fail closed
+  → acquire the shared-checkout writer lane over the existing project start
+       lock (OS boot + PID + process-start identity), re-reconcile inside it,
+       and retain it through worker execution and durable delivery; session
+       mirror publication is advisory and cannot reverse durable success
   → prepare the canonical delegation-v2 transaction at
        .pi/workbench/delegations/<id>/v2/transaction.json BEFORE child launch
   → short-lived pi --mode json --no-session
@@ -237,6 +269,8 @@ GPT-5.6 Sol parent in DEV
   → per-message context tracking (max tokens/ratio, 80% soft flag),
        compaction_start counting, 90% hard-stop termination, fail-closed
        rejection of any compaction attempt or hard-budget stop
+  → cumulative spend tracking after every assistant message; a hard turn,
+       total-token, or output-token boundary terminates the bounded attempt
   → untrusted report to Sol (budget/compaction facts in details + text)
   → successful/final-failure output publishes one strictly inventoried immutable
        v2 generation; incomplete terminal or publication evidence becomes
@@ -252,13 +286,23 @@ GPT-5.6 Sol parent in DEV
        prior-hash coverage is dropped — this call's rendered paths stay
        displayed), and every segment re-runs the full scope check and the
        complete diff hash (include_paths narrows only the patch)
-  → every non-zero delta remains PENDING_REVIEW; after inspecting the complete
-       unchanged packet, Sol calls workbench_review_worker_diff with paired
-       semantic_decision=ACCEPT + the exact expected_bound_diff_hash
-  → if that complete packet is wrong, Sol instead supplies paired
-       semantic_decision=REPAIR + the exact bound hash + repair_reason;
-       immutable negative authority leaves PENDING_REVIEW/Gates blocked and
-       enables one exact fresh repair_of lineage
+  → every non-zero successful delta first remains PENDING_REVIEW; the same
+       delivery completes a bounded durable presentation and, at <=32 pages,
+       invokes the structured Sol coordinator (one closed tool call per page,
+       then a cross-page final call over every raw hash-bound page)
+  → the existing review API alone persists ACCEPT or REPAIR; nested usage and
+       receipt hash are returned. Model/protocol/drift failures preserve worker
+       success + PENDING and return exact /q-review <id>
+  → /q-review <id> runs that durable service directly without a commander
+       model turn; manual workbench_review_worker_diff remains the bounded
+       route for legacy, oversized, mechanical FAIL, or authority gaps
+  → REPAIR leaves PENDING_REVIEW/Gates blocked and enables exact /q-repair
+       <id>, which strict-reads authority and idempotently executes/returns the
+       single successor without using session-latest state
+  → a closed failed implementation with attributed partial work publishes
+       INTERRUPTED. Eligible INTERRUPTED/legacy FAILED presentation permits
+       only a distinct terminal-negative Sol REPAIR sidecar; ACCEPT and
+       ordinary REVIEWED are impossible
   → strict compact facts may completely present a large regular SVG/JSON while
        keeping generator equality NOT_VERIFIED; an ordinary single-path source
        resumes through contiguous UTF-8 pages bound to the same diff and
@@ -282,6 +326,22 @@ GPT-5.6 Sol parent in DEV
   → Sol runs final VERIFY recipes/gates → final judgment
 ```
 
+Recipe subprocesses use the same checkout lane and a separate durable
+`command-effect.json` evidence chain. Before spawn, production capture must
+obtain the workspace guard and streaming identities for every exact declared
+output (including Git-ignored files); otherwise the subprocess is not started.
+After capture, exact declared changes are `COMMAND_ATTRIBUTED`,
+`mutation:none` changes are `RECIPE_DECLARATION_VIOLATION`, broad declarations
+remain `UNKNOWN_ORIGIN`, and undeclared/out-of-contract paths are
+`OUT_OF_SCOPE`. Unknown/violation/out-of-scope/evidence-unavailable results
+fail closed, while command attribution alone never grants semantic acceptance.
+
+The current composition root uses filesystem delegation v2 authority and this
+singleton checkout lane. Strict historical path-lane admission is connected
+to delegation and revalidated after lease acquisition; it isolates known
+non-overlapping history without creating concurrent writers or accepting
+unknown provenance.
+
 ### Bounded Git completion
 
 After a non-zero implementation has finalized semantic ACCEPT authority and
@@ -295,7 +355,10 @@ Already-clean reviewed paths are recognized only when their current bytes equal
 the sealed bytes. This checkpoint binding is deliberately path-local: an
 unrelated pending/failed/diagnostic transaction, unrelated worktree changes,
 staging-state changes, and path-disjoint descendant commits do not invalidate
-it. All compatible slices are committed once; `git commit --only` plus
+it. A newer valid review may supersede an invalid historical candidate only
+when it fully covers every dirty path claimed by that candidate; partially
+uncovered or newest invalid authority remains fail-closed. All compatible
+slices are committed once; `git commit --only` plus
 before/after index verification preserves unrelated staged entries.
 
 `action=push` is a separate branch of the same structured tool. It requires an
@@ -345,11 +408,11 @@ spend dimension with the deterministic hard-stop message, and records the
 final profile/state/band/reasons facts on every run result; the
 worker-role lifecycle reads the profile from the fixed
 `WORKBENCH_WORKER_SPEND_PROFILE` child env contract (retired `low` and
-malformed/missing values fall back to `extended` defensively) and sends exactly one hidden
+malformed/missing values fall back to `standard` defensively) and sends exactly one hidden
 cumulative soft steer when the band first becomes soft/hard. Phase 3 adds
 the public profile surface: the optional `budget_profile` tool parameter
-(closed literal union `standard | extended`, default `extended`; `standard`
-is explicit for clearly small bounded slices) is resolved fail-closed by the pure contract
+(closed literal union `standard | extended`, default `standard`; `extended`
+is explicit for a justified larger slice) is resolved fail-closed by the pure contract
 check in `core/worker-policy.ts` before ledger creation/child launch, the
 resolved profile travels into the before contract
 (`before.json` → `contract.budget_profile`) and the runner (child env +
@@ -363,12 +426,12 @@ derived from the SAME persisted worker-summary spend object).
 The retired `low` literal is historical-read-only: frozen v1 metadata and
 already committed v1/v2 records remain readable and hash-verifiable, while
 new public contracts and committed generations reject it. Direct/internal
-runner input and child env `low` resolve to `extended`.
+runner input and child env `low` resolve to `standard`.
 
 Development-efficiency policy stays advisory and reuses existing evidence.
-The pure router recommends `standard` only for a fully evidenced, bounded,
-low-risk implementation; missing evidence and diagnosis recommend `extended`,
-while the explicit profile and compatible `extended` default remain effective.
+The pure router recommends `standard` for fully evidenced bounded work and
+keeps it as the fail-closed runtime default; `extended` requires an explicit
+larger-slice decision and is never inferred.
 The worker runtime may emit one session-scoped no-progress steer after three
 consecutive implementation intervals with neither a successful write nor a
 new successful recipe run id; it never loops, terminates, or changes authority,

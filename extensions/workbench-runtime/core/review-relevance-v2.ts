@@ -12,6 +12,11 @@ import { dirname, posix } from "node:path";
 
 import { canonicalHash } from "../cache/canonical-hash.ts";
 import { validateChangeSet, type ChangeSetRecord } from "./change-set.ts";
+import {
+	revalidateDelegationCommandProvenanceReceipts,
+	validateDelegationCommandProvenance,
+	type DelegationCommandProvenanceRecord,
+} from "./delegation-command-effect-provenance.ts";
 import type { ExecFn } from "./config.ts";
 import {
 	DELEGATION_TRANSACTION_HASH_RE,
@@ -39,7 +44,7 @@ export const REVIEW_RELEVANCE_MAX_PATHS_V2 = 500 as const;
 export const REVIEW_RELEVANCE_MAX_TOTAL_BYTES_V2 = 256 * 1024 * 1024;
 export const REVIEW_RELEVANCE_MAX_FILE_BYTES_V2 = 64 * 1024 * 1024;
 
-export type ReviewRelevanceRoleV2 = "W" | "D" | "S";
+export type ReviewRelevanceRoleV2 = "W" | "C" | "D" | "S";
 
 export interface ReviewRelevanceEntryV2 {
 	path: string;
@@ -55,6 +60,8 @@ export interface ReviewRelevanceProjectionV2 {
 	contract_hash: string;
 	change_set_hash: string;
 	worker_delta_hash: string;
+	/** Present only for current generations with command-effect provenance. */
+	command_provenance_hash?: string;
 	git_head: string | null;
 	entries: readonly ReviewRelevanceEntryV2[];
 }
@@ -101,6 +108,7 @@ export interface CollectReviewRelevanceV2Input {
 	contract_hash: string;
 	after_guard: Readonly<WorkspaceGuardRecord>;
 	change_set: Readonly<ChangeSetRecord>;
+	command_provenance?: Readonly<DelegationCommandProvenanceRecord>;
 	exec: ExecFn;
 	limits?: Readonly<ReviewRelevanceLimitsV2>;
 	/** Same-binding segmented/finalized replay authority. */
@@ -134,7 +142,7 @@ const FIXED_CONTROL_PATHS = [
 	".pi/workbench/gates.yaml",
 	".pi/workbench/profiles.yaml",
 ] as const;
-const ROLE_ORDER: readonly ReviewRelevanceRoleV2[] = ["W", "D", "S"];
+const ROLE_ORDER: readonly ReviewRelevanceRoleV2[] = ["W", "C", "D", "S"];
 
 function byteCompare(left: string, right: string): number {
 	return Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8"));
@@ -291,9 +299,14 @@ function controlPaths(
 	])].sort(byteCompare);
 }
 
-function roleMap(worker: readonly string[], dependencies: readonly string[], controls: readonly string[]): Map<string, ReviewRelevanceRoleV2[]> {
+function roleMap(
+	worker: readonly string[],
+	command: readonly string[],
+	dependencies: readonly string[],
+	controls: readonly string[],
+): Map<string, ReviewRelevanceRoleV2[]> {
 	const map = new Map<string, ReviewRelevanceRoleV2[]>();
-	for (const [role, paths] of [["W", worker], ["D", dependencies], ["S", controls]] as const) {
+	for (const [role, paths] of [["W", worker], ["C", command], ["D", dependencies], ["S", controls]] as const) {
 		for (const path of paths) {
 			const roles = map.get(path) ?? [];
 			if (!roles.includes(role)) roles.push(role);
@@ -337,15 +350,20 @@ export function computeReviewRelevanceConflictHashV2(input: {
 }
 
 export function validateReviewRelevanceProjectionV2(value: unknown): value is ReviewRelevanceProjectionV2 {
-	if (!isRecord(value) || !exactKeys(value, [
+	if (!isRecord(value) || !(exactKeys(value, [
 		"schema_version", "diff_identity_kind", "delegation_id", "contract_hash", "change_set_hash",
 		"worker_delta_hash", "git_head", "entries",
-	]) || value.schema_version !== REVIEW_RELEVANCE_SCHEMA_VERSION_V2
+	]) || exactKeys(value, [
+		"schema_version", "diff_identity_kind", "delegation_id", "contract_hash", "change_set_hash",
+		"worker_delta_hash", "command_provenance_hash", "git_head", "entries",
+	])) || value.schema_version !== REVIEW_RELEVANCE_SCHEMA_VERSION_V2
 		|| value.diff_identity_kind !== REVIEW_RELEVANCE_KIND_V2
 		|| typeof value.delegation_id !== "string" || !DELEGATION_TRANSACTION_ID_RE.test(value.delegation_id)
 		|| typeof value.contract_hash !== "string" || !DELEGATION_TRANSACTION_HASH_RE.test(value.contract_hash)
 		|| typeof value.change_set_hash !== "string" || !DELEGATION_TRANSACTION_HASH_RE.test(value.change_set_hash)
 		|| typeof value.worker_delta_hash !== "string" || !DELEGATION_TRANSACTION_HASH_RE.test(value.worker_delta_hash)
+		|| !(value.command_provenance_hash === undefined || (typeof value.command_provenance_hash === "string"
+			&& DELEGATION_TRANSACTION_HASH_RE.test(value.command_provenance_hash)))
 		|| (value.git_head !== null && (typeof value.git_head !== "string" || !/^[0-9a-f]{40}([0-9a-f]{24})?$/u.test(value.git_head)))
 		|| !Array.isArray(value.entries) || value.entries.length > REVIEW_RELEVANCE_MAX_PATHS_V2) return false;
 	let prior: string | undefined;
@@ -359,7 +377,8 @@ export function validateReviewRelevanceProjectionV2(value: unknown): value is Re
 			|| !validIdentity(entry.full_identity, entry.path)) return false;
 		prior = entry.path;
 	}
-	return true;
+	const hasCommandRole = value.entries.some((entry) => entry.roles.includes("C"));
+	return hasCommandRole ? value.command_provenance_hash !== undefined : true;
 }
 
 export function validateReviewRelevanceBindingV2(value: unknown): value is ReviewRelevanceBindingV2 {
@@ -381,8 +400,19 @@ export async function collectReviewRelevanceV2(
 			|| !DELEGATION_TRANSACTION_ID_RE.test(input.delegation_id) || !DELEGATION_TRANSACTION_HASH_RE.test(input.contract_hash)
 			|| !validateWorkspaceGuard(input.after_guard) || !validateChangeSet(input.change_set)
 			|| input.change_set.delegation_id !== input.delegation_id || input.change_set.contract_hash !== input.contract_hash
+			|| (input.command_provenance !== undefined
+				&& !validateDelegationCommandProvenance(input.command_provenance, input.change_set))
 			|| (input.expected_projection !== undefined && !validateReviewRelevanceProjectionV2(input.expected_projection))) {
 			return fail("invalid_input", meter);
+		}
+		if (input.command_provenance !== undefined
+			&& !await revalidateDelegationCommandProvenanceReceipts(
+				input.project_root,
+				input.command_provenance,
+				input.change_set,
+				input.after_guard,
+			)) {
+			return fail("binding_conflict", meter);
 		}
 		const collectGuard = dependencies.collect_guard ?? collectWorkspaceGuard;
 		const currentResult = await collectGuard({ project_root: input.project_root, exec: input.exec });
@@ -393,9 +423,11 @@ export async function collectReviewRelevanceV2(
 		if (current.git_head !== input.after_guard.git_head) return fail("head_conflict", meter);
 
 		const worker = input.change_set.worker_delta.map((entry) => entry.path);
+		const command = input.command_provenance?.command_delta.map((entry) => entry.path) ?? [];
+		const effective = [...new Set([...worker, ...command])].sort(byteCompare);
 		const dependenciesPaths = [...input.change_set.dependency_paths];
-		const controls = controlPaths(worker, dependenciesPaths, input.after_guard, current);
-		const roles = roleMap(worker, dependenciesPaths, controls);
+		const controls = controlPaths(effective, dependenciesPaths, input.after_guard, current);
+		const roles = roleMap(worker, command, dependenciesPaths, controls);
 		const relevancePaths = [...roles.keys()].sort(byteCompare);
 		if (relevancePaths.length > limits.max_paths) return fail("limit_exceeded", meter);
 
@@ -445,6 +477,13 @@ export async function collectReviewRelevanceV2(
 				return fail("relevant_conflict", meter, workerEntry.path);
 			}
 		}
+		for (const commandEntry of input.command_provenance?.command_delta ?? []) {
+			const currentIdentity = identityByPath.get(commandEntry.path);
+			if (currentIdentity === undefined || currentIdentity.path !== commandEntry.path
+				|| !streamingIdentityEqual(currentIdentity, commandEntry.after)) {
+				return fail("relevant_conflict", meter, commandEntry.path);
+			}
+		}
 		const entries: ReviewRelevanceEntryV2[] = relevancePaths.map((path) => ({
 			path,
 			roles: Object.freeze([...(roles.get(path) ?? [])]),
@@ -458,6 +497,9 @@ export async function collectReviewRelevanceV2(
 			contract_hash: input.contract_hash,
 			change_set_hash: input.change_set.change_set_hash,
 			worker_delta_hash: input.change_set.worker_delta_hash,
+			...(input.command_provenance === undefined ? {} : {
+				command_provenance_hash: input.command_provenance.command_provenance_hash,
+			}),
 			git_head: current.git_head,
 			entries: Object.freeze(entries.map((entry) => Object.freeze(entry))),
 		});
@@ -480,7 +522,7 @@ export async function collectReviewRelevanceV2(
 				binding,
 				projection,
 				current_guard: current,
-				worker_paths: Object.freeze([...worker]),
+				worker_paths: Object.freeze([...effective]),
 				dependency_paths: Object.freeze([...dependenciesPaths]),
 				control_paths: Object.freeze([...controls]),
 				baseline_ignored_paths: Object.freeze(baselineIgnored),

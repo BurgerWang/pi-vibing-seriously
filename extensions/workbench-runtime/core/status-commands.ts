@@ -16,6 +16,11 @@ import {
 import { loadProjectConfig } from "./config.ts";
 import { MODE_TOOLS, type WorkbenchMode } from "./mode-policy.ts";
 import {
+	doctorWorkbenchRuntimeBuildV1,
+	workbenchRuntimeBuildLinesV1,
+	workbenchRuntimeDoctorLinesV1,
+} from "./runtime-build-identity.ts";
+import {
 	renderOutputControlStatus,
 	type OutputControlTelemetryAccumulator,
 } from "./output-control-telemetry.ts";
@@ -102,6 +107,7 @@ export function registerStatusCommands(controller: StatusCommandController): voi
 				.map((tool) => tool.name)
 				.filter((name) => name.startsWith("workbench_"));
 			const lines = [
+				...workbenchRuntimeBuildLinesV1(),
 				`workbench mode : ${mode} — ${describeMode(mode)}`,
 				`cwd            : ${ctx.cwd}`,
 				`project trust  : ${ctx.isProjectTrusted() ? "trusted" : "not trusted"}`,
@@ -120,6 +126,13 @@ export function registerStatusCommands(controller: StatusCommandController): voi
 			const contextRisk = delegationContextRiskLine(ctx.sessionManager.getEntries());
 			if (contextRisk) lines.push(contextRisk);
 			controller.output(ctx, lines);
+		},
+	});
+
+	controller.pi.registerCommand("q-runtime-doctor", {
+		description: "Compare this session's loaded workbench build with the exact runtime source currently on disk",
+		handler: async (_args, ctx) => {
+			controller.output(ctx, workbenchRuntimeDoctorLinesV1(doctorWorkbenchRuntimeBuildV1()));
 		},
 	});
 
@@ -163,13 +176,14 @@ export function registerStatusCommands(controller: StatusCommandController): voi
 			controller.syncLease();
 			const trustError = controller.trustedOrError(ctx);
 			if (trustError) {
-				controller.output(ctx, [`/q-delegation-status: ${trustError}`]);
+				controller.output(ctx, [...workbenchRuntimeBuildLinesV1(), `/q-delegation-status: ${trustError}`]);
 				return;
 			}
 			const projectRoot = await controller.projectRootFor(ctx);
 			const status = await controller.delegationStatusLines(projectRoot);
 			const contextRisk = delegationContextRiskLine(ctx.sessionManager.getEntries());
-			controller.output(ctx, contextRisk ? [...status.lines, contextRisk] : status.lines);
+			const lines = [...workbenchRuntimeBuildLinesV1(), ...status.lines];
+			controller.output(ctx, contextRisk ? [...lines, contextRisk] : lines);
 			void controller.refreshStatus(ctx);
 		},
 	});

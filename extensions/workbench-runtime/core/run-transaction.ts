@@ -191,6 +191,23 @@ export async function commitRunTransaction(transaction: RunTransactionPaths, com
 			throw new Error("RUN_RECORD_COMMIT_FAILED: gate authority readback invalid");
 		}
 	}
+	if (manifest.command_effect_path !== undefined) {
+		const effectEntry = files.find((entry) => entry.path === manifest.command_effect_path);
+		const { COMMAND_EFFECT_MAX_BYTES, validateCommandEffectRecord } = await import("./command-effect.ts");
+		if (!effectEntry || effectEntry.bytes <= 0 || effectEntry.bytes > COMMAND_EFFECT_MAX_BYTES) {
+			throw new Error("RUN_RECORD_COMMIT_FAILED: command effect missing or oversized");
+		}
+		try {
+			const effect = JSON.parse(await readFile(join(transaction.stagingDir, manifest.command_effect_path), "utf8")) as unknown;
+			if (!validateCommandEffectRecord(effect)
+				|| effect.run_id !== manifest.run_id
+				|| effect.recipe !== manifest.recipe
+				|| effect.command_effect_hash !== manifest.command_effect_hash
+				|| effect.status !== manifest.command_effect_status) throw new Error("invalid");
+		} catch {
+			throw new Error("RUN_RECORD_COMMIT_FAILED: command effect readback invalid");
+		}
+	}
 	const record: RunCommitRecordV2 = {
 		schema_version: RUN_TRANSACTION_SCHEMA_VERSION,
 		run_id: transaction.runId,

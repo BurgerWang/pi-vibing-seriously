@@ -19,6 +19,11 @@ import {
 	type ProjectDelegationStartLockLeaseV1,
 } from "./delegation-start-lock.ts";
 import {
+	acquireProjectCheckoutOperationV1,
+	releaseProjectCheckoutOperationV1,
+	type ProjectCheckoutOperationLeaseV1,
+} from "./project-checkout-operation.ts";
+import {
 	collectGitFacts,
 	contentDigest,
 	delegationsDir,
@@ -129,6 +134,9 @@ export interface LocalReviewedCommitServicesV1 {
 	collectGitFacts: typeof collectGitFacts;
 	acquireStartLock: typeof acquireProjectDelegationStartLockV1;
 	releaseStartLock: typeof releaseProjectDelegationStartLockV1;
+	/** Exact outer tool lane reentrancy; optional for historical test adapters. */
+	acquireCheckoutOperation?: typeof acquireProjectCheckoutOperationV1;
+	releaseCheckoutOperation?: typeof releaseProjectCheckoutOperationV1;
 }
 
 export const LOCAL_REVIEWED_COMMIT_SERVICES_V1: LocalReviewedCommitServicesV1 = Object.freeze({
@@ -139,6 +147,8 @@ export const LOCAL_REVIEWED_COMMIT_SERVICES_V1: LocalReviewedCommitServicesV1 = 
 	collectGitFacts,
 	acquireStartLock: acquireProjectDelegationStartLockV1,
 	releaseStartLock: releaseProjectDelegationStartLockV1,
+	acquireCheckoutOperation: acquireProjectCheckoutOperationV1,
+	releaseCheckoutOperation: releaseProjectCheckoutOperationV1,
 });
 
 function failure(
@@ -310,12 +320,18 @@ async function operationInProgress(exec: ExecFn, projectRoot: string): Promise<b
 	return false;
 }
 
+type LocalCommitLeaseV1 =
+	| { kind: "legacy"; value: ProjectDelegationStartLockLeaseV1 }
+	| { kind: "checkout"; value: ProjectCheckoutOperationLeaseV1 };
+
 async function releaseLease(
 	services: LocalReviewedCommitServicesV1,
-	lease: ProjectDelegationStartLockLeaseV1,
+	lease: LocalCommitLeaseV1,
 ): Promise<boolean> {
 	try {
-		const released = await services.releaseStartLock(lease);
+		const released = lease.kind === "legacy"
+			? await services.releaseStartLock(lease.value)
+			: await (services.releaseCheckoutOperation ?? releaseProjectCheckoutOperationV1)(lease.value);
 		return released.ok;
 	} catch {
 		return false;
@@ -340,6 +356,8 @@ export async function commitLatestReviewedDelegationV1(input: {
 	message: string;
 	now: string;
 	exec: ExecFn;
+	/** Exact guard-owned lane token; never accepted without rereading its fixed lock. */
+	checkout_operation_token?: string;
 }, services: LocalReviewedCommitServicesV1 = LOCAL_REVIEWED_COMMIT_SERVICES_V1): Promise<LocalReviewedCommitResultV1> {
 	if (typeof input.project_root !== "string" || input.project_root.length === 0
 		|| typeof input.message !== "string" || input.message.trim() !== input.message
@@ -354,13 +372,26 @@ export async function commitLatestReviewedDelegationV1(input: {
 	if (firstLatest.value === null) return failure("review_not_ready", "no reviewed delegation is available to commit");
 	const lockDelegationId = firstLatest.value.delegation_id;
 
-	const acquired = await services.acquireStartLock({
-		project_root: input.project_root,
-		delegation_id: lockDelegationId,
-		now: input.now,
-	});
-	if (!acquired.ok) return failure("lock_conflict", "another delegation or local commit is active", lockDelegationId);
-	const lease = acquired.value;
+	let lease: LocalCommitLeaseV1;
+	if (input.checkout_operation_token !== undefined) {
+		const acquired = await (services.acquireCheckoutOperation ?? acquireProjectCheckoutOperationV1)({
+			project_root: input.project_root,
+			operation_kind: "tool",
+			operation_id: "tool:workbench_git:checkpoint",
+			now: input.now,
+			reentrant_token: input.checkout_operation_token,
+		});
+		if (!acquired.ok) return failure("lock_conflict", "the guard-owned checkout lane is unavailable", lockDelegationId);
+		lease = { kind: "checkout", value: acquired.value };
+	} else {
+		const acquired = await services.acquireStartLock({
+			project_root: input.project_root,
+			delegation_id: lockDelegationId,
+			now: input.now,
+		});
+		if (!acquired.ok) return failure("lock_conflict", "another delegation or local commit is active", lockDelegationId);
+		lease = { kind: "legacy", value: acquired.value };
+	}
 	let delegationId = lockDelegationId;
 	let intentAdded = false;
 	let committedHash: string | undefined;
@@ -429,6 +460,8 @@ export async function commitLatestReviewedDelegationV1(input: {
 			}
 			const snapshot = reviewedAfterSnapshot(committed.value.records["after.json"], paths);
 			if (snapshot === undefined) {
+				// Newer strict authority already owns every live path in this historical slice.
+				if (dirtyPaths.every((path) => selectedPaths.has(path))) continue;
 				outcome = failure("authority_unavailable", "the accepted delegation lacks a valid sealed path snapshot", candidateId);
 				return outcome;
 			}

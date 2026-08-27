@@ -36,6 +36,12 @@ import {
 	type WorkerWriteJournalRuntimeFailureCode,
 	type WorkerWriteJournalRuntimeObservation,
 } from "./worker-write-journal-runtime.ts";
+import {
+	EMPTY_WORKER_COMMAND_EFFECT_RUNTIME_OBSERVATION,
+	finalizeDelegationCommandProvenance,
+	type DelegationCommandProvenanceRecord,
+	type WorkerCommandEffectRuntimeObservation,
+} from "./delegation-command-effect-provenance.ts";
 import { isStrictStreamingIdentityPath } from "./streaming-identity.ts";
 import {
 	createWorkerWriteJournal,
@@ -74,6 +80,8 @@ export interface PreparedDelegationChangeSetLifecycleV2 {
 export interface FinalizeDelegationChangeSetLifecycleV2Input {
 	prepared: Readonly<PreparedDelegationChangeSetLifecycleV2>;
 	observation: Readonly<WorkerWriteJournalRuntimeObservation>;
+	/** Optional only for historical/direct callers; production always supplies it. */
+	command_effect_observation?: Readonly<WorkerCommandEffectRuntimeObservation>;
 	exec: ExecFn;
 }
 
@@ -82,6 +90,8 @@ export interface FinalizedDelegationChangeSetLifecycleV2 {
 	sealed_journal: Readonly<WorkerWriteJournalRecord>;
 	after_guard: Readonly<WorkspaceGuardRecord>;
 	change_set: Readonly<ChangeSetRecord>;
+	/** Absent only on historical/source-compatible v2 fixtures and records. */
+	command_provenance?: Readonly<DelegationCommandProvenanceRecord>;
 }
 
 export type DelegationChangeSetLifecycleV2ErrorCode =
@@ -94,7 +104,8 @@ export type DelegationChangeSetLifecycleV2ErrorCode =
 	| "seal_failed"
 	| "sealed_journal_invalid"
 	| "after_guard_failed"
-	| "finalizer_failed";
+	| "finalizer_failed"
+	| "command_provenance_failed";
 
 export type DelegationChangeSetLifecycleV2FailureCause =
 	| "exception"
@@ -167,6 +178,7 @@ const PREPARED_FIELDS = [
 	"schema_version", "project_root", "delegation_id", "contract_hash", "dependency_paths", "before_guard", "journal",
 ] as const;
 const FINALIZE_INPUT_FIELDS = ["prepared", "observation", "exec"] as const;
+const FINALIZE_INPUT_FIELDS_WITH_COMMAND_EFFECT = ["prepared", "observation", "command_effect_observation", "exec"] as const;
 const OBSERVATION_FIELDS = ["state", "tool", "outcome", "code", "revision"] as const;
 const PREPARE_DEPENDENCY_FIELDS = ["create_journal", "collect_guard", "journal_options", "guard_options"] as const;
 const FINALIZE_DEPENDENCY_FIELDS = [
@@ -184,6 +196,7 @@ const ERROR_MESSAGES: Readonly<Record<DelegationChangeSetLifecycleV2ErrorCode, s
 	sealed_journal_invalid: "delegation ChangeSet sealed journal is invalid",
 	after_guard_failed: "delegation ChangeSet after guard collection failed",
 	finalizer_failed: "delegation ChangeSet finalization failed",
+	command_provenance_failed: "delegation command-effect provenance finalization failed",
 });
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -474,7 +487,8 @@ export async function finalizeDelegationChangeSetLifecycleV2(
 	dependenciesValue?: FinalizeDelegationChangeSetLifecycleV2Dependencies,
 ): Promise<FinalizeDelegationChangeSetLifecycleV2Result> {
 	try {
-		const input = exactDataRecord(inputValue, FINALIZE_INPUT_FIELDS);
+		const input = exactDataRecord(inputValue, FINALIZE_INPUT_FIELDS_WITH_COMMAND_EFFECT)
+			?? exactDataRecord(inputValue, FINALIZE_INPUT_FIELDS);
 		const dependencies = finalizeDependencies(dependenciesValue);
 		if (input === undefined || dependencies === undefined || !validPrepared(input.prepared) || typeof input.exec !== "function") {
 			return failure("invalid_input");
@@ -556,12 +570,25 @@ export async function finalizeDelegationChangeSetLifecycleV2(
 		if (!validateChangeSet(finalized.value) || finalized.value.delegation_id !== prepared.delegation_id
 			|| finalized.value.contract_hash !== prepared.contract_hash
 			|| finalized.value.journal_hash !== sealed.value.journal_hash) return failure("finalizer_failed", "invalid_result");
+		const commandProvenance = await finalizeDelegationCommandProvenance({
+			project_root: prepared.project_root,
+			delegation_id: prepared.delegation_id,
+			contract_hash: prepared.contract_hash,
+			before_guard: prepared.before_guard,
+			after_guard: after.guard,
+			change_set: finalized.value,
+			observation: (input.command_effect_observation as Readonly<WorkerCommandEffectRuntimeObservation> | undefined)
+				?? EMPTY_WORKER_COMMAND_EFFECT_RUNTIME_OBSERVATION,
+		});
+		if (!commandProvenance.ok) return failure("command_provenance_failed",
+			commandProvenance.code === "identity_unavailable" ? "identity_failure" : "invalid_result");
 
 		const value = immutableSnapshot({
 			prepared,
 			sealed_journal: sealed.value,
 			after_guard: after.guard,
 			change_set: finalized.value,
+			command_provenance: commandProvenance.value,
 		});
 		return value === undefined ? failure("finalizer_failed", "invalid_result") : { ok: true, value };
 	} catch {

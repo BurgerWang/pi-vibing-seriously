@@ -205,6 +205,18 @@ test("expanded recipe renderer shows recipe, duration, exit code, artifacts and 
 	assert.ok(lines.includes("cache mode : default"));
 });
 
+test("expanded recipe renderer surfaces durable command-effect status without granting acceptance", () => {
+	const lines = renderRecipeLines({
+		...RECIPE,
+		command_effect_status: "RECIPE_DECLARATION_VIOLATION",
+		command_effect_path: ".pi/workbench/runs/20260801-004/command-effect.json",
+		command_effect_warning: "COMMAND_EFFECT_EVIDENCE_UNAVAILABLE",
+	}, true);
+	assert.ok(lines.some((line) => line.includes("RECIPE_DECLARATION_VIOLATION")), lines.join("\n"));
+	assert.ok(lines.some((line) => line.includes("COMMAND_EFFECT_EVIDENCE_UNAVAILABLE")), lines.join("\n"));
+	assert.ok(lines.some((line) => line.includes("command-effect.json")), lines.join("\n"));
+});
+
 test("Phase 2B: recipe renderer shows declared components and cache mode, fails closed when absent", () => {
 	// Declared facts render exactly as declared.
 	const expanded = renderRecipeLines(RECIPE, true).join("\n");

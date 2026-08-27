@@ -76,6 +76,9 @@ function fakeExec(options: FakeExecOptions = {}): ExecFn & { recipeCalls: number
 	const fn = (async (command: string, args: string[], opts?: { timeout?: number; signal?: AbortSignal }) => {
 		if (command === "git") {
 			state.gitCalls += 1;
+			if (args[0] === "rev-parse" && args[1] === "HEAD") {
+				return { stdout: `${"a".repeat(40)}\n`, stderr: "", code: 0, killed: false };
+			}
 			return { stdout: "", stderr: "", code: 0, killed: false };
 		}
 		const tool = (options.toolchain ?? {})[command];
@@ -270,7 +273,7 @@ test("lifecycle: argv change -> miss", async () => {
 	});
 });
 
-test("lifecycle: failure is NOT cached by default; explicit successOnly=false caches it", async () => {
+test("lifecycle: failed runs are never cache authority, including legacy successOnly=false declarations", async () => {
 	await withTempDir(async (root) => {
 		await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"]) });
 		const exec = fakeExec({ recipeCode: 1, recipeStdout: "boom" });
@@ -283,16 +286,17 @@ test("lifecycle: failure is NOT cached by default; explicit successOnly=false ca
 		assert.equal(again.cache?.status, "miss");
 		assert.equal(exec.recipeCalls, 2, "failure runs always execute");
 
-		// Explicit successOnly=false caches failures too.
+		// A legacy successOnly=false declaration cannot override the runOk
+		// provenance boundary: failed runs never enter the action store.
 		await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"], { successOnly: false }) });
 		const third = await run(root, exec);
 		assert.equal(third.ok, false);
 		assert.equal(third.cache?.status, "miss");
-		assert.equal(await countActionRecords(root), 1);
+		assert.equal(await countActionRecords(root), 0);
 		const fourth = await run(root, exec);
-		assert.equal(fourth.cache?.status, "hit");
-		assert.equal(fourth.ok, false, "cached failure reproduces the failure");
-		assert.equal(exec.recipeCalls, 3);
+		assert.equal(fourth.cache?.status, "miss");
+		assert.equal(fourth.ok, false);
+		assert.equal(exec.recipeCalls, 4, "every failed run executes and produces fresh evidence");
 	});
 });
 
@@ -1360,7 +1364,7 @@ test("P4a: concurrent locked/double-checked hit persists evidence on both termin
 	});
 });
 
-test("P4a: a cached failure persists unsuccessful source=cache evidence and still reproduces the failure", async () => {
+test("P4a: successOnly=false cannot turn an unsuccessful run into cache authority", async () => {
 	await withTempDir(async (root) => {
 		await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"], { successOnly: false }) });
 		const exec = fakeExec({ recipeCode: 1 });
@@ -1368,10 +1372,12 @@ test("P4a: a cached failure persists unsuccessful source=cache evidence and stil
 		assert.equal(first.ok, false);
 		assert.equal(first.cache?.status, "miss");
 		const second = await run(root, exec);
-		assert.equal(second.cache?.status, "hit");
-		assert.equal(second.ok, false, "P4 evidence must never flip a cached failure into a success");
+		assert.equal(second.cache?.status, "miss");
+		assert.equal(second.ok, false);
+		assert.equal(exec.recipeCalls, 2);
+		assert.equal(await countActionRecords(root), 0);
 		const manifest = await readManifest(root, second.record!.run_id);
-		assert.deepEqual(manifest?.validation_evidence?.binding?.outcome, { successful: false, complete: true, source: "cache" });
+		assert.deepEqual(manifest?.validation_evidence?.binding?.outcome, { successful: false, complete: true, source: "exec" });
 	});
 });
 
@@ -1841,7 +1847,7 @@ test("P4b/P6-C separation: a read never auto-executes — an explicit --refresh-
 	});
 });
 
-test("P4b/P6-C separation: failed/cached-failure outcomes are never flipped by a read — fail-closed RERUN_REQUIRED verdicts through the registered surface, the failure still reproduces on the next explicit invocation", async () => {
+test("P4b/P6-C separation: failed outcomes stay uncached and reads never change the next explicit execution", async () => {
 	await withTempDir(async (root) => {
 		await makeProject(root, { "src/a.ts": "x" }, { cache: cacheYaml(["src/**/*.ts"], { successOnly: false }) });
 		const exec = fakeExec({ recipeCode: 1, recipeStdout: "boom" });
@@ -1852,7 +1858,8 @@ test("P4b/P6-C separation: failed/cached-failure outcomes are never flipped by a
 		const readRun = stub.tools.get("workbench_read_run") as unknown as ReadRunTool;
 		assert.ok(recipeTool && readRun, "workbench_run_recipe and workbench_read_run registered");
 
-		// explicit failing invocation: miss that caches the failure (successOnly=false)
+		// Explicit failing invocation: miss, but never a cache write even when the
+		// legacy declaration says successOnly=false.
 		const first = await recipeTool.execute("call-1", { recipe: "hello" }, undefined, undefined, trustedCtx(root) as never);
 		const firstDetails = first.details as unknown as RecipeToolDetails;
 		assert.equal(firstDetails.status, "FAILED", toolText(first));
@@ -1863,7 +1870,7 @@ test("P4b/P6-C separation: failed/cached-failure outcomes are never flipped by a
 		assert.equal(exec.recipeCalls, 1);
 		const storeBefore = await snapshotCacheStore(root);
 		const runsBefore = await runsEntries(root);
-		const recordBefore = await readFile(join(cacheDir(root), "actions", `${actionKey}.json`));
+		assert.equal(await countActionRecords(root), 0);
 
 		// registered read of the FAILED exec run: status stays FAILED and the
 		// exact fail-closed verdict renders through the registered surface
@@ -1885,28 +1892,28 @@ test("P4b/P6-C separation: failed/cached-failure outcomes are never flipped by a
 		assert.deepEqual(await runsEntries(root), runsBefore, "the read added no run record");
 		assert.equal(exec.recipeCalls, 1, "the read never re-executed the failing recipe");
 
-		// the next explicit default invocation still HITS the cached failure and
-		// reproduces it — the read neither auto-executed nor flipped the outcome
+		// The next explicit invocation still executes and fails. The intervening
+		// read neither created cache authority nor flipped the outcome.
 		const second = await recipeTool.execute("call-3", { recipe: "hello" }, undefined, undefined, trustedCtx(root) as never);
 		const secondDetails = second.details as unknown as RecipeToolDetails;
-		assert.equal(secondDetails.cache.status, "hit", toolText(second));
-		assert.equal(secondDetails.cache.actionKey, actionKey, "same action key for the cached failure");
-		assert.equal(secondDetails.status, "FAILED", "a cached failure reproduces the failure — never flipped by the read");
+		assert.equal(secondDetails.cache.status, "miss", toolText(second));
+		assert.equal(secondDetails.cache.actionKey, actionKey, "same action key for the repeated failed execution");
+		assert.equal(secondDetails.status, "FAILED", "the fresh failed execution remains failed");
 		assert.equal(secondDetails.exit_code, 1);
-		assert.equal(exec.recipeCalls, 1, "the cached-failure hit does not re-execute");
-		assert.deepEqual(await readFile(join(cacheDir(root), "actions", `${actionKey}.json`)), recordBefore, "the hit never rewrites the failure record");
+		assert.equal(exec.recipeCalls, 2, "failed runs are re-executed because no cache authority exists");
+		assert.equal(await countActionRecords(root), 0);
 		const storeAfterHit = await snapshotCacheStore(root);
-		assert.deepEqual(storeAfterHit.entries, storeBefore.entries, "no store paths changed by the cached-failure hit (index touch only)");
-		assert.equal((await runsEntries(root)).length, runsBefore.length + 1, "exactly one new run manifest from the explicit cached-failure hit");
+		assert.deepEqual(storeAfterHit.entries, storeBefore.entries, "no cache record was created by the repeated failure");
+		assert.equal((await runsEntries(root)).length, runsBefore.length + 1, "exactly one new run manifest from the explicit repeated execution");
 
-		// registered read of the CACHED-failure run: still FAILED, still the exact
-		// fail-closed verdict (unsuccessful source=cache evidence is never reusable)
+		// Registered read of the second failed exec run: still FAILED and still
+		// fail-closed as an unsuccessful source.
 		const read2 = await readRun.execute("call-4", { run_id: secondDetails.run_id }, undefined, undefined, trustedCtx(root) as never);
 		const text2 = toolText(read2);
 		assert.ok(text2.split("\n").includes("status     : FAILED"), text2);
 		assert.ok(text2.split("\n").includes("validation : RERUN_REQUIRED — unsuccessful-source"), text2);
 		assert.deepEqual(read2.details.validation, { status: "RERUN_REQUIRED", reasons: ["unsuccessful-source"] });
-		assertStoreUnchanged(storeAfterHit, await snapshotCacheStore(root), "after reading the cached-failure run");
-		assert.equal(exec.recipeCalls, 1, "reads never executed anything");
+		assertStoreUnchanged(storeAfterHit, await snapshotCacheStore(root), "after reading the repeated failed run");
+		assert.equal(exec.recipeCalls, 2, "reads never executed anything");
 	});
 });

@@ -29,6 +29,7 @@ import { buildGateParentSummary } from "./result-summary.ts";
 import { isPureLegacyRunForDiagnostic, isValidRunId, readCommittedManifest, readManifest } from "./runs.ts";
 import { renderGatePreflightLines, type GatePreflightToolDetails } from "./render.ts";
 import type { RecipeMutationFacts } from "./worker-policy.ts";
+import { runProjectCheckoutOperationV1 } from "./project-checkout-operation.ts";
 
 export interface GateCommandController {
 	pi: Pick<ExtensionAPI, "registerCommand">;
@@ -36,7 +37,7 @@ export interface GateCommandController {
 	getDelegationState(): DelegationState;
 	getActorFacts(): RecipeMutationFacts;
 	getProjectAuthorityBlockReason(action: "verify"): string | undefined;
-	reconcileProjectAuthority(projectRoot: string, now: string): Promise<unknown>;
+	reconcileProjectAuthority(projectRoot: string, now: string): Promise<boolean>;
 	buildWorkerFirstFacts(projectRoot: string, now: string): Promise<WorkerFirstGateFacts>;
 	exec: ExecFn;
 	trustedOrError(ctx: ExtensionCommandContext): string | undefined;
@@ -103,17 +104,20 @@ export function registerGateCommands(controller: GateCommandController): void {
 				controller.output(ctx, ["/q-gate: usage: /q-gate <gate-id|base|quant|all> [--preflight] [manual:<check-id>=<evidence> ...]"]);
 				return;
 			}
+			const trustError = controller.trustedOrError(ctx);
+			if (trustError) {
+				controller.output(ctx, [`/q-gate: ${trustError}`]);
+				return;
+			}
 			const projectRoot = await controller.projectRootFor(ctx);
-			if (!preflight) await controller.reconcileProjectAuthority(projectRoot, now());
+			if (!preflight && !await controller.reconcileProjectAuthority(projectRoot, now())) {
+				controller.output(ctx, ["/q-gate: checkout authority recovery is unavailable"]);
+				return;
+			}
 			const gateBlock = controller.getProjectAuthorityBlockReason("verify")
 				?? reviewBlockReason(controller.getDelegationState(), "verify");
 			if (!preflight && controller.getMode() === "VERIFY" && gateBlock) {
 				controller.output(ctx, [`/q-gate: ${gateBlock}`]);
-				return;
-			}
-			const trustError = controller.trustedOrError(ctx);
-			if (trustError) {
-				controller.output(ctx, [`/q-gate: ${trustError}`]);
 				return;
 			}
 			try {
@@ -135,19 +139,35 @@ export function registerGateCommands(controller: GateCommandController): void {
 					controller.output(ctx, renderGatePreflightLines(details, true));
 					return;
 				}
-				const workerFirstFacts = await controller.buildWorkerFirstFacts(projectRoot, now());
-				const result = await runGates({
-					projectRoot,
-					selector,
-					mode: controller.getMode(),
-					exec: controller.exec,
-					signal: ctx.signal,
-					manualEvidence,
-					manualEvidenceProvenance: "user-command",
-					workerFirstFacts,
-					actorFacts: controller.getActorFacts(),
+				const operation = await runProjectCheckoutOperationV1({
+					project_root: projectRoot,
+					operation_kind: "command",
+					operation_id: `command:q-gate:${selector}`.slice(0, 256),
+					now: now(),
+				}, async () => {
+					const workerFirstFacts = await controller.buildWorkerFirstFacts(projectRoot, now());
+					return runGates({
+						projectRoot,
+						selector,
+						mode: controller.getMode(),
+						exec: controller.exec,
+						signal: ctx.signal,
+						manualEvidence,
+						manualEvidenceProvenance: "user-command",
+						workerFirstFacts,
+						actorFacts: controller.getActorFacts(),
+					});
 				});
-				controller.output(ctx, gateParentSummaryLines(result, projectRoot));
+				if (!operation.ok) {
+					controller.output(ctx, [`/q-gate: checkout writer lane ${operation.error.code}`]);
+					return;
+				}
+				controller.output(ctx, [
+					...gateParentSummaryLines(operation.value, projectRoot),
+					...(operation.release === "recovery_required"
+						? ["warning: gate completed but checkout lock cleanup requires recovery"]
+						: []),
+				]);
 				void controller.refreshStatus(ctx);
 				void controller.refreshWidget(ctx);
 			} catch (error) {

@@ -4,10 +4,13 @@ import test from "node:test";
 import {
 	DELEGATION_CLAIM_GUARD_CODE,
 	DELEGATION_CLAIM_GUARD_SCHEMA,
+	exactRepairCommandIdV1,
+	exactRepairToolArgumentsV1,
 	inspectDelegationClaims,
 	registerDelegationClaimGuard,
 	validateDelegationClaims,
 } from "../extensions/workbench-runtime/core/delegation-claim-guard-controller.ts";
+import { normalizeDelegationBoundedTaskContractV2 } from "../extensions/workbench-runtime/core/delegation-transaction-artifacts.ts";
 
 const REAL_ID = "20260822-105301-zn8s";
 const FAKE_IDS = [
@@ -15,6 +18,130 @@ const FAKE_IDS = [
 	"20260822-125504-Nd0d",
 	"20260822-125844-gG6g",
 ] as const;
+
+test("exact repair command parser accepts only a standalone execution command", () => {
+	assert.equal(exactRepairCommandIdV1(`执行：repair_of=${REAL_ID}`), REAL_ID);
+	assert.equal(exactRepairCommandIdV1(`execute repair_of=${REAL_ID}.`), REAL_ID);
+	assert.equal(exactRepairCommandIdV1(`repair_of=${REAL_ID}`), REAL_ID);
+	assert.equal(exactRepairCommandIdV1(`请解释 repair_of=${REAL_ID}`), undefined);
+	assert.equal(exactRepairCommandIdV1(`repair_of=${REAL_ID} 然后 checkpoint`), undefined);
+});
+
+test("exact repair directive recovers the committed contract and changes only repair provenance", () => {
+	const prior = normalizeDelegationBoundedTaskContractV2({
+		task_kind: "implementation",
+		task: "Correct the rejected implementation under its exact semantic decision.",
+		allowed_paths: ["src/a.ts", "tests/a.test.ts"],
+		acceptance_criteria: ["The rejected behavior is corrected.", "Focused verification passes."],
+		verification: ["recipe:focused"],
+		timeout_seconds: 900,
+		budget_profile: "extended",
+		repair_of: "20260821-090000-root",
+	});
+	assert.ok(prior.ok);
+	const arguments_ = exactRepairToolArgumentsV1({
+		state: {
+			delegation_id: REAL_ID,
+			status: "PENDING_REVIEW",
+			task_kind: "implementation",
+			contract_hash: prior.value.contract_hash,
+		},
+		records: { "before.json": { contract: prior.value } },
+	}, REAL_ID);
+	assert.ok(arguments_);
+	assert.equal(arguments_.repair_of, REAL_ID);
+	assert.equal(arguments_.task, prior.value.task);
+	assert.deepEqual(arguments_.allowed_paths, prior.value.allowed_paths);
+	assert.deepEqual(arguments_.acceptance_criteria, prior.value.acceptance_criteria);
+	assert.deepEqual(arguments_.verification, prior.value.verification);
+});
+
+test("raw exact-repair prose receives only a compatibility notice for the deterministic q-repair route", async () => {
+	const prior = normalizeDelegationBoundedTaskContractV2({
+		task_kind: "implementation",
+		task: "Correct the rejected implementation under its exact semantic decision.",
+		allowed_paths: ["src/a.ts"],
+		acceptance_criteria: ["The rejected behavior is corrected."],
+		verification: ["recipe:focused"],
+		timeout_seconds: 900,
+		budget_profile: "extended",
+	});
+	assert.ok(prior.ok);
+	const committed = {
+		state: {
+			delegation_id: REAL_ID,
+			status: "PENDING_REVIEW",
+			task_kind: "implementation",
+			contract_hash: prior.value.contract_hash,
+		},
+		records: { "before.json": { contract: prior.value } },
+	};
+	const state = stub();
+	registerDelegationClaimGuard({
+		pi: {
+			on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+				const handlers = state.handlers.get(name) ?? [];
+				handlers.push(handler);
+				state.handlers.set(name, handlers);
+			},
+		} as never,
+		isCommander: () => true,
+		projectRootFor: async () => "/project",
+		getDelegationState: () => ({ latestId: REAL_ID, status: "PENDING_REVIEW" }),
+		readTransaction: (async () => ({ ok: false, error: { code: "not_found", message: "missing" } })) as never,
+		readCommittedGeneration: (async () => ({ ok: true, value: committed })) as never,
+		readReview: (async () => ({ ok: true, value: {} })) as never,
+		hasSemanticRepairAuthority: () => true,
+		readLegacyLedger: (async () => null) as never,
+		readCommittedRun: (async () => null) as never,
+	});
+	const results = await emit(state, "before_agent_start", {
+		type: "before_agent_start",
+		prompt: `执行：repair_of=${REAL_ID}`,
+		systemPrompt: "",
+	});
+	const directive = results.find((value) => value !== undefined) as {
+		message: { customType: string; content: string; display: boolean };
+	};
+	assert.equal(directive.message.customType, "workbench-exact-repair-directive-v1");
+	assert.equal(directive.message.display, false);
+	assert.match(directive.message.content, /Compatibility notice only/u);
+	assert.match(directive.message.content, new RegExp(`/q-repair ${REAL_ID}`, "u"));
+	assert.match(directive.message.content, /without an agent turn/u);
+	assert.match(directive.message.content, /Do not call workbench_delegate_worker with repair_of/u);
+	assert.doesNotMatch(directive.message.content, /tool_arguments_json/u);
+	assert.match(directive.message.content, /no delegate execution occurred/u);
+});
+
+test("pending automatic continuation suppresses only the legacy raw-repair compatibility notice", async () => {
+	const state = stub();
+	let durableReads = 0;
+	registerDelegationClaimGuard({
+		pi: {
+			on(name: string, handler: (event: unknown, ctx: unknown) => unknown) {
+				const handlers = state.handlers.get(name) ?? [];
+				handlers.push(handler);
+				state.handlers.set(name, handlers);
+			},
+		} as never,
+		isCommander: () => true,
+		hasPendingAutomaticDeliveryContinuation: () => true,
+		projectRootFor: async () => "/project",
+		getDelegationState: () => ({ latestId: REAL_ID, status: "PENDING_REVIEW" }),
+		readTransaction: (async () => ({ ok: false, error: { code: "not_found", message: "missing" } })) as never,
+		readCommittedGeneration: (async () => { durableReads += 1; throw new Error("must not read"); }) as never,
+		readReview: (async () => { durableReads += 1; throw new Error("must not read"); }) as never,
+		readLegacyLedger: (async () => null) as never,
+		readCommittedRun: (async () => null) as never,
+	});
+	const results = await emit(state, "before_agent_start", {
+		type: "before_agent_start",
+		prompt: `执行：repair_of=${REAL_ID}`,
+		systemPrompt: "",
+	});
+	assert.equal(results.every((value) => value === undefined), true);
+	assert.equal(durableReads, 0);
+});
 
 function assistant(text: string): Record<string, unknown> {
 	return {
@@ -909,6 +1036,7 @@ function register(
 					value: { state: { delegation_id: id, status, task_kind: status === "FINISHED" ? "diagnosis" : "implementation" } },
 				};
 		}) as never,
+		readReview: (async () => ({ ok: false, error: { code: "not_found", message: "missing" } })) as never,
 		readLegacyLedger: (async () => legacyLedger ?? null) as never,
 		readCommittedRun: (async (_root: string, id: string) => {
 			const outcome = readRun(id);
@@ -943,8 +1071,11 @@ test("controller replaces fabricated final prose and never repeats its ids", asy
 	assert.match(text, /claimed_delegation_count: 1/u);
 	assert.match(text, /verified_delegation_authority_count: 0/u);
 	assert.match(text, /delegate_calls_this_turn: 0/u);
+	assert.match(text, /persistence_assessment: NOT_APPLICABLE_NO_DELEGATE_CALL/u);
 	assert.match(text, /fresh_status_facts: \[\]/u);
-	assert.match(text, /next_action: discard guessed delegation ids/u);
+	assert.match(text, /next_action: no workbench_delegate_worker call occurred in this turn/u);
+	assert.match(text, /do not infer a delegation registry or persistence failure/u);
+	assert.match(text, /discard guessed delegation ids/u);
 	assert.match(text, /claim_hash: [a-f0-9]{64}/u, "the rejected prose remains correlatable without retaining it verbatim");
 	assert.equal(text.includes(FAKE_IDS[0]), false, "the guard never reinforces a fabricated id");
 	assert.equal(finalText(message).includes(DELEGATION_CLAIM_GUARD_CODE), false, "caller message is immutable");
@@ -975,9 +1106,50 @@ test("missing authority reuses a fresh observed latest instead of requesting ano
 	assert.match(text, /claimed_delegation_count: 2/u);
 	assert.match(text, /verified_delegation_authority_count: 1/u);
 	assert.match(text, new RegExp(`fresh_status_facts: .*${REAL_ID}.*REVIEWED.*STALE`, "u"));
-	assert.match(text, new RegExp(`next_action: discard guessed delegation ids; reuse verified latest delegation ${REAL_ID}`, "u"));
+	assert.match(text, new RegExp(`next_action: no workbench_delegate_worker call occurred in this turn; .*reuse verified latest delegation ${REAL_ID}`, "u"));
+	assert.match(text, /never guess delegation_id or tool-result receipt ids/u);
 	assert.doesNotMatch(text, new RegExp(guessedId, "u"));
 	assert.equal(text.includes("query workbench_delegation_status; if"), false, "fresh status is not redundantly requested");
+});
+
+test("controller rejects the incident's exact repair execution claim when only status ran", async () => {
+	const state = stub();
+	register(state, (id) => id === REAL_ID ? "PENDING_REVIEW" : undefined, true, "PENDING_REVIEW");
+	await emit(state, "agent_start", { type: "agent_start" });
+	await emit(state, "tool_execution_end", {
+		type: "tool_execution_end",
+		toolCallId: "status-only",
+		toolName: "workbench_delegation_status",
+		isError: false,
+		result: { details: { git_refresh: "fresh" } },
+	});
+	const results = await emit(state, "message_end", {
+		type: "message_end",
+		message: assistant([
+			`已执行 \`repair_of=${REAL_ID}\`，但持久化状态仍未推进。`,
+			"当前可验证状态仍为：",
+			`- \`${REAL_ID}\``,
+			"- `REPAIR_REQUIRED`",
+			"因此该调用未被 delegation registry 接纳。",
+		].join("\n")),
+	});
+	const replacement = (results.find((value) => value !== undefined) as { message: Record<string, unknown> }).message;
+	const text = finalText(replacement);
+	assert.match(text, /reason: missing_attempt_authority/u);
+	assert.match(text, /delegate_calls_this_turn: 0/u);
+	assert.match(text, /persistence_assessment: NOT_APPLICABLE_NO_DELEGATE_CALL/u);
+	assert.match(text, new RegExp(`use deterministic /q-repair ${REAL_ID}`, "u"));
+	assert.match(text, /never call workbench_delegate_worker with raw repair_of/u);
+});
+
+test("controller permits an explicit statement that exact repair was not executed", async () => {
+	const state = stub();
+	register(state, (id) => id === REAL_ID ? "PENDING_REVIEW" : undefined, true, "PENDING_REVIEW");
+	await emit(state, "agent_start", { type: "agent_start" });
+	assert.deepEqual(await emit(state, "message_end", {
+		type: "message_end",
+		message: assistant(`未执行 \`repair_of=${REAL_ID}\`；不能判断持久化失败。`),
+	}), [undefined]);
 });
 
 test("controller rejects the exact backticked fake completion even when an older latest transaction is reviewed", async () => {
@@ -1327,7 +1499,8 @@ test("a guessed id is rejected while the same-turn durable FAILED attempt remain
 	assert.match(text, /claimed_run_count: 8/u);
 	assert.match(text, /verified_run_authority_count: 8/u);
 	assert.match(text, new RegExp(`durable_attempt_facts: .*${failedId}.*FAILED`, "u"));
-	assert.match(text, new RegExp(`repair_of=${failedId}`, "u"));
+	assert.match(text, new RegExp(`/q-repair ${failedId}`, "u"));
+	assert.match(text, /never call raw repair_of/u);
 	assert.equal(text.includes(guessedId), false, "the rejected guessed id is never repeated");
 });
 

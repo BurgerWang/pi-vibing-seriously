@@ -56,7 +56,12 @@ workbench_delegate_worker   # normal bounded implementation path
 
 After updating or reinstalling the package, run `/reload` before starting a
 new conversation. `/new` resets conversation history but does not reload the
-workbench extension code already held by the Pi process.
+workbench extension code already held by the Pi process. `/q-runtime-doctor`
+compares the immutable load-time source-tree fingerprint with the current
+on-disk fingerprint; a stale result blocks mutation until that individual Pi
+session reloads or restarts. Session restoration reads the selected Pi branch
+(`getBranch()`); sibling or abandoned branch entries cannot become the active
+projection merely because they were appended later.
 
 If a project was initialized from the pre-release local-commit draft and its
 existing `AGENTS.md` still names `workbench_commit_reviewed`, run `/q-init`
@@ -93,17 +98,22 @@ recovery never applies to `ACCEPT` or `REPAIR`, which remain exact-id/hash
 bound. TUI failures retain the controller's actionable error instead of
 collapsing to `review unavailable`, and status/footer guidance follows the
 durable transaction (`RUNNING`, `FAILED`, or `PENDING_REVIEW`) so only one next
-action is shown. Long worker runs also get
-hidden wall-clock checkpoints at 65% and 85% of the existing timeout to finish a
-coherent slice, preserve verification, and write the required handoff before the
-unchanged hard timeout. These are workflow/observability improvements, not new
-approval or Gate layers.
+action is shown. A session custom entry is only a UI/recovery projection:
+v2 transaction, generation, review, repair, and command-effect files are the
+authority. If a projection append fails after a durable transition succeeds,
+the operation still succeeds with a warning and later reconciliation rebuilds
+the projection from durable authority.
 
-For a successful diagnosis worker, the durable transaction remains `FINISHED`
-while the worker result and session review projection are `REVIEWED` because no
-implementation diff needs semantic review. The guard derives both facts from
-the strict committed diagnosis generation, including after a later delegation
-becomes the session's latest item; neither projection grants Gate authority.
+Long worker runs use actual cumulative turn/token/output boundaries. The soft
+threshold requests a coherent handoff; reaching any hard boundary terminates
+the attempt and retains its evidence for a bounded continuation. There are no
+hidden 65%/85% wall-clock workflow checkpoints.
+
+For a successful diagnosis worker, the durable transaction is `FINISHED` and
+semantic review is not required because no implementation delta exists. Any
+session `REVIEWED` value is only a non-authoritative projection of that strict
+committed diagnosis generation; it cannot turn a failed transaction into
+success and grants no Gate authority.
 
 ## The product workflow
 
@@ -119,15 +129,37 @@ The normal path is intentionally short:
 inspect → Sol contract → one Luna delivery → focused feedback → stable candidate → final verification
 ```
 
-A successful delegated implementation performs its scope check and bounded
-actual-diff review in the same call. Explicit review and status tools are
-recovery surfaces, not mandatory follow-up steps. Once semantic acceptance and
-the relevant final checks are complete, Sol can call `workbench_git` with
+A successful delegated implementation performs its scope check and completes
+its bounded mechanical presentation in the same call. At no more than 32
+pages, the runtime then invokes the structured GPT-5.6 Sol reviewer and
+persists only a hash-bound `ACCEPT` or `REPAIR`; model/protocol/drift failure
+leaves durable worker success intact and returns `/q-review <id>` for direct,
+idempotent recovery. `/q-review` and `/q-repair` execute their exact durable
+services without asking the commander model to choose or reconstruct a tool
+call. Manual `workbench_review_worker_diff` remains available for legacy,
+oversized, mechanically failed, or authority-gap cases.
+
+A closed implementation failure with attributable partial work is persisted as
+`INTERRUPTED`, not as reviewable success. Strictly eligible `INTERRUPTED` (and
+compatible committed `FAILED`) evidence may receive only a terminal-negative
+Sol `REPAIR` sidecar; `ACCEPT` and ordinary `REVIEWED` are forbidden before an
+exact `/q-repair` successor is reviewed normally.
+
+All mutation-capable Workbench tools and commands share one checkout writer
+lane, including delegation, recipes, Git completion, review/repair publication,
+and project/config writes. Reentrancy requires the exact live token; cleanup of
+a settled generic operation is same-process, exact-token recovery, never a TTL
+or guessed-PID unlock.
+
+Once semantic acceptance and the relevant final checks are complete, Sol can
+call `workbench_git` with
 `action=checkpoint` and one commit message. The runtime derives exact paths
 from durable review authority, verifies their sealed after-records, batches
 all compatible accepted slices into one commit, and preserves unrelated dirty
 and staged work. A newer unrelated pending/failed/diagnostic transaction does
-not hide an older accepted slice. Path-disjoint descendant commits and index
+not hide an older accepted slice. A malformed older candidate may be skipped
+only when a newer valid review fully supersedes all of its dirty paths; any
+uncovered invalid path still fails closed. Path-disjoint descendant commits and index
 status changes do not force semantic re-review; reviewed path-content drift,
 non-descendant history, or an intervening commit touching a still-dirty
 reviewed path still fails closed.
@@ -166,19 +198,19 @@ dead end:
 | `standard` | 32 → 64 | 5,440,000 → 10,880,000 | 160,000 → 320,000 |
 | `extended` | 64 → 96 | 10,880,000 → 17,408,000 | 320,000 → 512,000 |
 
-`extended` is the safe default for new delegations. Select `standard`
-explicitly only for a clearly small, bounded slice.
+`standard` is the bounded default for new delegations. Select `extended`
+explicitly only for a justified larger bounded slice.
 
 Soft limits request a coherent handoff and allow a bounded follow-up in the
-same Sol session. A turn marker remains visible but never kills healthy,
-tool-heavy work by itself. Cumulative total/output limits remain fail-closed
-runaway protection. Every profile also keeps the per-message 272,000-token
+same Sol session. Every hard turn, cumulative-total, or cumulative-output
+boundary terminates the bounded attempt with retained evidence. Every profile
+also keeps the per-message 272,000-token
 context guard: 217,600 soft, 244,800 hard; timeout, compaction rejection, and
 model-identity checks are unchanged.
 
 The retired `low` profile remains readable only in historical delegation
 records. New requests reject it before persistence or worker launch; old or
-internal runtime values fall back to the safe `extended` default.
+internal runtime values fall back to the bounded `standard` default.
 
 Historical DeepSeek fixtures remain only for compatibility and cache behavior;
 they are not an active worker selector.
@@ -196,6 +228,9 @@ they are not an active worker selector.
   tool-result history.
 - Streaming file identities and immutable delegation evidence for trustworthy
   worker attribution and review.
+- Durable command-effect provenance: exact declared outputs are content-bound
+  even when Git-ignored; declaration violations, unknown origin, and
+  out-of-scope effects fail closed and never imply semantic acceptance.
 - Cache telemetry, cache health checks, and content-keyed recipe result reuse.
 - Generic, stock-selection, and market-timing project templates.
 
@@ -219,9 +254,16 @@ The benchmark figures are arithmetic facts for the frozen 20-control /
 /q-runs                           list durable runs
 /q-gate base                      run the base validation ladder
 /q-delegation-status              inspect delegation/review recovery state
+/q-runtime-doctor                 compare loaded and on-disk runtime fingerprints
+/q-review <delegation-id>         directly resume one durable Sol semantic review
+/q-repair <delegation-id>         directly execute one exact durable repair
 /q-cache-status                   inspect current cache telemetry
 /q-cache-doctor                   run cache health checks
 ```
+
+`/q-review` is reserved for the deterministic durable-review command. The
+former read-only code-review prompt is `/q-code-review [scope]`; the old prompt
+name has no alias so a review request cannot accidentally start a model turn.
 
 ## Security boundary
 
@@ -235,6 +277,12 @@ The current runtime and its committed transaction/run records are the product
 authority. Historical plans, handoffs, benchmark narratives, and compatibility
 notes explain decisions but never override current code or create a required
 development step.
+
+Production uses the v2 filesystem authority and one shared-checkout writer at
+a time. Before a delegation starts, strict historical path-lane admission
+scans durable blockers and is revalidated after the checkout lease is held;
+known non-overlapping history may proceed, while overlap, unknown provenance,
+or corrupt authority still fail closed.
 
 ## Compatibility
 

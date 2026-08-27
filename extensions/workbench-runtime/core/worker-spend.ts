@@ -6,7 +6,7 @@
  * (`docs/plans/worker-token-budget-repair.md`): this module is the pure
  * policy and is **WIRED into the runtime since Phase 2** — the runner
  * accumulates the cumulative spend state after every assistant message and
- * terminates fail-closed on hard total/output consumption, and the worker-role
+ * terminates fail-closed on any hard turn/total/output dimension, and the worker-role
  * lifecycle sends exactly one hidden soft steer when the band first becomes
  * soft/hard (profile carried through the fixed `WORKER_SPEND_PROFILE_ENV`
  * child env contract). Public profile selection and ledger/handoff
@@ -16,8 +16,9 @@
  * `core/worker-budget.ts` (272,000-token window, 217,600 soft handoff /
  * 244,800 hard stop): context safety bounds any single
  * message; this policy observes cumulative turns and bounds actual cumulative
- * total/output consumption across a delegation run. Turn thresholds remain
- * compatibility telemetry and steering markers, never a stand-alone kill switch.
+ * total/output consumption across a delegation run. The hard turn boundary is
+ * also enforced so an oversized task must hand off as a bounded continuation
+ * instead of growing into an unrecoverable 200+ turn process.
  *
  * The current limits are Luna-specific and expressed in 272K context-window
  * equivalents. Every profile has a substantial continuation reserve between
@@ -35,10 +36,10 @@
  *     directly (non-negative finite; malformed → 0), independent of which
  *     path the per-message total took; a provider that omits `output`
  *     undercounts the dimension (accepted, documented heuristic guard).
- *   - Two active profiles (`extended` — the safe default, `standard` —
- *     explicit for small bounded slices), with exact soft/hard limits. The retired `low` limits remain in
+ *   - Two active profiles (`standard` — the bounded default, `extended` —
+ *     explicit for larger slices), with exact soft/hard limits. The retired `low` limits remain in
  *     this module solely to validate already-committed historical records;
- *     runtime selection always maps `low` to `extended`.
+ *     runtime selection always maps `low` to `standard`.
  *   - Band evaluation on every processed message: any hard dimension →
  *     `hard` (hard wins over soft, always); else any soft dimension →
  *     `soft`; else `ok`. The triggered-reasons list is the subset of
@@ -47,12 +48,12 @@
  *   - At most one hidden cumulative soft steer per delegation (delivered
  *     exactly like the existing context steer, `display: false`,
  *     `deliverAs: "steer"`); the steer is a request, not enforcement. Any
- *     hard total/output dimension → runner terminates and the invocation
- *     fails closed. A turn marker alone never terminates healthy work.
+ *     hard turn/total/output dimension → runner terminates the attempt and the
+ *     invocation fails closed with retained evidence for a bounded continuation.
  *
  * Malformed counters, malformed usage, and unrecognized profile values
  * never throw and never produce NaN: counters normalize to zero, and limit
- * lookups fall back to the `extended` profile (defensive mirror of
+ * lookups fall back to the `standard` profile (defensive mirror of
  * `resolveWorkerSpendProfile`).
  */
 
@@ -99,10 +100,10 @@ export interface WorkerSpendDimensionFlags {
 type SpendDimensionKey = "turns" | "totalTokens" | "outputTokens";
 
 /** Default profile for every delegation that does not explicitly request another. */
-export const WORKER_SPEND_DEFAULT_PROFILE = "extended" as const;
+export const WORKER_SPEND_DEFAULT_PROFILE = "standard" as const;
 
 /** Current model-specific spend policy; persisted for diagnostics/tests. */
-export const WORKER_SPEND_POLICY_ID = "gpt-5.6-luna-xhigh-continuation-v1" as const;
+export const WORKER_SPEND_POLICY_ID = "gpt-5.6-luna-xhigh-continuation-v2" as const;
 
 /**
  * Fixed child env contract (Phase 2 wiring): the runner passes the resolved
@@ -110,7 +111,7 @@ export const WORKER_SPEND_POLICY_ID = "gpt-5.6-luna-xhigh-continuation-v1" as co
  * lifecycle enforces the SAME profile the runner accumulates against. The
  * runner always writes a valid active `standard` | `extended` value;
  * worker-role readers map retired `low` and malformed/missing values to
- * `extended` (defensive mirror of `resolveWorkerSpendProfile`).
+ * `standard` (defensive mirror of `resolveWorkerSpendProfile`).
  */
 export const WORKER_SPEND_PROFILE_ENV = "WORKBENCH_WORKER_SPEND_PROFILE";
 
@@ -185,7 +186,7 @@ function limitValue(limits: WorkerSpendDimensionLimits, reason: WorkerSpendReaso
 	}
 }
 
-/** Defensive limit lookup: an unrecognized profile value resolves to the current default (`extended`). */
+/** Defensive limit lookup: an unrecognized profile value resolves to the bounded default (`standard`). */
 function limitsFor(profile: WorkerSpendProfile): WorkerSpendLimits {
 	return WORKER_SPEND_LIMITS[profile] ?? WORKER_SPEND_LIMITS[WORKER_SPEND_DEFAULT_PROFILE];
 }
@@ -202,7 +203,7 @@ export function isWorkerSpendProfile(value: unknown): value is ActiveWorkerSpend
 
 /**
  * Profile normalization with an explicit default: any unrecognized value
- * resolves to `WORKER_SPEND_DEFAULT_PROFILE` (`extended`). This fallback
+ * resolves to `WORKER_SPEND_DEFAULT_PROFILE` (`standard`). This fallback
  * exists only here, where a default is explicitly requested; strict
  * validation (`isWorkerSpendProfile`) still rejects unknown values.
  */
@@ -257,7 +258,7 @@ export function addWorkerSpendUsage(state: unknown, usage: unknown): WorkerSpend
  * Per-dimension soft/hard trigger flags for a state against a profile.
  * Every dimension is evaluated with `>=` semantics ("reached" means at or
  * above the limit). Malformed state normalizes to zero; an unrecognized
- * profile value resolves to the current default (`extended`) limits. The
+ * profile value resolves to the current default (`standard`) limits. The
  * historical `low` literal remains directly evaluable only for committed-record
  * compatibility; current runtime selection normalizes it before evaluation.
  */

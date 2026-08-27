@@ -16,6 +16,7 @@ import type {
 import type { WorkbenchMode } from "./mode-policy.ts";
 import { WORKBENCH_TOOL_METADATA, WORKBENCH_TOOL_PARAMETERS } from "./tool-catalog.ts";
 import { detectActorRole, type ActorFacts } from "./write-authority.ts";
+import type { ProjectCheckoutOperationLeaseV1 } from "./project-checkout-operation.ts";
 
 export interface GitToolController {
 	pi: Pick<ExtensionAPI, "registerTool">;
@@ -25,6 +26,7 @@ export interface GitToolController {
 	projectRootFor(ctx: ExtensionContext): Promise<string>;
 	getMode(): WorkbenchMode;
 	getIdentity(): ActorFacts;
+	checkoutOperationForToolCall?(toolCallId: string, projectRoot: string): ProjectCheckoutOperationLeaseV1 | undefined;
 	reconcileProjectAuthority(projectRoot: string, now: string): Promise<boolean>;
 	refreshStatus(ctx: ExtensionContext): Promise<void>;
 }
@@ -54,7 +56,7 @@ export function registerGitTool(controller: GitToolController): void {
 	controller.pi.registerTool({
 		...WORKBENCH_TOOL_METADATA.workbench_git,
 		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_git,
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
 			const trustError = controller.trustedOrError(ctx);
 			if (trustError) {
 				return {
@@ -213,11 +215,13 @@ export function registerGitTool(controller: GitToolController): void {
 					details: { ok: false, code: "authority_unavailable" },
 				};
 			}
+			const checkoutOperation = controller.checkoutOperationForToolCall?.(toolCallId, projectRoot);
 			const result = await controller.services.commitReviewed({
 				project_root: projectRoot,
 				message: params.message,
 				now,
 				exec: controller.exec,
+				...(checkoutOperation === undefined ? {} : { checkout_operation_token: checkoutOperation.token }),
 			}, controller.services.commitServices);
 			if (!result.ok) {
 				return {

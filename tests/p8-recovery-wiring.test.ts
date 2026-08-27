@@ -44,16 +44,14 @@ import { before, test } from "node:test";
 import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import workbenchRuntime from "../extensions/workbench-runtime/index.ts";
-import { DEFAULT_RESULT_MAX_BYTES, DEFAULT_RESULT_MAX_LINES, DETAILS_MAX_BYTES, MAX_TOOL_CALLS_PER_TURN } from "../extensions/workbench-runtime/core/output-policy.ts";
+import { DEFAULT_RESULT_MAX_BYTES, DEFAULT_RESULT_MAX_LINES, DETAILS_MAX_BYTES } from "../extensions/workbench-runtime/core/output-policy.ts";
 import {
 	RECOVERY_TOOL_NAME,
 	WORKBENCH_RECEIPT_FREE_TOOL_NAMES,
 	workbenchToolRequiresReceipt,
 } from "../extensions/workbench-runtime/core/tool-catalog.ts";
-import { TURN_CALL_LIMIT_CONTROL_TEXT } from "../extensions/workbench-runtime/core/turn-output-budget.ts";
 import {
 	deriveResultId,
-	MAX_IN_FLIGHT_RECEIPTS,
 	MAX_SESSION_IDENTITY_CHARS,
 	MAX_TOOL_CALL_ID_CHARS,
 	OMISSION_MARKER,
@@ -67,7 +65,7 @@ import {
 } from "../extensions/workbench-runtime/core/tool-result-recovery.ts";
 import { WORKER_ALLOWED_PATHS_ENV, WORKER_PROJECT_ROOT_ENV, WORKER_ROLE_ENV } from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { WORKER_SPEND_PROFILE_ENV } from "../extensions/workbench-runtime/core/worker-spend.ts";
-import { spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
+import { initializeGitFixture, spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
 
 // ------------------------------------------------------------------ stubs
 
@@ -231,7 +229,14 @@ before(() => {
 // --------------------------------------------------------------- fixtures
 
 const SESSION = "p8b-wiring-session-0001";
-const TICK_RECIPES = 'recipes:\n  - name: tick\n    command: ["node", "tick.js"]\n';
+const TICK_RECIPES = [
+	"recipes:",
+	"  - name: tick",
+	'    command: ["node", "tick.js"]',
+	"    mutation: artifacts",
+	"    writes: [counter.txt]",
+	"",
+].join("\n");
 const TICK_JS = [
 	'const fs = require("node:fs");',
 	'const path = require("node:path");',
@@ -244,6 +249,7 @@ const TICK_JS = [
 async function setupProject(root: string, recipesYaml?: string): Promise<void> {
 	await writeConfigFile(root, "project.yaml", "name: p8b-wiring-test\nprofile: generic\n");
 	if (recipesYaml !== undefined) await writeConfigFile(root, "recipes.yaml", recipesYaml);
+	await initializeGitFixture(root);
 }
 
 async function tickCount(root: string): Promise<number> {
@@ -442,6 +448,7 @@ test("recovery fail-closed codes: missing, incomplete, malformed/corrupt, confli
 		const incomplete = await recoverTool.execute("call-m3", { result_id: idInc }, undefined, undefined, ctx as never);
 		assert.equal((incomplete.details as Record<string, unknown>).code, "incomplete");
 		assert.equal((incomplete.details as Record<string, unknown>).result_id, idInc);
+		await emitToolResult(stub, resultEvent(callInc, "workbench_run_recipe", "complete fixture", { ok: true }));
 
 		// malformed artifact → corrupt.
 		const callBad = "call-malformed-1";
@@ -450,6 +457,7 @@ test("recovery fail-closed codes: missing, incomplete, malformed/corrupt, confli
 		await writeFile(join(receiptsDir(root), `${idBad}.started`), "not-json{", "utf8");
 		const corrupt = await recoverTool.execute("call-m4", { result_id: idBad }, undefined, undefined, ctx as never);
 		assert.equal((corrupt.details as Record<string, unknown>).code, "corrupt");
+		await emitToolResult(stub, resultEvent(callBad, "workbench_run_recipe", "corrupt fixture", { ok: false }, true));
 
 		// conflict — both phases parse but disagree (cross-phase mismatch).
 		const callC = "call-conflict-1";
@@ -480,7 +488,7 @@ test("recovery fail-closed codes: missing, incomplete, malformed/corrupt, confli
 // 4. Begin storage failure blocks BEFORE execute
 // --------------------------------------------------------------------------
 
-test("begin storage failure blocks the tool call BEFORE execute (fail closed)", async () => {
+test("checkout authority failure blocks the tool call before receipt or execute", async () => {
 	await withTempDir(async (root) => {
 		// Make the config-dir path unusable: `.pi` becomes a regular FILE, so
 		// the receipt directory can never be created/contained. No project
@@ -496,7 +504,7 @@ test("begin storage failure blocks the tool call BEFORE execute (fail closed)", 
 			input: {},
 		});
 		assert.equal(guard.block, true, "storage failure blocks before execute");
-		assert.match(guard.reason ?? "", /storage unavailable/, "fixed storage block reason");
+		assert.match(guard.reason ?? "", /Checkout writer lane invalid_record/, "checkout authority fails before receipt storage");
 		// The underlying tool never ran: no receipt dir could exist and the
 		// registered execute is only ever called by the harness after a
 		// non-blocking guard — here it is never called.
@@ -543,10 +551,10 @@ test("finalization failure: unavailable metadata merged, started receipt left in
 });
 
 // --------------------------------------------------------------------------
-// 6. Distinct parallel calls
+// 6. Distinct sequential calls under the singleton checkout writer
 // --------------------------------------------------------------------------
 
-test("distinct parallel tool calls each get their own receipt lifecycle", async () => {
+test("distinct sequential tool calls each get their own receipt lifecycle", async () => {
 	await withTempDir(async (root) => {
 		await setupProject(root);
 		const stub = makeStub();
@@ -558,8 +566,6 @@ test("distinct parallel tool calls each get their own receipt lifecycle", async 
 		for (const callId of calls) {
 			const guard = await emitToolCall(stub, ctx, { type: "tool_call", toolCallId: callId, toolName: "workbench_run_recipe", input: {} });
 			assert.equal(guard.block, undefined, callId);
-		}
-		for (const callId of calls) {
 			const merged = await emitToolResult(stub, resultEvent(callId, "workbench_run_recipe", `result of ${callId}`, { ok: true }));
 			assert.ok(merged, `tool_result middleware merged details for ${callId}`);
 			assert.ok(merged.details, `details present for ${callId}`);
@@ -813,10 +819,10 @@ test("tool_result tool-name mismatch never finalizes: started stays incomplete, 
 });
 
 // --------------------------------------------------------------------------
-// 12. Capacity reachability: the per-turn call limit is the tighter bound
+// 12. Singleton checkout writer precedes receipt allocation
 // --------------------------------------------------------------------------
 
-test("capacity: the 16-call turn limit prevents an unreachable full map and never evicts admitted handles", async () => {
+test("the singleton checkout writer is tighter than receipt capacity and releases exactly for the next call", async () => {
 	await withTempDir(async (root) => {
 		await setupProject(root, TICK_RECIPES);
 		await writeFile(join(root, "tick.js"), TICK_JS, "utf8");
@@ -824,53 +830,33 @@ test("capacity: the 16-call turn limit prevents an unreachable full map and neve
 		workbenchRuntime(stub);
 		const ctx = trustedCtx(root, SESSION);
 
-		// A real turn clears the pending map at its boundary. Because turn_end
-		// clears it again and the hard per-turn call limit is smaller than the
-		// receipt-core capacity, a full runtime map is deliberately unreachable.
-		assert.ok(MAX_TOOL_CALLS_PER_TURN < MAX_IN_FLIGHT_RECEIPTS, "turn budget is the tighter runtime bound");
+		// A real turn clears every prior pending handle.
 		for (const handler of stub.events.get("turn_start") ?? []) {
 			await handler({ type: "turn_start", turnIndex: 0, timestamp: 1 }, ctx);
 		}
 
-		// Admit every call reachable in this turn without completing its result,
-		// leaving all sixteen receipt handles pending simultaneously.
-		const fillIds: string[] = [];
-		for (let i = 0; i < MAX_TOOL_CALLS_PER_TURN; i++) {
-			const callId = `call-cap-fill-${i}`;
-			const guard = await emitToolCall(stub, ctx, {
-				type: "tool_call",
-				toolCallId: callId,
-				toolName: "workbench_run_recipe",
-				input: {},
-			});
-			assert.equal(guard.block, undefined, callId);
-			assert.deepEqual(await receiptFiles(root, deriveResultId(SESSION, callId)), [`${deriveResultId(SESSION, callId)}.started`], `${callId} remains pending`);
-			fillIds.push(callId);
-		}
-		assert.equal(await tickCount(root), 0, "nothing executed yet");
-
-		// The next registered workbench call is blocked by the hard turn budget
-		// before receipt capacity is consulted, beginReceipt runs, or execution.
-		const excessCallId = "call-cap-excess-1";
-		const excessGuard = await emitToolCall(stub, ctx, {
-			type: "tool_call",
-			toolCallId: excessCallId,
-			toolName: "workbench_run_recipe",
-			input: { recipe: "tick" },
+		const firstCallId = "call-single-writer-a";
+		const first = await emitToolCall(stub, ctx, {
+			type: "tool_call", toolCallId: firstCallId, toolName: "workbench_run_recipe", input: {},
 		});
-		assert.equal(excessGuard.block, true, "excess call is blocked");
-		assert.equal(excessGuard.reason, TURN_CALL_LIMIT_CONTROL_TEXT, "fixed bounded turn-call-limit reason");
-		assert.deepEqual(await receiptFiles(root, deriveResultId(SESSION, excessCallId)), [], "excess call has NO receipt (blocked before begin)");
-		assert.equal(await tickCount(root), 0, "excess call did not execute");
+		assert.equal(first.block, undefined);
+		assert.deepEqual(await receiptFiles(root, deriveResultId(SESSION, firstCallId)), [`${deriveResultId(SESSION, firstCallId)}.started`]);
 
-		// Capacity was not used as an eviction mechanism: every admitted handle
-		// is retained and can still finalize successfully.
-		for (const callId of fillIds) {
-			const merged = await emitToolResult(stub, resultEvent(callId, "workbench_run_recipe", `result of ${callId}`, { ok: true }));
-			assert.ok(merged, `details merged for ${callId}`);
-			assert.ok(merged.details, `details present for ${callId}`);
-			const receiptMeta = (merged.details as Record<string, unknown>).receipt as Record<string, unknown>;
-			assert.equal(receiptMeta.available, true, callId);
-		}
+		const secondCallId = "call-single-writer-b";
+		const blocked = await emitToolCall(stub, ctx, {
+			type: "tool_call", toolCallId: secondCallId, toolName: "workbench_run_recipe", input: {},
+		});
+		assert.equal(blocked.block, true);
+		assert.match(blocked.reason ?? "", /Checkout writer lane conflict/);
+		assert.deepEqual(await receiptFiles(root, deriveResultId(SESSION, secondCallId)), [], "blocked writer creates no receipt");
+
+		await emitToolResult(stub, resultEvent(firstCallId, "workbench_run_recipe", "first complete", { ok: true }));
+		const retryCallId = "call-single-writer-c";
+		const second = await emitToolCall(stub, ctx, {
+			type: "tool_call", toolCallId: retryCallId, toolName: "workbench_run_recipe", input: {},
+		});
+		assert.equal(second.block, undefined, "settled first writer releases the exact next call");
+		assert.deepEqual(await receiptFiles(root, deriveResultId(SESSION, retryCallId)), [`${deriveResultId(SESSION, retryCallId)}.started`]);
+		await emitToolResult(stub, resultEvent(retryCallId, "workbench_run_recipe", "second complete", { ok: true }));
 	});
 });

@@ -93,7 +93,7 @@ const TOOL_FIELDS: Readonly<Record<string, readonly string[]>> = Object.freeze({
 	workbench_run_recipe: [
 		"ok", "run_id", "recipe", "status", "exit_code", "duration_ms", "artifact_paths", "stdout_log",
 		"stderr_log", "expected_exit_codes", "cache", "validation_components", "cache_request_mode", "phase",
-		"error", "blocked_reason",
+		"error", "blocked_reason", "command_effect_status", "command_effect_path", "command_effect_warning",
 	],
 	workbench_read_run: [
 		"run_id", "recipe", "kind", "status", "exit_code", "duration_ms", "profile", "mode", "started_at",
@@ -128,7 +128,10 @@ const TOOL_FIELDS: Readonly<Record<string, readonly string[]>> = Object.freeze({
 		"review_record", "next_include_paths", "patch_truncated", "error", "latest_delegation_id", "transaction_status",
 		"next_action", "repair_of",
 	],
-	workbench_delegation_status: ["git_refresh", "actor", "write_policy", "lease_status", "review_status"],
+	workbench_delegation_status: [
+		"git_refresh", "actor", "write_policy", "lease_status", "review_status",
+		"extension_build_schema", "extension_build", "extension_version", "extension_source_hash",
+	],
 	workbench_recover_tool_result: [
 		"ok", "available", "code", "result_id", "tool", "status", "path", "summary_omitted_lines",
 		"summary_omitted_bytes",

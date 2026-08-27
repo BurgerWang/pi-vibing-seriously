@@ -54,7 +54,7 @@ import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionCommandContext, type 
 import workbenchRuntime from "../extensions/workbench-runtime/index.ts";
 import { WORKER_ALLOWED_PATHS_ENV, WORKER_PROJECT_ROOT_ENV, WORKER_ROLE_ENV } from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { WORKER_SPEND_PROFILE_ENV } from "../extensions/workbench-runtime/core/worker-spend.ts";
-import { spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
+import { initializeGitFixture, spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
 
 // ------------------------------------------------------------------- caps
 
@@ -198,6 +198,7 @@ before(() => {
 async function setupProject(root: string, recipesYaml: string): Promise<void> {
 	await writeConfigFile(root, "project.yaml", "name: wiring-test\nprofile: generic\n");
 	await writeConfigFile(root, "recipes.yaml", recipesYaml);
+	await initializeGitFixture(root);
 }
 
 /** 250 noise lines + a raw marker — exceeds the default 200-line tail cap. */
@@ -871,11 +872,9 @@ test("model-callable gate tool cannot turn its own manual note into human author
 		// required check (g1.1) needs human evidence + `.pi/` gitignored
 		await setupProject(root, "recipes: []\n");
 		await writeConfigFile(root, "gates.yaml", MANUAL_GATES_YAML);
-		await writeFile(join(root, ".gitignore"), `${CONFIG_DIR_NAME}/\n`, "utf8");
 
-		// a REAL committed temp git repo — the binding binds an actual HEAD; the
-		// run record lands under the ignored `.pi/` and is never a diff fact
-		await initGitRepo(root);
+		// setupProject already established a real committed Git authority; the
+		// ignored config update above cannot alter its HEAD or source binding.
 		const committedHead = (await spawnExec("git", ["rev-parse", "HEAD"], { cwd: root })).stdout.trim();
 		assert.ok(/^[0-9a-f]{40}$/.test(committedHead), `expected a real HEAD commit, got: ${committedHead}`);
 

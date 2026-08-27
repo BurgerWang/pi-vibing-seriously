@@ -193,6 +193,41 @@ export function recordRepairDelegation(
 }
 
 /**
+ * Project an already-authorized path-lane successor into the session mirror.
+ *
+ * This transition carries no admission authority itself. The caller must have
+ * strictly enumerated every unresolved project blocker, obtained an ALLOW
+ * decision, and revalidated that same authority under the checkout writer
+ * lease immediately before PREPARED. It exists because the single-value
+ * session mirror may point at a different non-overlapping blocker than the
+ * exact project tip being repaired.
+ */
+export function recordProjectAdmittedDelegation(
+	state: DelegationState,
+	input: RecordDelegationInput,
+): DelegationTransitionResult {
+	const id = input.id.trim();
+	if (!id || id.length > MAX_ID_LENGTH || id === state.latestId) {
+		return { ok: false, error: `project-admitted delegation id must be distinct and at most ${MAX_ID_LENGTH} characters` };
+	}
+	const diffHash = input.diffHash.trim();
+	if (!diffHash || diffHash.length > MAX_HASH_LENGTH) {
+		return { ok: false, error: `delegation diff hash must be a non-empty string of at most ${MAX_HASH_LENGTH} characters` };
+	}
+	return {
+		ok: true,
+		state: {
+			latestId: id,
+			status: "PENDING_REVIEW",
+			currentDiffHash: diffHash,
+			reviewedDiffHash: undefined,
+			blockedWriteAttempts: state.blockedWriteAttempts,
+			updatedAt: input.now,
+		},
+	};
+}
+
+/**
  * Replace one exact STALE session mirror with a fresh successor delegation.
  *
  * This pure transition does NOT establish review authority. The caller must

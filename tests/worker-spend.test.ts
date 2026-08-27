@@ -4,7 +4,7 @@
  * wired into the runtime).
  *
  * Covers: the exact immutable profile constants (all 18 numbers), profile
- * selection (strict validation vs. extended safe default), per-message total
+ * selection (strict validation vs. bounded standard default), per-message total
  * normalization (reused `workerContextTokens` semantics) and independent
  * output extraction, immutable cumulative accumulation, malformed
  * counters/usage (never NaN, never a throw), the `>=` boundary matrix for
@@ -82,15 +82,15 @@ test("spend profile constants: all 18 numbers exact, immutable, ordered", () => 
 	assert.ok(WORKER_SPEND_LIMITS.low.hard.outputTokens < WORKER_SPEND_LIMITS.standard.hard.outputTokens);
 	assert.ok(WORKER_SPEND_LIMITS.standard.hard.outputTokens < WORKER_SPEND_LIMITS.extended.hard.outputTokens);
 
-	// extended is the exported safe default; steer message type is pinned.
-	assert.equal(WORKER_SPEND_DEFAULT_PROFILE, "extended");
-	assert.equal(WORKER_SPEND_POLICY_ID, "gpt-5.6-luna-xhigh-continuation-v1");
+	// standard is the exported bounded default; steer message type is pinned.
+	assert.equal(WORKER_SPEND_DEFAULT_PROFILE, "standard");
+	assert.equal(WORKER_SPEND_POLICY_ID, "gpt-5.6-luna-xhigh-continuation-v2");
 	assert.equal(WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE, "workbench-worker-spend-soft-steer");
 	assert.deepEqual(EMPTY_WORKER_SPEND_STATE, { turns: 0, totalTokens: 0, outputTokens: 0 });
 	assert.ok(Object.isFrozen(EMPTY_WORKER_SPEND_STATE));
 });
 
-test("active profile selection rejects retired low and resolves malformed or retired input to extended", () => {
+test("active profile selection rejects retired low and resolves malformed or retired input to standard", () => {
 	assert.equal(isWorkerSpendProfile("low"), false);
 	assert.equal(isWorkerSpendProfile("standard"), true);
 	assert.equal(isWorkerSpendProfile("extended"), true);
@@ -103,14 +103,14 @@ test("active profile selection rejects retired low and resolves malformed or ret
 	assert.equal(isWorkerSpendProfile(42), false);
 	assert.equal(isWorkerSpendProfile({}), false);
 
-	assert.equal(resolveWorkerSpendProfile("low"), "extended");
+	assert.equal(resolveWorkerSpendProfile("low"), "standard");
 	assert.equal(resolveWorkerSpendProfile("standard"), "standard");
 	assert.equal(resolveWorkerSpendProfile("extended"), "extended");
-	assert.equal(resolveWorkerSpendProfile(undefined), "extended");
-	assert.equal(resolveWorkerSpendProfile(null), "extended");
-	assert.equal(resolveWorkerSpendProfile(""), "extended");
-	assert.equal(resolveWorkerSpendProfile("bogus"), "extended");
-	assert.equal(resolveWorkerSpendProfile(42), "extended");
+	assert.equal(resolveWorkerSpendProfile(undefined), "standard");
+	assert.equal(resolveWorkerSpendProfile(null), "standard");
+	assert.equal(resolveWorkerSpendProfile(""), "standard");
+	assert.equal(resolveWorkerSpendProfile("bogus"), "standard");
+	assert.equal(resolveWorkerSpendProfile(42), "standard");
 });
 
 test("per-message total normalization reuses workerContextTokens semantics", () => {
@@ -333,10 +333,10 @@ test("soft steer text is deterministic and names profile, reasons, and current/s
 	const steerAll = formatWorkerSpendSteerText({ turns: 32, totalTokens: 5_440_000, outputTokens: 160_000 }, "standard");
 	assert.ok(steerAll.includes("turns 32/32, total_tokens 5440000/5440000, output_tokens 160000/160000"));
 
-	// Retired low is defensively presented under the safe extended profile.
-	const steerLow = formatWorkerSpendSteerText({ turns: 64, totalTokens: 0, outputTokens: 0 }, "low");
-	assert.match(steerLow, /profile extended/);
-	assert.ok(steerLow.includes("turns 64/64"));
+	// Retired low is defensively presented under the bounded standard profile.
+	const steerLow = formatWorkerSpendSteerText({ turns: 32, totalTokens: 0, outputTokens: 0 }, "low");
+	assert.match(steerLow, /profile standard/);
+	assert.ok(steerLow.includes("turns 32/32"));
 	const steerExtended = formatWorkerSpendSteerText({ turns: 64, totalTokens: 0, outputTokens: 0 }, "extended");
 	assert.match(steerExtended, /profile extended/);
 	assert.ok(steerExtended.includes("turns 64/64"));
@@ -361,7 +361,7 @@ test("hard-stop text is deterministic and names winning dimensions with current/
 	);
 	assert.equal(
 		formatWorkerSpendHardStop({ turns: 96, totalTokens: 0, outputTokens: 0 }, "low"),
-		`Worker cumulative spend hard budget reached (profile extended): turns 96/96.${action}`,
+		`Worker cumulative spend hard budget reached (profile standard): turns 96/64.${action}`,
 	);
 	assert.equal(
 		formatWorkerSpendHardStop({ turns: 96, totalTokens: 17_408_000, outputTokens: 512_000 }, "extended"),
@@ -406,7 +406,7 @@ test("hard-stop text derives reasons strictly from hard flags; soft-only states 
 	);
 	assert.equal(
 		formatWorkerSpendHardStop({ turns: 10, totalTokens: 0, outputTokens: 0 }, "low"),
-		`Worker cumulative spend hard budget reached (profile extended): no dimension at its hard limit.${action}`,
+		`Worker cumulative spend hard budget reached (profile standard): no dimension at its hard limit.${action}`,
 	);
 	assert.equal(
 		formatWorkerSpendHardStop({ turns: 80, totalTokens: 0, outputTokens: 0 }, "extended"),
@@ -439,7 +439,7 @@ test("spend summary formatter is deterministic with hard-limit denominators", ()
 	);
 	assert.equal(
 		formatWorkerSpendSummary({ turns: 5, totalTokens: 400_000, outputTokens: 20_000 }, "low"),
-		"spend budget : turns 5/96 | total 400000/17408000 | output 20000/512000 | profile extended",
+		"spend budget : turns 5/64 | total 400000/10880000 | output 20000/320000 | profile standard",
 	);
 	assert.equal(
 		formatWorkerSpendSummary({ turns: 50, totalTokens: 9_000_000, outputTokens: 250_000 }, "extended"),
@@ -456,7 +456,7 @@ test("spend summary formatter is deterministic with hard-limit denominators", ()
 	);
 	assert.equal(
 		formatWorkerSpendSummary(null, "low"),
-		"spend budget : turns 0/96 | total 0/17408000 | output 0/512000 | profile extended",
+		"spend budget : turns 0/64 | total 0/10880000 | output 0/320000 | profile standard",
 	);
 });
 

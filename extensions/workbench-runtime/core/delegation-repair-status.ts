@@ -9,6 +9,17 @@ import {
 	type DelegationAuthorityObservationV2,
 } from "./delegation-project-authority.ts";
 import type { DelegationState } from "./delegation-state.ts";
+import {
+	isDelegationPathLaneBypassableProjectIssueV1,
+	type DelegationPathLaneBypassableProjectIssueV1,
+} from "./delegation-path-lane-admission.ts";
+import {
+	isDelegationTerminalNegativeReviewEligibleV1,
+	readDelegationCommittedGenerationV2,
+	readDelegationTerminalNegativeSolAuthorityV1,
+} from "./delegation-transaction-storage.ts";
+import { recoverExactRepairCommandAuthorityV1 } from "./exact-repair-authority.ts";
+import { recoverRawLineageExactRepairAuthorityV1 } from "./exact-repair-raw-lineage-authority.ts";
 import { readWorkerRepairCapsule } from "./worker-repair-authority.ts";
 
 export interface DelegationRepairStatusReaderServicesV1 {
@@ -16,6 +27,8 @@ export interface DelegationRepairStatusReaderServicesV1 {
 	collectBinding: typeof collectCurrentDelegationBindingV2;
 	readRepairCapsule: typeof readWorkerRepairCapsule;
 	readRepairClosure?: typeof readProjectDelegationRepairClosureV1;
+	readCommittedGeneration?: typeof readDelegationCommittedGenerationV2;
+	readTerminalNegativeRepair?: typeof readDelegationTerminalNegativeSolAuthorityV1;
 }
 
 const DEFAULT_READER_SERVICES = Object.freeze({
@@ -23,6 +36,8 @@ const DEFAULT_READER_SERVICES = Object.freeze({
 	collectBinding: collectCurrentDelegationBindingV2,
 	readRepairCapsule: readWorkerRepairCapsule,
 	readRepairClosure: readProjectDelegationRepairClosureV1,
+	readCommittedGeneration: readDelegationCommittedGenerationV2,
+	readTerminalNegativeRepair: readDelegationTerminalNegativeSolAuthorityV1,
 }) satisfies DelegationRepairStatusReaderServicesV1;
 
 type V2Observation = Extract<DelegationAuthorityObservationV2, { kind: "v2" }>;
@@ -30,6 +45,11 @@ type V2Observation = Extract<DelegationAuthorityObservationV2, { kind: "v2" }>;
 export type DelegationRepairStatusV1 =
 	| { kind: "none" }
 	| { kind: "authority_invalid"; delegationId: string | null; code: string }
+	| {
+		kind: "historical_multiplicity";
+		delegationId: string | null;
+		code: DelegationPathLaneBypassableProjectIssueV1;
+	}
 	| { kind: "delegation_active"; delegationId: string; transactionStatus: string }
 	| {
 		kind: "delegation_retry";
@@ -38,6 +58,11 @@ export type DelegationRepairStatusV1 =
 		binding: "fresh" | "conflict" | "unavailable";
 	}
 	| { kind: "delegation_recovery"; delegationId: string; transactionStatus: string }
+	| {
+		kind: "terminal_negative_review";
+		delegationId: string;
+		transactionStatus: "INTERRUPTED" | "FAILED";
+	}
 	| {
 		kind: "repair_required";
 		delegationId: string;
@@ -91,12 +116,18 @@ export type DelegationRepairStatusV1 =
 		depth: number;
 	};
 
-/** Project-level reconcile failures override every session-local hint. */
+/**
+ * Project-level corruption overrides every session-local hint.  The two
+ * multiplicity projections are different: they describe multiple readable
+ * historical blockers and are resolved per request only by the strict,
+ * full-project path-lane admission scan.
+ */
 export function delegationProjectIssueRepairStatusV1(
 	issue: { code: string; delegationId?: string } | undefined,
 ): DelegationRepairStatusV1 | undefined {
-	return issue === undefined
-		? undefined
+	if (issue === undefined) return undefined;
+	return isDelegationPathLaneBypassableProjectIssueV1(issue.code)
+		? { kind: "historical_multiplicity", delegationId: issue.delegationId ?? null, code: issue.code }
 		: { kind: "authority_invalid", delegationId: issue.delegationId ?? null, code: issue.code };
 }
 
@@ -129,6 +160,7 @@ export function classifyDelegationRepairStatusV1(input: {
 	authority: DelegationAuthorityObservationV2;
 	binding: CurrentDelegationBindingV2;
 	retryable?: boolean;
+	terminalNegativeReviewEligible?: boolean;
 }): DelegationRepairStatusV1 {
 	if (input.authority.kind === "invalid-v2") {
 		return { kind: "authority_invalid", delegationId: input.delegationId, code: input.authority.code };
@@ -153,12 +185,23 @@ export function classifyDelegationRepairStatusV1(input: {
 				depth: authority.repairLineage.depth,
 			};
 	}
+	if (input.terminalNegativeReviewEligible === true) {
+		if (authority.repairLineage !== undefined ||
+			(authority.transactionStatus !== "INTERRUPTED" && authority.transactionStatus !== "FAILED")) {
+			return { kind: "authority_invalid", delegationId: input.delegationId, code: "terminal_negative_authority_mismatch" };
+		}
+		return {
+			kind: "terminal_negative_review",
+			delegationId: input.delegationId,
+			transactionStatus: authority.transactionStatus,
+		};
+	}
 	const lineage = authority.repairLineage;
 	if (lineage === undefined) {
 		if (["PREPARED", "RUNNING", "COMMITTING"].includes(authority.transactionStatus)) {
 			return { kind: "delegation_active", delegationId: input.delegationId, transactionStatus: authority.transactionStatus };
 		}
-		if (["FAILED", "RECOVERY_REQUIRED"].includes(authority.transactionStatus)) {
+		if (["FAILED", "INTERRUPTED", "RECOVERY_REQUIRED"].includes(authority.transactionStatus)) {
 			return input.retryable === true
 				? {
 					kind: "delegation_retry",
@@ -213,6 +256,42 @@ export function classifyDelegationRepairStatusV1(input: {
 	};
 }
 
+async function hasExecutableExactRepairAuthorityV1(input: {
+	projectRoot: string;
+	delegationId: string;
+	exec: ExecFn;
+	services: DelegationRepairStatusReaderServicesV1;
+}): Promise<boolean> {
+	const readCommitted = input.services.readCommittedGeneration ?? readDelegationCommittedGenerationV2;
+	const committed = await readCommitted(input.projectRoot, input.delegationId);
+	if (committed.ok) {
+		if (committed.value.state.status === "INTERRUPTED") {
+			const negative = await (input.services.readTerminalNegativeRepair ?? readDelegationTerminalNegativeSolAuthorityV1)(
+				input.projectRoot,
+				input.delegationId,
+			);
+			if (!negative.ok) return false;
+			const binding = await input.services.collectBinding(input.projectRoot, input.delegationId, input.exec);
+			return binding.status === "fresh" && recoverExactRepairCommandAuthorityV1({
+				repairOf: input.delegationId,
+				committed: committed.value,
+				terminalNegativeRepair: negative.value,
+				currentBindingHash: binding.hash,
+			}).ok;
+		}
+		return recoverExactRepairCommandAuthorityV1({
+			repairOf: input.delegationId,
+			committed: committed.value,
+		}).ok;
+	}
+	if (committed.error.code === "storage_failure") return false;
+	return (await recoverRawLineageExactRepairAuthorityV1({
+		project_root: input.projectRoot,
+		repair_of: input.delegationId,
+		collectCurrentBinding: (root, id) => input.services.collectBinding(root, id, input.exec),
+	})).ok;
+}
+
 export async function readDelegationRepairStatusV1(
 	projectRoot: string,
 	state: DelegationState,
@@ -222,7 +301,7 @@ export async function readDelegationRepairStatusV1(
 	try {
 		const closure = await (services.readRepairClosure ?? readProjectDelegationRepairClosureV1)(projectRoot);
 		if (!closure.ok) {
-			return { kind: "authority_invalid", delegationId: state.latestId ?? null, code: closure.issue.code };
+			return delegationProjectIssueRepairStatusV1(closure.issue)!;
 		}
 		const delegationId = closure.unresolvedTipId ?? state.latestId;
 		if (delegationId === undefined) return { kind: "none" };
@@ -230,11 +309,27 @@ export async function readDelegationRepairStatusV1(
 			services.readAuthority(projectRoot, delegationId),
 			services.collectBinding(projectRoot, delegationId, exec),
 		]);
-		const retryable = authority.kind === "v2" &&
-			["ABORTED", "FAILED", "RECOVERY_REQUIRED"].includes(authority.transactionStatus)
-			? (await services.readRepairCapsule(projectRoot, delegationId)).ok
-			: false;
-		return classifyDelegationRepairStatusV1({ delegationId, authority, binding, retryable });
+		let terminalNegativeReviewEligible = false;
+		if (authority.kind === "v2" && authority.repairLineage === undefined &&
+			(authority.transactionStatus === "INTERRUPTED" || authority.transactionStatus === "FAILED")) {
+			const committed = await (services.readCommittedGeneration ?? readDelegationCommittedGenerationV2)(projectRoot, delegationId);
+			if (!committed.ok || committed.value.state.delegation_id !== delegationId ||
+				committed.value.state.status !== authority.transactionStatus || committed.value.state.repair_lineage !== undefined) {
+				return { kind: "authority_invalid", delegationId, code: committed.ok ? "terminal_negative_authority_mismatch" : committed.error.code };
+			}
+			terminalNegativeReviewEligible = isDelegationTerminalNegativeReviewEligibleV1(committed.value.state);
+		}
+			const retryable = !terminalNegativeReviewEligible && authority.kind === "v2" &&
+				["ABORTED", "FAILED", "INTERRUPTED", "RECOVERY_REQUIRED"].includes(authority.transactionStatus)
+				? await hasExecutableExactRepairAuthorityV1({ projectRoot, delegationId, exec, services })
+				: false;
+		return classifyDelegationRepairStatusV1({
+			delegationId,
+			authority,
+			binding,
+			retryable,
+			terminalNegativeReviewEligible,
+		});
 	} catch {
 		return { kind: "authority_invalid", delegationId: state.latestId ?? null, code: "status_unavailable" };
 	}
@@ -252,27 +347,34 @@ export function delegationNextActionTextV1(
 		}
 		return `${subject} authority is ${repair.code}; repair, delegation, and VERIFY remain fail-closed`;
 	}
+	if (repair.kind === "historical_multiplicity") {
+		const exactTip = repair.delegationId === null
+			? "select an exact current repair tip before /q-repair"
+			: `run /q-repair ${repair.delegationId} only when selecting that strict current repair tip`;
+		return `project has readable historical blocker multiplicity (${repair.code}); ordinary delegation requires strict full-project path-lane admission proving every blocker known and non-overlapping; overlap or unknown authority remains blocked; ${exactTip}; VERIFY remains blocked`;
+	}
 	if (repair.kind === "delegation_active") {
 		return `delegation ${repair.delegationId} is ${repair.transactionStatus}; wait for the worker result before review or another delegation`;
 	}
 	if (repair.kind === "delegation_retry") {
 		return repair.binding === "fresh"
-			? `continue with workbench_delegate_worker repair_of=${repair.delegationId}; do not retry review`
+			? `delegation ${repair.delegationId} is ${repair.transactionStatus}, but has no committed repair lineage for deterministic /q-repair; inspect strict recovery authority before any compatibility repair and do not retry review`
 			: `delegation ${repair.delegationId} is ${repair.transactionStatus}, but its binding is ${repair.binding}; if its delta was discarded call workbench_git action=close_inactive_blocker delegation_id=${repair.delegationId}; unrelated work is preserved`;
 	}
 	if (repair.kind === "delegation_recovery") {
 		return `delegation ${repair.delegationId} is ${repair.transactionStatus}; if execution is inactive and its delta was discarded call workbench_git action=close_inactive_blocker delegation_id=${repair.delegationId}; do not retry review`;
 	}
+	if (repair.kind === "terminal_negative_review") {
+		return `run /q-review ${repair.delegationId} to publish the strict REPAIR-only Sol decision for the committed ${repair.transactionStatus} delta`;
+	}
 	if (repair.kind === "repair_required" || repair.kind === "repair_retry") {
 		if (repair.binding !== "fresh") {
 			return `delegation ${repair.delegationId} has REPAIR_REQUIRED authority but its current binding is ${repair.binding}; restore the exact bound workspace to repair, or if the rejected delta was deliberately discarded call workbench_git action=close_inactive_blocker delegation_id=${repair.delegationId}; unrelated work is preserved and no new worktree is required`;
 		}
-		return `start the exact semantic repair with workbench_delegate_worker repair_of=${repair.delegationId}`;
+		return `run /q-repair ${repair.delegationId} to execute the exact semantic repair directly from strict durable authority`;
 	}
 	if (repair.kind === "repair_terminal_retry") {
-		return repair.binding === "fresh"
-			? `continue the unresolved semantic repair with workbench_delegate_worker repair_of=${repair.delegationId}`
-			: `repair delegation ${repair.delegationId} is retryable but its current binding is ${repair.binding}; restore the exact workspace to retry, or if the rejected delta was deliberately discarded call workbench_git action=close_inactive_blocker delegation_id=${repair.delegationId}; unrelated work is preserved and no new worktree is required`;
+		return `run /q-repair ${repair.delegationId} for the deterministic lineaged terminal repair${repair.binding === "fresh" ? "" : `; current binding is ${repair.binding}, so the command will perform strict lineage-contained terminal rebase eligibility checks`}; it fails closed before worker start if authority or rebase is invalid`;
 	}
 	if (repair.kind === "repair_review") {
 		return `review repair delegation ${repair.delegationId}; explicitly ACCEPT the corrected delta or issue another REPAIR`;
@@ -299,6 +401,16 @@ export function delegationRepairStatusLinesV1(status: DelegationRepairStatusV1):
 	if (status.kind === "authority_invalid") {
 		return [`repair state : INVALID (${status.code}); no repair or Gate authority is inferred`];
 	}
+	if (status.kind === "historical_multiplicity") {
+		return [
+			`repair state : HISTORICAL_MULTIPLICITY (${status.code}); authority corruption is not inferred`,
+			"delegation   : ordinary starts require strict full-project path-lane admission; overlap or unknown authority remains BLOCKED",
+			status.delegationId === null
+				? "exact repair : select a strict current repair tip before /q-repair"
+				: `exact repair : run /q-repair ${status.delegationId} only for that strict current repair tip`,
+			"verify block : VERIFY remains BLOCKED while any historical blocker is unresolved",
+		];
+	}
 	if (status.kind === "delegation_active") {
 		return [
 			`execution v2 : ${status.transactionStatus} — review is not available yet`,
@@ -309,7 +421,7 @@ export function delegationRepairStatusLinesV1(status: DelegationRepairStatusV1):
 		return [
 			`completion v2: ${status.transactionStatus} — review is not the recovery path`,
 			status.binding === "fresh"
-				? `next action  : call workbench_delegate_worker with repair_of=${status.delegationId}`
+				? "next action  : inspect strict recovery authority; deterministic /q-repair requires a committed repair lineage"
 				: `next action  : binding is ${status.binding}; inspect status before repair`,
 		];
 	}
@@ -317,6 +429,12 @@ export function delegationRepairStatusLinesV1(status: DelegationRepairStatusV1):
 		return [
 			`completion v2: ${status.transactionStatus} — strict recovery is required`,
 			"next action  : inspect workbench_delegation_status; do not retry review",
+		];
+	}
+	if (status.kind === "terminal_negative_review") {
+		return [
+			`completion v2: ${status.transactionStatus} — committed attributed delta requires REPAIR-only Sol review`,
+			`next action  : run /q-review ${status.delegationId}`,
 		];
 	}
 	if (status.kind === "repair_required" || status.kind === "repair_retry") {
@@ -328,7 +446,7 @@ export function delegationRepairStatusLinesV1(status: DelegationRepairStatusV1):
 		];
 		if (status.kind === "repair_retry") lines.push(`repair lineage: depth ${status.depth} ${status.lineageHash}`);
 		lines.push(status.binding === "fresh"
-			? `next action  : call workbench_delegate_worker with repair_of=${status.delegationId}`
+			? `next action  : run /q-repair ${status.delegationId}`
 			: "next action  : restore the exact reviewed binding; repair delegation remains fail-closed");
 		return lines;
 	}
@@ -338,8 +456,8 @@ export function delegationRepairStatusLinesV1(status: DelegationRepairStatusV1):
 			`repair lineage: depth ${status.depth} ${status.lineageHash}`,
 			`root decision : ${status.rootDecisionHash}`,
 			status.binding === "fresh"
-				? `next action  : call workbench_delegate_worker with repair_of=${status.delegationId}`
-				: `next action  : current binding is ${status.binding}; exact repair retry remains fail-closed`,
+				? `next action  : run /q-repair ${status.delegationId}`
+				: `next action  : run /q-repair ${status.delegationId}; current binding is ${status.binding}, so strict lineage-contained terminal rebase eligibility will be checked before worker start`,
 		];
 	}
 	const lines = [
@@ -357,4 +475,13 @@ export function delegationRepairStatusLinesV1(status: DelegationRepairStatusV1):
 		);
 	}
 	return lines;
+}
+
+/** Clarify the exact semantic-repair exception to the ordinary pending-review blocker. */
+export function delegationExactRepairRouteLineV1(status: DelegationRepairStatusV1): string | undefined {
+	if (status.kind === "historical_multiplicity" && status.delegationId !== null) {
+		return `repair route : run deterministic /q-repair ${status.delegationId} only for that strict current tip; ordinary delegation requires path-lane admission and VERIFY remains blocked`;
+	}
+	if ((status.kind !== "repair_required" && status.kind !== "repair_retry") || status.binding !== "fresh") return undefined;
+	return `repair route : ALLOWED — ordinary/new delegations remain blocked; run deterministic /q-repair ${status.delegationId}`;
 }

@@ -1,18 +1,20 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, readdir, rm, symlink, unlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, open, readFile, readdir, rename, rm, symlink, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
+import { readProjectDelegationRepairClosureV1 } from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
 import {
 	commitDelegationGeneration,
 	computeHistoricalSemanticMigrationBindingHashV2,
 	createNodeDelegationTransactionStorageAdapter,
 	DELEGATION_SEMANTIC_MIGRATION_STORAGE_FAULT_POINTS,
 	DELEGATION_SEMANTIC_REPAIR_STORAGE_FAULT_POINTS,
+	DELEGATION_TERMINAL_NEGATIVE_REPAIR_STORAGE_FAULT_POINTS,
 	DELEGATION_TRANSACTION_REPORT_MAX_BYTES,
 	DELEGATION_TRANSACTION_SCOPE_RECORD_MAX_BYTES,
 	DELEGATION_TRANSACTION_STORAGE_FAULT_POINTS,
@@ -21,6 +23,8 @@ import {
 	hashDelegationCommittedRecords,
 	hasDelegationSemanticRepairAuthorityV2,
 	hasDelegationSemanticReviewAuthorityV2,
+	hasDelegationTerminalNegativeSemanticRepairAuthorityV1,
+	isDelegationTerminalNegativeReviewEligibleV1,
 	persistAbortedDelegationTransaction,
 	persistCommittingDelegationTransaction,
 	persistPreparedDelegationTransaction,
@@ -28,14 +32,18 @@ import {
 	persistReviewedDelegationTransaction,
 	persistRunningDelegationTransaction,
 	persistDelegationReviewProvisionalV2,
+	persistDelegationTerminalNegativeReviewProvisionalV1,
 	publishDelegationReviewV2,
 	publishDelegationSemanticRepairDecisionV1,
+	publishDelegationTerminalNegativeRepairDecisionV1,
 	publishHistoricalSemanticMigrationAcceptanceV2,
 	publishHistoricalSemanticMigrationPresentationV2,
 	readDelegationCommittedGenerationV2,
 	readDelegationReviewV2,
 	readDelegationSemanticMigrationV1,
 	readDelegationSemanticRepairDecisionV1,
+	readDelegationTerminalNegativeReviewV1,
+	readDelegationTerminalNegativeSolAuthorityV1,
 	readDelegationTransactionV2,
 	verifyDelegationGenerationV2,
 	type CommitDelegationGenerationInput,
@@ -43,6 +51,7 @@ import {
 	type DelegationReviewArtifactV2,
 	type DelegationSemanticRepairDecisionV1,
 	type DelegationSemanticMigrationCandidateProjectionV1,
+	type DelegationTransactionNodeFsPrimitives,
 	type DelegationTransactionStorageAdapter,
 	type DelegationTransactionStorageFaultPoint,
 } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
@@ -50,6 +59,7 @@ import { canonicalHash } from "../extensions/workbench-runtime/cache/canonical-h
 import {
 	DELEGATION_COMMITTED_RECORD_NAMES,
 	DELEGATION_TRANSACTION_SCHEMA_VERSION,
+	isCurrentDelegationTerminalOutcome,
 	type DelegationTaskKind,
 	type DelegationTerminalOutcome,
 	type DelegationTransactionRecord,
@@ -79,6 +89,88 @@ const IDENTITY: DelegationWorkerIdentity = {
 	model: WORKER_MODEL_ID,
 	worker_id: "storage-worker-1",
 };
+
+test("storage v2 Node adapter orders full writes and namespace fsyncs for Linux durability", async () => {
+	const events: string[] = [];
+	const written: number[] = [];
+	let firstCreated: string | undefined;
+	const primitives: DelegationTransactionNodeFsPrimitives = {
+		async open(path, flags, mode) {
+			events.push(`open ${path} ${flags} ${mode === undefined ? "-" : mode.toString(8)}`);
+			return {
+				async write(buffer, offset, length, position) {
+					const bytesWritten = Math.min(2, length);
+					events.push(`write ${path} ${offset} ${length} ${position}`);
+					written.push(...buffer.slice(offset, offset + bytesWritten));
+					return { bytesWritten };
+				},
+				async sync() { events.push(`sync ${path} ${flags}`); },
+				async close() { events.push(`close ${path} ${flags}`); },
+			};
+		},
+		async mkdir(path, options) {
+			events.push(`mkdir ${path} ${options.recursive ? "recursive" : "exclusive"}`);
+			return firstCreated;
+		},
+		async rename(source, destination) { events.push(`rename ${source} ${destination}`); },
+		async unlink(path) { events.push(`unlink ${path}`); },
+	};
+	const adapter = createNodeDelegationTransactionStorageAdapter(undefined, primitives);
+
+	await adapter.write("/repo/v2/.temp", Uint8Array.from([1, 2, 3, 4, 5, 6]), true);
+	assert.deepEqual(written, [1, 2, 3, 4, 5, 6], "short writes must loop until every byte is persisted");
+	assert.deepEqual(events, [
+		"open /repo/v2/.temp wx 600",
+		"write /repo/v2/.temp 0 6 0",
+		"write /repo/v2/.temp 2 4 2",
+		"write /repo/v2/.temp 4 2 4",
+		"sync /repo/v2/.temp wx",
+		"close /repo/v2/.temp wx",
+		"open /repo/v2 r -",
+		"sync /repo/v2 r",
+		"close /repo/v2 r",
+	]);
+
+	events.length = 0;
+	firstCreated = "/repo/a";
+	await adapter.makeDirectory("/repo/a/b/c", false);
+	assert.deepEqual(events, [
+		"mkdir /repo/a/b/c recursive",
+		"open /repo/a/b r -", "sync /repo/a/b r", "close /repo/a/b r",
+		"open /repo/a r -", "sync /repo/a r", "close /repo/a r",
+		"open /repo r -", "sync /repo r", "close /repo r",
+	], "recursive mkdir must persist each new parent entry from deepest to shallowest");
+
+	events.length = 0;
+	firstCreated = undefined;
+	await adapter.makeDirectory("/repo/v2/staging", true);
+	assert.deepEqual(events, [
+		"mkdir /repo/v2/staging exclusive",
+		"open /repo/v2 r -", "sync /repo/v2 r", "close /repo/v2 r",
+	]);
+
+	events.length = 0;
+	await adapter.move("/repo/v2/source", "/repo/v2/destination");
+	assert.deepEqual(events, [
+		"rename /repo/v2/source /repo/v2/destination",
+		"open /repo/v2 r -", "sync /repo/v2 r", "close /repo/v2 r",
+	]);
+
+	events.length = 0;
+	await adapter.move("/repo/source/value", "/repo/destination/value");
+	assert.deepEqual(events, [
+		"rename /repo/source/value /repo/destination/value",
+		"open /repo/destination r -", "sync /repo/destination r", "close /repo/destination r",
+		"open /repo/source r -", "sync /repo/source r", "close /repo/source r",
+	], "cross-directory rename must persist destination then source namespace changes");
+
+	events.length = 0;
+	await adapter.removeFile("/repo/v2/destination");
+	assert.deepEqual(events, [
+		"unlink /repo/v2/destination",
+		"open /repo/v2 r -", "sync /repo/v2 r", "close /repo/v2 r",
+	]);
+});
 
 test("storage v2 generation record locator accepts only bounded identity and exact record names", () => {
 	assert.equal(
@@ -116,6 +208,10 @@ function semanticMigrationPath(root: string, id = ID): string {
 
 function semanticRepairPath(root: string, id = ID): string {
 	return join(transactionDir(root, id), "repair-decision.json");
+}
+
+function terminalNegativeRepairPath(root: string, id = ID): string {
+	return join(transactionDir(root, id), "terminal-negative-repair-decision.json");
 }
 
 function generationDir(root: string, generation = 1, id = ID): string {
@@ -203,6 +299,8 @@ function outcome(kind: DelegationTaskKind, id = ID): DelegationTerminalOutcome {
 		task_kind: kind,
 		worker_identity: { ...IDENTITY },
 		provider_success: true,
+		worker_success: true,
+		worker_failure_code: null,
 		exit_code: 0,
 		report_complete: true,
 		terminal_facts_complete: true,
@@ -213,6 +311,14 @@ function outcome(kind: DelegationTaskKind, id = ID): DelegationTerminalOutcome {
 		denied_write_count: 0,
 		delta_hash: kind === "implementation" ? facts.changeSet.worker_delta_hash : null,
 	});
+}
+
+function terminalNegativeOutcome(status: "FAILED" | "INTERRUPTED", id = ID): DelegationTerminalOutcome {
+	return {
+		...outcome("implementation", id),
+		worker_success: false,
+		worker_failure_code: status === "INTERRUPTED" ? "TIMED_OUT" : "MODEL_IDENTITY_MISMATCH",
+	};
 }
 
 async function committingState(
@@ -240,8 +346,36 @@ async function committingState(
 	return committing.value;
 }
 
+async function terminalNegativeCommittingState(
+	root: string,
+	status: "FAILED" | "INTERRUPTED",
+): Promise<DelegationTransactionRecord> {
+	const prepared = await persistPreparedDelegationTransaction(root, {
+		delegation_id: ID, task_kind: "implementation", contract_hash: HASH, allowed_paths: ["src/**"],
+		worker_identity: { ...IDENTITY }, generation: 1, now: at(0),
+	});
+	assert.equal(prepared.ok, true);
+	if (!prepared.ok) throw new Error("prepare failed");
+	const running = await persistRunningDelegationTransaction(root, cas(prepared.value, 1));
+	assert.equal(running.ok, true);
+	if (!running.ok) throw new Error("start failed");
+	const committing = await persistCommittingDelegationTransaction(root, {
+		...cas(running.value, 2), outcome: terminalNegativeOutcome(status),
+	});
+	assert.equal(committing.ok, true);
+	if (!committing.ok) throw new Error("commit begin failed");
+	return committing.value;
+}
+
 function recordsFor(state: DelegationTransactionRecord): DelegationCommittedRecords {
 	assert.notEqual(state.terminal_outcome, null);
+	const terminalOutcome = state.terminal_outcome!;
+	const currentOutcome = isCurrentDelegationTerminalOutcome(terminalOutcome);
+	const workerSuccess = currentOutcome ? terminalOutcome.worker_success : terminalOutcome.provider_success;
+	const executionStatus = workerSuccess ? "success" : "failure";
+	const workerOutcomeFields = currentOutcome
+		? { worker_success: workerSuccess, worker_failure_code: terminalOutcome.worker_failure_code }
+		: {};
 	const facts = authority(state.task_kind, state.delegation_id);
 	const changedPaths = facts.changeSet.worker_delta.map((entry) => entry.path);
 	const pathStatuses = Object.fromEntries(facts.afterGuard.entries.map((entry) => [entry.path, entry.status]));
@@ -252,7 +386,8 @@ function recordsFor(state: DelegationTransactionRecord): DelegationCommittedReco
 	return structuredClone({
 		"after.json": {
 			schema_version: 2, diff_identity_kind: DELEGATION_WORKSPACE_DIFF_IDENTITY_KIND_V2,
-			delegation_id: state.delegation_id, recorded_at: state.updated_at, status: "success", exit_code: 0,
+			delegation_id: state.delegation_id, recorded_at: state.updated_at, status: executionStatus,
+			...workerOutcomeFields, exit_code: terminalOutcome.exit_code,
 			pinned_identity: { provider: WORKER_PROVIDER, model: WORKER_MODEL_ID }, git_head: facts.afterGuard.git_head,
 			git_dirty: facts.afterGuard.entries.length > 0, diff_hash: facts.afterGuard.workspace_guard_hash, changed_paths: changedPaths,
 			path_statuses: pathStatuses, path_digests: pathDigests, changed_since_before: changedPaths,
@@ -287,9 +422,15 @@ function recordsFor(state: DelegationTransactionRecord): DelegationCommittedReco
 			write_journal: facts.journal,
 			change_set: facts.changeSet,
 		},
-		"usage.json": { schema_version: 2, delegation_id: state.delegation_id, total_tokens: 20 },
+		"usage.json": {
+				schema_version: 2, delegation_id: state.delegation_id, status: executionStatus,
+				...workerOutcomeFields, total_tokens: 20,
+		},
 		"worker-report.md": "## Completed\n\nStorage transaction completed.\n",
-		"worker-summary.json": { schema_version: 2, delegation_id: state.delegation_id, changed_paths: changedPaths },
+		"worker-summary.json": {
+				schema_version: 2, delegation_id: state.delegation_id, status: executionStatus,
+				...workerOutcomeFields, changed_paths: changedPaths,
+		},
 	});
 }
 
@@ -297,12 +438,17 @@ function commitInput(state: DelegationTransactionRecord, records = recordsFor(st
 	return { ...cas(state, second), records };
 }
 
-async function completeProvisionalSemanticReview(root: string): Promise<{
+async function completeProvisionalSemanticReview(
+	root: string,
+	terminalStatus?: "FAILED" | "INTERRUPTED",
+): Promise<{
 	state: DelegationTransactionRecord;
 	artifact: DelegationReviewArtifactV2;
 	reviewHash: string;
 }> {
-	const committing = await committingState(root);
+	const committing = terminalStatus === undefined
+		? await committingState(root)
+		: await terminalNegativeCommittingState(root, terminalStatus);
 	const committed = await commitDelegationGeneration(root, commitInput(committing));
 	assert.equal(committed.ok, true);
 	if (!committed.ok) throw new Error("commit failed");
@@ -379,7 +525,9 @@ async function completeProvisionalSemanticReview(root: string): Promise<{
 		reviewed_at: reviewedAt,
 		review,
 	};
-	const persisted = await persistDelegationReviewProvisionalV2(root, { ...cas(committed.value, 4), artifact });
+	const persisted = terminalStatus === undefined
+		? await persistDelegationReviewProvisionalV2(root, { ...cas(committed.value, 4), artifact })
+		: await persistDelegationTerminalNegativeReviewProvisionalV1(root, { ...cas(committed.value, 4), artifact });
 	assert.equal(persisted.ok, true, persisted.ok ? "" : persisted.error.code);
 	if (!persisted.ok) throw new Error("provisional review failed");
 	return { state: committed.value, artifact, reviewHash: persisted.value.review_hash };
@@ -539,6 +687,134 @@ async function cleanup(root: string): Promise<void> {
 	await rm(root, { recursive: true, force: true });
 }
 
+function prepareInput(id = ID) {
+	return {
+		delegation_id: id,
+		task_kind: "implementation" as const,
+		contract_hash: HASH,
+		allowed_paths: ["src/**"],
+		worker_identity: { ...IDENTITY },
+		generation: 1,
+		now: at(0),
+	};
+}
+
+function realNodeFsPrimitivesWithHooks(hooks: Readonly<{
+	beforeSync?: (path: string, flags: string) => void | Promise<void>;
+	afterRename?: (source: string, destination: string) => void | Promise<void>;
+	afterUnlink?: (path: string) => void | Promise<void>;
+}>): DelegationTransactionNodeFsPrimitives {
+	return {
+		async open(path, flags, mode) {
+			const handle = await open(path, flags, mode);
+			return {
+				async write(buffer, offset, length, position) {
+					const result = await handle.write(buffer, offset, length, position);
+					return { bytesWritten: result.bytesWritten };
+				},
+				async sync() {
+					await hooks.beforeSync?.(path, flags);
+					await handle.sync();
+				},
+				async close() { await handle.close(); },
+			};
+		},
+		async mkdir(path, options) { return mkdir(path, options); },
+		async rename(source, destination) {
+			await rename(source, destination);
+			await hooks.afterRename?.(source, destination);
+		},
+		async unlink(path) {
+			await unlink(path);
+			await hooks.afterUnlink?.(path);
+		},
+	};
+}
+
+test("storage v2 Node fsync failures never report durable success, but post-commit lock cleanup stays successful", async () => {
+	const fileSyncRoot = await tempProject();
+	const lockParentRoot = await tempProject();
+	const renameParentRoot = await tempProject();
+	const cleanupRoot = await tempProject();
+	try {
+		const fileSyncAdapter = createNodeDelegationTransactionStorageAdapter(undefined,
+			realNodeFsPrimitivesWithHooks({
+				beforeSync(path, flags) {
+					if (flags === "wx" && path.includes("/.transaction.") && path.endsWith(".tmp")) {
+						throw new Error("injected transaction temp file fsync failure");
+					}
+				},
+			}));
+		const fileSyncResult = await persistPreparedDelegationTransaction(
+			fileSyncRoot, prepareInput(), { adapter: fileSyncAdapter },
+		);
+		assert.equal(fileSyncResult.ok, false, "a temp-file fsync failure must not report durable PREPARED success");
+
+		let lockFileSynced = false;
+		const lockParentAdapter = createNodeDelegationTransactionStorageAdapter(undefined,
+			realNodeFsPrimitivesWithHooks({
+				beforeSync(path, flags) {
+					if (path === lockPath(lockParentRoot) && flags === "wx") {
+						lockFileSynced = true;
+						return;
+					}
+					if (lockFileSynced && path === transactionDir(lockParentRoot) && flags === "r") {
+						lockFileSynced = false;
+						throw new Error("injected exclusive-lock parent fsync failure");
+					}
+				},
+			}));
+		const lockParentResult = await persistPreparedDelegationTransaction(
+			lockParentRoot, prepareInput(), { adapter: lockParentAdapter },
+		);
+		assert.equal(lockParentResult.ok, false, "an exclusive lock parent fsync failure must fail acquisition");
+		await assert.rejects(readFile(lockPath(lockParentRoot)), (error: unknown) =>
+			(error as NodeJS.ErrnoException).code === "ENOENT", "the caller may clean only its own failed lock token");
+
+		let transactionRenamed = false;
+		const renameParentAdapter = createNodeDelegationTransactionStorageAdapter(undefined,
+			realNodeFsPrimitivesWithHooks({
+				afterRename(_source, destination) {
+					if (destination === transactionPath(renameParentRoot)) transactionRenamed = true;
+				},
+				beforeSync(path, flags) {
+					if (transactionRenamed && path === transactionDir(renameParentRoot) && flags === "r") {
+						transactionRenamed = false;
+						throw new Error("injected transaction rename parent fsync failure");
+					}
+				},
+			}));
+		const renameParentResult = await persistPreparedDelegationTransaction(
+			renameParentRoot, prepareInput(), { adapter: renameParentAdapter },
+		);
+		assert.equal(renameParentResult.ok, false, "rename visibility without a successful parent fsync is not durable success");
+		assert.ok((await readFile(transactionPath(renameParentRoot))).byteLength > 0,
+			"the injected boundary is after rename, so visible bytes still must not be misreported as durable");
+
+		let releaseUnlinked = false;
+		const cleanupAdapter = createNodeDelegationTransactionStorageAdapter(undefined,
+			realNodeFsPrimitivesWithHooks({
+				afterUnlink(path) {
+					if (path.includes("transaction.lock.release.")) releaseUnlinked = true;
+				},
+				beforeSync(path, flags) {
+					if (releaseUnlinked && path === transactionDir(cleanupRoot) && flags === "r") {
+						releaseUnlinked = false;
+						throw new Error("injected post-commit lock cleanup parent fsync failure");
+					}
+				},
+			}));
+		const cleanupResult = await persistPreparedDelegationTransaction(
+			cleanupRoot, prepareInput(), { adapter: cleanupAdapter },
+		);
+		assert.equal(cleanupResult.ok, true,
+			"a failure after the state rename commit point must not invert published success");
+		assert.equal((await readDelegationTransactionV2(cleanupRoot, ID)).ok, true);
+	} finally {
+		await Promise.all([cleanup(fileSyncRoot), cleanup(lockParentRoot), cleanup(renameParentRoot), cleanup(cleanupRoot)]);
+	}
+});
+
 function migrationPresentationInput(
 	fixture: Awaited<ReturnType<typeof finalizedHistoricalMechanicalReview>>,
 	second = 5,
@@ -648,6 +924,117 @@ test("storage v2 semantic repair: immutable packet-bound decision is strict, ide
 		}
 		assert.deepEqual(await readFile(transactionPath(root)), transactionBytes);
 		assert.deepEqual(await readFile(reviewPath(root)), reviewBytes);
+	} finally {
+		await cleanup(root);
+	}
+});
+
+test("storage v2 terminal-negative repair: FAILED and INTERRUPTED publish a distinct immutable Sol sidecar with exact readback", async () => {
+	for (const status of ["FAILED", "INTERRUPTED"] as const) {
+		const root = await tempProject();
+		try {
+			const fixture = await completeProvisionalSemanticReview(root, status);
+			assert.equal(fixture.state.status, status);
+			const transactionBytes = await readFile(transactionPath(root));
+			const reviewBytes = await readFile(reviewPath(root));
+			const provisional = await readDelegationTerminalNegativeReviewV1(root, ID);
+			assert.equal(provisional.ok, true, provisional.ok ? "" : provisional.error.code);
+			if (!provisional.ok) continue;
+			assert.equal(provisional.value.terminal_negative_repair, undefined);
+			assert.equal(hasDelegationTerminalNegativeSemanticRepairAuthorityV1(provisional.value), false);
+
+			const input = repairDecisionInput(fixture);
+			const published = await publishDelegationTerminalNegativeRepairDecisionV1(root, input);
+			assert.equal(published.ok, true, published.ok ? "" : published.error.code);
+			if (!published.ok) continue;
+			assert.equal(published.value.kind, "delegation-terminal-negative-repair-decision-v1");
+			assert.equal(published.value.terminal_status, status);
+			assert.equal(published.value.parent_state_hash, canonicalHash(fixture.state));
+			assert.equal(published.value.generation_content_hash, fixture.state.committed_proof?.content_hash);
+			assert.equal(published.value.base_review_hash, fixture.reviewHash);
+			assert.equal(published.value.expected_bound_diff_hash, fixture.artifact.review.bound_diff_hash);
+			assert.equal(published.value.decision.decision, "REPAIR");
+			const artifactProjection = structuredClone(published.value) as unknown as Record<string, unknown>;
+			delete artifactProjection.artifact_hash;
+			assert.equal(published.value.artifact_hash, canonicalHash(artifactProjection));
+
+			const strict = await readDelegationTerminalNegativeReviewV1(root, ID);
+			assert.equal(strict.ok, true, strict.ok ? "" : strict.error.code);
+			if (strict.ok) assert.equal(hasDelegationTerminalNegativeSemanticRepairAuthorityV1(strict.value), true);
+			const seam = await readDelegationTerminalNegativeSolAuthorityV1(root, ID);
+			assert.equal(seam.ok, true, seam.ok ? "" : seam.error.code);
+			if (seam.ok) {
+				assert.deepEqual(Object.keys(seam.value).sort(), ["bound_diff_hash", "decision", "review_hash", "state"]);
+				assert.equal(seam.value.state.status, status);
+				assert.equal(seam.value.review_hash, fixture.reviewHash);
+				assert.equal(seam.value.bound_diff_hash, fixture.artifact.review.bound_diff_hash);
+				assert.equal(seam.value.decision.decision_hash, published.value.decision.decision_hash);
+			}
+			assert.deepEqual(await readProjectDelegationRepairClosureV1(root), {
+				ok: true,
+				unresolvedTipId: ID,
+				rootCount: 1,
+				lineageCount: 0,
+			}, `${status} terminal-negative decision is a strict project repair root`);
+
+			const replay = await publishDelegationTerminalNegativeRepairDecisionV1(root, { ...input, now: at(6) });
+			assert.equal(replay.ok, true, replay.ok ? "" : replay.error.code);
+			if (replay.ok) assert.equal(replay.value.decision.decided_at, input.now);
+			assert.deepEqual(await readFile(transactionPath(root)), transactionBytes, "terminal state is immutable");
+			assert.deepEqual(await readFile(reviewPath(root)), reviewBytes, "provisional packet is immutable after decision");
+		} finally {
+			await cleanup(root);
+		}
+	}
+});
+
+test("storage v2 terminal-negative eligibility rejects missing proof, empty delta, unsafe scope, conflicts, drift, and recovery state", async () => {
+	const root = await tempProject();
+	try {
+		const fixture = await completeProvisionalSemanticReview(root, "FAILED");
+		const state = fixture.state;
+		assert.equal(isDelegationTerminalNegativeReviewEligibleV1(state), true);
+		const variants: Array<DelegationTransactionRecord> = [
+			{ ...state, committed_proof: null },
+			{ ...state, status: "RECOVERY_REQUIRED", recovery_reason: "terminal facts need recovery" },
+			{ ...state, terminal_outcome: { ...state.terminal_outcome!, changed_paths: [] } },
+			{ ...state, terminal_outcome: { ...state.terminal_outcome!, delta_hash: null } },
+			{ ...state, terminal_outcome: { ...state.terminal_outcome!, changed_paths: ["outside.ts"] } },
+			{ ...state, terminal_outcome: { ...state.terminal_outcome!, change_set_status: "CONFLICT" } },
+			{ ...state, terminal_outcome: { ...state.terminal_outcome!, change_set_status: "WORKSPACE_DRIFT" } },
+		];
+		for (const candidate of variants) assert.equal(isDelegationTerminalNegativeReviewEligibleV1(candidate), false);
+	} finally {
+		await cleanup(root);
+	}
+});
+
+test("storage v2 terminal-negative repair: state/failure-fact tamper and ordinary sidecar ambiguity fail closed", async () => {
+	const root = await tempProject();
+	try {
+		const fixture = await completeProvisionalSemanticReview(root, "FAILED");
+		const published = await publishDelegationTerminalNegativeRepairDecisionV1(root, repairDecisionInput(fixture));
+		assert.equal(published.ok, true, published.ok ? "" : published.error.code);
+		if (!published.ok) return;
+		const bytes = await readFile(terminalNegativeRepairPath(root));
+		const raw = JSON.parse(bytes.toString("utf8")) as Record<string, unknown>;
+		raw.failure_facts_hash = "f".repeat(64);
+		await writeFile(terminalNegativeRepairPath(root), `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+		const tampered = await readDelegationTerminalNegativeSolAuthorityV1(root, ID);
+		assert.equal(tampered.ok, false);
+		if (!tampered.ok) assert.equal(tampered.error.code, "invalid_record");
+		const tamperedClosure = await readProjectDelegationRepairClosureV1(root);
+		assert.equal(tamperedClosure.ok, false);
+		if (!tamperedClosure.ok) assert.equal(tamperedClosure.issue.code, "invalid_record");
+
+		await writeFile(terminalNegativeRepairPath(root), bytes);
+		await writeFile(semanticRepairPath(root), bytes);
+		const ambiguous = await readDelegationTerminalNegativeReviewV1(root, ID);
+		assert.equal(ambiguous.ok, false);
+		if (!ambiguous.ok) assert.equal(ambiguous.error.code, "invalid_record");
+		const ambiguousClosure = await readProjectDelegationRepairClosureV1(root);
+		assert.equal(ambiguousClosure.ok, false);
+		if (!ambiguousClosure.ok) assert.equal(ambiguousClosure.issue.code, "invalid_record");
 	} finally {
 		await cleanup(root);
 	}
@@ -1045,6 +1432,12 @@ test("storage v2: exact record inventory, identity/scope bindings, complete repo
 		(records) => { (records["after.json"] as Record<string, unknown>).worker_delta_hash = "f".repeat(64); },
 		(records) => { (records["after.json"] as Record<string, unknown>).workspace_guard_hash = "f".repeat(64); },
 		(records) => { (records["after.json"] as Record<string, unknown>).change_set_hash = "f".repeat(64); },
+		(records) => { delete (records["after.json"] as Record<string, unknown>).worker_failure_code; },
+		(records) => { (records["after.json"] as Record<string, unknown>).worker_success = false; },
+		(records) => { delete (records["usage.json"] as Record<string, unknown>).worker_success; },
+		(records) => { (records["usage.json"] as Record<string, unknown>).worker_failure_code = "TIMED_OUT"; },
+		(records) => { delete (records["worker-summary.json"] as Record<string, unknown>).worker_failure_code; },
+		(records) => { (records["worker-summary.json"] as Record<string, unknown>).worker_success = false; },
 		(records) => { (records["before.json"] as Record<string, unknown>).diff_hash = "f".repeat(64); },
 		(records) => { (records["after.json"] as Record<string, unknown>).diff_hash = "f".repeat(64); },
 		(records) => { delete ((records["before.json"] as Record<string, any>).path_digests as Record<string, string>)["src/changed.ts"]; },
@@ -1194,6 +1587,38 @@ test("storage v2 semantic repair: every dedicated atomic-publication fault point
 			if (durable.ok) {
 				if (point === "repair_decision.final.read") assert.equal(durable.value?.decision, "REPAIR");
 				else assert.equal(durable.value, undefined);
+			}
+			assert.deepEqual(await readFile(transactionPath(root)), transactionBytes);
+			assert.deepEqual(await readFile(reviewPath(root)), reviewBytes);
+		} finally {
+			await cleanup(root);
+		}
+	}
+});
+
+test("storage v2 terminal-negative repair: every dedicated atomic-publication fault point fails closed without rewriting terminal state", async () => {
+	for (const point of DELEGATION_TERMINAL_NEGATIVE_REPAIR_STORAGE_FAULT_POINTS) {
+		const root = await tempProject();
+		try {
+			const fixture = await completeProvisionalSemanticReview(root, "FAILED");
+			const transactionBytes = await readFile(transactionPath(root));
+			const reviewBytes = await readFile(reviewPath(root));
+			const injected = faultAdapter(point);
+			const result = await publishDelegationTerminalNegativeRepairDecisionV1(
+				root,
+				repairDecisionInput(fixture),
+				{ adapter: injected.adapter },
+			);
+			assert.equal(injected.tripped(), true, `${point} must be reached`);
+			assert.equal(result.ok, false, `${point} must not report unverified success`);
+			const durable = await readDelegationTerminalNegativeReviewV1(root, ID);
+			assert.equal(durable.ok, true, durable.ok ? "" : durable.error.code);
+			if (durable.ok) {
+				if (point === "terminal_negative_repair.final.read") {
+					assert.equal(durable.value.terminal_negative_repair?.decision.decision, "REPAIR");
+				} else {
+					assert.equal(durable.value.terminal_negative_repair, undefined);
+				}
 			}
 			assert.deepEqual(await readFile(transactionPath(root)), transactionBytes);
 			assert.deepEqual(await readFile(reviewPath(root)), reviewBytes);

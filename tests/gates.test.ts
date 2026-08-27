@@ -48,6 +48,13 @@ import { gateStateHash } from "../extensions/workbench-runtime/core/validation-e
 import { workbenchDir, type ExecFn } from "../extensions/workbench-runtime/core/config.ts";
 import { BASE_GATES } from "../extensions/workbench-runtime/core/gate-catalog.ts";
 import { runRecipe } from "../extensions/workbench-runtime/core/recipe-runner.ts";
+import {
+	WORKER_ALLOWED_PATHS_ENV,
+	WORKER_CONTRACT_HASH_ENV,
+	WORKER_DELEGATION_ID_ENV,
+	WORKER_PROJECT_ROOT_ENV,
+	WORKER_TASK_KIND_ENV,
+} from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { parseGate, type GateCheck, type WorkerFirstGateFacts } from "../extensions/workbench-runtime/core/gate-schema.ts";
 import { makeValidQuantResult, spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
 import { canonicalHash, sha256Hex } from "../extensions/workbench-runtime/cache/canonical-hash.ts";
@@ -554,7 +561,7 @@ test("artifact checks use persisted run records, never model claims", async () =
 				"recipes:",
 				'  - name: producer',
 				'    command: ["node", "-e", "require(\\"fs\\").mkdirSync(\\"out\\", { recursive: true }); require(\\"fs\\").writeFileSync(\\"out/result.json\\", \\"{}\\")"]',
-				'    writes: ["out/"]',
+				'    writes: ["out/result.json"]',
 				"    mutation: artifacts",
 				'    artifacts: [{ path: "out/*.json", required: true, min_bytes: 1, freshness: current }]',
 				"",
@@ -582,7 +589,7 @@ test("current artifact checks reject a producer whose validation authority is st
 				"recipes:",
 				"  - name: producer",
 				'    command: ["node", "-e", "require(\\"fs\\").mkdirSync(\\"out\\", { recursive: true }); require(\\"fs\\").writeFileSync(\\"out/result.json\\", \\"{}\\")"]',
-				"    writes: [out/]",
+				"    writes: [out/result.json]",
 				"    mutation: artifacts",
 				'    artifacts: [{ path: "out/*.json", required: true, min_bytes: 1, freshness: current }]',
 				"",
@@ -610,7 +617,7 @@ test("artifact authority binds the exact producer run identity even when validat
 				"recipes:",
 				"  - name: producer",
 				'    command: ["node", "-e", "require(\\"fs\\").mkdirSync(\\"out\\", { recursive: true }); require(\\"fs\\").writeFileSync(\\"out/result.json\\", \\"{}\\")"]',
-				"    writes: [out/]",
+				"    writes: [out/result.json]",
 				"    mutation: artifacts",
 				'    artifacts: [{ path: "out/*.json", required: true, min_bytes: 1, freshness: current }]',
 				"",
@@ -789,6 +796,7 @@ test("evidence paths that escape the project root are rejected", async () => {
 				`  - id: g1\n    title: G1\n    checks:\n      - { id: g1.1, title: Evil, kind: file, path: ../evil.txt }`,
 			),
 		});
+		await gitBacked(dir);
 		await assert.rejects(
 			runGates({ projectRoot: dir, selector: "g1", mode: "DEV", exec: spawnExec }),
 			(error) => error instanceof GateSetupError && error.message.includes("escapes the project root"),
@@ -1574,6 +1582,7 @@ test("recipe checks apply the shared mutation policy: strict Sol denies mutation
 				].join("\n"),
 			),
 		});
+		await gitBacked(dir);
 		// Strict Sol: mutation:source recipe check is BLOCKED; none/artifacts run.
 		const sol = await runGates({
 			projectRoot: dir,
@@ -1587,16 +1596,40 @@ test("recipe checks apply the shared mutation policy: strict Sol denies mutation
 		assert.equal(sol.gates[1]!.status, "PASS", "mutation:artifacts recipe check runs for strict Sol");
 		assert.equal(sol.gates[2]!.status, "PASS", "mutation:none recipe check runs for strict Sol");
 		// Delegated worker: only mutation:none runs.
-		const worker = await runGates({
-			projectRoot: dir,
-			selector: "g1,g2,g3",
-			mode: "DEV",
-			exec: spawnExec,
-			actorFacts: { role: "worker", provider: "deepseek", model: "deepseek-v4-flash" },
-		});
+		const workerEnvNames = [
+			WORKER_ALLOWED_PATHS_ENV,
+			WORKER_CONTRACT_HASH_ENV,
+			WORKER_DELEGATION_ID_ENV,
+			WORKER_PROJECT_ROOT_ENV,
+			WORKER_TASK_KIND_ENV,
+		] as const;
+		const previousWorkerEnv = new Map(workerEnvNames.map((name) => [name, process.env[name]]));
+		process.env[WORKER_ALLOWED_PATHS_ENV] = "[]";
+		process.env[WORKER_CONTRACT_HASH_ENV] = "b".repeat(64);
+		process.env[WORKER_DELEGATION_ID_ENV] = "20260827-120000-gate";
+		process.env[WORKER_PROJECT_ROOT_ENV] = dir;
+		process.env[WORKER_TASK_KIND_ENV] = "implementation";
+		let worker: Awaited<ReturnType<typeof runGates>>;
+		try {
+			worker = await runGates({
+				projectRoot: dir,
+				selector: "g1,g2,g3",
+				mode: "DEV",
+				exec: spawnExec,
+				actorFacts: { role: "worker", provider: "deepseek", model: "deepseek-v4-flash" },
+			});
+		} finally {
+			for (const [name, value] of previousWorkerEnv) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+		}
 		assert.equal(worker.gates[0]!.status, "BLOCKED");
 		assert.equal(worker.gates[1]!.status, "BLOCKED", "workers cannot run mutation:artifacts recipes");
-		assert.ok(worker.gates[1]!.checks[0]!.blocked_reason?.includes("mutation: artifacts"));
+		assert.ok(
+			worker.gates[1]!.checks[0]!.blocked_reason?.includes('Delegated worker cannot run mutating recipe "build"'),
+			worker.gates[1]!.checks[0]!.blocked_reason ?? "missing blocked reason",
+		);
 		assert.equal(worker.gates[2]!.status, "PASS", "workers run mutation:none recipe checks");
 		// Other controllers / no actor facts: prior behavior (all run).
 		const other = await runGates({ projectRoot: dir, selector: "g1,g2,g3", mode: "DEV", exec: spawnExec });
@@ -1723,6 +1756,8 @@ test("recipe execution and artifact checks stay repository-root based with proje
 				"recipes:",
 				'  - name: producer',
 				'    command: ["node", "-e", "process.stdout.write(process.cwd()); require(\\"fs\\").mkdirSync(\\"out\\", { recursive: true }); require(\\"fs\\").writeFileSync(\\"out/result.json\\", \\"{}\\")"]',
+				"    mutation: artifacts",
+				"    writes: [out/result.json]",
 				'    artifacts: [{ path: "out/*.json", required: true, min_bytes: 1, freshness: current }]',
 				"",
 			].join("\n"),

@@ -14,6 +14,7 @@ import type {
 	PreparedDelegationChangeSetLifecycleV2,
 } from "./delegation-change-set-lifecycle.ts";
 import { validateChangeSet } from "./change-set.ts";
+import { validateDelegationCommandProvenance } from "./delegation-command-effect-provenance.ts";
 import type { GitFacts } from "./delegation-ledger.ts";
 import { validateWorkspaceGuard, type WorkspaceGuardRecord } from "./workspace-guard.ts";
 import { validateWorkerWriteJournalRecord } from "./write-journal.ts";
@@ -79,6 +80,9 @@ function guardProjection(
 		gitHead: guard.git_head,
 		gitDirty: guard.entries.length > 0,
 		changedPaths: Object.freeze([...changedPaths]) as unknown as string[],
+		// Git status remains a projection of the real guard only. In
+		// particular, a Git-ignored command output can be in effective_paths
+		// and pathDigests without being forged into `??` here.
 		pathStatuses: Object.freeze(Object.fromEntries(guard.entries.map((entry) => [entry.path, entry.status]))),
 		pathDigests: Object.freeze({ ...pathDigests }),
 	});
@@ -125,6 +129,8 @@ export function deriveFinalizedDelegationWorkspaceFactsV2(
 		const prepared = finalized?.prepared;
 		if (!prepared || !validateWorkspaceGuard(prepared.before_guard)
 			|| !validateWorkspaceGuard(finalized.after_guard) || !validateChangeSet(finalized.change_set)
+			|| !(finalized.command_provenance === undefined
+				|| validateDelegationCommandProvenance(finalized.command_provenance, finalized.change_set))
 			|| !completedOperations(prepared, finalized)
 			|| finalized.change_set.delegation_id !== prepared.delegation_id
 			|| finalized.change_set.contract_hash !== prepared.contract_hash
@@ -134,6 +140,9 @@ export function deriveFinalizedDelegationWorkspaceFactsV2(
 		}
 
 		const workerPaths = finalized.change_set.worker_delta.map((entry) => entry.path);
+		const effectivePaths = finalized.command_provenance === undefined
+			? [...workerPaths]
+			: [...finalized.command_provenance.effective_paths];
 		const beforeDigests: Record<string, string> = {};
 		for (const entry of finalized.change_set.worker_delta) {
 			// ChangeSet already binds each path to the first journal operation.
@@ -146,14 +155,18 @@ export function deriveFinalizedDelegationWorkspaceFactsV2(
 		for (const entry of finalized.change_set.worker_delta) {
 			if (entry.after.kind === "file") afterDigests[entry.path] = entry.after.sha256;
 		}
+		for (const entry of finalized.command_provenance?.command_delta ?? []) {
+			if (entry.after.kind === "file") afterDigests[entry.path] = entry.after.sha256;
+		}
 		const changedSinceBefore = [...new Set([
-			...workerPaths,
-			...finalized.change_set.workspace_drift.map((entry) => entry.path),
+			...effectivePaths,
+			...(finalized.command_provenance?.remaining_workspace_drift ?? finalized.change_set.workspace_drift)
+				.map((entry) => entry.path),
 			...finalized.change_set.conflicts.map((entry) => entry.path),
 		])].sort(byteCompare);
 		const beforePaths = finalized.prepared.before_guard.entries.map((entry) => entry.path);
 		const before = guardProjection(finalized.prepared.before_guard, beforePaths, beforeDigests);
-		const afterBase = guardProjection(finalized.after_guard, workerPaths, afterDigests);
+		const afterBase = guardProjection(finalized.after_guard, effectivePaths, afterDigests);
 		const after: Readonly<DelegationWorkspaceAfterFactsV2> = Object.freeze({
 			...afterBase,
 			changedSinceBefore: Object.freeze(changedSinceBefore) as unknown as string[],

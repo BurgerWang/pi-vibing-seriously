@@ -35,6 +35,10 @@ import {
 	validateWorkerWriteJournalRecord,
 	type WorkerWriteJournalRecord,
 } from "./write-journal.ts";
+import {
+	isRecoverableUnpublishedPathAuthorityCandidateV1,
+	readRecoverableUnpublishedPathAuthorityV1,
+} from "./recoverable-unpublished-path-authority.ts";
 
 const BLOCKER_DIR_NAME = "blocker-closures-v2";
 const QUARANTINE_DIR_NAME = "delegation-authority-quarantine-v1";
@@ -292,7 +296,13 @@ function evidenceReadFailure(code: string): DelegationAuthorityClosureResult<Res
 	return {
 		ok: false,
 		error: {
-			code: code === "storage_failure" ? "storage_failure" : code === "not_found" ? "not_found" : "invalid_record",
+			code: code === "storage_failure"
+				? "storage_failure"
+				: code === "not_found"
+					? "not_found"
+					: code === "not_recoverable"
+						? "not_recoverable"
+						: "invalid_record",
 		},
 	};
 }
@@ -321,6 +331,30 @@ async function resolveInactiveBlockerRelevantPathsV2(
 	projectRoot: string,
 	transaction: DelegationTransactionRecord,
 ): Promise<DelegationAuthorityClosureResult<ResolvedInactiveBlockerPathsV2>> {
+	if (isRecoverableUnpublishedPathAuthorityCandidateV1(transaction)) {
+		const recoverable = await readRecoverableUnpublishedPathAuthorityV1(
+			projectRoot,
+			transaction.delegation_id,
+		);
+		if (!recoverable.ok) return evidenceReadFailure(recoverable.error.code);
+		if (recoverable.value.transaction_hash !== canonicalHash(transaction)) {
+			return { ok: false, error: { code: "conflict" } };
+		}
+		// Path-local admission may safely use the conservative union even when a
+		// command-only path has no durable before identity.  A closure is stronger:
+		// every relevant path must be provably restored to its exact pre-worker
+		// content, including Git-ignored paths.
+		if (!recoverable.value.baseline_complete) {
+			return { ok: false, error: { code: "not_recoverable" } };
+		}
+		return {
+			ok: true,
+			value: {
+				paths: [...recoverable.value.relevant_paths],
+				journal_before: [...recoverable.value.journal_before],
+			},
+		};
+	}
 	const outcome = transaction.terminal_outcome;
 	if (outcome === null || !outcome.terminal_facts_complete || !outcome.scope_complete) {
 		if (transaction.committed_proof === null) {
@@ -447,7 +481,11 @@ export async function readDelegationInactiveBlockerClosureV2(
 		const bytes = await readBoundedFile(path, RECEIPT_MAX_BYTES);
 		let decoded: unknown;
 		try { decoded = JSON.parse(bytes.toString("utf8")); } catch { return { ok: false, error: { code: "invalid_record" } }; }
-		const legacyPaths = inactiveBlockerRelevantPathsV2(transaction);
+		// A proof-null artifact failure must never accept the older changed-paths
+		// projection, which omitted journal-only/ignored paths and before identities.
+		const legacyPaths = isRecoverableUnpublishedPathAuthorityCandidateV1(transaction)
+			? undefined
+			: inactiveBlockerRelevantPathsV2(transaction);
 		let record = legacyPaths === undefined ? undefined : normalizeBlocker(decoded, transaction, legacyPaths);
 		if (record === undefined) {
 			const resolved = await resolveInactiveBlockerRelevantPathsV2(projectRoot, transaction);

@@ -9,7 +9,7 @@ export const WORKER_REPAIR_CAPSULE_MAX_FAILED_RUNS = 4;
 export interface WorkerRepairFailedRunFact {
 	recipe: string;
 	run_id: string;
-	outcome: "PROCESS_FAILED" | "ARTIFACT_FAILED";
+	outcome: "PROCESS_FAILED" | "ARTIFACT_FAILED" | "COMMAND_EFFECT_FAILED";
 }
 
 export interface WorkerRepairPlanFact {

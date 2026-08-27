@@ -25,6 +25,80 @@ quality or speed result.
 DeepSeek rows below are retained only as historical v0.10.0/cache-provider
 compatibility evidence and are not the active worker selector.
 
+## Current unreleased delegation/recovery compatibility
+
+The current source keeps filesystem delegation v2 as project authority.
+`transaction.json`, committed generation records, `review.json`, and immutable
+repair sidecars win over the `workbench-delegation-state` Pi custom entry. The
+entry is a bounded UI/recovery mirror only: append failure after a durable
+transition returns a warning and does not turn the operation into failure.
+Reload/status rebuild that projection from strict durable readback.
+
+Production session restore reads the selected Pi branch through
+`sessionManager.getBranch()`. The `getEntries()` fallback exists only for older
+test/compatibility contexts and does not authorize an abandoned sibling branch
+to become current. Separately, the runtime snapshots a deterministic SHA-256
+over byte-sorted relative extension `.ts` paths and exact bytes once at module
+load. `/q-runtime-doctor` compares the loaded and disk identities; mutation is
+blocked while they differ. `/new` changes conversation history but does not
+reload extension code, and each concurrently running Pi process must reload or
+restart independently.
+
+Every production mutation-capable tool and command shares the historical fixed
+project lock as one checkout writer lane. The read-only allowlist is closed;
+unknown tools default to mutation-capable. Nested work requires an exact live
+token. A settled generic command/tool record may be cleaned up only by
+same-process, byte-exact registry/lock recovery (or proven durable absence),
+never TTL or guessed PID; delegations retain their stricter transaction-aware
+CAS recovery.
+
+Automatic semantic review is additive to the existing manual review API. It
+first completes the durable provisional packet, refuses to call the model above
+32 pages, assesses each complete hash-bound page with strict
+`openai-codex/gpt-5.6-sol`, and makes one final call over the raw pages plus
+page assessments. Nested usage and an immutable receipt hash are returned, but
+only the existing semantic artifact grants review authority. Model/protocol/
+drift failure leaves successful worker authority at `PENDING_REVIEW` and gives
+exact `/q-review <id>`; legacy, oversized, mechanical FAIL, and authority-gap
+cases retain a bounded manual route. `/q-review` is a direct command and the old
+read-only prompt is now `/q-code-review` with no same-name alias.
+
+Closed implementation failure with nonempty attributed work is represented as
+`INTERRUPTED`. Strict eligible `INTERRUPTED`, and compatible historical
+`FAILED`, may publish only a distinct terminal-negative Sol `REPAIR` sidecar;
+`ACCEPT` and ordinary `REVIEWED` are invalid. Reload/status exposes a valid
+sidecar as `repair_required` plus exact `/q-repair <id>`, exposes a missing
+eligible decision as exact `/q-review <id>`, and fails closed on corruption.
+`/q-repair` strict-reads exact ordinary or terminal-negative authority and
+idempotently returns/creates the one lineaged successor without relying on the
+session's latest entry.
+
+Recipe command provenance is also additive. `command-effect.json` binds run id,
+before/after workspace guards, mutation declaration, observed paths, and
+streaming content identities for exact declared outputs even when Git-ignored.
+Unavailable pre-execution evidence blocks spawn. Exact outputs may be
+`COMMAND_ATTRIBUTED`; `RECIPE_DECLARATION_VIOLATION`, `UNKNOWN_ORIGIN`,
+`OUT_OF_SCOPE`, and `EVIDENCE_UNAVAILABLE` fail closed and never become
+semantic acceptance. Historical run records without this artifact remain
+readable but cannot fabricate current provenance.
+
+The hard cumulative turn threshold is now an execution boundary, matching the
+already hard total/output thresholds. `standard` remains the omitted default
+(32 soft/64 hard turns); `extended` is explicit (64/96). Reaching a hard turn,
+total-token, or output-token limit terminates the bounded attempt and retains
+evidence; it is no longer a telemetry-only turn marker.
+
+Checkpoint backlog selection scans all durable candidates. Unrelated pending,
+failed, or zero-change latest records do not hide an older accepted slice. An
+invalid historical candidate is skipped only when a newer valid review fully
+supersedes all of its dirty paths; an invalid newest or partially uncovered
+candidate still fails closed.
+
+Compatibility remains based on v2 filesystem authority and one checkout-wide
+writer at a time. Historical path-lane admission is production-wired and may
+allow a new delegation past known non-overlapping old blockers, but overlap,
+unknown provenance, damaged records, and active writers remain blocking.
+
 ## Unreleased cache-prefix P0–P2 compatibility
 
 These are Unreleased source compatibility statements. No deployment, tag,
@@ -228,10 +302,10 @@ records without them parse unchanged and are never rewritten (no
 migration).
 
 The current surface retires `low`: public JSON Schema exposes only
-`standard | extended`, omission now defaults to the safe `extended` profile,
-`standard` remains an explicit small-slice selection, and explicit
+`standard | extended`, omission now defaults to the bounded `standard` profile,
+`extended` remains an explicit larger-slice selection, and explicit
 `low` fails closed before transaction persistence or worker launch. Runner
-and child-env compatibility maps old/internal `low` input to `extended`.
+and child-env compatibility maps old/internal `low` input to `standard`.
 Frozen governance-v1 catalog/schema/hash evidence is unchanged, and already
 committed v1/v2 `low` records remain strict read/hash compatibility data;
 new committed artifacts cannot carry `low`. This intentional current-schema
@@ -833,15 +907,21 @@ contexts (both are bound by Pi in every mode; failures are caught).
 ## Session lifecycle
 
 `session_start` reasons exercised/verified through the extension's restore
-path (custom entries are read on every `session_start`):
+path. Production reads custom entries from the selected branch via
+`getBranch()`, restores bounded session/UI state, then reconciles delegation
+projection from project v2 authority:
 
 | Reason | Behavior |
 | ------ | -------- |
 | `startup` | Restore persisted mode/state from the session file, else DEV. |
 | `new` | Fresh session file → DEV default (verified by test). |
-| `resume` | Session file carries the custom entries → mode/state restored. |
-| `fork` (also `/clone`) | The session file (and its custom entries) is copied → restored. |
-| `reload` | Same session file → restored. |
+| `resume` | Selected branch carries custom entries → bounded session state restored; delegation mirror reconciled from v2. |
+| `fork` (also `/clone`) | Copied selected-branch entries restore UI/session state; project authority is reread. |
+| `reload` | Same selected branch is restored, project authority is reread, and newly loaded code captures a fresh runtime source fingerprint. |
+
+An append failure or sibling-branch entry cannot override committed project
+authority. `/new` uses a fresh session but does not reload code in the existing
+Pi process.
 
 ## Version policy
 

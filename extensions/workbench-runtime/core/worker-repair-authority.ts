@@ -160,7 +160,7 @@ async function failedRunFacts(
 		if (!RUN_ID_RE.test(candidate.run_id) || seen.has(candidate.run_id)) continue;
 		const manifest = await readCommittedManifest(projectRoot, candidate.run_id);
 		if (!manifest || manifest.recipe !== candidate.recipe ||
-			(manifest.run_outcome !== "PROCESS_FAILED" && manifest.run_outcome !== "ARTIFACT_FAILED") ||
+			(manifest.run_outcome !== "PROCESS_FAILED" && manifest.run_outcome !== "ARTIFACT_FAILED" && manifest.run_outcome !== "COMMAND_EFFECT_FAILED") ||
 			manifest.started_at < startedAt || manifest.finished_at > finishedAt) continue;
 		seen.add(candidate.run_id);
 		output.push({ recipe: candidate.recipe, run_id: candidate.run_id, outcome: manifest.run_outcome });

@@ -53,7 +53,7 @@ export interface WorkerTaskContract {
 	/**
 	 * Phase 3 (worker token-budget repair): the resolved cumulative
 	 * spend-budget profile (additive, optional). Omitted resolves to
-	 * `extended`; `standard` remains available explicitly for small bounded slices. Historical `low`
+	 * `standard`; `extended` remains available only as an explicit larger slice. Historical `low`
 	 * values are never accepted for a new contract. The profile is
 	 * carried on the contract for ledger/record consistency — the runner
 	 * enforces it through the fixed WORKER_SPEND_PROFILE_ENV child env
@@ -225,10 +225,46 @@ export function workerRoleToolCallBlockReason(
 	return undefined;
 }
 
-/** Workers may run validation recipes only when they declare no writes. */
-export function workerRecipeBlockReason(role: string | undefined, recipeName: string, declaredWrites: readonly string[]): string | undefined {
-	if (role !== WORKER_ROLE || declaredWrites.length === 0) return undefined;
-	return `Delegated worker cannot run recipe "${recipeName}" because it declares writes: ${declaredWrites.join(", ")}`;
+export interface WorkerRecipeMutationScope {
+	projectRoot: string;
+	allowedPaths: readonly string[];
+	taskKind: WorkerRuntimeTaskKind;
+}
+
+const RECIPE_WRITE_GLOB_META_RE = /[*?\[\]{}]/u;
+
+function exactWorkerRecipeWrite(projectRoot: string, path: string): boolean {
+	return path === path.trim()
+		&& path.length > 0
+		&& !isAbsolute(path)
+		&& !path.includes("\\")
+		&& !path.startsWith("./")
+		&& !path.endsWith("/")
+		&& !path.includes("//")
+		&& !RECIPE_WRITE_GLOB_META_RE.test(path)
+		&& path.split("/").every((segment) => segment.length > 0 && segment !== "." && segment !== "..")
+		&& isInside(resolve(projectRoot), resolve(projectRoot, path));
+}
+
+/**
+ * Compatibility wrapper for callers that only know a recipe's declarations.
+ * A mutating worker recipe needs the full immutable delegation scope and is
+ * therefore denied when that scope is absent.
+ */
+export function workerRecipeBlockReason(
+	role: string | undefined,
+	recipeName: string,
+	declaredWrites: readonly string[],
+	mutation: RecipeMutation = declaredWrites.length === 0 ? "none" : "source",
+	scope?: WorkerRecipeMutationScope,
+): string | undefined {
+	return recipeMutationBlockReason(
+		role === WORKER_ROLE ? { role } : undefined,
+		recipeName,
+		mutation,
+		declaredWrites,
+		scope,
+	);
 }
 
 // ---------------------------------------------------------------------------
@@ -239,12 +275,12 @@ export function workerRecipeBlockReason(role: string | undefined, recipeName: st
  * Strict deterministic budget-profile validation/resolution for the
  * delegation task contract (Phase 3 of the worker token-budget repair):
  *
- *   - omitted/undefined → `extended` (the only default path);
+ *   - omitted/undefined → `standard` (the only default path);
  *   - exactly `standard` | `extended` accepted;
  *   - everything else (unknown strings, empty strings, case variants,
  *     null, numbers, objects, arrays) FAILS CLOSED with a bounded useful
- *     error — before any ledger creation or child launch. `extended` is
- *     never inferred.
+ *     error — before any ledger creation or child launch. `extended` remains
+ *     an explicit larger-profile selection and is never inferred.
  *
  * The tool schema enforces the same closed union at the boundary; this
  * pure check is the contract layer's own fail-closed decision (defense in
@@ -346,22 +382,42 @@ export interface RecipeMutationFacts {
  *   - strict Sol (approved GPT-5.6 Sol under worker-first-strict) may run
  *     recipes declaring mutation none or artifacts; mutation source is
  *     DENIED (source-mutating work is delegated to a worker);
- *   - delegated workers may run ONLY mutation none (write-free) recipes;
+ *   - delegated implementation workers may run mutation none or a mutating
+ *     recipe whose writes are all exact and delegation-scoped;
  *   - every other controller retains prior behavior (no restriction);
  *   - missing/unknown actor facts impose no restriction (backward
  *     compatible with all pre-P7 callers).
  * Legacy inference (recipe-schema.ts) maps non-empty writes to source, so
  * this decision is exactly as strict as the declared writes for legacy
- * recipes and additionally denies artifact-producing recipes to workers.
+ * recipes. Diagnosis and invalid worker task kinds stay read-only.
  */
 export function recipeMutationBlockReason(
 	facts: RecipeMutationFacts | undefined,
 	recipeName: string,
 	mutation: RecipeMutation,
+	declaredWrites: readonly string[] = [],
+	workerScope?: WorkerRecipeMutationScope,
 ): string | undefined {
 	if (facts?.role === WORKER_ROLE) {
-		if (mutation !== "none") {
-			return `Delegated worker cannot run recipe "${recipeName}": it declares mutation: ${mutation}; workers run only mutation: none (write-free) recipes`;
+		if (mutation === "none") return undefined;
+		if (workerScope === undefined) {
+			return `Delegated worker cannot run mutating recipe "${recipeName}": immutable task-kind and allowed-path authority are unavailable`;
+		}
+		if (workerScope.taskKind !== "implementation") {
+			return workerScope.taskKind === "diagnosis"
+				? `Diagnosis worker cannot run mutating recipe "${recipeName}"`
+				: `Delegated worker cannot run mutating recipe "${recipeName}": task-kind authority is invalid`;
+		}
+		if (declaredWrites.length === 0) {
+			return `Delegated worker cannot run mutating recipe "${recipeName}": at least one exact writes output is required`;
+		}
+		for (const output of declaredWrites) {
+			if (!exactWorkerRecipeWrite(workerScope.projectRoot, output)) {
+				return `Delegated worker cannot run mutating recipe "${recipeName}": writes output is not one exact project-relative path: ${output}`;
+			}
+			if (!isWorkerPathAllowed(workerScope.projectRoot, output, workerScope.allowedPaths)) {
+				return `Delegated worker cannot run mutating recipe "${recipeName}": writes output is outside delegation allowed_paths: ${output}`;
+			}
 		}
 		return undefined;
 	}
@@ -380,7 +436,7 @@ export function recipeMutationBlockReason(
  * Stable task text: fixed instructions plus dynamic contract in the user
  * message. Phase 5: the text includes one short deterministic
  * spend-profile line naming the resolved active `budgetProfile` (omitted or
- * retired `low` → `extended`; explicit `standard` remains named when supplied) and stating
+ * retired `low` → `standard`; explicit `extended` remains named when supplied) and stating
  * that the profile bounds cumulative spend only — it never expands the
  * parent-approved path/scope authority. Phase 4A: when and only when
  * `repairOf` is present, a deterministic `Repair provenance:` line

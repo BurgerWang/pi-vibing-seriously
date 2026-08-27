@@ -1,0 +1,240 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { canonicalHash } from "../extensions/workbench-runtime/cache/canonical-hash.ts";
+import { normalizeDelegationBoundedTaskContractV2 } from "../extensions/workbench-runtime/core/delegation-transaction-artifacts.ts";
+import { persistPreparedDelegationTransaction } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
+import type { DelegationCommittedGenerationV2 } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
+import { bindDelegationRepairLineageV1 } from "../extensions/workbench-runtime/core/delegation-transaction.ts";
+import type {
+	ExactRepairCommandAuthorityV1,
+	ExactRepairToolArgumentsV1,
+} from "../extensions/workbench-runtime/core/exact-repair-authority.ts";
+import { readExactRepairSuccessorV1 } from "../extensions/workbench-runtime/core/exact-repair-successor.ts";
+import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtime/core/worker-policy.ts";
+import { withTempDir } from "./helpers.ts";
+
+const PARENT_ID = "20260827-020100-prnt";
+const SUCCESSOR_ID = "20260827-020101-next";
+const SECOND_ID = "20260827-020102-more";
+const PROOF_HASH = "a".repeat(64);
+const DECISION_HASH = "b".repeat(64);
+
+function reboundContract(allowedPaths: readonly string[] = ["src/**"]) {
+	const normalized = normalizeDelegationBoundedTaskContractV2({
+		task_kind: "implementation",
+		task: "Continue the exact rejected implementation.",
+		allowed_paths: [...allowedPaths],
+		acceptance_criteria: ["The rejected behavior is corrected."],
+		verification: [],
+		timeout_seconds: 600,
+		budget_profile: "extended",
+		repair_of: PARENT_ID,
+	});
+	assert.equal(normalized.ok, true);
+	return normalized.value;
+}
+
+function authority(allowedPaths: readonly string[] = ["src/**"]): ExactRepairCommandAuthorityV1 {
+	const contract = reboundContract(allowedPaths);
+	const lineage = bindDelegationRepairLineageV1({
+		schema_version: 1,
+		kind: "semantic-repair-lineage-v1",
+		root_delegation_id: PARENT_ID,
+		repair_of: PARENT_ID,
+		root_decision_hash: DECISION_HASH,
+		continuation_decision_delegation_id: PARENT_ID,
+		continuation_decision_hash: DECISION_HASH,
+		parent_lineage_hash: null,
+		depth: 1,
+		carried_paths: ["src/dependency.ts", "src/generated.ts", "src/worker.ts"],
+	});
+	assert.ok(lineage);
+	const { contract_hash: _contractHash, budget_profile: _budgetProfile, ...rest } = contract;
+	const arguments_: ExactRepairToolArgumentsV1 = { ...rest, budget_profile: "extended" };
+	const projection = {
+		schema_version: 1 as const,
+		kind: "exact-repair-command-execution-v1" as const,
+		repair_of: PARENT_ID,
+		committed_proof_content_hash: PROOF_HASH,
+		arguments: arguments_,
+		successor_lineage: lineage,
+		authority_kind: "terminal-negative-repair" as const,
+		semantic_decision_hash: DECISION_HASH,
+		expected_bound_diff_hash: "c".repeat(64),
+	};
+	const idempotencyKey = canonicalHash(projection);
+	return {
+		...projection,
+		idempotency_key: idempotencyKey,
+		tool_call_id: `q-repair-${idempotencyKey}`,
+	};
+}
+
+function parent(allowedPaths: readonly string[] = ["src/**"]): DelegationCommittedGenerationV2 {
+	const proof = { content_hash: PROOF_HASH };
+	return {
+		state: {
+			delegation_id: PARENT_ID,
+			status: "INTERRUPTED",
+			allowed_paths: [...allowedPaths],
+			committed_proof: proof,
+		},
+		proof,
+	} as unknown as DelegationCommittedGenerationV2;
+}
+
+const closureReader = async () => ({
+	ok: true as const,
+	unresolvedTipId: PARENT_ID,
+	rootCount: 1,
+	lineageCount: 0,
+});
+
+async function preparedSuccessor(
+	root: string,
+	id: string,
+	commandAuthority: ExactRepairCommandAuthorityV1,
+	options: { contractHash?: string; allowedPaths?: readonly string[]; carriedPaths?: readonly string[] } = {},
+): Promise<void> {
+	let lineage = commandAuthority.successor_lineage;
+	if (options.carriedPaths !== undefined) {
+		const { lineage_hash: _lineageHash, ...lineageInput } = lineage;
+		const rebound = bindDelegationRepairLineageV1({
+			...lineageInput,
+			carried_paths: [...options.carriedPaths],
+		});
+		assert.ok(rebound);
+		lineage = rebound;
+	}
+	const expected = reboundContract(options.allowedPaths ?? commandAuthority.arguments.allowed_paths);
+	const persisted = await persistPreparedDelegationTransaction(root, {
+		delegation_id: id,
+		task_kind: "implementation",
+		contract_hash: options.contractHash ?? expected.contract_hash,
+		allowed_paths: [...(options.allowedPaths ?? commandAuthority.arguments.allowed_paths)],
+		worker_identity: {
+			provider: WORKER_PROVIDER,
+			model: WORKER_MODEL_ID,
+			worker_id: `worker:${id}`,
+		},
+		generation: 1,
+		now: "2026-08-27T02:01:03.000Z",
+		repair_lineage: lineage,
+	});
+	assert.equal(persisted.ok, true, persisted.ok ? "" : persisted.error.code);
+}
+
+test("successor scan returns the one durable transaction with exact contract and lineage identity", async () => {
+	await withTempDir(async (root) => {
+		const commandAuthority = authority();
+		await preparedSuccessor(root, SUCCESSOR_ID, commandAuthority);
+		const result = await readExactRepairSuccessorV1({
+			projectRoot: root,
+			parent: parent(),
+			authority: commandAuthority,
+			readRepairClosure: closureReader,
+		});
+		assert.equal(result.ok, true, result.ok ? "" : result.code);
+		if (!result.ok) return;
+		assert.equal(result.kind, "existing");
+		if (result.kind === "existing") {
+			assert.equal(result.value.delegation_id, SUCCESSOR_ID);
+			assert.equal(result.value.status, "PREPARED");
+			assert.equal(result.value.committed_proof_content_hash, null);
+		}
+	});
+});
+
+test("successor replay keeps carried review dependencies separate from worker write capability", async () => {
+	await withTempDir(async (root) => {
+		const allowedPaths = ["src/worker.ts"];
+		const commandAuthority = authority(allowedPaths);
+		await preparedSuccessor(root, SUCCESSOR_ID, commandAuthority);
+		const result = await readExactRepairSuccessorV1({
+			projectRoot: root,
+			parent: parent(allowedPaths),
+			authority: commandAuthority,
+			readRepairClosure: closureReader,
+		});
+		assert.equal(result.ok, true, result.ok ? "" : result.code);
+		if (result.ok) assert.equal(result.kind, "existing");
+	});
+});
+
+test("successor scan rejects a sibling whose carried paths or immutable contract differ", async () => {
+	await withTempDir(async (root) => {
+		const commandAuthority = authority();
+		await preparedSuccessor(root, SUCCESSOR_ID, commandAuthority, {
+			carriedPaths: ["src/dependency.ts", "src/other.ts", "src/worker.ts"],
+		});
+		const result = await readExactRepairSuccessorV1({
+			projectRoot: root,
+			parent: parent(),
+			authority: commandAuthority,
+			readRepairClosure: closureReader,
+		});
+		assert.deepEqual(result, { ok: false, code: "IDEMPOTENCY_CONFLICT", delegation_id: SUCCESSOR_ID });
+	});
+
+	await withTempDir(async (root) => {
+		const commandAuthority = authority();
+		await preparedSuccessor(root, SUCCESSOR_ID, commandAuthority, {
+			allowedPaths: ["src/worker.ts"],
+		});
+		const result = await readExactRepairSuccessorV1({
+			projectRoot: root,
+			parent: parent(),
+			authority: commandAuthority,
+			readRepairClosure: closureReader,
+		});
+		assert.deepEqual(result, { ok: false, code: "IDEMPOTENCY_CONFLICT", delegation_id: SUCCESSOR_ID });
+	});
+});
+
+test("successor scan treats multiple exact successors as a durable idempotency conflict", async () => {
+	await withTempDir(async (root) => {
+		const commandAuthority = authority();
+		await preparedSuccessor(root, SUCCESSOR_ID, commandAuthority);
+		await preparedSuccessor(root, SECOND_ID, commandAuthority);
+		assert.deepEqual(await readExactRepairSuccessorV1({
+			projectRoot: root,
+			parent: parent(),
+			authority: commandAuthority,
+			readRepairClosure: closureReader,
+		}), { ok: false, code: "IDEMPOTENCY_CONFLICT" });
+	});
+});
+
+test("successor scan fails closed on parent proof drift and absent on-disk root authority", async () => {
+	await withTempDir(async (root) => {
+		const commandAuthority = authority();
+		await preparedSuccessor(root, SUCCESSOR_ID, commandAuthority);
+		const changedParent = parent();
+		changedParent.proof.content_hash = "d".repeat(64);
+		assert.deepEqual(await readExactRepairSuccessorV1({
+			projectRoot: root,
+			parent: changedParent,
+			authority: commandAuthority,
+			readRepairClosure: closureReader,
+		}), { ok: false, code: "AUTHORITY_INVALID" });
+		const corruptIdempotency = {
+			...structuredClone(commandAuthority),
+			idempotency_key: "e".repeat(64),
+		};
+		assert.deepEqual(await readExactRepairSuccessorV1({
+			projectRoot: root,
+			parent: parent(),
+			authority: corruptIdempotency,
+			readRepairClosure: closureReader,
+		}), { ok: false, code: "AUTHORITY_INVALID" });
+
+		const withoutHegelClosure = await readExactRepairSuccessorV1({
+			projectRoot: root,
+			parent: parent(),
+			authority: commandAuthority,
+		});
+		assert.equal(withoutHegelClosure.ok, false, "default closure cannot fabricate a terminal-negative root absent from disk");
+		if (!withoutHegelClosure.ok) assert.equal(withoutHegelClosure.code, "AUTHORITY_INVALID");
+	});
+});

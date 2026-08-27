@@ -23,7 +23,6 @@ import {
 	readRunLogPage,
 } from "./runs.ts";
 import { assessRunValidation } from "./validation-assessment.ts";
-import { workerRecipeBlockReason } from "./worker-policy.ts";
 import { buildTrustedRecoveryAuthority } from "./trusted-recovery-authority.ts";
 import type { TrustedRecoveryAuthority } from "./tool-result-ingress-projection.ts";
 import {
@@ -149,10 +148,10 @@ export function registerRecipeTools<TIngress>(controller: RecipeToolsController<
 					};
 				}
 				const identity = controller.getIdentity();
-				if (identity.role === "worker") {
-					const roleError = workerRecipeBlockReason(identity.role, declaredRecipe.name, declaredRecipe.writes);
-					if (roleError) return fixedToolFailure("workbench_run_recipe", "execution_denied");
-				}
+				// The shared runner owns worker recipe admission because it binds the
+				// fixed child identity, task kind, exact writes and allowed_paths in one
+				// decision. The controller must not reintroduce the old blanket
+				// "all writes denied" rule or duplicate a weaker scope check.
 				onUpdate?.({
 					content: [{ type: "text", text: "Running declared recipe..." }],
 					details: { phase: "started", recipe: boundedInlineDetail(params.recipe, 256) },
@@ -189,9 +188,17 @@ export function registerRecipeTools<TIngress>(controller: RecipeToolsController<
 					artifactPaths: summary.artifact_paths,
 					cache: result.cache,
 				});
-				const text = boundedCommandText(result.error
-					? `error      : ${boundedInlineDetail(result.error, 128)}\n${parentSummary.text}`
-					: parentSummary.text);
+				const commandEffectStatus = result.record?.command_effect_status;
+				const commandEffectPath = summary.command_effect_path === undefined
+					? undefined
+					: displayRelative(projectRoot, summary.command_effect_path);
+				const commandEffectWarning = result.warnings?.[0];
+				const text = boundedCommandText([
+					...(result.error ? [`error      : ${boundedInlineDetail(result.error, 128)}`] : []),
+					...(commandEffectStatus ? [`cmd effect : ${boundedInlineDetail(commandEffectStatus, 128)}; semantic_acceptance=NOT_GRANTED`] : []),
+					...(commandEffectWarning ? [`warning    : ${boundedInlineDetail(commandEffectWarning, 128)}`] : []),
+					parentSummary.text,
+				].join("\n"));
 				const artifactPaths = summary.artifact_paths
 					.slice(0, summary.artifact_paths.length > 32 ? 31 : 32)
 					.map((path) => boundedInlineDetail(path, 512));
@@ -214,6 +221,9 @@ export function registerRecipeTools<TIngress>(controller: RecipeToolsController<
 						? {
 							validation_components: result.record.validation_components,
 							cache_request_mode: result.record.cache_request_mode,
+							...(commandEffectStatus === undefined ? {} : { command_effect_status: commandEffectStatus }),
+							...(commandEffectPath === undefined ? {} : { command_effect_path: boundedInlineDetail(commandEffectPath, 512) }),
+							...(commandEffectWarning === undefined ? {} : { command_effect_warning: boundedInlineDetail(commandEffectWarning, 128) }),
 						}
 						: {}),
 					cache: result.cache,

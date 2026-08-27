@@ -33,6 +33,7 @@ import {
 import type { ValidationComponent } from "./recipe-schema.ts";
 import type { ValidationEvidenceBlock } from "./validation-evidence.ts";
 import type { CacheRequestMode } from "../cache/action-types.ts";
+import type { CommandEffectStatus } from "./command-effect.ts";
 
 /** Frozen legacy manifest version. Existing v1 records remain read-only. */
 export const RUN_SCHEMA_VERSION = 1;
@@ -145,8 +146,12 @@ export interface RunRecord {
 	/** Present on runs published through the atomic v2 run transaction. */
 	run_transaction_schema_version?: 2;
 	/** Bounded machine outcome; process success alone is never sufficient. */
-	run_outcome?: "SUCCESS" | "PROCESS_FAILED" | "ARTIFACT_FAILED";
+	run_outcome?: "SUCCESS" | "PROCESS_FAILED" | "ARTIFACT_FAILED" | "COMMAND_EFFECT_FAILED";
 	artifact_manifest_path?: "artifact-manifest.json";
+	/** Durable subprocess provenance, committed in the same atomic run receipt. */
+	command_effect_path?: "command-effect.json";
+	command_effect_hash?: string;
+	command_effect_status?: CommandEffectStatus;
 }
 
 function plainRecord(value: unknown): value is Record<string, unknown> {
@@ -213,7 +218,7 @@ export function parseCommittedRunManifestV2(value: unknown, runId: string): RunR
 		|| value.validation_components.length > 3
 		|| value.validation_components.some((entry) => entry !== "typecheck" && entry !== "unit-test" && entry !== "whitespace")
 		|| (value.cache_request_mode !== "default" && value.cache_request_mode !== "no-cache" && value.cache_request_mode !== "refresh-cache")
-		|| (value.run_outcome !== "SUCCESS" && value.run_outcome !== "PROCESS_FAILED" && value.run_outcome !== "ARTIFACT_FAILED")
+		|| (value.run_outcome !== "SUCCESS" && value.run_outcome !== "PROCESS_FAILED" && value.run_outcome !== "ARTIFACT_FAILED" && value.run_outcome !== "COMMAND_EFFECT_FAILED")
 	) return null;
 
 	if (new Set(value.expected_exit_codes).size !== value.expected_exit_codes.length) return null;
@@ -238,6 +243,24 @@ export function parseCommittedRunManifestV2(value: unknown, runId: string): RunR
 	if (!(value.validation_evidence === undefined || plainRecord(value.validation_evidence))) return null;
 	if (!(value.artifact_validation === undefined || plainRecord(value.artifact_validation))) return null;
 	if (!(value.quant_contract === undefined || plainRecord(value.quant_contract))) return null;
+	const commandEffectFields = [value.command_effect_path, value.command_effect_hash, value.command_effect_status];
+	if (commandEffectFields.some((entry) => entry !== undefined)) {
+		if (value.command_effect_path !== "command-effect.json"
+			|| typeof value.command_effect_hash !== "string" || !/^[0-9a-f]{64}$/.test(value.command_effect_hash)
+			|| typeof value.command_effect_status !== "string" || ![
+				"CLEAN", "COMMAND_ATTRIBUTED", "RECIPE_DECLARATION_VIOLATION", "UNKNOWN_ORIGIN", "OUT_OF_SCOPE", "EVIDENCE_UNAVAILABLE",
+			].includes(value.command_effect_status)) return null;
+	}
+	if (value.run_outcome === "COMMAND_EFFECT_FAILED"
+		&& value.command_effect_status !== "RECIPE_DECLARATION_VIOLATION"
+		&& value.command_effect_status !== "UNKNOWN_ORIGIN"
+		&& value.command_effect_status !== "OUT_OF_SCOPE"
+		&& value.command_effect_status !== "EVIDENCE_UNAVAILABLE") return null;
+	if (value.run_outcome === "SUCCESS"
+		&& (value.command_effect_status === "RECIPE_DECLARATION_VIOLATION"
+			|| value.command_effect_status === "UNKNOWN_ORIGIN"
+			|| value.command_effect_status === "OUT_OF_SCOPE"
+			|| value.command_effect_status === "EVIDENCE_UNAVAILABLE")) return null;
 
 	return value as unknown as RunRecord;
 }
@@ -1156,6 +1179,8 @@ export interface RunSummaryRecord {
 	stderr: string;
 	stdout_log: string;
 	stderr_log: string;
+	command_effect_status?: CommandEffectStatus;
+	command_effect_path?: string;
 }
 
 export async function readSummary(projectRoot: string, runId: string): Promise<RunSummaryRecord | null> {

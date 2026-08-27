@@ -49,6 +49,8 @@ import {
 	DELEGATION_TRANSACTION_HASH_RE,
 	DELEGATION_TRANSACTION_ID_RE,
 } from "../core/delegation-transaction.ts";
+import { WORKBENCH_CHECKOUT_OPERATION_TOKEN_ENV } from "../core/project-checkout-operation.ts";
+import type { WorkerRunFailureCode } from "../core/worker-run-failure.ts";
 import {
 	WORKER_HARD_BUDGET,
 	workerBudgetBand,
@@ -64,6 +66,11 @@ import {
 	observeWorkerWriteJournalRuntimeEntry,
 	type WorkerWriteJournalRuntimeObservation,
 } from "../core/worker-write-journal-runtime.ts";
+import {
+	EMPTY_WORKER_COMMAND_EFFECT_RUNTIME_OBSERVATION,
+	observeWorkerCommandEffectRuntimeEntry,
+	type WorkerCommandEffectRuntimeObservation,
+} from "../core/delegation-command-effect-provenance.ts";
 import { WORKER_TURN_MAX_BYTES } from "../core/output-policy.ts";
 import {
 	addWorkerSpendUsage,
@@ -218,8 +225,8 @@ export interface WorkerRunResult {
 	// derive from the pure policy in core/worker-spend.ts and are recorded on
 	// EVERY outcome (success, hard stop, compaction, drift, abort, timeout,
 	// spawn failure). The profile is the runner-resolved value (deterministic
-	// `extended` default when no profile was requested).
-	/** Spend profile this run accumulated against (deterministic default: extended). */
+	// `standard` default when no profile was requested).
+	/** Spend profile this run accumulated against (deterministic default: standard). */
 	spendProfile: WorkerSpendProfile;
 	/** Final cumulative spend state (turns / totalTokens / outputTokens). */
 	spendState: WorkerSpendState;
@@ -245,22 +252,12 @@ export interface WorkerRunResult {
 	 * authoritative.
 	 */
 	writeJournalObservation: Readonly<WorkerWriteJournalRuntimeObservation>;
+	/** Machine-only committed recipe identities; assistant report text is never parsed. */
+	commandEffectObservation?: Readonly<WorkerCommandEffectRuntimeObservation>;
 }
 
 /** Closed, content-free failure categories safe to surface at the public edge. */
-export type WorkerRunFailureCode =
-	| "COMPACTION_REJECTED"
-	| "CONTEXT_HARD_LIMIT"
-	| "SPEND_TOTAL_TOKEN_LIMIT"
-	| "SPEND_OUTPUT_TOKEN_LIMIT"
-	| "SPEND_TURN_LIMIT_LEGACY"
-	| "MODEL_IDENTITY_MISMATCH"
-	| "ABORTED"
-	| "TIMED_OUT"
-	| "EXIT_CODE_NONZERO"
-	| "STOP_REASON_FAILURE"
-	| "PROVIDER_RESPONSE_UNVERIFIED"
-	| "FINAL_OUTPUT_MISSING";
+export type { WorkerRunFailureCode } from "../core/worker-run-failure.ts";
 
 export interface WorkerRunFailure {
 	readonly code: WorkerRunFailureCode;
@@ -316,6 +313,7 @@ export interface PiInvocation {
 export interface WorkerRuntimeIdentity {
 	delegationId: string;
 	contractHash: string;
+	checkoutOperationToken?: string;
 }
 
 export interface RunWorkerOptions {
@@ -401,12 +399,19 @@ function exactDataRecord(value: unknown, keys: readonly string[]): Readonly<Reco
 
 function checkedRuntimeIdentity(value: unknown): Readonly<WorkerRuntimeIdentity> | undefined | false {
 	if (value === undefined) return undefined;
-	const record = exactDataRecord(value, ["delegationId", "contractHash"]);
+	const record = exactDataRecord(value, ["delegationId", "contractHash"])
+		?? exactDataRecord(value, ["delegationId", "contractHash", "checkoutOperationToken"]);
 	if (record === undefined || typeof record.delegationId !== "string"
 		|| !DELEGATION_TRANSACTION_ID_RE.test(record.delegationId)
 		|| typeof record.contractHash !== "string"
-		|| !DELEGATION_TRANSACTION_HASH_RE.test(record.contractHash)) return false;
-	return Object.freeze({ delegationId: record.delegationId, contractHash: record.contractHash });
+		|| !DELEGATION_TRANSACTION_HASH_RE.test(record.contractHash)
+		|| !(record.checkoutOperationToken === undefined
+			|| (typeof record.checkoutOperationToken === "string" && /^[a-f0-9]{32}$/u.test(record.checkoutOperationToken)))) return false;
+	return Object.freeze({
+		delegationId: record.delegationId,
+		contractHash: record.contractHash,
+		...(record.checkoutOperationToken === undefined ? {} : { checkoutOperationToken: record.checkoutOperationToken }),
+	});
 }
 
 function ownDataValue(value: unknown, key: string): unknown {
@@ -578,6 +583,7 @@ function childEnvironment(
 	// omit it and therefore always launch with both keys absent.
 	delete env[WORKER_DELEGATION_ID_ENV];
 	delete env[WORKER_CONTRACT_HASH_ENV];
+	delete env[WORKBENCH_CHECKOUT_OPERATION_TOKEN_ENV];
 	delete env[WORKER_TIMEOUT_MS_ENV];
 	env[WORKER_ROLE_ENV] = WORKER_ROLE;
 	env[WORKER_DEPTH_ENV] = "1";
@@ -591,6 +597,9 @@ function childEnvironment(
 	if (runtimeIdentity !== undefined) {
 		env[WORKER_DELEGATION_ID_ENV] = runtimeIdentity.delegationId;
 		env[WORKER_CONTRACT_HASH_ENV] = runtimeIdentity.contractHash;
+		if (runtimeIdentity.checkoutOperationToken !== undefined) {
+			env[WORKBENCH_CHECKOUT_OPERATION_TOKEN_ENV] = runtimeIdentity.checkoutOperationToken;
+		}
 	}
 	return env;
 }
@@ -611,29 +620,23 @@ export function workerRunFailure(result: WorkerRunResult): WorkerRunFailure | un
 			message: `Pinned worker exceeded the ${WORKER_HARD_BUDGET}-token hard context budget — fail closed`,
 		};
 	}
-	// Cumulative total/output tokens remain true hard resource ceilings.
-	// Turn thresholds are retained in persisted telemetry for historical
-	// compatibility, but a tool-heavy run is no longer killed solely because
-	// it processed many small assistant messages.
-	if (result.spendHardExceeded.totalTokens || result.spendHardExceeded.outputTokens) {
+	// Every hard cumulative dimension is an execution boundary. A worker that
+	// still needs more turns must hand off a bounded continuation; allowing the
+	// turn ceiling to remain telemetry-only produced 200+ turn whole-Phase runs
+	// that could not recover coherently after termination.
+	if (result.spendHardExceeded.turns || result.spendHardExceeded.totalTokens || result.spendHardExceeded.outputTokens) {
 		return {
-			code: result.spendHardExceeded.totalTokens ? "SPEND_TOTAL_TOKEN_LIMIT" : "SPEND_OUTPUT_TOKEN_LIMIT",
+			code: result.spendHardExceeded.turns
+				? "SPEND_TURN_LIMIT"
+				: result.spendHardExceeded.totalTokens
+					? "SPEND_TOTAL_TOKEN_LIMIT"
+					: "SPEND_OUTPUT_TOKEN_LIMIT",
 			message: formatWorkerSpendHardStop(result.spendState, result.spendProfile),
 		};
 	}
-	// Old runtimes terminated on the turn marker. Recognize their bounded,
-	// deterministic signature so a reloaded controller can diagnose the
-	// historical result accurately instead of blaming the provider.
-	if (
-		result.spendHardExceeded.turns &&
-		result.exitCode !== 0 &&
-		result.errorMessage?.startsWith("Worker cumulative spend hard budget reached")
-	) {
-		return {
-			code: "SPEND_TURN_LIMIT_LEGACY",
-			message: result.errorMessage,
-		};
-	}
+	// SPEND_TURN_LIMIT_LEGACY remains a persisted-record compatibility literal,
+	// but the current runner always emits the unambiguous SPEND_TURN_LIMIT. The
+	// old branch was unreachable behind the hard-dimension branch above.
 	if (result.modelMismatch) return { code: "MODEL_IDENTITY_MISMATCH", message: result.modelMismatch };
 	if (result.aborted) return { code: "ABORTED", message: "Pinned worker was aborted" };
 	if (result.timedOut) return { code: "TIMED_OUT", message: "Pinned worker timed out" };
@@ -674,8 +677,8 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 	if (!taskKindResult.ok) throw new Error(taskKindResult.error);
 	const taskKind = taskKindResult.taskKind;
 	// Deterministic active-profile resolution: omitted, malformed, and the
-	// retired historical `low` value all resolve to the safe `extended`
-	// default; explicit `standard` selects the smaller bounded-slice profile.
+	// retired historical `low` value all resolve to the bounded `standard`
+	// default; explicit `extended` selects the larger bounded-slice profile.
 	const spendProfile = resolveWorkerSpendProfile(options.spendProfile);
 	let repairCapsule: WorkerRepairCapsule | undefined;
 	if (options.contract.repairOf !== undefined) {
@@ -743,6 +746,7 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 		spendHardExceeded: { turns: false, totalTokens: false, outputTokens: false },
 		outputControl: EMPTY_OUTPUT_CONTROL_FACTS,
 		writeJournalObservation: EMPTY_WORKER_WRITE_JOURNAL_RUNTIME_OBSERVATION,
+		commandEffectObservation: EMPTY_WORKER_COMMAND_EFFECT_RUNTIME_OBSERVATION,
 	};
 
 	try {
@@ -836,6 +840,14 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 					);
 					outputControl = observeOutputControlEntry(event.entry, outputControl);
 					result.outputControl = outputControl;
+					result.commandEffectObservation = observeWorkerCommandEffectRuntimeEntry(
+						event.entry,
+						result.commandEffectObservation ?? EMPTY_WORKER_COMMAND_EFFECT_RUNTIME_OBSERVATION,
+						runtimeIdentity === undefined ? undefined : {
+							delegation_id: runtimeIdentity.delegationId,
+							contract_hash: runtimeIdentity.contractHash,
+						},
+					);
 					return;
 				}
 				// Pi emits compaction_start before compacting. The worker extension
@@ -880,13 +892,13 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 				// normalized total/output added (positive totalTokens authoritative,
 				// else the non-negative component sum; cacheRead counts; malformed
 				// usage contributes zero but still counts the turn — never NaN). Any
-				// cumulative total/output hard dimension reached (`>=`) terminates the
-				// child fail-closed with the deterministic hard-stop message. Turns
-				// remain an advisory/telemetry marker: tool-heavy development must not
-				// be killed solely for crossing an arbitrary message count.
+				// cumulative hard dimension reached (`>=`) terminates this bounded
+				// attempt with a deterministic handoff boundary. Turn enforcement is
+				// intentional: larger work must resume as another idempotent slice, not
+				// grow into an unbounded 200+ turn worker.
 				result.spendState = addWorkerSpendUsage(result.spendState, message.usage);
 				const spendFlags = workerSpendDimensionFlags(result.spendState, spendProfile);
-				if (spendFlags.hard.totalTokens || spendFlags.hard.outputTokens) {
+				if (spendFlags.hard.turns || spendFlags.hard.totalTokens || spendFlags.hard.outputTokens) {
 					result.errorMessage = formatWorkerSpendHardStop(result.spendState, spendProfile);
 					terminate("error");
 				}

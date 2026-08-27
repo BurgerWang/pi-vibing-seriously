@@ -369,7 +369,7 @@ export interface HandoffSpendFacts {
 }
 
 export type HandoffReviewStatus = "PENDING_REVIEW" | "REVIEWED" | "STALE";
-export type HandoffSemanticReview = "accepted" | "required" | "not_required";
+export type HandoffSemanticReview = "accepted" | "repair_required" | "required" | "not_required";
 
 export interface HandoffScopeIntegrityPacket {
 	/** Existing bounded/redacted actual-diff presentation from diff-review.ts. */

@@ -9,6 +9,7 @@ import {
 } from "../extensions/workbench-runtime/core/delegation-default-delivery.ts";
 import type { DelegationReviewV2Result } from "../extensions/workbench-runtime/core/delegation-review-v2.ts";
 import type { DelegationState } from "../extensions/workbench-runtime/core/delegation-state.ts";
+import type { AutomaticSemanticReviewInput } from "../extensions/workbench-runtime/core/automatic-semantic-review-service.ts";
 
 const ID = "20260820-190000-auto";
 const BEFORE_HASH = "a".repeat(64);
@@ -293,6 +294,9 @@ test("scope/integrity FAIL returns its packet without closing or replaying", asy
 	assert.equal(result.scope_integrity_verdict, "FAIL");
 	assert.equal(result.presentation_complete, false);
 	assert.equal(result.state.status, "PENDING_REVIEW");
+	assert.equal(result.automatic_semantic_review?.status, "RETRYABLE_FAILURE");
+	assert.equal(result.automatic_semantic_review?.code, "MECHANICAL_SCOPE_INTEGRITY_FAILED");
+	assert.equal(result.automatic_semantic_review?.next_action, `/q-review ${ID}`);
 	assert.equal(calls, 1);
 	assert.deepEqual(persisted, [result.state]);
 });
@@ -386,7 +390,7 @@ test("complete zero-delta packet is the only mechanical implementation closure",
 	assert.deepEqual(persisted, [result.state]);
 });
 
-test("session append failure never exposes REVIEWED", async () => {
+test("session append failure preserves successful durable delivery and returns a confirmed warning", async () => {
 	const state = pendingState();
 	const result = await completeDefaultDelegationDeliveryV2({
 		projectRoot: "/project",
@@ -396,14 +400,68 @@ test("session append failure never exposes REVIEWED", async () => {
 		exec,
 		now: NOW,
 		persistState: () => { throw new Error("injected"); },
-	}, { review: async () => successfulReview() });
-
-	assert.deepEqual(result, {
-		ok: false,
-		code: "session_persistence_failed",
-		state,
-		review_path: `.pi/workbench/delegations/${ID}/v2/review.json`,
+	}, {
+		review: async () => successfulReview(),
+		readReview: async () => ({
+			ok: true,
+			value: {
+				state: { status: "PENDING_REVIEW" },
+				review_hash: "c".repeat(64),
+				review_path: `.pi/workbench/delegations/${ID}/v2/review.json`,
+				finalized: false,
+			} as never,
+		}),
 	});
+
+	assert.equal(result.ok, true);
+	if (!result.ok) return;
+	assert.equal(result.state.status, "PENDING_REVIEW");
+	assert.equal(result.state.currentDiffHash, REVIEW_HASH);
+	assert.deepEqual(result.session_mirror_warning, {
+		code: "session_mirror_append_failed",
+		message: "durable review succeeded; session mirror append failed and will be reconciled from durable authority",
+		durable_readback: "confirmed",
+		durable_transaction_status: "PENDING_REVIEW",
+		durable_review_finalized: false,
+	});
+});
+
+test("zero-delta durable closure remains successful when the REVIEWED mirror append fails", async () => {
+	const result = await completeDefaultDelegationDeliveryV2({
+		projectRoot: "/project",
+		delegationId: ID,
+		changedPaths: [],
+		state: pendingState(),
+		exec,
+		now: NOW,
+		persistState: () => { throw new Error("injected"); },
+	}, {
+		review: async () => successfulReview({
+			checked_paths: [],
+			displayed_paths: [],
+			remaining_paths: [],
+			fully_presented_paths: [],
+			presentation_remaining_paths: [],
+			presentation_progress: [],
+			semantic_review: "not_required",
+			patch: [],
+		}, true),
+		readReview: async () => ({
+			ok: true,
+			value: {
+				state: { status: "REVIEWED" },
+				review_hash: "c".repeat(64),
+				review_path: `.pi/workbench/delegations/${ID}/v2/review.json`,
+				finalized: true,
+			} as never,
+		}),
+	});
+
+	assert.equal(result.ok, true);
+	if (!result.ok) return;
+	assert.equal(result.state.status, "REVIEWED");
+	assert.equal(result.session_mirror_warning?.durable_readback, "confirmed");
+	assert.equal(result.session_mirror_warning?.durable_transaction_status, "REVIEWED");
 });
 
 test("a different latest delegation is rejected before review", async () => {
@@ -423,4 +481,111 @@ test("a different latest delegation is rejected before review", async () => {
 	assert.equal(result.ok, false);
 	if (!result.ok) assert.equal(result.code, "state_transition_failed");
 	assert.equal(calls, 0);
+});
+
+test("complete default delivery automatically persists ACCEPT and projects REVIEWED", async () => {
+	const completedAt = new Date("2026-08-20T19:05:00.000Z");
+	const acceptedReview = successfulReview({
+		semantic_review: "accepted",
+		semantic_acceptance: {
+			decision: "ACCEPT",
+			expected_bound_diff_hash: REVIEW_HASH,
+			reviewer: { provider: "openai-codex", model: "gpt-5.6-sol" },
+			accepted_at: completedAt.toISOString(),
+		},
+	}, true);
+	const result = await completeDefaultDelegationDeliveryV2({
+		projectRoot: "/project",
+		delegationId: ID,
+		changedPaths: ["src/a.ts"],
+		state: pendingState(),
+		exec,
+		now: NOW,
+		persistState: () => {},
+		modelRegistry: {} as never,
+	}, {
+		review: async () => successfulReview(),
+		now: () => completedAt,
+		automaticSemanticReview: (async (input: AutomaticSemanticReviewInput) => {
+			assert.equal(input.now?.().toISOString(), completedAt.toISOString(), "semantic accepted_at uses completion clock, not worker-start timestamp");
+			return {
+				status: "ACCEPT",
+				delegation_id: ID,
+				bound_diff_hash: REVIEW_HASH,
+				durable: true,
+				replayed: false,
+				receipt_hash: "f".repeat(64),
+				nested_usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+				mechanical_page_calls: 0,
+				review_result: acceptedReview,
+			};
+		}) as never,
+	});
+	assert.equal(result.ok, true);
+	if (!result.ok) return;
+	assert.equal(result.state.status, "REVIEWED");
+	assert.equal(result.state.updatedAt, completedAt.toISOString());
+	assert.equal(result.semantic_review, "accepted");
+	assert.equal(result.automatic_semantic_review?.nested_usage.totalTokens, 15);
+});
+
+test("automatic semantic REPAIR stays worker-success/PENDING and routes only to q-repair", async () => {
+	const result = await completeDefaultDelegationDeliveryV2({
+		projectRoot: "/project",
+		delegationId: ID,
+		changedPaths: ["src/a.ts"],
+		state: pendingState(),
+		exec,
+		now: NOW,
+		persistState: () => {},
+		modelRegistry: {} as never,
+	}, {
+		review: async () => successfulReview(),
+		automaticSemanticReview: (async () => ({
+			status: "REPAIR",
+			delegation_id: ID,
+			bound_diff_hash: REVIEW_HASH,
+			durable: true,
+			replayed: false,
+			receipt_hash: "e".repeat(64),
+			nested_usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, totalTokens: 15, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			mechanical_page_calls: 0,
+			next_action: `/q-repair ${ID}`,
+			review_result: successfulReview({}, false),
+		})) as never,
+	});
+	assert.equal(result.ok, true);
+	if (!result.ok) return;
+	assert.equal(result.state.status, "PENDING_REVIEW");
+	assert.equal(result.semantic_review, "repair_required");
+	assert.equal(result.automatic_semantic_review?.next_action, `/q-repair ${ID}`);
+});
+
+test("automatic model failure preserves worker-success/PENDING and exact q-review recovery", async () => {
+	const result = await completeDefaultDelegationDeliveryV2({
+		projectRoot: "/project",
+		delegationId: ID,
+		changedPaths: ["src/a.ts"],
+		state: pendingState(),
+		exec,
+		now: NOW,
+		persistState: () => {},
+		modelRegistry: {} as never,
+	}, {
+		review: async () => successfulReview(),
+		automaticSemanticReview: (async () => ({
+			status: "RETRYABLE_FAILURE",
+			code: "MODEL_UNAVAILABLE",
+			delegation_id: ID,
+			bound_diff_hash: REVIEW_HASH,
+			nested_usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			mechanical_page_calls: 0,
+			next_action: `/q-review ${ID}`,
+		})) as never,
+	});
+	assert.equal(result.ok, true);
+	if (!result.ok) return;
+	assert.equal(result.state.status, "PENDING_REVIEW");
+	assert.equal(result.semantic_review, "required");
+	assert.equal(result.automatic_semantic_review?.next_action, `/q-review ${ID}`);
 });

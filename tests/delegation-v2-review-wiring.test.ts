@@ -294,6 +294,8 @@ async function seedV2(
 		task_kind: "implementation",
 		worker_identity: { ...IDENTITY },
 		provider_success: true,
+		worker_success: true,
+		worker_failure_code: null,
 		exit_code: 0,
 		report_complete: true,
 		terminal_facts_complete: true,
@@ -310,7 +312,8 @@ async function seedV2(
 	const report = `## Completed\n- done\n## Files Changed\n${changedPaths.map((path) => `- ${path}`).join("\n")}\n## Verification\n- facts\n## Remaining Risks\n- none\n`;
 	const relevance = await collectReviewRelevanceV2({
 		project_root: root, delegation_id: ID, contract_hash: contract.value.contract_hash,
-		after_guard: lifecycle.value.after_guard, change_set: lifecycle.value.change_set, exec: spawnExec,
+		after_guard: lifecycle.value.after_guard, change_set: lifecycle.value.change_set,
+		command_provenance: lifecycle.value.command_provenance, exec: spawnExec,
 	});
 	assert.equal(relevance.ok, true);
 	if (!relevance.ok) throw new Error("review relevance setup failed");
@@ -365,6 +368,7 @@ function latestCompact(stub: StubAPI): CompactState {
 function workerFacts(report = "## Completed\n- done\n## Files Changed\n- src/legacy.ts\n## Verification\n- facts\n## Remaining Risks\n- none\n"): LedgerWorkerFacts {
 	return {
 		provider: WORKER_PROVIDER, model: WORKER_MODEL_ID, status: "success", exitCode: 0, turns: 1,
+		workerSuccess: true, workerFailureCode: null,
 		stopReason: "done", errorMessage: null,
 		usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 		cacheHitRatio: null,
@@ -615,7 +619,7 @@ test("historical mechanical FINAL migrates by complete Sol presentation plus two
 			undefined,
 			undefined,
 			ctx,
-		), /requires explicit historical semantic migration review first/);
+		), /model-supplied repair_of .* has no exact in-process authority; run \/q-repair/);
 
 		const reviewTool = tool(stub, "workbench_review_worker_diff");
 		const presented = await reviewTool.execute(
@@ -837,7 +841,7 @@ test("registered semantic ACCEPT rejects first-call, incomplete, hash-mismatch, 
 	});
 });
 
-test("registered semantic REPAIR exposes exact repair_of guidance while strict review and Gate authority stay blocked", async () => {
+test("registered semantic REPAIR exposes deterministic q-repair guidance while strict review and Gate authority stay blocked", async () => {
 	await withTempDir(async (root) => {
 		const fixture = await seedV2(root);
 		const { stub, ctx } = await runtimeFor(root, stateEntry(fixture.id, fixture.afterHash));
@@ -859,10 +863,11 @@ test("registered semantic REPAIR exposes exact repair_of guidance while strict r
 		assert.equal(repair.details.semantic_review, "repair_required");
 		assert.equal(repair.details.gate_authority, false);
 		assert.equal(repair.details.repair_of, fixture.id);
-		assert.equal(repair.details.next_action, "workbench_delegate_worker");
+		assert.equal(repair.details.next_action, "q_repair_command");
+		assert.equal(repair.details.next_action_command, `/q-repair ${fixture.id}`);
 		assert.match(String(repair.details.repair_decision_hash), /^[0-9a-f]{64}$/u);
 		assert.match(String(repair.details.repair_reason_hash), /^[0-9a-f]{64}$/u);
-		assert.match(text(repair), /start only exact repair_of/);
+		assert.match(text(repair), new RegExp(`/q-repair ${fixture.id}`));
 		assert.equal(latestState(stub).status, "PENDING_REVIEW");
 
 		const strict = await readDelegationReviewV2(root, fixture.id);
@@ -875,6 +880,13 @@ test("registered semantic REPAIR exposes exact repair_of guidance while strict r
 			assert.equal(hasDelegationSemanticRepairAuthorityV2(strict.value), true);
 			assert.equal(hasDelegationSemanticReviewAuthorityV2(strict.value), false);
 		}
+		const repairStatus = await tool(stub, "workbench_delegation_status").execute(
+			"v2-repair-status", {}, undefined, undefined, ctx,
+		);
+		assert.match(text(repairStatus), new RegExp(`next action\\s+: run /q-repair ${fixture.id}`));
+		assert.match(text(repairStatus), new RegExp(`repair route\\s+: ALLOWED .*run deterministic /q-repair ${fixture.id}`));
+		assert.doesNotMatch(text(repairStatus), /call workbench_delegate_worker with repair_of/u);
+		assert.doesNotMatch(text(repairStatus), /blocked\s+: Starting a new worker delegation/u);
 
 		const gateResult = await tool(stub, "workbench_run_gate").execute(
 			"v2-repair-gate", { gates: "b6" }, undefined, undefined, ctx,
@@ -933,7 +945,7 @@ test("no v2 root uses the unchanged read-only legacy fallback", async () => {
 	});
 });
 
-test("final v2 artifact survives a one-shot REVIEWED mirror append failure and replay completes only the mirror", async () => {
+test("final v2 artifact remains a successful durable ACCEPT when the REVIEWED mirror append fails", async () => {
 	await withTempDir(async (root) => {
 		const fixture = await seedV2(root);
 		const { stub, ctx } = await runtimeFor(root, stateEntry(fixture.id, fixture.afterHash));
@@ -944,18 +956,25 @@ test("final v2 artifact survives a one-shot REVIEWED mirror append failure and r
 		stub.failDelegationAppendOnce = (state) => state.status === "REVIEWED";
 		const acceptance = semanticAccept(String(presented.details.bound_diff_hash));
 		const first = await reviewTool.execute("v2-append-fail", acceptance, undefined, undefined, ctx);
-		assert.equal(first.details.ok, false);
-		assert.equal(first.details.error, "session_persistence_failed");
+		assert.equal(first.details.ok, true, text(first));
 		assert.equal(first.details.finalized, true);
+		assert.deepEqual(first.details.session_mirror_warning, {
+			code: "session_mirror_append_failed",
+			message: "durable review succeeded; session mirror append failed and will be reconciled from durable authority",
+			durable_readback: "confirmed",
+			durable_transaction_status: "REVIEWED",
+			durable_review_finalized: true,
+		});
+		assert.match(text(first), /WARNING: durable review succeeded; session mirror append failed/u);
 		assert.equal(stub.failedDelegationAppends, 1);
-		assert.equal(latestState(stub).status, "PENDING_REVIEW", "last successful session entry stays blocking");
+		assert.equal(latestState(stub).status, "PENDING_REVIEW", "failed append does not invent a persisted session entry");
 		const strict = await readDelegationReviewV2(root, fixture.id);
 		assert.equal(strict.ok, true);
 		if (!strict.ok) return;
 		assert.equal(strict.value.finalized, true, "project authority was finalized before the injected session failure");
 		const artifactBytes = await readFile(join(root, strict.value.review_path));
 		await persistCompact(stub, ctx);
-		assert.equal(latestCompact(stub).pendingDelegationReview, true);
+		assert.notEqual(latestCompact(stub).pendingDelegationReview, true, "compact projection follows durable authority held in memory");
 
 		const retry = await reviewTool.execute("v2-append-retry", acceptance, undefined, undefined, ctx);
 		assert.equal(retry.details.ok, true, text(retry));

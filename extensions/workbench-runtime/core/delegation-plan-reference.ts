@@ -146,6 +146,9 @@ export async function readCurrentDelegationPlanAuthority(
 	if (contract.status === "absent") {
 		if (delegationId !== null && delegationId !== undefined) {
 			const observation = await readDelegationAuthorityObservationV2(projectRoot, delegationId);
+			if (observation.kind === "invalid-v2") {
+				return { status: "blocked", reason: "plan-generation-invalid", planReferenceHash: null, requiredGateIds: [] };
+			}
 			if (observation.kind === "v2" && observation.repairLineage !== undefined) {
 				const root = await readDelegationPlanContractAuthority(projectRoot, observation.repairLineage.rootDelegationId);
 				if (root.status !== "absent") {

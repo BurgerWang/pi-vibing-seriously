@@ -144,6 +144,9 @@ import { readJsonFileBounded, type BoundedFileIoHooks } from "./bounded-file-io.
 import type { ExecFn } from "./config.ts";
 import {
 	REVIEW_RELEVANCE_KIND_V2,
+	computeReviewRelevanceProjectionHashV2,
+	validateReviewRelevanceBindingV2,
+	validateReviewRelevanceProjectionV2,
 	type ReviewRelevanceBindingV2,
 	type ReviewRelevanceProjectionV2,
 } from "./review-relevance-v2.ts";
@@ -153,6 +156,7 @@ import {
 	SEMANTIC_REVIEW_ENVELOPE_MAX_STREAM_BYTES_V1,
 	buildSemanticReviewEnvelopeV1,
 	estimateSemanticReviewRecordBytesV1,
+	validateSemanticReviewEnvelopeV1,
 	type SemanticReviewEnvelopeErrorCodeV1,
 	type SemanticReviewEnvelopeV1,
 	type SemanticReviewStreamDescriptorV1,
@@ -194,6 +198,8 @@ const REVIEW_PAGE_ENVELOPE_RESERVE_BYTES = 1_152;
 const REVIEW_PAGE_ENVELOPE_RESERVE_LINES = 4;
 export const REVIEW_PAGE_BODY_MAX_BYTES = REVIEW_PATCH_MAX_BYTES - REVIEW_PAGE_ENVELOPE_RESERVE_BYTES;
 export const REVIEW_PAGE_BODY_MAX_LINES = REVIEW_PATCH_MAX_LINES - REVIEW_PAGE_ENVELOPE_RESERVE_LINES;
+/** Hard aggregate page ceiling shared by automatic structured review. */
+export const STRUCTURED_REVIEW_PRESENTATION_MAX_PAGES_V1 = 512 as const;
 
 /**
  * Compile the exact canonical payload accepted by readReviewRecord before
@@ -1333,7 +1339,8 @@ export type SemanticReviewEnvelopePreflightResult =
 	| { ok: true; value: SemanticReviewEnvelopeV1 }
 	| { ok: false; code: SemanticReviewEnvelopePreflightFailureCode };
 
-function projectedPageCount(text: string): number | undefined {
+/** Historical v1 estimate. It is not safe for new admission because byte- and line-heavy regions can be disjoint. */
+function legacyProjectedPageCount(text: string): number | undefined {
 	const bytes = Buffer.byteLength(text, "utf8");
 	if (bytes === 0) return 0;
 	let lines = 1;
@@ -1343,6 +1350,67 @@ function projectedPageCount(text: string): number | undefined {
 		Math.ceil(lines / REVIEW_PAGE_BODY_MAX_LINES),
 	);
 	return Number.isSafeInteger(pages) && pages > 0 ? pages : undefined;
+}
+
+interface IteratedPresentationPage {
+	text: string;
+	start_byte: number;
+	end_byte: number;
+	total_bytes: number;
+}
+
+/** Run the exact production slicer until EOF; estimates are never admission authority. */
+function iteratePresentationPages(
+	text: string,
+	maxPages: number = STRUCTURED_REVIEW_PRESENTATION_MAX_PAGES_V1,
+): IteratedPresentationPage[] | undefined {
+	const totalBytes = Buffer.byteLength(text, "utf8");
+	if (totalBytes === 0) return [];
+	const pages: IteratedPresentationPage[] = [];
+	let startByte = 0;
+	while (startByte < totalBytes) {
+		if (pages.length >= maxPages) return undefined;
+		const page = slicePresentationPage(text, startByte, REVIEW_PAGE_BODY_MAX_BYTES, REVIEW_PAGE_BODY_MAX_LINES);
+		if (page === null || page.totalBytes !== totalBytes || page.endByte <= startByte) return undefined;
+		pages.push({ text: page.text, start_byte: startByte, end_byte: page.endByte, total_bytes: totalBytes });
+		startByte = page.endByte;
+	}
+	return startByte === totalBytes ? pages : undefined;
+}
+
+function actualPresentationPageCount(
+	text: string,
+	maxPages: number = STRUCTURED_REVIEW_PRESENTATION_MAX_PAGES_V1,
+): number | undefined {
+	return iteratePresentationPages(text, maxPages)?.length;
+}
+
+interface RebuiltRedactedReviewStream {
+	source: SemanticReviewStreamDescriptorV1["source"];
+	text: string;
+}
+
+/** Shared current-state constructor used by admission and automatic presentation collection. */
+async function rebuildRedactedReviewStream(input: {
+	projectRoot: string;
+	path: string;
+	afterDigests: Readonly<Record<string, string>>;
+	pathStatus: string;
+	exec: ExecFn;
+	secrets: readonly string[];
+}): Promise<RebuiltRedactedReviewStream | undefined> {
+	const compact = await compactFactsFor(
+		input.projectRoot,
+		input.path,
+		input.secrets,
+		input.afterDigests,
+		input.pathStatus,
+	);
+	if (compact !== null) return { source: "compact", text: renderCompactFacts(compact) };
+	const stream = await pageablePatchStreamFor(input.projectRoot, input.path, input.exec, input.secrets);
+	if (stream !== null) return { source: stream.source, text: stream.text };
+	const deleted = !(input.path in input.afterDigests) && input.pathStatus.includes("D");
+	return deleted ? { source: "deleted", text: "(deleted or unreadable)" } : undefined;
 }
 
 /**
@@ -1370,41 +1438,30 @@ export async function preflightSemanticReviewEnvelopeV1(input: {
 			return { ok: false, code: "invalid_input" };
 		}
 		const streams: SemanticReviewStreamDescriptorV1[] = [];
+		let totalPages = 0;
 		const secrets = input.secrets ?? [];
 		for (const path of workerPaths) {
 			if (!(await isWorkerPathAllowedRealpath(input.projectRoot, path, input.allowedPaths))) {
 				return { ok: false, code: "presentation_unavailable" };
 			}
-			let source: SemanticReviewStreamDescriptorV1["source"];
-			let text: string;
-			const compact = await compactFactsFor(
-				input.projectRoot,
+			const rebuiltStream = await rebuildRedactedReviewStream({
+				projectRoot: input.projectRoot,
 				path,
+				afterDigests: input.afterDigests,
+				pathStatus: input.pathStatuses[path] ?? "",
+				exec: input.exec,
 				secrets,
-				input.afterDigests,
-				input.pathStatuses[path] ?? "",
-			);
-			if (compact !== null) {
-				source = "compact";
-				text = renderCompactFacts(compact);
-			} else {
-				const stream = await pageablePatchStreamFor(input.projectRoot, path, input.exec, secrets);
-				if (stream === null) {
-					const deleted = !(path in input.afterDigests) && (input.pathStatuses[path] ?? "").includes("D");
-					if (!deleted) return { ok: false, code: "stream_limit_exceeded" };
-					source = "deleted";
-					text = "(deleted or unreadable)";
-				} else {
-					source = stream.source;
-					text = stream.text;
-				}
-			}
+			});
+			if (rebuiltStream === undefined) return { ok: false, code: "stream_limit_exceeded" };
+			const { source, text } = rebuiltStream;
 			const streamBytes = Buffer.byteLength(text, "utf8");
 			if (streamBytes > REVIEW_PAGE_SOURCE_MAX_BYTES) return { ok: false, code: "stream_limit_exceeded" };
-			const pageCount = source === "compact" || source === "deleted"
-				? (streamBytes === 0 ? 0 : 1)
-				: projectedPageCount(text);
+			const pageCount = actualPresentationPageCount(text);
 			if (pageCount === undefined) return { ok: false, code: "invalid_input" };
+			totalPages += pageCount;
+			if (!Number.isSafeInteger(totalPages) || totalPages > STRUCTURED_REVIEW_PRESENTATION_MAX_PAGES_V1) {
+				return { ok: false, code: "invalid_input" };
+			}
 			streams.push({
 				path,
 				source,
@@ -1428,6 +1485,229 @@ export async function preflightSemanticReviewEnvelopeV1(input: {
 	} catch {
 		return { ok: false, code: "presentation_unavailable" };
 	}
+}
+
+export type StructuredReviewEnvelopeCompatibilityV1 = "current" | "legacy-page-count-v1";
+
+export interface StructuredReviewPresentationPageV1 {
+	path: string;
+	source: SemanticReviewStreamDescriptorV1["source"];
+	stream_sha256: string;
+	/** Ordinal within this stream; global review finding ids use the array index instead. */
+	page_number: number;
+	page_count: number;
+	start_byte: number;
+	end_byte: number;
+	total_bytes: number;
+	page_content_sha256: string;
+	content: string;
+}
+
+export interface StructuredReviewPresentationV1 {
+	schema_version: 1;
+	kind: "structured-review-presentation-v1";
+	delegation_id: string;
+	envelope_compatibility: StructuredReviewEnvelopeCompatibilityV1;
+	semantic_envelope: Readonly<SemanticReviewEnvelopeV1>;
+	streams: readonly SemanticReviewStreamDescriptorV1[];
+	pages: readonly StructuredReviewPresentationPageV1[];
+	presentation_hash: string;
+}
+
+export type CollectStructuredReviewPresentationErrorCodeV1 =
+	| "INVALID_AUTHORITY"
+	| "PRESENTATION_UNAVAILABLE"
+	| "PRESENTATION_PAGE_LIMIT_EXCEEDED"
+	| "SEMANTIC_ENVELOPE_MISMATCH";
+
+export type CollectStructuredReviewPresentationResultV1 =
+	| { ok: true; value: Readonly<StructuredReviewPresentationV1> }
+	| { ok: false; code: CollectStructuredReviewPresentationErrorCodeV1 };
+
+export interface CollectStructuredReviewPresentationInputV1 {
+	projectRoot: string;
+	authority: Readonly<ReviewAuthorityFacts>;
+	exec: ExecFn;
+	secrets?: readonly string[];
+}
+
+function byteSortedUnique(values: readonly string[]): boolean {
+	return values.every((value, index) => typeof value === "string" && value.length > 0
+		&& (index === 0 || Buffer.from(values[index - 1]!, "utf8").compare(Buffer.from(value, "utf8")) < 0));
+}
+
+function structuredPresentationEffectivePaths(projection: Readonly<ReviewRelevanceProjectionV2>): string[] {
+	return [...new Set(projection.entries
+		.filter((entry) => entry.roles.includes("W") || entry.roles.includes("C"))
+		.map((entry) => entry.path))].sort((left, right) => Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8")));
+}
+
+function strictStructuredPresentationAuthority(authority: Readonly<ReviewAuthorityFacts>): boolean {
+	const envelope = authority.review_envelope;
+	const binding = authority.relevance_binding;
+	const projection = authority.relevance_projection;
+	const current = authority.current;
+	if (!validateSemanticReviewEnvelopeV1(envelope) || !validateReviewRelevanceBindingV2(binding)
+		|| !validateReviewRelevanceProjectionV2(projection) || current === undefined
+		|| authority.delegation_id !== projection.delegation_id
+		|| binding.projection_hash !== computeReviewRelevanceProjectionHashV2(projection)
+		|| binding.projection_hash !== envelope.relevance_projection_hash
+		|| authority.recorded_after_hash !== binding.projection_hash
+		|| authority.current_diff_hash !== binding.projection_hash
+		|| !Array.isArray(authority.drift_paths) || authority.drift_paths.length !== 0
+		|| !Array.isArray(authority.worker_paths) || !byteSortedUnique(authority.worker_paths)
+		|| authority.worker_paths.length !== envelope.path_count
+		|| current.gitHead !== projection.git_head
+		|| canonicalHash(current.changedPaths) !== canonicalHash(authority.worker_paths)) return false;
+	const effectivePaths = structuredPresentationEffectivePaths(projection);
+	if (canonicalHash(effectivePaths) !== canonicalHash(authority.worker_paths)) return false;
+	const effectiveSet = new Set(effectivePaths);
+	for (const entry of projection.entries.filter((candidate) => effectiveSet.has(candidate.path))) {
+		if (current.pathStatuses[entry.path] !== entry.status) return false;
+		if (entry.full_identity.kind === "file") {
+			if (current.pathDigests[entry.path] !== entry.full_identity.sha256) return false;
+		} else if (Object.prototype.hasOwnProperty.call(current.pathDigests, entry.path)) return false;
+	}
+	return true;
+}
+
+function presentationIdentity(input: {
+	delegation_id: string;
+	envelope_compatibility: StructuredReviewEnvelopeCompatibilityV1;
+	semantic_envelope: Readonly<SemanticReviewEnvelopeV1>;
+	streams: readonly SemanticReviewStreamDescriptorV1[];
+	pages: readonly StructuredReviewPresentationPageV1[];
+}): string {
+	return canonicalHash({
+		schema_version: 1,
+		kind: "structured-review-presentation-identity-v1",
+		delegation_id: input.delegation_id,
+		envelope_compatibility: input.envelope_compatibility,
+		semantic_envelope_hash: canonicalHash(input.semantic_envelope),
+		streams: input.streams,
+		pages: input.pages.map(({ content: _content, ...binding }) => binding),
+	});
+}
+
+function rebuildPresentationEnvelope(
+	authority: Readonly<ReviewAuthorityFacts>,
+	streams: readonly SemanticReviewStreamDescriptorV1[],
+): SemanticReviewEnvelopeV1 | undefined {
+	if (authority.relevance_projection === undefined || authority.relevance_binding === undefined) return undefined;
+	const projectedBytes = estimateSemanticReviewRecordBytesV1({
+		worker_paths: authority.worker_paths,
+		allowed_paths: authority.allowed_paths,
+		streams,
+		relevance_projection: authority.relevance_projection,
+	});
+	if (projectedBytes === undefined) return undefined;
+	const rebuilt = buildSemanticReviewEnvelopeV1({
+		streams,
+		projected_review_record_bytes: projectedBytes,
+		relevance_projection_hash: authority.relevance_binding.projection_hash,
+	});
+	return rebuilt.ok ? rebuilt.value : undefined;
+}
+
+/**
+ * Rebuild the complete current redacted stream set and slice it with the
+ * exact production UTF-8 byte+line pager. No review/session state is read or
+ * written; callers receive one immutable, hash-bound presentation snapshot.
+ */
+export async function collectStructuredReviewPresentationV1(
+	input: CollectStructuredReviewPresentationInputV1,
+): Promise<CollectStructuredReviewPresentationResultV1> {
+	try {
+		if (!strictStructuredPresentationAuthority(input.authority)) return { ok: false, code: "INVALID_AUTHORITY" };
+		const envelope = input.authority.review_envelope!;
+		const current = input.authority.current!;
+		const secrets = input.secrets ?? [];
+		const streams: SemanticReviewStreamDescriptorV1[] = [];
+		const legacyStreams: SemanticReviewStreamDescriptorV1[] = [];
+		const pages: StructuredReviewPresentationPageV1[] = [];
+		for (const path of input.authority.worker_paths) {
+			if (!(await isWorkerPathAllowedRealpath(input.projectRoot, path, input.authority.allowed_paths))) {
+				return { ok: false, code: "PRESENTATION_UNAVAILABLE" };
+			}
+			const rebuilt = await rebuildRedactedReviewStream({
+				projectRoot: input.projectRoot,
+				path,
+				afterDigests: input.authority.after.pathDigests,
+				pathStatus: current.pathStatuses[path] ?? "",
+				exec: input.exec,
+				secrets,
+			});
+			if (rebuilt === undefined) return { ok: false, code: "PRESENTATION_UNAVAILABLE" };
+			const streamBytes = Buffer.byteLength(rebuilt.text, "utf8");
+			if (streamBytes > REVIEW_PAGE_SOURCE_MAX_BYTES) return { ok: false, code: "PRESENTATION_UNAVAILABLE" };
+			const slices = iteratePresentationPages(rebuilt.text, REVIEW_PAGE_SOURCE_MAX_BYTES);
+			if (slices === undefined) return { ok: false, code: "PRESENTATION_UNAVAILABLE" };
+			if (pages.length + slices.length > STRUCTURED_REVIEW_PRESENTATION_MAX_PAGES_V1) {
+				return { ok: false, code: "PRESENTATION_PAGE_LIMIT_EXCEEDED" };
+			}
+			const streamHash = createHash("sha256").update(rebuilt.text, "utf8").digest("hex");
+			const descriptor: SemanticReviewStreamDescriptorV1 = {
+				path,
+				source: rebuilt.source,
+				stream_bytes: streamBytes,
+				stream_sha256: streamHash,
+				page_count: slices.length,
+			};
+			streams.push(descriptor);
+			const legacyCount = rebuilt.source === "compact" || rebuilt.source === "deleted"
+				? (streamBytes === 0 ? 0 : 1)
+				: legacyProjectedPageCount(rebuilt.text);
+			if (legacyCount === undefined) return { ok: false, code: "PRESENTATION_UNAVAILABLE" };
+			legacyStreams.push({ ...descriptor, page_count: legacyCount });
+			for (const [index, slice] of slices.entries()) {
+				pages.push({
+					path,
+					source: rebuilt.source,
+					stream_sha256: streamHash,
+					page_number: index + 1,
+					page_count: slices.length,
+					start_byte: slice.start_byte,
+					end_byte: slice.end_byte,
+					total_bytes: slice.total_bytes,
+					page_content_sha256: createHash("sha256").update(slice.text, "utf8").digest("hex"),
+					content: slice.text,
+				});
+			}
+		}
+		const currentEnvelope = rebuildPresentationEnvelope(input.authority, streams);
+		const legacyEnvelope = rebuildPresentationEnvelope(input.authority, legacyStreams);
+		const compatibility: StructuredReviewEnvelopeCompatibilityV1 | undefined = currentEnvelope !== undefined
+			&& canonicalHash(currentEnvelope) === canonicalHash(envelope)
+			? "current"
+			: legacyEnvelope !== undefined && canonicalHash(legacyEnvelope) === canonicalHash(envelope)
+				? "legacy-page-count-v1"
+				: undefined;
+		if (compatibility === undefined) return { ok: false, code: "SEMANTIC_ENVELOPE_MISMATCH" };
+		const base = {
+			delegation_id: input.authority.delegation_id,
+			envelope_compatibility: compatibility,
+			semantic_envelope: structuredClone(envelope),
+			streams,
+			pages,
+		};
+		const value: StructuredReviewPresentationV1 = {
+			schema_version: 1,
+			kind: "structured-review-presentation-v1",
+			...base,
+			presentation_hash: presentationIdentity(base),
+		};
+		return { ok: true, value: deepFreezeReviewPresentation(value) };
+	} catch {
+		return { ok: false, code: "PRESENTATION_UNAVAILABLE" };
+	}
+}
+
+function deepFreezeReviewPresentation<T>(value: T): Readonly<T> {
+	if (value !== null && typeof value === "object") {
+		for (const child of Object.values(value as Record<string, unknown>)) deepFreezeReviewPresentation(child);
+		Object.freeze(value);
+	}
+	return value;
 }
 
 /**
@@ -1819,7 +2099,7 @@ async function rebuildLegacySemanticReviewEnvelopeV1(input: {
 		if (streamBytes > REVIEW_PAGE_SOURCE_MAX_BYTES) return undefined;
 		const pageCount = source === "compact" || source === "deleted"
 			? (streamBytes === 0 ? 0 : 1)
-			: projectedPageCount(text);
+			: legacyProjectedPageCount(text);
 		if (pageCount === undefined) return undefined;
 		streams.push({
 			path,
@@ -1903,9 +2183,7 @@ export async function validateReviewPresentationAgainstAuthority(
 			for (const segment of item.segments) {
 				if (createHash("sha256").update(actualBytes.subarray(segment.start_byte, segment.end_byte)).digest("hex") !== segment.page_sha256) return false;
 			}
-			const pageCount = source === "compact" || source === "deleted"
-				? (total === 0 ? 0 : 1)
-				: projectedPageCount(text);
+			const pageCount = actualPresentationPageCount(text, REVIEW_PAGE_SOURCE_MAX_BYTES);
 			if (pageCount === undefined) return false;
 			envelopeStreams.push({
 				path: item.path,

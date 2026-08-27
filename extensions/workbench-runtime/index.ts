@@ -102,14 +102,13 @@ import {
 } from "./cache/cache-telemetry.ts";
 import { readDelegationLedger, type GitFacts } from "./core/delegation-ledger.ts";
 import {
-	readDelegationCommittedGenerationV2,
-	readDelegationTransactionV2,
+	readDelegationCommittedGenerationV2, readDelegationReviewV2, readDelegationTransactionV2,
 } from "./core/delegation-transaction-storage.ts";
 import {
 	readRecoverableUnpublishedDelegationV2,
 	readDelegationAuthorityObservationV2 as readDelegationAuthorityObservation,
 } from "./core/delegation-project-authority.ts";
-import { delegationDisplayedStatusV1, delegationNextActionTextV1, delegationProjectIssueRepairStatusV1, delegationRepairStatusLinesV1, readDelegationRepairStatusV1,
+import { delegationDisplayedStatusV1, delegationExactRepairRouteLineV1, delegationNextActionTextV1, delegationProjectIssueRepairStatusV1, delegationRepairStatusLinesV1, readDelegationRepairStatusV1,
 	type DelegationRepairStatusV1 } from "./core/delegation-repair-status.ts";
 import { buildDelegationWorkerFirstGateFacts } from "./core/delegation-plan-reference.ts";
 import { resolveToolOutputPolicy } from "./core/output-policy.ts";
@@ -182,7 +181,6 @@ import { collectSecretValues } from "./core/redact.ts";
 import { registerMilestoneHandoffCommand } from "./core/milestone-handoff-controller.ts";
 import {
 	boundedCommandText as boundedToolText,
-	boundedInlineDetail,
 } from "./core/command-output.ts";
 import { registerRunCommands } from "./core/run-commands.ts";
 import { gateParentSummaryLines, registerGateCommands } from "./core/gate-commands.ts";
@@ -199,19 +197,14 @@ import {
 import {
 	fixedToolFailure,
 } from "./core/tool-presentation.ts";
-import { registerRecipeTools } from "./core/recipe-tools-controller.ts";
-import { registerGateTools } from "./core/gate-tools-controller.ts";
-import { registerCompareTool } from "./core/compare-tool-controller.ts";
-import { registerDelegationStatusTool } from "./core/delegation-status-tool-controller.ts";
-import { registerReviewTool } from "./core/review-tool-controller.ts";
-import { registerDelegateTool } from "./core/delegate-tool-controller.ts";
-import { registerRecoveryTool } from "./core/recovery-tool-controller.ts";
-import { registerGitTool } from "./core/local-commit-tool-controller.ts";
+import {
+	doctorWorkbenchRuntimeBuildV1,
+	workbenchRuntimeMutationBlockReasonV1,
+} from "./core/runtime-build-identity.ts";
 import { RUNTIME_CONTROLLER_SERVICES } from "./core/runtime-controller-services.ts";
 import { createRuntimeTransientState } from "./core/runtime-transient-state.ts";
 import { createDelegationSessionController } from "./core/delegation-session-controller.ts";
-import { registerToolResultMiddleware } from "./core/tool-result-middleware-controller.ts";
-import { registerToolCallGuard } from "./core/tool-call-guard-controller.ts";
+import { registerRuntimeWorkbenchToolsV1 } from "./core/runtime-workbench-tools-controller.ts";
 import { registerMessageEndController } from "./core/message-end-controller.ts";
 import { registerDelegationClaimGuard } from "./core/delegation-claim-guard-controller.ts";
 import { solCommanderDriftStatus } from "./core/development-efficiency.ts";
@@ -263,6 +256,8 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	 * finalized; a replayed call or the recovery tool never enters this map.
 	 */
 	const pendingReceiptHandles = new Map<string, { handle: ReceiptHandle; projectRoot: string }>();
+	/** Late-bound so the earlier claim guard can suppress only its compatibility notice. */
+	let hasPendingAutomaticDeliveryContinuation = (): boolean => false;
 	/** Latest selected identity/reasoning facts (updated on session_start/select events). */
 	let currentModelFacts: { provider?: string; model?: string; thinking?: string } = {};
 	let workerBudgetSteerSent = false;
@@ -866,6 +861,18 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		return undefined;
 	}
 
+	function runtimeMutationBlockReason(toolName: unknown): string | undefined {
+		try {
+			return workbenchRuntimeMutationBlockReasonV1(toolName);
+		} catch {
+			return "Workbench runtime freshness is unavailable; mutation fails closed — run /reload and verify /q-runtime-doctor";
+		}
+	}
+
+	function trustedMutationOrError(ctx: ExtensionContext, boundary: string): string | undefined {
+		return trustedOrError(ctx) ?? runtimeMutationBlockReason(boundary);
+	}
+
 	async function projectRootFor(ctx: ExtensionContext): Promise<string> {
 		return findProjectRoot(ctx.cwd, execFn);
 	}
@@ -919,11 +926,20 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		const delegationProjectAuthorityIssue = delegationSession.getProjectAuthorityIssue();
 		const delegationState = delegationSession.getState();
 		if (delegationProjectAuthorityIssue !== undefined) {
-			lines.push(
-				`project auth : INVALID (${delegationProjectAuthorityIssue.code}) — delegation and verification fail closed`,
-				`latest       : ${delegationProjectAuthorityIssue.delegationId ?? delegationState.latestId ?? "(unknown)"} PROJECT_AUTHORITY_INVALID`,
-				`blocked writes: ${delegationState.blockedWriteAttempts}`,
-			);
+			if (latestRepairStatus.kind === "historical_multiplicity") {
+				lines.push(
+					`project auth : HISTORICAL_MULTIPLICITY (${delegationProjectAuthorityIssue.code}) — request-specific strict path admission required`,
+					`latest       : ${delegationProjectAuthorityIssue.delegationId ?? delegationState.latestId ?? "(unknown)"} HISTORICAL_MULTIPLICITY`,
+					`blocked writes: ${delegationState.blockedWriteAttempts}`,
+					...delegationRepairStatusLinesV1(latestRepairStatus),
+				);
+			} else {
+				lines.push(
+					`project auth : INVALID (${delegationProjectAuthorityIssue.code}) — delegation and verification fail closed`,
+					`latest       : ${delegationProjectAuthorityIssue.delegationId ?? delegationState.latestId ?? "(unknown)"} PROJECT_AUTHORITY_INVALID`,
+					`blocked writes: ${delegationState.blockedWriteAttempts}`,
+				);
+			}
 		} else if (delegationState.latestId !== undefined) {
 			const authority = await readDelegationAuthorityObservation(projectRoot, delegationState.latestId);
 			const displayedStatus = delegationDisplayedStatusV1(delegationState.status, authority.kind === "v2" ? authority.transactionStatus : undefined);
@@ -940,7 +956,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			const finalizedReviewedStaleSuccessor = delegationState.status === "STALE" && authority.kind === "v2"
 				&& authority.transactionStatus === "REVIEWED" && authority.finalized
 				&& authority.review?.verdict === "PASS" && authority.semanticAccepted;
-			if (block && !finalizedReviewedStaleSuccessor) lines.push(`blocked      : ${block}`);
+			if (block && !finalizedReviewedStaleSuccessor) lines.push(delegationExactRepairRouteLineV1(latestRepairStatus) ?? `blocked      : ${block}`);
 			if (block && finalizedReviewedStaleSuccessor) {
 				lines.push(
 					"successor    : ALLOWED after live revalidation — prior v2 review has strict semantic authority; a fresh delegation adopts the current workspace as its new baseline",
@@ -956,7 +972,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 						"authority v2 : RECOVERABLE_UNPUBLISHED (RECOVERY_REQUIRED; committed proof absent)",
 					);
 					if (latestRepairStatus.kind !== "delegation_retry") {
-						lines.push(`next action  : call workbench_delegate_worker with repair_of=${delegationState.latestId}; do not retry review`);
+						lines.push("recovery note: committed proof is absent, so deterministic /q-repair is unavailable; inspect strict unpublished recovery authority and do not retry review");
 					}
 				} else {
 					lines.push(`authority v2 : INVALID (${authority.code}) — legacy fallback refused`);
@@ -974,7 +990,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				if (recoverable?.ok) {
 					lines.push("authority v2 : RECOVERABLE_UNPUBLISHED (RECOVERY_REQUIRED; committed proof absent)");
 					if (latestRepairStatus.kind !== "delegation_retry") {
-						lines.push(`next action  : call workbench_delegate_worker with repair_of=${delegationState.latestId}; do not retry review`);
+						lines.push("recovery note: committed proof is absent, so deterministic /q-repair is unavailable; inspect strict unpublished recovery authority and do not retry review");
 					}
 				} else {
 					lines.push(`authority v2 : transaction ${authority.transactionStatus}`);
@@ -1014,6 +1030,20 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	}
 
 	// -------------------------------------------------------------- lifecycle
+	function activeBranchEntries(ctx: ExtensionContext) {
+		// Pi sessions are trees. getEntries() includes abandoned/sibling branches
+		// and a later custom entry on another branch can otherwise overwrite the
+		// selected branch's state. Production Pi exposes getBranch(); the fallback
+		// keeps older test/compatibility contexts readable without changing the
+		// production authority rule.
+		try {
+			const manager = ctx.sessionManager as typeof ctx.sessionManager & { getBranch?: () => ReturnType<typeof ctx.sessionManager.getEntries> };
+			if (typeof manager.getBranch === "function") return manager.getBranch();
+		} catch {
+			// Fall through to the legacy read-only compatibility surface.
+		}
+		return ctx.sessionManager.getEntries();
+	}
 
 	pi.on("session_start", async (event, ctx) => {
 		transientState.resetTrustedIngressAuthorities();
@@ -1023,7 +1053,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		// and every session-replacement path (/new, /resume, /fork, /clone,
 		// /reload all reach this handler via session_start); /new starts a
 		// fresh session file, so it falls back to the DEV default.
-		const entries = ctx.sessionManager.getEntries();
+		const entries = activeBranchEntries(ctx);
 		pendingRetryCompactNote = undefined;
 		retryCompactNoteReady = false;
 		workbenchOverflowCompactRequested = false;
@@ -1080,9 +1110,9 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			latestRepairStatus = { kind: "none" };
 			delegationSession.clearProjectAuthorityIssue();
 		}
-		// P7 slice 3: mirror the restored authority facts into the compaction
-		// state (fresh derivation — the mirror never overrides the restored
-		// lease/delegation entries, which stay authoritative).
+		// P7 slice 3: mirror the freshly reconciled project-authority projection
+		// into compaction state. Session delegation entries are presentation
+		// cache only; they never override the durable project transaction.
 		refreshCompactP7Facts();
 		applyModeTools();
 
@@ -1117,12 +1147,43 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		persistContextPressure();
 	});
 
-	pi.on("session_tree", () => {
+	pi.on("session_tree", async (_event, ctx) => {
 		transientState.resetTrustedIngressAuthorities();
+		const entries = activeBranchEntries(ctx);
+		// Tree navigation changes the active branch without rebuilding the
+		// extension runtime. Reload every branch-owned presentation preference,
+		// then reconcile delegation truth from the project registry. Never retain
+		// a sibling branch's mode, lease, or delegation mirror in memory.
+		mode = loadModeFromEntries(entries);
+		compactState = loadCompactStateFromEntries(entries, mode);
+		delegationSession.restore(entries);
+		writeLease = loadLeaseFromEntries(entries);
+		if (writeLease !== undefined) {
+			writeLease = revokeLease(writeLease, "session tree navigation requires a fresh write lease", new Date().toISOString());
+			persistLease();
+		}
 		resetHistoryProjection();
 		persistHistoryProjectionState();
 		persistContextPressure();
+		outputControlTelemetry = undefined;
+		outputControlTelemetryRole = undefined;
+		ensureOutputControlTelemetry(entries);
+		mirrorOutputControlCompactFacts();
+		try {
+			if (!ctx.isProjectTrusted()) throw new Error("untrusted project");
+			const projectRoot = await projectRootFor(ctx);
+			await delegationSession.reconcileProjectAuthority(projectRoot, new Date().toISOString());
+			latestRepairStatus = delegationProjectIssueRepairStatusV1(delegationSession.getProjectAuthorityIssue()) ??
+				await readDelegationRepairStatusV1(projectRoot, delegationSession.getState(), execFn);
+		} catch {
+			latestRepairStatus = { kind: "none" };
+			delegationSession.clearProjectAuthorityIssue();
+		}
+		refreshCompactP7Facts();
+		applyModeTools();
 		cacheTelemetry.observeSessionTreeChange();
+		void refreshStatus(ctx);
+		void refreshWidget(ctx);
 	});
 
 	// ----------------------------------------------------- P5 compaction
@@ -1693,10 +1754,12 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	registerDelegationClaimGuard({
 		pi,
 		isCommander: () => outputTurnRole() === "commander",
+		hasPendingAutomaticDeliveryContinuation: () => hasPendingAutomaticDeliveryContinuation(),
 		projectRootFor,
 		getDelegationState: delegationSession.getState,
 		readTransaction: readDelegationTransactionV2,
 		readCommittedGeneration: readDelegationCommittedGenerationV2,
+		readReview: readDelegationReviewV2,
 		readLegacyLedger: readDelegationLedger,
 		readCommittedRun: readCommittedManifest,
 	});
@@ -1780,8 +1843,9 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 
 	registerInitCommand({
 		pi,
-		trustedOrError,
+		trustedOrError: (ctx) => trustedMutationOrError(ctx, "write"),
 		projectRootFor,
+		reconcileProjectAuthority: delegationSession.reconcileProjectAuthority,
 		output,
 	});
 
@@ -1796,8 +1860,9 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			model: currentModelFacts.model,
 		}),
 		exec: execFn,
-		trustedOrError,
+		trustedOrError: (ctx) => trustedMutationOrError(ctx, "workbench_run_recipe"),
 		projectRootFor,
+		reconcileProjectAuthority: delegationSession.reconcileProjectAuthority,
 		output,
 		refreshStatus,
 		refreshWidget,
@@ -1818,7 +1883,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		reconcileProjectAuthority: delegationSession.reconcileProjectAuthority,
 		buildWorkerFirstFacts: buildWorkerFirstGateFacts,
 		exec: execFn,
-		trustedOrError,
+		trustedOrError: (ctx) => trustedMutationOrError(ctx, "workbench_run_gate"),
 		projectRootFor,
 		output,
 		refreshStatus,
@@ -1838,7 +1903,9 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		exec: execFn,
 		refreshConfig: refreshCacheConfig,
 		trustedOrError,
+		mutationOrError: trustedMutationOrError,
 		projectRootFor,
+		reconcileProjectAuthority: delegationSession.reconcileProjectAuthority,
 		output,
 	});
 
@@ -1852,149 +1919,47 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 
 	// --------------------------------------------------------- custom tools
 
-	registerRecipeTools({
+	const runtimeTools = registerRuntimeWorkbenchToolsV1({
 		pi,
-		getMode: () => mode,
-		getIdentity: () => ({
-			role: workerRoleContext.role,
-			provider: currentModelFacts.provider,
-			model: currentModelFacts.model,
-		}),
-		exec: execFn,
-		trustedOrError,
-		projectRootFor,
-		buildReadOnlyWorkerFirstGateFacts,
-		peekOutputAuthorization: transientState.peekOutputAuthorization,
-		rememberTrustedRunLogContinuation: transientState.rememberTrustedRunLogContinuation,
-		bindTrustedIngressAuthority: transientState.bindTrustedIngressAuthority,
-		rememberTrustedIngressAuthority: transientState.rememberTrustedIngressAuthority,
-	});
-	registerGateTools({
-		pi,
-		getMode: () => mode,
-		getDelegationState: delegationSession.getState,
-		getIdentity: () => ({
-			role: workerRoleContext.role,
-			provider: currentModelFacts.provider,
-			model: currentModelFacts.model,
-		}),
-		exec: execFn,
-		trustedOrError,
-		projectRootFor,
-		reconcileProjectAuthority: delegationSession.reconcileProjectAuthority,
-		getProjectAuthorityBlockReason: delegationSession.projectAuthorityBlockReason,
-		buildWorkerFirstGateFacts,
-		peekOutputAuthorization: transientState.peekOutputAuthorization,
-		rememberTrustedGateContinuation: transientState.rememberTrustedGateContinuation,
-		bindTrustedIngressAuthority: transientState.bindTrustedIngressAuthority,
-		rememberTrustedIngressAuthority: transientState.rememberTrustedIngressAuthority,
-	});
-	registerCompareTool({
-		pi,
-		services: RUNTIME_CONTROLLER_SERVICES.compare,
-		trustedOrError,
-		projectRootFor,
-		bindTrustedIngressAuthority: transientState.bindTrustedIngressAuthority,
-		rememberTrustedIngressAuthority: transientState.rememberTrustedIngressAuthority,
-	});
-	registerDelegateTool({
-		pi,
-		services: RUNTIME_CONTROLLER_SERVICES.delegate,
 		exec: execFn,
 		secrets,
-		trustedOrError,
-		projectRootFor,
 		getMode: () => mode,
-		reconcileProjectAuthority: delegationSession.reconcileProjectAuthority,
-		getProjectAuthorityBlockReason: delegationSession.projectAuthorityBlockReason,
-		collectCurrentDelegationBinding: delegationSession.collectCurrentBinding,
-		projectTerminalReviewedBinding: delegationSession.projectTerminalReviewedBinding,
-		getDelegationState: delegationSession.getState,
-		setDelegationState: delegationSession.setState,
-		persistDelegationState: delegationSession.persistBestEffort,
-		persistDelegationStateStrict: delegationSession.persistStrict,
-		markTerminalMirrorBlocked: delegationSession.markTerminalMirrorBlocked,
-		refreshStatus,
-		bindTrustedIngressAuthority: transientState.bindTrustedIngressAuthority,
-		rememberTrustedIngressAuthority: transientState.rememberTrustedIngressAuthority,
-	});
-	registerReviewTool({
-		pi,
-		services: RUNTIME_CONTROLLER_SERVICES.review,
-		exec: execFn,
-		secrets,
-		trustedOrError,
-		projectRootFor,
-		peekOutputAuthorization: transientState.peekOutputAuthorization,
-		syncLease: syncLeaseLock,
-		reconcileProjectAuthority: delegationSession.reconcileProjectAuthority,
-		getProjectAuthorityBlockReason: delegationSession.projectAuthorityBlockReason,
-		getProjectAuthorityIssueCode: () => delegationSession.getProjectAuthorityIssue()?.code,
-		getDelegationState: delegationSession.getState,
-		setDelegationState: delegationSession.setState,
-		isStrictMirrorDirty: delegationSession.isStrictMirrorDirty,
-		setStrictMirrorDirty: delegationSession.setStrictMirrorDirty,
-		persistDelegationState: delegationSession.persistBestEffort,
-		persistDelegationStateStrict: delegationSession.persistStrict,
-		refreshCompactFacts: refreshCompactP7Facts,
-		refreshStatus,
-	});
-	registerDelegationStatusTool({
-		pi,
-		trustedOrError,
-		projectRootFor,
-		syncLease: syncLeaseLock,
-		delegationStatusLines,
-	});
-
-	registerRecoveryTool({
-		pi,
-		services: RUNTIME_CONTROLLER_SERVICES.recovery,
-		trustedOrError,
-		projectRootFor,
-	});
-	registerGitTool({ pi, services: RUNTIME_CONTROLLER_SERVICES.git, exec: execFn, trustedOrError, projectRootFor, getMode: () => mode, getIdentity: () => ({ roleEnv: workerRoleContext.role, provider: currentModelFacts.provider, model: currentModelFacts.model }), reconcileProjectAuthority: delegationSession.reconcileProjectAuthority, refreshStatus });
-	registerToolResultMiddleware({
-		pi,
-		workerJournalActive: workerRoleContext.role === "worker" && workerRoleContext.taskKind === "implementation",
+		getIdentity: () => ({ provider: currentModelFacts.provider, model: currentModelFacts.model }),
+		workerRoleContext,
 		workerWriteJournalRuntime,
-		getOutputTurnRole: outputTurnRole,
-		takeTrustedContinuation: (toolCallId, toolName) =>
-			transientState.takeTrustedReadContinuation(toolCallId, toolName)
-			?? transientState.takeTrustedRunLogContinuation(toolCallId, toolName)
-			?? transientState.takeTrustedGateContinuation(toolCallId, toolName),
-		takeOutputAuthorization: transientState.takeOutputAuthorization,
+		delegationSession,
+		transientState,
+		trustedOrError,
+		projectRootFor,
+		output,
+		buildReadOnlyWorkerFirstGateFacts,
+		buildWorkerFirstGateFacts,
+		refreshStatus,
+		refreshCompactFacts: refreshCompactP7Facts,
+		delegationStatusLines,
+		syncLease: syncLeaseLock,
+		compactionPending: () => compactAttempt?.status === "started" ||
+			workbenchOverflowCompactRequested || overflowFollowUpPending ||
+			pendingOverflowRecoveryContext !== undefined || nativeOverflowCompactStarted ||
+			retryCompactNoteReady || pendingRetryCompactNote !== undefined,
+		streamingToolCallBlockReason: (toolName) => streamingControl.toolCallBlockReason(toolName),
+		runtimeMutationBlockReason,
+		outputTurnRole,
 		authorizeOutput,
-		takeTrustedIngressAuthority: transientState.takeTrustedIngressAuthority,
-		turnOutputBudget,
 		observeOutputEnvelope,
-		rememberProcessedNormalResult: transientState.rememberProcessedNormalResult,
+		turnOutputBudget,
 		pendingReceiptHandles,
-		secrets,
-	});
-	registerToolCallGuard({
-		pi,
-		toolCallBlockReason: (toolName) => streamingControl.toolCallBlockReason(toolName),
-		getWorkerRoleContext: () => workerRoleContext,
-		getIdentity: () => currentModelFacts,
-		getMode: () => mode,
 		getLease: () => writeLease,
 		setLease: (lease) => { writeLease = lease; },
-		syncLease: syncLeaseLock,
+		persistLease,
+		applyModeTools,
 		recordBlockedWriteAttempt: (now) => {
 			delegationSession.setState(recordBlockedWriteAttempt(delegationSession.getState(), now));
 			delegationSession.persistBestEffort();
 		},
-		projectRootFor,
-		authorizeOutput,
-		rememberOutputAuthorization: transientState.rememberOutputAuthorization,
-		workerWriteJournalRuntime,
-		turnOutputBudget,
-		pendingReceiptHandles,
-		persistLease,
-		applyModeTools,
 		recordModifiedFile: (path) => {
 			compactState.modifiedFiles = pushBounded(compactState.modifiedFiles, path, MAX_MODIFIED_FILES);
 		},
 	});
+	hasPendingAutomaticDeliveryContinuation = runtimeTools.hasPendingAutomaticDeliveryContinuation;
 }

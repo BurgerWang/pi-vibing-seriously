@@ -13,6 +13,10 @@ import { canonicalHash } from "../cache/canonical-hash.ts";
 import type { FinalizedDelegationChangeSetLifecycleV2 } from "./delegation-change-set-lifecycle.ts";
 import { validateChangeSet, type ChangeSetRecord } from "./change-set.ts";
 import {
+	validateDelegationCommandProvenance,
+	type DelegationCommandProvenanceRecord,
+} from "./delegation-command-effect-provenance.ts";
+import {
 	MAX_WORKER_REPORT_BYTES,
 	parseWorkerReport,
 	truncateUtf8,
@@ -48,11 +52,14 @@ import {
 	DELEGATION_TRANSACTION_ID_RE,
 	DELEGATION_TRANSACTION_SCHEMA_VERSION,
 	delegationPathAllowedV2,
+	isCurrentDelegationTerminalOutcome,
+	isDelegationInterruptedCandidateV2,
 	parseDelegationTransaction,
 	serializeDelegationTransaction,
 	type DelegationTaskKind,
 	type DelegationTransactionRecord,
 } from "./delegation-transaction.ts";
+import { isWorkerRunFailureCode } from "./worker-run-failure.ts";
 import {
 	DELEGATION_TRANSACTION_RECORD_MAX_BYTES,
 	DELEGATION_TRANSACTION_REPORT_MAX_BYTES,
@@ -362,7 +369,7 @@ export function normalizeDelegationBoundedTaskContractV2(
 	if (!Number.isSafeInteger(timeout_seconds) || (timeout_seconds as number) < 60 || (timeout_seconds as number) > 3_600) {
 		return fail("invalid_contract", "delegation v2 public timeout is outside the fixed bound");
 	}
-	const budget_profile = raw.budget_profile === undefined ? "extended" : raw.budget_profile;
+	const budget_profile = raw.budget_profile === undefined ? "standard" : raw.budget_profile;
 	if (!CURRENT_SPEND_PROFILES.includes(budget_profile as WorkerSpendProfile)) {
 		return fail("invalid_contract", "delegation v2 public budget profile is invalid");
 	}
@@ -453,6 +460,13 @@ function finiteNonNegative(value: unknown): value is number {
 
 function validateWorkerFacts(worker: LedgerWorkerFacts): boolean {
 	if (!isRecord(worker)) return false;
+	const hasWorkerSuccess = Object.prototype.hasOwnProperty.call(worker, "workerSuccess");
+	const hasWorkerFailure = Object.prototype.hasOwnProperty.call(worker, "workerFailureCode");
+	if (hasWorkerSuccess !== hasWorkerFailure) return false;
+	if (hasWorkerSuccess && (typeof worker.workerSuccess !== "boolean" ||
+		!(worker.workerFailureCode === null || isWorkerRunFailureCode(worker.workerFailureCode)) ||
+		worker.workerSuccess !== (worker.workerFailureCode === null) ||
+		worker.status !== (worker.workerSuccess ? "success" : "failure"))) return false;
 	const spendProfile = worker.spendProfile;
 	if ((worker.status !== "success" && worker.status !== "failure") ||
 		typeof worker.provider !== "string" || typeof worker.model !== "string" ||
@@ -522,6 +536,7 @@ function boundedJson(value: unknown, name: keyof DelegationCommittedRecords): bo
 }
 
 const FINALIZED_LIFECYCLE_FIELDS = ["prepared", "sealed_journal", "after_guard", "change_set"] as const;
+const FINALIZED_LIFECYCLE_FIELDS_WITH_COMMAND = [...FINALIZED_LIFECYCLE_FIELDS, "command_provenance"] as const;
 const PREPARED_LIFECYCLE_FIELDS = [
 	"schema_version", "project_root", "delegation_id", "contract_hash", "dependency_paths", "before_guard", "journal",
 ] as const;
@@ -536,7 +551,10 @@ function samePathSetByte(left: readonly string[], right: readonly string[]): boo
 	return sameStrings(leftSorted, rightSorted);
 }
 
-function guardMatchesGitFacts(guard: Readonly<WorkspaceGuardRecord>, facts: Readonly<DelegationWorkspaceGitFactsV2>): boolean {
+function guardMatchesGitFacts(
+	guard: Readonly<WorkspaceGuardRecord>,
+	facts: Readonly<DelegationWorkspaceGitFactsV2>,
+): boolean {
 	return facts.gitHead === guard.git_head && facts.gitDirty === (guard.entries.length > 0) &&
 		facts.diffIdentityKind === DELEGATION_WORKSPACE_DIFF_IDENTITY_KIND_V2 &&
 		facts.diffHash === guard.workspace_guard_hash &&
@@ -546,6 +564,13 @@ function guardMatchesGitFacts(guard: Readonly<WorkspaceGuardRecord>, facts: Read
 
 function workerDeltaPaths(changeSet: Readonly<ChangeSetRecord>): string[] {
 	return changeSet.worker_delta.map((entry) => entry.path);
+}
+
+function effectivePaths(
+	changeSet: Readonly<ChangeSetRecord>,
+	command: Readonly<DelegationCommandProvenanceRecord> | undefined,
+): string[] {
+	return command === undefined ? workerDeltaPaths(changeSet) : [...command.effective_paths];
 }
 
 function exactWorkerFileDigests(
@@ -570,7 +595,8 @@ function validFinalizedLifecycle(
 	before: Readonly<DelegationWorkspaceGitFactsV2>,
 	after: Readonly<DelegationWorkspaceAfterFactsV2>,
 ): value is Readonly<FinalizedDelegationChangeSetLifecycleV2> {
-	if (!isRecord(value) || !exactFields(value, FINALIZED_LIFECYCLE_FIELDS) ||
+	if (!isRecord(value) || !(exactFields(value, FINALIZED_LIFECYCLE_FIELDS)
+		|| exactFields(value, FINALIZED_LIFECYCLE_FIELDS_WITH_COMMAND)) ||
 		!isRecord(value.prepared) || !exactFields(value.prepared, PREPARED_LIFECYCLE_FIELDS)) return false;
 	const prepared = value.prepared;
 	const openJournal = prepared.journal;
@@ -578,17 +604,32 @@ function validFinalizedLifecycle(
 	const beforeGuard = prepared.before_guard;
 	const afterGuard = value.after_guard;
 	const changeSet = value.change_set;
+	const command = value.command_provenance;
 	if (prepared.schema_version !== 2 || typeof prepared.project_root !== "string" || !isAbsolute(prepared.project_root) ||
 		prepared.delegation_id !== transaction.delegation_id || prepared.contract_hash !== transaction.contract_hash ||
 		!Array.isArray(prepared.dependency_paths) ||
 		!validateWorkspaceGuard(beforeGuard) || !validateWorkspaceGuard(afterGuard) ||
 		!validateWorkerWriteJournalRecord(openJournal) || !validateWorkerWriteJournalRecord(sealedJournal) ||
-		!validateChangeSet(changeSet)) return false;
+		!validateChangeSet(changeSet)
+		|| !(command === undefined || validateDelegationCommandProvenance(command, changeSet as ChangeSetRecord))) return false;
 	const open = openJournal as WorkerWriteJournalRecord;
 	const sealed = sealedJournal as WorkerWriteJournalRecord;
 	const beforeRecord = beforeGuard as WorkspaceGuardRecord;
 	const afterRecord = afterGuard as WorkspaceGuardRecord;
 	const change = changeSet as ChangeSetRecord;
+	const provenance = command as DelegationCommandProvenanceRecord | undefined;
+	const effective = effectivePaths(change, provenance);
+	const expectedAfterDigests = Object.fromEntries([
+		...change.worker_delta.flatMap((entry) => entry.after.kind === "file" ? [[entry.path, entry.after.sha256] as const] : []),
+		...(provenance?.command_delta ?? []).flatMap((entry) => entry.after.kind === "file"
+			? [[entry.path, entry.after.sha256] as const]
+			: []),
+	]);
+	const unsafe = [...new Set([
+		...effective,
+		...(provenance?.remaining_workspace_drift ?? change.workspace_drift).map((entry) => entry.path),
+		...change.conflicts.map((entry) => entry.path),
+	])].sort(byteCompare);
 	return open.state === "OPEN" && open.journal_hash === null && open.revision === 0 && open.operations.length === 0 &&
 		sealed.state === "SEALED" && sealed.journal_hash !== null &&
 		open.delegation_id === transaction.delegation_id && sealed.delegation_id === transaction.delegation_id &&
@@ -600,9 +641,10 @@ function validFinalizedLifecycle(
 		change.workspace_guard_hash === afterRecord.workspace_guard_hash &&
 		guardMatchesGitFacts(beforeRecord, before) && guardMatchesGitFacts(afterRecord, after) &&
 		samePathSetByte(before.changedPaths, beforeRecord.entries.map((entry) => entry.path)) &&
-		sameStrings(after.changedPaths, workerDeltaPaths(change)) &&
+		sameStrings(after.changedPaths, effective) && sameStrings(after.changedSinceBefore, unsafe) &&
 		exactWorkerFileDigests(before.pathDigests, change, "before") &&
-		exactWorkerFileDigests(after.pathDigests, change, "after") &&
+		sameStrings(Object.keys(after.pathDigests).sort(byteCompare), Object.keys(expectedAfterDigests).sort(byteCompare)) &&
+		Object.entries(expectedAfterDigests).every(([path, digest]) => after.pathDigests[path] === digest) &&
 		sameStrings(change.dependency_paths, prepared.dependency_paths as readonly string[]);
 }
 
@@ -713,14 +755,16 @@ function buildDelegationCommittedArtifactsUnchecked(
 	}
 	const lifecycle = input.changeSetLifecycle;
 	const changeSet = lifecycle.change_set;
-	const changedPaths = workerDeltaPaths(changeSet);
+	const commandProvenance = lifecycle.command_provenance;
+	const changedPaths = effectivePaths(changeSet, commandProvenance);
 	if (!changedPaths.every((path, index) => index === 0 || byteCompare(changedPaths[index - 1]!, path) < 0)) {
 		return fail("invalid_facts", "delegation worker delta paths are not in canonical byte order");
 	}
-	const pendingReviewCandidate = transaction.task_kind === "implementation" && changedPaths.length > 0 &&
-		transaction.postcondition_reasons.length === 0 && transaction.terminal_outcome.terminal_facts_complete &&
-		transaction.terminal_outcome.scope_complete;
-	if (pendingReviewCandidate &&
+	const reviewEnvelopeCandidate = transaction.task_kind === "implementation" && changedPaths.length > 0 &&
+		(transaction.postcondition_reasons.length === 0 ||
+			isDelegationInterruptedCandidateV2(transaction, transaction.terminal_outcome)) &&
+		transaction.terminal_outcome.terminal_facts_complete && transaction.terminal_outcome.scope_complete;
+	if (reviewEnvelopeCandidate &&
 		(!validateSemanticReviewEnvelopeV1(input.reviewEnvelope) || input.reviewEnvelope.path_count !== changedPaths.length)) {
 		return fail("review_envelope_exceeded", "delegation semantic review cannot be closed inside the versioned capacity envelope");
 	}
@@ -731,6 +775,7 @@ function buildDelegationCommittedArtifactsUnchecked(
 		// journal and ChangeSet, so requiring a duplicate Git-visible entry
 		// would reject a valid delivery after the worker has written it.
 		...changedPaths,
+		...(commandProvenance?.command_delta.map((entry) => entry.path) ?? []),
 		...lifecycle.prepared.before_guard.entries.map((entry) => entry.path),
 		...lifecycle.after_guard.entries.map((entry) => entry.path),
 		...changeSet.conflicts.map((entry) => entry.path),
@@ -739,13 +784,18 @@ function buildDelegationCommittedArtifactsUnchecked(
 		return fail("invalid_facts", "delegation actual changed paths are not bound to the snapshots or worker delta");
 	}
 	const outcome = transaction.terminal_outcome;
+	if (!isCurrentDelegationTerminalOutcome(outcome)) {
+		return fail("invalid_state", "fresh delegation generations require a closed worker outcome");
+	}
 	const successfulWriteCount = lifecycle.sealed_journal.operations.filter((operation) =>
 		operation.status === "completed" && operation.outcome === "succeeded").length;
 	const scopeComplete = changedPaths.every((path) => delegationPathAllowedV2(path, transaction.allowed_paths));
-	if (!sameStrings(changedPaths, outcome.changed_paths) || outcome.change_set_status !== changeSet.status ||
+	const effectiveStatus = commandProvenance?.effective_status ?? changeSet.status;
+	const effectiveDeltaHash = commandProvenance?.effective_delta_hash ?? changeSet.worker_delta_hash;
+	if (!sameStrings(changedPaths, outcome.changed_paths) || outcome.change_set_status !== effectiveStatus ||
 		outcome.terminal_facts_complete !== true || outcome.scope_complete !== scopeComplete ||
 		outcome.successful_write_count !== successfulWriteCount ||
-		(outcome.task_kind === "implementation" && outcome.delta_hash !== changeSet.worker_delta_hash) ||
+		(outcome.task_kind === "implementation" && outcome.delta_hash !== effectiveDeltaHash) ||
 		(outcome.task_kind === "diagnosis" && outcome.delta_hash !== null)) {
 		return fail("binding_conflict", "ChangeSet authority conflicts with the terminal outcome");
 	}
@@ -753,7 +803,9 @@ function buildDelegationCommittedArtifactsUnchecked(
 		input.worker.provider !== transaction.worker_identity.provider ||
 		input.worker.model !== transaction.worker_identity.model ||
 		input.worker.spendProfile !== contract.budget_profile ||
-		(input.worker.turns > 0) !== outcome.provider_success) {
+		(input.worker.turns > 0) !== outcome.provider_success ||
+		input.worker.workerSuccess !== outcome.worker_success ||
+		input.worker.workerFailureCode !== outcome.worker_failure_code) {
 		return fail("binding_conflict", "worker facts conflict with the pinned transaction outcome");
 	}
 	const reportResult = deriveDelegationPersistedReportV2(input.reportText, input.secrets ?? []);
@@ -797,6 +849,8 @@ function buildDelegationCommittedArtifactsUnchecked(
 		provider: input.worker.provider,
 		model: input.worker.model,
 		status: input.worker.status,
+		...(input.worker.workerSuccess === undefined ? {} : { worker_success: input.worker.workerSuccess }),
+		...(input.worker.workerFailureCode === undefined ? {} : { worker_failure_code: input.worker.workerFailureCode }),
 		exit_code: input.worker.exitCode,
 		turns: input.worker.turns,
 		stop_reason: safeStop,
@@ -823,6 +877,8 @@ function buildDelegationCommittedArtifactsUnchecked(
 		provider: input.worker.provider,
 		model: input.worker.model,
 		status: input.worker.status,
+		...(input.worker.workerSuccess === undefined ? {} : { worker_success: input.worker.workerSuccess }),
+		...(input.worker.workerFailureCode === undefined ? {} : { worker_failure_code: input.worker.workerFailureCode }),
 		exit_code: input.worker.exitCode,
 		turns: input.worker.turns,
 		stop_reason: safeStop,
@@ -839,6 +895,8 @@ function buildDelegationCommittedArtifactsUnchecked(
 			delegation_id: transaction.delegation_id,
 			recorded_at: recordedAt,
 			status: input.worker.status,
+			...(input.worker.workerSuccess === undefined ? {} : { worker_success: input.worker.workerSuccess }),
+			...(input.worker.workerFailureCode === undefined ? {} : { worker_failure_code: input.worker.workerFailureCode }),
 			exit_code: input.worker.exitCode,
 			pinned_identity: {
 				pinned_provider: transaction.worker_identity.provider,
@@ -854,16 +912,20 @@ function buildDelegationCommittedArtifactsUnchecked(
 			path_digests: { ...input.after.pathDigests },
 			changed_since_before: [...input.after.changedSinceBefore],
 			workspace_guard: structuredClone(lifecycle.after_guard),
-			change_set_status: changeSet.status,
+			change_set_status: effectiveStatus,
 			worker_delta_hash: changeSet.worker_delta_hash,
 			workspace_guard_hash: changeSet.workspace_guard_hash,
 			change_set_hash: changeSet.change_set_hash,
+			...(commandProvenance === undefined ? {} : {
+				command_provenance_hash: commandProvenance.command_provenance_hash,
+				effective_delta_hash: commandProvenance.effective_delta_hash,
+			}),
 			reported_paths: [...reportedPaths],
 			usage: structuredClone(usage),
 			budget: structuredClone(budget),
 			report_summary: truncateUtf8(report.persisted_text, MAX_AFTER_SUMMARY_CHARS),
 			review_status: "PENDING_REVIEW",
-			...(pendingReviewCandidate ? { review_envelope: structuredClone(input.reviewEnvelope!) } : {}),
+			...(reviewEnvelopeCandidate ? { review_envelope: structuredClone(input.reviewEnvelope!) } : {}),
 		},
 		"before.json": {
 			schema_version: 2,
@@ -906,6 +968,9 @@ function buildDelegationCommittedArtifactsUnchecked(
 			changed_paths: [...outcome.changed_paths],
 			write_journal: structuredClone(lifecycle.sealed_journal),
 			change_set: structuredClone(changeSet),
+			...(commandProvenance === undefined ? {} : {
+				command_provenance: structuredClone(commandProvenance),
+			}),
 		},
 		"usage.json": usageRecord,
 		"worker-report.md": report.persisted_text,

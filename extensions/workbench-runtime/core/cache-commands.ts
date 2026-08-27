@@ -23,6 +23,7 @@ import { loadProjectConfig, type ExecFn } from "./config.ts";
 import type { WorkbenchMode } from "./mode-policy.ts";
 import { displayRelative } from "./recipe-runner.ts";
 import { buildArgv } from "./recipe-schema.ts";
+import { runProjectCheckoutOperationV1 } from "./project-checkout-operation.ts";
 
 export interface CacheCommandController {
 	pi: Pick<ExtensionAPI, "getActiveTools" | "getAllTools" | "getThinkingLevel" | "registerCommand">;
@@ -31,7 +32,9 @@ export interface CacheCommandController {
 	exec: ExecFn;
 	refreshConfig(ctx: ExtensionCommandContext): Promise<void>;
 	trustedOrError(ctx: ExtensionCommandContext): string | undefined;
+	mutationOrError(ctx: ExtensionCommandContext, boundary: string): string | undefined;
 	projectRootFor(ctx: ExtensionCommandContext): Promise<string>;
+	reconcileProjectAuthority(projectRoot: string, now: string): Promise<boolean>;
 	output(ctx: ExtensionCommandContext, lines: string[]): void;
 }
 
@@ -147,10 +150,28 @@ export function registerCacheCommands(controller: CacheCommandController): void 
 			});
 			const lines = renderCacheReport(report);
 			if (saveName) {
-				const saved = await store.saveReport(saveName, report);
+				const mutationError = controller.mutationOrError(ctx, "q-cache-report");
+				if (mutationError || !await controller.reconcileProjectAuthority(projectRoot, new Date().toISOString())) {
+					lines.push("", mutationError ?? "report save blocked: checkout authority recovery is unavailable");
+					controller.output(ctx, lines);
+					return;
+				}
+				const operation = await runProjectCheckoutOperationV1({
+					project_root: projectRoot,
+					operation_kind: "command",
+					operation_id: `command:q-cache-report:${saveName}`.slice(0, 256),
+					now: new Date().toISOString(),
+				}, async () => store.saveReport(saveName, report));
+				if (!operation.ok) {
+					lines.push("", `report save blocked: checkout writer lane ${operation.error.code}`);
+					controller.output(ctx, lines);
+					return;
+				}
+				const saved = operation.value;
 				lines.push("", saved.ok && saved.path
 					? `report saved: ${displayRelative(projectRoot, saved.path)}`
 					: `report save failed: ${saved.error ?? "unknown error"}`);
+				if (operation.release === "recovery_required") lines.push("warning: report saved but checkout lock cleanup requires recovery");
 			}
 			if (history.skipped > 0) lines.push(`(note: ${history.skipped} corrupted line(s) skipped in telemetry history)`);
 			controller.output(ctx, lines);
@@ -284,7 +305,29 @@ export function registerCacheCommands(controller: CacheCommandController): void 
 					return;
 				}
 			}
-			controller.output(ctx, renderPrune(await store.prune({ apply }), config.actionCacheMaxBytes));
+			if (!apply) {
+				controller.output(ctx, renderPrune(await store.prune({ apply: false }), config.actionCacheMaxBytes));
+				return;
+			}
+			const mutationError = controller.mutationOrError(ctx, "q-cache-prune");
+			if (mutationError || !await controller.reconcileProjectAuthority(projectRoot, new Date().toISOString())) {
+				controller.output(ctx, [`/q-cache-prune: ${mutationError ?? "checkout authority recovery is unavailable"}`]);
+				return;
+			}
+			const operation = await runProjectCheckoutOperationV1({
+				project_root: projectRoot,
+				operation_kind: "command",
+				operation_id: "command:q-cache-prune:apply",
+				now: new Date().toISOString(),
+			}, async () => store.prune({ apply: true }));
+			if (!operation.ok) {
+				controller.output(ctx, [`/q-cache-prune: checkout writer lane ${operation.error.code}`]);
+				return;
+			}
+			controller.output(ctx, [
+				...renderPrune(operation.value, config.actionCacheMaxBytes),
+				...(operation.release === "recovery_required" ? ["warning: prune completed but checkout lock cleanup requires recovery"] : []),
+			]);
 		},
 	});
 
@@ -323,7 +366,25 @@ export function registerCacheCommands(controller: CacheCommandController): void 
 				controller.output(ctx, [`/q-cache-clear: ${target} not cleared (no confirmation)`]);
 				return;
 			}
-			controller.output(ctx, renderClear(await store.clear(target === "all" ? "all" : target)));
+			const mutationError = controller.mutationOrError(ctx, "q-cache-clear");
+			if (mutationError || !await controller.reconcileProjectAuthority(projectRoot, new Date().toISOString())) {
+				controller.output(ctx, [`/q-cache-clear: ${mutationError ?? "checkout authority recovery is unavailable"}`]);
+				return;
+			}
+			const operation = await runProjectCheckoutOperationV1({
+				project_root: projectRoot,
+				operation_kind: "command",
+				operation_id: `command:q-cache-clear:${target}`.slice(0, 256),
+				now: new Date().toISOString(),
+			}, async () => store.clear(target === "all" ? "all" : target));
+			if (!operation.ok) {
+				controller.output(ctx, [`/q-cache-clear: checkout writer lane ${operation.error.code}`]);
+				return;
+			}
+			controller.output(ctx, [
+				...renderClear(operation.value),
+				...(operation.release === "recovery_required" ? ["warning: clear completed but checkout lock cleanup requires recovery"] : []),
+			]);
 		},
 	});
 

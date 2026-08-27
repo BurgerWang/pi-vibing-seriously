@@ -11,6 +11,7 @@ import {
 	listCommittedRuns,
 	listRunAttempts,
 	listRuns,
+	parseCommittedRunManifestV2,
 	readCommittedManifest,
 	readManifest,
 	RUN_SCHEMA_VERSION,
@@ -24,7 +25,7 @@ function recipesYaml(command: string, artifact: string): string {
 		"recipes:",
 		"  - name: producer",
 		`    command: ${command}`,
-		"    writes: [out/]",
+		"    writes: [out/result.json]",
 		"    mutation: artifacts",
 		`    artifacts: [${artifact}]`,
 		"",
@@ -65,8 +66,8 @@ async function gitBacked(dir: string): Promise<void> {
 	await spawnExec("git", ["commit", "-qm", "init"], { cwd: dir });
 }
 
-async function writeMinimalRunPayload(directory: string, runId: string, marker: string): Promise<void> {
-	await writeFile(join(directory, "manifest.json"), JSON.stringify({
+function minimalRunManifest(directory: string, runId: string): Record<string, unknown> {
+	return {
 		schema_version: 2,
 		run_id: runId,
 		recipe: "test",
@@ -92,13 +93,29 @@ async function writeMinimalRunPayload(directory: string, runId: string, marker: 
 		cache_request_mode: "no-cache",
 		run_transaction_schema_version: 2,
 		run_outcome: "SUCCESS",
-	}), "utf8");
+	};
+}
+
+async function writeMinimalRunPayload(directory: string, runId: string, marker: string): Promise<void> {
+	await writeFile(join(directory, "manifest.json"), JSON.stringify(minimalRunManifest(directory, runId)), "utf8");
 	await writeFile(join(directory, "command.json"), "{}", "utf8");
 	await writeFile(join(directory, "environment.json"), "{}", "utf8");
 	await writeFile(join(directory, "summary.json"), marker, "utf8");
 	await writeFile(join(directory, "stdout.log"), "", "utf8");
 	await writeFile(join(directory, "stderr.log"), "", "utf8");
 }
+
+test("a blocking command-effect status can never be parsed as a successful run", () => {
+	const runId = "20260820-191500-blok";
+	const manifest = {
+		...minimalRunManifest("/repo", runId),
+		command_effect_path: "command-effect.json",
+		command_effect_hash: "a".repeat(64),
+		command_effect_status: "EVIDENCE_UNAVAILABLE",
+	};
+	assert.equal(parseCommittedRunManifestV2(manifest, runId), null);
+	assert.equal(parseCommittedRunManifestV2({ ...manifest, run_outcome: "COMMAND_EFFECT_FAILED" }, runId)?.run_outcome, "COMMAND_EFFECT_FAILED");
+});
 
 test("exit zero with a missing required artifact commits a failed diagnostic run, never SUCCESS", async () => {
 	await withTempDir(async (dir) => {
@@ -164,6 +181,7 @@ test("partial visible directories and post-commit mutation are never consumable"
 test("new v2 manifests are rejected by the frozen v1 discriminator", async () => {
 	await withTempDir(async (dir) => {
 		await setup(dir);
+		await gitBacked(dir);
 		const run = await runRecipe({ projectRoot: dir, recipeName: "producer", mode: "DEV", exec: spawnExec, actorFacts: SOL_FACTS });
 		assert.equal(run.ok, true, run.error ?? "");
 		const raw = JSON.parse(await readFile(join(run.runDir!, "manifest.json"), "utf8")) as Record<string, unknown>;

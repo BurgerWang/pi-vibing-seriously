@@ -5,7 +5,7 @@
  * 1. Direct load: the extension module is imported and its default export is
  *    invoked with a stub ExtensionAPI — no Pi runtime needed. This is the
  *    "extension direct-load smoke test" as a repeatable unit test.
- * 2. Inventory: the registered command set must be EXACTLY the 30
+ * 2. Inventory: the registered command set must be exact and deterministic
  *    deterministic workbench commands, the registered tool surface exactly
  *    the 14 tools (three fixed native read/grep/find overrides first, then
  *    the 11 workbench catalog tools), and the 7 prompt templates — no
@@ -30,6 +30,11 @@ export const EXPECTED_COMMANDS = [
 	"q-mode-dev",
 	"q-mode-verify",
 	"q-status",
+	"q-runtime-doctor",
+	// Deterministic user-only repair transition; no model turn is involved.
+	"q-repair",
+	// Deterministic automatic semantic review; replaces the old prompt name.
+	"q-review",
 	"q-init",
 	"q-run",
 	"q-runs",
@@ -85,7 +90,7 @@ export const EXPECTED_TOOLS = [
 	"workbench_git",
 ] as const;
 
-export const EXPECTED_PROMPTS = ["q-audit", "q-plan", "q-build", "q-debug", "q-verify", "q-optimize", "q-review"] as const;
+export const EXPECTED_PROMPTS = ["q-audit", "q-plan", "q-build", "q-debug", "q-verify", "q-optimize", "q-code-review"] as const;
 
 function makeStub(): ExtensionAPI & Record<string, unknown> {
 	const commands = new Map<string, { description?: string }>();
@@ -115,7 +120,7 @@ function makeStub(): ExtensionAPI & Record<string, unknown> {
 	return stub as unknown as ExtensionAPI & Record<string, unknown>;
 }
 
-test("extension module direct-loads and registers exactly the 30 deterministic commands, including the R8 observation-only status command", () => {
+test("extension module direct-loads and registers the exact deterministic command inventory", () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	const registered = stub.commands as Map<string, unknown>;

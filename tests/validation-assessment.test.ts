@@ -47,7 +47,14 @@ import {
 	type ValidationRefusalReason,
 } from "../extensions/workbench-runtime/core/validation-evidence.ts";
 import type { WorkerFirstGateFacts } from "../extensions/workbench-runtime/core/gate-schema.ts";
-import type { RecipeMutationFacts } from "../extensions/workbench-runtime/core/worker-policy.ts";
+import {
+	WORKER_ALLOWED_PATHS_ENV,
+	WORKER_CONTRACT_HASH_ENV,
+	WORKER_DELEGATION_ID_ENV,
+	WORKER_PROJECT_ROOT_ENV,
+	WORKER_TASK_KIND_ENV,
+	type RecipeMutationFacts,
+} from "../extensions/workbench-runtime/core/worker-policy.ts";
 import type { WorkbenchMode } from "../extensions/workbench-runtime/core/mode-policy.ts";
 import { KNOWN_LOCKFILES } from "../extensions/workbench-runtime/cache/action-types.ts";
 import { spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
@@ -232,7 +239,27 @@ test("failed, incomplete and non-Sol sources refuse with the fixed codes", async
 		assert.deepEqual(await assess(dir, slow.manifest), rerun(["unsuccessful-source", "incomplete-source"]));
 
 		// Successful complete run by a worker: non-sol-source alone.
-		const worker = await runRecipeRun(dir, "hello", { actorFacts: WORKER_FACTS });
+		const workerEnv = new Map([
+			WORKER_ALLOWED_PATHS_ENV,
+			WORKER_CONTRACT_HASH_ENV,
+			WORKER_DELEGATION_ID_ENV,
+			WORKER_PROJECT_ROOT_ENV,
+			WORKER_TASK_KIND_ENV,
+		].map((name) => [name, process.env[name]]));
+		process.env[WORKER_ALLOWED_PATHS_ENV] = "[]";
+		process.env[WORKER_CONTRACT_HASH_ENV] = "b".repeat(64);
+		process.env[WORKER_DELEGATION_ID_ENV] = "20260827-120000-vldt";
+		process.env[WORKER_PROJECT_ROOT_ENV] = dir;
+		process.env[WORKER_TASK_KIND_ENV] = "implementation";
+		let worker: Awaited<ReturnType<typeof runRecipeRun>>;
+		try {
+			worker = await runRecipeRun(dir, "hello", { actorFacts: WORKER_FACTS });
+		} finally {
+			for (const [name, value] of workerEnv) {
+				if (value === undefined) delete process.env[name];
+				else process.env[name] = value;
+			}
+		}
 		assert.equal(worker.manifest.validation_evidence?.binding?.owner, "worker");
 		assert.deepEqual(await assess(dir, worker.manifest), rerun(["non-sol-source"]));
 	});

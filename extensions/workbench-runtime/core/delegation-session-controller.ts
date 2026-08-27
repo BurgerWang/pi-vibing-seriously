@@ -86,7 +86,9 @@ export function createDelegationSessionController(
 			try {
 				options.appendEntry(DELEGATION_STATE_ENTRY_TYPE, serializeDelegationState(state));
 			} catch {
-				// The in-memory state remains authoritative for this runtime.
+				// Session JSONL is presentation cache only. The in-memory value remains
+				// the last project-authority projection and is reconciled from the
+				// project store at the next authority boundary.
 			}
 		},
 		persistStrict,

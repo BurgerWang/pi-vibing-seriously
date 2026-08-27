@@ -28,7 +28,7 @@
  */
 
 import { writeFile } from "node:fs/promises";
-import { join, relative } from "node:path";
+import { join, relative, resolve } from "node:path";
 
 import { truncateHead, truncateTail } from "@earendil-works/pi-coding-agent";
 
@@ -36,7 +36,19 @@ import { loadProjectConfig, type ExecFn } from "./config.ts";
 import type { WorkbenchMode } from "./mode-policy.ts";
 import { realpathContained, lexicalContain } from "./path-guard.ts";
 import { buildArgv, RecipeParamError, type Recipe } from "./recipe-schema.ts";
-import { recipeMutationBlockReason, type RecipeMutationFacts } from "./worker-policy.ts";
+import {
+	parseWorkerAllowedPaths,
+	parseWorkerTaskKindEnvironment,
+	recipeMutationBlockReason,
+	WORKER_ALLOWED_PATHS_ENV,
+	WORKER_CONTRACT_HASH_ENV,
+	WORKER_DELEGATION_ID_ENV,
+	WORKER_PROJECT_ROOT_ENV,
+	WORKER_ROLE,
+	WORKER_TASK_KIND_ENV,
+	type RecipeMutationFacts,
+	type WorkerRecipeMutationScope,
+} from "./worker-policy.ts";
 import { collectSecretValues, redactArgvEntry, redactEnvValue, redactText } from "./redact.ts";
 import { makeRunId, RUN_MANIFEST_SCHEMA_VERSION_V2, type RunRecord, type RunSummaryRecord } from "./runs.ts";
 import { EXTENSION_VERSION } from "../cache/cache-types.ts";
@@ -60,6 +72,17 @@ import {
 	writeArtifactManifestV2,
 } from "./artifact-contract.ts";
 import { beginRunTransaction, commitRunTransaction } from "./run-transaction.ts";
+import { isWorkerPathAllowedRealpath } from "../worker/path-scope.ts";
+import {
+	COMMAND_EFFECT_FILE,
+	beginRecipeCommandEffectCapture,
+	buildRecipeCommandEffectRecord,
+	commandEffectBlockingReason,
+	completeRecipeCommandEffectCapture,
+	recipeCommandEffectPreCaptureError,
+	type CommandEffectRecord,
+	type RecipeCommandEffectCaptureStart,
+} from "./command-effect.ts";
 
 export interface RunRecipeInput {
 	projectRoot: string;
@@ -102,12 +125,22 @@ export interface RunRecipeResult {
 		reusedFromRunId?: string;
 		reason?: string;
 	};
+	/** Durable command-effect evidence for an actual Workbench/worker exec. */
+	commandEffect?: Readonly<CommandEffectRecord>;
+	warnings?: string[];
 }
 
 export class RecipeSetupError extends Error {
 	constructor(message: string) {
 		super(message);
 		this.name = "RecipeSetupError";
+	}
+}
+
+class RecipeCommandEffectPreCaptureError extends Error {
+	constructor(readonly record: Readonly<CommandEffectRecord>) {
+		super("command-effect evidence is unavailable before process start");
+		this.name = "RecipeCommandEffectPreCaptureError";
 	}
 }
 
@@ -118,6 +151,50 @@ function buildEnvironment(recipe: Recipe): Record<string, string> {
 		if (value !== undefined) env[name] = value;
 	}
 	return env;
+}
+
+const COMMAND_EFFECT_DELEGATION_ID_RE = /^\d{8}-\d{6}-[A-Za-z0-9]{4}$/u;
+const COMMAND_EFFECT_HASH_RE = /^[0-9a-f]{64}$/u;
+
+type CommandEffectActorResolution =
+	| {
+		ok: true;
+		actor: {
+			actor: "workbench" | "worker";
+			worker_delegation_id: string | null;
+			worker_contract_hash: string | null;
+		};
+		workerScope?: WorkerRecipeMutationScope;
+	}
+	| { ok: false; error: string };
+
+function commandEffectActor(facts: RecipeMutationFacts, projectRoot: string): CommandEffectActorResolution {
+	if (facts.role !== WORKER_ROLE) {
+		return { ok: true, actor: { actor: "workbench", worker_delegation_id: null, worker_contract_hash: null } };
+	}
+	const delegationId = process.env[WORKER_DELEGATION_ID_ENV];
+	const contractHash = process.env[WORKER_CONTRACT_HASH_ENV];
+	if (delegationId === undefined || !COMMAND_EFFECT_DELEGATION_ID_RE.test(delegationId)
+		|| contractHash === undefined || !COMMAND_EFFECT_HASH_RE.test(contractHash)) {
+		return { ok: false, error: "WORKER_COMMAND_EFFECT_IDENTITY_INVALID" };
+	}
+	const declaredRoot = process.env[WORKER_PROJECT_ROOT_ENV];
+	if (declaredRoot !== undefined && resolve(declaredRoot) !== resolve(projectRoot)) {
+		return { ok: false, error: "WORKER_COMMAND_EFFECT_PROJECT_ROOT_MISMATCH" };
+	}
+	return {
+		ok: true,
+		actor: {
+			actor: "worker",
+			worker_delegation_id: delegationId,
+			worker_contract_hash: contractHash,
+		},
+		workerScope: {
+			projectRoot,
+			allowedPaths: parseWorkerAllowedPaths(process.env[WORKER_ALLOWED_PATHS_ENV]),
+			taskKind: parseWorkerTaskKindEnvironment(process.env[WORKER_TASK_KIND_ENV]),
+		},
+	};
 }
 
 async function gitState(projectRoot: string, exec: ExecFn): Promise<{ commit: string | null; dirty: boolean }> {
@@ -217,7 +294,7 @@ export async function captureAndPatchRunManifest(input: {
 export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult> {
 	const { projectRoot, recipeName, mode, exec } = input;
 	const params = input.params ?? {};
-	const cacheMode: CacheRequestMode = input.cacheMode ?? "default";
+	const requestedCacheMode: CacheRequestMode = input.cacheMode ?? "default";
 	const now = input.now ?? (() => new Date());
 	const startedAt = now();
 
@@ -235,12 +312,26 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 
 	// P7: the shared mutation-policy decision applies to DIRECT recipe
 	// execution (workbench_run_recipe tool and /q-run). Strict Sol is denied
-	// mutation: source; delegated workers run only mutation: none; other
-	// controllers and fact-less callers are unrestricted (prior behavior).
-	const mutationBlock = recipeMutationBlockReason(input.actorFacts, recipe.name, recipe.mutation);
+	// mutation: source; delegated implementation workers may run only exact,
+	// in-scope mutating declarations; other controllers and fact-less callers
+	// are unrestricted (prior behavior).
+	const actorResolution = input.actorFacts === undefined ? undefined : commandEffectActor(input.actorFacts, projectRoot);
+	if (actorResolution?.ok === false) return { ok: false, error: actorResolution.error };
+	const mutationBlock = recipeMutationBlockReason(
+		input.actorFacts,
+		recipe.name,
+		recipe.mutation,
+		recipe.writes,
+		actorResolution?.workerScope,
+	);
 	if (mutationBlock) {
 		return { ok: false, error: mutationBlock };
 	}
+	// A mutating worker command always executes under a fresh before/after
+	// command-effect capture. It may never bypass provenance through cache.
+	const cacheMode: CacheRequestMode = actorResolution?.actor.actor === "worker" && recipe.mutation !== "none"
+		? "no-cache"
+		: requestedCacheMode;
 
 	let argv: string[];
 	try {
@@ -251,6 +342,17 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 	}
 
 	await validateRecipePaths(projectRoot, recipe);
+	if (actorResolution?.actor.actor === "worker" && recipe.mutation !== "none") {
+		const allowedPaths = actorResolution.workerScope?.allowedPaths ?? [];
+		for (const output of recipe.writes) {
+			if (!(await isWorkerPathAllowedRealpath(projectRoot, output, allowedPaths))) {
+				return {
+					ok: false,
+					error: `Delegated worker cannot run mutating recipe "${recipe.name}": writes output resolves outside delegation allowed_paths: ${output}`,
+				};
+			}
+		}
+	}
 
 	// ------------------------------------------------------------ P6-C cache
 	const store = new ActionCacheStore(projectRoot, { maxBytes: config.actionCacheMaxBytes, now });
@@ -393,9 +495,33 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 	const cwd = (await realpathContained(projectRoot, recipe.cwd)) as string;
 
 	const git = await gitState(projectRoot, exec);
+	let commandEffectStarted: Readonly<RecipeCommandEffectCaptureStart> | undefined;
+	let commandEffectActorFacts: Extract<CommandEffectActorResolution, { ok: true }>["actor"] | undefined;
+	if (actorResolution !== undefined && actorResolution.ok) {
+		commandEffectActorFacts = actorResolution.actor;
+		commandEffectStarted = await beginRecipeCommandEffectCapture({
+			project_root: projectRoot,
+			exec,
+			declared_writes: recipe.writes,
+		});
+	}
 
 	let result: { stdout: string; stderr: string; code: number; killed: boolean };
 	try {
+		if (commandEffectStarted !== undefined && commandEffectActorFacts !== undefined
+			&& recipeCommandEffectPreCaptureError(commandEffectStarted) !== undefined) {
+			throw new RecipeCommandEffectPreCaptureError(buildRecipeCommandEffectRecord({
+				run_id: runId,
+				recipe: recipe.name,
+				...commandEffectActorFacts,
+				mutation_declaration: recipe.mutation,
+				declared_writes: recipe.writes,
+				before_guard: commandEffectStarted.before_guard,
+				after_guard: commandEffectStarted.before_guard,
+				before_exact_output_evidence: commandEffectStarted.before_exact_output_evidence,
+				after_exact_output_evidence: commandEffectStarted.before_exact_output_evidence,
+			}));
+		}
 		result = await exec(argv[0] ?? "", argv.slice(1), {
 			cwd,
 			timeout: recipe.timeout_ms,
@@ -405,6 +531,21 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		// Spawn failure: persist what we know so the run is not lost, then
 		// surface the error to the caller.
 		const failedAt = now();
+		const preCaptureFailure = error instanceof RecipeCommandEffectPreCaptureError;
+		const commandEffect = preCaptureFailure
+			? error.record
+			: commandEffectStarted === undefined || commandEffectActorFacts === undefined
+			? undefined
+			: await completeRecipeCommandEffectCapture({
+				project_root: projectRoot,
+				exec,
+				run_id: runId,
+				recipe: recipe.name,
+				...commandEffectActorFacts,
+				mutation_declaration: recipe.mutation,
+				declared_writes: recipe.writes,
+				started: commandEffectStarted,
+			});
 		const redactedArgv = redactText(argv.join("\u0000"), secrets).split("\u0000").map(redactArgvEntry);
 		const record: RunRecord = {
 			schema_version: RUN_MANIFEST_SCHEMA_VERSION_V2,
@@ -432,8 +573,16 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 			cache_request_mode: cacheMode,
 			argv_hash: executedArgvHashValue,
 			run_transaction_schema_version: 2,
+			// The subprocess did not start. The existing closed manifest schema
+			// represents that honestly as PROCESS_FAILED while the bound
+			// command-effect receipt carries EVIDENCE_UNAVAILABLE.
 			run_outcome: "PROCESS_FAILED",
 			artifact_manifest_path: "artifact-manifest.json",
+			...(commandEffect === undefined ? {} : {
+				command_effect_path: COMMAND_EFFECT_FILE,
+				command_effect_hash: commandEffect.command_effect_hash,
+				command_effect_status: commandEffect.status,
+			}),
 		};
 		const environmentRecord: Record<string, string> = {};
 		for (const [name, value] of Object.entries(env)) {
@@ -441,18 +590,49 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		}
 		const artifactCollection = await collectRecipeArtifactsV2({ projectRoot, runId, stagingRunDir: writeDir, contracts: recipe.artifact_contracts, authorizedExternalRoots: config.artifactExternalRoots, exec });
 		await writeArtifactManifestV2(writeDir, artifactCollection.manifest);
+		if (commandEffect !== undefined) {
+			await writeFile(join(writeDir, COMMAND_EFFECT_FILE), JSON.stringify(commandEffect, null, 2), "utf8");
+		}
 		await writeFile(join(writeDir, "manifest.json"), JSON.stringify(record, null, 2), "utf8");
 		await writeFile(join(writeDir, "command.json"), JSON.stringify({ recipe: recipe.name, argv: redactedArgv, cwd, error: (error as Error).message }, null, 2), "utf8");
 		await writeFile(join(writeDir, "environment.json"), JSON.stringify({ environment: environmentRecord }, null, 2), "utf8");
 		await writeFile(join(writeDir, "stdout.log"), "", "utf8");
 		await writeFile(join(writeDir, "stderr.log"), "", "utf8");
-		await writeFile(join(writeDir, "summary.json"), JSON.stringify({ run_id: runId, recipe: recipe.name, error: "PROCESS_FAILED" }, null, 2), "utf8");
+		const failureCode = preCaptureFailure ? "COMMAND_EFFECT_EVIDENCE_UNAVAILABLE" : "PROCESS_FAILED";
+		const failedSummary: RunSummaryRecord = {
+			run_id: runId,
+			recipe: recipe.name,
+			profile: config.profile,
+			started_at: record.started_at,
+			finished_at: record.finished_at,
+			duration_ms: record.duration_ms,
+			cwd,
+			argv: redactedArgv,
+			exit_code: null,
+			timed_out: false,
+			cancelled: input.signal?.aborted ?? false,
+			git_commit: git.commit,
+			git_dirty: git.dirty,
+			artifact_paths: artifactCollection.artifactPaths,
+			stdout_truncated: false,
+			stderr_truncated: false,
+			stdout: "",
+			stderr: "",
+			stdout_log: join(runDir, "stdout.log"),
+			stderr_log: join(runDir, "stderr.log"),
+			...(commandEffect === undefined ? {} : {
+				command_effect_status: commandEffect.status,
+				command_effect_path: join(runDir, COMMAND_EFFECT_FILE),
+			}),
+		};
+		await writeFile(join(writeDir, "summary.json"), JSON.stringify(failedSummary, null, 2), "utf8");
 		// P4a: capture the validation binding for the spawn-failure terminal
 		// path too (outcome: unsuccessful + incomplete). A capture failure
 		// persists bounded unavailable state; the original spawn error always
 		// surfaces — the patch must never mask it.
+		let finalizedFailureRecord = record;
 		try {
-			await captureAndPatchRunManifest({
+			finalizedFailureRecord = await captureAndPatchRunManifest({
 				projectRoot,
 				runDir: writeDir,
 				record,
@@ -474,7 +654,20 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		try {
 			await commitRunTransaction(transaction, failedAt);
 		} catch {
+			if (preCaptureFailure) return { ok: false, error: "RUN_RECORD_COMMIT_FAILED" };
 			throw new Error(`recipe "${recipeName}" failed to spawn and RUN_RECORD_COMMIT_FAILED`);
+		}
+		if (preCaptureFailure) {
+			return {
+				ok: false,
+				error: failureCode,
+				record: finalizedFailureRecord,
+				summary: failedSummary,
+				runDir,
+				cache: { status: "no-cache", reason: "process start refused because command-effect before evidence is unavailable" },
+				commandEffect: error.record,
+				warnings: ["COMMAND_EFFECT_EVIDENCE_UNAVAILABLE"],
+			};
 		}
 		throw new Error(`recipe "${recipeName}" failed to spawn: ${(error as Error).message}`);
 	}
@@ -483,6 +676,22 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 	const cancelled = input.signal?.aborted ?? false;
 	const timedOut = result.killed && !cancelled;
 	const exitOk = !result.killed && recipe.expected_exit_codes.includes(result.code);
+	const commandEffect = commandEffectStarted === undefined || commandEffectActorFacts === undefined
+		? undefined
+		: await completeRecipeCommandEffectCapture({
+			project_root: projectRoot,
+			exec,
+			run_id: runId,
+			recipe: recipe.name,
+			...commandEffectActorFacts,
+			mutation_declaration: recipe.mutation,
+			declared_writes: recipe.writes,
+			started: commandEffectStarted,
+		});
+	const commandEffectFailure = commandEffect === undefined ? undefined : commandEffectBlockingReason(commandEffect);
+	const commandEffectWarnings = commandEffect?.status === "EVIDENCE_UNAVAILABLE"
+		? ["COMMAND_EFFECT_EVIDENCE_UNAVAILABLE"]
+		: undefined;
 
 	const stdoutFull = redactText(result.stdout, secrets);
 	const stderrFull = redactText(result.stderr, secrets);
@@ -500,7 +709,7 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		exec,
 	});
 	const artifactPaths = artifactCollection.artifactPaths;
-	const runOk = exitOk && artifactCollection.ok;
+	const runOk = exitOk && artifactCollection.ok && commandEffectFailure === undefined;
 
 	const record: RunRecord = {
 		schema_version: RUN_MANIFEST_SCHEMA_VERSION_V2,
@@ -529,8 +738,17 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		execution_source: "exec",
 		argv_hash: executedArgvHashValue,
 		run_transaction_schema_version: 2,
-		run_outcome: !exitOk ? "PROCESS_FAILED" : artifactCollection.ok ? "SUCCESS" : "ARTIFACT_FAILED",
+		run_outcome: !exitOk
+			? "PROCESS_FAILED"
+			: !artifactCollection.ok
+				? "ARTIFACT_FAILED"
+				: commandEffectFailure === undefined ? "SUCCESS" : "COMMAND_EFFECT_FAILED",
 		artifact_manifest_path: "artifact-manifest.json",
+		...(commandEffect === undefined ? {} : {
+			command_effect_path: COMMAND_EFFECT_FILE,
+			command_effect_hash: commandEffect.command_effect_hash,
+			command_effect_status: commandEffect.status,
+		}),
 	};
 
 	const summary: RunSummaryRecord = {
@@ -554,6 +772,10 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		stderr: stderrView.content,
 		stdout_log: join(runDir, "stdout.log"),
 		stderr_log: join(runDir, "stderr.log"),
+		...(commandEffect === undefined ? {} : {
+			command_effect_status: commandEffect.status,
+			command_effect_path: join(runDir, COMMAND_EFFECT_FILE),
+		}),
 	};
 
 	const environmentRecord: Record<string, string> = {};
@@ -562,6 +784,9 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 	}
 
 	await writeArtifactManifestV2(writeDir, artifactCollection.manifest);
+	if (commandEffect !== undefined) {
+		await writeFile(join(writeDir, COMMAND_EFFECT_FILE), JSON.stringify(commandEffect, null, 2), "utf8");
+	}
 	await writeFile(join(writeDir, "manifest.json"), JSON.stringify(record, null, 2), "utf8");
 	await writeFile(
 		join(writeDir, "command.json"),
@@ -619,7 +844,7 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 			gitCommit: git.commit,
 			gitDirty: git.dirty,
 		};
-		if (artifactCollection.ok && shouldCacheRun(recipe.cache, facts)) {
+		if (runOk && shouldCacheRun(recipe.cache, facts)) {
 			// P6-D: the quant contract is re-validated AT WRITE TIME — a schema
 			// that became invalid (or a logical reference that can no longer
 			// resolve) between key computation and write REFUSES the cache.
@@ -667,16 +892,26 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 	try {
 		await commitRunTransaction(transaction, finishedAt);
 	} catch {
-		return { ok: false, error: "RUN_RECORD_COMMIT_FAILED", record: patched, summary, cache: cacheStatus };
+		return {
+			ok: false,
+			error: "RUN_RECORD_COMMIT_FAILED",
+			record: patched,
+			summary,
+			cache: cacheStatus,
+			...(commandEffect === undefined ? {} : { commandEffect }),
+			...(commandEffectWarnings === undefined ? {} : { warnings: commandEffectWarnings }),
+		};
 	}
 
 	return {
 		ok: runOk,
-		error: artifactCollection.ok ? undefined : artifactCollection.code,
+		error: commandEffectFailure ?? (artifactCollection.ok ? undefined : artifactCollection.code),
 		record: patched,
 		summary,
 		runDir,
 		cache: cacheStatus,
+		...(commandEffect === undefined ? {} : { commandEffect }),
+		...(commandEffectWarnings === undefined ? {} : { warnings: commandEffectWarnings }),
 	};
 	} finally {
 		if (lock) await lock.release().catch(() => {});

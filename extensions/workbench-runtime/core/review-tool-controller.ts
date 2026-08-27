@@ -12,7 +12,9 @@ import {
 } from "./delegation-state.ts";
 import type { reviewDelegationV2 } from "./delegation-review-v2.ts";
 import type { readRecoverableUnpublishedDelegationV2 } from "./delegation-project-authority.ts";
+import { readDelegationReviewV2 } from "./delegation-transaction-storage.ts";
 import type {
+	DelegationReviewAuthorityV2,
 	readDelegationCommittedGenerationV2,
 	readDelegationTransactionV2,
 } from "./delegation-transaction-storage.ts";
@@ -39,7 +41,8 @@ interface OutputAuthorizationReservation {
 	readonly allocatedBytes: number;
 }
 
-const SEMANTIC_REVIEW_HEADER_LINES = 2;
+const SESSION_MIRROR_WARNING_TEXT = "WARNING: durable review succeeded; session mirror append failed; durable authority remains authoritative and the mirror requires reconciliation";
+const SEMANTIC_REVIEW_HEADER_LINES = 3;
 const SEMANTIC_REVIEW_HEADER_SEPARATOR_BYTES = 2;
 const MAX_BOUND_DIFF_HASH = "f".repeat(64);
 
@@ -51,17 +54,25 @@ function semanticReviewHeader(
 ): string[] {
 	return [
 		`review kind: scope_integrity (mechanical evidence; never Gate authority)${selectorRecovered ? "; selector: RECOVERED_DURABLE_LATEST (stale provisional id/path hints ignored)" : ""}`,
-		`semantic review: ${semanticReview.toUpperCase()}${semanticReview === "accepted" ? ` — explicit Sol ACCEPT bound ${boundDiffHash}` : semanticReview === "repair_required" ? ` — explicit Sol REPAIR bound ${boundDiffHash}; start only exact repair_of=${repairOf ?? "20260823-000000-xxxx"}` : semanticReview === "required" ? ` — inspect the complete packet, then call again with semantic_decision=ACCEPT or REPAIR and expected_bound_diff_hash=${boundDiffHash}; REPAIR also requires repair_reason` : " — zero actual delta"}`,
+		`semantic review: ${semanticReview.toUpperCase()}${semanticReview === "accepted" ? ` — explicit Sol ACCEPT bound ${boundDiffHash}` : semanticReview === "repair_required" ? ` — explicit Sol REPAIR bound ${boundDiffHash}; run deterministic /q-repair ${repairOf ?? "20260823-000000-xxxx"}` : semanticReview === "required" ? ` — inspect the complete packet, then call again with semantic_decision=ACCEPT or REPAIR and expected_bound_diff_hash=${boundDiffHash}; REPAIR also requires repair_reason` : " — zero actual delta"}`,
 	];
 }
 
 const SEMANTIC_REVIEW_HEADER_MAX_BYTES = Math.max(
 	...(["accepted", "required", "not_required", "repair_required"] as const).flatMap((status) =>
 		[false, true].map((selectorRecovered) => Buffer.byteLength(
-			semanticReviewHeader(status, MAX_BOUND_DIFF_HASH, "20260823-000000-xxxx", selectorRecovered).join("\n"),
+			[...semanticReviewHeader(status, MAX_BOUND_DIFF_HASH, "20260823-000000-xxxx", selectorRecovered), SESSION_MIRROR_WARNING_TEXT].join("\n"),
 			"utf8",
 		))),
 );
+
+interface ReviewSessionMirrorWarning {
+	code: "session_mirror_append_failed";
+	message: string;
+	durable_readback: "confirmed" | "unavailable" | "mismatch";
+	durable_transaction_status?: string;
+	durable_review_finalized?: boolean;
+}
 
 export interface ReviewToolController {
 	pi: Pick<ExtensionAPI, "registerTool">;
@@ -89,6 +100,8 @@ export interface ReviewToolServices {
 	now(): Date;
 	readTransaction: typeof readDelegationTransactionV2;
 	readCommittedGeneration: typeof readDelegationCommittedGenerationV2;
+	/** Optional fault-injection seam; production falls back to strict storage. */
+	readReview?: typeof readDelegationReviewV2;
 	readRecoverableUnpublished: typeof readRecoverableUnpublishedDelegationV2;
 	reviewV2: typeof reviewDelegationV2;
 	reviewLegacy: typeof reviewDelegation;
@@ -101,6 +114,7 @@ export function registerReviewTool(controller: ReviewToolController): void {
 		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_review_worker_diff,
 		executionMode: "sequential",
 		async execute(toolCallId, params, _signal, _onUpdate, ctx) {
+			let sessionMirrorWarning: ReviewSessionMirrorWarning | undefined;
 			const pendingAuthorization = controller.peekOutputAuthorization(toolCallId, "workbench_review_worker_diff");
 			const requestedMaxBytes = Math.min(params.max_bytes ?? DIFF_REVIEW_RESULT_MAX_BYTES, DIFF_REVIEW_RESULT_MAX_BYTES);
 			const renderMaxBytes = pendingAuthorization === undefined
@@ -154,19 +168,22 @@ export function registerReviewTool(controller: ReviewToolController): void {
 					};
 				}
 			}
-			const repairRequired = (delegationId: string) => ({
+			const repairRequired = (delegationId: string, deterministicLineage = false) => ({
 				content: [{
 					type: "text" as const,
 					text: reviewText(
-						`workbench_review_worker_diff: repair_required; delegation ${delegationId} cannot be completed by review; call workbench_delegate_worker with repair_of=${delegationId} to start a fresh bounded repair; do not retry review`,
+						deterministicLineage
+							? `workbench_review_worker_diff: repair_required; delegation ${delegationId} cannot be completed by review; run /q-repair ${delegationId}; do not retry review`
+							: `workbench_review_worker_diff: repair_required; delegation ${delegationId} cannot be completed by review, but deterministic /q-repair authority is unavailable; call workbench_delegation_status and do not retry review`,
 					),
 				}],
-							details: {
+				details: {
 					ok: false,
 					error: "repair_required",
 					authority_version: 2,
 					repair_of: delegationId,
-					next_action: "workbench_delegate_worker",
+					next_action: deterministicLineage ? "q_repair_command" : "workbench_delegation_status",
+					...(deterministicLineage ? { next_action_command: `/q-repair ${delegationId}` } : {}),
 				},
 			});
 			if (packetMaxBytes <= 0 || packetMaxLines <= 0) {
@@ -216,7 +233,9 @@ export function registerReviewTool(controller: ReviewToolController): void {
 			const includePaths = selectorRecovered ? undefined : params.include_paths;
 			const now = controller.services.now().toISOString();
 			const transaction = await controller.services.readTransaction(projectRoot, delegationId);
-			if (transaction.ok && transaction.value.status === "FAILED") return repairRequired(delegationId);
+			if (transaction.ok && transaction.value.status === "FAILED") {
+				return repairRequired(delegationId, transaction.value.repair_lineage !== undefined);
+			}
 			if (transaction.ok && ["PREPARED", "RUNNING", "COMMITTING"].includes(transaction.value.status)) {
 				return {
 					content: [{
@@ -243,7 +262,9 @@ export function registerReviewTool(controller: ReviewToolController): void {
 			let semanticReview: "accepted" | "required" | "not_required" | "repair_required" = "required";
 			let semanticRisk: "low" | "medium" | "high" = "medium";
 			if (v2Preflight.ok) {
-				if (v2Preflight.value.state.status === "FAILED") return repairRequired(delegationId);
+				if (v2Preflight.value.state.status === "FAILED") {
+					return repairRequired(delegationId, v2Preflight.value.state.repair_lineage !== undefined);
+				}
 				authorityVersion = 2;
 				const v2Result = await controller.services.reviewV2({
 					projectRoot,
@@ -338,15 +359,35 @@ export function registerReviewTool(controller: ReviewToolController): void {
 					try {
 						controller.persistDelegationStateStrict(projected);
 					} catch {
-						if (!finalized && projected.status !== "REVIEWED") {
-							controller.setDelegationState(projected);
-							controller.setStrictMirrorDirty(true);
-							controller.refreshCompactFacts();
-						}
-						return {
-							content: [{ type: "text", text: reviewText("workbench_review_worker_diff: v2 review artifact persisted but session_persistence_failed") }],
-							details: { ok: false, error: "session_persistence_failed", authority_version: 2, finalized, review_record: reviewRecordPath },
+						const readReview = controller.services.readReview ?? readDelegationReviewV2;
+						sessionMirrorWarning = {
+							code: "session_mirror_append_failed",
+							message: "durable review succeeded; session mirror append failed and will be reconciled from durable authority",
+							durable_readback: "unavailable",
 						};
+						try {
+							const readback = await readReview(projectRoot, delegationId);
+							if (readback.ok) {
+								const authority: DelegationReviewAuthorityV2 = readback.value;
+								const exact = authority.review_hash === v2Result.review_hash
+									&& authority.review_path === v2Result.review_path
+									&& authority.finalized === v2Result.finalized
+									&& (v2Result.repair_decision_hash === undefined
+										|| authority.semantic_repair?.decision_hash === v2Result.repair_decision_hash);
+								sessionMirrorWarning = {
+									...sessionMirrorWarning,
+									durable_readback: exact ? "confirmed" : "mismatch",
+									durable_transaction_status: authority.state.status,
+									durable_review_finalized: authority.finalized,
+								};
+							}
+						} catch {
+							// Keep the successful durable result and expose unavailable
+							// read-back explicitly; a session mirror is never authority.
+						}
+						controller.setDelegationState(projected);
+						controller.setStrictMirrorDirty(true);
+						controller.refreshCompactFacts();
 					}
 				}
 			} else if (v2Preflight.error.code === "not_found") {
@@ -404,6 +445,7 @@ export function registerReviewTool(controller: ReviewToolController): void {
 			const record = result.record;
 			const presentation = normalizeReviewPresentationCoverage(record);
 			const semanticHeader = semanticReviewHeader(semanticReview, record.bound_diff_hash, delegationId, selectorRecovered);
+			if (sessionMirrorWarning !== undefined) semanticHeader.push(SESSION_MIRROR_WARNING_TEXT);
 			const text = reviewText([...semanticHeader, ...result.lines].join("\n"));
 			const nextIncludePaths: string[] = [];
 			let nextIncludeBytes = 0;
@@ -436,7 +478,8 @@ export function registerReviewTool(controller: ReviewToolController): void {
 					...(semanticReview === "repair_required"
 						? {
 							repair_of: delegationId,
-							next_action: "workbench_delegate_worker",
+							next_action: "q_repair_command",
+							next_action_command: `/q-repair ${delegationId}`,
 							...(repairDecisionHash === undefined ? {} : { repair_decision_hash: repairDecisionHash }),
 							...(repairReasonHash === undefined ? {} : { repair_reason_hash: repairReasonHash }),
 						}
@@ -448,15 +491,16 @@ export function registerReviewTool(controller: ReviewToolController): void {
 					checked_count: record.checked_paths.length,
 					displayed_count: record.displayed_paths.length,
 					remaining_count: record.remaining_paths.length,
-						coverage_complete: record.coverage_complete,
-						presentation_complete: presentation.presentation_complete,
-						fully_presented_count: presentation.fully_presented_paths.length,
-						presentation_remaining_count: presentation.presentation_remaining_paths.length,
+					coverage_complete: record.coverage_complete,
+					presentation_complete: presentation.presentation_complete,
+					fully_presented_count: presentation.fully_presented_paths.length,
+					presentation_remaining_count: presentation.presentation_remaining_paths.length,
 					review_record: reviewRecordPath ?? record.review_path,
 					next_include_paths: nextIncludePaths,
 					patch_truncated: record.patch_truncated,
 					authority_version: authorityVersion,
 					finalized,
+					...(sessionMirrorWarning === undefined ? {} : { session_mirror_warning: sessionMirrorWarning }),
 				},
 			};
 		},

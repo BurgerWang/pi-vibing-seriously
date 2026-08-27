@@ -48,7 +48,12 @@ import {
 	type DelegationTransactionResult,
 } from "../extensions/workbench-runtime/core/delegation-transaction.ts";
 import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtime/core/worker-policy.ts";
-import { createWorkerWriteJournal, sealWorkerWriteJournal } from "../extensions/workbench-runtime/core/write-journal.ts";
+import {
+	beginWriteJournalOperation,
+	completeWriteJournalOperation,
+	createWorkerWriteJournal,
+	sealWorkerWriteJournal,
+} from "../extensions/workbench-runtime/core/write-journal.ts";
 import { collectWorkspaceGuard } from "../extensions/workbench-runtime/core/workspace-guard.ts";
 import { spawnExec, withTempDir } from "./helpers.ts";
 
@@ -318,6 +323,38 @@ test("inactive blocker closure requires only its exact changed paths clean and p
 		});
 		assert.equal(running.ok, true, running.ok ? "" : running.error.code);
 		if (!running.ok) return;
+		const begun = await beginWriteJournalOperation({
+			project_root: root,
+			delegation_id: id,
+			contract_hash: initial.contract_hash,
+			expected_revision: journal.value.revision,
+			operation_id: "1".repeat(64),
+			kind: "write",
+			path: "src/rejected.ts",
+		});
+		assert.equal(begun.ok, true, begun.ok ? "" : begun.error.code);
+		if (!begun.ok) return;
+		await mkdir(join(root, "src"), { recursive: true });
+		await writeFile(join(root, "src", "rejected.ts"), "discard me\n", "utf8");
+		const completed = await completeWriteJournalOperation({
+			project_root: root,
+			delegation_id: id,
+			contract_hash: initial.contract_hash,
+			expected_revision: begun.value.revision,
+			operation_id: "1".repeat(64),
+			kind: "write",
+			path: "src/rejected.ts",
+			outcome: "succeeded",
+		});
+		assert.equal(completed.ok, true, completed.ok ? "" : completed.error.code);
+		if (!completed.ok) return;
+		const sealed = await sealWorkerWriteJournal({
+			project_root: root,
+			delegation_id: id,
+			contract_hash: initial.contract_hash,
+			expected_revision: completed.value.revision,
+		});
+		assert.equal(sealed.ok, true, sealed.ok ? "" : sealed.error.code);
 		const committing = await persistCommittingDelegationTransaction(root, {
 			delegation_id: id, contract_hash: running.value.contract_hash, worker_identity: running.value.worker_identity,
 			expected_generation: running.value.generation, expected_revision: running.value.revision, now: at(2),
@@ -336,8 +373,6 @@ test("inactive blocker closure requires only its exact changed paths clean and p
 			now: at(3), reason: "committed artifact construction failed",
 		});
 		assert.equal(recovery.ok, true, recovery.ok ? "" : recovery.error.code);
-		await mkdir(join(root, "src"), { recursive: true });
-		await writeFile(join(root, "src", "rejected.ts"), "discard me\n", "utf8");
 		await writeFile(join(root, "notes.txt"), "unrelated user work\n", "utf8");
 
 		const dirty = await closeInactiveProjectDelegationBlockerV2({
@@ -537,6 +572,42 @@ test("a zero-delta failed repair remains blocking while an ordinary zero-delta f
 		const { repair_lineage: _lineage, ...ordinaryZeroDeltaFailure } = zeroDeltaFailure;
 		assert.deepEqual(projectDelegationDispositionV2(ordinaryZeroDeltaFailure), {
 			blocking: false,
+			terminal_verdict: "FAIL",
+		});
+	});
+});
+
+test("attributed interrupted partial work remains a fail-closed project blocker", async () => {
+	await withTempDir(async (root) => {
+		const initial = await prepared(root, "20260820-100010-int1", 0);
+		const running = transactionState(startDelegationTransaction(initial, transactionCas(initial, 1)));
+		const committing = transactionState(beginDelegationCommit(running, {
+			...transactionCas(running, 2),
+			outcome: {
+				delegation_id: running.delegation_id,
+				task_kind: "implementation",
+				worker_identity: running.worker_identity,
+				provider_success: true,
+				worker_success: false,
+				worker_failure_code: "TIMED_OUT",
+				exit_code: 0,
+				report_complete: true,
+				terminal_facts_complete: true,
+				scope_complete: true,
+				change_set_status: "ATTRIBUTED",
+				changed_paths: ["src/interrupted.ts"],
+				successful_write_count: 1,
+				denied_write_count: 0,
+				delta_hash: "c".repeat(64),
+			},
+		}));
+		const interrupted = transactionState(publishDelegationCommit(committing, {
+			...transactionCas(committing, 3),
+			proof: committedProof(committing),
+		}));
+		assert.equal(interrupted.status, "INTERRUPTED");
+		assert.deepEqual(projectDelegationDispositionV2(interrupted), {
+			blocking: true,
 			terminal_verdict: "FAIL",
 		});
 	});

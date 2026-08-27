@@ -61,6 +61,9 @@ export interface RecipeToolDetails {
 	 * the renderer fails closed as unavailable and never infers "default".
 	 */
 	cache_request_mode?: CacheRequestMode;
+	command_effect_status?: string;
+	command_effect_path?: string;
+	command_effect_warning?: string;
 	phase?: string;
 }
 
@@ -348,6 +351,10 @@ export function renderRecipeLines(d: RecipeToolDetails, expanded: boolean): stri
 		`exit code  : ${fmtExit(d.exit_code)} (expected: ${(d.expected_exit_codes ?? []).join(", ") || "(none)"})`,
 		`validation : ${validationComponents}`,
 		`cache mode : ${cacheRequestMode}`,
+		...(d.command_effect_status || d.command_effect_warning
+			? [`cmd effect : ${boundedBytes(d.command_effect_status ?? "EVIDENCE_UNAVAILABLE", 128)}${d.command_effect_warning ? `; ${boundedBytes(d.command_effect_warning, 256)}` : ""}`]
+			: []),
+		...(d.command_effect_path ? [`effect file: ${fmtPath(d.command_effect_path)}`] : []),
 		`artifacts  : ${fmtArtifacts(d.artifact_paths)}`,
 		`stdout log : ${fmtPath(d.stdout_log)}`,
 		`stderr log : ${fmtPath(d.stderr_log)}`,

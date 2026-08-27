@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import {
 	CONFIG_DIR_NAME,
 	type ExtensionAPI,
+	type ExtensionCommandContext,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
@@ -21,11 +22,16 @@ import {
 	persistPreparedDelegationTransaction,
 	persistRecoveryRequiredDelegationTransaction,
 	persistRunningDelegationTransaction,
+	publishDelegationSemanticRepairDecisionV1,
 	readDelegationCommittedGenerationV2,
 	readDelegationReviewV2,
 	readDelegationTransactionV2,
 } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
-import type { DelegationTransactionRecord } from "../extensions/workbench-runtime/core/delegation-transaction.ts";
+import {
+	bindDelegationRepairLineageV1,
+	type DelegationTransactionRecord,
+} from "../extensions/workbench-runtime/core/delegation-transaction.ts";
+import { normalizeDelegationBoundedTaskContractV2 } from "../extensions/workbench-runtime/core/delegation-transaction-artifacts.ts";
 import {
 	DELEGATION_STATE_ENTRY_TYPE,
 	type DelegationStateRecord,
@@ -44,17 +50,30 @@ import {
 } from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { WORKER_SPEND_PROFILE_ENV } from "../extensions/workbench-runtime/core/worker-spend.ts";
 import { createWorkerWriteJournal, sealWorkerWriteJournal } from "../extensions/workbench-runtime/core/write-journal.ts";
+import { RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2 } from "../extensions/workbench-runtime/core/delegation-execution-owner.ts";
+import { recoverRawLineageExactRepairAuthorityV1 } from "../extensions/workbench-runtime/core/exact-repair-raw-lineage-authority.ts";
+import { readExactRepairSuccessorV1 } from "../extensions/workbench-runtime/core/exact-repair-successor.ts";
 import { readWorkerRepairCapsule } from "../extensions/workbench-runtime/core/worker-repair-authority.ts";
-import { readProjectDelegationRepairClosureV1 } from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
+import {
+	collectCurrentDelegationBindingV2,
+	readProjectDelegationRepairClosureV1,
+} from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
 import { buildDelegationWorkerFirstGateFacts } from "../extensions/workbench-runtime/core/delegation-plan-reference.ts";
 import { spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
 
 interface StubAPI {
 	tools: Map<string, unknown>;
+	commands: Map<string, RuntimeCommand>;
 	events: Map<string, Array<(event: unknown, ctx: unknown) => unknown>>;
 	appendedEntries: Array<{ customType: string; data: unknown }>;
+	sentUserMessageCount: number;
 	failDelegationStateAppendOnceWhen?: (state: DelegationStateRecord) => boolean;
 	failedDelegationStateAppendCount: number;
+}
+
+interface RuntimeCommand {
+	description?: string;
+	handler(args: string, ctx: ExtensionCommandContext): Promise<void>;
 }
 
 interface RuntimeResult {
@@ -87,11 +106,13 @@ const WRITE_JOURNAL_MODULE_PATH = fileURLToPath(new URL("../extensions/workbench
 function makeStub(): StubAPI & ExtensionAPI {
 	const stub = {
 		tools: new Map<string, unknown>(),
+		commands: new Map<string, RuntimeCommand>(),
 		events: new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>(),
 		appendedEntries: [] as Array<{ customType: string; data: unknown }>,
+		sentUserMessageCount: 0,
 		failDelegationStateAppendOnceWhen: undefined as ((state: DelegationStateRecord) => boolean) | undefined,
 		failedDelegationStateAppendCount: 0,
-		registerCommand: () => {},
+		registerCommand: (name: string, definition: RuntimeCommand) => { stub.commands.set(name, definition); },
 		registerTool: (definition: { name: string }) => { stub.tools.set(definition.name, definition); },
 		on: (event: string, handler: (event: unknown, ctx: unknown) => unknown) => {
 			const handlers = stub.events.get(event) ?? [];
@@ -111,7 +132,7 @@ function makeStub(): StubAPI & ExtensionAPI {
 			stub.appendedEntries.push({ customType, data });
 		},
 		sendMessage: () => {},
-		sendUserMessage: () => {},
+		sendUserMessage: () => { stub.sentUserMessageCount += 1; },
 		setActiveTools: () => {},
 		getActiveTools: () => [],
 		getAllTools: () => [],
@@ -181,6 +202,29 @@ function reviewTool(stub: StubAPI): RuntimeTool {
 	const tool = stub.tools.get("workbench_review_worker_diff");
 	assert.ok(tool);
 	return tool as RuntimeTool;
+}
+
+function exactRepairCommand(stub: StubAPI): RuntimeCommand {
+	const command = stub.commands.get("q-repair");
+	assert.ok(command);
+	return command;
+}
+
+function exactRepairCommandContext(
+	root: string,
+	sessionId: string,
+	notices: string[],
+	onWait: () => void,
+): ExtensionCommandContext {
+	const base = commanderContext(root, sessionId);
+	return {
+		...base,
+		waitForIdle: async () => { onWait(); },
+		ui: {
+			...base.ui,
+			notify: (text: string) => { notices.push(text); },
+		},
+	} as unknown as ExtensionCommandContext;
 }
 
 function gitTool(stub: StubAPI): RuntimeTool {
@@ -281,6 +325,57 @@ async function requireCurrentSemanticRepair(
 		assert.equal(presented.details.ok, true, resultText(presented));
 	}
 	throw new Error("semantic repair presentation did not converge");
+}
+
+async function completeCurrentSemanticPresentation(
+	root: string,
+	stub: StubAPI,
+	ctx: ExtensionContext,
+	delegationId: string,
+): Promise<void> {
+	const tool = reviewTool(stub);
+	for (let segment = 0; segment < 500; segment += 1) {
+		const current = await readDelegationReviewV2(root, delegationId);
+		assert.equal(current.ok, true);
+		if (!current.ok) throw new Error("strict provisional review is unavailable");
+		const record = current.value.review as unknown as Record<string, unknown>;
+		if (record.presentation_complete === true) return;
+		const remaining = record.presentation_remaining_paths;
+		assert.ok(Array.isArray(remaining) && remaining.length > 0);
+		const presented = await tool.execute(`semantic-presentation-${segment}`, {
+			delegation_id: delegationId,
+			include_paths: [remaining[0]],
+			max_lines: 400,
+			max_bytes: 32768,
+		}, undefined, undefined, ctx);
+		assert.equal(presented.details.ok, true, resultText(presented));
+	}
+	throw new Error("semantic presentation did not converge");
+}
+
+async function publishCompletedSemanticRepairFixture(
+	root: string,
+	delegationId: string,
+	reason: string,
+): Promise<void> {
+	const current = await readDelegationReviewV2(root, delegationId);
+	assert.equal(current.ok, true, current.ok ? "" : current.error.code);
+	if (!current.ok) return;
+	assert.equal(current.value.review.presentation_complete, true);
+	const state = current.value.state;
+	const published = await publishDelegationSemanticRepairDecisionV1(root, {
+		delegation_id: delegationId,
+		contract_hash: state.contract_hash,
+		worker_identity: state.worker_identity,
+		expected_generation: state.generation,
+		expected_revision: state.revision,
+		base_review_hash: current.value.review_hash,
+		expected_bound_diff_hash: current.value.review.bound_diff_hash,
+		repair_reason: reason,
+		reviewer: { provider: "openai-codex", model: "gpt-5.6-sol" },
+		now: current.value.review.reviewed_at,
+	});
+	assert.equal(published.ok, true, published.ok ? "" : published.error.code);
 }
 
 async function initializeProject(root: string): Promise<void> {
@@ -402,7 +497,14 @@ function completeReport(changedPaths: readonly string[] = []): string {
 
 async function writeFakeWorker(
 	root: string,
-	options: { changedPath?: string; changedPaths?: readonly string[]; deniedWrite?: boolean; body?: string; launchMarkerPath?: string; unownedPath?: string },
+	options: {
+		changedPath?: string;
+		changedPaths?: readonly string[];
+		deniedWrite?: boolean;
+		body?: string;
+		launchMarkerPath?: string;
+		unownedPath?: string;
+	},
 ): Promise<string> {
 	const path = join(root, `fake-worker-${Math.random().toString(36).slice(2)}.cjs`);
 	const setup = [
@@ -667,7 +769,7 @@ test("diagnosis zero-diff commits v2 FINISHED, unblocks the mirror, and trusts o
 	});
 });
 
-test("diagnosis REVIEWED mirror append failure stays PENDING_REVIEW and blocks the next delegation before transaction or child", async () => {
+test("diagnosis REVIEWED mirror append failure returns durable success and does not block the successor", async () => {
 	await withTempDir(async (root) => {
 		await initializeProject(root);
 		const launchMarkerPath = join(root, ".git", "worker-launches");
@@ -678,10 +780,18 @@ test("diagnosis REVIEWED mirror append failure stays PENDING_REVIEW and blocks t
 		stub.failDelegationStateAppendOnceWhen = (state) => state.status === "REVIEWED";
 
 		await withFakeWorker(script, async () => {
-			await assert.rejects(
-				tool.execute("diagnosis-reviewed-append-failure-1", delegateParams({ task_kind: "diagnosis" }), undefined, undefined, ctx),
-				/diagnosis session mirror persistence failed/,
+			const first = await tool.execute(
+				"diagnosis-reviewed-append-failure-1",
+				delegateParams({ task_kind: "diagnosis" }),
+				undefined,
+				undefined,
+				ctx,
 			);
+			assert.equal(first.details.status, "success");
+			assert.equal((first.details.session_mirror_warning as Record<string, unknown>).code, "session_mirror_append_failed");
+			assert.equal((first.details.session_mirror_warning as Record<string, unknown>).durable_readback, "confirmed");
+			assert.equal((first.details.session_mirror_warning as Record<string, unknown>).durable_transaction_status, "FINISHED");
+			assert.match(resultText(first), /WARNING session mirror append failed \(read-back confirmed\)/u);
 			assert.equal(stub.failedDelegationStateAppendCount, 1, "the injected failure is consumed exactly at the REVIEWED append");
 
 			const directoriesAfterFirst = await delegationDirectories(root);
@@ -694,18 +804,21 @@ test("diagnosis REVIEWED mirror append failure stays PENDING_REVIEW and blocks t
 
 			await persistCompactMirror(stub, ctx);
 			const compact = latestCompactState(stub);
-			assert.equal(compact.pendingDelegationReview, true, "the compact mirror stays blocking after the failed REVIEWED append");
+			assert.equal(compact.pendingDelegationReview, true, "the persisted compact mirror stays conservative until reconciliation");
 			assert.equal(compact.lastDelegationId, directoriesAfterFirst[0]);
-			assert.match(compact.nextDelegationAction ?? "", /PENDING_REVIEW/);
 
 			const launchCountAfterFirst = (await readFile(launchMarkerPath, "utf8")).trim().split("\n").length;
-			await assert.rejects(
-				tool.execute("diagnosis-reviewed-append-failure-2", delegateParams({ task_kind: "diagnosis" }), undefined, undefined, ctx),
-				/PENDING_REVIEW/,
+			const second = await tool.execute(
+				"diagnosis-reviewed-append-failure-2",
+				delegateParams({ task_kind: "diagnosis" }),
+				undefined,
+				undefined,
+				ctx,
 			);
-			assert.deepEqual(await delegationDirectories(root), directoriesAfterFirst, "the second delegation is rejected before a new transaction directory");
+			assert.notEqual(delegationId(second), directoriesAfterFirst[0]);
+			assert.equal((await delegationDirectories(root)).length, 2);
 			const launchCountAfterSecond = (await readFile(launchMarkerPath, "utf8")).trim().split("\n").length;
-			assert.equal(launchCountAfterSecond, launchCountAfterFirst, "the second delegation is rejected before child launch");
+			assert.equal(launchCountAfterSecond, launchCountAfterFirst + 1, "the successor launches exactly once");
 		});
 	});
 });
@@ -734,7 +847,7 @@ test("implementation real in-scope delta stays pending until explicit Sol accept
 				withFakeWorker(diagnosisScript, () => tool.execute(
 					"implementation-blocked-before-accept", delegateParams({ task_kind: "diagnosis" }), undefined, undefined, ctx,
 				)),
-				/PENDING_REVIEW/,
+					/path lane admission blocked: PATH_OVERLAP/u,
 			);
 			assert.deepEqual(await delegationDirectories(root), directoriesBeforeBlockedSuccessor);
 			await acceptCurrentSemanticReview(root, stub, ctx, id);
@@ -747,6 +860,199 @@ test("implementation real in-scope delta stays pending until explicit Sol accept
 			));
 			assert.notEqual(delegationId(second), id, "a hash-bound semantic ACCEPT releases the next delegation");
 		});
+	});
+});
+
+test("production path-lane admission bypasses only a known non-overlapping blocker and does not inherit its plan", async () => {
+	await withTempDir(async (root) => {
+		await initializeProject(root);
+		const planPath = "docs/plans/historical-lane.md";
+		const planBytes = "# Historical blocked lane plan\n";
+		await mkdir(dirname(join(root, planPath)), { recursive: true });
+		await writeFile(join(root, planPath), planBytes, "utf8");
+		const historicalPlan = {
+			schema: "workbench-plan-ref-v1",
+			plan_id: "historical-blocked-lane",
+			version: "1.0",
+			plan_path: planPath,
+			plan_sha256: createHash("sha256").update(planBytes).digest("hex"),
+			candidate: "CURRENT_WORKTREE",
+			status: "IN_PROGRESS",
+			criteria: [{ id: "C1", gate_id: "b1", check_ids: ["b1.1"], evidence_paths: ["src/historical-lane.ts"] }],
+			next_action: "repair only the historical source lane",
+		};
+		const historicalPath = "src/historical-lane.ts";
+		const initialScript = await writeFakeWorker(root, { changedPath: historicalPath, body: "pending\n" });
+		const nextScript = await writeFakeWorker(root, {});
+		const stub = commanderRuntime();
+		const tool = delegateTool(stub);
+		const ctx = commanderContext(root, "production-path-lane");
+		const initial = await withFakeWorker(initialScript, () => tool.execute(
+			"production-path-lane-parent",
+			delegateParams({ task_kind: "implementation", allowed_paths: [historicalPath], plan_ref: historicalPlan }),
+			undefined,
+			undefined,
+			ctx,
+		));
+		const parentId = delegationId(initial);
+		assert.equal(latestSessionState(stub).status, "PENDING_REVIEW");
+
+		for (const [callId, allowedPaths] of [
+			["production-path-lane-same", [historicalPath]],
+			["production-path-lane-subtree", ["src/**"]],
+		] as const) {
+			const before = await delegationDirectories(root);
+			await assert.rejects(
+				withFakeWorker(nextScript, () => tool.execute(
+					callId,
+					delegateParams({ task_kind: "diagnosis", allowed_paths: allowedPaths }),
+					undefined,
+					undefined,
+					ctx,
+				)),
+				/path lane admission blocked: PATH_OVERLAP/u,
+			);
+			assert.deepEqual(await delegationDirectories(root), before, "overlap is rejected before PREPARED allocation");
+		}
+
+		const admitted = await withFakeWorker(nextScript, () => tool.execute(
+			"production-path-lane-disjoint",
+			delegateParams({ task_kind: "diagnosis", allowed_paths: ["docs/**"] }),
+			undefined,
+			undefined,
+			ctx,
+		));
+		const childId = delegationId(admitted);
+		assert.notEqual(childId, parentId);
+		assert.deepEqual(await delegationDirectories(root), [parentId, childId].sort());
+		const child = await readDelegationCommittedGenerationV2(root, childId);
+		assert.equal(child.ok, true, child.ok ? "" : child.error.code);
+		if (child.ok) {
+			const before = child.value.records["before.json"] as Record<string, unknown>;
+			const contract = before.contract as Record<string, unknown>;
+			assert.equal(contract.plan_ref, undefined, "a disjoint lane does not inherit an unrelated blocked plan");
+			assert.equal(child.value.state.status, "FINISHED");
+		}
+	});
+});
+
+test("two on-disk repair lineages stay non-invalid, admit disjoint work, and q-repair either exact tip", async () => {
+	await withTempDir(async (root) => {
+		await initializeProject(root);
+		await mkdir(join(root, "docs"), { recursive: true });
+		await mkdir(join(root, "tests"), { recursive: true });
+		const pathA = "src/multi-lineage-a.ts";
+		const pathB = "docs/multi-lineage-b.md";
+		const pathC = "tests/multi-lineage-c.ts";
+		// Put B in A's immutable baseline before A is captured. This models a
+		// real dirty shared checkout without asking semantic binding to waive an
+		// unknown-origin path. B later changes its own already-known lane.
+		await writeFile(join(root, pathB), "baseline-b\n", "utf8");
+		const initialA = await writeFakeWorker(root, { changedPath: pathA, body: "bad-a\n" });
+		const initialB = await writeFakeWorker(root, { changedPath: pathB, body: "bad-b\n" });
+		const ordinaryC = await writeFakeWorker(root, { changedPath: pathC, body: "independent-c\n" });
+		const repairA = await writeFakeWorker(root, { changedPath: pathA, body: "fixed-a\n" });
+		const repairB = await writeFakeWorker(root, { changedPath: pathB, body: "fixed-b\n" });
+		const owner = commanderRuntime();
+		const ownerCtx = commanderContext(root, "two-lineage-owner");
+		const first = await withFakeWorker(initialA, () => delegateTool(owner).execute(
+			"two-lineage-a",
+			delegateParams({ task_kind: "implementation", allowed_paths: [pathA] }),
+			undefined,
+			undefined,
+			ownerCtx,
+		));
+		const rootA = delegationId(first);
+		await completeCurrentSemanticPresentation(root, owner, ownerCtx, rootA);
+
+		const second = await withFakeWorker(initialB, () => delegateTool(owner).execute(
+			"two-lineage-b",
+			delegateParams({ task_kind: "implementation", allowed_paths: [pathB] }),
+			undefined,
+			undefined,
+			ownerCtx,
+		));
+		const rootB = delegationId(second);
+		await requireCurrentSemanticRepair(root, owner, ownerCtx, rootB, "Reject the second independent path.");
+		await publishCompletedSemanticRepairFixture(root, rootA, "Reject the first independently reviewed path.");
+
+		const multiple = await readProjectDelegationRepairClosureV1(root);
+		assert.equal(multiple.ok, false);
+		if (!multiple.ok) assert.equal(multiple.issue.code, "repair_lineage_multiple_unresolved");
+
+		const resumed = commanderRuntime();
+		const resumedCtx = commanderContext(root, "two-lineage-resumed");
+		await startSession(resumed, resumedCtx);
+		const status = await delegationStatusTool(resumed).execute(
+			"two-lineage-status", {}, undefined, undefined, resumedCtx,
+		);
+		const statusText = resultText(status);
+		assert.match(statusText, /HISTORICAL_MULTIPLICITY/u);
+		assert.match(statusText, /strict full-project path-lane admission/u);
+		assert.match(statusText, /VERIFY remains BLOCKED/u);
+		assert.doesNotMatch(statusText, /project auth\s+: INVALID/u);
+		await persistCompactMirror(resumed, resumedCtx);
+		assert.match(latestCompactState(resumed).nextDelegationAction ?? "", /historical blocker multiplicity/u);
+		assert.doesNotMatch(latestCompactState(resumed).nextDelegationAction ?? "", /authority is .*fail-closed/u);
+
+		const beforeOverlap = await delegationDirectories(root);
+		await assert.rejects(
+			withFakeWorker(ordinaryC, () => delegateTool(resumed).execute(
+				"two-lineage-overlap",
+				delegateParams({ task_kind: "implementation", allowed_paths: [pathA] }),
+				undefined,
+				undefined,
+				resumedCtx,
+			)),
+			/path lane admission blocked: PATH_OVERLAP/u,
+		);
+		assert.deepEqual(await delegationDirectories(root), beforeOverlap, "overlap is rejected before transaction allocation");
+
+		const repairCommand = exactRepairCommand(resumed);
+		const notices: string[] = [];
+		const commandCtx = exactRepairCommandContext(root, "two-lineage-q-repair", notices, () => {});
+		const bindingA = await collectCurrentDelegationBindingV2(root, rootA, spawnExec);
+		const reviewA = await readDelegationReviewV2(root, rootA);
+		assert.equal(reviewA.ok, true);
+		assert.equal(bindingA.status, "fresh", JSON.stringify(bindingA));
+		if (reviewA.ok && bindingA.status === "fresh") {
+			assert.equal(bindingA.hash, reviewA.value.semantic_repair?.expected_bound_diff_hash);
+		}
+		const beforeA = await delegationDirectories(root);
+		await withFakeWorker(repairA, () => repairCommand.handler(rootA, commandCtx));
+		const afterA = await delegationDirectories(root);
+		assert.equal(afterA.length, beforeA.length + 1, notices.at(-1));
+		const childA = afterA.find((id) => !beforeA.includes(id));
+		assert.ok(childA);
+		const committedA = await readDelegationCommittedGenerationV2(root, childA);
+		assert.equal(committedA.ok, true, committedA.ok ? "" : committedA.error.code);
+		if (committedA.ok) assert.equal(committedA.value.state.repair_lineage?.repair_of, rootA);
+		const closureAfterA = await readProjectDelegationRepairClosureV1(root);
+		assert.equal(
+			closureAfterA.ok || ["additional_unresolved_authority", "repair_lineage_multiple_unresolved"].includes(closureAfterA.issue.code),
+			true,
+			JSON.stringify(closureAfterA),
+		);
+
+		const beforeB = await delegationDirectories(root);
+		await withFakeWorker(repairB, () => repairCommand.handler(rootB, commandCtx));
+		const afterB = await delegationDirectories(root);
+		assert.equal(afterB.length, beforeB.length + 1, notices.at(-1));
+		const childB = afterB.find((id) => !beforeB.includes(id));
+		assert.ok(childB);
+		const committedB = await readDelegationCommittedGenerationV2(root, childB);
+		assert.equal(committedB.ok, true, committedB.ok ? "" : committedB.error.code);
+		if (committedB.ok) assert.equal(committedB.value.state.repair_lineage?.repair_of, rootB);
+
+		const ordinary = await withFakeWorker(ordinaryC, () => delegateTool(resumed).execute(
+			"two-lineage-disjoint",
+			delegateParams({ task_kind: "implementation", allowed_paths: [pathC] }),
+			undefined,
+			undefined,
+			resumedCtx,
+		));
+		assert.equal((await readDelegationCommittedGenerationV2(root, delegationId(ordinary))).ok, true);
+		assert.equal(resumed.sentUserMessageCount, 0);
 	});
 });
 
@@ -851,7 +1157,7 @@ test("an incomplete v2-only directory blocks a fresh session before any new dele
 	});
 });
 
-test("semantic-accept mirror append failure reports failure, then durable FINAL reconciles before a successor", async () => {
+test("semantic-accept mirror append failure returns durable success and reconciles before a successor", async () => {
 	await withTempDir(async (root) => {
 		await initializeProject(root);
 		const launchMarkerPath = join(root, ".git", "worker-launches");
@@ -874,8 +1180,10 @@ test("semantic-accept mirror append failure reports failure, then durable FINAL 
 				semantic_decision: "ACCEPT",
 				expected_bound_diff_hash: provisional.value.review.bound_diff_hash,
 			}, undefined, undefined, ctx);
-			assert.equal(acceptance.details.ok, false);
-			assert.equal(acceptance.details.error, "session_persistence_failed");
+			assert.equal(acceptance.details.ok, true, resultText(acceptance));
+			assert.equal((acceptance.details.session_mirror_warning as Record<string, unknown>).code, "session_mirror_append_failed");
+			assert.equal((acceptance.details.session_mirror_warning as Record<string, unknown>).durable_readback, "confirmed");
+			assert.match(resultText(acceptance), /WARNING: durable review succeeded; session mirror append failed/u);
 			assert.equal(stub.failedDelegationStateAppendCount, 1);
 			const directories = await delegationDirectories(root);
 			assert.equal(directories.length, 1);
@@ -1010,18 +1318,19 @@ test("public WORKSPACE_DRIFT failure keeps a nonzero binding PENDING and never a
 			const status = await delegationStatusTool(stub).execute("implementation-drift-status", {}, undefined, undefined, ctx);
 			const statusOutput = resultText(status);
 			assert.match(statusOutput, new RegExp(`latest\\s+: ${state.latestId} FAILED`, "u"));
-			assert.match(statusOutput, new RegExp(`repair_of=${state.latestId}`, "u"));
+			assert.match(statusOutput, /next action\s+: inspect workbench_delegation_status; do not retry review/u);
+			assert.doesNotMatch(statusOutput, /repair_of=/u, "non-attributed drift has no fabricated exact-repair authority");
 			assert.doesNotMatch(statusOutput, /latest\s+: .* PENDING_REVIEW/u);
 			assert.equal((statusOutput.match(/next action\s+:/gu) ?? []).length, 1, "FAILED reports one durable recovery action");
 			await assert.rejects(
 				delegateTool(stub).execute("implementation-drift-blocked", delegateParams({ task_kind: "diagnosis" }), undefined, undefined, ctx),
-				/PENDING_REVIEW/,
+					/path lane admission blocked: PATH_OVERLAP/u,
 			);
 		});
 	});
 });
 
-test("implementation zero-delta FAILED mirror append fault stays PENDING_REVIEW and blocks before a second transaction or child", async () => {
+test("implementation zero-delta failure keeps its durable error primary when REVIEWED mirror append fails", async () => {
 	await withTempDir(async (root) => {
 		await initializeProject(root);
 		const launchMarkerPath = join(root, ".git", "worker-launches");
@@ -1034,7 +1343,7 @@ test("implementation zero-delta FAILED mirror append fault stays PENDING_REVIEW 
 		await withFakeWorker(script, async () => {
 			await assert.rejects(
 				tool.execute("implementation-zero-reviewed-append-failure-1", delegateParams(), undefined, undefined, ctx),
-				/session mirror persistence failed/,
+				/IMPLEMENTATION_DELTA_REQUIRED.*warning=session_mirror_append_failed.*durable_readback=confirmed/u,
 			);
 			assert.equal(stub.failedDelegationStateAppendCount, 1, "the injected failure is consumed exactly at the zero-delta REVIEWED append");
 
@@ -1048,13 +1357,17 @@ test("implementation zero-delta FAILED mirror append fault stays PENDING_REVIEW 
 			assert.equal(latestSessionState(stub).status, "PENDING_REVIEW", "the latest successfully appended mirror remains fail-closed");
 
 			const launchCountAfterFirst = (await readFile(launchMarkerPath, "utf8")).trim().split("\n").length;
-			await assert.rejects(
-				tool.execute("implementation-zero-reviewed-append-failure-2", delegateParams({ task_kind: "diagnosis" }), undefined, undefined, ctx),
-				/PENDING_REVIEW/,
+			const second = await tool.execute(
+				"implementation-zero-reviewed-append-failure-2",
+				delegateParams({ task_kind: "diagnosis" }),
+				undefined,
+				undefined,
+				ctx,
 			);
-			assert.deepEqual(await delegationDirectories(root), directoriesAfterFirst, "the second delegation is rejected before a new transaction directory");
+			assert.notEqual(delegationId(second), directoriesAfterFirst[0]);
+			assert.equal((await delegationDirectories(root)).length, 2);
 			const launchCountAfterSecond = (await readFile(launchMarkerPath, "utf8")).trim().split("\n").length;
-			assert.equal(launchCountAfterSecond, launchCountAfterFirst, "the second delegation is rejected before child launch");
+			assert.equal(launchCountAfterSecond, launchCountAfterFirst + 1, "the successor launches exactly once");
 		});
 	});
 });
@@ -1080,7 +1393,7 @@ test("diagnosis denied structured write or real delta durably FAILS", async () =
 					const directoriesAfterFirst = await delegationDirectories(root);
 					await assert.rejects(
 						tool.execute("diagnosis-real-delta-blocked-2", delegateParams({ task_kind: "diagnosis" }), undefined, undefined, ctx),
-						/PENDING_REVIEW/,
+							/path lane admission blocked: PATH_OVERLAP/u,
 					);
 					assert.deepEqual(await delegationDirectories(root), directoriesAfterFirst, "the blocked follow-up creates no transaction");
 				}
@@ -1094,7 +1407,7 @@ test("diagnosis denied structured write or real delta durably FAILS", async () =
 	}
 });
 
-test("an explicit repair_of supersedes the exact latest committed FAILED delegation with a real delta", async () => {
+test("model-supplied repair_of cannot supersede a committed FAILED delegation without exact command authority", async () => {
 	await withTempDir(async (root) => {
 		await initializeProject(root);
 		const failedScript = await writeFakeWorker(root, { changedPath: "src/failed-worker-delta.txt" });
@@ -1119,7 +1432,8 @@ test("an explicit repair_of supersedes the exact latest committed FAILED delegat
 		const transactionBefore = await readFile(transactionPath, "utf8");
 		const status = await delegationStatusTool(stub).execute("committed-failed-status", {}, undefined, undefined, ctx);
 		assert.match(resultText(status), /completion v2:\s+FAIL/);
-		assert.match(resultText(status), new RegExp(`repair_of=${failedId}`));
+		assert.match(resultText(status), /next action\s+: inspect workbench_delegation_status; do not retry review/u);
+		assert.doesNotMatch(resultText(status), /repair_of=/u, "the zero-quality diagnosis failure has no Sol terminal-negative sidecar");
 		const refusedReview = await reviewTool(stub).execute(
 			"committed-failed-review", { delegation_id: failedId }, undefined, undefined, ctx,
 		);
@@ -1128,14 +1442,342 @@ test("an explicit repair_of supersedes the exact latest committed FAILED delegat
 		assert.match(resultText(refusedReview), /do not retry review/);
 		assert.equal(await readFile(transactionPath, "utf8"), transactionBefore, "status and review guidance preserve committed FAILED evidence");
 
-		const repaired = await withFakeWorker(repairScript, () => delegateTool(stub).execute(
-			"committed-failed-repair", delegateParams({ task_kind: "diagnosis", repair_of: failedId }), undefined, undefined, ctx,
-		));
-		const repairId = delegationId(repaired);
-		assert.notEqual(repairId, failedId);
-		assert.equal(latestSessionState(stub).latestId, repairId);
-		assert.equal(latestSessionState(stub).status, "REVIEWED");
+		const beforeRawRepair = await delegationDirectories(root);
+		await assert.rejects(
+			withFakeWorker(repairScript, () => delegateTool(stub).execute(
+				"committed-failed-repair", delegateParams({ task_kind: "diagnosis", repair_of: failedId }), undefined, undefined, ctx,
+			)),
+			new RegExp(`model-supplied repair_of ${failedId} has no exact in-process authority; run /q-repair ${failedId}`, "u"),
+		);
+		assert.deepEqual(await delegationDirectories(root), beforeRawRepair, "raw repair parameters never allocate a successor");
 		assert.equal(await readFile(transactionPath, "utf8"), transactionBefore, "the committed FAILED authority remains immutable");
+	});
+});
+
+test("q-repair directly advances semantic and terminal-lineage transactions without an agent turn", async () => {
+	await withTempDir(async (root) => {
+		await initializeProject(root);
+		const rejectedPath = "src/q-repair.ts";
+		const initialScript = await writeFakeWorker(root, { changedPath: rejectedPath, body: "known-bad\n" });
+		const failedRepairScript = await writeFakeWorker(root, { deniedWrite: true });
+		const replayLaunchMarker = join(root, ".git", "q-repair-replay-launch");
+		const replayScript = await writeFakeWorker(root, { changedPath: rejectedPath, body: "must-not-run\n", launchMarkerPath: replayLaunchMarker });
+		const terminalRepairScript = await writeFakeWorker(root, { changedPath: rejectedPath, body: "fixed\n" });
+		const stub = commanderRuntime();
+		const toolCtx = commanderContext(root, "q-repair-direct-tool");
+		const initial = await withFakeWorker(initialScript, () => delegateTool(stub).execute(
+			"q-repair-parent",
+			delegateParams({ task_kind: "implementation", allowed_paths: [rejectedPath] }),
+			undefined,
+			undefined,
+			toolCtx,
+		));
+		const parentId = delegationId(initial);
+		await requireCurrentSemanticRepair(
+			root,
+			stub,
+			toolCtx,
+			parentId,
+			"The exact provisional implementation is semantically wrong and needs deterministic repair.",
+		);
+
+		const notices: string[] = [];
+		let idleWaits = 0;
+		const commandCtx = exactRepairCommandContext(root, "q-repair-direct-command", notices, () => { idleWaits += 1; });
+		const command = exactRepairCommand(stub);
+		const beforeSemanticRepair = await delegationDirectories(root);
+		await withFakeWorker(failedRepairScript, () => command.handler(parentId, commandCtx));
+		const afterSemanticRepair = await delegationDirectories(root);
+		assert.equal(afterSemanticRepair.length, beforeSemanticRepair.length + 1, "semantic command creates one real transaction");
+		const failedId = afterSemanticRepair.find((id) => !beforeSemanticRepair.includes(id));
+		assert.ok(failedId);
+		const failed = await readDelegationCommittedGenerationV2(root, failedId);
+		assert.equal(failed.ok, true, failed.ok ? "" : failed.error.code);
+		if (!failed.ok) return;
+		assert.equal(failed.value.state.status, "FAILED");
+		assert.equal(failed.value.state.repair_lineage?.repair_of, parentId);
+		assert.match(notices.at(-1) ?? "", /authority_kind: semantic-repair/u);
+		assert.match(notices.at(-1) ?? "", /prior successor ended before writes and has strict deterministic continuation authority/u);
+		assert.match(notices.at(-1) ?? "", new RegExp(`next_action: \/q-repair ${failedId}`, "u"));
+		// Model a lost command response after the durable child was committed.
+		// Replay must recover that child from project authority alone.
+		notices.length = 0;
+		const beforeReplay = await delegationDirectories(root);
+		await withFakeWorker(replayScript, () => command.handler(parentId, commandCtx));
+		assert.deepEqual(await delegationDirectories(root), beforeReplay, "replay does not allocate a sibling transaction");
+		await assert.rejects(readFile(replayLaunchMarker, "utf8"), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+		assert.match(notices.at(-1) ?? "", /prior successor ended before writes and has strict deterministic continuation authority/u);
+		assert.match(notices.at(-1) ?? "", new RegExp(`successor: ${failedId}`, "u"));
+		assert.match(notices.at(-1) ?? "", new RegExp(`next_action: \/q-repair ${failedId}`, "u"));
+
+		const beforeTerminalRepair = await delegationDirectories(root);
+		await withFakeWorker(terminalRepairScript, () => command.handler(failedId, commandCtx));
+		const afterTerminalRepair = await delegationDirectories(root);
+		assert.equal(afterTerminalRepair.length, beforeTerminalRepair.length + 1, "terminal command creates one real successor transaction");
+		const repairedId = afterTerminalRepair.find((id) => !beforeTerminalRepair.includes(id));
+		assert.ok(repairedId);
+		const repaired = await readDelegationCommittedGenerationV2(root, repairedId);
+		assert.equal(repaired.ok, true, repaired.ok ? "" : repaired.error.code);
+		if (!repaired.ok) return;
+		assert.equal(repaired.value.state.status, "PENDING_REVIEW");
+		assert.equal(repaired.value.state.repair_lineage?.repair_of, failedId);
+		assert.match(notices.at(-1) ?? "", /authority_kind: terminal-lineage/u);
+		assert.match(notices.at(-1) ?? "", /shared delegate execution completed/u);
+		assert.equal(idleWaits, 3);
+		assert.equal(stub.sentUserMessageCount, 0, "the command never creates model/session prose");
+	});
+});
+
+test("q-repair preserves immutable subtree authority while carrying only concrete rejected paths", async () => {
+	await withTempDir(async (root) => {
+		await initializeProject(root);
+		const rejectedPath = "src/q-repair-broad.ts";
+		const initialScript = await writeFakeWorker(root, { changedPath: rejectedPath, body: "known-bad\n" });
+		const repairScript = await writeFakeWorker(root, { changedPath: rejectedPath, body: "repaired\n" });
+		const stub = commanderRuntime();
+		const toolCtx = commanderContext(root, "q-repair-unsafe-tool");
+		const initial = await withFakeWorker(initialScript, () => delegateTool(stub).execute(
+			"q-repair-unsafe-parent",
+			delegateParams({ task_kind: "implementation", allowed_paths: ["src/**"] }),
+			undefined,
+			undefined,
+			toolCtx,
+		));
+		const parentId = delegationId(initial);
+		await requireCurrentSemanticRepair(root, stub, toolCtx, parentId, "Broad scope must not be replayed automatically.");
+		const before = await delegationDirectories(root);
+		const notices: string[] = [];
+		const commandCtx = exactRepairCommandContext(root, "q-repair-unsafe-command", notices, () => {});
+		await withFakeWorker(repairScript, () => exactRepairCommand(stub).handler(parentId, commandCtx));
+		const after = await delegationDirectories(root);
+		assert.equal(after.length, before.length + 1, "bounded subtree recovery allocates exactly one successor");
+		const childId = after.find((id) => !before.includes(id));
+		assert.ok(childId);
+		const child = await readDelegationCommittedGenerationV2(root, childId);
+		assert.equal(child.ok, true, child.ok ? "" : child.error.code);
+		if (child.ok) {
+			assert.deepEqual(child.value.state.allowed_paths, ["src/**"]);
+			assert.deepEqual(child.value.state.repair_lineage?.carried_paths, [rejectedPath]);
+		}
+		assert.match(notices.at(-1) ?? "", /shared delegate execution completed/u);
+		assert.equal(stub.sentUserMessageCount, 0);
+	});
+});
+
+test("q-repair replays a matching PREPARED successor after a pre-launch crash without starting a worker", async () => {
+	await withTempDir(async (root) => {
+		await initializeProject(root);
+		const rejectedPath = "src/q-repair-prepared.ts";
+		const initialScript = await writeFakeWorker(root, { changedPath: rejectedPath, body: "known-bad\n" });
+		const forbiddenLaunchMarker = join(root, ".git", "q-repair-prepared-replay-launch");
+		const forbiddenScript = await writeFakeWorker(root, {
+			changedPath: rejectedPath,
+			body: "must-not-run\n",
+			launchMarkerPath: forbiddenLaunchMarker,
+		});
+		const rawRepairScript = await writeFakeWorker(root, { changedPath: rejectedPath, body: "raw-lineage-fixed\n" });
+		const stub = commanderRuntime();
+		const toolCtx = commanderContext(root, "q-repair-prepared-tool");
+		const initial = await withFakeWorker(initialScript, () => delegateTool(stub).execute(
+			"q-repair-prepared-parent",
+			delegateParams({ task_kind: "implementation", allowed_paths: [rejectedPath] }),
+			undefined,
+			undefined,
+			toolCtx,
+		));
+		const parentId = delegationId(initial);
+		const decision = await requireCurrentSemanticRepair(
+			root,
+			stub,
+			toolCtx,
+			parentId,
+			"Seed one exact immutable repair authority for PREPARED replay testing.",
+		);
+		const decisionHash = decision.details.repair_decision_hash;
+		assert.equal(typeof decisionHash, "string");
+		const lineage = bindDelegationRepairLineageV1({
+			schema_version: 1,
+			kind: "semantic-repair-lineage-v1",
+			root_delegation_id: parentId,
+			repair_of: parentId,
+			root_decision_hash: decisionHash as string,
+			continuation_decision_delegation_id: parentId,
+			continuation_decision_hash: decisionHash as string,
+			parent_lineage_hash: null,
+			depth: 1,
+			carried_paths: [rejectedPath],
+		});
+		assert.ok(lineage);
+		const expectedContract = normalizeDelegationBoundedTaskContractV2({
+			task_kind: "implementation",
+			task: "Perform the bounded delegated task.",
+			allowed_paths: [rejectedPath],
+			acceptance_criteria: ["The requested bounded behavior is observed."],
+			verification: [],
+			timeout_seconds: 60,
+			budget_profile: "standard",
+			repair_of: parentId,
+		});
+		assert.equal(expectedContract.ok, true);
+		if (!expectedContract.ok) return;
+		const preparedId = "20991231-235958-qcrs";
+		const preparedAt = new Date().toISOString();
+		const prepared = await persistPreparedDelegationTransaction(root, {
+			delegation_id: preparedId,
+			task_kind: "implementation",
+			contract_hash: expectedContract.value.contract_hash,
+			allowed_paths: [rejectedPath],
+			worker_identity: { provider: WORKER_PROVIDER, model: WORKER_MODEL_ID, worker_id: `worker:${preparedId}` },
+			generation: 1,
+			now: preparedAt,
+			repair_lineage: lineage,
+		});
+		assert.equal(prepared.ok, true, prepared.ok ? "" : prepared.error.code);
+
+		const before = await delegationDirectories(root);
+		const notices: string[] = [];
+		const commandCtx = exactRepairCommandContext(root, "q-repair-prepared-command", notices, () => {});
+		await withFakeWorker(forbiddenScript, () => exactRepairCommand(stub).handler(parentId, commandCtx));
+		assert.deepEqual(await delegationDirectories(root), before, "PREPARED replay does not allocate a sibling transaction");
+		await assert.rejects(readFile(forbiddenLaunchMarker, "utf8"), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+		assert.match(notices.at(-1) ?? "", /exact successor already active; no second worker was started/u);
+		assert.match(notices.at(-1) ?? "", new RegExp(`successor: ${preparedId}`, "u"));
+		assert.match(notices.at(-1) ?? "", /successor_status: PREPARED/u);
+		assert.match(notices.at(-1) ?? "", /successor_disposition: ACTIVE/u);
+		assert.match(notices.at(-1) ?? "", /next_action: \/q-delegation-status/u);
+
+		const aborted = await persistAbortedDelegationTransaction(root, {
+			delegation_id: prepared.value.delegation_id,
+			contract_hash: prepared.value.contract_hash,
+			worker_identity: prepared.value.worker_identity,
+			expected_generation: prepared.value.generation,
+			expected_revision: prepared.value.revision,
+			now: preparedAt,
+			reason: RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.preparedCallbackFailed,
+		});
+		assert.equal(aborted.ok, true, aborted.ok ? "" : aborted.error.code);
+		if (!aborted.ok) return;
+		const abortedStatus = resultText(await delegationStatusTool(stub).execute(
+			"q-repair-prepared-aborted-status", {}, undefined, undefined, toolCtx,
+		));
+		assert.match(abortedStatus, new RegExp(`latest\\s+: ${preparedId} ABORTED`, "u"));
+		assert.match(abortedStatus, new RegExp(`next action\\s+: run /q-repair ${preparedId}`, "u"));
+		assert.equal((abortedStatus.match(/next action\s+:/gu) ?? []).length, 1);
+		const rawAuthority = await recoverRawLineageExactRepairAuthorityV1({
+			project_root: root,
+			repair_of: preparedId,
+			collectCurrentBinding: (projectRoot, delegationId) =>
+				collectCurrentDelegationBindingV2(projectRoot, delegationId, spawnExec),
+		});
+		assert.equal(rawAuthority.ok, true, JSON.stringify(rawAuthority));
+		notices.length = 0;
+		const beforeRawRepair = await delegationDirectories(root);
+		await withFakeWorker(rawRepairScript, () => exactRepairCommand(stub).handler(preparedId, commandCtx));
+		const afterRawRepair = await delegationDirectories(root);
+		assert.equal(afterRawRepair.length, beforeRawRepair.length + 1, notices.at(-1));
+		const rawChildId = afterRawRepair.find((id) => !beforeRawRepair.includes(id));
+		assert.ok(rawChildId);
+		const rawChild = await readDelegationCommittedGenerationV2(root, rawChildId);
+		assert.equal(rawChild.ok, true, rawChild.ok ? "" : rawChild.error.code);
+		if (rawChild.ok) {
+			assert.equal(rawChild.value.state.status, "PENDING_REVIEW");
+			assert.equal(rawChild.value.state.repair_lineage?.repair_of, preparedId);
+			assert.equal(rawChild.value.state.repair_lineage?.depth, 2);
+		}
+		const rawReview = await readDelegationReviewV2(root, rawChildId);
+		assert.equal(rawReview.ok, true, JSON.stringify(rawReview));
+		const rawSuccessor = await readExactRepairSuccessorV1({
+			projectRoot: root,
+			parent: aborted.value,
+			authority: rawAuthority.value,
+		});
+		assert.equal(rawSuccessor.ok, true, JSON.stringify(rawSuccessor));
+		if (rawSuccessor.ok) {
+			assert.equal(rawSuccessor.kind, "existing");
+			if (rawSuccessor.kind === "existing") assert.equal(rawSuccessor.value.delegation_id, rawChildId);
+		}
+		assert.match(notices.at(-1) ?? "", /authority_kind: raw-lineage-retry/u);
+		assert.match(notices.at(-1) ?? "", /shared delegate execution completed/u);
+		assert.equal(stub.sentUserMessageCount, 0);
+	});
+});
+
+test("q-repair fails closed when an existing successor binds a different recovered request", async () => {
+	await withTempDir(async (root) => {
+		await initializeProject(root);
+		const rejectedPath = "src/q-repair-conflict.ts";
+		const initialScript = await writeFakeWorker(root, { changedPath: rejectedPath, body: "known-bad\n" });
+		const forbiddenLaunchMarker = join(root, ".git", "q-repair-conflict-launch");
+		const forbiddenScript = await writeFakeWorker(root, {
+			changedPath: rejectedPath,
+			body: "must-not-run\n",
+			launchMarkerPath: forbiddenLaunchMarker,
+		});
+		const stub = commanderRuntime();
+		const toolCtx = commanderContext(root, "q-repair-conflict-tool");
+		const initial = await withFakeWorker(initialScript, () => delegateTool(stub).execute(
+			"q-repair-conflict-parent",
+			delegateParams({ task_kind: "implementation", allowed_paths: [rejectedPath] }),
+			undefined,
+			undefined,
+			toolCtx,
+		));
+		const parentId = delegationId(initial);
+		const decision = await requireCurrentSemanticRepair(
+			root,
+			stub,
+			toolCtx,
+			parentId,
+			"Seed one exact immutable repair authority for idempotency conflict testing.",
+		);
+		const decisionHash = decision.details.repair_decision_hash;
+		assert.equal(typeof decisionHash, "string");
+		const lineage = bindDelegationRepairLineageV1({
+			schema_version: 1,
+			kind: "semantic-repair-lineage-v1",
+			root_delegation_id: parentId,
+			repair_of: parentId,
+			root_decision_hash: decisionHash as string,
+			continuation_decision_delegation_id: parentId,
+			continuation_decision_hash: decisionHash as string,
+			parent_lineage_hash: null,
+			depth: 1,
+			carried_paths: [rejectedPath],
+		});
+		assert.ok(lineage);
+		const conflictingContract = normalizeDelegationBoundedTaskContractV2({
+			task_kind: "implementation",
+			task: "A different request that must not borrow the same repair authority.",
+			allowed_paths: [rejectedPath],
+			acceptance_criteria: ["A different acceptance condition."],
+			verification: [],
+			timeout_seconds: 60,
+			budget_profile: "extended",
+			repair_of: parentId,
+		});
+		assert.equal(conflictingContract.ok, true);
+		if (!conflictingContract.ok) return;
+		const conflictId = "20991231-235959-qcfl";
+		const prepared = await persistPreparedDelegationTransaction(root, {
+			delegation_id: conflictId,
+			task_kind: "implementation",
+			contract_hash: conflictingContract.value.contract_hash,
+			allowed_paths: [rejectedPath],
+			worker_identity: { provider: WORKER_PROVIDER, model: WORKER_MODEL_ID, worker_id: `worker:${conflictId}` },
+			generation: 1,
+			now: "2099-12-31T23:59:59.000Z",
+			repair_lineage: lineage,
+		});
+		assert.equal(prepared.ok, true, prepared.ok ? "" : prepared.error.code);
+
+		const before = await delegationDirectories(root);
+		const notices: string[] = [];
+		const commandCtx = exactRepairCommandContext(root, "q-repair-conflict-command", notices, () => {});
+		await withFakeWorker(forbiddenScript, () => exactRepairCommand(stub).handler(parentId, commandCtx));
+		assert.deepEqual(await delegationDirectories(root), before);
+		await assert.rejects(readFile(forbiddenLaunchMarker, "utf8"), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+		assert.match(notices.at(-1) ?? "", /durable idempotency refused \(IDEMPOTENCY_CONFLICT\)/u);
+		assert.match(notices.at(-1) ?? "", new RegExp(`conflicting_delegation: ${conflictId}`, "u"));
 	});
 });
 
@@ -1182,18 +1824,29 @@ test("an exact semantic REPAIR sidecar launches one bounded implementation linea
 				undefined,
 				ctx,
 			)),
-			/requires only exact-file allowed_paths/,
+			/model-supplied repair_of .* has no exact in-process authority; run \/q-repair/u,
 		);
-		assert.deepEqual(await delegationDirectories(root), beforeBroadRefusal, "broad repair scope refuses before allocating a child");
+		await assert.rejects(
+			withFakeWorker(repairScript, () => delegateTool(stub).execute(
+				"semantic-repair-exact-raw-refused",
+				delegateParams({ task_kind: "implementation", repair_of: parentId, allowed_paths: [rejectedPath] }),
+				undefined,
+				undefined,
+				ctx,
+			)),
+			/model-supplied repair_of .* has no exact in-process authority; run \/q-repair/u,
+		);
+		assert.deepEqual(await delegationDirectories(root), beforeBroadRefusal, "model repair parameters refuse before allocating a child");
 
-		const repaired = await withFakeWorker(repairScript, () => delegateTool(stub).execute(
-			"semantic-repair-exact",
-			delegateParams({ task_kind: "implementation", repair_of: parentId, allowed_paths: [rejectedPath] }),
-			undefined,
-			undefined,
-			ctx,
+		const repairNotices: string[] = [];
+		await withFakeWorker(repairScript, () => exactRepairCommand(stub).handler(
+			parentId,
+			exactRepairCommandContext(root, "semantic-repair-exact-command", repairNotices, () => {}),
 		));
-		const repairId = delegationId(repaired);
+		assert.match(repairNotices.at(-1) ?? "", /shared delegate execution completed/u);
+		const repairId = (await delegationDirectories(root)).find((id) => !beforeBroadRefusal.includes(id));
+		assert.equal(typeof repairId, "string");
+		if (repairId === undefined) return;
 		const committed = await readDelegationCommittedGenerationV2(root, repairId);
 		assert.equal(committed.ok, true, committed.ok ? "" : committed.error.code);
 		if (!committed.ok) return;
@@ -1216,14 +1869,16 @@ test("an exact semantic REPAIR sidecar launches one bounded implementation linea
 		);
 		const secondDecisionHash = secondDecision.details.repair_decision_hash;
 		assert.equal(typeof secondDecisionHash, "string");
-		const grandchildResult = await withFakeWorker(grandchildScript, () => delegateTool(stub).execute(
-			"semantic-repair-grandchild",
-			delegateParams({ task_kind: "implementation", repair_of: repairId, allowed_paths: [rejectedPath] }),
-			undefined,
-			undefined,
-			ctx,
+		const beforeGrandchild = await delegationDirectories(root);
+		const grandchildNotices: string[] = [];
+		await withFakeWorker(grandchildScript, () => exactRepairCommand(stub).handler(
+			repairId,
+			exactRepairCommandContext(root, "semantic-repair-grandchild-command", grandchildNotices, () => {}),
 		));
-		const grandchildId = delegationId(grandchildResult);
+		assert.match(grandchildNotices.at(-1) ?? "", /shared delegate execution completed/u);
+		const grandchildId = (await delegationDirectories(root)).find((id) => !beforeGrandchild.includes(id));
+		assert.equal(typeof grandchildId, "string");
+		if (grandchildId === undefined) return;
 		const grandchild = await readDelegationCommittedGenerationV2(root, grandchildId);
 		assert.equal(grandchild.ok, true, grandchild.ok ? "" : grandchild.error.code);
 		if (!grandchild.ok) return;
@@ -1263,6 +1918,80 @@ test("an exact semantic REPAIR sidecar launches one bounded implementation linea
 		const forked = await readProjectDelegationRepairClosureV1(root);
 		assert.equal(forked.ok, false);
 		if (!forked.ok) assert.equal(forked.issue.code, "repair_lineage_fork");
+	});
+});
+
+test("historical repair lineage may carry parent review dependencies outside the child's narrower write scope", async () => {
+	await withTempDir(async (root) => {
+		await initializeProject(root);
+		const firstPath = "src/legacy-first.ts";
+		const secondPath = "src/legacy-second.ts";
+		const initialScript = await writeFakeWorker(root, {
+			changedPaths: [firstPath, secondPath],
+			body: "historical rejected change\n",
+		});
+		const stub = commanderRuntime();
+		const ctx = commanderContext(root, "historical-carried-dependencies");
+		const initial = await withFakeWorker(initialScript, () => delegateTool(stub).execute(
+			"historical-carried-parent",
+			delegateParams({ task_kind: "implementation" }),
+			undefined,
+			undefined,
+			ctx,
+		));
+		const parentId = delegationId(initial);
+		const decision = await requireCurrentSemanticRepair(
+			root,
+			stub,
+			ctx,
+			parentId,
+			"The historical parent requires a bounded repair.",
+		);
+		const decisionHash = decision.details.repair_decision_hash;
+		assert.equal(typeof decisionHash, "string");
+		const lineage = bindDelegationRepairLineageV1({
+			schema_version: 1,
+			kind: "semantic-repair-lineage-v1",
+			root_delegation_id: parentId,
+			repair_of: parentId,
+			root_decision_hash: decisionHash as string,
+			continuation_decision_delegation_id: parentId,
+			continuation_decision_hash: decisionHash as string,
+			parent_lineage_hash: null,
+			depth: 1,
+			carried_paths: [firstPath, secondPath],
+		});
+		assert.ok(lineage);
+		const childId = "20991231-235958-leg1";
+		const childContract = normalizeDelegationBoundedTaskContractV2({
+			task_kind: "implementation",
+			task: "Repair only the remaining exact path while retaining historical review dependencies.",
+			allowed_paths: [firstPath],
+			acceptance_criteria: ["The remaining exact defect is corrected."],
+			verification: [],
+			timeout_seconds: 60,
+			budget_profile: "standard",
+			repair_of: parentId,
+		});
+		assert.equal(childContract.ok, true);
+		if (!childContract.ok) return;
+		const prepared = await persistPreparedDelegationTransaction(root, {
+			delegation_id: childId,
+			task_kind: "implementation",
+			contract_hash: childContract.value.contract_hash,
+			allowed_paths: [firstPath],
+			worker_identity: { provider: WORKER_PROVIDER, model: WORKER_MODEL_ID, worker_id: `worker:${childId}` },
+			generation: 1,
+			now: "2099-12-31T23:59:58.000Z",
+			repair_lineage: lineage,
+		});
+		assert.equal(prepared.ok, true, prepared.ok ? "" : prepared.error.code);
+		assert.deepEqual(await readProjectDelegationRepairClosureV1(root), {
+			ok: true,
+			unresolvedTipId: childId,
+			rootCount: 1,
+			lineageCount: 1,
+		});
 	});
 });
 
@@ -1343,18 +2072,14 @@ test("a deliberately discarded repair closes on a clean repository and the same 
 			rootCount: 1,
 			lineageCount: 0,
 		});
-		await writeFile(join(root, rejectedPath), "rejected\n", "utf8");
-		await assert.rejects(
-			withFakeWorker(repairScript, () => delegateTool(stub).execute(
-				"clean-close-cannot-reopen",
-				delegateParams({ task_kind: "implementation", repair_of: parentId, allowed_paths: [rejectedPath] }),
-				undefined,
-				undefined,
-				ctx,
-			)),
-			/durably closed after the rejected delta was discarded/,
-		);
-		await unlink(join(root, rejectedPath));
+		const beforeClosedRepair = await delegationDirectories(root);
+		const repairNotices: string[] = [];
+		await withFakeWorker(repairScript, () => exactRepairCommand(stub).handler(
+			parentId,
+			exactRepairCommandContext(root, "clean-close-cannot-reopen", repairNotices, () => {}),
+		));
+		assert.deepEqual(await delegationDirectories(root), beforeClosedRepair, "a closed root never allocates an exact successor");
+		assert.match(repairNotices.at(-1) ?? "", /path lane admission blocked: INVALID_REQUEST/u);
 
 		const next = await withFakeWorker(nextScript, () => delegateTool(stub).execute(
 			"clean-close-next",
@@ -1379,12 +2104,13 @@ test("a deliberately discarded repair closes on a clean repository and the same 
 	});
 });
 
-test("two sessions cannot consume one semantic REPAIR authority into sibling children", async () => {
+test("two sessions cannot use raw repair_of or replay one q-repair authority into sibling children", async () => {
 	await withTempDir(async (root) => {
 		await initializeProject(root);
 		const rejectedPath = "src/concurrent-rejected.ts";
 		const initialScript = await writeFakeWorker(root, { changedPath: rejectedPath, body: "known-bad\n" });
-		const repairScript = await writeFakeWorker(root, { changedPath: rejectedPath, body: "fixed\n" });
+		const launchMarkerPath = join(root, ".git", "semantic-repair-concurrency-launches");
+		const repairScript = await writeFakeWorker(root, { changedPath: rejectedPath, body: "fixed\n", launchMarkerPath });
 		const owner = commanderRuntime();
 		const ownerContext = commanderContext(root, "semantic-repair-concurrency-owner");
 		const initial = await withFakeWorker(initialScript, () => delegateTool(owner).execute(
@@ -1424,10 +2150,28 @@ test("two sessions cannot consume one semantic REPAIR authority into sibling chi
 				secondContext,
 			),
 		]));
-		assert.equal(attempts.filter((attempt) => attempt.status === "fulfilled").length, 1);
-		assert.equal(attempts.filter((attempt) => attempt.status === "rejected").length, 1);
+		assert.equal(attempts.filter((attempt) => attempt.status === "fulfilled").length, 0);
+		assert.equal(attempts.filter((attempt) => attempt.status === "rejected").length, 2);
+		for (const attempt of attempts) {
+			if (attempt.status === "rejected") assert.match(String(attempt.reason), /model-supplied repair_of .* has no exact in-process authority/u);
+		}
+		assert.deepEqual(await delegationDirectories(root), [parentId], "raw model parameters never allocate a repair child");
+
+		const firstNotices: string[] = [];
+		await withFakeWorker(repairScript, () => exactRepairCommand(first).handler(
+			parentId,
+			exactRepairCommandContext(root, "semantic-repair-concurrency-q-a", firstNotices, () => {}),
+		));
+		assert.match(firstNotices.at(-1) ?? "", /shared delegate execution completed/u);
+		const secondNotices: string[] = [];
+		await withFakeWorker(repairScript, () => exactRepairCommand(second).handler(
+			parentId,
+			exactRepairCommandContext(root, "semantic-repair-concurrency-q-b", secondNotices, () => {}),
+		));
+		assert.match(secondNotices.at(-1) ?? "", /durable replay — returning the existing exact successor/u);
 		const directories = await delegationDirectories(root);
 		assert.equal(directories.length, 2, "one root and exactly one repair child are durable");
+		assert.equal((await readFile(launchMarkerPath, "utf8")).trim().split("\n").length, 1, "q-repair replay starts no second worker");
 		const childId = directories.find((id) => id !== parentId)!;
 		const closure = await readProjectDelegationRepairClosureV1(root);
 		assert.deepEqual(closure, { ok: true, unresolvedTipId: childId, rootCount: 1, lineageCount: 1 });
@@ -1500,7 +2244,7 @@ async function installLegacyFinishedFixture(root: string, id: string): Promise<v
 	}
 }
 
-test("repair provenance prefers strict v2, large default review converges, and corrupt v2 never falls back", async () => {
+test("q-repair provenance stays strict, large default review converges, and corrupt v2 never falls back", async () => {
 	await withTempDir(async (root) => {
 		await initializeProject(root);
 		const diagnosisScript = await writeFakeWorker(root, {});
@@ -1524,18 +2268,16 @@ test("repair provenance prefers strict v2, large default review converges, and c
 
 		for (const repairId of [finishedId, failedId]) {
 			const stub = commanderRuntime();
-			const repaired = await withFakeWorker(diagnosisScript, () => delegateTool(stub).execute(
-				`repair-allowed-${repairId}`, delegateParams({ task_kind: "diagnosis", repair_of: repairId }), undefined, undefined, commanderContext(root, `repair-${repairId}`),
-			));
-			assert.notEqual(delegationId(repaired), repairId);
+			const before = await delegationDirectories(root);
+			const notices: string[] = [];
+			await exactRepairCommand(stub).handler(
+				repairId,
+				exactRepairCommandContext(root, `repair-${repairId}`, notices, () => {}),
+			);
+			assert.deepEqual(await delegationDirectories(root), before);
+			assert.match(notices.at(-1) ?? "", /\/q-repair: .*?(?:unavailable|refused)/u);
+			assert.doesNotMatch(notices.at(-1) ?? "", /shared delegate execution/u);
 		}
-
-		const legacyId = "20260817-030000-v1ok";
-		await installLegacyFinishedFixture(root, legacyId);
-		const legacyRepair = await withFakeWorker(diagnosisScript, () => delegateTool(commanderRuntime()).execute(
-			"repair-legacy-allowed", delegateParams({ task_kind: "diagnosis", repair_of: legacyId }), undefined, undefined, commanderContext(root, "repair-legacy-allowed"),
-		));
-		assert.notEqual(delegationId(legacyRepair), legacyId);
 
 		const segmentedStub = commanderRuntime();
 		const segmented = await withFakeWorker(implementationScript, () => delegateTool(segmentedStub).execute(
@@ -1568,26 +2310,42 @@ test("repair provenance prefers strict v2, large default review converges, and c
 		assert.equal(pendingAuthority.ok, true);
 		if (pendingAuthority.ok) assert.equal(pendingAuthority.value.state.status, "PENDING_REVIEW");
 		const beforePendingRefusal = await delegationDirectories(root);
-		await assert.rejects(
-			withFakeWorker(diagnosisScript, () => delegateTool(commanderRuntime()).execute(
-				"repair-pending-refused", delegateParams({ task_kind: "diagnosis", repair_of: segmentedId }), undefined, undefined,
-				commanderContext(root, "repair-pending-refused"),
-			)),
-			/requires an exact immutable semantic REPAIR decision/,
+		const pendingStub = commanderRuntime();
+		const pendingNotices: string[] = [];
+		await exactRepairCommand(pendingStub).handler(
+			segmentedId,
+			exactRepairCommandContext(root, "repair-pending-refused", pendingNotices, () => {}),
 		);
 		assert.deepEqual(await delegationDirectories(root), beforePendingRefusal, "pending provenance refuses before creating a transaction");
+		assert.match(pendingNotices.at(-1) ?? "", /\/q-repair: .*?(?:unavailable|recovery refused)/u);
 		await writeFile(segmentedTransactionPath, segmentedTransactionBefore, "utf8");
+
+		// A legacy-only envelope is deliberately installed only after all new-v2
+		// delegation work: production path admission treats its immutable path
+		// provenance as unknown and correctly blocks later starts.
+		const legacyId = "20260817-030000-v1ok";
+		await installLegacyFinishedFixture(root, legacyId);
+		const legacyStub = commanderRuntime();
+		const legacyBefore = await delegationDirectories(root);
+		const legacyNotices: string[] = [];
+		await exactRepairCommand(legacyStub).handler(
+			legacyId,
+			exactRepairCommandContext(root, "repair-legacy-refused", legacyNotices, () => {}),
+		);
+		assert.deepEqual(await delegationDirectories(root), legacyBefore);
+		assert.match(legacyNotices.at(-1) ?? "", /deterministic parameter recovery refused \(RAW_TIP_NOT_RETRYABLE\)/u);
 
 		await installLegacyFinishedFixture(root, finishedId);
 		await writeFile(join(root, CONFIG_DIR_NAME, "workbench", "delegations", finishedId, "v2", "transaction.json"), "{\"schema_version\":2", "utf8");
 		const beforeCorruptRefusal = await delegationDirectories(root);
-		await assert.rejects(
-			withFakeWorker(diagnosisScript, () => delegateTool(commanderRuntime()).execute(
-				"repair-corrupt-refused", delegateParams({ task_kind: "diagnosis", repair_of: finishedId }), undefined, undefined, commanderContext(root, "repair-corrupt-refused"),
-			)),
-			/invalid_record/,
+		const corruptStub = commanderRuntime();
+		const corruptNotices: string[] = [];
+		await exactRepairCommand(corruptStub).handler(
+			finishedId,
+			exactRepairCommandContext(root, "repair-corrupt-refused", corruptNotices, () => {}),
 		);
 		assert.deepEqual(await delegationDirectories(root), beforeCorruptRefusal, "corrupt v2 never falls back to the colocated v1 fixture");
+		assert.match(corruptNotices.at(-1) ?? "", /deterministic parameter recovery refused \(RAW_TIP_NOT_RETRYABLE\)/u);
 	});
 });
 
@@ -1743,7 +2501,7 @@ test("RECOVERY_REQUIRED project authority survives a failed session append and b
 		const before = await delegationDirectories(root);
 		await assert.rejects(
 			delegateTool(stub).execute("project-recovery-block", delegateParams({ task_kind: "diagnosis" }), undefined, undefined, ctx),
-			/PENDING_REVIEW/,
+			/path lane admission blocked: UNKNOWN_AUTHORITY/u,
 		);
 		assert.deepEqual(await delegationDirectories(root), before, "reconciliation blocks before a second transaction directory");
 		const status = await delegationStatusTool(stub).execute("project-recovery-status", {}, undefined, undefined, ctx);
@@ -1755,7 +2513,7 @@ test("RECOVERY_REQUIRED project authority survives a failed session append and b
 	});
 });
 
-test("an explicit repair_of safely supersedes an unpublished artifact failure without rewriting it", async () => {
+test("an unpublished artifact failure refuses model-supplied repair_of and remains immutable", async () => {
 	await withTempDir(async (root) => {
 		await initializeProject(root);
 		const brokenId = "20260820-170003-artf";
@@ -1772,34 +2530,34 @@ test("an explicit repair_of safely supersedes an unpublished artifact failure wi
 		assert.equal(latestSessionState(stub).status, "PENDING_REVIEW");
 		const status = await delegationStatusTool(stub).execute("artifact-repair-status", {}, undefined, undefined, ctx);
 		assert.match(resultText(status), /RECOVERABLE_UNPUBLISHED/);
-		assert.match(resultText(status), new RegExp(`repair_of=${brokenId}`));
+		assert.match(resultText(status), /committed proof is absent, so deterministic \/q-repair is unavailable/u);
+		assert.doesNotMatch(resultText(status), /repair_of=/u, "proofless recovery cannot advertise deterministic exact repair");
 		assert.doesNotMatch(resultText(status), /authority v2\s+: INVALID/);
 		const refusedReview = await reviewTool(stub).execute(
 			"artifact-repair-review", { delegation_id: brokenId }, undefined, undefined, ctx,
 		);
 		assert.equal(refusedReview.details.error, "repair_required");
 		assert.equal(refusedReview.details.repair_of, brokenId);
-		assert.equal(refusedReview.details.next_action, "workbench_delegate_worker");
-		assert.match(resultText(refusedReview), new RegExp(`repair_of=${brokenId}`));
+		assert.equal(refusedReview.details.next_action, "workbench_delegation_status");
+		assert.match(resultText(refusedReview), /deterministic \/q-repair authority is unavailable/u);
+		assert.doesNotMatch(resultText(refusedReview), /repair_of=/u, "proofless recovery is never advertised as a raw model repair call");
 		assert.match(resultText(refusedReview), /do not retry review/);
 		assert.equal(await readFile(transactionPath, "utf8"), transactionBefore, "status and review guidance never rewrite recovery evidence");
 
 		const script = await writeFakeWorker(root, {});
-		const repaired = await withFakeWorker(script, () => delegateTool(stub).execute(
-			"artifact-repair-call",
-			delegateParams({ task_kind: "diagnosis", repair_of: brokenId }),
-			undefined,
-			undefined,
-			ctx,
-		));
-		const repairId = delegationId(repaired);
-		assert.notEqual(repairId, brokenId);
-		const committed = await readDelegationCommittedGenerationV2(root, repairId);
-		assert.equal(committed.ok, true, committed.ok ? "" : committed.error.code);
-		if (committed.ok) assert.equal(committed.value.state.status, "FINISHED");
-		assert.equal(latestSessionState(stub).latestId, repairId);
-		assert.equal(latestSessionState(stub).status, "REVIEWED");
-		assert.equal(await readFile(transactionPath, "utf8"), transactionBefore, "the superseded recovery evidence remains immutable");
+		const beforeRawRepair = await delegationDirectories(root);
+		await assert.rejects(
+			withFakeWorker(script, () => delegateTool(stub).execute(
+				"artifact-repair-call",
+				delegateParams({ task_kind: "diagnosis", repair_of: brokenId }),
+				undefined,
+				undefined,
+				ctx,
+			)),
+			new RegExp(`model-supplied repair_of ${brokenId} has no exact in-process authority; run /q-repair ${brokenId}`, "u"),
+		);
+		assert.deepEqual(await delegationDirectories(root), beforeRawRepair);
+		assert.equal(await readFile(transactionPath, "utf8"), transactionBefore, "the unpublished recovery evidence remains immutable");
 	});
 });
 

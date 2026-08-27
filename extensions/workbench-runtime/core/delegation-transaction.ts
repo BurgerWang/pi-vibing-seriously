@@ -13,6 +13,11 @@ import {
 	WORKER_MODEL_ID,
 	WORKER_PROVIDER,
 } from "./worker-policy.ts";
+import {
+	isWorkerRunFailureCode,
+	isWorkerRunInterruptionFailureCode,
+	type WorkerRunFailureCode,
+} from "./worker-run-failure.ts";
 
 export const DELEGATION_TRANSACTION_SCHEMA_VERSION = 2 as const;
 export const DELEGATION_TRANSACTION_MAX_BYTES = 1_048_576 as const;
@@ -37,6 +42,7 @@ export const DELEGATION_TRANSACTION_STATUSES = [
 	"COMMITTING",
 	"FINISHED",
 	"PENDING_REVIEW",
+	"INTERRUPTED",
 	"REVIEWED",
 	"FAILED",
 	"ABORTED",
@@ -60,6 +66,7 @@ export type DelegationCommittedRecordName = (typeof DELEGATION_COMMITTED_RECORD_
 /** Fixed evaluation order; callers must never replace these facts with prose. */
 export const DELEGATION_POSTCONDITION_REASON_ORDER = [
 	"PROVIDER_NOT_SUCCESS",
+	"WORKER_RUN_FAILED",
 	"EXIT_CODE_NOT_ZERO",
 	"REPORT_INCOMPLETE",
 	"TERMINAL_FACTS_INCOMPLETE",
@@ -86,6 +93,10 @@ export interface DelegationTerminalOutcome {
 	task_kind: DelegationTaskKind;
 	worker_identity: DelegationWorkerIdentity;
 	provider_success: boolean;
+	/** Missing only on immutable historical v2 records. Fresh runtime outcomes always provide both worker fields. */
+	worker_success?: boolean;
+	/** Closed failure category; null iff worker_success is true. Missing only on historical v2 records. */
+	worker_failure_code?: WorkerRunFailureCode | null;
 	exit_code: number;
 	report_complete: boolean;
 	terminal_facts_complete: boolean;
@@ -245,7 +256,7 @@ const REPAIR_LINEAGE_FIELDS = [
 ] as const;
 
 const IDENTITY_FIELDS = ["provider", "model", "worker_id"] as const;
-const OUTCOME_FIELDS = [
+const LEGACY_OUTCOME_FIELDS = [
 	"delegation_id",
 	"task_kind",
 	"worker_identity",
@@ -260,6 +271,7 @@ const OUTCOME_FIELDS = [
 	"denied_write_count",
 	"delta_hash",
 ] as const;
+const OUTCOME_FIELDS = [...LEGACY_OUTCOME_FIELDS, "worker_success", "worker_failure_code"] as const;
 const PROOF_FIELDS = [
 	"schema_version",
 	"delegation_id",
@@ -439,11 +451,24 @@ function cloneOutcome(outcome: DelegationTerminalOutcome): DelegationTerminalOut
 	};
 }
 
+export function isCurrentDelegationTerminalOutcome(
+	value: DelegationTerminalOutcome,
+): value is DelegationTerminalOutcome & { worker_success: boolean; worker_failure_code: WorkerRunFailureCode | null } {
+	const hasSuccess = Object.prototype.hasOwnProperty.call(value, "worker_success");
+	const hasFailure = Object.prototype.hasOwnProperty.call(value, "worker_failure_code");
+	return hasSuccess && hasFailure && typeof value.worker_success === "boolean" &&
+		(value.worker_failure_code === null || isWorkerRunFailureCode(value.worker_failure_code)) &&
+		value.worker_success === (value.worker_failure_code === null);
+}
+
 function validOutcome(value: unknown): value is DelegationTerminalOutcome {
-	if (!isRecord(value) || !hasExactFields(value, OUTCOME_FIELDS)) return false;
+	if (!isRecord(value) || !(hasExactFields(value, OUTCOME_FIELDS) || hasExactFields(value, LEGACY_OUTCOME_FIELDS))) return false;
 	if (!DELEGATION_TRANSACTION_ID_RE.test(String(value.delegation_id)) || !isTaskKind(value.task_kind)) return false;
 	if (!validIdentity(value.worker_identity)) return false;
 	if (typeof value.provider_success !== "boolean" || !Number.isSafeInteger(value.exit_code)) return false;
+	const hasCurrentWorkerOutcome = Object.prototype.hasOwnProperty.call(value, "worker_success") ||
+		Object.prototype.hasOwnProperty.call(value, "worker_failure_code");
+	if (hasCurrentWorkerOutcome && !isCurrentDelegationTerminalOutcome(value as unknown as DelegationTerminalOutcome)) return false;
 	if (typeof value.report_complete !== "boolean" || typeof value.terminal_facts_complete !== "boolean" || typeof value.scope_complete !== "boolean") return false;
 	if (value.change_set_status !== "ATTRIBUTED" && value.change_set_status !== "WORKSPACE_DRIFT" && value.change_set_status !== "CONFLICT") return false;
 	if (!Array.isArray(value.changed_paths) || value.changed_paths.length > DELEGATION_TRANSACTION_MAX_PATHS) return false;
@@ -518,6 +543,7 @@ export function evaluateDelegationPostconditions(
 ): DelegationPostconditionReason[] {
 	const reasons: DelegationPostconditionReason[] = [];
 	if (!outcome.provider_success) reasons.push("PROVIDER_NOT_SUCCESS");
+	if (isCurrentDelegationTerminalOutcome(outcome) && !outcome.worker_success) reasons.push("WORKER_RUN_FAILED");
 	if (outcome.exit_code !== 0) reasons.push("EXIT_CODE_NOT_ZERO");
 	if (!outcome.report_complete) reasons.push("REPORT_INCOMPLETE");
 	if (!outcome.terminal_facts_complete) reasons.push("TERMINAL_FACTS_INCOMPLETE");
@@ -534,6 +560,31 @@ export function evaluateDelegationPostconditions(
 		if (outcome.denied_write_count !== 0) reasons.push("DIAGNOSIS_DENIED_WRITES_FORBIDDEN");
 	}
 	return reasons;
+}
+
+const INTERRUPTED_POSTCONDITION_REASONS = new Set<DelegationPostconditionReason>([
+	"WORKER_RUN_FAILED",
+	"EXIT_CODE_NOT_ZERO",
+	"REPORT_INCOMPLETE",
+]);
+
+/**
+ * A complete machine-attributed implementation delta interrupted by a closed
+ * execution failure is preserved as a non-success INTERRUPTED handoff. This
+ * grants no review or repair authority; the later Sol-only review slice must
+ * create any semantic REPAIR decision explicitly.
+ */
+export function isDelegationInterruptedCandidateV2(
+	state: Pick<DelegationTransactionRecord, "task_kind" | "allowed_paths">,
+	outcome: DelegationTerminalOutcome,
+): boolean {
+	if (state.task_kind !== "implementation" || !isCurrentDelegationTerminalOutcome(outcome) ||
+		outcome.worker_success || !isWorkerRunInterruptionFailureCode(outcome.worker_failure_code) ||
+		!outcome.provider_success || !outcome.terminal_facts_complete || !outcome.scope_complete ||
+		outcome.change_set_status !== "ATTRIBUTED" || outcome.changed_paths.length === 0 || outcome.delta_hash === null ||
+		outcome.changed_paths.some((path) => !delegationPathAllowedV2(path, state.allowed_paths))) return false;
+	const reasons = evaluateDelegationPostconditions(state, outcome);
+	return reasons.includes("WORKER_RUN_FAILED") && reasons.every((reason) => INTERRUPTED_POSTCONDITION_REASONS.has(reason));
 }
 
 function cloneState(state: DelegationTransactionRecord): DelegationTransactionRecord {
@@ -591,6 +642,9 @@ function validStateInvariants(state: DelegationTransactionRecord): boolean {
 			return state.revision === 3 && state.task_kind === "implementation" && outcome !== null && proof !== null && review === null &&
 				proof.revision === 2 &&
 				state.postcondition_reasons.length === 0 && state.abort_reason === null && state.recovery_reason === null;
+		case "INTERRUPTED":
+			return state.revision === 3 && outcome !== null && proof !== null && review === null && proof.revision === 2 &&
+				isDelegationInterruptedCandidateV2(state, outcome) && state.abort_reason === null && state.recovery_reason === null;
 		case "FINISHED":
 			return state.revision === 3 && state.task_kind === "diagnosis" && outcome !== null && proof !== null && review === null &&
 				proof.revision === 2 &&
@@ -602,7 +656,8 @@ function validStateInvariants(state: DelegationTransactionRecord): boolean {
 		case "FAILED":
 			return state.revision === 3 && outcome !== null && proof !== null && review === null && state.postcondition_reasons.length > 0 &&
 				proof.revision === 2 &&
-				outcome.terminal_facts_complete && outcome.scope_complete && state.abort_reason === null && state.recovery_reason === null;
+				outcome.terminal_facts_complete && outcome.scope_complete && !isDelegationInterruptedCandidateV2(state, outcome) &&
+				state.abort_reason === null && state.recovery_reason === null;
 		case "ABORTED":
 			return (state.revision === 1 || state.revision === 2) && outcome === null && proof === null && review === null &&
 				state.abort_reason !== null && state.recovery_reason === null;
@@ -813,6 +868,8 @@ export function publishDelegationCommit(
 	let status: DelegationTransactionStatus;
 	if (!state.terminal_outcome.terminal_facts_complete || !state.terminal_outcome.scope_complete) {
 		status = "RECOVERY_REQUIRED";
+	} else if (isDelegationInterruptedCandidateV2(state, state.terminal_outcome)) {
+		status = "INTERRUPTED";
 	} else if (state.postcondition_reasons.length > 0) {
 		status = "FAILED";
 	} else {

@@ -93,11 +93,22 @@ Defense-in-depth controls:
 - worker `edit`/`write` calls must match a parent-approved exact path or
   subtree; lexical plus realpath checks reject project escapes and symlink
   hops outside the approved subtree;
+- every mutation-capable Workbench tool and command shares the same fixed
+  checkout writer lane. The closed read-only list alone bypasses it; unknown
+  or third-party tools default to mutation-capable. Exact-token nested work is
+  allowed, but same-PID presence alone is not reentrancy authority;
 - the tool executes sequentially, propagates abort, enforces a timeout, and
   bounds stdout/stderr processing. On POSIX the pinned child owns a dedicated
   process group; abort, timeout, invalid output, and even a normal leader exit
   terminate remaining descendants so a background helper cannot write after
   the delegation lifetime ends.
+
+Every mutation boundary also compares the runtime's immutable load-time source
+hash with the exact on-disk source tree. A stale Pi process may run read-only
+diagnosis, but cannot mutate until `/reload` or restart followed by
+`/q-runtime-doctor`. `/new` does not reload extension code. Session restoration
+uses Pi's selected branch (`getBranch()`); later entries on sibling branches
+cannot overwrite the active projection.
 
 ### Fixed Sol -> Luna write authority (current; legacy id P7)
 
@@ -121,7 +132,11 @@ against delegation starts, uses path-limited commit semantics, verifies the
 created commit path set, and captures unrelated staged index entries before
 the commit so they must remain byte-identical afterward. Unrelated worktree
 state and newer unrelated transaction disposition cannot grant or revoke this
-path-local checkpoint authority.
+path-local checkpoint authority. An old invalid candidate is skipped only when
+a newer valid review fully covers every dirty path it claimed; a partially
+uncovered invalid candidate or invalid newest authority still blocks. This
+prevents a superseded record from poisoning the backlog without laundering
+unreviewed bytes.
 
 `action=push` accepts only an exact expected lowercase commit hash and a simple
 existing remote name. It rechecks current HEAD, requires a named current
@@ -163,16 +178,16 @@ append.
 
 ### Delegation ledger and review lifecycle (P7)
 
-Every delegation — success **and** failure — is recorded in a bounded ledger
-at `<project-root>/<CONFIG_DIR_NAME>/workbench/delegations/<id>/`
-(`manifest.json`, `before.json` before the worker starts; `after.json`,
-`worker-summary.json`, and a `review.json` PENDING_REVIEW placeholder at
-finish). Records are written atomically (tmp + rename, mode 0600), bounded
-(contract, per-path porcelain status codes + bounded content digests, diff
-hashes, usage/budget facts, redacted report summaries — never full worker
-transcripts or secrets), and the ledger's own directory is excluded from the
-git facts it records so records never pollute the diff they describe. Git
-facts come from argv-only `exec` calls (shell=false), never shell strings.
+New public delegations use one v2 authority rooted at
+`<project-root>/<CONFIG_DIR_NAME>/workbench/delegations/<id>/v2/`:
+revision-checked `transaction.json`, an exact-inventory immutable generation,
+and separate review/repair sidecars. The generation is authoritative only when
+all required records and `commit-marker.json` pass full-byte identities and
+binding checks. Records are atomic (sibling temp + rename, mode 0600), bounded,
+and redacted; they never contain full transcripts or secrets. The delegation
+directory is excluded from workspace facts, and Git facts come from argv-only
+`exec` calls (`shell=false`). Historical v1 ledger files remain strict
+read-only compatibility only and are never written for a new delegation.
 
 The v2 transaction lock protects individual atomic updates; a separate
 bounded `execution-owner.json` protects the complete PREPARED/RUNNING worker
@@ -275,6 +290,42 @@ exact bound hash and bounded reason. It atomically creates an immutable
 `PENDING_REVIEW`, and enables only the reported exact fresh `repair_of`
 lineage. The project remains Gate-blocking.
 
+Default delivery now completes the durable mechanical packet before attempting
+automatic semantic review. Production automation is capped at 32 pages and
+uses strict `openai-codex/gpt-5.6-sol`: exactly one closed tool call per page,
+then one final call that receives all raw hash-bound pages plus the page
+assessments under the aggregate request bound. Model identity, response shape,
+page/content hashes, cross-page findings, and nested usage are validated.
+Mechanical FAIL, oversized/legacy presentation, lineage gaps, model errors,
+drift, and persistence/readback faults cannot produce ACCEPT. They leave worker
+success and `PENDING_REVIEW` intact with `/q-review <id>` or a bounded manual
+route. The receipt is evidence; only the ordinary durable semantic artifact is
+review authority, and neither is Gate authority.
+
+A closed failed implementation with nonempty attributable in-scope partial
+work is `INTERRUPTED`. Strictly eligible `INTERRUPTED`, plus compatible legacy
+`FAILED` evidence, may be fully presented to Sol only under a `REPAIR_ONLY`
+schema. Sol `ACCEPT`, ordinary `REVIEWED`, missing proof, empty delta,
+scope/conflict/unknown-origin evidence, stale binding, and
+`RECOVERY_REQUIRED` are rejected. The immutable
+`terminal-negative-repair-decision.json` binds the parent state/failure proof,
+review and diff hashes without rewriting the terminal transaction. Status and
+reload project an eligible published sidecar as `repair_required` with exact
+`/q-repair <id>`; an eligible terminal without the sidecar points to exact
+`/q-review <id>`; malformed authority remains fail-closed.
+
+Both commands are direct and exact-id bound. `/q-review` runs the shared durable
+service without `sendUserMessage` or a commander model turn. `/q-repair`
+strict-reads ordinary or terminal-negative authority and the current binding,
+then returns an existing idempotent successor or executes the shared delegate
+kernel; it never selects the session's latest id.
+
+Production uses v2 filesystem records plus a singleton checkout-wide writer
+lease. Strict historical path-lane admission is wired into delegation and is
+revalidated while that lease is held; it permits only known non-overlapping
+history and never permits concurrent writers. Unknown, corrupt, or overlapping
+authority remains fail closed.
+
 Every semantic-repair start is serialized by a project lock bound to OS boot,
 PID, and process-start identity. The child carries root and continuation
 decision hashes plus cumulative scope. Reload, status, read-only Gate facts,
@@ -325,10 +376,13 @@ unknown-origin path fails closed. Historical untagged v2/v1 retains the
 complete full-diff binding, where any diff change after REVIEWED turns the
 delegation STALE. A binding returning to exactly the reviewed hash
 re-validates. Blocked commander write attempts are counted while a review is
-outstanding. The review lifecycle and the lease persist as custom
-entries (`workbench-delegation-state`, `workbench-write-lease`) — durable
-across compaction and session replacement — and restore fail-closed on
-`session_start`.
+outstanding. `workbench-delegation-state` is a non-authoritative session/UI
+mirror only: `session_start` restores the selected branch, then reconciles it
+from project v2 authority. A durable transaction/review decision remains
+successful if that mirror append fails; the result carries a warning and later
+reconciliation may rebuild it. `workbench-write-lease` remains separate,
+session-scoped exceptional authority and, as described above, never reactivates
+automatically after reload/session replacement.
 
 Optional delegation `plan_ref` input is traceability, never authority. Its
 strict nested shape is canonical-hash-bound into the existing v2 contract;
@@ -392,8 +446,8 @@ wording and granularity guidance since Phase 5):
 - operates independently of the per-message context budget above (which is
   unchanged) and accumulates turns, total tokens and output tokens over
   all assistant messages of a delegation run;
-- two active profiles — `extended` (the safe default), `standard`
-  (explicit for clearly small bounded slices) — with exact soft/hard turns,
+- two active profiles — `standard` (the bounded default), `extended`
+  (explicit only for a justified larger slice) — with exact soft/hard turns,
   total-token and output-token limits; "reached" means at or above (`>=`);
 - per-message totals reuse the context-budget semantics (positive
   `totalTokens` authoritative, else the non-negative
@@ -411,10 +465,10 @@ wording and granularity guidance since Phase 5):
   independent of the context steer, send failures swallowed);
 - the spend profile reaches the child through the fixed
   `WORKBENCH_WORKER_SPEND_PROFILE` env contract (the runner always writes
-  a valid active value; retired `low` and malformed/missing child env fall back to `extended`
+  a valid active value; retired `low` and malformed/missing child env fall back to `standard`
   defensively); public profile selection is an optional `budget_profile`
   tool parameter (closed literal union `standard | extended`,
-  default `extended`) validated fail-closed by
+  default `standard`) validated fail-closed by
   the pure contract check in `core/worker-policy.ts` BEFORE any ledger
   creation or child launch; the resolved profile is recorded in the before
   contract and the canonical cumulative `spend` object (profile, turns,
@@ -436,33 +490,45 @@ wording and granularity guidance since Phase 5):
 
 Historical committed v1/v2 records with `low` remain read-only compatible.
 The public contract and new committed-artifact boundary reject `low` before
-persistence or launch; runtime/internal `low` inputs never execute below the
-safe `extended` default limits.
+persistence or launch; runtime/internal `low` inputs use the bounded
+`standard` limits.
 
-Only recipes with an empty declared `writes` list are available to a worker.
 Recipe mutation policy (P7): every recipe declares
-`mutation: none | artifacts | source`; delegated workers run only
-`mutation: none` (write-free) recipes, and strict Sol runs only
-`none`/`artifacts` recipes — `source`-mutating recipes are denied to both
-(legacy inference maps non-empty declared `writes` to `source`, so this is
-exactly as strict as the declared writes for legacy recipes; other
-controllers are unaffected).
-This blocks honestly declared mutating recipes, but recipes remain
-trusted-project discipline mechanisms: a malicious command can write despite
-an empty declaration. They are not an OS sandbox or a substitute for reviewing
+`mutation: none | artifacts | source`. Diagnosis workers remain write-free.
+An implementation worker may run a mutating recipe only when every declared
+output is one exact project-relative path, every output is inside the immutable
+delegation `allowed_paths` both lexically and after realpath resolution, and
+the child carries the exact delegation/contract identity. Such runs bypass the
+action cache and persist a run-id-bound before/after command-effect receipt.
+Production capture must obtain its before guard and exact-output identities
+before spawning; `EVIDENCE_UNAVAILABLE` therefore cannot leave an unobserved
+subprocess write. Every exact declaration is streaming-SHA-256/size bound even
+when Git-ignored. Exact declared effects are `COMMAND_ATTRIBUTED`;
+`mutation:none` changes are `RECIPE_DECLARATION_VIOLATION`, broad declarations
+remain `UNKNOWN_ORIGIN`, and undeclared/contract-escaping effects are
+`OUT_OF_SCOPE`. Unknown, violation, out-of-scope, or unavailable evidence fails
+closed and never gains semantic acceptance. Strict Sol still runs only `none`/`artifacts`
+recipes; `source` mutation remains worker-owned. Recipes are trusted-project
+discipline mechanisms, not an OS sandbox or a substitute for reviewing
 repository configuration. Provider
 credentials may be used by the child but are never copied into the task
 message or tool details.
 
 Every delegation is a fresh `--no-session` child — worker sessions are never
 resumed (fresh-worker continuation), so no worker state persists between
-delegations. The tool executes sequentially and a worker can never delegate,
-so at most one writing worker exists per worktree at any time; Sol must not
-start a second writing delegation before the first has returned and its diff
-has been reviewed. A strict finalized-v2 STALE successor is a new sequential
-task after the old worker and immutable review have both completed; it never
-creates concurrent writers. See
+delegations. The tool executes sequentially and a worker can never delegate.
+Together with the checkout-wide writer lane, this permits at most one
+mutation-capable operation—including a writing worker—per worktree at any
+time; Sol must not start a second writing delegation before the first has
+returned and its diff has been reviewed. A strict finalized-v2 STALE successor
+is a new sequential task after the old worker and immutable review have both
+completed; it never creates concurrent writers. See
 [worker-delegation.md](worker-delegation.md).
+
+The worker mutation guard requires all three parent-bound facts: the strict
+worker project root, delegation id, and exact checkout token. If the token is
+missing it fails closed; the child cannot fall back to acquiring a fresh
+exclusive checkout lane.
 
 ## Records and redaction
 

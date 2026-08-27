@@ -72,6 +72,8 @@ import {
 } from "../extensions/workbench-runtime/core/output-control-telemetry.ts";
 import {
 	WORKER_ALLOWED_PATHS_ENV,
+	WORKER_CONTRACT_HASH_ENV,
+	WORKER_DELEGATION_ID_ENV,
 	WORKER_MODEL_ID,
 	WORKER_PROJECT_ROOT_ENV,
 	WORKER_PROVIDER,
@@ -251,6 +253,36 @@ function makeRoleRuntime(role: "commander" | "worker" | "other"): StubAPI & Exte
 			if (value === undefined) delete process.env[name];
 			else process.env[name] = value;
 		}
+	}
+}
+
+async function withWorkerCommandEffectIdentity<T>(operation: () => Promise<T>): Promise<T> {
+	const names = [WORKER_DELEGATION_ID_ENV, WORKER_CONTRACT_HASH_ENV] as const;
+	const previous = new Map(names.map((name) => [name, process.env[name]]));
+	process.env[WORKER_DELEGATION_ID_ENV] = "20260827-120000-wrkr";
+	process.env[WORKER_CONTRACT_HASH_ENV] = "d".repeat(64);
+	try {
+		return await operation();
+	} finally {
+		for (const name of names) {
+			const value = previous.get(name);
+			if (value === undefined) delete process.env[name];
+			else process.env[name] = value;
+		}
+	}
+}
+
+async function initializeGitAuthorityFixture(root: string): Promise<void> {
+	await writeFile(join(root, ".gitignore"), ".pi/\n", "utf8");
+	for (const [command, args] of [
+		["git", ["init", "-q"]],
+		["git", ["config", "user.email", "t@t"]],
+		["git", ["config", "user.name", "t"]],
+		["git", ["add", "-A"]],
+		["git", ["commit", "-qm", "init"]],
+	] as const) {
+		const initialized = await spawnExec(command, [...args], { cwd: root });
+		assert.equal(initialized.code, 0, initialized.stderr);
 	}
 }
 
@@ -1100,9 +1132,9 @@ test("context recovery keeps the latest durable status after a pre-user interrup
 	assert.doesNotMatch(JSON.stringify(projected), /INTERRUPTED-PARTIAL-RAW|interrupted-a|interrupted-b/);
 });
 
-test("runtime registers exactly three ordered tool_result handlers and envelope bounds unknown custom text and errors", async () => {
+test("runtime registers five ordered tool_result handlers and envelope bounds unknown custom text and errors", async () => {
 	const stub = makeStub(); workbenchRuntime(stub);
-	assert.equal(stub.events.get("tool_result")?.length, 3);
+	assert.equal(stub.events.get("tool_result")?.length, 5);
 	const raw = `${"safe\n".repeat(420_000)}RAW-TAIL-2M`;
 	const bounded = await emitToolResult(stub, {
 		type: "tool_result", toolCallId: "unknown-1", toolName: "third_party_huge", input: {},
@@ -2006,10 +2038,10 @@ test("message_end uses private FIFO markers for normal results and never trusts 
 
 test("turn_end persists only fixed enum and numeric output-budget telemetry and swallows append failure", async () => {
 	const stub = makeStub(); workbenchRuntime(stub); const ctx = trustedCtx(process.cwd()) as ExtensionContext;
-	await startBudgetTurn(stub, ctx, "other", 12, [{ id: "telemetry-1", name: "unknown", arguments: { secret: "must-not-persist" } }]);
-	const guard = await emitToolCall(stub, ctx, { type: "tool_call", toolCallId: "telemetry-1", toolName: "unknown", input: { secret: "must-not-persist" } });
+	await startBudgetTurn(stub, ctx, "other", 12, [{ id: "telemetry-1", name: "read", arguments: { path: "README.md" } }]);
+	const guard = await emitToolCall(stub, ctx, { type: "tool_call", toolCallId: "telemetry-1", toolName: "read", input: { path: "README.md" } });
 	assert.equal(guard.block, undefined);
-	await emitToolResult(stub, { type: "tool_result", toolCallId: "telemetry-1", toolName: "unknown", input: {}, content: [{ type: "text", text: "bounded" }], isError: false });
+	await emitToolResult(stub, { type: "tool_result", toolCallId: "telemetry-1", toolName: "read", input: {}, content: [{ type: "text", text: "bounded" }], isError: false });
 	await emitEvent(stub, "turn_end", { type: "turn_end", turnIndex: 12, message: {}, toolResults: [] }, ctx);
 	const entries = stub.appendedEntries.filter((entry) => entry.customType === "workbench-output-turn-telemetry-v1");
 	assert.equal(entries.length, 1);
@@ -2404,7 +2436,7 @@ test("tool_call guard source order pins budget before receipt and bookkeeping", 
 		"checkToolCall(mode",
 		"commanderToolCallBlockReason({",
 		"controller.authorizeOutput(event.toolCallId",
-		"beginReceipt({",
+		"controller.beginToolReceipt ?? beginReceipt",
 		"consumeLeaseCall(",
 	];
 	const positions = markers.map((marker) => guard.indexOf(marker));
@@ -2415,6 +2447,10 @@ test("tool_call guard source order pins budget before receipt and bookkeeping", 
 
 test("native read peeks the exact pending FIFO allocation before cursor rendering without consuming it", async () => {
 	const source = await readFile(join(process.cwd(), "extensions/workbench-runtime/index.ts"), "utf8");
+	const runtimeToolsController = await readFile(
+		join(process.cwd(), "extensions/workbench-runtime/core/runtime-workbench-tools-controller.ts"),
+		"utf8",
+	);
 	const transientState = await readFile(
 		join(process.cwd(), "extensions/workbench-runtime/core/runtime-transient-state.ts"),
 		"utf8",
@@ -2448,7 +2484,7 @@ test("native read peeks the exact pending FIFO allocation before cursor renderin
 	const positions = markers.map((marker) => read.indexOf(marker));
 	assert.ok(positions.every((position) => position >= 0), JSON.stringify(positions));
 	assert.deepEqual([...positions].sort((a, b) => a - b), positions);
-	assert.match(source, /transientState\.takeTrustedReadContinuation\(toolCallId, toolName\)/);
+	assert.match(runtimeToolsController, /transientState\.takeTrustedReadContinuation\(toolCallId, toolName\)/);
 	assert.doesNotMatch(
 		resultMiddleware,
 		/details\?\.next_cursor|details\.next_cursor/,
@@ -3429,6 +3465,17 @@ describe("trusted recovery authority and runtime ingress wiring", () => {
 			await writeFile(join(root, "present.txt"), "present", "utf8");
 			await writeComparisonManifest(root, "20260814-171000-left", "2026-08-14T17:10:00.000Z");
 			await writeComparisonManifest(root, "20260814-171001-rght", "2026-08-14T17:10:01.000Z");
+			await writeFile(join(root, ".gitignore"), ".pi/\n", "utf8");
+			for (const [command, args] of [
+				["git", ["init", "-q"]],
+				["git", ["config", "user.email", "t@t"]],
+				["git", ["config", "user.name", "t"]],
+				["git", ["add", "-A"]],
+				["git", ["commit", "-qm", "init"]],
+			] as const) {
+				const initialized = await spawnExec(command, [...args], { cwd: root });
+				assert.equal(initialized.code, 0, initialized.stderr);
+			}
 
 			const stub = makeRoleRuntime("commander");
 			const base = trustedCtx(root, "ingress-runtime-session") as ExtensionContext;
@@ -3546,16 +3593,18 @@ describe("trusted recovery authority and runtime ingress wiring", () => {
 			});
 			assert.equal(Object.hasOwn(currentGate.details as Record<string, unknown>, "ingress_projection"), false);
 
-			const workerStub = makeRoleRuntime("worker");
-			const workerRecipe = workerStub.tools.get("workbench_run_recipe") as RuntimeTool;
-			const workerRaw = await workerRecipe.execute("ingress-worker-recipe", {
-				recipe: "ingress-large", cache: "no-cache",
-			}, undefined, undefined, trustedCtx(root, "ingress-worker-session") as ExtensionContext);
-			const workerResult = await emitToolResult(workerStub, {
-				type: "tool_result", toolCallId: "ingress-worker-recipe", toolName: "workbench_run_recipe",
-				input: { recipe: "ingress-large", cache: "no-cache" }, content: workerRaw.content, details: workerRaw.details, isError: false,
+			await withWorkerCommandEffectIdentity(async () => {
+				const workerStub = makeRoleRuntime("worker");
+				const workerRecipe = workerStub.tools.get("workbench_run_recipe") as RuntimeTool;
+				const workerRaw = await workerRecipe.execute("ingress-worker-recipe", {
+					recipe: "ingress-large", cache: "no-cache",
+				}, undefined, undefined, trustedCtx(root, "ingress-worker-session") as ExtensionContext);
+				const workerResult = await emitToolResult(workerStub, {
+					type: "tool_result", toolCallId: "ingress-worker-recipe", toolName: "workbench_run_recipe",
+					input: { recipe: "ingress-large", cache: "no-cache" }, content: workerRaw.content, details: workerRaw.details, isError: false,
+				});
+				assertIngressResult(workerResult, "finalized_recipe_run", "/summary.json");
 			});
-			assertIngressResult(workerResult, "finalized_recipe_run", "/summary.json");
 		});
 	});
 
@@ -3629,6 +3678,7 @@ describe("trusted recovery authority and runtime ingress wiring", () => {
 				'    command: ["node", "-e", "process.stdout.write(\'ok\')"]',
 				"",
 			].join("\n"));
+			await initializeGitAuthorityFixture(root);
 			const stub = makeRoleRuntime("other");
 			const ctx = trustedCtx(root, "ingress-fifo-session") as ExtensionContext;
 			const tool = stub.tools.get("workbench_run_recipe") as RuntimeTool;
@@ -3686,6 +3736,7 @@ describe("trusted recovery authority and runtime ingress wiring", () => {
 				'    command: ["node", "-e", "process.stdout.write(\'R\'.repeat(12000))"]',
 				"",
 			].join("\n"));
+			await initializeGitAuthorityFixture(root);
 			const stub = makeRoleRuntime("other");
 			const ctx = trustedCtx(root, "ingress-receipt-session") as ExtensionContext;
 			const mismatchCall = { id: "ingress-content-mismatch", name: "workbench_run_recipe", arguments: { recipe: "ingress-receipt", cache: "no-cache" } };

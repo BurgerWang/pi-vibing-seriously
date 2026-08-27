@@ -24,6 +24,7 @@ import { before, test } from "node:test";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import workbenchRuntime from "../extensions/workbench-runtime/index.ts";
+import { withTempDir } from "./helpers.ts";
 import {
 	buildMilestoneHandoffNote,
 	buildMilestoneSnapshot,
@@ -341,9 +342,14 @@ async function runMilestoneCommand(
 let milestoneGuardSerial = 0;
 
 /** Run all guards for one real fresh-turn tool call with a unique Pi id. */
-async function guardCall(stub: StubAPI, toolName: string, input: unknown): Promise<{ block?: boolean; reason?: string } | undefined> {
+async function guardCall(
+	stub: StubAPI,
+	toolName: string,
+	input: unknown,
+	ctxOverrides: Partial<ExtensionContext> = {},
+): Promise<{ block?: boolean; reason?: string } | undefined> {
 	milestoneGuardSerial += 1;
-	const ctx = fakeCtx([]) as never;
+	const ctx = fakeCtx([], ctxOverrides) as never;
 	for (const handler of stub.events.get("turn_start") ?? []) {
 		await handler({ type: "turn_start", turnIndex: milestoneGuardSerial } as never, ctx);
 	}
@@ -985,6 +991,7 @@ test("successful handoff: idle wait, prepared record, parent link, setup entries
 });
 
 test("the source lease never transfers: DEV source with an ACTIVE lease yields an exactly-locked target", async () => {
+	await withTempDir(async (projectRoot) => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	// Source: DEV + approved Sol + delegation. An ACTIVE lease is deliberately
@@ -1013,7 +1020,8 @@ test("the source lease never transfers: DEV source with an ACTIVE lease yields a
 	assert.match(confirmedOutput, /CONFIRMED/);
 	// The source lease is genuinely ACTIVE: edit/write are advertised.
 	assert.deepEqual(stub.activeTools, [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
-	assert.equal(await guardCall(stub, "edit", { path: "src/main.ts" }), undefined, "source lease authorizes writes");
+	const guardContext = { cwd: projectRoot, isProjectTrusted: () => true };
+	assert.equal(await guardCall(stub, "edit", { path: "src/main.ts" }, guardContext), undefined, "source lease authorizes writes");
 
 	const harness = makeHarness();
 	await runMilestoneCommand(stub, stub.entries, harness, "implement the next slice");
@@ -1024,16 +1032,17 @@ test("the source lease never transfers: DEV source with an ACTIVE lease yields a
 	// worker-first surface is locked.
 	assert.deepEqual(stub.activeTools, [...STRICT_SOL_DEV_ALLOWLIST]);
 	assert.equal(stub.activeTools.length, 16);
-	const ordinaryBlocked = await guardCall(stub, "edit", { path: "src/main.ts" });
+	const ordinaryBlocked = await guardCall(stub, "edit", { path: "src/main.ts" }, guardContext);
 	assert.ok(ordinaryBlocked && ordinaryBlocked.block === true);
 	assert.match(String(ordinaryBlocked.reason), /lease locked/);
-	const blocked = await guardCall(stub, "edit", { path: "package.json" });
+	const blocked = await guardCall(stub, "edit", { path: "package.json" }, guardContext);
 	assert.ok(blocked && blocked.block === true, "direct commander path requires fresh authorization");
 	assert.match(String(blocked.reason), /lease locked/);
 	// The milestone note states the worker-first target fact.
 	const noteEntry = harness.targetEntries.find((e) => e.customType === MILESTONE_HANDOFF_NOTE_ENTRY_TYPE);
 	assert.ok(noteEntry && noteEntry.type === "custom_message");
 	assert.ok(String(noteEntry.content).includes("development writes: worker-first; temporary commander lease never carried"));
+	});
 });
 
 test("a cancelled replacement records an additive cancelled record in the source and reports", async () => {

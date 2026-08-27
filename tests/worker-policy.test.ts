@@ -176,9 +176,24 @@ test("diagnosis and malformed task kinds block edit/write before path evaluation
 	}
 });
 
-test("worker recipes are read-only by declaration", () => {
+test("worker recipes require complete scope authority for every mutating declaration", () => {
 	assert.equal(workerRecipeBlockReason(WORKER_ROLE, "unit-test", []), undefined);
-	assert.match(workerRecipeBlockReason(WORKER_ROLE, "format", ["src/"]) ?? "", /declares writes: src\//);
+	assert.match(workerRecipeBlockReason(WORKER_ROLE, "format", ["src/result.ts"]) ?? "", /authority are unavailable/);
+	assert.equal(workerRecipeBlockReason(WORKER_ROLE, "format", ["src/result.ts"], "source", {
+		projectRoot: "/repo",
+		allowedPaths: ["src/**"],
+		taskKind: "implementation",
+	}), undefined);
+	assert.match(workerRecipeBlockReason(WORKER_ROLE, "format", ["src/**"], "source", {
+		projectRoot: "/repo",
+		allowedPaths: ["src/**"],
+		taskKind: "implementation",
+	}) ?? "", /not one exact/);
+	assert.match(workerRecipeBlockReason(WORKER_ROLE, "format", ["other/result.ts"], "source", {
+		projectRoot: "/repo",
+		allowedPaths: ["src/**"],
+		taskKind: "implementation",
+	}) ?? "", /outside delegation allowed_paths/);
 	assert.equal(workerRecipeBlockReason(undefined, "format", ["src/"]), undefined, "commander recipes are unchanged");
 });
 
@@ -195,11 +210,15 @@ test("strict Sol runs only mutation none/artifacts recipes; mutation source is d
 	assert.match(recipeMutationBlockReason(sol, "format", "source") ?? "", /workbench_delegate_worker/);
 });
 
-test("delegated workers run only mutation none recipes", () => {
+test("delegated implementation workers may run only exact in-scope mutating recipes", () => {
 	const worker = { role: WORKER_ROLE, provider: WORKER_PROVIDER, model: WORKER_MODEL_ID };
 	assert.equal(recipeMutationBlockReason(worker, "unit-test", "none"), undefined);
-	assert.match(recipeMutationBlockReason(worker, "build", "artifacts") ?? "", /workers run only mutation: none/);
-	assert.match(recipeMutationBlockReason(worker, "format", "source") ?? "", /workers run only mutation: none/);
+	const scope = { projectRoot: "/repo", allowedPaths: ["src/**", "dist/result.json"], taskKind: "implementation" as const };
+	assert.equal(recipeMutationBlockReason(worker, "build", "artifacts", ["dist/result.json"], scope), undefined);
+	assert.equal(recipeMutationBlockReason(worker, "format", "source", ["src/result.ts"], scope), undefined);
+	assert.match(recipeMutationBlockReason(worker, "format", "source", ["src/**"], scope) ?? "", /not one exact/);
+	assert.match(recipeMutationBlockReason(worker, "format", "source", ["other/result.ts"], scope) ?? "", /outside delegation allowed_paths/);
+	assert.match(recipeMutationBlockReason(worker, "format", "source", ["src/result.ts"], { ...scope, taskKind: "diagnosis" }) ?? "", /Diagnosis worker/);
 });
 
 test("other controllers and fact-less callers retain prior behavior", () => {
@@ -213,8 +232,8 @@ test("other controllers and fact-less callers retain prior behavior", () => {
 test("the worker env contract wins over Sol-looking model facts for the mutation decision", () => {
 	const impersonating = { role: WORKER_ROLE, provider: "openai-codex", model: "gpt-5.6-sol" };
 	assert.equal(recipeMutationBlockReason(impersonating, "unit-test", "none"), undefined);
-	assert.match(recipeMutationBlockReason(impersonating, "build", "artifacts") ?? "", /workers run only mutation: none/);
-	assert.match(recipeMutationBlockReason(impersonating, "fmt", "source") ?? "", /workers run only mutation: none/);
+	assert.match(recipeMutationBlockReason(impersonating, "build", "artifacts") ?? "", /authority are unavailable/);
+	assert.match(recipeMutationBlockReason(impersonating, "fmt", "source") ?? "", /authority are unavailable/);
 });
 
 test("missing or malformed worker path contracts fail closed", () => {
@@ -270,8 +289,8 @@ test("formatted diagnosis task makes inspection-only authority explicit", () => 
 // Phase 3: budget-profile contract validation (worker token-budget repair)
 // ---------------------------------------------------------------------------
 
-test("budget-profile validation resolves omitted to extended and accepts both active profiles", () => {
-	assert.deepEqual(resolveWorkerBudgetProfile(undefined), { ok: true, profile: "extended" });
+test("budget-profile validation resolves omitted to standard and accepts both active profiles", () => {
+	assert.deepEqual(resolveWorkerBudgetProfile(undefined), { ok: true, profile: "standard" });
 	assert.deepEqual(resolveWorkerBudgetProfile("standard"), { ok: true, profile: "standard" });
 	assert.deepEqual(resolveWorkerBudgetProfile("extended"), { ok: true, profile: "extended" });
 	const retired = resolveWorkerBudgetProfile("low");
@@ -309,11 +328,11 @@ test("formatted worker task names the resolved spend profile deterministically (
 		acceptanceCriteria: ["Unit tests cover the new option"],
 		verification: [],
 	};
-	// Omitted and retired input resolve deterministically to the safe extended default.
-	const extendedText = formatWorkerTask(base);
-	assert.match(extendedText, /Worker spend-budget profile: extended/);
-	assert.match(formatWorkerTask({ ...base, budgetProfile: "low" }), /Worker spend-budget profile: extended/);
-	// Both active profiles remain explicit, including the smaller standard slice.
+	// Omitted and retired internal input resolve deterministically to the bounded standard default.
+	const defaultText = formatWorkerTask(base);
+	assert.match(defaultText, /Worker spend-budget profile: standard/);
+	assert.match(formatWorkerTask({ ...base, budgetProfile: "low" }), /Worker spend-budget profile: standard/);
+	// Both active profiles remain explicit, including the larger extended slice.
 	const standardText = formatWorkerTask({ ...base, budgetProfile: "standard" });
 	assert.match(standardText, /Worker spend-budget profile: standard/);
 	const explicitExtendedText = formatWorkerTask({ ...base, budgetProfile: "extended" });
@@ -322,7 +341,7 @@ test("formatted worker task names the resolved spend profile deterministically (
 	// expands the parent-approved path/scope authority (informational
 	// wording; the runner/child env contract enforces the profile and
 	// thresholds are unchanged).
-	for (const text of [standardText, extendedText, explicitExtendedText]) {
+	for (const text of [standardText, defaultText, explicitExtendedText]) {
 		assert.match(text, /bounds cumulative spend only/);
 		assert.match(text, /never expands parent-approved path\/scope authority/);
 	}
@@ -402,7 +421,7 @@ test("worker-delegation documentation defines fixed Sol/Luna boundaries and stri
 	assert.match(doc, /## Bounded worker continuation/);
 	assert.match(doc, /brand-new `--no-session` worker and cannot recurse/);
 	assert.match(doc, /not a mandatory ceremony after\s+a complete delivery/);
-	assert.match(doc, /## One writing worker per worktree/);
+	assert.match(doc, /## One mutation-capable operation per worktree/);
 	assert.match(doc, /at most one worker writes to a worktree at any time/);
 	// Current worker-first write authority and the single public v2 transaction.
 	assert.match(doc, /## Fixed Sol -> Luna write authority \(current; legacy id P7\)/);
@@ -450,7 +469,7 @@ test("worker-delegation documentation defines fixed Sol/Luna boundaries and stri
 	assert.match(doc, /diagnosis can reach\s+`FINISHED` only with zero actual delta, zero successful\s+write attempts, zero denied write attempts, and a complete report/);
 	assert.match(doc, /Both\s+successful paths also require provider success, exit code 0, a complete\s+report, complete terminal facts, and the exact pinned\/observed worker\s+identity/);
 	assert.match(doc, /Provider success, exit code 0, or reassuring worker prose cannot\s+bypass any other postcondition/);
-	assert.match(doc, /failure\s+becomes `FAILED`; incomplete terminal or generation facts become\s+`RECOVERY_REQUIRED`/);
+	assert.match(doc, /nonempty attributed partial work becomes `INTERRUPTED`; other closed\s+worker\/postcondition failures become `FAILED`\. Incomplete terminal or\s+generation facts become `RECOVERY_REQUIRED`/);
 	assert.match(doc, /`v2\/execution-owner\.json` while the owning Pi process is executing/);
 	assert.match(doc, /transaction timestamp plus both transaction and journal file mtimes to predate\s+the current OS boot/);
 	assert.match(doc, /any write evidence,\s+`COMMITTING`, corrupt data, or ambiguous inventory remains blocking/);
@@ -472,7 +491,7 @@ test("worker-delegation documentation defines fixed Sol/Luna boundaries and stri
 	assert.match(doc, /compatibility field names remain[\s\S]*new tagged v2 refreshes the W\/D\/S relevance binding/);
 	assert.match(doc, /Historical untagged v2\/v1 refreshes the complete full-diff\s+binding/);
 	assert.doesNotMatch(doc, /refreshes against the real git diff, so\s+any change after REVIEWED turns the delegation STALE/);
-	assert.match(doc, /append failure is returned as a persistence failure; a later tool call first\s+reconciles the strict durable FINAL artifact/);
+	assert.match(doc, /Once durable semantic\s+review succeeds, it is authoritative even if the session mirror append\s+fails; the tool returns success plus an explicit warning after durable\s+readback/);
 	// Strict repair provenance and legacy compatibility allow a v1 read only
 	// for a true v2 not-found result; invalid v2 authority remains blocking.
 	assert.match(doc, /committed implementation `PENDING_REVIEW` is referenceable only with its\s+strict current-binding Sol `REPAIR` sidecar/);
@@ -576,7 +595,7 @@ test("formatted worker task carries the repair provenance pointer line only when
 	// unchanged.
 	const without = formatWorkerTask(base);
 	assert.ok(!without.includes("Repair provenance"), "no provenance line when repairOf is omitted");
-	assert.match(without, /Worker spend-budget profile: extended/);
+	assert.match(without, /Worker spend-budget profile: standard/);
 	assert.match(without, /- src\/parser\/\*\*/);
 	assert.match(without, /- Unit tests cover the repaired option/);
 	assert.match(without, /Requested write-free recipe verification:/);
@@ -592,7 +611,7 @@ test("formatted worker task carries the repair provenance pointer line only when
 	for (const path of base.allowedPaths) assert.ok(withRepair.includes(path), `allowed path missing: ${path}`);
 	for (const criterion of base.acceptanceCriteria) assert.ok(withRepair.includes(criterion), `criterion missing: ${criterion}`);
 	for (const step of base.verification) assert.ok(withRepair.includes(step), `verification step missing: ${step}`);
-	assert.match(withRepair, /Worker spend-budget profile: extended/);
+	assert.match(withRepair, /Worker spend-budget profile: standard/);
 	// Adding repairOf changes nothing but the inserted line.
 	assert.equal(
 		withRepair,

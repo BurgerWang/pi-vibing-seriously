@@ -1,10 +1,12 @@
 /**
- * Cross-process serialization for starting one project delegation.
+ * Cross-process single-writer serialization for one project delegation.
  *
  * The fixed lock name is never opened for writing. A complete, fsynced owner
  * is first written beside it and then atomically committed with hard-link(2),
  * so contenders cannot observe an empty or partially written owner at the
- * publication path.
+ * publication path. The persisted name is retained for compatibility, but a
+ * controller lease spans the whole checkout-writing lifecycle: admission,
+ * PREPARED, worker execution, generation publication, and mechanical delivery.
  */
 
 import { createHash, randomBytes } from "node:crypto";
@@ -535,7 +537,7 @@ export async function inspectProjectDelegationStartLockV1(
 }
 
 /**
- * Acquire the one project-wide delegation-start lock.
+ * Acquire the one project-wide delegation lifecycle writer lock.
  *
  * A valid live owner conflicts. Only a canonical dead owner is recovered;
  * malformed fixed evidence fails closed because it cannot prove ownership.

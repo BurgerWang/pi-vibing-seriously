@@ -4,6 +4,10 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 
 import { sha256Hex } from "../cache/canonical-hash.ts";
 import {
+	exactRepairToolArgumentsV1,
+	type ExactRepairToolArgumentsV1,
+} from "./exact-repair-authority.ts";
+import {
 	DELEGATION_SCHEMA_VERSION,
 	type DelegationLedger,
 	type readDelegationLedger,
@@ -14,8 +18,10 @@ import {
 } from "./delegation-transaction.ts";
 import type {
 	readDelegationCommittedGenerationV2,
+	readDelegationReviewV2,
 	readDelegationTransactionV2,
 } from "./delegation-transaction-storage.ts";
+import { hasDelegationSemanticRepairAuthorityV2 } from "./delegation-transaction-storage.ts";
 import type { DelegationReviewStatus, DelegationState } from "./delegation-state.ts";
 import { ownDataValue } from "./runtime-output-controller.ts";
 import type { readCommittedManifest } from "./runs.ts";
@@ -23,6 +29,8 @@ import type { readCommittedManifest } from "./runs.ts";
 export const DELEGATION_CLAIM_GUARD_SCHEMA = "workbench-delegation-claim-guard-v2" as const;
 export const DELEGATION_CLAIM_GUARD_CODE = "UNVERIFIED_EXECUTION_CLAIM" as const;
 export const DELEGATION_CLAIM_BINDING_REVISION = "authority-resolved-v2" as const;
+export const EXACT_REPAIR_DIRECTIVE_SCHEMA = "workbench-exact-repair-directive-v1" as const;
+export { exactRepairToolArgumentsV1 };
 export const DELEGATION_CLAIM_GUARD_TEXT = [
 	`[${DELEGATION_CLAIM_GUARD_SCHEMA}]`,
 	DELEGATION_CLAIM_GUARD_CODE,
@@ -32,8 +40,9 @@ export const DELEGATION_CLAIM_GUARD_TEXT = [
 ].join("\n");
 
 const DELEGATION_ID_SCAN_RE = /\b\d{8}-\d{6}-[A-Za-z0-9]{4}\b/g;
+const REPAIR_OF_LABEL_RE = /\brepair_of\b/iu;
 const STATUS_SCAN_RE = /\b(?:SUCCESS|REVIEWED|STALE|PENDING_REVIEW|RECOVERY_REQUIRED|FINISHED|FAILED|ABORTED|RUNNING|PREPARED|COMMITTING)\b/gi;
-const DELEGATION_WORD_RE = /\bdelegation(?:s)?\b|委派|工作线程/i;
+const DELEGATION_WORD_RE = /\bdelegation(?:s)?\b|\brepair_of\b|委派|工作线程/i;
 const WORKER_WORD_RE = /\bworker(?:s)?\b|工作线程/iu;
 const WORKER_MACHINE_CLAIM_RE = /\bworker(?:s)?\b.{0,80}\b(?:SUCCESS(?:FUL(?:LY)?)?|SUCCEEDED|REVIEWED|FINISHED)\b|\bworker(?:s)?\b.{0,80}成功(?:退出|完成)?/isu;
 const EXECUTION_WORD_RE = /\b(?:start(?:ed)?|launch(?:ed)?|execut(?:e|ed)|creat(?:e|ed)|return(?:ed)?|complet(?:e|ed)|attempt(?:ed)?)\b|(?:已|重新|本次|刚刚|刚才|新(?:的)?|全新(?:的)?|再次)?(?:启动|执行|调用|创建|完成|改用|返回|尝试)/i;
@@ -45,14 +54,14 @@ const BLOCKED_EXECUTION_SCAN_RE = /(?:\b(?:starting|launching|creating)\b.{0,120
 const RECENT_WORD_RE = /\b(?:new|fresh|this\s+(?:turn|attempt|delegation)|just)\b|本次|刚刚|刚才|再次|重新|全新(?:的)?|新(?:的)?\s*(?:delegation|worker|工作线程|委派)|已按要求/i;
 const START_WORD_RE = /\b(?:start(?:ed)?|launch(?:ed)?|creat(?:e|ed)|call(?:ed)?)\b|启动|创建|调用|改用/i;
 const ASSERTED_START_RE = /\b(?:started|launched|created)\b|已(?:按要求)?(?:启动|创建|改用)|(?:启动|创建|改用)了/iu;
-const ASSERTED_ATTEMPT_RE = /\b(?:attempted|called|retried)\b|已(?:按要求)?(?:再次|重新)?(?:调用|尝试)|(?:再次|重新)?(?:调用|尝试)了/iu;
+const ASSERTED_ATTEMPT_RE = /\b(?:attempted|called|retried|executed)\b|已(?:按要求)?(?:再次|重新)?(?:调用|尝试|执行)|(?:再次|重新)?(?:调用|尝试|执行)了/iu;
 const PLANNED_EXECUTION_RE = /\b(?:will|can|could|should|may|might|plan(?:ned)?\s+to|need\s+to|ready\s+to|going\s+to)\b.{0,32}\b(?:start|launch|execute|create|call)\b|(?:下一步|计划|准备|打算|可以|需要).{0,24}(?:启动|执行|创建|调用|改用)/iu;
 const DISTRIBUTIVE_CLAIM_RE = /\b(?:all|both|each|these|those)\b|(?:两|三|四|五|六|七|八|九|十|多)次|(?:全部|都|分别|上述|这些)/iu;
 const INLINE_CODE_RE = /`([^`\r\n]*)`/gu;
 const RUN_ONLY_LABEL_RE = /\b(?:runs?|run[_ -]?ids?|recipe|tests?|pytest|mypy|compileall|loader|targeted|focused|audit|checks?|diff|gate(?:[-_ ]?profile)?|typecheck|lint)\b|(?:完整\s*)?G1|测试|验证|审计/iu;
 const RUN_SUFFIX_LABEL_RE = /^\s*(?:[:：]|[-–—]{1,2}|\(|\[)\s*`?(?:runs?|run[_ -]?ids?|recipe|tests?|pytest|mypy|compileall|loader|targeted|focused|audit|diff|gate(?:[-_ ]?profile)?|typecheck|lint|check:[A-Za-z0-9_.-]+|[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+)/iu;
 const BUILD_ONLY_LABEL_RE = /\b(?:build|job|workflow|pipeline)\b|构建|流水线/iu;
-const DELEGATION_LABEL_RE = /\b(?:delegation(?:s)?|worker(?:s)?|latest|delegation\s+authority|authority\s+v2|repair\s+(?:root|lineage)|lineage\s+root)\b|delegation[_ ]?id|委派|工作线程|修复根|修复链/iu;
+const DELEGATION_LABEL_RE = /\b(?:delegation(?:s)?|worker(?:s)?|latest|delegation\s+authority|authority\s+v2|repair\s+(?:root|lineage)|lineage\s+root|repair_of)\b|delegation[_ ]?id|委派|工作线程|修复根|修复链/iu;
 const LATEST_DELEGATION_LABEL_RE = /\blatest(?:\s+(?:delegation|authority))?(?:\s+id)?\s*[:=]?|最新(?:的)?\s*(?:delegation|authority|委派|工作线程)(?:\s*(?:id|编号))?\s*[:：=]?/iu;
 const REVIEW_PASS_FINAL_RE = /\breview(?:\s+v2)?\b.{0,24}\bPASS\b.{0,24}\bFINAL\b|审查.{0,24}(?:通过|PASS).{0,24}(?:最终|FINAL)/iu;
 const RUN_SUCCESS_OUTCOME_RE = /\b(?:PASS(?:ED)?|SUCCESS(?:FUL(?:LY)?)?|SUCCEEDED|OK)\b|\bexit(?:\s+code)?\s*[:=]?\s*0\b|成功(?:退出|完成)?/iu;
@@ -174,6 +183,30 @@ function assistantText(message: unknown): string | undefined {
 	return parts.join("\n");
 }
 
+/**
+ * Recognize only an unambiguous user command whose entire payload is one
+ * exact repair pointer. Explanations, quoted logs, and prompts containing any
+ * other request remain ordinary model input.
+ */
+export function exactRepairCommandIdV1(prompt: string): string | undefined {
+	const match = prompt.match(
+		/^\s*(?:(?:执行|调用|启动)|(?:execute|call|start|run))?\s*[:：]?\s*`?repair_of\s*=\s*(\d{8}-\d{6}-[A-Za-z0-9]{4})`?\s*[。.!]?\s*$/iu,
+	);
+	return match?.[1];
+}
+
+function exactRepairDirectiveContentV1(
+	repairOf: string,
+): string {
+	return [
+		`[${EXACT_REPAIR_DIRECTIVE_SCHEMA}]`,
+		"Compatibility notice only: this raw prompt did not execute a repair.",
+		`The deterministic user-only route is /q-repair ${repairOf}; it invokes the same delegate execution service without an agent turn.`,
+		"Do not call workbench_delegate_worker with repair_of: model-supplied repair parameters are intentionally rejected.",
+		"Do not report an attempt or persistence failure; no delegate execution occurred in this turn.",
+	].join("\n");
+}
+
 function claimClauses(text: string): string[] {
 	const clauses: string[] = [];
 	let fence: "`" | "~" | undefined;
@@ -214,7 +247,12 @@ function claimClauses(text: string): string[] {
 			const statuses = delegationLabelIndex >= runLabelIndex && delegationLabelIndex >= 0
 				? [...inline.matchAll(new RegExp(STATUS_SCAN_RE.source, "gi"))].map((match) => match[0]!)
 				: [];
-			return [...ids, ...statuses].join(" ") || " ";
+			// `repair_of=<id>` is itself a strong delegation label. Retain that
+			// label when Markdown backticks are removed so prose such as
+			// `已执行 \`repair_of=...\`` cannot degrade into an unlabelled
+			// historical id and evade the same-turn execution guard.
+			const repairLabel = REPAIR_OF_LABEL_RE.test(inline) ? ["repair_of"] : [];
+			return [...repairLabel, ...ids, ...statuses].join(" ") || " ";
 		});
 		// Keep comma-linked contrast clauses together. A sentence such as
 		// `did not fail, but completed successfully` contains both a negated
@@ -591,10 +629,11 @@ export function inspectDelegationClaims(message: unknown): DelegationClaimInspec
 		const clauseExecution = hasDelegationSubject && !plannedExecution && EXECUTION_WORD_RE.test(affirmativeClause);
 		const clauseSuccess = hasDelegationSubject && !plannedExecution
 			&& (SUCCESS_WORD_RE.test(affirmativeClause) || REVIEW_PASS_FINAL_RE.test(affirmativeClause));
-		const clauseAttempt = clauseExecution && ASSERTED_ATTEMPT_RE.test(affirmativeClause);
+		const exactRepairExecution = clauseExecution && REPAIR_OF_LABEL_RE.test(affirmativeClause);
+		const clauseAttempt = clauseExecution && (ASSERTED_ATTEMPT_RE.test(affirmativeClause) || exactRepairExecution);
 		const clauseStart = clauseExecution && ASSERTED_START_RE.test(affirmativeClause);
 		const clauseRecent = (clauseAttempt || clauseStart || clauseSuccess)
-			&& RECENT_WORD_RE.test(affirmativeClause)
+			&& (RECENT_WORD_RE.test(affirmativeClause) || exactRepairExecution)
 			&& (START_WORD_RE.test(affirmativeClause) || clauseAttempt || clauseSuccess);
 		executionClaim ||= clauseExecution;
 		workerAttemptClaim ||= clauseAttempt;
@@ -928,6 +967,9 @@ function claimGuardNextAction(
 	code: NonNullable<DelegationClaimValidation["code"]>,
 	facts: DelegationClaimFailureFacts,
 ): string {
+	const noDelegateCall = facts.attemptedDelegateCalls === 0
+		? "no workbench_delegate_worker call occurred in this turn; do not infer a delegation registry or persistence failure; "
+		: "";
 	if (code === "missing_run_authority" || code === "run_status_mismatch" || code === "ambiguous_run_outcome") {
 		return "query workbench_read_run for every stated run_id and report only its committed outcome";
 	}
@@ -935,21 +977,27 @@ function claimGuardNextAction(
 		return "query workbench_delegation_status and workbench_read_run, then restate each fact with an explicit delegation_id or run_id label";
 	}
 	if (code === "missing_attempt_authority" || code === "missing_started_authority" || code === "missing_success_result") {
-		return "do not claim a current-turn worker attempt or completion; query workbench_delegation_status and follow its persisted next action";
+		if (facts.attemptedDelegateCalls === 0 && facts.freshStatusFacts.length === 1) {
+			const observed = facts.freshStatusFacts[0]!;
+			if (observed.transaction_status === "PENDING_REVIEW" && observed.session_status === "PENDING_REVIEW") {
+				return `${noDelegateCall}use deterministic /q-repair ${observed.delegation_id}; it validates strict durable repair authority and fails closed before worker start when unavailable; never call workbench_delegate_worker with raw repair_of or guess a receipt id`;
+			}
+		}
+		return `${noDelegateCall}do not claim a current-turn worker attempt or completion; query workbench_delegation_status and follow its persisted next action`;
 	}
 	if (code === "missing_authority") {
 		if (facts.durableAttemptFacts.length === 1) {
 			const attempt = facts.durableAttemptFacts[0]!;
 			if (attempt.transaction_status === "FAILED") {
-				return `discard guessed delegation ids; current-turn durable delegation ${attempt.delegation_id} is FAILED; call workbench_delegation_status, then call workbench_delegate_worker with repair_of=${attempt.delegation_id}`;
+				return `discard guessed delegation ids; current-turn durable delegation ${attempt.delegation_id} is FAILED; run /q-repair ${attempt.delegation_id} for the deterministic authority check, which fails closed before worker start without a strict terminal-negative decision; never call raw repair_of`;
 			}
 			return `discard guessed delegation ids; current-turn durable delegation ${attempt.delegation_id} is ${attempt.transaction_status}; query workbench_delegation_status and follow its persisted next action`;
 		}
 		if (facts.freshStatusFacts.length === 1) {
 			const observed = facts.freshStatusFacts[0]!;
-			return `discard guessed delegation ids; reuse verified latest delegation ${observed.delegation_id} (${observed.transaction_status}/${observed.session_status ?? "NO_SESSION_STATUS"}) and follow the already returned fresh workbench_delegation_status next action; never guess delegation_id`;
+			return `${noDelegateCall}discard guessed delegation ids; reuse verified latest delegation ${observed.delegation_id} (${observed.transaction_status}/${observed.session_status ?? "NO_SESSION_STATUS"}) and follow the already returned fresh workbench_delegation_status next action exactly; never guess delegation_id or tool-result receipt ids`;
 		}
-		return "discard guessed delegation ids; query workbench_delegation_status; if its persisted next action permits delegation, call workbench_delegate_worker and report only the returned delegation_id";
+		return `${noDelegateCall}discard guessed delegation ids; query workbench_delegation_status; if its persisted next action permits delegation, call workbench_delegate_worker and report only the returned delegation_id`;
 	}
 	if (code === "status_mismatch") {
 		return "query workbench_delegation_status and restate each machine_mismatch_fact without collapsing transaction FINISHED into transaction REVIEWED";
@@ -1052,6 +1100,7 @@ function replacementMessage(
 				`verified_run_authority_count: ${facts.verifiedRuns}`,
 				`delegate_calls_this_turn: ${facts.attemptedDelegateCalls}`,
 				`successful_delegate_results_this_turn: ${facts.successfulDelegateResults}`,
+				`persistence_assessment: ${facts.attemptedDelegateCalls === 0 ? "NOT_APPLICABLE_NO_DELEGATE_CALL" : "REQUIRES_DURABLE_AUTHORITY"}`,
 				`durable_attempt_facts: ${JSON.stringify(facts.durableAttemptFacts)}`,
 				`fresh_status_facts: ${JSON.stringify(facts.freshStatusFacts)}`,
 				`status_mismatch_count: ${facts.statusMismatchCount}`,
@@ -1072,10 +1121,15 @@ function replacementMessage(
 export interface DelegationClaimGuardController {
 	pi: Pick<ExtensionAPI, "on">;
 	isCommander(): boolean;
+	/** Suppress only the legacy raw-repair notice while direct continuation owns the next before-agent boundary. */
+	hasPendingAutomaticDeliveryContinuation?: () => boolean;
 	projectRootFor(ctx: ExtensionContext): Promise<string>;
 	getDelegationState(): Pick<DelegationState, "latestId" | "status">;
 	readTransaction: typeof readDelegationTransactionV2;
 	readCommittedGeneration: typeof readDelegationCommittedGenerationV2;
+	readReview: typeof readDelegationReviewV2;
+	/** Test seam only; production omits it and uses strict storage parsing. */
+	hasSemanticRepairAuthority?: (authority: unknown) => boolean;
 	readLegacyLedger: typeof readDelegationLedger;
 	readCommittedRun: typeof readCommittedManifest;
 }
@@ -1095,6 +1149,50 @@ export function registerDelegationClaimGuard(controller: DelegationClaimGuardCon
 		baselineLatestId = controller.getDelegationState().latestId;
 		baselineCaptured = true;
 	};
+
+	// Legacy raw repair prose is compatibility input only.  Confirm that strict
+	// durable semantic authority exists, then point to the deterministic
+	// user-command route.  The model is never instructed to replay raw
+	// repair_of parameters, which the production delegate controller rejects.
+	controller.pi.on("before_agent_start", async (event, ctx) => {
+		if (!controller.isCommander()) return undefined;
+		try {
+			if (controller.hasPendingAutomaticDeliveryContinuation?.() === true) return undefined;
+		} catch {
+			// A broken suppression seam cannot grant repair authority. Continue to
+			// the ordinary strict compatibility readback below.
+		}
+		const repairOf = exactRepairCommandIdV1(event.prompt);
+		if (repairOf === undefined) return undefined;
+		const sessionState = controller.getDelegationState();
+		if (sessionState.latestId !== repairOf || sessionState.status !== "PENDING_REVIEW") return undefined;
+		try {
+			const projectRoot = await controller.projectRootFor(ctx);
+			const [committed, review] = await Promise.all([
+				controller.readCommittedGeneration(projectRoot, repairOf),
+				controller.readReview(projectRoot, repairOf),
+			]);
+			const hasRepairAuthority = controller.hasSemanticRepairAuthority
+				?? ((authority: unknown) => hasDelegationSemanticRepairAuthorityV2(authority as never));
+			if (!committed.ok || !review.ok || !hasRepairAuthority(review.value)) return undefined;
+			if (exactRepairToolArgumentsV1(committed.value, repairOf) === undefined) return undefined;
+			return {
+				message: {
+					customType: EXACT_REPAIR_DIRECTIVE_SCHEMA,
+					content: exactRepairDirectiveContentV1(repairOf),
+					display: false,
+					details: {
+						repair_of: repairOf,
+					},
+				},
+			};
+		} catch {
+			// The delegate tool remains the sole write/execution authority. If the
+			// exact immutable contract cannot be recovered, inject nothing and let
+			// the ordinary fail-closed status path explain the unavailable route.
+			return undefined;
+		}
+	});
 
 	// One Pi agent run can contain many turn_start events (one before every
 	// assistant/tool loop). Reset only at agent_start so a real delegation

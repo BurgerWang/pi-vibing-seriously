@@ -23,6 +23,7 @@ const RUNTIME_MODULES = [
 	"core/runtime-controller-services.ts",
 	"core/runtime-output-controller.ts",
 	"core/runtime-transient-state.ts",
+	"core/runtime-workbench-tools-controller.ts",
 	"core/tool-call-guard-controller.ts",
 	"core/tool-result-middleware-controller.ts",
 	"index.ts",
@@ -35,7 +36,10 @@ function relativeImports(source: string): string[] {
 }
 
 test("index is a bounded composition root and public tool behavior lives in controllers", async () => {
-	const source = await readFile(INDEX_PATH, "utf8");
+	const [source, toolsController] = await Promise.all([
+		readFile(INDEX_PATH, "utf8"),
+		readFile(join(RUNTIME_ROOT, "core", "runtime-workbench-tools-controller.ts"), "utf8"),
+	]);
 	const lines = source.split("\n").length - 1;
 	assert.ok(lines <= 2_000, `index.ts must stay at or below 2,000 lines; got ${lines}`);
 	assert.doesNotMatch(source, /\bpi\.registerTool\(/, "composition root delegates every public tool registration");
@@ -50,7 +54,8 @@ test("index is a bounded composition root and public tool behavior lives in cont
 		assert.equal(source.includes(directDomainCall), false, directDomainCall);
 	}
 	assert.match(source, /createRuntimeTransientState\(\)/);
-	assert.match(source, /services: RUNTIME_CONTROLLER_SERVICES\.(compare|delegate|review|recovery)/);
+	assert.match(source, /registerRuntimeWorkbenchToolsV1\(\{/);
+	assert.match(toolsController, /services: RUNTIME_CONTROLLER_SERVICES\.(compare|delegate|review|recovery)/);
 });
 
 test("runtime controller layer has no relative import cycle or import back to index", async () => {
