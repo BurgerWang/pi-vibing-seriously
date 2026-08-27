@@ -16,6 +16,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 import workbenchRuntime from "../extensions/workbench-runtime/index.ts";
+import { publishDelegationInactiveBlockerClosureV2 } from "../extensions/workbench-runtime/core/delegation-authority-closure.ts";
 import {
 	persistAbortedDelegationTransaction,
 	persistCommittingDelegationTransaction,
@@ -50,7 +51,10 @@ import {
 } from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { WORKER_SPEND_PROFILE_ENV } from "../extensions/workbench-runtime/core/worker-spend.ts";
 import { createWorkerWriteJournal, sealWorkerWriteJournal } from "../extensions/workbench-runtime/core/write-journal.ts";
-import { RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2 } from "../extensions/workbench-runtime/core/delegation-execution-owner.ts";
+import {
+	readStrictRetryableRawRepairEvidenceV1,
+	RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2,
+} from "../extensions/workbench-runtime/core/delegation-execution-owner.ts";
 import { recoverRawLineageExactRepairAuthorityV1 } from "../extensions/workbench-runtime/core/exact-repair-raw-lineage-authority.ts";
 import { readExactRepairSuccessorV1 } from "../extensions/workbench-runtime/core/exact-repair-successor.ts";
 import { readWorkerRepairCapsule } from "../extensions/workbench-runtime/core/worker-repair-authority.ts";
@@ -58,6 +62,7 @@ import {
 	collectCurrentDelegationBindingV2,
 	readProjectDelegationRepairClosureV1,
 } from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
+import { collectWorkspaceGuard } from "../extensions/workbench-runtime/core/workspace-guard.ts";
 import { buildDelegationWorkerFirstGateFacts } from "../extensions/workbench-runtime/core/delegation-plan-reference.ts";
 import { spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
 
@@ -1699,6 +1704,139 @@ test("q-repair replays a matching PREPARED successor after a pre-launch crash wi
 		assert.match(notices.at(-1) ?? "", /authority_kind: raw-lineage-retry/u);
 		assert.match(notices.at(-1) ?? "", /shared delegate execution completed/u);
 		assert.equal(stub.sentUserMessageCount, 0);
+	});
+});
+
+test("a no-write aborted repair attempt can be superseded without discarding its parent delta", async () => {
+	await withTempDir(async (root) => {
+		await initializeProject(root);
+		await writeFile(join(root, ".gitignore"), [
+			`${CONFIG_DIR_NAME}/workbench/delegations/`,
+			`${CONFIG_DIR_NAME}/workbench/tool-results/`,
+			`${CONFIG_DIR_NAME}/workbench/runs/`,
+			`${CONFIG_DIR_NAME}/workbench/delegation-start.lock`,
+			"fake-worker-*.cjs",
+			"",
+		].join("\n"), "utf8");
+		assert.equal((await spawnExec("git", ["add", ".gitignore", `${CONFIG_DIR_NAME}/workbench/project.yaml`], { cwd: root })).code, 0);
+		const baseline = await spawnExec("git", [
+			"-c", "user.name=Workbench Test", "-c", "user.email=workbench@example.invalid",
+			"commit", "-q", "-m", "test baseline",
+		], { cwd: root });
+		assert.equal(baseline.code, 0, baseline.stderr);
+		const rejectedPath = "src/q-repair-superseded.ts";
+		const initialScript = await writeFakeWorker(root, { changedPath: rejectedPath, body: "known-bad\n" });
+		const replacementScript = await writeFakeWorker(root, { changedPath: rejectedPath, body: "replacement\n" });
+		const stub = commanderRuntime();
+		const toolCtx = commanderContext(root, "q-repair-superseded-tool");
+		await startSession(stub, toolCtx);
+		const initial = await withFakeWorker(initialScript, () => delegateTool(stub).execute(
+			"q-repair-superseded-parent",
+			delegateParams({ task_kind: "implementation", allowed_paths: [rejectedPath] }),
+			undefined,
+			undefined,
+			toolCtx,
+		));
+		const parentId = delegationId(initial);
+		const decision = await requireCurrentSemanticRepair(
+			root,
+			stub,
+			toolCtx,
+			parentId,
+			"Seed an exact parent obligation whose first repair attempt never writes.",
+		);
+		const decisionHash = decision.details.repair_decision_hash;
+		assert.equal(typeof decisionHash, "string");
+		const lineage = bindDelegationRepairLineageV1({
+			schema_version: 1,
+			kind: "semantic-repair-lineage-v1",
+			root_delegation_id: parentId,
+			repair_of: parentId,
+			root_decision_hash: decisionHash as string,
+			continuation_decision_delegation_id: parentId,
+			continuation_decision_hash: decisionHash as string,
+			parent_lineage_hash: null,
+			depth: 1,
+			carried_paths: [rejectedPath],
+		});
+		assert.ok(lineage);
+		const contract = normalizeDelegationBoundedTaskContractV2({
+			task_kind: "implementation",
+			task: "Perform the bounded delegated task.",
+			allowed_paths: [rejectedPath],
+			acceptance_criteria: ["The requested bounded behavior is observed."],
+			verification: [],
+			timeout_seconds: 60,
+			budget_profile: "standard",
+			repair_of: parentId,
+		});
+		assert.equal(contract.ok, true);
+		if (!contract.ok) return;
+		const emptyId = "20991231-235957-empt";
+		const empty = await persistPreparedDelegationTransaction(root, {
+			delegation_id: emptyId,
+			task_kind: "implementation",
+			contract_hash: contract.value.contract_hash,
+			allowed_paths: [rejectedPath],
+			worker_identity: { provider: WORKER_PROVIDER, model: WORKER_MODEL_ID, worker_id: `worker:${emptyId}` },
+			generation: 1,
+			now: new Date().toISOString(),
+			repair_lineage: lineage,
+		});
+		assert.equal(empty.ok, true, empty.ok ? "" : empty.error.code);
+		if (!empty.ok) return;
+		const aborted = await persistAbortedDelegationTransaction(root, {
+			delegation_id: emptyId,
+			contract_hash: empty.value.contract_hash,
+			worker_identity: empty.value.worker_identity,
+			expected_generation: empty.value.generation,
+			expected_revision: empty.value.revision,
+			now: new Date().toISOString(),
+			reason: RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.preparedCallbackFailed,
+		});
+		assert.equal(aborted.ok, true, aborted.ok ? "" : aborted.error.code);
+		if (!aborted.ok) return;
+		const emptyEvidence = await readStrictRetryableRawRepairEvidenceV1(root, aborted.value);
+		assert.equal(emptyEvidence.ok, true, emptyEvidence.ok ? "" : emptyEvidence.code);
+		assert.equal(await readFile(join(root, rejectedPath), "utf8"), "known-bad\n");
+
+		const guard = await collectWorkspaceGuard({ project_root: root, exec: spawnExec });
+		assert.equal(guard.ok, true, guard.ok ? "" : guard.error.code);
+		if (!guard.ok) return;
+		const closed = await publishDelegationInactiveBlockerClosureV2({
+			project_root: root,
+			transaction: aborted.value,
+			workspace_guard: guard.guard,
+			now: new Date(Date.parse(aborted.value.updated_at) + 1_000).toISOString(),
+			closed_by: { provider: "openai", model: "gpt-5.6-sol" },
+		});
+		assert.equal(closed.ok, true, closed.ok ? "" : closed.error.code);
+		if (!closed.ok) return;
+		assert.equal(closed.value.relevant_paths.length, 0);
+		assert.equal(await readFile(join(root, rejectedPath), "utf8"), "known-bad\n", "the rejected parent delta remains byte-for-byte present");
+		assert.deepEqual(await readProjectDelegationRepairClosureV1(root), {
+			ok: true,
+			unresolvedTipId: parentId,
+			rootCount: 1,
+			lineageCount: 1,
+		});
+
+		const beforeReplacement = await delegationDirectories(root);
+		const notices: string[] = [];
+		await withFakeWorker(replacementScript, () => exactRepairCommand(stub).handler(
+			parentId,
+			exactRepairCommandContext(root, "q-repair-superseded-replacement", notices, () => {}),
+		));
+		const afterReplacement = await delegationDirectories(root);
+		assert.equal(afterReplacement.length, beforeReplacement.length + 1, notices.at(-1));
+		const replacementId = afterReplacement.find((id) => !beforeReplacement.includes(id));
+		assert.ok(replacementId);
+		const replacement = await readDelegationCommittedGenerationV2(root, replacementId);
+		assert.equal(replacement.ok, true, replacement.ok ? "" : replacement.error.code);
+		if (replacement.ok) {
+			assert.equal(replacement.value.state.repair_lineage?.repair_of, parentId);
+			assert.equal(replacement.value.state.status, "PENDING_REVIEW");
+		}
 	});
 });
 

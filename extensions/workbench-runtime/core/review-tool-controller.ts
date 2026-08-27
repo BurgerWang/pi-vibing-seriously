@@ -17,7 +17,10 @@ import {
 } from "./delegation-state.ts";
 import type { reviewDelegationV2 } from "./delegation-review-v2.ts";
 import type { readRecoverableUnpublishedDelegationV2 } from "./delegation-project-authority.ts";
-import { readDelegationReviewV2 } from "./delegation-transaction-storage.ts";
+import {
+	isDelegationTerminalNegativeReviewEligibleFromCommittedV1,
+	readDelegationReviewV2,
+} from "./delegation-transaction-storage.ts";
 import type {
 	DelegationReviewAuthorityV2,
 	readDelegationCommittedGenerationV2,
@@ -107,6 +110,8 @@ export interface ReviewToolServices {
 	readCommittedGeneration: typeof readDelegationCommittedGenerationV2;
 	/** Optional fault-injection seam; production falls back to strict storage. */
 	readReview?: typeof readDelegationReviewV2;
+	/** Optional test seam; production always uses committed-generation eligibility. */
+	isTerminalNegativeReviewEligible?: typeof isDelegationTerminalNegativeReviewEligibleFromCommittedV1;
 	readRecoverableUnpublished: typeof readRecoverableUnpublishedDelegationV2;
 	reviewV2: typeof reviewDelegationV2;
 	reviewLegacy: typeof reviewDelegation;
@@ -239,9 +244,6 @@ export function registerReviewTool(controller: ReviewToolController): void {
 			const includePaths = selectorRecovered ? undefined : params.include_paths;
 			const now = controller.services.now().toISOString();
 			const transaction = await controller.services.readTransaction(projectRoot, delegationId);
-			if (transaction.ok && transaction.value.status === "FAILED") {
-				return repairRequired(delegationId, transaction.value.repair_lineage !== undefined);
-			}
 			if (transaction.ok && ["PREPARED", "RUNNING", "COMMITTING"].includes(transaction.value.status)) {
 				return {
 					content: [{
@@ -268,7 +270,13 @@ export function registerReviewTool(controller: ReviewToolController): void {
 			let semanticReview: "accepted" | "required" | "not_required" | "repair_required" = "required";
 			let semanticRisk: "low" | "medium" | "high" = "medium";
 			if (v2Preflight.ok) {
-				if (v2Preflight.value.state.status === "FAILED") {
+				const terminalNegativeEligible = controller.services.isTerminalNegativeReviewEligible ??
+					isDelegationTerminalNegativeReviewEligibleFromCommittedV1;
+				if (v2Preflight.value.state.status === "FAILED" &&
+					!terminalNegativeEligible(
+						v2Preflight.value.state,
+						v2Preflight.value.records,
+					)) {
 					return repairRequired(delegationId, v2Preflight.value.state.repair_lineage !== undefined);
 				}
 				authorityVersion = 2;

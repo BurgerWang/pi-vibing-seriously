@@ -155,6 +155,7 @@ interface ReaderFixture {
 	terminalDecisions: Map<string, DelegationSemanticRepairDecisionV1>;
 	changed: Map<string, readonly string[]>;
 	closed: Set<string>;
+	superseded?: Set<string>;
 	pathErrors: Map<string, "invalid_record" | "not_found" | "storage_failure">;
 	order?: readonly string[];
 	pathReads: string[];
@@ -173,6 +174,10 @@ function readers(fixture: ReaderFixture): DelegationPathLaneAdmissionReadersV1 {
 			value: fixture.terminalDecisions.get(transaction.delegation_id),
 		}),
 		readInactiveClosure: async (_root, transaction) => ({ ok: true, value: fixture.closed.has(transaction.delegation_id) }),
+		readEmptyRepairAttemptSupersession: async (_root, transaction) => ({
+			ok: true,
+			value: fixture.superseded?.has(transaction.delegation_id) ?? false,
+		}),
 		readRepairAbandonment: async () => ({ ok: true, value: false }),
 		readSemanticReviewClosure: async () => ({ ok: true, value: false }),
 		readImmutablePaths: async (_root, transaction) => {
@@ -223,6 +228,28 @@ test("two independent unresolved repair lineages admit a known non-overlapping l
 		{ kind: "known", delegation_id: TIP_A, changed_paths: ["src/new-a.ts"], carried_paths: ["src/rejected-a.ts"], rename_sources: {} },
 		{ kind: "known", delegation_id: TIP_B, changed_paths: ["docs/new-b.md"], carried_paths: ["docs/rejected-b.md"], rename_sources: {} },
 	]);
+});
+
+test("a superseded empty attempt does not form a fork with its replacement sibling", async () => {
+	const fixture = twoLineages();
+	const replacementId = "20260827-100005-rpl1";
+	const replacement = pending(
+		replacementId,
+		12,
+		["src/replacement-a.ts"],
+		lineage(ROOT_A, DECISION_A, ["src/rejected-a.ts"]),
+	);
+	fixture.transactions.set(replacementId, replacement);
+	fixture.changed.set(replacementId, ["src/replacement-a.ts"]);
+	fixture.superseded = new Set([TIP_A]);
+
+	const admission = await admitProjectDelegationPathLaneV1(
+		{ project_root: "/project", allowed_paths: ["tests/**"] },
+		readers(fixture),
+	);
+	assert.equal(admission.decision.decision, "ALLOW", JSON.stringify(admission));
+	assert.deepEqual(admission.repair_tip_ids, [TIP_B, replacementId]);
+	assert.deepEqual(fixture.pathReads, [TIP_B, replacementId]);
 });
 
 test("an INTERRUPTED terminal-negative Sol root and its successor form one valid lineage", async () => {

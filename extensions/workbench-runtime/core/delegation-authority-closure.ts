@@ -39,8 +39,10 @@ import {
 	isRecoverableUnpublishedPathAuthorityCandidateV1,
 	readRecoverableUnpublishedPathAuthorityV1,
 } from "./recoverable-unpublished-path-authority.ts";
+import { readStrictRetryableRawRepairEvidenceV1 } from "./delegation-execution-owner.ts";
 
 const BLOCKER_DIR_NAME = "blocker-closures-v2";
+const EMPTY_REPAIR_ATTEMPT_SUPERSESSION_DIR_NAME = "empty-repair-attempt-supersessions-v1";
 const QUARANTINE_DIR_NAME = "delegation-authority-quarantine-v1";
 const RECEIPT_MAX_BYTES = 256 * 1024;
 const INVENTORY_MAX_ENTRIES = 512;
@@ -206,6 +208,16 @@ function blockerPath(projectRoot: string, delegationId: string, transactionHash:
 	return join(resolve(projectRoot), CONFIG_DIR_NAME, "workbench", "delegations", delegationId, "v2", BLOCKER_DIR_NAME, `${transactionHash}.json`);
 }
 
+function emptyRepairAttemptSupersessionPath(
+	projectRoot: string,
+	delegationId: string,
+	transactionHash: string,
+): string | undefined {
+	if (!DELEGATION_TRANSACTION_ID_RE.test(delegationId) || !DELEGATION_TRANSACTION_HASH_RE.test(transactionHash)) return undefined;
+	return join(resolve(projectRoot), CONFIG_DIR_NAME, "workbench", "delegations", delegationId,
+		EMPTY_REPAIR_ATTEMPT_SUPERSESSION_DIR_NAME, `${transactionHash}.json`);
+}
+
 function quarantinePath(projectRoot: string, delegationId: string, inventoryHash: string): string | undefined {
 	if (!DELEGATION_TRANSACTION_ID_RE.test(delegationId) || !HASH_RE.test(inventoryHash)) return undefined;
 	return join(resolve(projectRoot), CONFIG_DIR_NAME, "workbench", QUARANTINE_DIR_NAME, delegationId, `${inventoryHash}.json`);
@@ -331,6 +343,19 @@ async function resolveInactiveBlockerRelevantPathsV2(
 	projectRoot: string,
 	transaction: DelegationTransactionRecord,
 ): Promise<DelegationAuthorityClosureResult<ResolvedInactiveBlockerPathsV2>> {
+	// A lineaged raw attempt whose complete bounded inventory proves that no
+	// worker write could have started has no delta of its own to discard.  Its
+	// carried paths belong to the still-unresolved parent obligation, so making
+	// those paths Git-clean would wrongly require deleting the parent's exact
+	// rejected delta.  A zero-path closure retires only this empty attempt; the
+	// project authority graph deliberately rewinds to the parent.
+	if (transaction.repair_lineage !== undefined && transaction.committed_proof === null) {
+		const emptyAttempt = await readStrictRetryableRawRepairEvidenceV1(projectRoot, transaction);
+		if (emptyAttempt.ok) return { ok: true, value: { paths: [], journal_before: [] } };
+		if (emptyAttempt.code === "STORAGE_FAILURE") {
+			return { ok: false, error: { code: "storage_failure" } };
+		}
+	}
 	if (isRecoverableUnpublishedPathAuthorityCandidateV1(transaction)) {
 		const recoverable = await readRecoverableUnpublishedPathAuthorityV1(
 			projectRoot,
@@ -411,6 +436,29 @@ async function resolveInactiveBlockerRelevantPathsV2(
 		: { ok: true, value: { paths: fallback, journal_before: [] } };
 }
 
+/**
+ * A valid zero-path closure on a proof-null lineaged terminal is an
+ * attempt-only supersession, never acceptance or abandonment of its parent.
+ * `readDelegationInactiveBlockerClosureV2` has already revalidated the strict
+ * no-write inventory before a receipt can reach this classifier.
+ */
+export function isDelegationEmptyRepairAttemptSupersessionV1(
+	transaction: DelegationTransactionRecord,
+	closure: DelegationInactiveBlockerClosureV2,
+): boolean {
+	return transaction.repair_lineage !== undefined && transaction.committed_proof === null &&
+		transaction.terminal_outcome === null && transaction.review === null &&
+		(transaction.status === "ABORTED" || transaction.status === "RECOVERY_REQUIRED") &&
+		closure.delegation_id === transaction.delegation_id && closure.transaction_hash === canonicalHash(transaction) &&
+		closure.relevant_paths.length === 0;
+}
+
+function isEmptyRepairAttemptSupersessionCandidateV1(transaction: DelegationTransactionRecord): boolean {
+	return transaction.repair_lineage !== undefined && transaction.committed_proof === null &&
+		transaction.terminal_outcome === null && transaction.review === null &&
+		(transaction.status === "ABORTED" || transaction.status === "RECOVERY_REQUIRED");
+}
+
 function sameContentIdentity(left: StreamingPathIdentity, right: StreamingPathIdentity): boolean {
 	if (left.kind !== right.kind) return false;
 	if (left.kind === "missing" || right.kind === "missing") return left.kind === right.kind;
@@ -475,30 +523,66 @@ export async function readDelegationInactiveBlockerClosureV2(
 	projectRoot: string,
 	transaction: DelegationTransactionRecord,
 ): Promise<DelegationAuthorityClosureResult<DelegationInactiveBlockerClosureV2 | undefined>> {
-	const path = blockerPath(projectRoot, transaction.delegation_id, canonicalHash(transaction));
-	if (path === undefined) return { ok: false, error: { code: "invalid_input" } };
-	try {
-		const bytes = await readBoundedFile(path, RECEIPT_MAX_BYTES);
+	const transactionHash = canonicalHash(transaction);
+	const legacyPath = blockerPath(projectRoot, transaction.delegation_id, transactionHash);
+	if (legacyPath === undefined) return { ok: false, error: { code: "invalid_input" } };
+	const readAt = async (path: string): Promise<
+		| { status: "absent" }
+		| { status: "present"; bytes: Buffer; decoded: unknown }
+		| { status: "invalid" }
+		| { status: "storage_failure" }
+	> => {
+		try {
+			const bytes = await readBoundedFile(path, RECEIPT_MAX_BYTES);
 		let decoded: unknown;
-		try { decoded = JSON.parse(bytes.toString("utf8")); } catch { return { ok: false, error: { code: "invalid_record" } }; }
+			try { decoded = JSON.parse(bytes.toString("utf8")); } catch { return { status: "invalid" }; }
+			return { status: "present", bytes, decoded };
+		} catch (error) {
+			return isErrno(error, "ENOENT") ? { status: "absent" } : { status: "storage_failure" };
+		}
+	};
+	const legacy = await readAt(legacyPath);
+	if (legacy.status === "invalid" || legacy.status === "storage_failure") {
+		return { ok: false, error: { code: legacy.status === "invalid" ? "invalid_record" : "storage_failure" } };
+	}
+	let resolved: DelegationAuthorityClosureResult<ResolvedInactiveBlockerPathsV2> | undefined;
+	if (legacy.status === "present") {
 		// A proof-null artifact failure must never accept the older changed-paths
 		// projection, which omitted journal-only/ignored paths and before identities.
 		const legacyPaths = isRecoverableUnpublishedPathAuthorityCandidateV1(transaction)
 			? undefined
 			: inactiveBlockerRelevantPathsV2(transaction);
-		let record = legacyPaths === undefined ? undefined : normalizeBlocker(decoded, transaction, legacyPaths);
+		let record = legacyPaths === undefined ? undefined : normalizeBlocker(legacy.decoded, transaction, legacyPaths);
 		if (record === undefined) {
-			const resolved = await resolveInactiveBlockerRelevantPathsV2(projectRoot, transaction);
+			resolved = await resolveInactiveBlockerRelevantPathsV2(projectRoot, transaction);
 			if (!resolved.ok) return resolved;
-			record = normalizeBlocker(decoded, transaction, resolved.value.paths);
+			record = normalizeBlocker(legacy.decoded, transaction, resolved.value.paths);
 		}
 		const canonical = record === undefined ? undefined : encode(record);
-		return record !== undefined && canonical !== undefined && canonical.equals(bytes)
+		return record !== undefined && canonical !== undefined && canonical.equals(legacy.bytes)
 			? { ok: true, value: record }
 			: { ok: false, error: { code: "invalid_record" } };
-	} catch (error) {
-		return isErrno(error, "ENOENT") ? { ok: true, value: undefined } : { ok: false, error: { code: "storage_failure" } };
 	}
+	if (!isEmptyRepairAttemptSupersessionCandidateV1(transaction)) {
+		return { ok: true, value: undefined };
+	}
+	resolved ??= await resolveInactiveBlockerRelevantPathsV2(projectRoot, transaction);
+	if (!resolved.ok) return resolved;
+	if (!isEmptyRepairAttemptSupersessionCandidateV1(transaction) || resolved.value.paths.length !== 0) {
+		return { ok: true, value: undefined };
+	}
+	const supersessionPath = emptyRepairAttemptSupersessionPath(projectRoot, transaction.delegation_id, transactionHash);
+	if (supersessionPath === undefined) return { ok: false, error: { code: "invalid_input" } };
+	const supersession = await readAt(supersessionPath);
+	if (supersession.status === "absent") return { ok: true, value: undefined };
+	if (supersession.status === "invalid" || supersession.status === "storage_failure") {
+		return { ok: false, error: { code: supersession.status === "invalid" ? "invalid_record" : "storage_failure" } };
+	}
+	const record = normalizeBlocker(supersession.decoded, transaction, []);
+	const canonical = record === undefined ? undefined : encode(record);
+	return record !== undefined && canonical !== undefined && canonical.equals(supersession.bytes)
+		? { ok: true, value: record }
+		: { ok: false, error: { code: "invalid_record" } };
 }
 
 /** Publish one no-clobber, relevant-scope clean closure for an inactive blocker. */
@@ -509,8 +593,9 @@ export async function publishDelegationInactiveBlockerClosureV2(input: {
 	closed_by: DelegationInactiveBlockerClosureV2["closed_by"];
 	now: string;
 }): Promise<DelegationAuthorityClosureResult<DelegationInactiveBlockerClosureV2>> {
-	const path = blockerPath(input.project_root, input.transaction.delegation_id, canonicalHash(input.transaction));
-	if (path === undefined || !isInactiveClosableStatus(input.transaction) ||
+	const transactionHash = canonicalHash(input.transaction);
+	const legacyPath = blockerPath(input.project_root, input.transaction.delegation_id, transactionHash);
+	if (legacyPath === undefined || !isInactiveClosableStatus(input.transaction) ||
 		!validateWorkspaceGuard(input.workspace_guard) || input.workspace_guard.git_head === null ||
 		!validSol(input.closed_by) || !isCanonicalTime(input.now)) {
 		return { ok: false, error: { code: "invalid_input" } };
@@ -521,6 +606,11 @@ export async function publishDelegationInactiveBlockerClosureV2(input: {
 	const resolved = await resolveInactiveBlockerRelevantPathsV2(input.project_root, input.transaction);
 	if (!resolved.ok) return resolved;
 	const relevantPaths = resolved.value.paths;
+	const supersession = isEmptyRepairAttemptSupersessionCandidateV1(input.transaction) && relevantPaths.length === 0;
+	const path = supersession
+		? emptyRepairAttemptSupersessionPath(input.project_root, input.transaction.delegation_id, transactionHash)
+		: legacyPath;
+	if (path === undefined) return { ok: false, error: { code: "invalid_input" } };
 	const relevant = new Set(relevantPaths);
 	if (input.workspace_guard.entries.some((entry) => relevant.has(entry.path))) {
 		return { ok: false, error: { code: "not_recoverable" } };

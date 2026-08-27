@@ -43,3 +43,23 @@ export function workbenchToolRoutesExactRepairV1(toolName: unknown, input: unkno
 	return toolName === "workbench_delegate_worker" && typeof input === "object" && input !== null &&
 		"repair_of" in input && typeof (input as { repair_of?: unknown }).repair_of === "string";
 }
+
+/**
+ * These Git-shaped authority-recovery actions are also control routers.  Each
+ * recovery service acquires the project delegation-start lock internally
+ * after it has resolved the exact durable blocker.  Acquiring the generic
+ * checkout lane around the public tool would occupy that same lock first and
+ * make the service deterministically refuse itself with start_lock_conflict.
+ * Ordinary checkpoint/push calls and malformed inputs remain checkout writers.
+ */
+export function workbenchToolRoutesProjectAuthorityRecoveryV1(toolName: unknown, input: unknown): boolean {
+	if (toolName !== "workbench_git" || typeof input !== "object" || input === null) return false;
+	const action = (input as { action?: unknown }).action;
+	return action === "close_clean_repair" || action === "close_inactive_blocker" ||
+		action === "quarantine_unreadable_authority";
+}
+
+export function workbenchToolRoutesInternalCheckoutControlV1(toolName: unknown, input: unknown): boolean {
+	return workbenchToolRoutesExactRepairV1(toolName, input) ||
+		workbenchToolRoutesProjectAuthorityRecoveryV1(toolName, input);
+}

@@ -162,6 +162,14 @@ callable tool; slash commands remain user-only conveniences. Historical
 aliases: every caller-supplied task, path, criterion, verification and budget
 field is ignored, and the immutable contract is recovered from the id.
 
+If an exact lineaged repair attempt terminates before any worker write, its
+strict raw inventory may be closed with `close_inactive_blocker`. The receipt
+is stored beside, never inside, the immutable `v2` envelope and supersedes only
+that empty attempt. Project authority, path-lane admission, and exact-successor
+idempotency then all re-expose the unresolved parent so one replacement sibling
+can be created. The parent's rejected delta remains present and unresolved;
+the receipt neither accepts nor discards it.
+
 Immediately before launch, the runtime derives an at-most-8-KiB machine-fact
 capsule from strict authority. For an unresolved semantic repair it carries the
 rejected W/D closure, exact approved files, root plan presence and identity,

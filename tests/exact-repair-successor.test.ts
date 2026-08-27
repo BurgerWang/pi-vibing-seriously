@@ -1,18 +1,29 @@
 import assert from "node:assert/strict";
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import test from "node:test";
 
 import { canonicalHash } from "../extensions/workbench-runtime/cache/canonical-hash.ts";
+import { publishDelegationInactiveBlockerClosureV2 } from "../extensions/workbench-runtime/core/delegation-authority-closure.ts";
 import { normalizeDelegationBoundedTaskContractV2 } from "../extensions/workbench-runtime/core/delegation-transaction-artifacts.ts";
-import { persistPreparedDelegationTransaction } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
+import {
+	persistAbortedDelegationTransaction,
+	persistPreparedDelegationTransaction,
+} from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
 import type { DelegationCommittedGenerationV2 } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
 import { bindDelegationRepairLineageV1 } from "../extensions/workbench-runtime/core/delegation-transaction.ts";
+import {
+	readStrictRetryableRawRepairEvidenceV1,
+	RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2,
+} from "../extensions/workbench-runtime/core/delegation-execution-owner.ts";
 import type {
 	ExactRepairCommandAuthorityV1,
 	ExactRepairToolArgumentsV1,
 } from "../extensions/workbench-runtime/core/exact-repair-authority.ts";
 import { readExactRepairSuccessorV1 } from "../extensions/workbench-runtime/core/exact-repair-successor.ts";
 import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtime/core/worker-policy.ts";
-import { withTempDir } from "./helpers.ts";
+import { collectWorkspaceGuard } from "../extensions/workbench-runtime/core/workspace-guard.ts";
+import { spawnExec, withTempDir } from "./helpers.ts";
 
 const PARENT_ID = "20260827-020100-prnt";
 const SUCCESSOR_ID = "20260827-020101-next";
@@ -203,6 +214,67 @@ test("successor scan treats multiple exact successors as a durable idempotency c
 			authority: commandAuthority,
 			readRepairClosure: closureReader,
 		}), { ok: false, code: "IDEMPOTENCY_CONFLICT" });
+	});
+});
+
+test("a durably superseded no-write attempt is ignored so its parent can allocate one new exact successor", async () => {
+	await withTempDir(async (root) => {
+		assert.equal((await spawnExec("git", ["init", "-q"], { cwd: root })).code, 0);
+		await writeFile(join(root, ".gitignore"), ".pi/\n", "utf8");
+		await writeFile(join(root, "README.md"), "baseline\n", "utf8");
+		assert.equal((await spawnExec("git", ["add", ".gitignore", "README.md"], { cwd: root })).code, 0);
+		assert.equal((await spawnExec("git", ["-c", "user.name=Workbench Test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "baseline"], { cwd: root })).code, 0);
+
+		const commandAuthority = authority();
+		await preparedSuccessor(root, SUCCESSOR_ID, commandAuthority);
+		const aborted = await persistAbortedDelegationTransaction(root, {
+			delegation_id: SUCCESSOR_ID,
+			contract_hash: reboundContract().contract_hash,
+			worker_identity: { provider: WORKER_PROVIDER, model: WORKER_MODEL_ID, worker_id: `worker:${SUCCESSOR_ID}` },
+			expected_generation: 1,
+			expected_revision: 0,
+			now: "2026-08-27T02:01:04.000Z",
+			reason: RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.preparedCallbackFailed,
+		});
+		assert.equal(aborted.ok, true, aborted.ok ? "" : aborted.error.code);
+		if (!aborted.ok) return;
+		const emptyEvidence = await readStrictRetryableRawRepairEvidenceV1(root, aborted.value);
+		assert.equal(emptyEvidence.ok, true, emptyEvidence.ok ? "" : emptyEvidence.code);
+		assert.ok(Date.parse("2026-08-27T02:01:05.000Z") >= Date.parse(aborted.value.updated_at), aborted.value.updated_at);
+		await mkdir(join(root, "src"), { recursive: true });
+		await writeFile(join(root, "src", "worker.ts"), "rejected parent delta remains present\n", "utf8");
+		const guard = await collectWorkspaceGuard({ project_root: root, exec: spawnExec });
+		assert.equal(guard.ok, true, guard.ok ? "" : guard.error.code);
+		if (!guard.ok) return;
+		assert.notEqual(guard.guard.git_head, null);
+		const closed = await publishDelegationInactiveBlockerClosureV2({
+			project_root: root,
+			transaction: aborted.value,
+			workspace_guard: guard.guard,
+			closed_by: { provider: "openai", model: "gpt-5.6-sol" },
+			now: "2026-08-27T02:01:05.000Z",
+		});
+		assert.equal(closed.ok, true, closed.ok ? "" : closed.error.code);
+		if (!closed.ok) return;
+		assert.deepEqual(closed.value.relevant_paths, [], "the carried parent delta is not discarded by closing an empty child attempt");
+
+		const none = await readExactRepairSuccessorV1({
+			projectRoot: root,
+			parent: parent(),
+			authority: commandAuthority,
+			readRepairClosure: closureReader,
+		});
+		assert.deepEqual(none, { ok: true, kind: "none" });
+
+		await preparedSuccessor(root, SECOND_ID, commandAuthority);
+		const replacement = await readExactRepairSuccessorV1({
+			projectRoot: root,
+			parent: parent(),
+			authority: commandAuthority,
+			readRepairClosure: closureReader,
+		});
+		assert.equal(replacement.ok, true, replacement.ok ? "" : replacement.code);
+		if (replacement.ok && replacement.kind === "existing") assert.equal(replacement.value.delegation_id, SECOND_ID);
 	});
 });
 

@@ -162,6 +162,38 @@ test("exact repair routers skip only the outer lane and still create receipts", 
 	}
 });
 
+test("authority-recovery Git routers skip the outer lane while ordinary Git actions retain it", async () => {
+	for (const [toolCallId, input] of [
+		["close-clean", { action: "close_clean_repair" }],
+		["close-inactive", { action: "close_inactive_blocker", delegation_id: DELEGATION_ID }],
+		["quarantine", { action: "quarantine_unreadable_authority", delegation_id: DELEGATION_ID }],
+	] as const) {
+		const harness = guardHarness();
+		const result = await harness.handler({ toolCallId, toolName: "workbench_git", input }, context());
+		assert.equal(result, undefined);
+		assert.deepEqual(
+			harness.order,
+			["receipt"],
+			`${input.action} must leave the delegation-start lock available for its strict internal recovery service`,
+		);
+		assert.equal(harness.acquisitions.length, 0);
+		assert.equal(harness.pending.size, 0);
+	}
+
+	for (const [toolCallId, input] of [
+		["checkpoint", { action: "checkpoint", message: "reviewed checkpoint" }],
+		["push", { action: "push", expected_head: "a".repeat(40) }],
+		["malformed", { action: "unknown" }],
+	] as const) {
+		const harness = guardHarness();
+		const result = await harness.handler({ toolCallId, toolName: "workbench_git", input }, context());
+		assert.equal(result, undefined);
+		assert.deepEqual(harness.order.slice(0, 2), ["reconcile", "acquire"]);
+		assert.equal(harness.acquisitions.length, 1);
+		assert.equal(harness.pending.has(toolCallId), true);
+	}
+});
+
 test("review presentation and unknown custom tools both require the closed checkout lane", async () => {
 	for (const [toolCallId, toolName] of [
 		["review-call", "workbench_review_worker_diff"],

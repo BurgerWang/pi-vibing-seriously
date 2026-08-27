@@ -41,6 +41,7 @@ import {
 import {
 	publishDelegationAuthorityQuarantineV1,
 	publishDelegationInactiveBlockerClosureV2,
+	isDelegationEmptyRepairAttemptSupersessionV1,
 	readDelegationAuthorityQuarantineV1,
 	readDelegationInactiveBlockerClosureV2,
 	type DelegationAuthorityQuarantineV1,
@@ -629,6 +630,7 @@ export async function readProjectDelegationRepairClosureV1(
 	}
 
 	const children = new Map<string, string[]>();
+	const supersededAttempts = new Set<string>();
 	for (const transaction of lineaged.values()) {
 		const lineage = transaction.repair_lineage!;
 		const rootTransaction = roots.get(lineage.root_delegation_id);
@@ -696,15 +698,35 @@ export async function readProjectDelegationRepairClosureV1(
 		if (!pathSubset(required, lineage.carried_paths)) {
 			return { ok: false, issue: { code: "repair_lineage_scope_invalid", delegationId: transaction.delegation_id } };
 		}
-		const siblings = children.get(parent.delegation_id) ?? [];
-		siblings.push(transaction.delegation_id);
-		children.set(parent.delegation_id, siblings);
-		if (siblings.length > 1) {
-			return { ok: false, issue: { code: "repair_lineage_fork", delegationId: parent.delegation_id } };
+		const inactiveClosure = await readDelegationInactiveBlockerClosureV2(projectRoot, transaction);
+		if (!inactiveClosure.ok) {
+			return {
+				ok: false,
+				issue: {
+					code: inactiveClosure.error.code === "invalid_record" ? "blocker_closure_invalid" : inactiveClosure.error.code,
+					delegationId: transaction.delegation_id,
+				},
+			};
+		}
+		if (inactiveClosure.value !== undefined &&
+			isDelegationEmptyRepairAttemptSupersessionV1(transaction, inactiveClosure.value)) {
+			supersededAttempts.add(transaction.delegation_id);
+		} else {
+			const siblings = children.get(parent.delegation_id) ?? [];
+			siblings.push(transaction.delegation_id);
+			children.set(parent.delegation_id, siblings);
+			if (siblings.length > 1) {
+				return { ok: false, issue: { code: "repair_lineage_fork", delegationId: parent.delegation_id } };
+			}
+		}
+	}
+	for (const delegationId of supersededAttempts) {
+		if ((children.get(delegationId)?.length ?? 0) > 0) {
+			return { ok: false, issue: { code: "repair_lineage_superseded_attempt_has_child", delegationId } };
 		}
 	}
 
-	const reached = new Set<string>();
+	const reached = new Set<string>(supersededAttempts);
 	const unresolved: string[] = [];
 	for (const rootTransaction of roots.values()) {
 		let current = rootTransaction;

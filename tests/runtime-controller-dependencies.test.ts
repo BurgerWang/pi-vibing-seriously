@@ -409,7 +409,7 @@ test("review controller refuses corrupt v2 authority and never falls back to leg
 	assert.doesNotMatch(resultText(result), /private storage detail/);
 });
 
-test("review controller reserves the outer semantic header before rendering a complete packet", async () => {
+test("review controller routes an eligible committed FAILED packet and reserves the outer semantic header", async () => {
 	const fixed = new Date("2026-08-21T01:12:13.000Z");
 	const delegationId = "20260821-011213-W1r2";
 	const boundHash = "a".repeat(64);
@@ -461,8 +461,9 @@ test("review controller reserves the outer semantic header before rendering a co
 	const controller = {
 		services: {
 			now: () => fixed,
-			readTransaction: async () => ({ ok: true, value: { status: "PENDING_REVIEW" } }),
-			readCommittedGeneration: async () => ({ ok: true, value: { state: { status: "PENDING_REVIEW" } } }),
+			readTransaction: async () => ({ ok: true, value: { status: "FAILED" } }),
+			readCommittedGeneration: async () => ({ ok: true, value: { state: { status: "FAILED" }, records: {} } }),
+			isTerminalNegativeReviewEligible: () => true,
 			readRecoverableUnpublished: async () => ({ ok: false, error: { code: "not_recoverable" } }),
 			reviewV2: async (input: { maxBytes: number; maxLines: number }) => {
 				packetMaxBytes = input.maxBytes;
@@ -471,7 +472,7 @@ test("review controller reserves the outer semantic header before rendering a co
 				return {
 					ok: true,
 					review: { ok: true, record, lines: [packetText] },
-					transaction: { status: "PENDING_REVIEW" },
+					transaction: { status: "FAILED" },
 					review_hash: "b".repeat(64),
 					review_path: record.review_path,
 					finalized: false,
@@ -511,6 +512,7 @@ test("review controller reserves the outer semantic header before rendering a co
 	assert.equal(resultText(result).split("\n").at(-1), packetText, "the outer clamp presents the complete saturated packet");
 	assert.ok(Buffer.byteLength(resultText(result), "utf8") <= 4_096);
 	assert.equal(result.details.presentation_complete, true);
+	assert.notEqual(result.details.error, "repair_required", "strict terminal-negative eligibility reaches the v2 review service");
 	assert.equal(result.details.delegation_id, delegationId, "a presentation call defaults to the durable latest id");
 
 	const unboundDecision = await tool.execute(

@@ -73,6 +73,14 @@ eligible decision as exact `/q-review <id>`, and fails closed on corruption.
 idempotently returns/creates the one lineaged successor without relying on the
 session's latest entry.
 
+A compatible proof-null lineaged `ABORTED` or `RECOVERY_REQUIRED` attempt whose
+strict raw evidence proves zero worker writes can be durably superseded without
+cleaning its inherited paths. The additive receipt lives outside the immutable
+`v2` envelope, and all repair-graph, path-lane, and successor readers ignore
+only that exact empty attempt before permitting one replacement from its
+still-unresolved parent. Existing nonempty, ambiguous, or corrupt attempts
+remain fail-closed.
+
 Recipe command provenance is also additive. `command-effect.json` binds run id,
 before/after workspace guards, mutation declaration, observed paths, and
 streaming content identities for exact declared outputs even when Git-ignored.

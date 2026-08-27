@@ -39,6 +39,7 @@ import {
 	readDelegationCleanRepairAbandonmentV1,
 } from "./delegation-repair-abandonment.ts";
 import {
+	isDelegationEmptyRepairAttemptSupersessionV1,
 	readDelegationInactiveBlockerClosureV2,
 } from "./delegation-authority-closure.ts";
 import {
@@ -116,6 +117,10 @@ export interface DelegationPathLaneAdmissionReadersV1 {
 		transaction: DelegationTransactionRecord,
 	): Promise<AuthorityRead<DelegationSemanticRepairDecisionV1 | undefined>>;
 	readInactiveClosure(projectRoot: string, transaction: DelegationTransactionRecord): Promise<AuthorityRead<boolean>>;
+	readEmptyRepairAttemptSupersession(
+		projectRoot: string,
+		transaction: DelegationTransactionRecord,
+	): Promise<AuthorityRead<boolean>>;
 	readRepairAbandonment(
 		projectRoot: string,
 		tip: DelegationTransactionRecord,
@@ -291,6 +296,16 @@ const DEFAULT_READERS: DelegationPathLaneAdmissionReadersV1 = {
 		const read = await readDelegationInactiveBlockerClosureV2(projectRoot, transaction);
 		return read.ok ? { ok: true, value: read.value !== undefined } : read;
 	},
+	readEmptyRepairAttemptSupersession: async (projectRoot, transaction) => {
+		const read = await readDelegationInactiveBlockerClosureV2(projectRoot, transaction);
+		return read.ok
+			? {
+				ok: true,
+				value: read.value !== undefined &&
+					isDelegationEmptyRepairAttemptSupersessionV1(transaction, read.value),
+			}
+			: read;
+	},
 	readRepairAbandonment: async (projectRoot, tip, rootDecision) => {
 		const read = await readDelegationCleanRepairAbandonmentV1(projectRoot, tip, rootDecision);
 		return read.ok ? { ok: true, value: read.value !== undefined } : read;
@@ -399,6 +414,7 @@ async function scanAuthority(
 		else if (decisions.has(transaction.delegation_id)) roots.set(transaction.delegation_id, transaction);
 	}
 	const children = new Map<string, string>();
+	const supersededAttempts = new Set<string>();
 	for (const child of lineaged.values()) {
 		const lineage = child.repair_lineage!;
 		const root = roots.get(lineage.root_delegation_id);
@@ -408,8 +424,9 @@ async function scanAuthority(
 		if (root === undefined || rootDecision === undefined || parent === undefined ||
 			rootDecision.decision_hash !== lineage.root_decision_hash || continuation === undefined ||
 			continuation.decision_hash !== lineage.continuation_decision_hash ||
-			parent.created_at > child.created_at || rootDecision.decided_at > child.created_at || continuation.decided_at > child.created_at ||
-			children.has(parent.delegation_id)) return { ok: false, failure: invalidGraph(child.delegation_id) };
+			parent.created_at > child.created_at || rootDecision.decided_at > child.created_at || continuation.decided_at > child.created_at) {
+			return { ok: false, failure: invalidGraph(child.delegation_id) };
+		}
 		if (lineage.depth === 1) {
 			if (parent.delegation_id !== root.delegation_id || parent.repair_lineage !== undefined ||
 				lineage.parent_lineage_hash !== null || lineage.continuation_decision_delegation_id !== parent.delegation_id) {
@@ -433,10 +450,24 @@ async function scanAuthority(
 				return { ok: false, failure: invalidGraph(child.delegation_id) };
 			}
 		}
+		const superseded = await readers.readEmptyRepairAttemptSupersession(projectRoot, child);
+		if (!superseded.ok) {
+			return { ok: false, failure: errorFailure(superseded.error.code, child.delegation_id) };
+		}
+		if (superseded.value) {
+			supersededAttempts.add(child.delegation_id);
+			continue;
+		}
+		if (children.has(parent.delegation_id)) {
+			return { ok: false, failure: invalidGraph(child.delegation_id) };
+		}
 		children.set(parent.delegation_id, child.delegation_id);
 	}
+	for (const supersededId of supersededAttempts) {
+		if (children.has(supersededId)) return { ok: false, failure: invalidGraph(supersededId) };
+	}
 
-	const reached = new Set<string>();
+	const reached = new Set<string>(supersededAttempts);
 	const repairTips: DelegationTransactionRecord[] = [];
 	for (const root of [...roots.values()].sort((a, b) => byteCompare(a.delegation_id, b.delegation_id))) {
 		let current = root;

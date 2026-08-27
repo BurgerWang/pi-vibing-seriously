@@ -5,6 +5,10 @@ import type { Dirent } from "node:fs";
 import { join } from "node:path";
 
 import { canonicalHash } from "../cache/canonical-hash.ts";
+import {
+	isDelegationEmptyRepairAttemptSupersessionV1,
+	readDelegationInactiveBlockerClosureV2,
+} from "./delegation-authority-closure.ts";
 import { delegationsDir, isValidDelegationId } from "./delegation-ledger.ts";
 import { isDelegationPathLaneBypassableProjectIssueV1 } from "./delegation-path-lane-admission.ts";
 import { readStrictRetryableRawRepairEvidenceV1 } from "./delegation-execution-owner.ts";
@@ -225,6 +229,16 @@ async function scanExactRepairSuccessorV1(input: {
 		const candidate = read.value;
 		if (candidate.delegation_id !== entry.name) return { ok: false, code: "AUTHORITY_INVALID", delegation_id: entry.name };
 		if (candidate.repair_lineage?.repair_of !== input.parent.delegation_id) continue;
+		const closure = await readDelegationInactiveBlockerClosureV2(input.projectRoot, candidate);
+		if (!closure.ok) {
+			return {
+				ok: false,
+				code: closure.error.code === "storage_failure" ? "STORAGE_FAILURE" : "AUTHORITY_INVALID",
+				delegation_id: candidate.delegation_id,
+			};
+		}
+		if (closure.value !== undefined &&
+			isDelegationEmptyRepairAttemptSupersessionV1(candidate, closure.value)) continue;
 		if (candidate.task_kind !== "implementation" || candidate.contract_hash !== expected.value.contract_hash ||
 			!sameStrings(candidate.allowed_paths, expected.value.allowed_paths) ||
 			canonicalHash(candidate.repair_lineage) !== canonicalHash(input.successorLineage)) {
