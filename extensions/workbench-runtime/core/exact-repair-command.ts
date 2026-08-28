@@ -158,6 +158,9 @@ export function exactRepairServiceLinesV1(
 				`${entrypoint}: prior successor ended before writes and has strict deterministic continuation authority`,
 				...recoveredLines(result),
 				...successorLines(result.successor),
+				...(result.execution_error === undefined ? [] : [
+					`execution_failure: ${boundedInlineDetail(result.execution_error, 1_024)}`,
+				]),
 				...successorNextActionLines(result.successor),
 			];
 		case "SUCCESSOR_BLOCKED":

@@ -10,6 +10,7 @@ import {
 	formatWorkerCacheSummary,
 	runPinnedWorker,
 	workerCacheHitRatio,
+	workerRunnerPreflightFailureCode,
 	workerRunFailure,
 	WORKER_DIAGNOSIS_SYSTEM_PROMPT,
 	WORKER_SYSTEM_PROMPT,
@@ -407,7 +408,7 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 			invocation: { command: "must-not-spawn", argsPrefix: [] },
 			readRepairAuthority: async () => ({ ok: false, code: "authority_invalid" }),
 		}),
-		/Worker repair authority is authority_invalid/,
+		(error) => workerRunnerPreflightFailureCode(error) === "REPAIR_AUTHORITY_INVALID",
 	);
 });
 

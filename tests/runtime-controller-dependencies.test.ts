@@ -296,6 +296,7 @@ test("Git controller exposes only non-acceptance recovery in VERIFY", async () =
 				inactiveCalls += 1;
 				return {
 					ok: true as const,
+					closed_delegation_ids: ["20260825-120000-abcd"],
 					value: {
 						delegation_id: "20260825-120000-abcd",
 						relevant_paths: ["src/a.ts"],
@@ -335,6 +336,7 @@ test("Git controller exposes only non-acceptance recovery in VERIFY", async () =
 	assert.equal(inactive.details.ok, true);
 	assert.equal(inactive.details.git_mutation, "NONE");
 	assert.equal(inactive.details.unrelated_work, "PRESERVED");
+	assert.equal(inactive.details.closed_attempt_count, 1);
 
 	const quarantine = await tool.execute("quarantine-verify", {
 		action: "quarantine_unreadable_authority",

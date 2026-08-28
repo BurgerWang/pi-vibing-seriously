@@ -13,6 +13,7 @@ import {
 	DEFAULT_REVIEW_MAX_LINES,
 	isReviewPresentationFullyVisible,
 	isScopeIntegrityPacketComplete,
+	preflightSemanticReviewEnvelopeV1,
 	validateReviewPresentationAgainstAuthority,
 	isStrictSemanticAcceptedOrZeroDelta,
 	renderReviewLines,
@@ -953,6 +954,7 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 				command_provenance: authorityInfo.command_provenance,
 			}),
 			exec: input.exec,
+			...(terminalNegative ? { allow_control_rebase: true } : {}),
 			...(expectedProjection === undefined ? {} : { expected_projection: expectedProjection }),
 		});
 		if (!relevance.ok) {
@@ -962,14 +964,34 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 				...(bindingHash === undefined ? {} : { binding_hash: bindingHash }),
 			});
 		}
-		if (authorityInfo.review_envelope !== undefined &&
+		if (!terminalNegative && authorityInfo.review_envelope !== undefined &&
 			authorityInfo.review_envelope.relevance_projection_hash !== relevance.value.binding.projection_hash) {
 			return fail("review_conflict", "delegation semantic-review envelope no longer matches the current relevance projection", {
 				transaction: state,
 				binding_hash: relevance.value.binding.projection_hash,
 			});
 		}
-		const authority = authorityWithRelevance(authorityInfo.authority, relevance.value);
+		let authority = authorityWithRelevance(authorityInfo.authority, relevance.value);
+		if (terminalNegative && authorityInfo.review_envelope !== undefined &&
+			authorityInfo.review_envelope.relevance_projection_hash !== relevance.value.binding.projection_hash) {
+			const reboundEnvelope = await preflightSemanticReviewEnvelopeV1({
+				projectRoot: input.projectRoot,
+				workerPaths: relevance.value.worker_paths,
+				allowedPaths: state.allowed_paths,
+				afterDigests: authority.after.pathDigests,
+				pathStatuses: authority.current?.pathStatuses ?? {},
+				relevanceProjection: relevance.value.projection,
+				relevanceProjectionHash: relevance.value.binding.projection_hash,
+				exec: input.exec,
+				...(input.secrets === undefined ? {} : { secrets: input.secrets }),
+			});
+			if (!reboundEnvelope.ok) {
+				return fail("review_invalid", `terminal-negative review envelope rebind failed (${reboundEnvelope.code})`, {
+					transaction: state,
+				});
+			}
+			authority = { ...authority, review_envelope: reboundEnvelope.value };
+		}
 		const reviewedAt = input.now ?? new Date().toISOString();
 		if (!isCanonicalTime(reviewedAt)) return fail("review_invalid", "review time must be canonical ISO-8601", { transaction: state });
 		let review: ReviewResult;

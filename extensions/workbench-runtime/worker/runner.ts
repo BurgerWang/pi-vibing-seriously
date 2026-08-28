@@ -344,6 +344,26 @@ export interface RunWorkerOptions {
 	readRepairAuthority?: (projectRoot: string, repairOf: string) => Promise<WorkerRepairAuthorityResult>;
 }
 
+export type WorkerRunnerPreflightFailureCode =
+	| "REPAIR_AUTHORITY_UNAVAILABLE"
+	| "REPAIR_AUTHORITY_INVALID"
+	| "REPAIR_CAPSULE_TOO_LARGE";
+
+/** Closed preflight category; the message never carries provider or worker prose. */
+export class WorkerRunnerPreflightError extends Error {
+	readonly code: WorkerRunnerPreflightFailureCode;
+
+	constructor(code: WorkerRunnerPreflightFailureCode) {
+		super(code);
+		this.name = "WorkerRunnerPreflightError";
+		this.code = code;
+	}
+}
+
+export function workerRunnerPreflightFailureCode(error: unknown): WorkerRunnerPreflightFailureCode | undefined {
+	return error instanceof WorkerRunnerPreflightError ? error.code : undefined;
+}
+
 interface AssistantLike {
 	role?: unknown;
 	content?: unknown;
@@ -683,7 +703,13 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 	let repairCapsule: WorkerRepairCapsule | undefined;
 	if (options.contract.repairOf !== undefined) {
 		const authority = await (options.readRepairAuthority ?? readWorkerRepairCapsule)(options.projectRoot, options.contract.repairOf);
-		if (!authority.ok) throw new Error(`Worker repair authority is ${authority.code}`);
+		if (!authority.ok) {
+			throw new WorkerRunnerPreflightError(authority.code === "authority_unavailable"
+				? "REPAIR_AUTHORITY_UNAVAILABLE"
+				: authority.code === "capsule_too_large"
+					? "REPAIR_CAPSULE_TOO_LARGE"
+					: "REPAIR_AUTHORITY_INVALID");
+		}
 		repairCapsule = authority.capsule;
 	}
 	// Render the same active profile used by the runner and child env. This

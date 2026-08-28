@@ -27,6 +27,13 @@ export const DELEGATION_TRANSACTION_MAX_REASON_CHARS = 500 as const;
 export const DELEGATION_REPAIR_LINEAGE_SCHEMA_VERSION = 1 as const;
 export const DELEGATION_REPAIR_LINEAGE_KIND = "semantic-repair-lineage-v1" as const;
 export const DELEGATION_REPAIR_LINEAGE_MAX_DEPTH = 16 as const;
+/**
+ * A raw no-write execution failure may receive one deterministic retry. A
+ * second consecutive raw failure is a platform incident, not fresh repair
+ * authority; callers must collapse the empty attempt chain before retrying
+ * the last committed parent.
+ */
+export const EXACT_REPAIR_RAW_LINEAGE_MAX_RETRYABLE_DEPTH_V1 = 1 as const;
 export const DELEGATION_REPAIR_LINEAGE_MAX_PATHS = DELEGATION_TRANSACTION_MAX_PATHS;
 
 export const DELEGATION_TRANSACTION_ID_RE = /^\d{8}-\d{6}-[A-Za-z0-9]{4}$/;

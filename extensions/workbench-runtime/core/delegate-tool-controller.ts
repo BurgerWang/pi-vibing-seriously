@@ -1314,6 +1314,9 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					const workerFailure = execution.worker_failure_code === undefined
 						? ""
 						: `; worker_failure=${execution.worker_failure_code}`;
+					const runnerPreflightFailure = execution.runner_preflight_failure_code === undefined
+						? ""
+						: `; runner_preflight_failure=${execution.runner_preflight_failure_code}`;
 					const workerFacts = execution.result === undefined
 						? ""
 						: `; assistant_turns=${execution.result.turns}; spend_profile=${execution.result.spend.profile}; spend_total_tokens=${execution.result.spend.totalTokens}; spend_output_tokens=${execution.result.spend.outputTokens}; exit_code=${execution.result.exitCode ?? "none"}`;
@@ -1337,7 +1340,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					const mirrorWarning = sessionMirrorWarnings.length === 0
 						? ""
 						: `; warning=session_mirror_append_failed; durable_readback=${sessionMirrorWarnings.at(-1)!.durable_readback}`;
-					const summary = `workbench_delegate_worker: delegation v2 ${execution.code}${artifactError}${preparedStep}; delegation_id=${delegationId}; durable_status=${status}; postconditions=${reasons}${workerFailure}${workerReport}${changedPaths}${workerFacts}${mirrorWarning}${nextAction}`;
+					const summary = `workbench_delegate_worker: delegation v2 ${execution.code}${artifactError}${preparedStep}; delegation_id=${delegationId}; durable_status=${status}; postconditions=${reasons}${workerFailure}${runnerPreflightFailure}${workerReport}${changedPaths}${workerFacts}${mirrorWarning}${nextAction}`;
 					const boundedSummary = Buffer.byteLength(summary, "utf8") <= DELEGATION_FAILURE_SUMMARY_MAX_BYTES
 						? summary
 						: `workbench_delegate_worker: delegation v2 ${execution.code}${preparedStep}; delegation_id=${delegationId}; durable_status=${status}; postconditions=summary_over_bound${workerReport}${changedPaths}${nextAction}`;

@@ -16,6 +16,7 @@ import {
 	hasDelegationSemanticRepairAuthorityV2,
 	readDelegationCommittedGenerationV2,
 	readDelegationReviewV2,
+	readDelegationTerminalNegativeSolAuthorityV1,
 	readDelegationTransactionV2,
 	type DelegationSemanticRepairDecisionV1,
 } from "./delegation-transaction-storage.ts";
@@ -81,29 +82,52 @@ function semanticRepairFact(decision: DelegationSemanticRepairDecisionV1): NonNu
 	};
 }
 
-async function strictSemanticRepairDecision(
+async function strictRepairDecisionForCommitted(
 	projectRoot: string,
 	state: DelegationTransactionRecord,
 ): Promise<DelegationSemanticRepairDecisionV1 | undefined> {
-	const lineage = state.repair_lineage;
-	if (lineage === undefined) {
+	if (state.status === "PENDING_REVIEW") {
 		const review = await readDelegationReviewV2(projectRoot, state.delegation_id);
 		return review.ok && hasDelegationSemanticRepairAuthorityV2(review.value)
 			? review.value.semantic_repair!
 			: undefined;
 	}
-	const root = await readDelegationReviewV2(projectRoot, lineage.root_delegation_id);
-	if (!root.ok || !hasDelegationSemanticRepairAuthorityV2(root.value) ||
-		root.value.semantic_repair!.decision_hash !== lineage.root_decision_hash) return undefined;
+	if (state.repair_lineage === undefined && (state.status === "FAILED" || state.status === "INTERRUPTED")) {
+		const terminal = await readDelegationTerminalNegativeSolAuthorityV1(projectRoot, state.delegation_id);
+		return terminal.ok ? terminal.value.decision : undefined;
+	}
+	return undefined;
+}
+
+async function strictRepairLineageDecision(
+	projectRoot: string,
+	state: DelegationTransactionRecord,
+): Promise<DelegationSemanticRepairDecisionV1 | undefined> {
+	const lineage = state.repair_lineage;
+	if (lineage === undefined) {
+		return strictRepairDecisionForCommitted(projectRoot, state);
+	}
+	const root = await readDelegationCommittedGenerationV2(projectRoot, lineage.root_delegation_id);
+	if (!root.ok || root.value.state.repair_lineage !== undefined) return undefined;
+	const rootDecision = await strictRepairDecisionForCommitted(projectRoot, root.value.state);
+	if (rootDecision === undefined || rootDecision.decision_hash !== lineage.root_decision_hash) return undefined;
 	if (lineage.continuation_decision_delegation_id === lineage.root_delegation_id) {
 		return lineage.continuation_decision_hash === lineage.root_decision_hash
-			? root.value.semantic_repair!
+			? rootDecision
 			: undefined;
 	}
-	const continuation = await readDelegationReviewV2(projectRoot, lineage.continuation_decision_delegation_id);
-	if (!continuation.ok || !hasDelegationSemanticRepairAuthorityV2(continuation.value) ||
-		continuation.value.semantic_repair!.decision_hash !== lineage.continuation_decision_hash) return undefined;
-	return continuation.value.semantic_repair!;
+	const continuation = await readDelegationCommittedGenerationV2(
+		projectRoot,
+		lineage.continuation_decision_delegation_id,
+	);
+	if (!continuation.ok) return undefined;
+	const continuationLineage = continuation.value.state.repair_lineage;
+	if (continuationLineage === undefined || continuationLineage.root_delegation_id !== lineage.root_delegation_id ||
+		continuationLineage.root_decision_hash !== lineage.root_decision_hash) return undefined;
+	const continuationDecision = await strictRepairDecisionForCommitted(projectRoot, continuation.value.state);
+	return continuationDecision?.decision_hash === lineage.continuation_decision_hash
+		? continuationDecision
+		: undefined;
 }
 
 function minimalPlanFact(before: unknown): WorkerRepairPlanFact | null {
@@ -194,12 +218,16 @@ export async function readWorkerRepairCapsule(
 				return { ok: false, code: review.ok ? "authority_invalid" : review.error.code === "storage_failure" ? "authority_unavailable" : "authority_invalid" };
 			}
 			semanticDecision = review.value.semantic_repair!;
-		} else if (!new Set(["FAILED", "FINISHED", "REVIEWED"]).has(state.status) &&
+		} else {
+			semanticDecision = await strictRepairDecisionForCommitted(projectRoot, state);
+		}
+		if (state.status !== "PENDING_REVIEW" &&
+			!new Set(["FAILED", "INTERRUPTED", "FINISHED", "REVIEWED"]).has(state.status) &&
 			!(state.status === "RECOVERY_REQUIRED" && state.repair_lineage !== undefined)) {
 			return { ok: false, code: "authority_invalid" };
 		}
 		if (state.repair_lineage !== undefined) {
-			const rootDecision = await strictSemanticRepairDecision(projectRoot, state);
+			const rootDecision = await strictRepairLineageDecision(projectRoot, state);
 			if (rootDecision === undefined) return { ok: false, code: "authority_invalid" };
 			semanticDecision ??= rootDecision;
 		}
@@ -242,7 +270,7 @@ export async function readWorkerRepairCapsule(
 			(await isStrictRetryableAbortedRepairV2(projectRoot, raw.value) ||
 				await isStrictRetryableEmptyRepairRecoveryV2(projectRoot, raw.value));
 		if (raw.ok && safeRawLineage) {
-			const semanticDecision = await strictSemanticRepairDecision(projectRoot, raw.value);
+			const semanticDecision = await strictRepairLineageDecision(projectRoot, raw.value);
 			if (semanticDecision === undefined) return { ok: false, code: "authority_invalid" };
 			const plan = await strictRepairPlanFact(projectRoot, raw.value);
 			if (!plan.ok) return { ok: false, code: "authority_invalid" };
@@ -278,7 +306,7 @@ export async function readWorkerRepairCapsule(
 		if (outcome === null || journal.journal_hash === null) return { ok: false, code: "authority_invalid" };
 		const semanticDecision = transaction.repair_lineage === undefined
 			? undefined
-			: await strictSemanticRepairDecision(projectRoot, transaction);
+			: await strictRepairLineageDecision(projectRoot, transaction);
 		if (transaction.repair_lineage !== undefined && semanticDecision === undefined) {
 			return { ok: false, code: "authority_invalid" };
 		}

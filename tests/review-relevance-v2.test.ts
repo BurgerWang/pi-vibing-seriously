@@ -368,6 +368,61 @@ test("D/control/unknown drift conflict while guard-classified artifacts are igno
 	assert.equal(artifact.ok, true);
 });
 
+test("terminal-negative review may rebind only an S-only control while worker bytes remain exact", async () => {
+	const source = fixture();
+	const controlPath = ".pi/workbench/recipes.yaml";
+	const controlIdentity = file(controlPath, "8".repeat(64), 11, "88");
+	const current = guard([...source.afterGuard.entries, entry(controlIdentity, "??")]);
+	const capture = {
+		collect_guard: async () => ({ ok: true as const, guard: current }),
+		capture_identities: async (input: { paths: readonly string[] }) => ({
+			ok: true as const,
+			identities: input.paths.map((path) => path === W
+				? source.workerAfter
+				: path === controlPath ? controlIdentity : missing(path)),
+			meter: {
+				paths_attempted: input.paths.length,
+				paths_completed: input.paths.length,
+				bytes_read: source.workerAfter.byte_size + controlIdentity.byte_size,
+			},
+		}),
+	};
+	const rebased = await collectReviewRelevanceV2({
+		project_root: "/tmp/review-relevance-v2",
+		delegation_id: ID,
+		contract_hash: CONTRACT,
+		after_guard: source.afterGuard,
+		change_set: source.changeSet,
+		exec: EXEC,
+		allow_control_rebase: true,
+	}, capture);
+	assert.equal(rebased.ok, true, rebased.ok ? "" : rebased.error.code);
+	if (!rebased.ok) return;
+	const control = rebased.value.projection.entries.find((candidate) => candidate.path === controlPath);
+	assert.deepEqual(control?.roles, ["S"]);
+	assert.deepEqual(control?.full_identity, controlIdentity);
+
+	const changedWorker = file(W, "9".repeat(64), source.workerAfter.byte_size, "99");
+	const workerDrift = await collectReviewRelevanceV2({
+		project_root: "/tmp/review-relevance-v2",
+		delegation_id: ID,
+		contract_hash: CONTRACT,
+		after_guard: source.afterGuard,
+		change_set: source.changeSet,
+		exec: EXEC,
+		allow_control_rebase: true,
+	}, {
+		...capture,
+		capture_identities: async (input: { paths: readonly string[] }) => ({
+			ok: true as const,
+			identities: input.paths.map((path) => path === W ? changedWorker : controlIdentity),
+			meter: { paths_attempted: input.paths.length, paths_completed: input.paths.length, bytes_read: 22 },
+		}),
+	});
+	assert.equal(workerDrift.ok, false);
+	if (!workerDrift.ok) assert.equal(workerDrift.error.code, "relevant_conflict");
+});
+
 test("hard path bounds fail closed before identity capture", async () => {
 	const source = fixture();
 	let captured = false;

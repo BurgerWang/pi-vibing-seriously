@@ -95,11 +95,13 @@ export function registerGitTool(controller: GitToolController): void {
 				await controller.reconcileProjectAuthority(projectRoot, controller.services.now().toISOString());
 				await controller.refreshStatus(ctx);
 				return {
-					content: [{ type: "text" as const, text: `workbench_git: inactive blocker closed; delegation=${result.value.delegation_id}; relevant_paths=${result.value.relevant_paths.length}; unrelated work=PRESERVED; Git mutation=NONE; authority=NOT_ACCEPTED${result.remaining_blocker_id === undefined ? "; next_action=continue in this worktree" : "; next_action=close the remaining blocker reported by status"}` }],
+					content: [{ type: "text" as const, text: `workbench_git: inactive blocker closed; delegation=${result.value.delegation_id}; closed_attempts=${result.closed_delegation_ids.length}; relevant_paths=${result.value.relevant_paths.length}; unrelated work=PRESERVED; Git mutation=NONE; authority=NOT_ACCEPTED${result.remaining_blocker_id === undefined ? "; next_action=continue in this worktree" : "; next_action=follow the current status for the remaining blocker"}` }],
 					details: {
 						ok: true,
 						action: "close_inactive_blocker",
 						delegation_id: result.value.delegation_id,
+						closed_delegation_ids: [...result.closed_delegation_ids],
+						closed_attempt_count: result.closed_delegation_ids.length,
 						relevant_path_count: result.value.relevant_paths.length,
 						closure_hash: result.value.closure_hash,
 						git_mutation: "NONE",

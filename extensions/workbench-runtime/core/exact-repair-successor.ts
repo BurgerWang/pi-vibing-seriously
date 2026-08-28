@@ -24,6 +24,7 @@ import {
 	type DelegationCommittedGenerationV2,
 } from "./delegation-transaction-storage.ts";
 import {
+	EXACT_REPAIR_RAW_LINEAGE_MAX_RETRYABLE_DEPTH_V1,
 	parseDelegationRepairLineageV1,
 	type DelegationTransactionRecord,
 } from "./delegation-transaction.ts";
@@ -175,7 +176,9 @@ export async function classifyExactRepairSuccessorV1(
 	return {
 		ok: true,
 		committed_proof_content_hash: null,
-		disposition: retryable.ok ? "EXACT_REPAIR_PENDING" : "BLOCKED",
+		disposition: retryable.ok && candidate.repair_lineage !== undefined
+			&& candidate.repair_lineage.depth <= EXACT_REPAIR_RAW_LINEAGE_MAX_RETRYABLE_DEPTH_V1
+			? "EXACT_REPAIR_PENDING" : "BLOCKED",
 	};
 }
 

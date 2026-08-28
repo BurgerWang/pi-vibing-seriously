@@ -58,6 +58,9 @@ export const RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2 = Object.freeze({
 } as const);
 export const RETRYABLE_EMPTY_RECOVERY_REASONS_V2 = Object.freeze({
 	workerRunnerFailed: "worker runner failed before terminal facts",
+	workerRepairAuthorityUnavailable: "worker repair authority was unavailable before worker launch",
+	workerRepairAuthorityInvalid: "worker repair authority was invalid before worker launch",
+	workerRepairCapsuleTooLarge: "worker repair capsule exceeded its bound before worker launch",
 	workerIdentityInvalid: "worker identity was missing or conflicted",
 	changeSetFinalizeFailed: "change set lifecycle finalization failed after worker return",
 	afterFactsConflict: "after facts conflicted with the finalized workspace guard",

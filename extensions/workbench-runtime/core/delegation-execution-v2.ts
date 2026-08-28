@@ -80,10 +80,12 @@ import { isStrictStreamingIdentityPath } from "./streaming-identity.ts";
 import { truncateUtf8 } from "../worker/handoff.ts";
 import {
 	runPinnedWorker,
+	workerRunnerPreflightFailureCode,
 	workerRunFailure,
 	type RunWorkerOptions,
 	type WorkerProgress,
 	type WorkerRunResult,
+	type WorkerRunnerPreflightFailureCode,
 } from "../worker/runner.ts";
 import { collectReviewRelevanceV2 } from "./review-relevance-v2.ts";
 import { preflightSemanticReviewEnvelopeV1 } from "./diff-review.ts";
@@ -171,6 +173,8 @@ interface DelegationExecutionV2Common {
 	workerSummary?: LedgerWorkerSummaryRecord;
 	/** Closed runner category; never contains provider text, stderr, paths, or raw errors. */
 	worker_failure_code?: WorkerRunFailureCode;
+	/** Closed preflight category for a runner exception before terminal facts. */
+	runner_preflight_failure_code?: WorkerRunnerPreflightFailureCode;
 	/** Bounded builder category; raw builder messages are never exposed. */
 	artifact_error_code?: DelegationArtifactErrorCode | "internal_error";
 }
@@ -607,10 +611,21 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 			onProgress: input.onProgress,
 			spendProfile: checked.contract.budget_profile as WorkerSpendProfile,
 		});
-	} catch {
+	} catch (error) {
+		const preflightCode = workerRunnerPreflightFailureCode(error);
+		const recoveryReason = preflightCode === "REPAIR_AUTHORITY_UNAVAILABLE"
+			? RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRepairAuthorityUnavailable
+			: preflightCode === "REPAIR_AUTHORITY_INVALID"
+				? RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRepairAuthorityInvalid
+				: preflightCode === "REPAIR_CAPSULE_TOO_LARGE"
+					? RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRepairCapsuleTooLarge
+					: RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed;
 		state = await attemptRecovery(checked, state, input.clock, storageOptions,
-			RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed);
-		return failure("runner_failed", checked, input, { durable_state: state });
+			recoveryReason);
+		return failure("runner_failed", checked, input, {
+			durable_state: state,
+			...(preflightCode === undefined ? {} : { runner_preflight_failure_code: preflightCode }),
+		});
 	}
 	if (!fixedWorkerIdentity(worker)) {
 		state = await attemptRecovery(checked, state, input.clock, storageOptions,

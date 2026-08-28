@@ -391,7 +391,7 @@ export function delegationNextActionTextV1(
 		return `repair delegation ${repair.delegationId} is ${repair.transactionStatus}; wait for it or recover its durable transaction`;
 	}
 	if (repair.kind === "repair_recovery") {
-		return `repair delegation ${repair.delegationId} is ${repair.transactionStatus}; inspect strict recovery authority before an exact repair_of retry`;
+		return `repair delegation ${repair.delegationId} is ${repair.transactionStatus} and has no further exact retry authority; if execution is inactive and this attempt ended before writes, call workbench_git action=close_inactive_blocker delegation_id=${repair.delegationId} to collapse the empty attempt chain; otherwise inspect strict recovery authority`;
 	}
 	if (state.latestId === undefined) return "start the first worker delegation (no delegation yet)";
 	if (state.status === "PENDING_REVIEW") {

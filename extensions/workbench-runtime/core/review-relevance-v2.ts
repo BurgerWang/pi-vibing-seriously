@@ -113,6 +113,12 @@ export interface CollectReviewRelevanceV2Input {
 	limits?: Readonly<ReviewRelevanceLimitsV2>;
 	/** Same-binding segmented/finalized replay authority. */
 	expected_projection?: Readonly<ReviewRelevanceProjectionV2>;
+	/**
+	 * A committed terminal-negative packet may be reviewed after a managed
+	 * policy/schema control changed. Worker, command, and dependency paths stay
+	 * byte-exact; only S-only controls are rebound into the new Sol packet.
+	 */
+	allow_control_rebase?: boolean;
 }
 
 export interface CollectReviewRelevanceV2Dependencies {
@@ -402,7 +408,8 @@ export async function collectReviewRelevanceV2(
 			|| input.change_set.delegation_id !== input.delegation_id || input.change_set.contract_hash !== input.contract_hash
 			|| (input.command_provenance !== undefined
 				&& !validateDelegationCommandProvenance(input.command_provenance, input.change_set))
-			|| (input.expected_projection !== undefined && !validateReviewRelevanceProjectionV2(input.expected_projection))) {
+			|| (input.expected_projection !== undefined && !validateReviewRelevanceProjectionV2(input.expected_projection))
+			|| (input.allow_control_rebase !== undefined && typeof input.allow_control_rebase !== "boolean")) {
 			return fail("invalid_input", meter);
 		}
 		if (input.command_provenance !== undefined
@@ -435,7 +442,10 @@ export async function collectReviewRelevanceV2(
 		const currentByPath = new Map(current.entries.map((entry) => [entry.path, entry]));
 		for (const path of relevancePaths) {
 			if (!sameGuardEntry(baselineByPath.get(path), currentByPath.get(path))) {
-				return fail("relevant_conflict", meter, path);
+				const pathRoles = roles.get(path) ?? [];
+				const safeControlRebase = input.allow_control_rebase === true
+					&& pathRoles.length === 1 && pathRoles[0] === "S";
+				if (!safeControlRebase) return fail("relevant_conflict", meter, path);
 			}
 		}
 		const baselinePaths = new Set(input.after_guard.entries.map((entry) => entry.path));

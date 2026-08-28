@@ -23,6 +23,7 @@ import {
 import {
 	abortPristinePreparedDelegationUnderStartLockV2,
 	RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2,
+	RETRYABLE_EMPTY_RECOVERY_REASONS_V2,
 } from "../extensions/workbench-runtime/core/delegation-execution-owner.ts";
 import {
 	acquireProjectDelegationStartLockV1,
@@ -54,7 +55,10 @@ import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtim
 import { EMPTY_WORKER_WRITE_JOURNAL_RUNTIME_OBSERVATION } from "../extensions/workbench-runtime/core/worker-write-journal-runtime.ts";
 import { beginWriteJournalOperation, completeWriteJournalOperation } from "../extensions/workbench-runtime/core/write-journal.ts";
 import { beginRunTransaction, commitRunTransaction } from "../extensions/workbench-runtime/core/run-transaction.ts";
-import type { WorkerRunResult } from "../extensions/workbench-runtime/worker/runner.ts";
+import {
+	WorkerRunnerPreflightError,
+	type WorkerRunResult,
+} from "../extensions/workbench-runtime/worker/runner.ts";
 
 const HEAD = "1".repeat(40);
 const execFileAsync = promisify(execFile);
@@ -912,6 +916,30 @@ test("execution v2: runner throw, identity drift, and after failure become durab
 			assert.equal(strict.ok, false);
 		});
 	}
+});
+
+test("execution v2: repair preflight failure keeps its closed cause in the response and durable recovery", async (t) => {
+	const projectRoot = await root(t);
+	const delegationId = id(34);
+	const result = await executeDelegationV2(await input(
+		projectRoot,
+		delegationId,
+		"implementation",
+		after(["src/changed.ts"]),
+		worker(completeReport(["src/changed.ts"])),
+		{
+			runWorker: async () => { throw new WorkerRunnerPreflightError("REPAIR_AUTHORITY_INVALID"); },
+		},
+	));
+	assert.equal(result.ok, false);
+	if (result.ok) return;
+	assert.equal(result.code, "runner_failed");
+	assert.equal(result.runner_preflight_failure_code, "REPAIR_AUTHORITY_INVALID");
+	assert.equal(result.durable_state?.status, "RECOVERY_REQUIRED");
+	assert.equal(result.durable_state?.recovery_reason,
+		RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRepairAuthorityInvalid);
+	assert.equal(JSON.stringify(result).includes("authority was invalid"), true);
+	assert.equal((await readDelegationCommittedGenerationV2(projectRoot, delegationId)).ok, false);
 });
 
 test("execution v2: missing exec aborts prepared ChangeSet lifecycle before callback or child", async (t) => {

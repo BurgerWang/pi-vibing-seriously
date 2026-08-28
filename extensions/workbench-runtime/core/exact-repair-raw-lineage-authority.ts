@@ -24,6 +24,7 @@ import {
 import {
 	bindDelegationRepairLineageV1,
 	DELEGATION_REPAIR_LINEAGE_MAX_DEPTH,
+	EXACT_REPAIR_RAW_LINEAGE_MAX_RETRYABLE_DEPTH_V1,
 	parseDelegationRepairLineageV1,
 	type DelegationTransactionRecord,
 } from "./delegation-transaction.ts";
@@ -175,7 +176,8 @@ export async function readRawLineageImmutableRepairV1(
 	const tip = tipRead.value;
 	const lineage = parseDelegationRepairLineageV1(tip.repair_lineage);
 	if (tip.task_kind !== "implementation" || tip.committed_proof !== null || lineage === undefined ||
-		lineage.repair_of === tip.delegation_id || lineage.depth >= DELEGATION_REPAIR_LINEAGE_MAX_DEPTH) {
+		lineage.repair_of === tip.delegation_id || lineage.depth >= DELEGATION_REPAIR_LINEAGE_MAX_DEPTH ||
+		lineage.depth > EXACT_REPAIR_RAW_LINEAGE_MAX_RETRYABLE_DEPTH_V1) {
 		return { ok: false, code: "RAW_TIP_NOT_RETRYABLE" };
 	}
 	const evidence = await readers.readRawEvidence(projectRoot, tip);

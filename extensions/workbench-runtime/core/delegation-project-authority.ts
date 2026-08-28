@@ -59,6 +59,7 @@ import {
 	releaseOrphanedTerminalExecutionOwnerV2,
 	isStrictRetryableAbortedRepairV2,
 	isStrictRetryableEmptyRepairRecoveryV2,
+	readStrictRetryableRawRepairEvidenceV1,
 	type DelegationExecutionOwnerOptionsV2,
 } from "./delegation-execution-owner.ts";
 import {
@@ -167,7 +168,12 @@ export type AbandonCleanProjectDelegationRepairV1Result =
 	| { ok: false; code: string; delegation_id?: string };
 
 export type CloseInactiveProjectDelegationBlockerV2Result =
-	| { ok: true; value: DelegationInactiveBlockerClosureV2; remaining_blocker_id?: string }
+	| {
+		ok: true;
+		value: DelegationInactiveBlockerClosureV2;
+		closed_delegation_ids: readonly string[];
+		remaining_blocker_id?: string;
+	}
 	| { ok: false; code: string; delegation_id?: string };
 
 export type QuarantineProjectDelegationAuthorityV1Result =
@@ -1013,6 +1019,10 @@ export async function collectCurrentDelegationBindingV2(
 		change_set: changeSet as ChangeSetRecord,
 		...(commandProvenance === undefined ? {} : { command_provenance: commandProvenance }),
 		exec,
+		...(isDelegationTerminalNegativeReviewEligibleFromCommittedV1(
+			committed.value.state,
+			committed.value.records,
+		) ? { allow_control_rebase: true } : {}),
 		...(expectedProjection === undefined ? {} : { expected_projection: expectedProjection }),
 	});
 	if (relevance.ok) {
@@ -1250,38 +1260,66 @@ export async function closeInactiveProjectDelegationBlockerV2(input: {
 	if (!acquired.ok) return { ok: false, code: `start_lock_${acquired.error.code}`, delegation_id: initialId };
 
 	const outcome = await (async (): Promise<CloseInactiveProjectDelegationBlockerV2Result> => {
-		const current = await readProjectDelegationBlockerV2(input.project_root);
+		const guard = await collectWorkspaceGuard({ project_root: input.project_root, exec: input.exec });
+		if (!guard.ok) return { ok: false, code: `workspace_${guard.error.code}`, delegation_id: initialId };
+		let current = await readProjectDelegationBlockerV2(input.project_root);
 		if (!current.ok) return { ok: false, code: current.issue.code, ...(current.issue.delegationId === undefined ? {} : { delegation_id: current.issue.delegationId }) };
 		if (current.value === null || current.value.delegation_id !== initialId) {
 			return { ok: false, code: "blocker_changed", ...(current.value === null ? {} : { delegation_id: current.value.delegation_id }) };
 		}
-		if (["PREPARED", "RUNNING", "COMMITTING"].includes(current.value.status)) {
-			return { ok: false, code: "blocker_execution_active", delegation_id: initialId };
+		let firstClosure: DelegationInactiveBlockerClosureV2 | undefined;
+		const closedIds: string[] = [];
+		while (current.value !== null) {
+			const transaction = current.value;
+			if (["PREPARED", "RUNNING", "COMMITTING"].includes(transaction.status)) {
+				return { ok: false, code: "blocker_execution_active", delegation_id: transaction.delegation_id };
+			}
+			const owner = await readDelegationExecutionOwnerV2(input.project_root, transaction);
+			if (owner.ok) return { ok: false, code: "execution_owner_present", delegation_id: transaction.delegation_id };
+			if (owner.error.code !== "not_found") return { ok: false, code: owner.error.code, delegation_id: transaction.delegation_id };
+			const published = await publishDelegationInactiveBlockerClosureV2({
+				project_root: input.project_root,
+				transaction,
+				workspace_guard: guard.guard,
+				closed_by: input.closed_by,
+				now: input.now,
+			});
+			if (!published.ok) {
+				const code = published.error.code === "not_recoverable" ? "relevant_paths_not_clean" : `blocker_closure_${published.error.code}`;
+				return { ok: false, code, delegation_id: transaction.delegation_id };
+			}
+			firstClosure ??= published.value;
+			closedIds.push(transaction.delegation_id);
+			const closedEmptyAttempt = isDelegationEmptyRepairAttemptSupersessionV1(transaction, published.value);
+			const verified = await readProjectDelegationBlockerV2(input.project_root);
+			if (!verified.ok) return { ok: false, code: verified.issue.code, ...(verified.issue.delegationId === undefined ? {} : { delegation_id: verified.issue.delegationId }) };
+			if (verified.value?.delegation_id === transaction.delegation_id) {
+				return { ok: false, code: "blocker_closure_not_effective", delegation_id: transaction.delegation_id };
+			}
+			if (!closedEmptyAttempt || verified.value === null) {
+				return {
+					ok: true,
+					value: firstClosure,
+					closed_delegation_ids: Object.freeze([...closedIds]),
+					...(verified.value === null ? {} : { remaining_blocker_id: verified.value.delegation_id }),
+				};
+			}
+			const next = verified.value;
+			const retryableEmpty = next.repair_lineage !== undefined && next.committed_proof === null
+				&& next.terminal_outcome === null && next.review === null
+				&& (next.status === "ABORTED" || next.status === "RECOVERY_REQUIRED")
+				&& (await readStrictRetryableRawRepairEvidenceV1(input.project_root, next)).ok;
+			if (!retryableEmpty) {
+				return {
+					ok: true,
+					value: firstClosure,
+					closed_delegation_ids: Object.freeze([...closedIds]),
+					remaining_blocker_id: next.delegation_id,
+				};
+			}
+			current = verified;
 		}
-		const owner = await readDelegationExecutionOwnerV2(input.project_root, current.value);
-		if (owner.ok) return { ok: false, code: "execution_owner_present", delegation_id: initialId };
-		if (owner.error.code !== "not_found") return { ok: false, code: owner.error.code, delegation_id: initialId };
-		const guard = await collectWorkspaceGuard({ project_root: input.project_root, exec: input.exec });
-		if (!guard.ok) return { ok: false, code: `workspace_${guard.error.code}`, delegation_id: initialId };
-		const published = await publishDelegationInactiveBlockerClosureV2({
-			project_root: input.project_root,
-			transaction: current.value,
-			workspace_guard: guard.guard,
-			closed_by: input.closed_by,
-			now: input.now,
-		});
-		if (!published.ok) {
-			const code = published.error.code === "not_recoverable" ? "relevant_paths_not_clean" : `blocker_closure_${published.error.code}`;
-			return { ok: false, code, delegation_id: initialId };
-		}
-		const verified = await readProjectDelegationBlockerV2(input.project_root);
-		if (!verified.ok) return { ok: false, code: verified.issue.code, ...(verified.issue.delegationId === undefined ? {} : { delegation_id: verified.issue.delegationId }) };
-		if (verified.value?.delegation_id === initialId) return { ok: false, code: "blocker_closure_not_effective", delegation_id: initialId };
-		return {
-			ok: true,
-			value: published.value,
-			...(verified.value === null ? {} : { remaining_blocker_id: verified.value.delegation_id }),
-		};
+		throw new Error("unreachable blocker closure state");
 	})();
 	const released = await releaseProjectDelegationStartLockV1(acquired.value);
 	if (!released.ok) return { ok: false, code: `start_lock_release_${released.error.code}`, delegation_id: initialId };

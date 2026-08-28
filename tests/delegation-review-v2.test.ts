@@ -9,6 +9,8 @@ import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import { reviewDelegationV2 } from "../extensions/workbench-runtime/core/delegation-review-v2.ts";
 import {
+	closeInactiveProjectDelegationBlockerV2,
+	collectCurrentDelegationBindingV2,
 	readDelegationAuthorityObservationV2,
 	reconcileProjectDelegationAuthorityV2,
 } from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
@@ -20,6 +22,7 @@ import {
 	commitDelegationGeneration,
 	createNodeDelegationTransactionStorageAdapter,
 	DELEGATION_REVIEW_STORAGE_FAULT_POINTS,
+	persistAbortedDelegationTransaction,
 	persistCommittingDelegationTransaction,
 	persistPreparedDelegationTransaction,
 	persistRunningDelegationTransaction,
@@ -34,6 +37,7 @@ import {
 	type DelegationCommittedRecords,
 	type DelegationTransactionStorageFaultPoint,
 } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
+import { RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2 } from "../extensions/workbench-runtime/core/delegation-execution-owner.ts";
 import {
 	collectGitFacts,
 	computeDiffHash,
@@ -58,6 +62,8 @@ import {
 	estimateSemanticReviewRecordBytesV1,
 } from "../extensions/workbench-runtime/core/semantic-review-envelope.ts";
 import { collectReviewRelevanceV2 } from "../extensions/workbench-runtime/core/review-relevance-v2.ts";
+import { readRawLineageImmutableRepairV1 } from "../extensions/workbench-runtime/core/exact-repair-raw-lineage-authority.ts";
+import { readWorkerRepairCapsule } from "../extensions/workbench-runtime/core/worker-repair-authority.ts";
 import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { beginWriteJournalOperation, completeWriteJournalOperation } from "../extensions/workbench-runtime/core/write-journal.ts";
 import { spawnExec } from "./helpers.ts";
@@ -958,6 +964,159 @@ test("review v2 terminal-negative: complete W/C packet permits only immutable So
 		} finally {
 			await cleanup(fixture);
 		}
+	}
+});
+
+test("terminal-negative recovery rebinds S-only control drift, exposes repair capsules, and collapses an empty retry chain", async () => {
+	const fixture = await setupReviewFixture(
+		["src/a.ts"], undefined, ["src/a.ts"], false, false, undefined, undefined, [], "INTERRUPTED",
+	);
+	try {
+		const controlPath = ".pi/workbench/recipes.yaml";
+		await mkdir(dirname(join(fixture.root, controlPath)), { recursive: true });
+		await writeFile(join(fixture.root, controlPath), "version: 2\n", "utf8");
+		const presented = await reviewDelegationV2({
+			projectRoot: fixture.root,
+			delegationId: ID,
+			exec: spawnExec,
+			now: at(4),
+		});
+		assert.equal(presented.ok, true, presented.ok ? "" : JSON.stringify(presented.error));
+		if (!presented.ok || presented.review.record === undefined) return;
+		const projection = presented.review.record.relevance_projection;
+		assert.notEqual(projection, undefined);
+		if (projection === undefined) return;
+		const control = projection.entries
+			.find((candidate) => candidate.path === controlPath);
+		assert.deepEqual(control?.roles, ["S"]);
+		assert.equal(control?.full_identity.kind, "file");
+
+		const repaired = await repairPresentedReview(
+			fixture,
+			presented.review.record.bound_diff_hash,
+			"Repair the interrupted worker outcome under the current managed control.",
+			5,
+		);
+		assert.equal(repaired.ok, true, repaired.ok ? "" : JSON.stringify(repaired.error));
+		if (!repaired.ok) return;
+		assert.equal(repaired.semantic_authority, "terminal_repair_required");
+		assert.deepEqual(await collectCurrentDelegationBindingV2(fixture.root, ID, spawnExec), {
+			status: "fresh",
+			hash: presented.review.record.bound_diff_hash,
+			kind: "changeset-relevance-v2",
+		});
+		const rootCapsule = await readWorkerRepairCapsule(fixture.root, ID);
+		assert.equal(rootCapsule.ok, true, rootCapsule.ok ? "" : rootCapsule.code);
+		if (!rootCapsule.ok) return;
+		assert.equal(rootCapsule.capsule.authority_kind, "v2_committed");
+		assert.equal(rootCapsule.capsule.authority_status, "INTERRUPTED");
+		const terminalAuthority = await readDelegationTerminalNegativeReviewV1(fixture.root, ID);
+		assert.equal(terminalAuthority.ok, true, terminalAuthority.ok ? "" : JSON.stringify(terminalAuthority.error));
+		if (!terminalAuthority.ok || terminalAuthority.value.terminal_negative_repair === undefined) return;
+		const rootDecision = terminalAuthority.value.terminal_negative_repair.decision;
+		assert.equal(rootCapsule.capsule.semantic_repair?.decision_hash, rootDecision.decision_hash);
+		const before = fixture.records["before.json"] as Record<string, any>;
+		const { contract_hash: _persistedHash, repair_of: _priorRepair, ...contractPayload } = before.contract;
+		const contractFor = (repairOf: string) => {
+			const rebound = bindDelegationBoundedTaskContractV2({ ...contractPayload, repair_of: repairOf });
+			assert.equal(rebound.ok, true, rebound.ok ? "" : rebound.error.code);
+			if (!rebound.ok) throw new Error("repair contract setup failed");
+			return rebound.value;
+		};
+		const firstId = "20260817-170006-rw01";
+		const firstLineage = bindDelegationRepairLineageV1({
+			schema_version: 1,
+			kind: "semantic-repair-lineage-v1",
+			root_delegation_id: ID,
+			repair_of: ID,
+			root_decision_hash: rootDecision.decision_hash,
+			continuation_decision_delegation_id: ID,
+			continuation_decision_hash: rootDecision.decision_hash,
+			parent_lineage_hash: null,
+			depth: 1,
+			carried_paths: ["src/a.ts"],
+		});
+		assert.notEqual(firstLineage, undefined);
+		if (firstLineage === undefined) return;
+		const firstContract = contractFor(ID);
+		const firstPrepared = await persistPreparedDelegationTransaction(fixture.root, {
+			delegation_id: firstId,
+			task_kind: "implementation",
+			contract_hash: firstContract.contract_hash,
+			allowed_paths: firstContract.allowed_paths,
+			worker_identity: { ...IDENTITY, worker_id: `worker:${firstId}` },
+			generation: 1,
+			now: at(6),
+			repair_lineage: firstLineage,
+		});
+		assert.equal(firstPrepared.ok, true, firstPrepared.ok ? "" : firstPrepared.error.code);
+		if (!firstPrepared.ok) return;
+		const firstAborted = await persistAbortedDelegationTransaction(fixture.root, {
+			...cas(firstPrepared.value, 7),
+			reason: RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.preparedCallbackFailed,
+		});
+		assert.equal(firstAborted.ok, true, firstAborted.ok ? "" : firstAborted.error.code);
+		if (!firstAborted.ok) return;
+		const firstCapsule = await readWorkerRepairCapsule(fixture.root, firstId);
+		assert.equal(firstCapsule.ok, true, firstCapsule.ok ? "" : firstCapsule.code);
+		if (firstCapsule.ok) {
+			assert.equal(firstCapsule.capsule.authority_kind, "v2_repair_lineage");
+			assert.equal(firstCapsule.capsule.semantic_repair?.decision_hash, rootDecision.decision_hash);
+		}
+
+		const secondId = "20260817-170008-rw02";
+		const secondLineage = bindDelegationRepairLineageV1({
+			schema_version: 1,
+			kind: "semantic-repair-lineage-v1",
+			root_delegation_id: ID,
+			repair_of: firstId,
+			root_decision_hash: rootDecision.decision_hash,
+			continuation_decision_delegation_id: ID,
+			continuation_decision_hash: rootDecision.decision_hash,
+			parent_lineage_hash: firstLineage.lineage_hash,
+			depth: 2,
+			carried_paths: ["src/a.ts"],
+		});
+		assert.notEqual(secondLineage, undefined);
+		if (secondLineage === undefined) return;
+		const secondContract = contractFor(firstId);
+		const secondPrepared = await persistPreparedDelegationTransaction(fixture.root, {
+			delegation_id: secondId,
+			task_kind: "implementation",
+			contract_hash: secondContract.contract_hash,
+			allowed_paths: secondContract.allowed_paths,
+			worker_identity: { ...IDENTITY, worker_id: `worker:${secondId}` },
+			generation: 1,
+			now: at(8),
+			repair_lineage: secondLineage,
+		});
+		assert.equal(secondPrepared.ok, true, secondPrepared.ok ? "" : secondPrepared.error.code);
+		if (!secondPrepared.ok) return;
+		const secondAborted = await persistAbortedDelegationTransaction(fixture.root, {
+			...cas(secondPrepared.value, 9),
+			reason: RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.preparedCallbackFailed,
+		});
+		assert.equal(secondAborted.ok, true, secondAborted.ok ? "" : secondAborted.error.code);
+		if (!secondAborted.ok) return;
+		assert.deepEqual(await readRawLineageImmutableRepairV1(fixture.root, secondId), {
+			ok: false,
+			code: "RAW_TIP_NOT_RETRYABLE",
+		});
+
+		const closed = await closeInactiveProjectDelegationBlockerV2({
+			project_root: fixture.root,
+			expected_delegation_id: secondId,
+			now: at(10),
+			exec: spawnExec,
+			closed_by: SOL_REVIEWER,
+		});
+		assert.equal(closed.ok, true, closed.ok ? "" : closed.code);
+		if (closed.ok) {
+			assert.deepEqual(closed.closed_delegation_ids, [secondId, firstId]);
+			assert.equal(closed.remaining_blocker_id, ID);
+		}
+	} finally {
+		await cleanup(fixture);
 	}
 });
 
