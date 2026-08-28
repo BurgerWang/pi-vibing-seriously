@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, readlink, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -119,6 +119,49 @@ async function readFixture(id: typeof FIXTURE_IDS[number]): Promise<{ fixture: R
 	return { fixture: parsed, raw };
 }
 
+interface TreeIdentityEntry {
+	path: string;
+	kind: "directory" | "file" | "symlink" | "other";
+	bytes?: number;
+	sha256?: string;
+	target?: string;
+}
+
+/** Byte identity of the replay root; timestamps are deliberately not authority. */
+async function treeIdentity(root: string): Promise<TreeIdentityEntry[]> {
+	const output: TreeIdentityEntry[] = [];
+	const walk = async (directory: string, prefix: string): Promise<void> => {
+		const entries = await readdir(directory, { withFileTypes: true });
+		entries.sort((left, right) => byteCompare(left.name, right.name));
+		for (const entry of entries) {
+			const path = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
+			const absolute = join(directory, entry.name);
+			if (entry.isDirectory()) {
+				output.push({ path, kind: "directory" });
+				await walk(absolute, path);
+				continue;
+			}
+			if (entry.isFile()) {
+				const bytes = await readFile(absolute);
+				output.push({
+					path,
+					kind: "file",
+					bytes: bytes.byteLength,
+					sha256: createHash("sha256").update(bytes).digest("hex"),
+				});
+				continue;
+			}
+			if (entry.isSymbolicLink()) {
+				output.push({ path, kind: "symlink", target: await readlink(absolute) });
+				continue;
+			}
+			output.push({ path, kind: "other" });
+		}
+	};
+	await walk(root, "");
+	return output;
+}
+
 function fixtureReaders(fixture: ReplayFixture): DelegationPathLaneAdmissionReadersV1 {
 	const transactions = new Map(fixture.transactions.map((entry) => [entry.state.delegation_id, entry]));
 	const missing = () => ({ ok: false as const, error: { code: "not_found" as const } });
@@ -170,6 +213,7 @@ test("real-history fixtures replay independently through the production path-lan
 			t.after(async () => rm(tempRoot, { recursive: true, force: true }));
 			const copiedFixture = join(tempRoot, "history.json");
 			await writeFile(copiedFixture, raw, "utf8");
+			const beforeReplay = await treeIdentity(tempRoot);
 			const reparsed = JSON.parse(await readFile(copiedFixture, "utf8")) as ReplayFixture;
 			const readers = fixtureReaders(reparsed);
 			const input = { project_root: tempRoot, allowed_paths: [reparsed.expected.probe_path] };
@@ -192,6 +236,11 @@ test("real-history fixtures replay independently through the production path-lan
 			assert.equal(lifecycle.state, "TERMINAL_NON_BLOCKING");
 			assert.equal(lifecycle.primary_action.action, "CONTINUE_DEVELOPMENT");
 			assert.equal(lifecycle.primary_action.reason, "NO_CURRENT_BLOCKER");
+			assert.deepEqual(
+				await treeIdentity(tempRoot),
+				beforeReplay,
+				"v1/old-v2 compatibility replay must not create or rewrite any durable file",
+			);
 		});
 	}
 });
