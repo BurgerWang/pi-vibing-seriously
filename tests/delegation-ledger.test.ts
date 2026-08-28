@@ -26,13 +26,13 @@ import {
 	collectGitFacts,
 	computeDiffHash,
 	contentDigest,
-	createDelegationLedger,
+	createDelegationLedger as createHistoricalDelegationLedger,
 	delegationDirFor,
 	delegationReportPath,
 	delegationsDir,
 	DELEGATION_RECORD_MAX_BYTES,
 	digestFromPrefix,
-	finishDelegationLedger,
+	finishDelegationLedger as finishHistoricalDelegationLedger,
 	isDelegationRecordPath,
 	isDelegationStartLockArtifactPath,
 	isToolResultReceiptPath,
@@ -49,6 +49,10 @@ import {
 	type GitFacts,
 	type LedgerWorkerFacts,
 } from "../extensions/workbench-runtime/core/delegation-ledger.ts";
+import {
+	createLegacyDelegationFixture as createDelegationLedger,
+	finishLegacyDelegationFixture as finishDelegationLedger,
+} from "./legacy-delegation-fixture.ts";
 import {
 	MAX_WORKER_REPORT_BYTES,
 	WORKER_REPORT_TRUNCATION_MARKER,
@@ -541,6 +545,34 @@ test("changedSinceBefore detects new, deleted and digest-moved paths — includi
 // ---------------------------------------------------------------------------
 // ledger lifecycle
 // ---------------------------------------------------------------------------
+
+test("production refuses historical schema v1 ledger writes without creating artifacts", async () => {
+	await withTempDir(async (dir) => {
+		const id = "20260828-120000-rdon";
+		const before: GitFacts = {
+			gitHead: null,
+			gitDirty: false,
+			changedPaths: [],
+			pathStatuses: {},
+			pathDigests: {},
+		};
+		const created = await createHistoricalDelegationLedger(
+			dir,
+			id,
+			{ task: "legacy", allowedPaths: ["src/**"], acceptanceCriteria: [], verification: [], timeoutSeconds: 60 },
+			before,
+			NOW,
+		);
+		assert.deepEqual(created, { ok: false, error: "historical delegation schema v1 is read-only" });
+		const finished = await finishHistoricalDelegationLedger(dir, id, {
+			after: { ...before, diffHash: computeDiffHash([], {}, {}), changedSinceBefore: [] },
+			worker: workerFacts(),
+			now: NOW,
+		});
+		assert.deepEqual(finished, { ok: false, error: "historical delegation schema v1 is read-only" });
+		await assert.rejects(stat(delegationDirFor(dir, id)), /ENOENT/);
+	});
+});
 
 test("createDelegationLedger writes atomic bounded manifest + before records", async () => {
 	await withTempDir(async (dir) => {

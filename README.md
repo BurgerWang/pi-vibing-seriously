@@ -74,9 +74,12 @@ Execution summaries are checked against machine evidence. In particular, the
 assistant may report a current-turn worker attempt only when that turn actually
 called `workbench_delegate_worker`; delegation status and completion claims
 must match durable workbench authority. If the claim guard rejects a summary,
-follow its emitted `next_action` and avoid treating the rejected prose as
+follow its emitted typed `next_action` and avoid treating the rejected prose as
 evidence. Run-related failures direct you to `workbench_read_run`; delegation
-failures direct you to `workbench_delegation_status`. Explicit `delegation_id`
+failures use the single lifecycle resolver to select one callable action.
+`workbench_delegation_status` only projects durable authority plus the live
+binding: reading status never appends a session entry, rewrites authority, or
+creates a tool-result receipt. Explicit `delegation_id`
 and `run_id` labels are never interchangeable. For an otherwise unlabeled id,
 the guard resolves the shared id shape through exclusive strict on-disk run or
 delegation authority instead of relying only on prose word order. New guard
@@ -123,7 +126,9 @@ success and grants no Gate authority.
 | **DEV** | Build and repair | Sol directs; Luna performs routine writes; temporary Sol writes require an explicit bounded lease |
 | **VERIFY** | Re-check a stable candidate | Declared recipes and gates only |
 
-The normal path is intentionally short:
+The normal path is intentionally short. Safe close, supersede, rebase,
+stale-lock reclaim, and continuation are runtime-owned transitions; ordinary
+development does not require user lifecycle choreography:
 
 ```text
 inspect → Sol contract → one Luna delivery → focused feedback → stable candidate → final verification
@@ -133,12 +138,11 @@ A successful delegated implementation performs its scope check and completes
 its bounded mechanical presentation in the same call. At no more than 32
 pages, the runtime then invokes the structured GPT-5.6 Sol reviewer and
 persists only a hash-bound `ACCEPT` or `REPAIR`; model/protocol/drift failure
-leaves durable worker success intact and returns `/q-review <id>` for direct,
-idempotent recovery. `/q-review` and `/q-repair` execute their exact durable
-services without asking the commander model to choose or reconstruct a tool
-call. Machine-facing results instead return callable
+leaves durable worker success intact and resolves one typed machine action for
+direct, idempotent recovery. Machine-facing results return callable
 `workbench_review_worker_diff` or `workbench_repair_delegation` actions, so an
-agent never deadlocks on a user-only slash command. Manual
+agent never deadlocks on a user-only slash command. `/q-review` and `/q-repair`
+remain equivalent human convenience commands, not required workflow steps. Manual
 `workbench_review_worker_diff` remains available for legacy,
 oversized, mechanically failed, or authority-gap cases.
 

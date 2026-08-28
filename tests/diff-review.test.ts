@@ -38,13 +38,15 @@ import {
 	collectGitFacts,
 	computeDiffHash,
 	contentDigest,
-	createDelegationLedger,
-	finishDelegationLedger,
 	makeDelegationId,
 	MAX_DIGEST_BYTES,
 	readDelegationLedger,
 	type LedgerWorkerFacts,
 } from "../extensions/workbench-runtime/core/delegation-ledger.ts";
+import {
+	createLegacyDelegationFixture as createDelegationLedger,
+	finishLegacyDelegationFixture as finishDelegationLedger,
+} from "./legacy-delegation-fixture.ts";
 import {
 	COMPACT_GENERATOR_EQUALITY,
 	COMPACT_MIN_BYTES,

@@ -101,6 +101,8 @@ extensions/workbench-runtime/
     │                        #   cumulative spend object in usage.json/worker-summary.json
 	├── delegation-state.ts  # P7 review lifecycle: PENDING_REVIEW → REVIEWED → STALE,
 	│                        #   hash binding invariants, delegation/VERIFY blocking (pure)
+	├── delegation-lifecycle-resolver.ts # canonical pure lifecycle state/action owner;
+	│                        #   compatibility classifiers only project into it
 	├── delegation-execution-owner.ts # v2 PREPARED/RUNNING owner identity +
 	│                        #   fail-closed crash/reboot orphan reconciliation
     ├── project-checkout-operation.ts # one shared-checkout writer lane for all
@@ -228,6 +230,15 @@ contexts only. It is not the production branch-selection rule. A session
 custom entry may restore presentation preferences, but it cannot override a
 v2 transaction, generation, review, or repair sidecar.
 
+`core/delegation-lifecycle-resolver.ts` is the only production owner of
+lifecycle state and primary-action selection. Status, exact-repair successor,
+review, and continuation compatibility surfaces first project their facts into
+that pure resolver; they do not maintain parallel transition tables. Status is
+a read-only projection: it may observe the current binding in memory, but it
+does not reconcile or persist a session mirror, append entries, rewrite project
+authority, or create a tool-result receipt. Mutation boundaries own any safe
+close, supersede, rebase, lock-reclaim, or continuation effect.
+
 ### Controlled worker delegation
 
 ```
@@ -292,15 +303,14 @@ GPT-5.6 Sol parent in DEV
        then a cross-page final call over every raw hash-bound page)
   → the existing review API alone persists ACCEPT or REPAIR; nested usage and
        receipt hash are returned. Model/protocol/drift failures preserve worker
-       success + PENDING and return exact /q-review <id>
-  → /q-review <id> runs that durable service directly without a commander
-       model turn; machine next_action uses workbench_review_worker_diff and
-       manual review remains the bounded
+       success + PENDING and resolve one typed REVIEW_CANDIDATE action
+  → machine next_action uses workbench_review_worker_diff; /q-review <id>
+       is the equivalent human convenience command, and manual review remains the bounded
        route for legacy, oversized, mechanical FAIL, or authority gaps
   → REPAIR leaves PENDING_REVIEW/Gates blocked and enables exact
        workbench_repair_delegation(delegation_id), which strict-reads authority
        and idempotently executes/returns the single successor without using
-       session-latest state; /q-repair is the user-only convenience command
+       session-latest state; /q-repair is the equivalent human convenience command
   → a closed failed implementation with attributed partial work publishes
        INTERRUPTED. Eligible INTERRUPTED/legacy FAILED presentation permits
        only a distinct terminal-negative Sol REPAIR sidecar; ACCEPT and

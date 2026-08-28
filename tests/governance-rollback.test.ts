@@ -5,7 +5,8 @@ import { join } from "node:path";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
-import { createDelegationLedger, readDelegationLedger } from "../extensions/workbench-runtime/core/delegation-ledger.ts";
+import { readDelegationLedger } from "../extensions/workbench-runtime/core/delegation-ledger.ts";
+import { createLegacyDelegationFixture as createDelegationLedger } from "./legacy-delegation-fixture.ts";
 import { inspectGovernanceRollback } from "../extensions/workbench-runtime/core/governance-rollback.ts";
 import { persistPreparedDelegationTransaction } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
 import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtime/core/worker-policy.ts";

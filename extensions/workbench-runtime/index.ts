@@ -883,11 +883,10 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	}
 
 	/**
-	 * P7: refresh the delegation state against its tagged current binding, then build
-	 * the status lines (actor, policy, lease, latest delegation, review
-	 * status, hashes, blocked write attempts, latest review verdict). Relevant
-	 * or unknown-origin new-v2 drift, or any legacy full-diff change, turns a
-	 * REVIEWED delegation STALE here.
+	 * Build a read-only projection from durable authority and the live binding,
+	 * then render the canonical lifecycle action. Relevant or unknown-origin
+	 * new-v2 drift, or any legacy full-diff change, is displayed as STALE here
+	 * without rewriting the session mirror.
 	 *
 	 * Fail closed: when the authority-specific binding cannot be collected, the
 	 * authoritative delegation state stays untouched (no observe, no
@@ -898,21 +897,18 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	async function delegationStatusLines(projectRoot: string): Promise<{ lines: string[]; gitRefresh: "fresh" | "unavailable" }> {
 		const now = new Date().toISOString();
 		let gitRefresh: "fresh" | "unavailable" = "fresh";
-		await delegationSession.reconcileProjectAuthority(projectRoot, now);
-		latestRepairStatus = delegationProjectIssueRepairStatusV1(delegationSession.getProjectAuthorityIssue()) ?? await readDelegationRepairStatusV1(projectRoot, delegationSession.getState(), execFn);
-		refreshCompactP7Facts();
+		let delegationState = delegationSession.getState();
 		try {
-			if (delegationSession.getProjectAuthorityIssue() !== undefined) throw new Error("project authority unavailable");
 			const binding = await delegationSession.collectCurrentBinding(projectRoot);
 			if (binding.status === "unavailable") throw new Error("delegation binding unavailable");
-			delegationSession.setState(observeDiffChange(delegationSession.getState(), binding.hash, now));
-			delegationSession.persistBestEffort();
+			delegationState = observeDiffChange(delegationState, binding.hash, now);
 		} catch {
-			// Real-git refresh unavailable: the in-memory/persisted
-			// authoritative state is left untouched and reported as NOT
-			// freshly verified (never silently presented as fresh).
+			// The persisted mirror remains untouched and is never presented as
+			// freshly verified when the live binding cannot be collected.
 			gitRefresh = "unavailable";
 		}
+		latestRepairStatus = await readDelegationRepairStatusV1(projectRoot, delegationState, execFn);
+		refreshCompactP7Facts(delegationState);
 		const actor = detectActorRole({
 			roleEnv: workerRoleContext.role,
 			provider: currentModelFacts.provider,
@@ -924,21 +920,24 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			`write policy : ${policy ?? "not-applicable"}`,
 			`write lease  : ${leaseCompactSummary(writeLease, now)}`,
 		];
-		const delegationProjectAuthorityIssue = delegationSession.getProjectAuthorityIssue();
-		const delegationState = delegationSession.getState();
+		const delegationProjectAuthorityIssue = latestRepairStatus.kind === "historical_multiplicity" ||
+			latestRepairStatus.kind === "authority_invalid"
+			? { code: latestRepairStatus.code, delegationId: latestRepairStatus.delegationId ?? undefined }
+			: undefined;
 		if (delegationProjectAuthorityIssue !== undefined) {
 			if (latestRepairStatus.kind === "historical_multiplicity") {
 				lines.push(
 					`project auth : HISTORICAL_MULTIPLICITY (${delegationProjectAuthorityIssue.code}) — request-specific strict path admission required`,
 					`latest       : ${delegationProjectAuthorityIssue.delegationId ?? delegationState.latestId ?? "(unknown)"} HISTORICAL_MULTIPLICITY`,
 					`blocked writes: ${delegationState.blockedWriteAttempts}`,
-					...delegationRepairStatusLinesV1(latestRepairStatus),
+					...delegationRepairStatusLinesV1(latestRepairStatus, delegationState),
 				);
 			} else {
 				lines.push(
 					`project auth : INVALID (${delegationProjectAuthorityIssue.code}) — delegation and verification fail closed`,
 					`latest       : ${delegationProjectAuthorityIssue.delegationId ?? delegationState.latestId ?? "(unknown)"} PROJECT_AUTHORITY_INVALID`,
 					`blocked writes: ${delegationState.blockedWriteAttempts}`,
+					...delegationRepairStatusLinesV1(latestRepairStatus, delegationState),
 				);
 			}
 		} else if (delegationState.latestId !== undefined) {
@@ -950,14 +949,16 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				`reviewed hash: ${delegationState.reviewedDiffHash ?? "(none)"}`,
 				`blocked writes: ${delegationState.blockedWriteAttempts}`,
 			);
-			lines.push(...delegationRepairStatusLinesV1(latestRepairStatus));
+			lines.push(...delegationRepairStatusLinesV1(latestRepairStatus, delegationState));
 			const block = authority.kind === "v2" && !["PENDING_REVIEW", "REVIEWED"].includes(authority.transactionStatus)
 				? undefined
 				: reviewBlockReason(delegationState, "delegation");
 			const finalizedReviewedStaleSuccessor = delegationState.status === "STALE" && authority.kind === "v2"
 				&& authority.transactionStatus === "REVIEWED" && authority.finalized
 				&& authority.review?.verdict === "PASS" && authority.semanticAccepted;
-			if (block && !finalizedReviewedStaleSuccessor) lines.push(delegationExactRepairRouteLineV1(latestRepairStatus) ?? `blocked      : ${block}`);
+			if (block && !finalizedReviewedStaleSuccessor && delegationExactRepairRouteLineV1(latestRepairStatus) === undefined) {
+				lines.push(`blocked      : ${block}`);
+			}
 			if (block && finalizedReviewedStaleSuccessor) {
 				lines.push(
 					"successor    : ALLOWED after live revalidation — prior v2 review has strict semantic authority; a fresh delegation adopts the current workspace as its new baseline",
@@ -1004,7 +1005,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 						const strictSemantic = authority.finalized && authority.semanticAccepted;
 						if (authority.finalized && !strictSemantic) lines.push(
 							"semantic v2  : MISSING — historical scope/integrity FINAL is not hash-bound Sol ACCEPT",
-							authority.review.schema_version === 2 ? "next action  : call workbench_review_worker_diff without a decision; inspect the migration packet, then ACCEPT both displayed hashes" : "next action  : legacy schema-1 FINAL has no automatic semantic migration and remains blocked",
+							authority.review.schema_version === 2 ? "migration     : inspect the immutable packet before any hash-bound ACCEPT" : "migration     : legacy schema-1 FINAL has no automatic semantic migration and remains blocked",
 						);
 						else if (authority.semanticSource === "migration") lines.push(`semantic v2  : ACCEPT (migration) by ${authority.semanticReviewer} at ${authority.semanticAcceptedAt}`, `reviewed bind : ${authority.semanticBindingHash}`);
 						else if (authority.semanticSource === "embedded") lines.push(`semantic v2  : ACCEPT by ${authority.semanticReviewer} at ${authority.semanticAcceptedAt}`);
@@ -1012,7 +1013,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 					} else if (authority.transactionVerdict !== null) {
 						lines.push(`completion v2: ${authority.transactionVerdict} (strict terminal machine facts; no review artifact)`);
 						if (authority.repairLineage === undefined && authority.transactionStatus === "ABORTED") {
-							lines.push("next action  : start a fresh delegation; the terminal before-worker transaction needs no review");
+							lines.push("completion   : terminal before-worker attempt; no review authority is required");
 						}
 					} else {
 						lines.push(`review v2    : NOT_RUN`);
@@ -1023,6 +1024,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			latestRepairStatus = { kind: "none" };
 			lines.push(`latest       : (no delegation)`);
 			lines.push(`blocked writes: ${delegationState.blockedWriteAttempts}`);
+			lines.push(...delegationRepairStatusLinesV1(latestRepairStatus, delegationState));
 		}
 		if (gitRefresh === "unavailable") {
 			lines.push(`git refresh  : UNAVAILABLE — git status failed; the hashes above are persisted state, NOT freshly verified`);

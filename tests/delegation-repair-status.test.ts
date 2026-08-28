@@ -93,19 +93,18 @@ test("repair status projects a fresh negative decision into one exact next actio
 	});
 	assert.equal(status.kind, "repair_required");
 	assert.equal(delegationNextActionTextV1(state, status),
-		`call workbench_repair_delegation with delegation_id=${ID} to execute the exact semantic repair directly from strict durable authority`);
+		`call workbench_repair_delegation with delegation_id=${ID} to execute the exact repair from durable authority`);
 	assert.match(delegationRepairStatusLinesV1(status).join("\n"), /REPAIR_REQUIRED/);
 	assert.match(delegationRepairStatusLinesV1(status).join("\n"), new RegExp(`workbench_repair_delegation with delegation_id=${ID}`));
 	assert.doesNotMatch(delegationRepairStatusLinesV1(status).join("\n"), /call workbench_delegate_worker/u);
 	assert.equal(
 		delegationExactRepairRouteLineV1(status),
-		`repair route : ALLOWED — ordinary/new delegations remain blocked; call workbench_repair_delegation with delegation_id=${ID}`,
+		`repair route : ALLOWED — ordinary/new delegations remain blocked; call workbench_repair_delegation with delegation_id=${ID} to execute the exact repair from durable authority`,
 	);
 });
 
 test("strict terminal-negative sidecars survive status reload and route directly to q-repair", async () => {
 	for (const terminalStatus of ["INTERRUPTED", "FAILED"] as const) {
-		let capsuleReads = 0;
 		const projected = await readDelegationRepairStatusV1("/tmp/project", state, (async () => {
 			throw new Error("unused");
 		}) as ExecFn, {
@@ -122,17 +121,12 @@ test("strict terminal-negative sidecars survive status reload and route directly
 			}),
 			collectBinding: async () => ({ status: "fresh", hash: HASH, kind: "changeset-relevance-v2" }),
 			readCommittedGeneration: async () => ({ ok: true, value: terminalCommitted(terminalStatus) }),
-			readRepairCapsule: async () => {
-				capsuleReads += 1;
-				return { ok: false, code: "authority_invalid" };
-			},
 		});
 		assert.equal(projected.kind, "repair_required");
-		assert.equal(capsuleReads, 0, "terminal-negative sidecar authority must not depend on a legacy retry capsule");
 		assert.match(delegationNextActionTextV1(state, projected) ?? "", new RegExp(`workbench_repair_delegation with delegation_id=${ID}`));
 		assert.match(delegationRepairStatusLinesV1(projected).join("\n"), /REPAIR_REQUIRED/u);
 		assert.equal(delegationExactRepairRouteLineV1(projected),
-			`repair route : ALLOWED — ordinary/new delegations remain blocked; call workbench_repair_delegation with delegation_id=${ID}`);
+			`repair route : ALLOWED — ordinary/new delegations remain blocked; call workbench_repair_delegation with delegation_id=${ID} to execute the exact repair from durable authority`);
 	}
 });
 
@@ -142,7 +136,6 @@ test("eligible terminal-negative authority without a sidecar routes to q-review,
 		readAuthority: async () => observation({ transactionStatus: "INTERRUPTED" }),
 		collectBinding: async () => ({ status: "fresh" as const, hash: HASH, kind: "changeset-relevance-v2" as const }),
 		readCommittedGeneration: async () => ({ ok: true as const, value: terminalCommitted("INTERRUPTED") }),
-		readRepairCapsule: async () => { throw new Error("terminal-negative route must not read a legacy retry capsule"); },
 	};
 	const missing = await readDelegationRepairStatusV1("/tmp/project", state, (async () => {
 		throw new Error("unused");
@@ -159,7 +152,8 @@ test("eligible terminal-negative authority without a sidecar routes to q-review,
 		...services,
 		readAuthority: async () => ({ kind: "invalid-v2", code: "invalid_record" }),
 	});
-	assert.deepEqual(corrupt, { kind: "authority_invalid", delegationId: ID, code: "invalid_record" });
+	assert.equal(corrupt.kind, "authority_invalid");
+	assert.equal(corrupt.resolution?.primary_action.action, "QUARANTINE_CORRUPT_AUTHORITY");
 	const corruptAction = delegationNextActionTextV1(state, corrupt) ?? "";
 	assert.match(corruptAction, /quarantine_unreadable_authority/u);
 	assert.doesNotMatch(corruptAction, /\/q-(?:review|repair)/u);
@@ -178,7 +172,6 @@ test("a corrupt provisional review over readable committed authority resolves to
 			kind: "derived-review-invalid", transactionStatus: "PENDING_REVIEW", code: "invalid_record", resolution,
 		}),
 		collectBinding: async () => ({ status: "fresh", hash: HASH, kind: "changeset-relevance-v2" }),
-		readRepairCapsule: async () => { throw new Error("derived review regeneration must not read repair authority"); },
 	});
 	assert.equal(projected.kind, "derived_review_invalid");
 	if (projected.kind !== "derived_review_invalid") return;
@@ -223,7 +216,6 @@ test("an eligible lineaged INTERRUPTED tip routes to q-review instead of generic
 		readAuthority: async () => observation({ transactionStatus: "INTERRUPTED", repairLineage: lineage }),
 		collectBinding: async () => ({ status: "fresh", hash: HASH, kind: "changeset-relevance-v2" }),
 		readCommittedGeneration: async () => ({ ok: true, value: committed }),
-		readRepairCapsule: async () => { throw new Error("review route must not read the retry capsule"); },
 	});
 	assert.equal(projected.kind, "terminal_negative_review");
 	assert.match(delegationNextActionTextV1(state, projected) ?? "", new RegExp(`workbench_review_worker_diff with delegation_id=${ID}`));
@@ -237,7 +229,6 @@ test("ineligible lineageless FAILED authority remains on strict recovery and nev
 		readAuthority: async () => observation({ transactionStatus: "FAILED" }),
 		collectBinding: async () => ({ status: "fresh", hash: HASH, kind: "changeset-relevance-v2" }),
 		readCommittedGeneration: async () => ({ ok: true, value: terminalCommitted("FAILED", []) }),
-		readRepairCapsule: async () => ({ ok: false, code: "authority_invalid" }),
 	});
 	assert.equal(projected.kind, "delegation_recovery");
 	assert.doesNotMatch(delegationNextActionTextV1(state, projected) ?? "", /q-review/u);
@@ -260,25 +251,21 @@ test("binding conflict and project-chain invalidity never advertise an executabl
 	assert.equal(conflict.kind, "repair_required");
 	const conflictAction = delegationNextActionTextV1(state, conflict) ?? "";
 	assert.doesNotMatch(conflictAction, /start the exact semantic repair/);
-	assert.match(conflictAction, new RegExp(`workbench_git action=close_inactive_blocker delegation_id=${ID}`));
-	assert.match(conflictAction, /no new worktree is required/);
+	assert.match(conflictAction, /rebase the current binding under the writer lock/u);
+	assert.equal(conflict.resolution?.primary_action.action, "REBASE_CURRENT_BINDING");
+	assert.doesNotMatch(conflictAction, /workbench_repair_delegation/u);
 	assert.equal(delegationExactRepairRouteLineV1(conflict), undefined);
 
-	let capsuleReads = 0;
 	const invalid = await readDelegationRepairStatusV1("/tmp/project", state, (async () => {
 		throw new Error("unused");
 	}) as ExecFn, {
 		readAuthority: async () => ({ kind: "invalid-v2", code: "repair_lineage_fork" }),
 		collectBinding: async () => ({ status: "unavailable" }),
-		readRepairCapsule: async () => {
-			capsuleReads += 1;
-			return { ok: false, code: "authority_invalid" };
-		},
 	});
-	assert.deepEqual(invalid, { kind: "authority_invalid", delegationId: ID, code: "repair_lineage_fork" });
-	assert.equal(capsuleReads, 0);
+	assert.equal(invalid.kind, "authority_invalid");
+	assert.equal(invalid.resolution?.primary_action.action, "QUARANTINE_CORRUPT_AUTHORITY");
 	const next = delegationNextActionTextV1(state, invalid) ?? "";
-	assert.match(next, /fail-closed/);
+	assert.match(next, /quarantine_unreadable_authority/u);
 	assert.doesNotMatch(next, /workbench_delegate_worker repair_of/);
 });
 
@@ -294,11 +281,11 @@ test("project-wide repair corruption remains visible even when the restored mirr
 		readRepairClosure: async () => ({ ok: false, issue: { code: "repair_lineage_fork" } }),
 		readAuthority: async () => { throw new Error("must not read a missing latest id"); },
 		collectBinding: async () => { throw new Error("must not collect a missing latest id"); },
-		readRepairCapsule: async () => { throw new Error("must not read a missing latest id"); },
 	});
-	assert.deepEqual(invalid, { kind: "authority_invalid", delegationId: null, code: "repair_lineage_fork" });
+	assert.equal(invalid.kind, "authority_invalid");
+	assert.equal(invalid.resolution?.primary_action.action, "QUARANTINE_CORRUPT_AUTHORITY");
 	const next = delegationNextActionTextV1(empty, invalid) ?? "";
-	assert.match(next, /project delegation authority is repair_lineage_fork/);
+	assert.match(next, /select and quarantine the exact unreadable project authority/u);
 	assert.doesNotMatch(next, /start the first worker delegation/);
 });
 
@@ -325,23 +312,23 @@ test("durable unresolved tip overrides a stale cached latest id and project issu
 			readIds.push(id ?? "(none)");
 			return { status: "fresh", hash: HASH, kind: "changeset-relevance-v2" };
 		},
-		readRepairCapsule: async () => ({ ok: false, code: "authority_invalid" }),
 	});
 	assert.equal(projected.kind, "repair_required");
 	if (projected.kind === "repair_required") assert.equal(projected.delegationId, hiddenTip);
 	assert.deepEqual(readIds, [hiddenTip, hiddenTip]);
 	assert.match(delegationNextActionTextV1(state, projected) ?? "", new RegExp(`workbench_repair_delegation with delegation_id=${hiddenTip}`));
 	assert.doesNotMatch(delegationNextActionTextV1(state, projected) ?? "", /start the next delegation/);
-	assert.deepEqual(delegationProjectIssueRepairStatusV1({ code: "binding_unavailable" }), {
-		kind: "authority_invalid", delegationId: null, code: "binding_unavailable",
-	});
+	const unavailable = delegationProjectIssueRepairStatusV1({ code: "binding_unavailable" });
+	assert.equal(unavailable?.kind, "authority_invalid");
+	assert.equal(unavailable?.resolution?.primary_action.action, "REPORT_STORAGE_FAILURE");
 });
 
 test("readable historical multiplicity is not projected as corrupt authority", async () => {
 	for (const code of ["additional_unresolved_authority", "repair_lineage_multiple_unresolved"] as const) {
 		const tip = "20260827-120000-mult";
 		const projected = delegationProjectIssueRepairStatusV1({ code, delegationId: tip });
-		assert.deepEqual(projected, { kind: "historical_multiplicity", delegationId: tip, code });
+		assert.equal(projected?.kind, "historical_multiplicity");
+		assert.equal(projected?.resolution?.primary_action.action, "BLOCK_OVERLAPPING_PATHS");
 		if (projected === undefined) continue;
 		const lines = delegationRepairStatusLinesV1(projected).join("\n");
 		const next = delegationNextActionTextV1(state, projected) ?? "";
@@ -349,14 +336,11 @@ test("readable historical multiplicity is not projected as corrupt authority", a
 		assert.match(lines, /strict full-project path-lane admission/u);
 		assert.match(lines, /overlap or unknown authority remains BLOCKED/u);
 		assert.match(lines, /VERIFY remains BLOCKED/u);
-		assert.match(lines, new RegExp(`workbench_repair_delegation with delegation_id=${tip}`, "u"));
+		assert.doesNotMatch(lines, /workbench_repair_delegation/u);
 		assert.doesNotMatch(lines, /INVALID/u);
-		assert.match(next, /ordinary delegation requires strict full-project path-lane admission/u);
-		assert.match(next, /VERIFY remains blocked/u);
-		assert.equal(
-			delegationExactRepairRouteLineV1(projected),
-			`repair route : call workbench_repair_delegation with delegation_id=${tip} only for that strict current tip; ordinary delegation requires path-lane admission and VERIFY remains blocked`,
-		);
+		assert.match(next, /overlapping or unknown path authority/u);
+		assert.match(next, /VERIFY remain blocked/u);
+		assert.equal(delegationExactRepairRouteLineV1(projected), undefined);
 	}
 });
 
@@ -371,13 +355,9 @@ test("repair-status closure uses the same historical multiplicity classification
 		}),
 		readAuthority: async () => { throw new Error("must not read one arbitrary tip"); },
 		collectBinding: async () => { throw new Error("must not collect one arbitrary tip"); },
-		readRepairCapsule: async () => ({ ok: false, code: "authority_invalid" }),
 	});
-	assert.deepEqual(projected, {
-		kind: "historical_multiplicity",
-		delegationId: tip,
-		code: "repair_lineage_multiple_unresolved",
-	});
+	assert.equal(projected.kind, "historical_multiplicity");
+	assert.equal(projected.resolution?.primary_action.action, "BLOCK_OVERLAPPING_PATHS");
 });
 
 test("lineaged terminal retry, active execution, and pending review have distinct non-contradictory guidance", () => {
@@ -401,11 +381,15 @@ test("lineaged terminal retry, active execution, and pending review have distinc
 	assert.match(delegationNextActionTextV1(state, failed) ?? "", new RegExp(`workbench_repair_delegation with delegation_id=${ID}`));
 	assert.match(delegationRepairStatusLinesV1(failed).join("\n"), new RegExp(`workbench_repair_delegation with delegation_id=${ID}`));
 
-	const staleFailed = { ...failed, binding: "conflict" as const };
-	assert.match(delegationNextActionTextV1(state, staleFailed) ?? "", /lineage-contained terminal rebase eligibility/u);
-	assert.match(delegationRepairStatusLinesV1(staleFailed).join("\n"), /lineage-contained terminal rebase eligibility/u);
-	assert.match(delegationRepairStatusLinesV1(staleFailed).join("\n"), new RegExp(`workbench_repair_delegation with delegation_id=${ID}`));
-	assert.doesNotMatch(delegationRepairStatusLinesV1(staleFailed).join("\n"), /restore the exact/u);
+	const staleFailed = classifyDelegationRepairStatusV1({
+		delegationId: ID,
+		authority: observation({ transactionStatus: "FAILED", repairLineage: lineage }),
+		binding: { status: "conflict", hash: "f".repeat(64), kind: "changeset-relevance-v2", code: "binding_conflict" },
+		retryable: true,
+	});
+	assert.equal(staleFailed.resolution?.primary_action.action, "REBASE_CURRENT_BINDING");
+	assert.match(delegationNextActionTextV1(state, staleFailed) ?? "", /rebase the current binding under the writer lock/u);
+	assert.doesNotMatch(delegationRepairStatusLinesV1(staleFailed).join("\n"), /workbench_repair_delegation/u);
 
 	const active = classifyDelegationRepairStatusV1({
 		delegationId: ID,
@@ -413,7 +397,7 @@ test("lineaged terminal retry, active execution, and pending review have distinc
 		binding: { status: "fresh", hash: HASH, kind: "changeset-relevance-v2" },
 	});
 	assert.equal(active.kind, "repair_active");
-	assert.match(delegationNextActionTextV1(state, active) ?? "", /wait for it or recover/);
+	assert.match(delegationNextActionTextV1(state, active) ?? "", /active writer.*wait for its durable result/u);
 	assert.doesNotMatch(delegationNextActionTextV1(state, active) ?? "", /review delegation/);
 
 	const pending = classifyDelegationRepairStatusV1({
@@ -422,7 +406,7 @@ test("lineaged terminal retry, active execution, and pending review have distinc
 		binding: { status: "fresh", hash: HASH, kind: "changeset-relevance-v2" },
 	});
 	assert.equal(pending.kind, "repair_review");
-	assert.match(delegationNextActionTextV1(state, pending) ?? "", /explicitly ACCEPT.*or issue another REPAIR/);
+	assert.match(delegationNextActionTextV1(state, pending) ?? "", new RegExp(`workbench_review_worker_diff with delegation_id=${ID}`));
 });
 
 test("status lines expose the canonical typed action recovered by the status reader", () => {
@@ -449,7 +433,7 @@ test("status lines expose the canonical typed action recovered by the status rea
 	assert.match(lines.join("\n"), /typed action : REVIEW_CANDIDATE \(CURRENT_DELTA_REVIEW_REQUIRED\)/u);
 });
 
-test("ordinary active and failed v2 transactions never inherit the mirror's review instruction", () => {
+test("ordinary active and retryable v2 transactions consume the canonical action, never the mirror instruction", () => {
 	const ordinaryFailed = classifyDelegationRepairStatusV1({
 		delegationId: ID,
 		authority: observation({ transactionStatus: "FAILED", repairLineage: undefined }),
@@ -457,7 +441,8 @@ test("ordinary active and failed v2 transactions never inherit the mirror's revi
 		retryable: true,
 	});
 	assert.equal(ordinaryFailed.kind, "delegation_retry");
-	assert.match(delegationNextActionTextV1(state, ordinaryFailed) ?? "", /no committed repair lineage/u);
+	assert.equal(ordinaryFailed.resolution?.primary_action.action, "EXECUTE_EXACT_REPAIR");
+	assert.match(delegationNextActionTextV1(state, ordinaryFailed) ?? "", new RegExp(`workbench_repair_delegation with delegation_id=${ID}`));
 	assert.doesNotMatch(delegationRepairStatusLinesV1(ordinaryFailed).join("\n"), /call workbench_delegate_worker/u);
 	assert.doesNotMatch(delegationNextActionTextV1(state, ordinaryFailed) ?? "", /review delegation/);
 
@@ -467,7 +452,7 @@ test("ordinary active and failed v2 transactions never inherit the mirror's revi
 		binding: { status: "fresh", hash: HASH, kind: "changeset-relevance-v2" },
 	});
 	assert.equal(ordinaryRunning.kind, "delegation_active");
-	assert.match(delegationNextActionTextV1(state, ordinaryRunning) ?? "", /wait for the worker result/);
+	assert.match(delegationNextActionTextV1(state, ordinaryRunning) ?? "", /active writer.*wait for its durable result/u);
 	assert.doesNotMatch(delegationNextActionTextV1(state, ordinaryRunning) ?? "", /review delegation/);
 });
 

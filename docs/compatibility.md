@@ -59,19 +59,26 @@ first completes the durable provisional packet, refuses to call the model above
 page assessments. Nested usage and an immutable receipt hash are returned, but
 only the existing semantic artifact grants review authority. Model/protocol/
 drift failure leaves successful worker authority at `PENDING_REVIEW` and gives
-exact `/q-review <id>`; legacy, oversized, mechanical FAIL, and authority-gap
-cases retain a bounded manual route. `/q-review` is a direct command and the old
+one typed `REVIEW_CANDIDATE` action whose machine command is
+`workbench_review_worker_diff`; legacy, oversized, mechanical FAIL, and authority-gap
+cases retain a bounded manual route. `/q-review` is an equivalent human convenience command and the old
 read-only prompt is now `/q-code-review` with no same-name alias.
 
 Closed implementation failure with nonempty attributed work is represented as
 `INTERRUPTED`. Strict eligible `INTERRUPTED`, and compatible historical
 `FAILED`, may publish only a distinct terminal-negative Sol `REPAIR` sidecar;
 `ACCEPT` and ordinary `REVIEWED` are invalid. Reload/status exposes a valid
-sidecar as `repair_required` plus exact `/q-repair <id>`, exposes a missing
-eligible decision as exact `/q-review <id>`, and fails closed on corruption.
+sidecar as `repair_required` plus one typed `EXECUTE_EXACT_REPAIR` action,
+exposes a missing eligible decision as `REVIEW_CANDIDATE`, and fails closed on corruption.
 `/q-repair` strict-reads exact ordinary or terminal-negative authority and
 idempotently returns/creates the one lineaged successor without relying on the
 session's latest entry.
+
+These compatibility labels and exported shapes do not own lifecycle decisions:
+they project into the canonical resolver, which returns exactly one primary
+action. Status is read-only and produces no session append, authority rewrite,
+or durable receipt. Historical schema-v1 ledger readers remain supported, while
+the retained create/finish exports fail closed instead of writing v1 records.
 
 A compatible proof-null lineaged `ABORTED` or `RECOVERY_REQUIRED` attempt whose
 strict raw evidence proves zero worker writes can be durably superseded without

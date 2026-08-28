@@ -1046,7 +1046,7 @@ test("two on-disk repair lineages stay non-invalid, admit disjoint work, and q-r
 		assert.match(statusText, /VERIFY remains BLOCKED/u);
 		assert.doesNotMatch(statusText, /project auth\s+: INVALID/u);
 		await persistCompactMirror(resumed, resumedCtx);
-		assert.match(latestCompactState(resumed).nextDelegationAction ?? "", /historical blocker multiplicity/u);
+		assert.match(latestCompactState(resumed).nextDelegationAction ?? "", /overlapping or unknown path authority/u);
 		assert.doesNotMatch(latestCompactState(resumed).nextDelegationAction ?? "", /authority is .*fail-closed/u);
 
 		const beforeOverlap = await delegationDirectories(root);
@@ -1491,7 +1491,8 @@ test("model-supplied repair_of cannot supersede a committed FAILED delegation wi
 		const transactionBefore = await readFile(transactionPath, "utf8");
 		const status = await delegationStatusTool(stub).execute("committed-failed-status", {}, undefined, undefined, ctx);
 		assert.match(resultText(status), /completion v2:\s+FAIL/);
-		assert.match(resultText(status), /next action\s+: inspect workbench_delegation_status; do not retry review/u);
+		assert.match(resultText(status), /typed action\s+: BLOCK_OVERLAPPING_PATHS/u);
+		assert.match(resultText(status), /next action\s+: resolve the overlapping or unknown path authority/u);
 		assert.doesNotMatch(resultText(status), /repair_of=/u, "the zero-quality diagnosis failure has no Sol terminal-negative sidecar");
 		const refusedReview = await reviewTool(stub).execute(
 			"committed-failed-review", { delegation_id: failedId }, undefined, undefined, ctx,
@@ -2767,11 +2768,17 @@ test("a fresh session discovers durable ABORTED project authority without report
 		const mirror = latestSessionState(stub);
 		assert.equal(mirror.latestId, id);
 		assert.equal(mirror.status, "REVIEWED", "a before-worker abort is terminal and does not strand the next delegation");
+		const entriesBeforeStatus = stub.appendedEntries.length;
+		const transactionPath = join(root, CONFIG_DIR_NAME, "workbench", "delegations", id, "v2", "transaction.json");
+		const transactionBeforeStatus = await readFile(transactionPath, "utf8");
 		const status = await delegationStatusTool(stub).execute("project-aborted-status", {}, undefined, undefined, ctx);
 		assert.match(resultText(status), /authority v2\s+: transaction ABORTED/);
 		assert.match(resultText(status), /completion v2: FAIL/);
-		assert.match(resultText(status), /next action\s+: start a fresh delegation; the terminal before-worker transaction needs no review/);
+		assert.match(resultText(status), /typed action\s+: CONTINUE_DEVELOPMENT/u);
+		assert.match(resultText(status), /next action\s+: continue ordinary development; no lifecycle command is required/u);
 		assert.doesNotMatch(resultText(status), /INVALID|\(no delegation\)/);
+		assert.equal(stub.appendedEntries.length, entriesBeforeStatus, "status adds no session mirror entry");
+		assert.equal(await readFile(transactionPath, "utf8"), transactionBeforeStatus, "status never rewrites durable authority");
 
 		const script = await writeFakeWorker(root, {});
 		const successor = await withFakeWorker(script, () => delegateTool(stub).execute(
@@ -2874,7 +2881,7 @@ test("session_start atomically aborts an ownerless preboot empty RUNNING transac
 		assert.equal(latestSessionState(stub).status, "REVIEWED");
 		const status = await delegationStatusTool(stub).execute("project-interrupted-status", {}, undefined, undefined, ctx);
 		assert.doesNotMatch(resultText(status), /blocked\s+: Starting a new worker delegation/);
-		assert.match(resultText(status), /next action\s+: start a fresh delegation/);
+		assert.match(resultText(status), /next action\s+: continue ordinary development; no lifecycle command is required/u);
 	});
 });
 

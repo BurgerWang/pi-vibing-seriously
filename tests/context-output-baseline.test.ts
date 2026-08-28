@@ -10,11 +10,13 @@ import workbenchRuntime from "../extensions/workbench-runtime/index.ts";
 import {
 	collectAfterFacts,
 	collectGitFacts,
-	createDelegationLedger,
-	finishDelegationLedger,
 	makeDelegationId,
 	type LedgerWorkerFacts,
 } from "../extensions/workbench-runtime/core/delegation-ledger.ts";
+import {
+	createLegacyDelegationFixture as createDelegationLedger,
+	finishLegacyDelegationFixture as finishDelegationLedger,
+} from "./legacy-delegation-fixture.ts";
 import { DELEGATION_STATE_ENTRY_TYPE, serializeDelegationState } from "../extensions/workbench-runtime/core/delegation-state.ts";
 import {
 	COMMANDER_HISTORY_MAX_BYTES,

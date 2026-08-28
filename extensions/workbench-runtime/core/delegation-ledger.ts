@@ -1,7 +1,9 @@
 /**
- * P7 delegation ledger — durable before/after records for one worker
- * delegation. Pure logic with injected exec (git calls are argv-only,
- * shell=false), no Pi imports.
+ * Historical P7 delegation schema v1 — strict read compatibility, shared
+ * bounded Git-fact primitives, and retained public types. Production
+ * create/finish exports fail closed; current delegation writes use v2 only.
+ * Pure logic with injected exec (git calls are argv-only, shell=false), no Pi
+ * imports.
  *
  * Layout: `<project-root>/<CONFIG_DIR_NAME>/workbench/delegations/<id>/`
  *   manifest.json        — status + git/diff hash summary
@@ -41,8 +43,8 @@
  *   - git calls go through the injected ExecFn with argv arrays only
  *     (shell=false is the caller's contract — the same exec used for
  *     recipes); no shell strings, no user-controlled flags
- *   - every JSON file is written atomically (tmp + rename), bounded, and
- *     never contains full worker transcripts, secrets, or unbounded logs
+ *   - the exported atomic helpers remain for bounded compatibility fixtures;
+ *     production lifecycle code cannot use them to create schema-v1 ledgers
  *   - the ledger's own directory is excluded from the git facts it
  *     records, so its records can never pollute the diff they describe;
  *     the P8b tool-result receipts subtree is excluded the same way
@@ -60,7 +62,6 @@ import { TextDecoder } from "node:util";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import { canonicalHash, sha256HexBytes } from "../cache/canonical-hash.ts";
-import { redactText } from "./redact.ts";
 import type { ExecFn } from "./config.ts";
 import type {
 	WorkerSpendBand,
@@ -74,12 +75,7 @@ import { resolveWorkerBudgetProfile, resolveWorkerRepairOf } from "./worker-poli
 import { readJsonFileBounded, type BoundedFileIoHooks } from "./bounded-file-io.ts";
 import {
 	MAX_WORKER_REPORT_BYTES,
-	parseWorkerReport,
-	truncateUtf8,
 	WORKER_REPORT_FILE_NAME,
-	WORKER_REPORT_TRUNCATION_MARKER,
-	WORKER_SUMMARY_FILE_NAME,
-	WORKER_USAGE_FILE_NAME,
 } from "../worker/handoff.ts";
 
 export const DELEGATION_SCHEMA_VERSION = 1;
@@ -1044,58 +1040,15 @@ export function boundLedgerContract(raw: LedgerContract): { ok: true; contract: 
 // ---------------------------------------------------------------------------
 
 export type LedgerResult = { ok: true; dir: string } | { ok: false; error: string };
-/**
- * Create the delegation ledger: atomic manifest.json (status "running") and
- * before.json. Call AFTER collecting the before facts (the ledger's own
- * files are excluded from git facts, so the order keeps them out of both
- * snapshots).
- */
+/** @deprecated Historical schema v1 is read-only; production writes v2 only. */
 export async function createDelegationLedger(
-	projectRoot: string,
-	delegationId: string,
-	rawContract: LedgerContract,
-	before: GitFacts,
-	now: string,
+	_projectRoot: string,
+	_delegationId: string,
+	_rawContract: LedgerContract,
+	_before: GitFacts,
+	_now: string,
 ): Promise<LedgerResult> {
-	if (!isValidDelegationId(delegationId)) return { ok: false, error: `invalid delegation id "${delegationId}"` };
-	const bounded = boundLedgerContract(rawContract);
-	if (!bounded.ok) return bounded;
-	const dir = delegationDirFor(projectRoot, delegationId);
-	const beforeHash = computeDiffHash(before.changedPaths, before.pathDigests, before.pathStatuses);
-	const manifest: DelegationManifest = {
-		schema_version: DELEGATION_SCHEMA_VERSION,
-		delegation_id: delegationId,
-		created_at: now,
-		finished_at: null,
-		status: "running",
-		review_status: "PENDING_REVIEW",
-		git_head_before: before.gitHead,
-		git_dirty_before: before.gitDirty,
-		diff_hash_before: beforeHash,
-		diff_hash_after: null,
-		changed_path_count_before: before.changedPaths.length,
-		changed_path_count_after: null,
-		changed_since_before_count: null,
-	};
-	const beforeRecord: LedgerBeforeRecord = {
-		schema_version: DELEGATION_SCHEMA_VERSION,
-		delegation_id: delegationId,
-		recorded_at: now,
-		contract: bounded.contract,
-		git_head: before.gitHead,
-		git_dirty: before.gitDirty,
-		diff_hash: beforeHash,
-		changed_paths: [...before.changedPaths],
-		path_statuses: { ...before.pathStatuses },
-		path_digests: { ...before.pathDigests },
-	};
-	try {
-		await writeJsonAtomic(dir, "manifest.json", manifest);
-		await writeJsonAtomic(dir, "before.json", beforeRecord);
-		return { ok: true, dir };
-	} catch (error) {
-		return { ok: false, error: (error as Error).message };
-	}
+	return { ok: false, error: "historical delegation schema v1 is read-only" };
 }
 
 export interface FinishDelegationInput {
@@ -1118,205 +1071,13 @@ export interface FinishDelegationInput {
 
 export type FinishLedgerResult = { ok: true; dir: string; workerSummary: LedgerWorkerSummaryRecord } | { ok: false; error: string };
 
-/**
- * Finish the ledger after the worker returns — on success AND failure. The
- * after record always carries the outcome facts, the true changed paths
- * (digests + porcelain statuses), the after diff hash, usage/budget facts,
- * a bounded redacted report summary and the safe reported_paths parsed
- * from the worker's ## Files Changed section; review stays PENDING_REVIEW
- * (review.json placeholder). Every finished outcome atomically writes the
- * seven-artifact layout (manifest/before/after/worker-summary/review.json
- * + the bounded worker-report.md and usage.json) — the review service
- * replaces the placeholder. worker-report.md is the REDACTED final worker
- * text: redaction happens FIRST, then the UTF-8-safe cap to
- * MAX_WORKER_REPORT_BYTES with the explicit truncation marker ONLY when
- * the REDACTED report still exceeds the bound (mode 0600, atomic
- * temp+rename, never included in any parent tool result).
- * worker-summary.json carries the ACTUAL changed paths (never worker
- * prose) plus bounded parsed section items, the parse-reliability and
- * item-truncation facts, and the parse warning (missing sections /
- * caps / reported-vs-actual divergence). The returned workerSummary is
- * the SINGLE shared summary derivation the parent handoff renders — the
- * runtime never re-parses the report text for the parent. Never falls
- * back or auto-retries.
- */
+/** @deprecated Historical schema v1 is read-only; production writes v2 only. */
 export async function finishDelegationLedger(
-	projectRoot: string,
-	delegationId: string,
-	input: FinishDelegationInput,
+	_projectRoot: string,
+	_delegationId: string,
+	_input: FinishDelegationInput,
 ): Promise<FinishLedgerResult> {
-	if (!isValidDelegationId(delegationId)) return { ok: false, error: `invalid delegation id "${delegationId}"` };
-	const dir = delegationDirFor(projectRoot, delegationId);
-	const secrets = input.secrets ?? [];
-	const redact = (text: string): string => redactText(text, secrets);
-	// Redact BEFORE any slice/truncation so secrets can never survive in
-	// content or influence truncation behavior.
-	const safeReportText = redact(input.reportText ?? input.worker.reportSummary);
-	const parsed = parseWorkerReport(safeReportText);
-	const reportedPaths = parseReportedPaths(safeReportText);
-	const afterSummary = safeReportText.slice(0, MAX_AFTER_SUMMARY_CHARS);
-	const reportPath = delegationReportPath(projectRoot, delegationId);
-	// Phase 3: the canonical cumulative spend facts object — the SINGLE
-	// derivation persisted identically into usage.json and
-	// worker-summary.json from the runner's recorded spend facts (profile,
-	// final state, band, fixed-order reasons, per-dimension soft/hard
-	// flags). Never recomputed from worker prose. ALL six facts must be
-	// present (the runtime always supplies them on every outcome — success
-	// and failure, exception fallback included); legacy-shaped callers that
-	// omit them keep the pre-repair record shape (readable, no migration).
-	let spend: LedgerSpendFacts | undefined;
-	if (
-		input.worker.spendProfile !== undefined &&
-		input.worker.spendState !== undefined &&
-		input.worker.spendBand !== undefined &&
-		input.worker.spendReasons !== undefined &&
-		input.worker.spendSoftReached !== undefined &&
-		input.worker.spendHardExceeded !== undefined
-	) {
-		spend = {
-			profile: input.worker.spendProfile,
-			turns: input.worker.spendState.turns,
-			totalTokens: input.worker.spendState.totalTokens,
-			outputTokens: input.worker.spendState.outputTokens,
-			band: input.worker.spendBand,
-			softReached: { ...input.worker.spendSoftReached },
-			hardExceeded: { ...input.worker.spendHardExceeded },
-			reasons: [...input.worker.spendReasons],
-		};
-	}
-
-	// Parse-warning: the report sections are unreliable (missing) or the
-	// Files Changed claims diverge from the ACTUAL digest-based diff.
-	const divergence: string[] = [];
-	if (reportedPaths.length === 0 && input.after.changedSinceBefore.length > 0) {
-		divergence.push("report has no parseable Files Changed claims but the actual diff has changed paths");
-	} else if (reportedPaths.length > 0 && input.after.changedSinceBefore.length > 0) {
-		const reportedSet = new Set(reportedPaths);
-		const actualSet = new Set(input.after.changedSinceBefore);
-		const onlyReported = reportedPaths.filter((p) => !actualSet.has(p));
-		const onlyActual = input.after.changedSinceBefore.filter((p) => !reportedSet.has(p));
-		if (onlyReported.length > 0 || onlyActual.length > 0) {
-			divergence.push(
-				`reported Files Changed claims diverge from the actual diff (${onlyReported.length} claimed-only, ${onlyActual.length} actual-only)`,
-			);
-		}
-	}
-	const parseWarning =
-		[parsed.parseWarning, ...divergence].filter((w): w is string => Boolean(w)).join("; ").slice(0, 500) || null;
-
-	const afterRecord: LedgerAfterRecord = {
-		schema_version: DELEGATION_SCHEMA_VERSION,
-		delegation_id: delegationId,
-		recorded_at: input.now,
-		status: input.worker.status,
-		...(input.worker.workerSuccess === undefined ? {} : { worker_success: input.worker.workerSuccess }),
-		...(input.worker.workerFailureCode === undefined ? {} : { worker_failure_code: input.worker.workerFailureCode }),
-		exit_code: input.worker.exitCode,
-		pinned_identity: {
-			pinned_provider: "deepseek",
-			pinned_model: "deepseek-v4-flash",
-			provider: input.worker.provider,
-			model: input.worker.model,
-		},
-		git_head: input.after.gitHead,
-		git_dirty: input.after.gitDirty,
-		diff_hash: input.after.diffHash,
-		changed_paths: [...input.after.changedPaths],
-		path_statuses: { ...input.after.pathStatuses },
-		path_digests: { ...input.after.pathDigests },
-		changed_since_before: [...input.after.changedSinceBefore],
-		reported_paths: reportedPaths,
-		usage: input.worker.usage,
-		budget: input.worker.budget,
-		report_summary: redact(afterSummary),
-		review_status: "PENDING_REVIEW",
-	};
-	const reviewPlaceholder: PendingReviewPlaceholder = {
-		schema_version: DELEGATION_SCHEMA_VERSION,
-		delegation_id: delegationId,
-		recorded_at: input.now,
-		review_status: "PENDING_REVIEW",
-		message: "review pending — replaced by the review service (core/diff-review.ts)",
-	};
-	const workerSummary: LedgerWorkerSummaryRecord = {
-		schema_version: DELEGATION_SCHEMA_VERSION,
-		delegation_id: delegationId,
-		recorded_at: input.now,
-		provider: input.worker.provider,
-		model: input.worker.model,
-		status: input.worker.status,
-		...(input.worker.workerSuccess === undefined ? {} : { worker_success: input.worker.workerSuccess }),
-		...(input.worker.workerFailureCode === undefined ? {} : { worker_failure_code: input.worker.workerFailureCode }),
-		exit_code: input.worker.exitCode,
-		turns: input.worker.turns,
-		stop_reason: input.worker.stopReason ? input.worker.stopReason.slice(0, MAX_STOP_REASON_CHARS) : null,
-		error_message: input.worker.errorMessage ? redact(input.worker.errorMessage.slice(0, MAX_ERROR_MESSAGE_CHARS)) : null,
-		usage: input.worker.usage,
-		cache_hit_ratio: input.worker.cacheHitRatio,
-		budget: input.worker.budget,
-		spend,
-		report_summary: redact(safeReportText.slice(0, MAX_REPORT_SUMMARY_CHARS)),
-		changed_paths: [...input.after.changedSinceBefore],
-		completed: parsed.completed,
-		verification_commands: parsed.verificationCommands,
-		verification_observations: parsed.verificationObservations,
-		remaining_risks: parsed.remainingRisks,
-		report_path: reportPath,
-		parse_warning: parseWarning,
-		parse_reliable: parsed.reliable,
-		truncated_items: parsed.truncatedItems,
-	};
-	const usageRecord: DelegationUsageRecord = {
-		schema_version: DELEGATION_SCHEMA_VERSION,
-		delegation_id: delegationId,
-		recorded_at: input.now,
-		provider: input.worker.provider,
-		model: input.worker.model,
-		status: input.worker.status,
-		...(input.worker.workerSuccess === undefined ? {} : { worker_success: input.worker.workerSuccess }),
-		...(input.worker.workerFailureCode === undefined ? {} : { worker_failure_code: input.worker.workerFailureCode }),
-		exit_code: input.worker.exitCode,
-		turns: input.worker.turns,
-		stop_reason: input.worker.stopReason ? input.worker.stopReason.slice(0, MAX_STOP_REASON_CHARS) : null,
-		error_message: input.worker.errorMessage ? redact(input.worker.errorMessage.slice(0, MAX_ERROR_MESSAGE_CHARS)) : null,
-		usage: input.worker.usage,
-		cache_hit_ratio: input.worker.cacheHitRatio,
-		budget: input.worker.budget,
-		spend,
-	};
-
-	// The bounded durable report artifact: redacted FIRST, then capped
-	// UTF-8-safe, atomic, mode 0600, with the explicit truncation marker
-	// appended ONLY when the REDACTED report still exceeds
-	// MAX_WORKER_REPORT_BYTES — a report that fits after redaction is
-	// persisted in full (tail content after long secrets survives, no
-	// marker). The report is persisted but NEVER enters any parent tool
-	// result/details.
-	let reportBody = safeReportText;
-	if (Buffer.byteLength(reportBody, "utf8") > MAX_WORKER_REPORT_BYTES) {
-		const markerBytes = Buffer.byteLength(WORKER_REPORT_TRUNCATION_MARKER, "utf8");
-		const bodyBudget = Math.max(MAX_WORKER_REPORT_BYTES - markerBytes, 0);
-		reportBody = `${truncateUtf8(reportBody, bodyBudget)}${WORKER_REPORT_TRUNCATION_MARKER}`;
-	}
-	try {
-		await writeTextAtomic(dir, WORKER_REPORT_FILE_NAME, reportBody);
-		await writeJsonAtomic(dir, WORKER_USAGE_FILE_NAME, usageRecord);
-		await writeJsonAtomic(dir, "after.json", afterRecord);
-		await writeJsonAtomic(dir, WORKER_SUMMARY_FILE_NAME, workerSummary);
-		await writeJsonAtomic(dir, "review.json", reviewPlaceholder);
-		const manifest = await readJson<DelegationManifest>(dir, "manifest.json");
-		if (manifest && manifest.delegation_id === delegationId) {
-			manifest.finished_at = input.now;
-			manifest.status = "finished";
-			manifest.diff_hash_after = input.after.diffHash;
-			manifest.changed_path_count_after = input.after.changedPaths.length;
-			manifest.changed_since_before_count = input.after.changedSinceBefore.length;
-			await writeJsonAtomic(dir, "manifest.json", manifest);
-		}
-		return { ok: true, dir, workerSummary };
-	} catch (error) {
-		return { ok: false, error: (error as Error).message };
-	}
+	return { ok: false, error: "historical delegation schema v1 is read-only" };
 }
 
 /**

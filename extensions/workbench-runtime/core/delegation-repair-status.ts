@@ -1,8 +1,7 @@
 /** Read-only projection of durable semantic-repair authority for status and compact guidance. */
 
 import {
-	repairDelegationToolActionV1,
-	reviewDelegationToolActionV1,
+	delegationLifecycleActionTextV1,
 } from "./agent-next-action.ts";
 
 import type { ExecFn } from "./config.ts";
@@ -26,19 +25,23 @@ import {
 } from "./delegation-transaction-storage.ts";
 import { recoverExactRepairCommandAuthorityV1 } from "./exact-repair-authority.ts";
 import { recoverRawLineageExactRepairAuthorityV1 } from "./exact-repair-raw-lineage-authority.ts";
-import { readWorkerRepairCapsule } from "./worker-repair-authority.ts";
 import {
 	DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+	delegationLifecycleSnapshotFromCompatibilityProjectionV1,
 	delegationLifecycleSnapshotFromExactRepairAuthorityV1,
 	delegationLifecycleSnapshotFromReviewCandidateV1,
 	resolveDelegationLifecycleV1,
+	type DelegationLifecycleAttemptV1,
+	type DelegationLifecycleAuthorityDispositionV1,
+	type DelegationLifecycleAuthorityHealthV1,
+	type DelegationLifecycleBindingV1,
 	type DelegationLifecycleResolutionV1,
+	type DelegationLifecycleWriterLockV1,
 } from "./delegation-lifecycle-resolver.ts";
 
 export interface DelegationRepairStatusReaderServicesV1 {
 	readAuthority: typeof readDelegationAuthorityObservationV2;
 	collectBinding: typeof collectCurrentDelegationBindingV2;
-	readRepairCapsule: typeof readWorkerRepairCapsule;
 	readRepairClosure?: typeof readProjectDelegationRepairClosureV1;
 	readInactiveLifecycle?: typeof readInactiveProjectDelegationBlockerLifecycleResolutionV1;
 	readCommittedGeneration?: typeof readDelegationCommittedGenerationV2;
@@ -48,7 +51,6 @@ export interface DelegationRepairStatusReaderServicesV1 {
 const DEFAULT_READER_SERVICES = Object.freeze({
 	readAuthority: readDelegationAuthorityObservationV2,
 	collectBinding: collectCurrentDelegationBindingV2,
-	readRepairCapsule: readWorkerRepairCapsule,
 	readRepairClosure: readProjectDelegationRepairClosureV1,
 	readInactiveLifecycle: readInactiveProjectDelegationBlockerLifecycleResolutionV1,
 	readCommittedGeneration: readDelegationCommittedGenerationV2,
@@ -151,9 +153,10 @@ export function delegationProjectIssueRepairStatusV1(
 	issue: { code: string; delegationId?: string } | undefined,
 ): DelegationRepairStatusV1 | undefined {
 	if (issue === undefined) return undefined;
-	return isDelegationPathLaneBypassableProjectIssueV1(issue.code)
+	const status: DelegationRepairStatusV1 = isDelegationPathLaneBypassableProjectIssueV1(issue.code)
 		? { kind: "historical_multiplicity", delegationId: issue.delegationId ?? null, code: issue.code }
 		: { kind: "authority_invalid", delegationId: issue.delegationId ?? null, code: issue.code };
+	return withCompatibilityResolutionV1(status);
 }
 
 /** Prefer durable execution state, except where a terminal success still needs session completion/freshness. */
@@ -175,12 +178,112 @@ function bindingStatus(
 	return binding.status === "fresh" && binding.hash === expectedHash ? "fresh" : "conflict";
 }
 
+function observeLifecycle(snapshot: ReturnType<typeof delegationLifecycleSnapshotFromCompatibilityProjectionV1>): DelegationLifecycleResolutionV1 {
+	return resolveDelegationLifecycleV1(snapshot, {
+		schema_version: 1,
+		kind: DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+		event: "OBSERVE",
+		expected_snapshot_hash: null,
+	});
+}
+
+/**
+ * Read-only v1 projection adapter. Historical labels remain available for
+ * diagnostics, but only the canonical resolver chooses the action.
+ */
+function compatibilityLifecycleResolutionV1(
+	status: DelegationRepairStatusV1,
+	state?: DelegationState,
+): DelegationLifecycleResolutionV1 {
+	if (status.kind === "derived_review_invalid") return status.resolution;
+	const statusId = status.kind === "none" ? state?.latestId : status.delegationId;
+	const target = statusId === undefined || statusId === null
+		? { kind: "PROJECT_AUTHORITY" as const, id: "project-authority" }
+		: { kind: "DELEGATION" as const, id: statusId };
+	let authorityHealth: DelegationLifecycleAuthorityHealthV1 = "VALID";
+	let authorityDisposition: DelegationLifecycleAuthorityDispositionV1 = "INACTIVE";
+	let writerLock: DelegationLifecycleWriterLockV1 = "ABSENT";
+	let binding: DelegationLifecycleBindingV1 = "CURRENT";
+	let attempt: DelegationLifecycleAttemptV1 = "TERMINAL";
+	let scopeUnknown = false;
+	let recoveryRank: { unresolved_obligations: number; unresolved_attempts: number } | null =
+		{ unresolved_obligations: 0, unresolved_attempts: 0 };
+
+	switch (status.kind) {
+		case "none":
+			if (state?.latestId !== undefined && state.status === "PENDING_REVIEW") attempt = "AWAITING_REVIEW";
+			else if (state?.latestId !== undefined && state.status === "STALE") {
+				attempt = "AWAITING_REVIEW";
+				binding = "REBASEABLE";
+			}
+			break;
+		case "authority_invalid":
+			authorityHealth = /(?:storage|unavailable)/u.test(status.code) ? "STORAGE_FAILURE" : "CORRUPT";
+			authorityDisposition = "UNKNOWN";
+			scopeUnknown = true;
+			recoveryRank = null;
+			break;
+		case "historical_multiplicity":
+			binding = "OVERLAPPING";
+			scopeUnknown = true;
+			recoveryRank = { unresolved_obligations: 1, unresolved_attempts: 1 };
+			break;
+		case "delegation_active":
+		case "repair_active":
+			attempt = "ACTIVE";
+			authorityDisposition = "ACTIVE";
+			writerLock = "LIVE";
+			recoveryRank = { unresolved_obligations: 1, unresolved_attempts: 1 };
+			break;
+		case "delegation_recovery":
+		case "repair_recovery":
+			authorityDisposition = "UNKNOWN";
+			binding = "OVERLAPPING";
+			scopeUnknown = true;
+			recoveryRank = { unresolved_obligations: 1, unresolved_attempts: 1 };
+			break;
+		case "terminal_negative_review":
+		case "repair_review":
+			attempt = "AWAITING_REVIEW";
+			recoveryRank = { unresolved_obligations: 1, unresolved_attempts: 1 };
+			break;
+		case "delegation_retry":
+		case "repair_required":
+		case "repair_retry":
+		case "repair_terminal_retry": {
+			attempt = "REPAIRABLE";
+			recoveryRank = { unresolved_obligations: 1, unresolved_attempts: 1 };
+			if (status.binding === "conflict") binding = "REBASEABLE";
+			else if (status.binding === "unavailable") authorityHealth = "STORAGE_FAILURE";
+			break;
+		}
+	}
+
+	return observeLifecycle(delegationLifecycleSnapshotFromCompatibilityProjectionV1({
+		source_authority: { status, state },
+		authority_health: authorityHealth,
+		authority_disposition: authorityDisposition,
+		writer_lock: writerLock,
+		binding,
+		attempt,
+		target,
+		scope_unknown: scopeUnknown,
+		recovery_rank: recoveryRank,
+	}));
+}
+
+function withCompatibilityResolutionV1(status: DelegationRepairStatusV1): DelegationRepairStatusV1 {
+	return status.kind === "none" || status.resolution !== undefined
+		? status
+		: { ...status, resolution: compatibilityLifecycleResolutionV1(status) };
+}
+
 /**
  * Classify only strict facts already read from project authority.  This is a
  * diagnostic projection: it never grants review, repair, successor, or Gate
  * authority, and callers must still revalidate at the mutating boundary.
  */
-export function classifyDelegationRepairStatusV1(input: {
+function classifyDelegationRepairFactsV1(input: {
 	delegationId: string;
 	authority: DelegationAuthorityObservationV2;
 	binding: CurrentDelegationBindingV2;
@@ -279,6 +382,17 @@ export function classifyDelegationRepairStatusV1(input: {
 		lineageHash: lineage.lineageHash,
 		depth: lineage.depth,
 	};
+}
+
+/** @deprecated Compatibility diagnostic; lifecycle action ownership is canonical resolver v1. */
+export function classifyDelegationRepairStatusV1(input: {
+	delegationId: string;
+	authority: DelegationAuthorityObservationV2;
+	binding: CurrentDelegationBindingV2;
+	retryable?: boolean;
+	terminalNegativeReviewEligible?: boolean;
+}): DelegationRepairStatusV1 {
+	return withCompatibilityResolutionV1(classifyDelegationRepairFactsV1(input));
 }
 
 async function hasExecutableExactRepairAuthorityV1(input: {
@@ -396,7 +510,11 @@ export async function readDelegationRepairStatusV1(
 			if (!committed.ok || committed.value.state.delegation_id !== delegationId ||
 				committed.value.state.status !== authority.transactionStatus
 				|| (committed.value.state.repair_lineage === undefined) !== (authority.repairLineage === undefined)) {
-				return { kind: "authority_invalid", delegationId, code: committed.ok ? "terminal_negative_authority_mismatch" : committed.error.code };
+				return withCompatibilityResolutionV1({
+					kind: "authority_invalid",
+					delegationId,
+					code: committed.ok ? "terminal_negative_authority_mismatch" : committed.error.code,
+				});
 			}
 			terminalNegativeReviewEligible = isDelegationTerminalNegativeReviewEligibleFromCommittedV1(
 				committed.value.state,
@@ -439,7 +557,11 @@ export async function readDelegationRepairStatusV1(
 		}
 		return resolution === undefined ? classified : { ...classified, resolution };
 	} catch {
-		return { kind: "authority_invalid", delegationId: state.latestId ?? null, code: "status_unavailable" };
+		return withCompatibilityResolutionV1({
+			kind: "authority_invalid",
+			delegationId: state.latestId ?? null,
+			code: "status_unavailable",
+		});
 	}
 }
 
@@ -448,62 +570,10 @@ export function delegationNextActionTextV1(
 	state: DelegationState,
 	repair: DelegationRepairStatusV1 = { kind: "none" },
 ): string | undefined {
-	if (repair.kind === "derived_review_invalid") {
-		return `delegation ${repair.delegationId} has rebuildable derived review evidence (${repair.resolution.primary_action.action}); ${reviewDelegationToolActionV1(repair.delegationId)} to regenerate it; do not quarantine the readable transaction`;
-	}
-	if (repair.kind === "authority_invalid") {
-		const subject = repair.delegationId === null ? "project delegation" : `delegation ${repair.delegationId}`;
-		if (repair.delegationId !== null && ["incomplete_v2_authority", "invalid_record", "unsupported_version"].includes(repair.code)) {
-			return `${subject} authority is ${repair.code}; call workbench_git action=quarantine_unreadable_authority delegation_id=${repair.delegationId} in DEV or VERIFY; source bytes and Git remain preserved`;
-		}
-		return `${subject} authority is ${repair.code}; repair, delegation, and VERIFY remain fail-closed`;
-	}
-	if (repair.kind === "historical_multiplicity") {
-		const exactTip = repair.delegationId === null
-			? "select an exact current repair tip before calling workbench_repair_delegation"
-			: `${repairDelegationToolActionV1(repair.delegationId)} only when selecting that strict current repair tip`;
-		return `project has readable historical blocker multiplicity (${repair.code}); ordinary delegation requires strict full-project path-lane admission proving every blocker known and non-overlapping; overlap or unknown authority remains blocked; ${exactTip}; VERIFY remains blocked`;
-	}
-	if (repair.kind === "delegation_active") {
-		return `delegation ${repair.delegationId} is ${repair.transactionStatus}; wait for the worker result before review or another delegation`;
-	}
-	if (repair.kind === "delegation_retry") {
-		return repair.binding === "fresh"
-			? `delegation ${repair.delegationId} is ${repair.transactionStatus}, but has no committed repair lineage for deterministic exact repair; inspect strict recovery authority before any compatibility repair and do not retry review`
-			: `delegation ${repair.delegationId} is ${repair.transactionStatus}, but its binding is ${repair.binding}; if its delta was discarded call workbench_git action=close_inactive_blocker delegation_id=${repair.delegationId}; unrelated work is preserved`;
-	}
-	if (repair.kind === "delegation_recovery") {
-		return `delegation ${repair.delegationId} is ${repair.transactionStatus}; if execution is inactive and its delta was discarded call workbench_git action=close_inactive_blocker delegation_id=${repair.delegationId}; do not retry review`;
-	}
-	if (repair.kind === "terminal_negative_review") {
-		return `${reviewDelegationToolActionV1(repair.delegationId)} to publish the strict REPAIR-only Sol decision for the committed ${repair.transactionStatus} delta`;
-	}
-	if (repair.kind === "repair_required" || repair.kind === "repair_retry") {
-		if (repair.binding !== "fresh") {
-			return `delegation ${repair.delegationId} has REPAIR_REQUIRED authority but its current binding is ${repair.binding}; restore the exact bound workspace to repair, or if the rejected delta was deliberately discarded call workbench_git action=close_inactive_blocker delegation_id=${repair.delegationId}; unrelated work is preserved and no new worktree is required`;
-		}
-		return `${repairDelegationToolActionV1(repair.delegationId)} to execute the exact semantic repair directly from strict durable authority`;
-	}
-	if (repair.kind === "repair_terminal_retry") {
-		return `${repairDelegationToolActionV1(repair.delegationId)} for the deterministic lineaged terminal repair${repair.binding === "fresh" ? "" : `; current binding is ${repair.binding}, so the tool will perform strict lineage-contained terminal rebase eligibility checks`}; it fails closed before worker start if authority or rebase is invalid`;
-	}
-	if (repair.kind === "repair_review") {
-		return `review repair delegation ${repair.delegationId}; explicitly ACCEPT the corrected delta or issue another REPAIR`;
-	}
-	if (repair.kind === "repair_active") {
-		return `repair delegation ${repair.delegationId} is ${repair.transactionStatus}; wait for it or recover its durable transaction`;
-	}
-	if (repair.kind === "repair_recovery") {
-		return `repair delegation ${repair.delegationId} is ${repair.transactionStatus} and has no further exact retry authority; if execution is inactive and this attempt ended before writes, call workbench_git action=close_inactive_blocker delegation_id=${repair.delegationId} to collapse the empty attempt chain; otherwise inspect strict recovery authority`;
-	}
-	if (state.latestId === undefined) return "start the first worker delegation (no delegation yet)";
-	if (state.status === "PENDING_REVIEW") {
-		return `review delegation ${state.latestId} (PENDING_REVIEW) before the next delegation or VERIFY`;
-	}
-	if (state.status === "STALE") {
-		return `delegation ${state.latestId} is STALE — inspect status; only prior v2 FINAL/PASS with explicit Sol semantic authority permits a fresh successor; otherwise recover the outstanding review; VERIFY remains blocked`;
-	}
-	return `delegation ${state.latestId} REVIEWED — start the next delegation or run final verification`;
+	const resolution = repair.kind === "none"
+		? compatibilityLifecycleResolutionV1(repair, state)
+		: repair.resolution ?? compatibilityLifecycleResolutionV1(repair, state);
+	return delegationLifecycleActionTextV1(resolution.primary_action);
 }
 
 /** Human-readable strict repair facts; hashes are shown, free-form reasons are not. */
@@ -512,8 +582,6 @@ function delegationRepairStatusBaseLinesV1(status: DelegationRepairStatusV1): st
 	if (status.kind === "derived_review_invalid") {
 		return [
 			`review state : DERIVED_INVALID (${status.code}); transaction and committed generation remain readable`,
-			`typed action : ${status.resolution.primary_action.action} (${status.resolution.primary_action.reason})`,
-			`next action  : ${reviewDelegationToolActionV1(status.delegationId)}; quarantine is not eligible`,
 		];
 	}
 	if (status.kind === "authority_invalid") {
@@ -523,36 +591,28 @@ function delegationRepairStatusBaseLinesV1(status: DelegationRepairStatusV1): st
 		return [
 			`repair state : HISTORICAL_MULTIPLICITY (${status.code}); authority corruption is not inferred`,
 			"delegation   : ordinary starts require strict full-project path-lane admission; overlap or unknown authority remains BLOCKED",
-			status.delegationId === null
-				? "exact repair : select a strict current repair tip before calling workbench_repair_delegation"
-				: `exact repair : ${repairDelegationToolActionV1(status.delegationId)} only for that strict current repair tip`,
 			"verify block : VERIFY remains BLOCKED while any historical blocker is unresolved",
 		];
 	}
 	if (status.kind === "delegation_active") {
 		return [
 			`execution v2 : ${status.transactionStatus} — review is not available yet`,
-			"next action  : wait for the current worker result",
 		];
 	}
 	if (status.kind === "delegation_retry") {
 		return [
 			`completion v2: ${status.transactionStatus} — review is not the recovery path`,
-			status.binding === "fresh"
-				? "next action  : inspect strict recovery authority; deterministic exact repair requires a committed repair lineage"
-				: `next action  : binding is ${status.binding}; inspect status before repair`,
+			`repair bind  : ${status.binding}`,
 		];
 	}
 	if (status.kind === "delegation_recovery") {
 		return [
 			`completion v2: ${status.transactionStatus} — strict recovery is required`,
-			"next action  : inspect workbench_delegation_status; do not retry review",
 		];
 	}
 	if (status.kind === "terminal_negative_review") {
 		return [
 			`completion v2: ${status.transactionStatus} — committed non-empty delta requires REPAIR-only Sol review`,
-			`next action  : ${reviewDelegationToolActionV1(status.delegationId)}`,
 		];
 	}
 	if (status.kind === "repair_required" || status.kind === "repair_retry") {
@@ -563,9 +623,6 @@ function delegationRepairStatusBaseLinesV1(status: DelegationRepairStatusV1): st
 			`reason hash  : ${status.reasonHash}`,
 		];
 		if (status.kind === "repair_retry") lines.push(`repair lineage: depth ${status.depth} ${status.lineageHash}`);
-		lines.push(status.binding === "fresh"
-			? `next action  : ${repairDelegationToolActionV1(status.delegationId)}`
-			: "next action  : restore the exact reviewed binding; repair delegation remains fail-closed");
 		return lines;
 	}
 	if (status.kind === "repair_terminal_retry") {
@@ -573,9 +630,7 @@ function delegationRepairStatusBaseLinesV1(status: DelegationRepairStatusV1): st
 			`semantic v2  : UNRESOLVED REPAIR (${status.transactionStatus}); Gate remains BLOCKED`,
 			`repair lineage: depth ${status.depth} ${status.lineageHash}`,
 			`root decision : ${status.rootDecisionHash}`,
-			status.binding === "fresh"
-				? `next action  : ${repairDelegationToolActionV1(status.delegationId)}`
-				: `next action  : ${repairDelegationToolActionV1(status.delegationId)}; current binding is ${status.binding}, so strict lineage-contained terminal rebase eligibility will be checked before worker start`,
+			`repair bind  : ${status.binding}`,
 		];
 	}
 	const lines = [
@@ -587,32 +642,38 @@ function delegationRepairStatusBaseLinesV1(status: DelegationRepairStatusV1): st
 	} else if (status.kind === "repair_active") {
 		lines.push(`semantic v2  : REPAIR ACTIVE (${status.transactionStatus}); Gate remains BLOCKED`);
 	} else {
-		lines.push(
-			`semantic v2  : UNRESOLVED REPAIR (${status.transactionStatus}); Gate remains BLOCKED`,
-			`next action  : strict recovery must validate before repair_of=${status.delegationId} can retry`,
-		);
+		lines.push(`semantic v2  : UNRESOLVED REPAIR (${status.transactionStatus}); Gate remains BLOCKED`);
 	}
 	return lines;
 }
 
-/** Prepend the one canonical action whenever status recovered typed lifecycle authority. */
-export function delegationRepairStatusLinesV1(status: DelegationRepairStatusV1): string[] {
+/** Render exactly one canonical typed action and one derived instruction. */
+export function delegationRepairStatusLinesV1(
+	status: DelegationRepairStatusV1,
+	state?: DelegationState,
+): string[] {
 	const lines = delegationRepairStatusBaseLinesV1(status);
-	if (status.kind === "none" || status.kind === "derived_review_invalid" || status.resolution === undefined) {
-		return lines;
-	}
+	if (status.kind === "none" && state === undefined) return lines;
+	const resolution = status.kind === "none"
+		? compatibilityLifecycleResolutionV1(status, state)
+		: status.resolution ?? compatibilityLifecycleResolutionV1(status, state);
+	const actionLines = [
+		`typed action : ${resolution.primary_action.action} (${resolution.primary_action.reason})`,
+		`next action  : ${delegationLifecycleActionTextV1(resolution.primary_action)}`,
+	];
+	if (lines.length === 0) return actionLines;
 	return [
 		lines[0]!,
-		`typed action : ${status.resolution.primary_action.action} (${status.resolution.primary_action.reason})`,
+		...actionLines,
 		...lines.slice(1),
 	];
 }
 
-/** Clarify the exact semantic-repair exception to the ordinary pending-review blocker. */
+/** v1 compatibility line derived only from the resolver's exact-repair action. */
 export function delegationExactRepairRouteLineV1(status: DelegationRepairStatusV1): string | undefined {
-	if (status.kind === "historical_multiplicity" && status.delegationId !== null) {
-		return `repair route : ${repairDelegationToolActionV1(status.delegationId)} only for that strict current tip; ordinary delegation requires path-lane admission and VERIFY remains blocked`;
-	}
-	if ((status.kind !== "repair_required" && status.kind !== "repair_retry") || status.binding !== "fresh") return undefined;
-	return `repair route : ALLOWED — ordinary/new delegations remain blocked; ${repairDelegationToolActionV1(status.delegationId)}`;
+	if (status.kind === "none") return undefined;
+	const resolution = status.resolution ?? compatibilityLifecycleResolutionV1(status);
+	return resolution.primary_action.action === "EXECUTE_EXACT_REPAIR"
+		? `repair route : ALLOWED — ordinary/new delegations remain blocked; ${delegationLifecycleActionTextV1(resolution.primary_action)}`
+		: undefined;
 }

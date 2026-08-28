@@ -13,8 +13,6 @@ import { types as utilTypes } from "node:util";
 
 import {
 	delegationStatusToolActionV1,
-	repairDelegationToolActionV1,
-	reviewDelegationToolActionV1,
 } from "./agent-next-action.ts";
 
 import type {
@@ -48,11 +46,15 @@ import {
 	DELIVERY_CHAIN_MAX_SUCCESSOR_ATTEMPTS_V1,
 	type DeliveryChainCoordinatorResultV1,
 } from "./delivery-chain-coordinator.ts";
-import type {
-	ExactRepairServiceRunnerV1,
-	ExactRepairServiceResultV1,
+
+import {
+	exactRepairSuccessorNextActionV1,
+	type ExactRepairServiceRunnerV1,
+	type ExactRepairServiceResultV1,
 } from "./exact-repair-service.ts";
-import type { ExactRepairExistingSuccessorV1 } from "./exact-repair-successor.ts";
+import type {
+	ExactRepairExistingSuccessorV1,
+} from "./exact-repair-successor.ts";
 import type { WorkbenchMode } from "./mode-policy.ts";
 import {
 	recoverSettledGenericProjectCheckoutOperationV1,
@@ -294,21 +296,7 @@ function lifecycleCode(result: AutomaticDeliveryContinuationLifecycleResultV1): 
 function chainNextAction(chain: DeliveryChainCoordinatorResultV1): string | null {
 	if ("next_action" in chain) return chain.next_action;
 	if (chain.status !== "SUCCESSOR_RECORDED") return null;
-	const successor = chain.repair.successor;
-	switch (successor.disposition) {
-		case "CHAIN_CLOSED":
-			return successor.status === "REVIEWED" ? null : delegationStatusToolActionV1();
-		case "REVIEW_PENDING":
-			return successor.status === "PENDING_REVIEW" || successor.status === "INTERRUPTED"
-				? reviewDelegationToolActionV1(successor.delegation_id)
-				: delegationStatusToolActionV1();
-		case "REPAIR_PENDING":
-		case "EXACT_REPAIR_PENDING":
-			return repairDelegationToolActionV1(successor.delegation_id);
-		case "ACTIVE":
-		case "BLOCKED":
-			return delegationStatusToolActionV1();
-	}
+	return exactRepairSuccessorNextActionV1(chain.repair.successor);
 }
 
 function exactRepairSuccessor(

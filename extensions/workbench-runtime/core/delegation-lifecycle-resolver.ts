@@ -505,6 +505,56 @@ export function serializeDelegationLifecycleResolutionV1(resolution: DelegationL
 	return canonicalJson(resolution);
 }
 
+export interface DelegationLifecycleCompatibilityProjectionV1 {
+	readonly source_authority: unknown;
+	readonly operation_intent?: DelegationLifecycleOperationIntentV1;
+	readonly authority_health: DelegationLifecycleAuthorityHealthV1;
+	readonly authority_disposition: DelegationLifecycleAuthorityDispositionV1;
+	readonly writer_lock?: DelegationLifecycleWriterLockV1;
+	readonly binding: DelegationLifecycleBindingV1;
+	readonly attempt: DelegationLifecycleAttemptV1;
+	readonly candidate?: DelegationLifecycleCandidateV1;
+	readonly runtime_identity?: DelegationLifecycleRuntimeIdentityV1;
+	readonly request_valid?: boolean;
+	readonly target: DelegationLifecycleTargetV1;
+	readonly affected_paths?: readonly string[];
+	readonly scope_unknown?: boolean;
+	readonly recovery_rank: DelegationLifecycleRecoveryRankV1 | null;
+}
+
+/**
+	* Normalize a historical read-model projection into the canonical resolver
+	* input. Compatibility callers may preserve old labels, but they do not get
+	* to classify a lifecycle action independently.
+	*/
+export function delegationLifecycleSnapshotFromCompatibilityProjectionV1(
+	input: DelegationLifecycleCompatibilityProjectionV1,
+): DelegationLifecycleSnapshotV1 {
+	return {
+		schema_version: 1,
+		kind: DELEGATION_LIFECYCLE_SNAPSHOT_KIND_V1,
+		source_authority_hash: canonicalHash({
+			kind: "delegation-lifecycle-compatibility-source-v1",
+			authority: input.source_authority,
+		}),
+		operation_intent: input.operation_intent ?? "DEV",
+		authority: {
+			health: input.authority_health,
+			disposition: input.authority_disposition,
+		},
+		writer_lock: input.writer_lock ?? "ABSENT",
+		binding: input.binding,
+		attempt: input.attempt,
+		candidate: input.candidate ?? "NONE",
+		runtime_identity: input.runtime_identity ?? "NOT_REQUIRED",
+		request_valid: input.request_valid ?? true,
+		target: { ...input.target },
+		affected_paths: [...(input.affected_paths ?? [])],
+		scope_unknown: input.scope_unknown ?? false,
+		recovery_rank: input.recovery_rank === null ? null : { ...input.recovery_rank },
+	};
+}
+
 /**
 	* Read-only compatibility adapter for the existing project path-lane reader.
 	* It creates no files and grants no new authority; production wiring remains

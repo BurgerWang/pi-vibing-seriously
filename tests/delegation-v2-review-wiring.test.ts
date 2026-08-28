@@ -40,10 +40,12 @@ import {
 	collectAfterFacts,
 	collectGitFacts,
 	computeDiffHash,
-	createDelegationLedger,
-	finishDelegationLedger,
 	type LedgerWorkerFacts,
 } from "../extensions/workbench-runtime/core/delegation-ledger.ts";
+import {
+	createLegacyDelegationFixture as createDelegationLedger,
+	finishLegacyDelegationFixture as finishDelegationLedger,
+} from "./legacy-delegation-fixture.ts";
 import type {
 	DelegationTerminalOutcome,
 	DelegationTransactionRecord,

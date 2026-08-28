@@ -1,7 +1,6 @@
 /** One-review/one-successor delivery-chain coordinator. */
 
 import {
-	delegationStatusToolActionV1,
 	repairDelegationToolActionV1,
 	reviewDelegationToolActionV1,
 } from "./agent-next-action.ts";
@@ -17,6 +16,7 @@ import {
 	type ExactRepairServiceResultV1,
 	type ExactRepairServiceRunnerV1,
 	type ExactRepairSuccessorRecordedV1,
+	exactRepairSuccessorNextActionV1,
 } from "./exact-repair-service.ts";
 
 export const DELIVERY_CHAIN_MAX_SUCCESSOR_ATTEMPTS_V1 = 1 as const;
@@ -125,23 +125,12 @@ export type DeliveryChainCoordinatorResultV1 =
 
 const SHA256_RE = /^[a-f0-9]{64}$/u;
 
-function qReview(delegationId: string): string {
-	return reviewDelegationToolActionV1(delegationId);
-}
-
-function qRepair(delegationId: string): string {
-	return repairDelegationToolActionV1(delegationId);
-}
-
 function exactRepairDispositionNextAction(
 	repair: ExactRepairServiceResultV1,
 	parentDelegationId: string,
 ): string {
-	if (repair.status === "EXACT_REPAIR_PENDING") return qRepair(repair.successor.delegation_id);
-	if (repair.status === "SUCCESSOR_ACTIVE" || repair.status === "SUCCESSOR_BLOCKED") {
-		return delegationStatusToolActionV1();
-	}
-	return qRepair(parentDelegationId);
+	const successorAction = "successor" in repair ? exactRepairSuccessorNextActionV1(repair.successor) : null;
+	return successorAction ?? repairDelegationToolActionV1(parentDelegationId);
 }
 
 function validDurableReviewResult(
@@ -151,7 +140,7 @@ function validDurableReviewResult(
 	if (result.delegation_id !== delegationId) return false;
 	if (result.status !== "ACCEPT" && result.status !== "REPAIR") return true;
 	return result.durable === true && SHA256_RE.test(result.bound_diff_hash) &&
-		(result.status !== "REPAIR" || result.next_action === qRepair(delegationId));
+		(result.status !== "REPAIR" || result.next_action === repairDelegationToolActionV1(delegationId));
 }
 
 function isAcceptResult(result: AutomaticSemanticReviewResult): result is AutomaticSemanticAcceptResultV1 {
@@ -182,7 +171,7 @@ export async function coordinateDeliveryChainV1(
 			status: "AUTHORITY_ERROR",
 			code: "INVALID_MAX_SUCCESSOR_ATTEMPTS",
 			successor_attempts_used: 0,
-			next_action: qReview(delegationId),
+			next_action: reviewDelegationToolActionV1(delegationId),
 		};
 	}
 
@@ -195,7 +184,7 @@ export async function coordinateDeliveryChainV1(
 			status: "AUTHORITY_ERROR",
 			code: "REVIEW_SERVICE_FAILED",
 			successor_attempts_used: 0,
-			next_action: qReview(delegationId),
+			next_action: reviewDelegationToolActionV1(delegationId),
 		};
 	}
 	if (!validDurableReviewResult(review, delegationId)) {
@@ -205,7 +194,7 @@ export async function coordinateDeliveryChainV1(
 			code: "REVIEW_RESULT_INVALID",
 			successor_attempts_used: 0,
 			review,
-			next_action: qReview(delegationId),
+			next_action: reviewDelegationToolActionV1(delegationId),
 		};
 	}
 	if (isAcceptResult(review)) {
@@ -237,7 +226,7 @@ export async function coordinateDeliveryChainV1(
 			code: "REVIEW_RESULT_INVALID",
 			successor_attempts_used: 0,
 			review,
-			next_action: qReview(delegationId),
+			next_action: reviewDelegationToolActionV1(delegationId),
 		};
 	}
 
@@ -256,7 +245,7 @@ export async function coordinateDeliveryChainV1(
 			code: "PARENT_OPERATION_NOT_SETTLED",
 			successor_attempts_used: 0,
 			review,
-			next_action: qRepair(delegationId),
+			next_action: repairDelegationToolActionV1(delegationId),
 		};
 	}
 	if (!settled.ok) {
@@ -266,7 +255,7 @@ export async function coordinateDeliveryChainV1(
 			code: "PARENT_OPERATION_NOT_SETTLED",
 			successor_attempts_used: 0,
 			review,
-			next_action: qRepair(delegationId),
+			next_action: repairDelegationToolActionV1(delegationId),
 		};
 	}
 	if (settled.value.schema_version !== 1 || settled.value.authority_confirmed !== true ||
@@ -280,7 +269,7 @@ export async function coordinateDeliveryChainV1(
 			code: "PARENT_SETTLED_AUTHORITY_INVALID",
 			successor_attempts_used: 0,
 			review,
-			next_action: qRepair(delegationId),
+			next_action: repairDelegationToolActionV1(delegationId),
 		};
 	}
 
@@ -298,7 +287,7 @@ export async function coordinateDeliveryChainV1(
 			code: "EXACT_REPAIR_SERVICE_FAILED",
 			successor_attempts_used: 1,
 			review,
-			next_action: qRepair(delegationId),
+			next_action: repairDelegationToolActionV1(delegationId),
 		};
 	}
 	if (repair.repair_of !== delegationId) {
@@ -309,7 +298,7 @@ export async function coordinateDeliveryChainV1(
 			successor_attempts_used: 1,
 			review,
 			repair,
-			next_action: qRepair(delegationId),
+			next_action: repairDelegationToolActionV1(delegationId),
 		};
 	}
 	if (repair.status === "SUCCESSOR_RECORDED" &&

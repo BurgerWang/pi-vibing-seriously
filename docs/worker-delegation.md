@@ -464,6 +464,13 @@ Consequences for the commander workflow:
 
 ## Delegation transaction and review lifecycle (P7)
 
+One pure canonical resolver owns lifecycle state and the single primary action.
+Review/status/repair compatibility surfaces translate historical facts into
+that resolver rather than deciding independently. Safe closure, empty-attempt
+supersession, rebase, stale-lock reclaim, and continuation execute at mutation
+boundaries; ordinary delivery does not require a user to sequence status,
+review, repair, and retry commands manually.
+
 New public delegations have one write authority: delegation transaction v2.
 The mutable CAS state is
 `.pi/workbench/delegations/<id>/v2/transaction.json`; its successful terminal
@@ -601,9 +608,10 @@ session runs `/reload` or restarts and reports `CURRENT`; `/new` is not reload.
   Mechanical FAIL, more than 32 pages, legacy page-count authority, lineage
   presentation gaps, drift, model/protocol errors, and persistence/readback
   failures never fabricate `ACCEPT` or semantic `REPAIR`. Worker durable
-  success stays success and review stays pending/retryable with an exact
-  `/q-review <id>` or bounded manual route. `REPAIR` readback points to exact
-  `/q-repair <id>`. The structured receipt binds page/content/model-response
+  success stays success and review stays pending/retryable with one typed
+  `REVIEW_CANDIDATE` machine action or bounded manual route. `REPAIR` readback
+  points to one typed `EXECUTE_EXACT_REPAIR` action. `/q-review` and `/q-repair`
+  are equivalent human conveniences. The structured receipt binds page/content/model-response
   and usage hashes, but the durable semantic artifact remains the review
   authority and still grants no Gate authority.
 - **`workbench_review_worker_diff`** (DEV-only review path): reads the current
@@ -634,7 +642,7 @@ session runs `/reload` or restarts and reports `CURRENT`; `/new` is not reload.
   bounded non-empty `repair_reason`. The runtime atomically publishes an
   immutable negative sidecar; it does not finalize the review, change the
   transaction from `PENDING_REVIEW`, or grant Gate authority. Status then
-  exposes one exact `repair_of` action while the binding remains current.
+  exposes one typed `EXECUTE_EXACT_REPAIR` action while the binding remains current.
   `FAIL` (any out-of-scope path) keeps the transaction PENDING_REVIEW. The v2
   review artifact binds the versioned current binding. Once durable semantic
   review succeeds, it is authoritative even if the session mirror append
@@ -668,6 +676,9 @@ session runs `/reload` or restarts and reports `CURRENT`; `/new` is not reload.
   workbench artifacts do not stale it, while Git HEAD, W/D/S, or U conflicts
   fail closed. Historical untagged v2/v1 refreshes the complete full-diff
   binding, so any diff change there turns a reviewed delegation STALE.
+  This surface is a pure read projection: it emits exactly one resolver-owned
+  typed action and its derived instruction, and does not append a session entry,
+  persist a mirror, rewrite authority, or create a durable receipt.
 - **Blocking:** a pending or stale review blocks VERIFY (`/q-mode-verify`
   refuses, and `/q-gate`/`workbench_run_gate` are refused in VERIFY) until
   the active delegation's versioned binding is reviewed. It also blocks the
@@ -703,6 +714,9 @@ compatibility. New public delegations never write v1: they write only the v2
 transaction, immutable generation, and v2 review paths above. Public reads,
 status, gates, review, and `repair_of` resolve strict v2 authority first; only
 a strict v2 `not_found` result may use the applicable finished v1 fallback.
+The exported historical v1 create/finish functions are compatibility symbols
+only and fail closed with `historical delegation schema v1 is read-only`;
+legacy fixtures are constructed only by test support, never production code.
 Corrupt, pending, unsupported, storage-failed, or otherwise invalid v2 never
 falls back. Rollback may stop using v2 but must not delete or rewrite v2
 authority, and an unknown higher schema version always fails closed.
@@ -1228,7 +1242,7 @@ cumulative receipt (page count, recomputable `[0,next_byte)` prefix hash, and on
 range/hash), so 4097 or more short-line pages cannot exhaust the review
 record. Content or proof above any limit is refused before `PENDING_REVIEW`:
 the transaction becomes the existing strictly recoverable unpublished
-`RECOVERY_REQUIRED` shape and exposes the exact `repair_of=<id>` route; it is
+`RECOVERY_REQUIRED` shape and the resolver exposes its one exact typed route; it is
 never left as an uncloseable pending review.
 For sufficiently large current regular `.svg` and `.json` files, a strict
 bounded compact packet (status, size, digest binding, head/tail previews and
@@ -1385,11 +1399,10 @@ untrusted repositories or unattended automation.
    affected files, and concrete risk.
 2. Give Luna one bounded contract for the coherent source, test, and
    documentation slice. Use focused recipes while the candidate is changing.
-3. Inspect the provisional scope/integrity packet returned with every non-zero
-   implementation. Complete any bounded presentation segments, then explicitly
-   ACCEPT the unchanged packet hash. If the complete unchanged packet is wrong,
-   publish hash-bound REPAIR and follow only the exact `repair_of` action shown
-   by status; `repair_of` cannot replace that negative semantic decision.
+3. Let the delivery path complete bounded presentation and semantic review.
+   Exceptional pending or rejected outcomes expose exactly one typed machine
+   action; the runtime executes safe lifecycle effects at mutation boundaries,
+   while slash commands remain optional human recovery conveniences.
 4. Use the temporary Sol lease only for an explicit user-authorized exception;
    never turn it into the routine implementation path.
 5. Once the candidate is stable, switch to VERIFY and run one final recipe or

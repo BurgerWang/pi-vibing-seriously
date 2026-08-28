@@ -79,6 +79,18 @@ machine check for chronological train/validation/test ranges, non-overlapping
 fold tests, explicit gap/embargo applicability, retained failed folds, and
 content-addressed parameter-stability evidence references.
 
+## Candidate and promotion lane
+
+Delegation lifecycle is development evidence, not research, Gate, promotion,
+release, or profitability authority. A completed/reviewed worker transaction,
+historical v1 record, repair sidecar, status projection, or automatic closure
+cannot satisfy Q0–Q5 and cannot select or promote a Candidate. Promotion uses
+only the exact current Candidate identity plus its Candidate-bound full Gate
+run and, for release, the explicit source/build/input/artifact provenance and
+user authorization. Ordinary research development does not require manual
+lifecycle choreography; any exceptional typed review/repair action merely
+restores the development lane and still grants no Q-Gate authority.
+
 ## Quant tooling
 
 - `/q-gate q0,q1,...` / `workbench_run_gate` — run gates

@@ -5,6 +5,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import {
 	delegationStatusToolActionV1,
 	repairDelegationToolActionV1,
+	reviewDelegationToolActionV1,
 } from "./agent-next-action.ts";
 
 import type { ExecFn } from "./config.ts";
@@ -357,7 +358,7 @@ export function registerReviewTool(controller: ReviewToolController): void {
 								review_kind: "scope_integrity",
 								gate_authority: false,
 								...(v2Result.binding_hash === undefined ? {} : { binding_hash: v2Result.binding_hash }),
-								...(migrationBlocked ? { next_action: `call workbench_review_worker_diff with delegation_id=${delegationId}`, delegation_id: delegationId } : {}),
+								...(migrationBlocked ? { next_action: reviewDelegationToolActionV1(delegationId), delegation_id: delegationId } : {}),
 						},
 					};
 				}

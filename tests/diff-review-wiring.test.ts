@@ -48,12 +48,14 @@ import {
 	collectAfterFacts,
 	collectGitFacts,
 	contentDigest,
-	createDelegationLedger,
-	finishDelegationLedger,
 	makeDelegationId,
 	MAX_DIGEST_BYTES,
 	type LedgerWorkerFacts,
 } from "../extensions/workbench-runtime/core/delegation-ledger.ts";
+import {
+	createLegacyDelegationFixture as createDelegationLedger,
+	finishLegacyDelegationFixture as finishDelegationLedger,
+} from "./legacy-delegation-fixture.ts";
 import { DELEGATION_STATE_ENTRY_TYPE, serializeDelegationState } from "../extensions/workbench-runtime/core/delegation-state.ts";
 import { WORKBENCH_TOOL_NAMES, WORKBENCH_TOOL_PARAMETERS } from "../extensions/workbench-runtime/core/tool-catalog.ts";
 import { NATIVE_OVERRIDE_NAMES } from "../extensions/workbench-runtime/core/native-tool-policy.ts";

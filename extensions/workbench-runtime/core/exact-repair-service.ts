@@ -2,9 +2,7 @@
 
 import { canonicalHash } from "../cache/canonical-hash.ts";
 import {
-	delegationStatusToolActionV1,
-	repairDelegationToolActionV1,
-	reviewDelegationToolActionV1,
+	delegationLifecycleActionCommandV1,
 } from "./agent-next-action.ts";
 import type {
 	DelegateExactRepairExecuteV1,
@@ -22,6 +20,7 @@ import {
 import {
 	readExactRepairSuccessorV1,
 	readRawLineageExactRepairSuccessorV1,
+	resolveExactRepairSuccessorDispositionV1,
 	type ExactRepairExistingSuccessorV1,
 	type ExactRepairSuccessorReadCodeV1,
 } from "./exact-repair-successor.ts";
@@ -189,13 +188,8 @@ function executionWasRefused(result: ExactRepairExecutionResultV1): boolean {
 }
 
 export function exactRepairSuccessorNextActionV1(successor: ExactRepairExistingSuccessorV1): string | null {
-	if (successor.disposition === "REVIEW_PENDING") return reviewDelegationToolActionV1(successor.delegation_id);
-	if (successor.disposition === "REPAIR_PENDING" || successor.disposition === "EXACT_REPAIR_PENDING") {
-		return repairDelegationToolActionV1(successor.delegation_id);
-	}
-	if (successor.disposition === "ACTIVE") return delegationStatusToolActionV1();
-	if (successor.disposition === "BLOCKED") return delegationStatusToolActionV1();
-	return null;
+	const resolution = resolveExactRepairSuccessorDispositionV1(successor);
+	return delegationLifecycleActionCommandV1(resolution.primary_action);
 }
 
 function rawSuccessorReplayResult(input: {

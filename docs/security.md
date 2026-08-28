@@ -187,7 +187,15 @@ binding checks. Records are atomic (sibling temp + rename, mode 0600), bounded,
 and redacted; they never contain full transcripts or secrets. The delegation
 directory is excluded from workspace facts, and Git facts come from argv-only
 `exec` calls (`shell=false`). Historical v1 ledger files remain strict
-read-only compatibility only and are never written for a new delegation.
+read-only compatibility only and are never written for a new delegation. The
+retained v1 create/finish exports fail closed; only readers remain operational.
+
+The pure canonical lifecycle resolver is the sole production owner of state
+and primary-action selection. Compatibility classifiers may preserve public
+shapes, but must delegate action selection to that resolver. Status reads only
+durable authority and observes the live binding in memory; they never persist
+the session mirror, append a session entry, rewrite authority, or create a
+tool-result receipt. This prevents a read from becoming a shadow writer.
 
 The v2 transaction lock protects individual atomic updates; a separate
 bounded `execution-owner.json` protects the complete PREPARED/RUNNING worker
@@ -287,8 +295,8 @@ Zero actual delta alone is `semantic_review:not_required`. For a complete but
 wrong current packet, `semantic_decision=REPAIR` additionally requires the
 exact bound hash and bounded reason. It atomically creates an immutable
 `v2/repair-decision.json` negative sidecar, leaves the transaction
-`PENDING_REVIEW`, and enables only the reported exact fresh `repair_of`
-lineage. The project remains Gate-blocking.
+`PENDING_REVIEW`, and enables only the resolver-owned exact-repair action for
+that lineage. The project remains Gate-blocking.
 
 Default delivery now completes the durable mechanical packet before attempting
 automatic semantic review. Production automation is capped at 32 pages and
@@ -298,8 +306,9 @@ assessments under the aggregate request bound. Model identity, response shape,
 page/content hashes, cross-page findings, and nested usage are validated.
 Mechanical FAIL, oversized/legacy presentation, lineage gaps, model errors,
 drift, and persistence/readback faults cannot produce ACCEPT. They leave worker
-success and `PENDING_REVIEW` intact with `/q-review <id>` or a bounded manual
-route. The receipt is evidence; only the ordinary durable semantic artifact is
+success and `PENDING_REVIEW` intact with one resolver-owned
+`REVIEW_CANDIDATE` machine action or a bounded manual route. `/q-review` is the
+equivalent human convenience command. The receipt is evidence; only the ordinary durable semantic artifact is
 review authority, and neither is Gate authority.
 
 A closed failed implementation with nonempty attributable in-scope partial

@@ -4,7 +4,7 @@
 | --- | --- |
 | Plan ID | `pi-workbench-two-lane-lifecycle-convergence-v1` |
 | 版本 | `1.0` |
-| 状态 | **IN_PROGRESS — WP0–WP5 源码与自动化测试已推进；WP6 NEXT** |
+| 状态 | **IN_PROGRESS — WP0–WP7 源码与自动化测试已推进；WP8 NEXT** |
 | 批准日期 | `2026-08-28` |
 | 执行仓库 | `/home/hanbaoji/Projects/pi-vibing-seriously` |
 | 基线 HEAD | `main@d003fdf` |
@@ -543,15 +543,19 @@ resolver 将其与 committed generation、review、lock、binding 和 lineage �
 | WP3 | 已分阶段实现并提交 | `513d9b7` 至 `357f84b`，统一 effect/review/status/continuation 收敛 |
 | WP4 | 已实现、测试并提交 | `7391000`，普通开发通道与回归测试 |
 | WP5 | 源码与自动化测试完成，纳入本次提交 | Candidate identity/version/alias、Candidate-bound Gates、research/release promotion、Q4 机验、release provenance、report/compare |
-| WP6 | `NOT_STARTED` | 下一工作包：模型化、并发与故障注入测试 |
-| WP7 | `NOT_STARTED` | 等待 WP6 证据 |
-| WP8 | `NOT_STARTED` | 等待 WP6–WP7；三项目部署与最终出口尚未执行 |
+| WP6 | 已实现、自动化测试完成，未提交 | 10,000 个固定 seed 模型序列、缩减/replay、review/repair/lock 调度、逐 publish boundary 故障注入、三项目兼容零写入回放 |
+| WP7 | 源码与自动化测试完成，未提交 | 唯一 resolver/action owner、status 纯投影、v1 writer fail-closed、六份最终行为文档与结构回归 |
+| WP8 | `NOT_STARTED` | 下一工作包：三项目部署与最终出口 |
 
-WP5 当前验证证据为 `npm run typecheck` PASS、`npm test` PASS、相关 focused tests
-PASS 和 `git diff --check` PASS。该结果只证明当前源码候选及自动化测试通过；真实
-Candidate 的 research/release promotion、运行中的 Pi reload/runtime identity、三个外部
-项目 canary、release 授权、push 和 publish 均为 `NOT_RUN`。因此本计划仍为
-`IN_PROGRESS`，不得标记 `COMPLETE`；下一执行入口是 WP6。
+WP6 当前验证证据为 lifecycle focused 组 160/160 PASS；WP7 focused lifecycle、
+兼容、回放、打包组 244/244 PASS，最新 `npm run check` PASS，其中 typecheck PASS、
+全量测试 3101 项（3100 PASS、1 项按普通测试合同 SKIP）且 `git diff --check` PASS。
+模型测试覆盖 10,000 个固定 seed 序列、全部 37 个模型
+命令、15 个主动作和 12 个 canonical state；失败输出携带 seed、完整 replay 序列和
+缩减结果。该结果只证明当前源码候选及自动化测试通过；运行中的 Pi
+reload/runtime identity、三个外部项目 canary、release 授权、push 和 publish 均为
+`NOT_RUN`。因此本计划仍为 `IN_PROGRESS`，不得标记 `COMPLETE`；下一执行入口是
+WP8。
 
 ### WP0 — 收束现有恢复候选
 
@@ -786,6 +790,15 @@ Candidate 的 research/release promotion、运行中的 Pi reload/runtime identi
 - `WP6-AC05` storage fault injection 覆盖每个 durable publish boundary。
 - `WP6-AC06` 对旧历史的兼容 replay 不产生新的持久文件。
 
+**当前完成证据（2026-08-28）：** 状态—动作 table test 与生成序列共同覆盖全部
+canonical state/action；10,000 个固定 seed 序列逐步验证 safety、determinism、
+idempotency、recovery rank、历史隔离和 promotion strictness，并提供已自测的
+delta-debugging 缩减器；review/repair 的全部三任务排列在共享 writer lock 下只产生
+一次 effect 与一次 replay，注入首次 lock crash 后队列仍收敛且 successor 唯一；
+Scalper/Mace/Onchain 脱敏 fixture 均通过，v1/旧 v2 兼容 replay 前后目录、文件大小与
+SHA-256 完全一致；transaction、review、semantic migration、semantic repair 与
+terminal-negative sidecar 的全部已声明 storage fault point 均实际注入并 fail-closed。
+
 ### WP7 — 删除旧治理与兼容收口
 
 **目标：** 防止 resolver 成为第八个判断器。
@@ -808,6 +821,20 @@ Candidate 的 research/release promotion、运行中的 Pi reload/runtime identi
 - `WP7-AC04` 文档不再要求用户手工生命周期编排。
 - `WP7-AC05` v1 public compatibility 与当前工具合同无非预期破坏。
 - `WP7-AC06` 不存在 shadow/parallel authority。
+
+**当前完成证据（2026-08-28）：** `delegation-lifecycle-resolver.ts` 是唯一导出的
+生产 resolver；旧 repair-status 与 exact-successor classification 导出仅保留兼容
+shape，并把动作选择转交 resolver。next-action 的机器命令和人类说明集中于
+`agent-next-action.ts`；status 只读观察 live binding，不再 reconcile/persist session
+mirror、append entry 或生成 receipt。历史 schema-v1 reader 继续可读，生产
+create/finish export 均固定 fail-closed；旧记录只由 test-only fixture 构造。
+`tests/delegation-lifecycle-ownership.test.ts` 固化唯一 owner、status 零写入、单一
+action 文本 owner 和 v1 writer 禁止，`delegation-v2-wiring` 另以实际目录/entry
+断言 status 前后无 transaction rewrite、session append 或 receipt。六份指定文档均
+已更新为普通开发零手工 lifecycle choreography。当前生产 runtime/core 受影响文件
+为 `+411/-435`，净删除 24 行；focused 244/244 PASS，最新 `npm run check` PASS。
+`S2.2–S2.6` 没有本轮实际基线/吞吐指标，继续保持 `NOT_RUN`；这也不证明 runtime
+reload、三个外部项目 canary、Gate、release、push 或 publish，均留给 WP8。
 
 ### WP8 — 三项目部署与最终出口
 

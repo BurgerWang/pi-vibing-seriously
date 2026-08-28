@@ -12,6 +12,12 @@ import {
 import { delegationsDir, isValidDelegationId } from "./delegation-ledger.ts";
 import { isDelegationPathLaneBypassableProjectIssueV1 } from "./delegation-path-lane-admission.ts";
 import { readStrictRetryableRawRepairEvidenceV1 } from "./delegation-execution-owner.ts";
+import {
+	DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+	delegationLifecycleSnapshotFromCompatibilityProjectionV1,
+	resolveDelegationLifecycleV1,
+	type DelegationLifecycleResolutionV1,
+} from "./delegation-lifecycle-resolver.ts";
 import { readProjectDelegationRepairClosureV1 } from "./delegation-project-authority.ts";
 import { normalizeDelegationBoundedTaskContractV2 } from "./delegation-transaction-artifacts.ts";
 import {
@@ -145,8 +151,8 @@ const DEFAULT_CLASSIFIER_READERS = Object.freeze({
 	recoverExactRepairAuthority: recoverExactRepairCommandAuthorityV1,
 }) satisfies ClassifyExactRepairSuccessorReadersV1;
 
-/** Strict machine disposition shared by command replay and runtime chaining. */
-export async function classifyExactRepairSuccessorV1(
+/** Strict durable fact reader; it does not own lifecycle action selection. */
+async function readExactRepairSuccessorFactsV1(
 	projectRoot: string,
 	candidate: DelegationTransactionRecord,
 	readers: ClassifyExactRepairSuccessorReadersV1 = DEFAULT_CLASSIFIER_READERS,
@@ -220,6 +226,53 @@ export async function classifyExactRepairSuccessorV1(
 			&& candidate.repair_lineage.depth <= EXACT_REPAIR_RAW_LINEAGE_MAX_RETRYABLE_DEPTH_V1
 			? "EXACT_REPAIR_PENDING" : "BLOCKED",
 	};
+}
+
+/** Resolve one historical successor disposition through the canonical owner. */
+export function resolveExactRepairSuccessorDispositionV1(input: Pick<
+	ExactRepairExistingSuccessorV1,
+	"delegation_id" | "disposition"
+>): DelegationLifecycleResolutionV1 {
+	return resolveDelegationLifecycleV1(
+		delegationLifecycleSnapshotFromCompatibilityProjectionV1({
+			source_authority: input,
+			authority_health: "VALID",
+			authority_disposition: input.disposition === "ACTIVE" ? "ACTIVE" : "INACTIVE",
+			writer_lock: input.disposition === "ACTIVE" ? "LIVE" : "ABSENT",
+			binding: input.disposition === "BLOCKED" ? "OVERLAPPING" : "CURRENT",
+			attempt: input.disposition === "REVIEW_PENDING" ? "AWAITING_REVIEW"
+				: input.disposition === "REPAIR_PENDING" || input.disposition === "EXACT_REPAIR_PENDING" ? "REPAIRABLE"
+					: input.disposition === "ACTIVE" ? "ACTIVE"
+						: input.disposition === "CHAIN_CLOSED" ? "ACCEPTED" : "TERMINAL",
+			target: { kind: "DELEGATION", id: input.delegation_id },
+			scope_unknown: input.disposition === "BLOCKED",
+			recovery_rank: input.disposition === "CHAIN_CLOSED"
+				? { unresolved_obligations: 0, unresolved_attempts: 0 }
+				: { unresolved_obligations: 1, unresolved_attempts: 1 },
+		}),
+		{ schema_version: 1, kind: DELEGATION_LIFECYCLE_EVENT_KIND_V1, event: "OBSERVE", expected_snapshot_hash: null },
+	);
+}
+
+/** @deprecated v1 disposition compatibility; the canonical resolver owns the action. */
+export async function classifyExactRepairSuccessorV1(
+	projectRoot: string,
+	candidate: DelegationTransactionRecord,
+	readers: ClassifyExactRepairSuccessorReadersV1 = DEFAULT_CLASSIFIER_READERS,
+): Promise<ClassifyExactRepairSuccessorResultV1> {
+	const facts = await readExactRepairSuccessorFactsV1(projectRoot, candidate, readers);
+	if (!facts.ok) return facts;
+	const action = resolveExactRepairSuccessorDispositionV1({
+		delegation_id: candidate.delegation_id,
+		disposition: facts.disposition,
+	}).primary_action.action;
+	const compatible = facts.disposition === "ACTIVE" ? action === "WAIT_FOR_ACTIVE_WRITER"
+		: facts.disposition === "REVIEW_PENDING" ? action === "REVIEW_CANDIDATE"
+			: facts.disposition === "REPAIR_PENDING" || facts.disposition === "EXACT_REPAIR_PENDING"
+				? action === "EXECUTE_EXACT_REPAIR"
+				: facts.disposition === "CHAIN_CLOSED" ? action === "CLOSE_ACCEPTED_OBLIGATION"
+					: action === "BLOCK_OVERLAPPING_PATHS";
+	return compatible ? facts : { ok: false, code: "AUTHORITY_INVALID" };
 }
 
 async function hasV2Layout(root: string, delegationId: string): Promise<"absent" | "present" | "invalid"> {
