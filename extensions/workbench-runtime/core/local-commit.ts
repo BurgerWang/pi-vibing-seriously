@@ -35,6 +35,10 @@ import {
 	readLatestProjectDelegationTransactionV2,
 } from "./delegation-project-authority.ts";
 import { readDelegationCommittedGenerationV2 } from "./delegation-transaction-storage.ts";
+import {
+	REVIEW_RELEVANCE_KIND_V2,
+	validateReviewRelevanceProjectionV2,
+} from "./review-relevance-v2.ts";
 
 export const LOCAL_COMMIT_MESSAGE_MAX_BYTES_V1 = 240 as const;
 const COMMIT_HASH_RE = /^[0-9a-f]{40,64}$/u;
@@ -239,6 +243,36 @@ function reviewedAfterSnapshot(
 	return { gitHead: after.git_head, pathStatuses: statuses, pathDigests: digests };
 }
 
+function reviewedProjectionSnapshot(
+	review: unknown,
+	reviewedPaths: readonly string[],
+): ReviewedAfterSnapshotV1 | undefined {
+	if (!isRecord(review) || review.diff_identity_kind !== REVIEW_RELEVANCE_KIND_V2 ||
+		!validateReviewRelevanceProjectionV2(review.relevance_projection)) return undefined;
+	const projection = review.relevance_projection;
+	if (projection.git_head === null || !COMMIT_HASH_RE.test(projection.git_head)) return undefined;
+	const byPath = new Map(projection.entries.map((entry) => [entry.path, entry]));
+	const statuses: Record<string, string> = {};
+	const digests: Record<string, string> = {};
+	for (const path of reviewedPaths) {
+		const entry = byPath.get(path);
+		if (entry === undefined || (!entry.roles.includes("W") && !entry.roles.includes("C") && !entry.roles.includes("D"))) {
+			return undefined;
+		}
+		statuses[path] = entry.status;
+		if (entry.full_identity.kind === "file") digests[path] = entry.full_identity.sha256;
+	}
+	return { gitHead: projection.git_head, pathStatuses: statuses, pathDigests: digests };
+}
+
+function reviewedSealedSnapshot(
+	after: unknown,
+	review: unknown,
+	reviewedPaths: readonly string[],
+): ReviewedAfterSnapshotV1 | undefined {
+	return reviewedProjectionSnapshot(review, reviewedPaths) ?? reviewedAfterSnapshot(after, reviewedPaths);
+}
+
 function matchesReviewedSnapshot(
 	facts: GitFacts,
 	paths: readonly string[],
@@ -440,8 +474,14 @@ export async function commitLatestReviewedDelegationV1(input: {
 				|| !authority.semanticAccepted || authority.semanticBindingHash === null || authority.review === null) {
 				continue;
 			}
+			const committed = await services.readCommittedGeneration(input.project_root, candidateId);
+			if (!committed.ok) {
+				outcome = failure("authority_unavailable", "the accepted delegation generation is unavailable", candidateId);
+				return outcome;
+			}
 			acceptedCandidateSeen = true;
-			const paths = sortedUnique(authority.review.checked_paths);
+			const carriedPaths = committed.value.state?.repair_lineage?.carried_paths ?? [];
+			const paths = sortedUnique([...authority.review.checked_paths, ...carriedPaths]);
 			if (paths.length === 0) continue;
 			const dirtyPaths = paths.filter((path) => before.changedPaths.includes(path));
 			if (dirtyPaths.length === 0) continue;
@@ -453,12 +493,7 @@ export async function commitLatestReviewedDelegationV1(input: {
 				incompatibleCandidateId ??= candidateId;
 				continue;
 			}
-			const committed = await services.readCommittedGeneration(input.project_root, candidateId);
-			if (!committed.ok) {
-				outcome = failure("authority_unavailable", "the accepted delegation generation is unavailable", candidateId);
-				return outcome;
-			}
-			const snapshot = reviewedAfterSnapshot(committed.value.records["after.json"], paths);
+			const snapshot = reviewedSealedSnapshot(committed.value.records["after.json"], authority.review, paths);
 			if (snapshot === undefined) {
 				// Newer strict authority already owns every live path in this historical slice.
 				if (dirtyPaths.every((path) => selectedPaths.has(path))) continue;

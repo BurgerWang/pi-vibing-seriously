@@ -334,7 +334,7 @@ test("mechanical scope/integrity FAIL never invokes paging or Sol and exposes on
 	assert.deepEqual(h.facts(), { pageCalls: 0, decisionCalls: 0, coordinateCalls: 0 });
 });
 
-test("lineage gap detector distinguishes carried rejected D from paths actually presented by W/C", () => {
+test("lineage gap detector promotes only immutable carried D paths into the successor review scope", () => {
 	const identity = (path: string) => ({
 		schema_version: 2 as const,
 		kind: "file" as const,
@@ -357,7 +357,11 @@ test("lineage gap detector distinguishes carried rejected D from paths actually 
 		],
 	};
 	const lineage = { carried_paths: ["src/a.ts", "src/b.ts"] } as never;
-	assert.deepEqual(missingRepairLineageStructuredPresentationPathsV2(lineage, projection), ["src/b.ts"]);
+	assert.deepEqual(missingRepairLineageStructuredPresentationPathsV2(lineage, projection), []);
+	assert.deepEqual(missingRepairLineageStructuredPresentationPathsV2(
+		{ carried_paths: ["src/a.ts", "src/b.ts", "src/missing.ts"] } as never,
+		projection,
+	), ["src/missing.ts"]);
 	const fullyPresented = {
 		...projection,
 		command_provenance_hash: "6".repeat(64),

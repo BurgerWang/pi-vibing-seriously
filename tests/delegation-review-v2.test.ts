@@ -743,6 +743,24 @@ test("review v2: a default multi-path bounded presentation persists only fully v
 			assert.ok(progress, `complete entry ${entry.path} has strict persisted progress`);
 			assert.equal(progress.next_byte, progress.total_bytes);
 		}
+		let resumed: Awaited<ReturnType<typeof reviewDelegationV2>> = result;
+		for (let attempt = 0; attempt < 8 && resumed.ok &&
+			resumed.review.record?.presentation_complete !== true; attempt += 1) {
+			resumed = await reviewDelegationV2({
+				projectRoot: fixture.root,
+				delegationId: ID,
+				exec: spawnExec,
+				maxBytes: 3_000,
+				maxLines: 80,
+				now: at(5 + attempt),
+			});
+		}
+		assert.equal(resumed.ok, true, resumed.ok ? "" : JSON.stringify(resumed.error));
+		if (resumed.ok) {
+			assert.equal(resumed.review.record?.presentation_complete, true,
+				"default re-review resumes remaining paths without requiring manual include_paths");
+			assert.deepEqual(resumed.review.record?.fully_presented_paths, ["src/a-small.ts", "src/b-large.ts"]);
+		}
 	} finally {
 		await cleanup(fixture);
 	}

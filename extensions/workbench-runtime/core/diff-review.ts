@@ -614,6 +614,8 @@ export interface ReviewAuthorityFacts {
 	delegation_id: string;
 	allowed_paths: readonly string[];
 	worker_paths: readonly string[];
+	/** Immutable rejected-lineage paths promoted into this successor's review scope. */
+	lineage_carried_paths?: readonly string[];
 	recorded_after_hash: string;
 	after: GitFacts;
 	reported_paths: readonly string[];
@@ -1536,10 +1538,16 @@ function byteSortedUnique(values: readonly string[]): boolean {
 		&& (index === 0 || Buffer.from(values[index - 1]!, "utf8").compare(Buffer.from(value, "utf8")) < 0));
 }
 
-function structuredPresentationEffectivePaths(projection: Readonly<ReviewRelevanceProjectionV2>): string[] {
+function structuredPresentationEffectivePaths(
+	projection: Readonly<ReviewRelevanceProjectionV2>,
+	lineageCarriedPaths: readonly string[] = [],
+): string[] {
+	const carried = new Set(lineageCarriedPaths);
 	return [...new Set(projection.entries
-		.filter((entry) => entry.roles.includes("W") || entry.roles.includes("C"))
-		.map((entry) => entry.path))].sort((left, right) => Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8")));
+		.filter((entry) => entry.roles.includes("W") || entry.roles.includes("C") ||
+			(carried.has(entry.path) && entry.roles.includes("D")))
+		.map((entry) => entry.path))]
+		.sort((left, right) => Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8")));
 }
 
 function strictStructuredPresentationAuthority(authority: Readonly<ReviewAuthorityFacts>): boolean {
@@ -1559,7 +1567,9 @@ function strictStructuredPresentationAuthority(authority: Readonly<ReviewAuthori
 		|| authority.worker_paths.length !== envelope.path_count
 		|| current.gitHead !== projection.git_head
 		|| canonicalHash(current.changedPaths) !== canonicalHash(authority.worker_paths)) return false;
-	const effectivePaths = structuredPresentationEffectivePaths(projection);
+	const lineageCarriedPaths = authority.lineage_carried_paths ?? [];
+	if (!byteSortedUnique(lineageCarriedPaths)) return false;
+	const effectivePaths = structuredPresentationEffectivePaths(projection, lineageCarriedPaths);
 	if (canonicalHash(effectivePaths) !== canonicalHash(authority.worker_paths)) return false;
 	const effectiveSet = new Set(effectivePaths);
 	for (const entry of projection.entries.filter((candidate) => effectiveSet.has(candidate.path))) {

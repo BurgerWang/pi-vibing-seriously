@@ -51,6 +51,7 @@ import {
 	DELEGATION_TRANSACTION_HASH_RE,
 	DELEGATION_TRANSACTION_ID_RE,
 	DELEGATION_TRANSACTION_SCHEMA_VERSION,
+	delegationRepairReviewPathsV1,
 	delegationPathAllowedV2,
 	isCurrentDelegationTerminalOutcome,
 	isDelegationInterruptedCandidateV2,
@@ -760,12 +761,13 @@ function buildDelegationCommittedArtifactsUnchecked(
 	if (!changedPaths.every((path, index) => index === 0 || byteCompare(changedPaths[index - 1]!, path) < 0)) {
 		return fail("invalid_facts", "delegation worker delta paths are not in canonical byte order");
 	}
-	const reviewEnvelopeCandidate = transaction.task_kind === "implementation" && changedPaths.length > 0 &&
+	const reviewPaths = delegationRepairReviewPathsV1(changedPaths, transaction.repair_lineage);
+	const reviewEnvelopeCandidate = transaction.task_kind === "implementation" &&
 		(transaction.postcondition_reasons.length === 0 ||
 			isDelegationInterruptedCandidateV2(transaction, transaction.terminal_outcome)) &&
 		transaction.terminal_outcome.terminal_facts_complete && transaction.terminal_outcome.scope_complete;
-	if (reviewEnvelopeCandidate &&
-		(!validateSemanticReviewEnvelopeV1(input.reviewEnvelope) || input.reviewEnvelope.path_count !== changedPaths.length)) {
+	if (reviewEnvelopeCandidate && (reviewPaths === undefined || reviewPaths.length === 0 ||
+		!validateSemanticReviewEnvelopeV1(input.reviewEnvelope) || input.reviewEnvelope.path_count !== reviewPaths.length)) {
 		return fail("review_envelope_exceeded", "delegation semantic review cannot be closed inside the versioned capacity envelope");
 	}
 	const authorityBoundPaths = new Set([

@@ -277,6 +277,47 @@ test("implementation zero delta cannot succeed even with provider success, exit 
 	assert.equal(publish(state).status, "FAILED");
 });
 
+test("repair successor with an already-installed carried fix requires semantic review instead of another implementation delta", () => {
+	const lineage = repairLineage();
+	const preparedRepair = ok(createPreparedDelegationTransaction({
+		delegation_id: ID,
+		task_kind: "implementation",
+		contract_hash: CONTRACT_HASH,
+		allowed_paths: ["src/a.ts", "src/z.ts"],
+		worker_identity: IDENTITY,
+		generation: 1,
+		now: T0,
+		repair_lineage: lineage,
+	}));
+	const runningRepair = ok(startDelegationTransaction(preparedRepair, cas(preparedRepair, T1)));
+	const noNewDelta = terminalOutcome(runningRepair, {
+		changed_paths: [],
+		successful_write_count: 0,
+		delta_hash: DELTA_HASH,
+	});
+	const committingRepair = ok(beginDelegationCommit(runningRepair, {
+		...cas(runningRepair, T2),
+		outcome: noNewDelta,
+	}));
+	assert.deepEqual(committingRepair.postcondition_reasons, []);
+	const pending = publish(committingRepair);
+	assert.equal(pending.status, "PENDING_REVIEW");
+	assert.deepEqual(pending.repair_lineage?.carried_paths, ["src/a.ts", "src/z.ts"]);
+
+	const historicalFailed = structuredClone(pending);
+	historicalFailed.status = "FAILED";
+	historicalFailed.postcondition_reasons = ["IMPLEMENTATION_DELTA_REQUIRED"];
+	assert.equal(parseDelegationTransaction(historicalFailed).ok, true,
+		"immutable pre-fix zero-delta failures remain readable and retryable");
+
+	const missingIdentity = ok(beginDelegationCommit(runningRepair, {
+		...cas(runningRepair, T2),
+		outcome: { ...noNewDelta, delta_hash: null },
+	}));
+	assert.deepEqual(missingIdentity.postcondition_reasons, ["IMPLEMENTATION_DELTA_HASH_REQUIRED"]);
+	assert.equal(publish(missingIdentity).status, "FAILED");
+});
+
 test("diagnosis delta, successful writes, and denied writes each fail closed", () => {
 	const state = committing("diagnosis", {
 		changed_paths: ["src/main.ts"],

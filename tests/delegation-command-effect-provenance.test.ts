@@ -265,6 +265,108 @@ test("a failed CLEAN recipe remains spatially ATTRIBUTED and is a separate worke
 	});
 });
 
+test("a later non-overlapping SUCCESS closes only failures from the same exact recipe", async (t) => {
+	const cases = [
+		{
+			name: "same recipe final success",
+			runs: [
+				["20260827-120010-cm10", "bounded-check", "PROCESS_FAILED", "2026-08-27T12:00:10.000Z", "2026-08-27T12:00:10.100Z"],
+				["20260827-120011-cm11", "bounded-check", "SUCCESS", "2026-08-27T12:00:11.000Z", "2026-08-27T12:00:11.100Z"],
+			],
+			expected: [],
+		},
+		{
+			name: "different recipe success",
+			runs: [
+				["20260827-120012-cm12", "bounded-check-a", "PROCESS_FAILED", "2026-08-27T12:00:12.000Z", "2026-08-27T12:00:12.100Z"],
+				["20260827-120013-cm13", "bounded-check-b", "SUCCESS", "2026-08-27T12:00:13.000Z", "2026-08-27T12:00:13.100Z"],
+			],
+			expected: ["COMMAND_EFFECT_RUN_FAILED"],
+		},
+		{
+			name: "same recipe final failure",
+			runs: [
+				["20260827-120014-cm14", "bounded-check", "SUCCESS", "2026-08-27T12:00:14.000Z", "2026-08-27T12:00:14.100Z"],
+				["20260827-120015-cm15", "bounded-check", "PROCESS_FAILED", "2026-08-27T12:00:15.000Z", "2026-08-27T12:00:15.100Z"],
+			],
+			expected: ["COMMAND_EFFECT_RUN_FAILED"],
+		},
+		{
+			name: "overlapping success cannot close failure",
+			runs: [
+				["20260827-120016-cm16", "bounded-check", "PROCESS_FAILED", "2026-08-27T12:00:16.000Z", "2026-08-27T12:00:17.100Z"],
+				["20260827-120017-cm17", "bounded-check", "SUCCESS", "2026-08-27T12:00:17.000Z", "2026-08-27T12:00:17.200Z"],
+			],
+			expected: ["COMMAND_EFFECT_RUN_FAILED"],
+		},
+	] as const;
+
+	for (const fixture of cases) await t.test(fixture.name, async () => {
+		await withTempDir(async (root) => {
+			await initIgnoredOutputRepo(root);
+			const contract = bindDelegationBoundedTaskContractV2({
+				task_kind: "implementation",
+				task: "Converge a bounded validation recipe after a repair.",
+				allowed_paths: ["src/**"],
+				acceptance_criteria: ["Only the same recipe's final non-overlapping result may close its earlier failure."],
+				verification: [],
+				timeout_seconds: 600,
+				budget_profile: "standard",
+			});
+			assert.equal(contract.ok, true);
+			if (!contract.ok) return;
+			const prepared = await prepareDelegationChangeSetLifecycleV2({
+				project_root: root,
+				delegation_id: DELEGATION_ID,
+				contract_hash: contract.value.contract_hash,
+				dependency_paths: [],
+				exec: spawnExec,
+			});
+			assert.equal(prepared.ok, true);
+			if (!prepared.ok) return;
+			for (const [runId, recipe, outcome, startedAt, finishedAt] of fixture.runs) {
+				const started = await beginRecipeCommandEffectCapture({
+					project_root: root,
+					exec: spawnExec,
+					declared_writes: [],
+				});
+				const effect = await completeRecipeCommandEffectCapture({
+					project_root: root,
+					exec: spawnExec,
+					started,
+					run_id: runId,
+					recipe,
+					actor: "worker",
+					worker_delegation_id: DELEGATION_ID,
+					worker_contract_hash: contract.value.contract_hash,
+					mutation_declaration: "none",
+					declared_writes: [],
+				});
+				assert.equal(effect.status, "CLEAN");
+				await commitEffectRun(root, effect, startedAt, finishedAt, outcome);
+			}
+			const finalized = await finalizeDelegationChangeSetLifecycleV2({
+				prepared: prepared.value,
+				observation: { state: "empty", tool: "none", outcome: "none", code: "none", revision: 0 },
+				exec: spawnExec,
+			});
+			assert.equal(finalized.ok, true, finalized.ok ? "" : finalized.error.code);
+			if (!finalized.ok || finalized.value.command_provenance === undefined) return;
+			assert.deepEqual(finalized.value.command_provenance.terminal_reasons, fixture.expected);
+			assert.equal(validateDelegationCommandProvenance(
+				finalized.value.command_provenance,
+				finalized.value.change_set,
+			), true);
+			if (fixture.expected.length === 0) {
+				const historicalSticky = structuredClone(finalized.value.command_provenance) as DelegationCommandProvenanceRecord;
+				historicalSticky.terminal_reasons = ["COMMAND_EFFECT_RUN_FAILED"];
+				assert.equal(validateDelegationCommandProvenance(resign(historicalSticky), finalized.value.change_set), true,
+					"immutable records from the sticky-failure implementation remain readable");
+			}
+		});
+	});
+});
+
 async function commandRun(
 	root: string,
 	contractHash: string,

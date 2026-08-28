@@ -20,6 +20,7 @@ import {
 	executeDelegationV2,
 	type ExecuteDelegationV2Input,
 } from "../extensions/workbench-runtime/core/delegation-execution-v2.ts";
+import { reviewDelegationV2 } from "../extensions/workbench-runtime/core/delegation-review-v2.ts";
 import {
 	abortPristinePreparedDelegationUnderStartLockV2,
 	RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2,
@@ -49,7 +50,10 @@ import {
 } from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
 import { readWorkerRepairCapsule } from "../extensions/workbench-runtime/core/worker-repair-authority.ts";
 import { SEMANTIC_REVIEW_ENVELOPE_MAX_STREAM_BYTES_V1 } from "../extensions/workbench-runtime/core/semantic-review-envelope.ts";
-import type { DelegationTaskKind } from "../extensions/workbench-runtime/core/delegation-transaction.ts";
+import {
+	bindDelegationRepairLineageV1,
+	type DelegationTaskKind,
+} from "../extensions/workbench-runtime/core/delegation-transaction.ts";
 import type { ExecFn } from "../extensions/workbench-runtime/core/config.ts";
 import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { EMPTY_WORKER_WRITE_JOURNAL_RUNTIME_OBSERVATION } from "../extensions/workbench-runtime/core/worker-write-journal-runtime.ts";
@@ -252,14 +256,18 @@ async function createThenEditWorker(
 	};
 }
 
-async function commitFailedCleanWorkerRecipe(
+async function commitCleanWorkerRecipe(
 	projectRoot: string,
 	delegationId: string,
 	contractHash: string,
+	options: {
+		runId: string;
+		recipe: string;
+		startedAt: string;
+		finishedAt: string;
+		outcome: "SUCCESS" | "PROCESS_FAILED";
+	},
 ): Promise<void> {
-	const runId = "20260827-185440-tf01";
-	const startedAt = "2026-08-27T11:54:40.123Z";
-	const finishedAt = "2026-08-27T11:54:40.193Z";
 	const started = await beginRecipeCommandEffectCapture({
 		project_root: projectRoot,
 		exec: realExec,
@@ -269,8 +277,8 @@ async function commitFailedCleanWorkerRecipe(
 		project_root: projectRoot,
 		exec: realExec,
 		started,
-		run_id: runId,
-		recipe: "expected-no-write-check",
+		run_id: options.runId,
+		recipe: options.recipe,
 		actor: "worker",
 		worker_delegation_id: delegationId,
 		worker_contract_hash: contractHash,
@@ -278,18 +286,18 @@ async function commitFailedCleanWorkerRecipe(
 		declared_writes: [],
 	});
 	assert.equal(effect.status, "CLEAN");
-	const transaction = await beginRunTransaction(projectRoot, runId);
+	const transaction = await beginRunTransaction(projectRoot, options.runId);
 	const manifest = {
 		schema_version: 2,
-		run_id: runId,
+		run_id: options.runId,
 		recipe: effect.recipe,
 		profile: "generic",
-		started_at: startedAt,
-		finished_at: finishedAt,
-		duration_ms: 70,
+		started_at: options.startedAt,
+		finished_at: options.finishedAt,
+		duration_ms: Date.parse(options.finishedAt) - Date.parse(options.startedAt),
 		cwd: projectRoot,
 		argv: ["fixture-check"],
-		exit_code: 2,
+		exit_code: options.outcome === "SUCCESS" ? 0 : 2,
 		timed_out: false,
 		cancelled: false,
 		git_commit: null,
@@ -304,7 +312,7 @@ async function commitFailedCleanWorkerRecipe(
 		validation_components: [],
 		cache_request_mode: "no-cache",
 		run_transaction_schema_version: 2,
-		run_outcome: "PROCESS_FAILED",
+		run_outcome: options.outcome,
 		command_effect_path: "command-effect.json",
 		command_effect_hash: effect.command_effect_hash,
 		command_effect_status: effect.status,
@@ -318,7 +326,21 @@ async function commitFailedCleanWorkerRecipe(
 		writeFile(join(transaction.stagingDir, "stdout.log"), "expected validation failure\n", "utf8"),
 		writeFile(join(transaction.stagingDir, "stderr.log"), "", "utf8"),
 	]);
-	await commitRunTransaction(transaction, new Date(finishedAt));
+	await commitRunTransaction(transaction, new Date(options.finishedAt));
+}
+
+async function commitFailedCleanWorkerRecipe(
+	projectRoot: string,
+	delegationId: string,
+	contractHash: string,
+): Promise<void> {
+	await commitCleanWorkerRecipe(projectRoot, delegationId, contractHash, {
+		runId: "20260827-185440-tf01",
+		recipe: "expected-no-write-check",
+		startedAt: "2026-08-27T11:54:40.123Z",
+		finishedAt: "2026-08-27T11:54:40.193Z",
+		outcome: "PROCESS_FAILED",
+	});
 }
 
 async function input(
@@ -461,6 +483,53 @@ test("execution v2: a failed CLEAN recipe fails the worker without inventing wor
 	assert.equal(scope.command_provenance.effective_status, "ATTRIBUTED");
 	assert.deepEqual(scope.command_provenance.remaining_workspace_drift, []);
 	assert.deepEqual(scope.command_provenance.terminal_reasons, ["COMMAND_EFFECT_RUN_FAILED"]);
+});
+
+test("execution v2: the same recipe's final SUCCESS closes its earlier CLEAN process failure", async (t) => {
+	const projectRoot = await root(t);
+	const delegationId = id(53);
+	const path = "src/command-recovered.ts";
+	const report = completeReport([path]);
+	const executionInput = await input(projectRoot, delegationId, "implementation", after([path]), worker(report));
+	executionInput.runWorker = async () => {
+		const result = await journalWorker(
+			projectRoot,
+			delegationId,
+			executionInput.contract.contract_hash,
+			[path],
+			worker(report),
+		);
+		await commitCleanWorkerRecipe(projectRoot, delegationId, executionInput.contract.contract_hash, {
+			runId: "20260827-185441-tf02",
+			recipe: "expected-no-write-check",
+			startedAt: "2026-08-27T11:54:41.000Z",
+			finishedAt: "2026-08-27T11:54:41.100Z",
+			outcome: "PROCESS_FAILED",
+		});
+		await commitCleanWorkerRecipe(projectRoot, delegationId, executionInput.contract.contract_hash, {
+			runId: "20260827-185442-tf03",
+			recipe: "expected-no-write-check",
+			startedAt: "2026-08-27T11:54:42.000Z",
+			finishedAt: "2026-08-27T11:54:42.100Z",
+			outcome: "SUCCESS",
+		});
+		return result;
+	};
+	const result = await executeDelegationV2(executionInput);
+	assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result));
+	if (!result.ok) return;
+	assert.equal(result.status, "PENDING_REVIEW");
+	assert.equal(result.durable_state.terminal_outcome?.worker_success, true);
+	assert.equal(result.durable_state.terminal_outcome?.worker_failure_code, null);
+	const committed = await readDelegationCommittedGenerationV2(projectRoot, delegationId);
+	assert.equal(committed.ok, true, committed.ok ? "" : committed.error.code);
+	if (!committed.ok) return;
+	const scope = committed.value.records["scope.json"] as Record<string, any>;
+	assert.deepEqual(scope.command_provenance.receipts.map((receipt: Record<string, unknown>) => receipt.run_outcome), [
+		"PROCESS_FAILED",
+		"SUCCESS",
+	]);
+	assert.deepEqual(scope.command_provenance.terminal_reasons, []);
 });
 
 test("execution v2: an over-envelope delivery never enters PENDING and exposes strict repair_of recovery authority", async (t) => {
@@ -744,6 +813,78 @@ test("execution v2: diagnosis commits FINISHED only with zero writes", async (t)
 	const committed = await readDelegationCommittedGenerationV2(projectRoot, delegationId);
 	assert.equal(committed.ok, true);
 	assert.equal(committed.ok && committed.value.state.status, "FINISHED");
+});
+
+test("execution v2: an already-installed repair successor reviews and accepts its full carried scope with zero new delta", async (t) => {
+	const projectRoot = await root(t);
+	const carriedPath = "src/already-fixed.ts";
+	await mkdir(join(projectRoot, "src"), { recursive: true });
+	await writeFile(join(projectRoot, carriedPath), "export const repaired = true;\n");
+	const rootId = id(32);
+	const delegationId = id(33);
+	const decisionHash = "9".repeat(64);
+	const lineage = bindDelegationRepairLineageV1({
+		schema_version: 1,
+		kind: "semantic-repair-lineage-v1",
+		root_delegation_id: rootId,
+		repair_of: rootId,
+		root_decision_hash: decisionHash,
+		continuation_decision_delegation_id: rootId,
+		continuation_decision_hash: decisionHash,
+		parent_lineage_hash: null,
+		depth: 1,
+		carried_paths: [carriedPath],
+	});
+	assert.notEqual(lineage, undefined);
+	const result = await executeDelegationV2(await input(
+		projectRoot,
+		delegationId,
+		"implementation",
+		after([]),
+		worker(completeReport([])),
+		{
+			dependencyPaths: [carriedPath],
+			repairLineage: lineage!,
+		},
+	));
+	assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result));
+	if (!result.ok) return;
+	assert.equal(result.status, "PENDING_REVIEW");
+	assert.deepEqual(result.durable_state.postcondition_reasons, []);
+	assert.deepEqual(result.durable_state.terminal_outcome?.changed_paths, []);
+
+	const committed = await readDelegationCommittedGenerationV2(projectRoot, delegationId);
+	assert.equal(committed.ok, true, committed.ok ? "" : committed.error.code);
+	if (!committed.ok) return;
+	const afterRecord = committed.value.records["after.json"] as Record<string, any>;
+	const scopeRecord = committed.value.records["scope.json"] as Record<string, any>;
+	assert.deepEqual(afterRecord.changed_paths, []);
+	assert.equal(afterRecord.review_envelope.path_count, 1);
+	assert.deepEqual(scopeRecord.change_set.dependency_paths, [carriedPath]);
+
+	const presented = await reviewDelegationV2({
+		projectRoot,
+		delegationId,
+		exec: realExec,
+		now: "2026-08-17T18:11:00.000Z",
+	});
+	assert.equal(presented.ok, true, presented.ok ? "" : JSON.stringify(presented.error));
+	if (!presented.ok || presented.review.record === undefined) return;
+	assert.deepEqual(presented.review.record.checked_paths, [carriedPath]);
+	assert.deepEqual(presented.review.record.relevance_projection?.entries
+		.find((entry) => entry.path === carriedPath)?.roles, ["D"]);
+	assert.equal(presented.review.record.presentation_complete, true);
+	const accepted = await reviewDelegationV2({
+		projectRoot,
+		delegationId,
+		exec: realExec,
+		now: "2026-08-17T18:11:01.000Z",
+		semanticDecision: "ACCEPT",
+		expectedBoundDiffHash: presented.review.record.bound_diff_hash,
+		reviewer: { provider: "openai-codex", model: "gpt-5.6-sol" },
+	});
+	assert.equal(accepted.ok, true, accepted.ok ? "" : JSON.stringify(accepted.error));
+	if (accepted.ok) assert.equal(accepted.transaction.status, "REVIEWED");
 });
 
 test("execution v2: complete machine facts commit postcondition failures as fail-closed generations", async (t) => {

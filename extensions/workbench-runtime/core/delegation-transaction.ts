@@ -423,6 +423,24 @@ export function bindDelegationRepairLineageV1(value: DelegationRepairLineageInpu
 	return { ...projection, lineage_hash: computeDelegationRepairLineageHashV1(projection) };
 }
 
+/**
+ * Exact semantic-review/checkpoint scope for one implementation generation.
+ * A repair successor owns both its current effective delta and every immutable
+ * carried path from the rejected lineage, even when the worker did not touch a
+ * carried path again. The union is bounded by the lineage schema ceiling.
+ */
+export function delegationRepairReviewPathsV1(
+	effectivePaths: readonly string[],
+	repairLineage: Readonly<DelegationRepairLineageV1> | undefined,
+): string[] | undefined {
+	if (!Array.isArray(effectivePaths) || !effectivePaths.every(isStrictRelativePath)) return undefined;
+	const paths = [...new Set([
+		...effectivePaths,
+		...(repairLineage?.carried_paths ?? []),
+	])].sort((left, right) => Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8")));
+	return paths.length <= DELEGATION_REPAIR_LINEAGE_MAX_PATHS ? paths : undefined;
+}
+
 export function parseDelegationRepairLineageV1(value: unknown): DelegationRepairLineageV1 | undefined {
 	if (!isRecord(value) || !hasExactFields(value, REPAIR_LINEAGE_FIELDS)) return undefined;
 	const { lineage_hash: lineageHash, ...projection } = value;
@@ -545,7 +563,7 @@ export function delegationPathAllowedV2(path: string, allowedPaths: readonly str
 
 /** Evaluate machine facts only, in a fixed order independent of worker prose. */
 export function evaluateDelegationPostconditions(
-	state: Pick<DelegationTransactionRecord, "task_kind" | "allowed_paths">,
+	state: Pick<DelegationTransactionRecord, "task_kind" | "allowed_paths" | "repair_lineage">,
 	outcome: DelegationTerminalOutcome,
 ): DelegationPostconditionReason[] {
 	const reasons: DelegationPostconditionReason[] = [];
@@ -559,7 +577,14 @@ export function evaluateDelegationPostconditions(
 	if (outcome.change_set_status === "CONFLICT") reasons.push("CHANGE_SET_CONFLICT");
 	if (outcome.changed_paths.some((path) => !delegationPathAllowedV2(path, state.allowed_paths))) reasons.push("OUT_OF_SCOPE_CHANGES");
 	if (state.task_kind === "implementation") {
-		if (outcome.changed_paths.length === 0) reasons.push("IMPLEMENTATION_DELTA_REQUIRED");
+		// A repair successor may legitimately find that an earlier attempt already
+		// installed every carried fix.  Zero *new* worker delta is then not success
+		// by itself: the successor remains implementation work and must enter the
+		// normal semantic review over its immutable carried-path scope.  Ordinary
+		// implementation delegations still require a new attributed delta.
+		if (outcome.changed_paths.length === 0 && state.repair_lineage === undefined) {
+			reasons.push("IMPLEMENTATION_DELTA_REQUIRED");
+		}
 		if (outcome.delta_hash === null) reasons.push("IMPLEMENTATION_DELTA_HASH_REQUIRED");
 	} else {
 		if (outcome.changed_paths.length !== 0 || outcome.delta_hash !== null) reasons.push("DIAGNOSIS_DELTA_FORBIDDEN");
@@ -567,6 +592,27 @@ export function evaluateDelegationPostconditions(
 		if (outcome.denied_write_count !== 0) reasons.push("DIAGNOSIS_DENIED_WRITES_FORBIDDEN");
 	}
 	return reasons;
+}
+
+/**
+ * Historical repair successors were committed before zero-delta carried-scope
+ * review existed and therefore persisted IMPLEMENTATION_DELTA_REQUIRED.  Keep
+ * those immutable generations readable while all new transitions use the
+ * convergent rule above.  This compatibility predicate grants no new review
+ * authority: the historical transaction remains FAILED exactly as recorded.
+ */
+function historicalRepairPostconditionsV2(
+	state: Pick<DelegationTransactionRecord, "task_kind" | "allowed_paths" | "repair_lineage">,
+	outcome: DelegationTerminalOutcome,
+): DelegationPostconditionReason[] {
+	const reasons = evaluateDelegationPostconditions(state, outcome);
+	if (state.task_kind !== "implementation" || state.repair_lineage === undefined || outcome.changed_paths.length !== 0 ||
+		reasons.includes("IMPLEMENTATION_DELTA_REQUIRED")) return reasons;
+	const insertAt = DELEGATION_POSTCONDITION_REASON_ORDER.indexOf("IMPLEMENTATION_DELTA_REQUIRED");
+	const out = [...reasons];
+	const nextIndex = out.findIndex((reason) => DELEGATION_POSTCONDITION_REASON_ORDER.indexOf(reason) > insertAt);
+	out.splice(nextIndex < 0 ? out.length : nextIndex, 0, "IMPLEMENTATION_DELTA_REQUIRED");
+	return out;
 }
 
 const INTERRUPTED_POSTCONDITION_REASONS = new Set<DelegationPostconditionReason>([
@@ -623,7 +669,9 @@ function validStateInvariants(state: DelegationTransactionRecord): boolean {
 	if (state.repair_lineage !== undefined && state.task_kind !== "implementation") return false;
 	if (outcome !== null) {
 		if (outcome.delegation_id !== state.delegation_id || outcome.task_kind !== state.task_kind || !sameIdentity(outcome.worker_identity, state.worker_identity)) return false;
-		if (!exactReasons(state.postcondition_reasons, evaluateDelegationPostconditions(state, outcome))) return false;
+		const currentReasons = evaluateDelegationPostconditions(state, outcome);
+		if (!exactReasons(state.postcondition_reasons, currentReasons) &&
+			!exactReasons(state.postcondition_reasons, historicalRepairPostconditionsV2(state, outcome))) return false;
 	} else if (state.postcondition_reasons.length !== 0) {
 		return false;
 	}

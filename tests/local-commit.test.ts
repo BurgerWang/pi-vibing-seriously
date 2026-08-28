@@ -339,6 +339,89 @@ test("one checkpoint batches all compatible reviewed slices", async () => {
 	}
 });
 
+test("accepted repair successor checkpoints unchanged carried paths after its own slice was already committed", async () => {
+	const root = await repo();
+	try {
+		await writeFile(join(root, "reviewed.txt"), "successor repair\n", "utf8");
+		await writeFile(join(root, "unrelated.txt"), "carried parent bytes\n", "utf8");
+		const reviewedSnapshot = await collectGitFacts(root, exec);
+		assert.ok(reviewedSnapshot.gitHead);
+		const identity = (path: string, bytes: number) => ({
+			schema_version: 2 as const,
+			kind: "file" as const,
+			path,
+			byte_size: bytes,
+			sha256: reviewedSnapshot.pathDigests[path]!,
+			stat: { dev: "1", ino: path === "reviewed.txt" ? "1" : "2", mtime_ns: "1", ctime_ns: "1" },
+		});
+		const projection = {
+			schema_version: 2 as const,
+			diff_identity_kind: "changeset-relevance-v2" as const,
+			delegation_id: DELEGATION_ID,
+			contract_hash: "b".repeat(64),
+			change_set_hash: "c".repeat(64),
+			worker_delta_hash: "d".repeat(64),
+			git_head: reviewedSnapshot.gitHead,
+			entries: [
+				{
+					path: "reviewed.txt", roles: ["W"] as const,
+					status: reviewedSnapshot.pathStatuses["reviewed.txt"]!,
+					full_identity: identity("reviewed.txt", Buffer.byteLength("successor repair\n")),
+				},
+				{
+					path: "unrelated.txt", roles: ["D"] as const,
+					status: reviewedSnapshot.pathStatuses["unrelated.txt"]!,
+					full_identity: identity("unrelated.txt", Buffer.byteLength("carried parent bytes\n")),
+				},
+			],
+		};
+		await git(root, "add", "--", "reviewed.txt");
+		await git(root, "commit", "-m", "checkpoint successor slice");
+
+		const base = services();
+		const accepted = acceptedAuthority(DELEGATION_ID, ["reviewed.txt"]);
+		const repairServices: LocalReviewedCommitServicesV1 = {
+			...base,
+			readAuthority: async () => ({
+				...accepted,
+				review: {
+					checked_paths: ["reviewed.txt"],
+					diff_identity_kind: "changeset-relevance-v2",
+					relevance_projection: projection,
+				} as never,
+			}),
+			readCommittedGeneration: async () => ({
+				ok: true,
+				value: {
+					state: { repair_lineage: { carried_paths: ["unrelated.txt"] } },
+					records: {
+						"after.json": {
+							git_head: reviewedSnapshot.gitHead,
+							changed_paths: ["reviewed.txt"],
+							path_statuses: { "reviewed.txt": reviewedSnapshot.pathStatuses["reviewed.txt"] },
+							path_digests: { "reviewed.txt": reviewedSnapshot.pathDigests["reviewed.txt"] },
+						},
+					},
+				} as never,
+			}),
+		};
+
+		const result = await commitLatestReviewedDelegationV1({
+			project_root: root,
+			message: "checkpoint carried repair paths",
+			now: "2026-08-25T12:01:05.000Z",
+			exec,
+		}, repairServices);
+		assert.equal(result.ok, true, JSON.stringify(result));
+		if (!result.ok) return;
+		assert.deepEqual(result.committed_paths, ["unrelated.txt"]);
+		assert.equal((await git(root, "status", "--short")).trim(), "");
+		assert.equal((await git(root, "log", "-1", "--format=%s")).trim(), "checkpoint carried repair paths");
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
 test("a newer valid review supersedes an invalid historical snapshot for the same dirty paths", async () => {
 	const root = await repo();
 	try {

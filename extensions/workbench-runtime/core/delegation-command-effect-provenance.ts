@@ -639,6 +639,31 @@ function receiptOrder(left: BoundCommandEffectReceipt, right: BoundCommandEffect
 }
 
 /**
+ * A worker may repair a failed check and rerun the same exact recipe.  The
+ * recipe's terminal result is authoritative only when every earlier failed
+ * invocation is followed, without overlap, by its final successful run.
+ * Failures from another recipe, or a final failed invocation, remain sticky.
+ */
+function hasUnresolvedCommandRunFailure(
+	receipts: readonly BoundCommandEffectReceipt[],
+): boolean {
+	const byRecipe = new Map<string, BoundCommandEffectReceipt[]>();
+	for (const receipt of receipts) {
+		const entries = byRecipe.get(receipt.recipe) ?? [];
+		entries.push(receipt);
+		byRecipe.set(receipt.recipe, entries);
+	}
+	for (const entries of byRecipe.values()) {
+		const failures = entries.filter((receipt) => receipt.run_outcome !== "SUCCESS");
+		if (failures.length === 0) continue;
+		const terminal = entries.at(-1)!;
+		if (terminal.run_outcome !== "SUCCESS" || failures.some((failure) =>
+			Date.parse(terminal.started_at) < Date.parse(failure.finished_at))) return true;
+	}
+	return false;
+}
+
+/**
  * Discover authority from the project store itself. Session custom entries
  * are intentionally absent from this algorithm: a reload, mirror failure or
  * lost JSON event cannot hide an already committed worker receipt.
@@ -734,10 +759,9 @@ export async function finalizeDelegationCommandProvenance(
 		if (durable === undefined) reasons.add("COMMAND_EFFECT_EVIDENCE_UNAVAILABLE");
 		else if (JSON.stringify(durable) !== JSON.stringify(observedReceipt)) reasons.add("COMMAND_EFFECT_BINDING_CONFLICT");
 	}
+	if (hasUnresolvedCommandRunFailure(receipts)) reasons.add("COMMAND_EFFECT_RUN_FAILED");
 	for (let index = 0; index < effects.length; index += 1) {
 		const effect = effects[index]!;
-		const receipt = receipts[index]!;
-		if (receipt.run_outcome !== "SUCCESS") reasons.add("COMMAND_EFFECT_RUN_FAILED");
 		const blocking = commandEffectBlockingReason(effect);
 		if (blocking !== undefined) reasons.add(blocking);
 	}
@@ -980,9 +1004,10 @@ export function validateDelegationCommandProvenance(
 	}))) return false;
 	const terminal = new Set(record.terminal_reasons as DelegationCommandProvenanceTerminalReason[]);
 	const hasFailedRun = receipts.some((receipt) => receipt.run_outcome !== "SUCCESS");
-	if (terminal.has("COMMAND_EFFECT_RUN_FAILED") !== hasFailedRun) return false;
+	const hasUnresolvedRunFailure = hasUnresolvedCommandRunFailure(receipts);
+	const historicalStickyRunFailure = terminal.has("COMMAND_EFFECT_RUN_FAILED") && hasFailedRun && !hasUnresolvedRunFailure;
+	if (terminal.has("COMMAND_EFFECT_RUN_FAILED") !== hasUnresolvedRunFailure && !historicalStickyRunFailure) return false;
 	for (const receipt of receipts) {
-		if (receipt.run_outcome !== "SUCCESS" && !terminal.has("COMMAND_EFFECT_RUN_FAILED")) return false;
 		const required = receipt.command_effect_status === "RECIPE_DECLARATION_VIOLATION" ? "RECIPE_DECLARATION_VIOLATION"
 			: receipt.command_effect_status === "UNKNOWN_ORIGIN" ? "COMMAND_EFFECT_UNKNOWN_ORIGIN"
 				: receipt.command_effect_status === "OUT_OF_SCOPE" ? "COMMAND_EFFECT_OUT_OF_SCOPE"

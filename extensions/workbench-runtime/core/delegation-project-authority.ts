@@ -867,11 +867,9 @@ export async function readProjectDelegationBlockerV2(
 		// A fully validated semantic-repair graph with no unresolved tip has
 		// already proved all of its root/lineage records closed.
 		if (transaction.repair_lineage !== undefined) continue;
-		if (transaction.status === "PENDING_REVIEW") {
-			const decision = await readDelegationSemanticRepairDecisionV1(projectRoot, transaction.delegation_id);
-			if (!decision.ok) return { ok: false, issue: { code: decision.error.code, delegationId: transaction.delegation_id } };
-			if (decision.value !== undefined) continue;
-		}
+		const closedRootDecision = await readRepairRootDecisionV1(projectRoot, transaction.delegation_id);
+		if (!closedRootDecision.ok) return { ok: false, issue: closedRootDecision.issue };
+		if (closedRootDecision.value !== undefined) continue;
 		if (!projectDelegationDispositionV2(transaction).blocking) continue;
 		const closure = await readDelegationInactiveBlockerClosureV2(projectRoot, transaction);
 		if (!closure.ok) {

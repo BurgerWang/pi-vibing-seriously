@@ -61,6 +61,7 @@ import {
 	DELEGATION_TRANSACTION_HASH_RE,
 	DELEGATION_TRANSACTION_ID_RE,
 	DELEGATION_TRANSACTION_WORKER_ID_RE,
+	delegationRepairReviewPathsV1,
 	delegationPathAllowedV2,
 	isDelegationInterruptedCandidateV2,
 	parseDelegationRepairLineageV1,
@@ -727,10 +728,21 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 	state = committing.value;
 
 	let reviewEnvelope: SemanticReviewEnvelopeV1 | undefined;
-	if (checked.contract.task_kind === "implementation" && changedPaths.length > 0 &&
+	const reviewPaths = delegationRepairReviewPathsV1(changedPaths, state.repair_lineage);
+	const reviewEnvelopeRequired = checked.contract.task_kind === "implementation" &&
 		(state.postcondition_reasons.length === 0 || (state.terminal_outcome !== null &&
 			isDelegationInterruptedCandidateV2(state, state.terminal_outcome))) &&
-		state.terminal_outcome?.terminal_facts_complete === true && state.terminal_outcome.scope_complete === true) {
+		state.terminal_outcome?.terminal_facts_complete === true && state.terminal_outcome.scope_complete === true;
+	if (reviewEnvelopeRequired) {
+		if (reviewPaths === undefined || reviewPaths.length === 0) {
+			state = await attemptRecovery(checked, state, input.clock, storageOptions,
+				"committed artifact construction failed: review_envelope_exceeded");
+			return failure("artifact_failed", checked, input, {
+				durable_state: state,
+				artifact_error_code: "review_envelope_exceeded",
+				after: cloneAfter(after),
+			});
+		}
 		const relevance = await collectReviewRelevanceV2({
 			project_root: checked.projectRoot,
 			delegation_id: checked.delegationId,
@@ -740,13 +752,20 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 			command_provenance: commandProvenance,
 			exec: input.exec,
 		}).catch(() => undefined);
+		const relevanceStatuses = relevance?.ok
+			? Object.fromEntries(relevance.value.projection.entries.map((entry) => [entry.path, entry.status]))
+			: {};
+		const relevanceDigests = relevance?.ok
+			? Object.fromEntries(relevance.value.projection.entries.flatMap((entry) =>
+				entry.full_identity.kind === "file" ? [[entry.path, entry.full_identity.sha256] as const] : []))
+			: {};
 		const envelope = relevance?.ok
 			? await preflightSemanticReviewEnvelopeV1({
 				projectRoot: checked.projectRoot,
-				workerPaths: changedPaths,
+				workerPaths: reviewPaths,
 				allowedPaths: checked.contract.allowed_paths,
-				afterDigests: after.pathDigests,
-				pathStatuses: after.pathStatuses,
+				afterDigests: relevanceDigests,
+				pathStatuses: relevanceStatuses,
 				relevanceProjection: relevance.value.projection,
 				relevanceProjectionHash: relevance.value.binding.projection_hash,
 				exec: input.exec,

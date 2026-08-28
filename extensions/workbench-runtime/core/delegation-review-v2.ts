@@ -11,6 +11,7 @@ import {
 	collectReviewBoundDiffHash,
 	DEFAULT_REVIEW_MAX_BYTES,
 	DEFAULT_REVIEW_MAX_LINES,
+	MAX_REVIEW_PATCH_PATHS,
 	isReviewPresentationFullyVisible,
 	isScopeIntegrityPacketComplete,
 	preflightSemanticReviewEnvelopeV1,
@@ -72,7 +73,9 @@ import {
 } from "./historical-semantic-migration.ts";
 import {
 	DELEGATION_TRANSACTION_HASH_RE,
+	delegationRepairReviewPathsV1,
 	isCurrentDelegationTerminalOutcome,
+	type DelegationRepairLineageV1,
 	type DelegationTransactionRecord,
 } from "./delegation-transaction.ts";
 import type { ExecFn } from "./config.ts";
@@ -391,9 +394,12 @@ function authorityFromGeneration(generation: DelegationCommittedGenerationV2): G
 		afterFacts = validAfterGitRecord(after);
 		if (beforeFacts === undefined) return undefined;
 	}
-	if (afterFacts === undefined || !sameJson(after.changed_paths, state.terminal_outcome.changed_paths) ||
+	const changedPaths = after.changed_paths as string[];
+	const repairReviewPaths = delegationRepairReviewPathsV1(changedPaths, state.repair_lineage);
+	if (afterFacts === undefined || repairReviewPaths === undefined || !sameJson(after.changed_paths, state.terminal_outcome.changed_paths) ||
 		(envelopeTagged && (!validateSemanticReviewEnvelopeV1(after.review_envelope) ||
-			after.review_envelope.path_count !== (after.changed_paths as string[]).length))) return undefined;
+			(after.review_envelope.path_count !== changedPaths.length &&
+				after.review_envelope.path_count !== repairReviewPaths.length)))) return undefined;
 	if (identity.schema_version !== 2 || identity.delegation_id !== state.delegation_id || identity.task_kind !== state.task_kind ||
 		identity.contract_hash !== state.contract_hash || identity.generation !== state.generation ||
 		identity.revision !== state.committed_proof.revision || !sameJson(identity.worker_identity, state.worker_identity)) return undefined;
@@ -439,8 +445,11 @@ function projectionFromReview(review: ReviewRecord | null): ReviewRelevanceProje
 function authorityWithRelevance(
 	base: ReviewAuthorityFacts,
 	relevance: Readonly<Pick<CollectedReviewRelevanceV2, "binding" | "projection" | "worker_paths">>,
-): ReviewAuthorityFacts {
-	const worker = new Set(relevance.worker_paths);
+	repairLineage?: Readonly<DelegationRepairLineageV1>,
+): ReviewAuthorityFacts | undefined {
+	const reviewPaths = delegationRepairReviewPathsV1(relevance.worker_paths, repairLineage);
+	if (reviewPaths === undefined) return undefined;
+	const worker = new Set(reviewPaths);
 	const pathStatuses: Record<string, string> = {};
 	const pathDigests: Record<string, string> = {};
 	for (const entry of relevance.projection.entries) {
@@ -448,13 +457,16 @@ function authorityWithRelevance(
 		pathStatuses[entry.path] = entry.status;
 		if (entry.full_identity.kind === "file") pathDigests[entry.path] = entry.full_identity.sha256;
 	}
+	if (reviewPaths.some((path) => !Object.prototype.hasOwnProperty.call(pathStatuses, path))) return undefined;
 	return {
 		...base,
+		worker_paths: reviewPaths,
+		...(repairLineage === undefined ? {} : { lineage_carried_paths: [...repairLineage.carried_paths] }),
 		recorded_after_hash: relevance.binding.projection_hash,
 		current: {
 			gitHead: relevance.projection.git_head,
-			gitDirty: relevance.worker_paths.length > 0,
-			changedPaths: [...relevance.worker_paths],
+			gitDirty: reviewPaths.length > 0,
+			changedPaths: reviewPaths,
 			pathStatuses,
 			pathDigests,
 		},
@@ -478,8 +490,9 @@ export type CommittedStructuredReviewAuthorityV2Result =
 
 /**
  * A repair successor may close carried rejected paths that it did not touch
- * again. W/C is sufficient only when every carried path is present there;
- * generic D entries cannot prove rejected-lineage ownership.
+ * again. W/C presents current delta normally; an immutable lineage-carried
+ * path may be promoted from its byte-bound D projection. A generic dependency
+ * that is not named by the lineage still grants no rejected-path ownership.
  */
 export function missingRepairLineageStructuredPresentationPathsV2(
 	repairLineage: Readonly<DelegationTransactionRecord["repair_lineage"]>,
@@ -487,8 +500,10 @@ export function missingRepairLineageStructuredPresentationPathsV2(
 ): string[] | undefined {
 	if (!validateReviewRelevanceProjectionV2(projection)) return undefined;
 	if (repairLineage === undefined) return [];
+	const carried = new Set(repairLineage?.carried_paths ?? []);
 	const presented = new Set(projection.entries
-		.filter((entry) => entry.roles.includes("W") || entry.roles.includes("C"))
+		.filter((entry) => entry.roles.includes("W") || entry.roles.includes("C") ||
+			(carried.has(entry.path) && entry.roles.includes("D")))
 		.map((entry) => entry.path));
 	return repairLineage.carried_paths.filter((path) => !presented.has(path));
 }
@@ -531,10 +546,12 @@ function committedStructuredReviewAuthorityForLifecycleV2(
 			|| info.review_envelope === undefined || canonicalHash(info.review_envelope) !== canonicalHash(envelope)) {
 			return { ok: false, code: "PROVISIONAL_REVIEW_INVALID" };
 		}
-		const effectivePaths = [...new Set(projection.entries
+		const baseEffectivePaths = [...new Set(projection.entries
 			.filter((entry) => entry.roles.includes("W") || entry.roles.includes("C"))
 			.map((entry) => entry.path))]
 			.sort((left, right) => Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8")));
+		const effectivePaths = delegationRepairReviewPathsV1(baseEffectivePaths, generation.state.repair_lineage);
+		if (effectivePaths === undefined) return { ok: false, code: "PROVISIONAL_REVIEW_INVALID" };
 		const lineageGap = missingRepairLineageStructuredPresentationPathsV2(generation.state.repair_lineage, projection);
 		if (lineageGap === undefined) return { ok: false, code: "PROVISIONAL_REVIEW_INVALID" };
 		if (lineageGap.length > 0) return { ok: false, code: "LINEAGE_PRESENTATION_GAP" };
@@ -544,7 +561,8 @@ function committedStructuredReviewAuthorityForLifecycleV2(
 			binding,
 			projection,
 			worker_paths: effectivePaths,
-		});
+		}, generation.state.repair_lineage);
+		if (authority === undefined) return { ok: false, code: "PROVISIONAL_REVIEW_INVALID" };
 		return {
 			ok: true,
 			value: {
@@ -964,19 +982,27 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 				...(bindingHash === undefined ? {} : { binding_hash: bindingHash }),
 			});
 		}
-		if (!terminalNegative && authorityInfo.review_envelope !== undefined &&
+		if (!terminalNegative && state.repair_lineage === undefined && authorityInfo.review_envelope !== undefined &&
 			authorityInfo.review_envelope.relevance_projection_hash !== relevance.value.binding.projection_hash) {
 			return fail("review_conflict", "delegation semantic-review envelope no longer matches the current relevance projection", {
 				transaction: state,
 				binding_hash: relevance.value.binding.projection_hash,
 			});
 		}
-		let authority = authorityWithRelevance(authorityInfo.authority, relevance.value);
-		if (terminalNegative && authorityInfo.review_envelope !== undefined &&
-			authorityInfo.review_envelope.relevance_projection_hash !== relevance.value.binding.projection_hash) {
+		let authority = authorityWithRelevance(authorityInfo.authority, relevance.value, state.repair_lineage);
+		if (authority === undefined) {
+			return fail("review_invalid", "delegation repair review scope exceeds or escapes the bound relevance projection", {
+				transaction: state,
+			});
+		}
+		const envelopeNeedsRebind = authorityInfo.review_envelope !== undefined && (
+			authorityInfo.review_envelope.relevance_projection_hash !== relevance.value.binding.projection_hash ||
+			authorityInfo.review_envelope.path_count !== authority.worker_paths.length
+		);
+		if ((terminalNegative || state.repair_lineage !== undefined) && envelopeNeedsRebind) {
 			const reboundEnvelope = await preflightSemanticReviewEnvelopeV1({
 				projectRoot: input.projectRoot,
-				workerPaths: relevance.value.worker_paths,
+				workerPaths: authority.worker_paths,
 				allowedPaths: state.allowed_paths,
 				afterDigests: authority.after.pathDigests,
 				pathStatuses: authority.current?.pathStatuses ?? {},
@@ -1087,11 +1113,19 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 				lines: renderReviewLines(priorReview!, { maxBytes: input.maxBytes, maxLines: input.maxLines }),
 			};
 		} else {
+			// A repeated default review call must advance the durable presentation,
+			// not render the first already-complete paths forever. Explicit include
+			// paths still win; otherwise resume the prior bounded remaining set.
+			const resumedIncludePaths = input.includePaths === undefined && priorReview !== null &&
+				priorReview.presentation_remaining_paths !== undefined &&
+				priorReview.presentation_remaining_paths.length > 0
+				? priorReview.presentation_remaining_paths.slice(0, MAX_REVIEW_PATCH_PATHS)
+				: input.includePaths;
 			review = await reviewDelegationFromAuthority({
 				projectRoot: input.projectRoot,
 				delegationId: state.delegation_id,
 				exec: input.exec,
-				includePaths: input.includePaths === undefined ? undefined : [...input.includePaths],
+				includePaths: resumedIncludePaths === undefined ? undefined : [...resumedIncludePaths],
 				maxLines: input.maxLines,
 				maxBytes: input.maxBytes,
 				secrets: input.secrets === undefined ? undefined : [...input.secrets],

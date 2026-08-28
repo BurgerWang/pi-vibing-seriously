@@ -26,6 +26,7 @@ import {
 	DELEGATION_TRANSACTION_SCHEMA_VERSION,
 	delegationCommitMarker,
 	delegationPathAllowedV2,
+	delegationRepairReviewPathsV1,
 	isCurrentDelegationTerminalOutcome,
 	parseDelegationTransaction,
 	publishDelegationCommit,
@@ -1067,8 +1068,14 @@ function validReviewRecordForState(value: unknown, state: DelegationTransactionR
 	if (hasEnvelope && (!validateSemanticReviewEnvelopeV1(value.review_envelope) ||
 		value.review_envelope.relevance_projection_hash !== (value.relevance_binding as { projection_hash: string }).projection_hash ||
 		value.review_envelope.path_count !== (value.checked_paths as unknown[]).length)) return false;
-	if (!sameJson(value.allowed_paths, state.allowed_paths) || state.terminal_outcome === null ||
-		!sameJson(value.checked_paths, state.terminal_outcome.changed_paths)) return false;
+	if (state.terminal_outcome === null) return false;
+	const repairReviewPaths = delegationRepairReviewPathsV1(
+		state.terminal_outcome.changed_paths,
+		state.repair_lineage,
+	);
+	if (!sameJson(value.allowed_paths, state.allowed_paths) || repairReviewPaths === undefined ||
+		(!sameJson(value.checked_paths, state.terminal_outcome.changed_paths) &&
+			!sameJson(value.checked_paths, repairReviewPaths))) return false;
 	if (!Array.isArray(value.violations) || value.violations.length > 10 || !value.violations.every((item) =>
 		isRecord(item) && exactFields(item, ["path", "reason"]) && isStrictReviewPath(item.path) &&
 		typeof item.reason === "string" && item.reason.length > 0 && item.reason.length <= 240)) return false;
@@ -1706,11 +1713,25 @@ function reviewArtifactBindsGeneration(
 	if (!isRecord(after) || !isRecord(scope) || state.terminal_outcome === null) return false;
 	const tagged = after.diff_identity_kind === DELEGATION_WORKSPACE_DIFF_IDENTITY_KIND_V2;
 	if (tagged !== (artifact.review.schema_version === 2)) return false;
+	const repairReviewPaths = delegationRepairReviewPathsV1(
+		state.terminal_outcome.changed_paths,
+		state.repair_lineage,
+	);
+	const envelope = after.review_envelope;
+	const checkedPathsBindEnvelope = repairReviewPaths !== undefined && isRecord(envelope) &&
+		validateSemanticReviewEnvelopeV1(envelope)
+		? (envelope.path_count === repairReviewPaths.length
+			? sameJson(artifact.review.checked_paths, repairReviewPaths)
+			: envelope.path_count === state.terminal_outcome.changed_paths.length &&
+				sameJson(artifact.review.checked_paths, state.terminal_outcome.changed_paths))
+		: repairReviewPaths !== undefined &&
+			(sameJson(artifact.review.checked_paths, state.terminal_outcome.changed_paths) ||
+				sameJson(artifact.review.checked_paths, repairReviewPaths));
 	const base = typeof after.diff_hash === "string" && DELEGATION_TRANSACTION_HASH_RE.test(after.diff_hash) &&
 		validByteSortedPaths(after.changed_paths, 500) &&
 		sameJson(after.changed_paths, state.terminal_outcome.changed_paths) &&
 		artifact.review.recorded_after_hash === (tagged ? artifact.review.bound_diff_hash : after.diff_hash) &&
-		sameJson(artifact.review.checked_paths, after.changed_paths) &&
+		checkedPathsBindEnvelope &&
 		validateScopeRecord(scope, state) &&
 		sameJson(artifact.review.allowed_paths, scope.allowed_paths);
 	if (!base || !tagged) return base;
@@ -2221,6 +2242,7 @@ function validateAfterRecord(
 	const guard = value.workspace_guard as WorkspaceGuardRecord;
 	if (commandTagged !== (command !== undefined)) return false;
 	const changedPaths = effectiveDeltaPaths(changeSet, command);
+	const reviewPaths = delegationRepairReviewPathsV1(changedPaths, state.repair_lineage);
 	const effectiveStatus = command?.effective_status ?? changeSet.status;
 	const fullPaths = guard.entries.map((entry) => entry.path);
 	const common = value.schema_version === DELEGATION_TRANSACTION_SCHEMA_VERSION && value.delegation_id === state.delegation_id &&
@@ -2235,8 +2257,9 @@ function validateAfterRecord(
 		(command === undefined || (value.command_provenance_hash === command.command_provenance_hash
 			&& value.effective_delta_hash === command.effective_delta_hash)) &&
 		guard.workspace_guard_hash === changeSet.after_workspace_guard_hash;
-	if (!common || (envelopeTagged && (!validateSemanticReviewEnvelopeV1(value.review_envelope) ||
-		value.review_envelope.path_count !== changedPaths.length))) return false;
+	if (!common || reviewPaths === undefined || (envelopeTagged && (!validateSemanticReviewEnvelopeV1(value.review_envelope) ||
+		(value.review_envelope.path_count !== changedPaths.length &&
+			value.review_envelope.path_count !== reviewPaths.length)))) return false;
 	if (!tagged) return allowLegacyRead &&
 		validateGuardDiagnostics(guard, value.git_head, value.git_dirty, value.path_statuses, value.path_digests) &&
 		value.diff_hash === computeDiffHash(fullPaths, value.path_digests as Record<string, string>, value.path_statuses as Record<string, string>);

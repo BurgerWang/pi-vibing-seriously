@@ -60,6 +60,7 @@ import { readExactRepairSuccessorV1 } from "../extensions/workbench-runtime/core
 import { readWorkerRepairCapsule } from "../extensions/workbench-runtime/core/worker-repair-authority.ts";
 import {
 	collectCurrentDelegationBindingV2,
+	readProjectDelegationBlockerV2,
 	readProjectDelegationRepairClosureV1,
 } from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
 import { collectWorkspaceGuard } from "../extensions/workbench-runtime/core/workspace-guard.ts";
@@ -1459,7 +1460,7 @@ test("model-supplied repair_of cannot supersede a committed FAILED delegation wi
 	});
 });
 
-test("q-repair directly advances semantic and terminal-lineage transactions without an agent turn", async () => {
+test("q-repair directly advances chained semantic repairs including a zero-delta successor without an agent turn", async () => {
 	await withTempDir(async (root) => {
 		await initializeProject(root);
 		const rejectedPath = "src/q-repair.ts";
@@ -1499,11 +1500,19 @@ test("q-repair directly advances semantic and terminal-lineage transactions with
 		const failed = await readDelegationCommittedGenerationV2(root, failedId);
 		assert.equal(failed.ok, true, failed.ok ? "" : failed.error.code);
 		if (!failed.ok) return;
-		assert.equal(failed.value.state.status, "FAILED");
+		assert.equal(failed.value.state.status, "PENDING_REVIEW",
+			"a no-delta repair successor reviews its carried fix instead of failing generically");
 		assert.equal(failed.value.state.repair_lineage?.repair_of, parentId);
 		assert.match(notices.at(-1) ?? "", /authority_kind: semantic-repair/u);
-		assert.match(notices.at(-1) ?? "", /prior successor ended before writes and has strict deterministic continuation authority/u);
-		assert.match(notices.at(-1) ?? "", new RegExp(`next_action: call workbench_repair_delegation with delegation_id=${failedId}`, "u"));
+		assert.match(notices.at(-1) ?? "", /shared delegate execution completed/u);
+		assert.match(notices.at(-1) ?? "", new RegExp(`next_action: call workbench_review_worker_diff with delegation_id=${failedId}`, "u"));
+		await requireCurrentSemanticRepair(
+			root,
+			stub,
+			toolCtx,
+			failedId,
+			"The already-installed carried repair still requires one semantic correction.",
+		);
 		// Model a lost command response after the durable child was committed.
 		// Replay must recover that child from project authority alone.
 		notices.length = 0;
@@ -1511,7 +1520,6 @@ test("q-repair directly advances semantic and terminal-lineage transactions with
 		await withFakeWorker(replayScript, () => command.handler(parentId, commandCtx));
 		assert.deepEqual(await delegationDirectories(root), beforeReplay, "replay does not allocate a sibling transaction");
 		await assert.rejects(readFile(replayLaunchMarker, "utf8"), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
-		assert.match(notices.at(-1) ?? "", /prior successor ended before writes and has strict deterministic continuation authority/u);
 		assert.match(notices.at(-1) ?? "", new RegExp(`successor: ${failedId}`, "u"));
 		assert.match(notices.at(-1) ?? "", new RegExp(`next_action: call workbench_repair_delegation with delegation_id=${failedId}`, "u"));
 
@@ -1526,7 +1534,7 @@ test("q-repair directly advances semantic and terminal-lineage transactions with
 		if (!repaired.ok) return;
 		assert.equal(repaired.value.state.status, "PENDING_REVIEW");
 		assert.equal(repaired.value.state.repair_lineage?.repair_of, failedId);
-		assert.match(notices.at(-1) ?? "", /authority_kind: terminal-lineage/u);
+		assert.match(notices.at(-1) ?? "", /authority_kind: semantic-repair/u);
 		assert.match(notices.at(-1) ?? "", /shared delegate execution completed/u);
 		assert.equal(idleWaits, 3);
 		assert.equal(stub.sentUserMessageCount, 0, "the command never creates model/session prose");
@@ -2032,6 +2040,8 @@ test("an exact semantic REPAIR sidecar launches one bounded implementation linea
 			rootCount: 1,
 			lineageCount: 2,
 		});
+		assert.deepEqual(await readProjectDelegationBlockerV2(root), { ok: true, value: null },
+			"an accepted lineage closes both successor records and the terminal-negative root blocker");
 
 		const secondDecisionPath = join(root, CONFIG_DIR_NAME, "workbench", "delegations", repairId, "v2", "repair-decision.json");
 		const parkedDecisionPath = `${secondDecisionPath}.parked`;
