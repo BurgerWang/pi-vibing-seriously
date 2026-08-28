@@ -1,0 +1,4566 @@
+{
+  "schema_version": 1,
+  "kind": "delegation-history-replay-fixture-v1",
+  "fixture_id": "scalper",
+  "source_project": "Scalper_V2",
+  "collected_at": "2026-08-28T08:15:00.000Z",
+  "sanitization_version": 1,
+  "synthetic_root": "/fixture/scalper",
+  "source_fingerprint": "ddd79436ec358e056a78ffafe896888dda691af78c0f85effe21f27e2793eca6",
+  "coverage": [
+    "accepted-successor-closure",
+    "current-binding-changed",
+    "deep-lineage",
+    "idempotency-refused",
+    "implementation-delta-required",
+    "invalid-committed-scope",
+    "lineage-continuation-invalid",
+    "multiple-repair-roots",
+    "runtime-identity-stale",
+    "terminal-negative-sidecar",
+    "zero-delta-supersession"
+  ],
+  "inventory": {
+    "transaction_count": 37,
+    "root_count": 4,
+    "lineage_count": 29,
+    "max_lineage_depth": 11,
+    "sanitized_path_count": 67,
+    "semantic_repair_sidecars": 3,
+    "terminal_negative_repair_sidecars": 6,
+    "inactive_closures": 3,
+    "empty_attempt_supersessions": 3,
+    "semantic_review_closures": 4,
+    "session_file_count": 8,
+    "fault_counts": {
+      "CURRENT_BINDING_CHANGED": 38,
+      "DURABLE_REVIEW_INVALID": 0,
+      "SEMANTIC_REPAIR_SIDECAR_INVALID": 0,
+      "TERMINAL_REPAIR_SIDECAR_INVALID": 0,
+      "IMPLEMENTATION_DELTA_REQUIRED": 20,
+      "INVALID_COMMITTED_SCOPE": 6,
+      "PROJECT_AUTHORITY_CHANGED": 0,
+      "repair_lineage_continuation_invalid": 2,
+      "IDEMPOTENCY_REFUSED": 5,
+      "BLOCKED_RELOAD_REQUIRED": 0,
+      "LINEAGE_PRESENTATION_GAP": 0,
+      "PRESENTATION_UNAVAILABLE": 0,
+      "STALE": 122,
+      "WORKSPACE_DRIFT": 30
+    },
+    "runtime_source_hashes": [
+      "sha256:28768ffd55902f2a3dc3dd57d6dee4aa0110a5db714f5f6ce05cf1b27a379e88",
+      "sha256:dd55b33cd4b011b33f01b7e3630de84da748e81004c3a93b3814d1a450da519a",
+      "sha256:eb71a99e33203cd71ceebefa1ec063eb81f654b79a5dfaf512d92ab7a877aae4",
+      "sha256:877814a57023b838b1269690a0359e08d196592d62b8cb49c92a7faff87497d1",
+      "sha256:2676134f057d0ed83f71c621ae1f879e22c6a2df8564eb4ee70bfb351a398d97",
+      "sha256:b0bde40c99477ddf481f8aa65396aeabdd34f3f85bae329d84b6f0c27e9a4aed",
+      "sha256:73d9b4fc4fe60e6d017851146c847471f074820472ec46f5c60509a9793e3af7",
+      "sha256:e1ef589619f48103132e2cbff363028c6abba863d214945adf2ee65fd24ee9c0",
+      "sha256:d1d92ef3b1e2dd52f9d84679d24bc3ee27d10ac6333eead8298f9c842e1a89fa",
+      "sha256:6a348a4090deaf52f84fb903ce53298f6d6307fa3cb2918f468ff853df56123d",
+      "sha256:2b7b52010ccd4b4ed06876ebe580c990f0a60b23fdf84e21a489413d778cb9a6",
+      "sha256:18d44a787dfa5ecf45e4679d8ec792b7ae1ff8dd3f0c77280517cae7306a3b36",
+      "sha256:f7bc458f9f0bdee84a0cd9015d7d831cad99b68e3d0727db15d5020813814728",
+      "sha256:68b74e7c0bddad4192f07c7ffd03888306eb08dcd2bf10d7c34f34a61fe4a9d3"
+    ]
+  },
+  "fixed_content": {
+    "encoding": "base64",
+    "bytes": "cGktd29ya2JlbmNoLXJlcGxheS1maXh0dXJlLXYxCg==",
+    "sha256": "6466a3937ede6932c08f889707ce868bbcb02aa321e8c7beaed9b3c7c443ca61"
+  },
+  "expected": {
+    "probe_path": "replay-probe/candidate.txt",
+    "closure": {
+      "ok": true,
+      "unresolvedTipId": "20260828-145820-71ji",
+      "rootCount": 4,
+      "lineageCount": 29
+    },
+    "ordinary_blocker_ids": [],
+    "repair_tip_ids": [
+      "20260828-145820-71ji"
+    ],
+    "blockers": [
+      {
+        "kind": "known",
+        "delegation_id": "20260828-145820-71ji",
+        "changed_paths": [],
+        "carried_paths": [
+          "s0001/s0067/s0052",
+          "s0006",
+          "s0019/s0020/s0002",
+          "s0019/s0020/s0012",
+          "s0019/s0020/s0013",
+          "s0023/s0055/s0059/s0025",
+          "s0023/s0055/s0059/s0035",
+          "s0023/s0055/s0059/s0037",
+          "s0023/s0055/s0059/s0054",
+          "s0051/s0056/s0014",
+          "s0051/s0056/s0026",
+          "s0051/s0056/s0034",
+          "s0057/s0024/s0018",
+          "s0057/s0024/s0029",
+          "s0057/s0024/s0031",
+          "s0057/s0024/s0033",
+          "s0057/s0024/s0042",
+          "s0057/s0024/s0046",
+          "s0057/s0024/s0048",
+          "s0057/s0024/s0050",
+          "s0057/s0024/s0061",
+          "s0065/s0036/s0005/s0017",
+          "s0065/s0036/s0005/s0028",
+          "s0065/s0036/s0005/s0030",
+          "s0065/s0036/s0005/s0032",
+          "s0065/s0036/s0005/s0041",
+          "s0065/s0036/s0005/s0045",
+          "s0065/s0036/s0005/s0047",
+          "s0065/s0036/s0005/s0049",
+          "s0065/s0036/s0005/s0060",
+          "s0066/s0038",
+          "s0066/s0039"
+        ],
+        "rename_sources": {}
+      }
+    ],
+    "decision": {
+      "schema_version": 1,
+      "kind": "delegation-path-lane-decision-v1",
+      "decision": "ALLOW",
+      "block_reasons": [],
+      "normalized_allowed_paths": [
+        "replay-probe/candidate.txt"
+      ],
+      "conflicts": [],
+      "authority_failures": [],
+      "maintenance_warnings": [
+        {
+          "code": "NON_OVERLAPPING_HISTORICAL_BLOCKER",
+          "delegation_id": "20260828-145820-71ji",
+          "relevant_paths": [
+            "s0001/s0067/s0052",
+            "s0006",
+            "s0019/s0020/s0002",
+            "s0019/s0020/s0012",
+            "s0019/s0020/s0013",
+            "s0023/s0055/s0059/s0025",
+            "s0023/s0055/s0059/s0035",
+            "s0023/s0055/s0059/s0037",
+            "s0023/s0055/s0059/s0054",
+            "s0051/s0056/s0014",
+            "s0051/s0056/s0026",
+            "s0051/s0056/s0034",
+            "s0057/s0024/s0018",
+            "s0057/s0024/s0029",
+            "s0057/s0024/s0031",
+            "s0057/s0024/s0033",
+            "s0057/s0024/s0042",
+            "s0057/s0024/s0046",
+            "s0057/s0024/s0048",
+            "s0057/s0024/s0050",
+            "s0057/s0024/s0061",
+            "s0065/s0036/s0005/s0017",
+            "s0065/s0036/s0005/s0028",
+            "s0065/s0036/s0005/s0030",
+            "s0065/s0036/s0005/s0032",
+            "s0065/s0036/s0005/s0041",
+            "s0065/s0036/s0005/s0045",
+            "s0065/s0036/s0005/s0047",
+            "s0065/s0036/s0005/s0049",
+            "s0065/s0036/s0005/s0060",
+            "s0066/s0038",
+            "s0066/s0039"
+          ]
+        }
+      ]
+    }
+  },
+  "transactions": [
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260827-182724-51ux",
+        "task_kind": "implementation",
+        "contract_hash": "a8bc9e2aa58201128d3fd6c57c96249cd50c51dfcb47e5a34898f6e4a47956d8",
+        "allowed_paths": [
+          "s0066/s0064"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-27T11:27:24.203Z",
+        "updated_at": "2026-08-27T11:27:36.449Z",
+        "postcondition_reasons": [
+          "IMPLEMENTATION_DELTA_REQUIRED"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260827-182724-51ux",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": true,
+          "worker_failure_code": null,
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [],
+          "successful_write_count": 0,
+          "denied_write_count": 0,
+          "delta_hash": "9b68505d21c452cf135c9f87e9f5fedcea4ef40a126fcf7dd8fc8e6017b1b951"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260827-182724-51ux",
+          "task_kind": "implementation",
+          "contract_hash": "a8bc9e2aa58201128d3fd6c57c96249cd50c51dfcb47e5a34898f6e4a47956d8",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "3eae9fac8e172917b1c601ba6f63bf13655062c310df9a5677e7bda488ee4cbf",
+          "commit_marker": "delegation-v2:20260827-182724-51ux:implementation:a8bc9e2aa58201128d3fd6c57c96249cd50c51dfcb47e5a34898f6e4a47956d8:1:2:3eae9fac8e172917b1c601ba6f63bf13655062c310df9a5677e7bda488ee4cbf"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260827-183007-gtsm",
+        "task_kind": "implementation",
+        "contract_hash": "b4990852443e53e3facd97962c69ed55e5c80e1502ea552d97a0fb6b3fedaeef",
+        "allowed_paths": [
+          "s0066/s0064"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-27T11:30:07.231Z",
+        "updated_at": "2026-08-27T11:31:47.388Z",
+        "postcondition_reasons": [
+          "WORKSPACE_DRIFT_DETECTED"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260827-183007-gtsm",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": true,
+          "worker_failure_code": null,
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "WORKSPACE_DRIFT",
+          "changed_paths": [
+            "s0066/s0064"
+          ],
+          "successful_write_count": 1,
+          "denied_write_count": 0,
+          "delta_hash": "e5ad7ceaf9b667fa711d8949101d439074776accf47009905f708c53a8d53a0b"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260827-183007-gtsm",
+          "task_kind": "implementation",
+          "contract_hash": "b4990852443e53e3facd97962c69ed55e5c80e1502ea552d97a0fb6b3fedaeef",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "5a99d53423ee402f2dd977f0f6388c48a066f9ebcb917af407137d43c391cddd",
+          "commit_marker": "delegation-v2:20260827-183007-gtsm:implementation:b4990852443e53e3facd97962c69ed55e5c80e1502ea552d97a0fb6b3fedaeef:1:2:5a99d53423ee402f2dd977f0f6388c48a066f9ebcb917af407137d43c391cddd"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null
+      },
+      "semantic_repair_decision": {
+        "schema_version": 1,
+        "delegation_id": "20260827-183007-gtsm",
+        "contract_hash": "b4990852443e53e3facd97962c69ed55e5c80e1502ea552d97a0fb6b3fedaeef",
+        "generation": 1,
+        "transaction_revision": 3,
+        "generation_content_hash": "5a99d53423ee402f2dd977f0f6388c48a066f9ebcb917af407137d43c391cddd",
+        "base_review_hash": "fc268c58be9ab31b3d6017745000862d16b0c2a8541ca5840bf090858bfe31b6",
+        "expected_bound_diff_hash": "c93c9ad108042c519b21399a3824cf8b187b73b62158f6f2d64a4989ef0a8852",
+        "decision": "REPAIR",
+        "repair_reason": "fixture repair required",
+        "repair_reason_hash": "146a3a4af8d94206ba152e51b58fc979bfe62333ee20c8bb5c9d787a6e9e6f9d",
+        "reviewer": {
+          "provider": "openai",
+          "model": "gpt-5.6-sol"
+        },
+        "decided_at": "2026-08-28T02:26:43.567Z",
+        "decision_hash": "0811e560265d1b75ff5bd45e973ad64f9147773d4099f811599449ea2a1c4ad9"
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": true
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260827-183531-hbiv",
+        "task_kind": "implementation",
+        "contract_hash": "00580dbb3f6c1c523eab5eb175679b7ae0dffd086575bfe2ab6b658005fb5109",
+        "allowed_paths": [
+          "s0006",
+          "s0051/s0056/s0016/s0044"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-27T11:35:31.464Z",
+        "updated_at": "2026-08-27T11:37:05.496Z",
+        "postcondition_reasons": [
+          "WORKSPACE_DRIFT_DETECTED"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260827-183531-hbiv",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": true,
+          "worker_failure_code": null,
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "WORKSPACE_DRIFT",
+          "changed_paths": [
+            "s0006",
+            "s0051/s0056/s0016/s0044"
+          ],
+          "successful_write_count": 2,
+          "denied_write_count": 0,
+          "delta_hash": "2663c78da75a14501b89f8a66e1022aec0d5f1461992dbc28399faa76cd64648"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260827-183531-hbiv",
+          "task_kind": "implementation",
+          "contract_hash": "00580dbb3f6c1c523eab5eb175679b7ae0dffd086575bfe2ab6b658005fb5109",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "ac188e8471ebcc15c28c7c26a0f6634e94af01f51b12f69c6a53ad71b7f18d83",
+          "commit_marker": "delegation-v2:20260827-183531-hbiv:implementation:00580dbb3f6c1c523eab5eb175679b7ae0dffd086575bfe2ab6b658005fb5109:1:2:ac188e8471ebcc15c28c7c26a0f6634e94af01f51b12f69c6a53ad71b7f18d83"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null
+      },
+      "semantic_repair_decision": {
+        "schema_version": 1,
+        "delegation_id": "20260827-183531-hbiv",
+        "contract_hash": "00580dbb3f6c1c523eab5eb175679b7ae0dffd086575bfe2ab6b658005fb5109",
+        "generation": 1,
+        "transaction_revision": 3,
+        "generation_content_hash": "ac188e8471ebcc15c28c7c26a0f6634e94af01f51b12f69c6a53ad71b7f18d83",
+        "base_review_hash": "70c17a1f68adce2d6ffd2e5791b9fcb0702fb9ac0fc5251e042312a9c3319196",
+        "expected_bound_diff_hash": "6c089dee3a624cdf91c43c95746f3261c5cf059cc0d2c21e23abeae52586e4d3",
+        "decision": "REPAIR",
+        "repair_reason": "fixture repair required",
+        "repair_reason_hash": "146a3a4af8d94206ba152e51b58fc979bfe62333ee20c8bb5c9d787a6e9e6f9d",
+        "reviewer": {
+          "provider": "openai",
+          "model": "gpt-5.6-sol"
+        },
+        "decided_at": "2026-08-28T00:11:22.070Z",
+        "decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382"
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": true
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260827-183809-hbx7",
+        "task_kind": "implementation",
+        "contract_hash": "04b6ec34cda779a4df6b194fd68434d6f6037baff7fec9b8cf3542a99a6e9e9b",
+        "allowed_paths": [
+          "s0001/s0067/s0052"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-27T11:38:09.548Z",
+        "updated_at": "2026-08-27T11:38:23.500Z",
+        "postcondition_reasons": [
+          "IMPLEMENTATION_DELTA_REQUIRED"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260827-183809-hbx7",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": true,
+          "worker_failure_code": null,
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [],
+          "successful_write_count": 0,
+          "denied_write_count": 0,
+          "delta_hash": "10de94d0822a2c30e4e90146b2eaca0d35f0a087691d2dc348f3ff1a430f34c3"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260827-183809-hbx7",
+          "task_kind": "implementation",
+          "contract_hash": "04b6ec34cda779a4df6b194fd68434d6f6037baff7fec9b8cf3542a99a6e9e9b",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "34dfb33dd530ffcaa34ddcb3dd33536423f236cc91c411f2e7e88eaf38e3c9d7",
+          "commit_marker": "delegation-v2:20260827-183809-hbx7:implementation:04b6ec34cda779a4df6b194fd68434d6f6037baff7fec9b8cf3542a99a6e9e9b:1:2:34dfb33dd530ffcaa34ddcb3dd33536423f236cc91c411f2e7e88eaf38e3c9d7"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260827-183837-4jrz",
+        "task_kind": "implementation",
+        "contract_hash": "75668d0f5a8bd7f7e9c4a05f4af27092d8a82adc9731322ef3b744a6390d6f58",
+        "allowed_paths": [
+          "s0001/s0067/s0052"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 4,
+        "status": "REVIEWED",
+        "created_at": "2026-08-27T11:38:37.827Z",
+        "updated_at": "2026-08-27T11:40:28.697Z",
+        "postcondition_reasons": [],
+        "terminal_outcome": {
+          "delegation_id": "20260827-183837-4jrz",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": true,
+          "worker_failure_code": null,
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [
+            "s0001/s0067/s0052"
+          ],
+          "successful_write_count": 1,
+          "denied_write_count": 0,
+          "delta_hash": "b8a5f16456ad8e775b1b50c52e7cacb2b686d0c82f54c94ca179b71b28a31e27"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260827-183837-4jrz",
+          "task_kind": "implementation",
+          "contract_hash": "75668d0f5a8bd7f7e9c4a05f4af27092d8a82adc9731322ef3b744a6390d6f58",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "4e1e255f94667acaa80778d67bde9659f6d24753d494e2d7971b2ca2c881a6a7",
+          "commit_marker": "delegation-v2:20260827-183837-4jrz:implementation:75668d0f5a8bd7f7e9c4a05f4af27092d8a82adc9731322ef3b744a6390d6f58:1:2:4e1e255f94667acaa80778d67bde9659f6d24753d494e2d7971b2ca2c881a6a7"
+        },
+        "review": {
+          "delegation_id": "20260827-183837-4jrz",
+          "generation": 1,
+          "transaction_revision": 3,
+          "review_hash": "5ef16117bd4ad558c299dbce11fab52b5bd5e9f7545463e0e002c5b090997326",
+          "reviewed_at": "2026-08-27T11:40:28.697Z",
+          "reviewer": "sol"
+        },
+        "abort_reason": null,
+        "recovery_reason": null
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": true,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260827-184140-1h4t",
+        "task_kind": "implementation",
+        "contract_hash": "4c56d29b08058c8859f83ee229471c694a654f5ff24e03ac257f321dc337c56e",
+        "allowed_paths": [
+          "s0066/s0040"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "PENDING_REVIEW",
+        "created_at": "2026-08-27T11:41:40.314Z",
+        "updated_at": "2026-08-27T11:45:29.327Z",
+        "postcondition_reasons": [],
+        "terminal_outcome": {
+          "delegation_id": "20260827-184140-1h4t",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": true,
+          "worker_failure_code": null,
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [
+            "s0066/s0040"
+          ],
+          "successful_write_count": 1,
+          "denied_write_count": 0,
+          "delta_hash": "5566202eb1f507d5967f92a5a375c2b928d9955304c68bfe26dc6a6cec01ab1b"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260827-184140-1h4t",
+          "task_kind": "implementation",
+          "contract_hash": "4c56d29b08058c8859f83ee229471c694a654f5ff24e03ac257f321dc337c56e",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "e184e8298e735867ad2afcb1598856a018741500945989083828c0beadbe7981",
+          "commit_marker": "delegation-v2:20260827-184140-1h4t:implementation:4c56d29b08058c8859f83ee229471c694a654f5ff24e03ac257f321dc337c56e:1:2:e184e8298e735867ad2afcb1598856a018741500945989083828c0beadbe7981"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null
+      },
+      "semantic_repair_decision": {
+        "schema_version": 1,
+        "delegation_id": "20260827-184140-1h4t",
+        "contract_hash": "4c56d29b08058c8859f83ee229471c694a654f5ff24e03ac257f321dc337c56e",
+        "generation": 1,
+        "transaction_revision": 3,
+        "generation_content_hash": "e184e8298e735867ad2afcb1598856a018741500945989083828c0beadbe7981",
+        "base_review_hash": "2ffb938b166d420b96e433217b2756e37139b533193af289953485ea598ab589",
+        "expected_bound_diff_hash": "3d6f75d7fc14bb21b4574035016456e038785bbc2ebd522820291ce1f10d8537",
+        "decision": "REPAIR",
+        "repair_reason": "fixture repair required",
+        "repair_reason_hash": "146a3a4af8d94206ba152e51b58fc979bfe62333ee20c8bb5c9d787a6e9e6f9d",
+        "reviewer": {
+          "provider": "openai",
+          "model": "gpt-5.6-sol"
+        },
+        "decided_at": "2026-08-27T11:49:50.762Z",
+        "decision_hash": "58f44f5860464cdea4be0d8d89d2f6f9b562c51e8be3dfa973e451cb8346a2e1"
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": true,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260827-185059-3h7i",
+        "task_kind": "implementation",
+        "contract_hash": "81d8f09804ca7e5a8a2b0ba4ec571bfecdcdfaf06aeffc74a2728a983087b4a4",
+        "allowed_paths": [
+          "s0066/s0040"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-27T11:51:00.040Z",
+        "updated_at": "2026-08-27T11:56:05.305Z",
+        "postcondition_reasons": [
+          "WORKSPACE_DRIFT_DETECTED"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260827-185059-3h7i",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": true,
+          "worker_failure_code": null,
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "WORKSPACE_DRIFT",
+          "changed_paths": [
+            "s0066/s0040"
+          ],
+          "successful_write_count": 1,
+          "denied_write_count": 0,
+          "delta_hash": "b561757cf642aa5649648573e88b70eda8097b31ef8d4b339496ebe181ab884e"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260827-185059-3h7i",
+          "task_kind": "implementation",
+          "contract_hash": "81d8f09804ca7e5a8a2b0ba4ec571bfecdcdfaf06aeffc74a2728a983087b4a4",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "42b59b847f0255097075d6fe8449bacbd2e91cfec463aa31aec1c08b57a98711",
+          "commit_marker": "delegation-v2:20260827-185059-3h7i:implementation:81d8f09804ca7e5a8a2b0ba4ec571bfecdcdfaf06aeffc74a2728a983087b4a4:1:2:42b59b847f0255097075d6fe8449bacbd2e91cfec463aa31aec1c08b57a98711"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260827-184140-1h4t",
+          "repair_of": "20260827-184140-1h4t",
+          "root_decision_hash": "58f44f5860464cdea4be0d8d89d2f6f9b562c51e8be3dfa973e451cb8346a2e1",
+          "continuation_decision_delegation_id": "20260827-184140-1h4t",
+          "continuation_decision_hash": "58f44f5860464cdea4be0d8d89d2f6f9b562c51e8be3dfa973e451cb8346a2e1",
+          "parent_lineage_hash": null,
+          "depth": 1,
+          "carried_paths": [
+            "s0066/s0040"
+          ],
+          "lineage_hash": "bf80a399f53799c4a240f9c259a8db57906995751607359f4a976e4f1db794ef"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260827-194743-lsmc",
+        "task_kind": "implementation",
+        "contract_hash": "6bee6b958e7c023b66a4367f127261802ffb268ea7997bbf9528d4207c41d33a",
+        "allowed_paths": [
+          "s0066/s0040"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 2,
+        "status": "ABORTED",
+        "created_at": "2026-08-27T12:47:43.822Z",
+        "updated_at": "2026-08-27T12:48:57.698Z",
+        "postcondition_reasons": [],
+        "terminal_outcome": null,
+        "committed_proof": null,
+        "review": null,
+        "abort_reason": "fixture-abort",
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260827-184140-1h4t",
+          "repair_of": "20260827-185059-3h7i",
+          "root_decision_hash": "52e73a157586a533e81a966d0c346b995c87d260c91c67e2be0957dc2c33d9e8",
+          "continuation_decision_delegation_id": "20260827-184140-1h4t",
+          "continuation_decision_hash": "52e73a157586a533e81a966d0c346b995c87d260c91c67e2be0957dc2c33d9e8",
+          "parent_lineage_hash": "4458c226c44e68d7e05c3128e662250faf0e20e2642e49c5f3315125e1279914",
+          "depth": 2,
+          "carried_paths": [
+            "s0066/s0040"
+          ],
+          "lineage_hash": "ffc4b45aeecc7bfe290b43f49952d99246bec8038a42e901eb20c43b87e90849"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": true,
+        "empty_repair_attempt_supersession": true,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260827-220723-8yxw",
+        "task_kind": "implementation",
+        "contract_hash": "37c5921fd763fcd7efed06c88df90c84e11c4790504da7f919632fcb7e2f1236",
+        "allowed_paths": [
+          "s0066/s0040"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "PENDING_REVIEW",
+        "created_at": "2026-08-27T15:07:23.753Z",
+        "updated_at": "2026-08-27T15:13:16.623Z",
+        "postcondition_reasons": [],
+        "terminal_outcome": {
+          "delegation_id": "20260827-220723-8yxw",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": true,
+          "worker_failure_code": null,
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [
+            "s0066/s0040"
+          ],
+          "successful_write_count": 1,
+          "denied_write_count": 0,
+          "delta_hash": "98617ecea0efbfc220bed9b8061f785e59a45d03407afa3995436d4a3757be3d"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260827-220723-8yxw",
+          "task_kind": "implementation",
+          "contract_hash": "37c5921fd763fcd7efed06c88df90c84e11c4790504da7f919632fcb7e2f1236",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "3ae29c5b7489181959436b50530538ddcc8e7fdb72f37ac72742387994bc5aa4",
+          "commit_marker": "delegation-v2:20260827-220723-8yxw:implementation:37c5921fd763fcd7efed06c88df90c84e11c4790504da7f919632fcb7e2f1236:1:2:3ae29c5b7489181959436b50530538ddcc8e7fdb72f37ac72742387994bc5aa4"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260827-184140-1h4t",
+          "repair_of": "20260827-185059-3h7i",
+          "root_decision_hash": "58f44f5860464cdea4be0d8d89d2f6f9b562c51e8be3dfa973e451cb8346a2e1",
+          "continuation_decision_delegation_id": "20260827-184140-1h4t",
+          "continuation_decision_hash": "58f44f5860464cdea4be0d8d89d2f6f9b562c51e8be3dfa973e451cb8346a2e1",
+          "parent_lineage_hash": "bf80a399f53799c4a240f9c259a8db57906995751607359f4a976e4f1db794ef",
+          "depth": 2,
+          "carried_paths": [
+            "s0066/s0040"
+          ],
+          "lineage_hash": "d2c6a566cb28d172b32b4ee234d9f3ccd39cc1f9a9bd237b626c6e8b5480f432"
+        }
+      },
+      "semantic_repair_decision": {
+        "schema_version": 1,
+        "delegation_id": "20260827-220723-8yxw",
+        "contract_hash": "37c5921fd763fcd7efed06c88df90c84e11c4790504da7f919632fcb7e2f1236",
+        "generation": 1,
+        "transaction_revision": 3,
+        "generation_content_hash": "3ae29c5b7489181959436b50530538ddcc8e7fdb72f37ac72742387994bc5aa4",
+        "base_review_hash": "66b7c88cf818c98adedeaa2a64d03f9afa440ccad3d3af574cb5c928f2c31b72",
+        "expected_bound_diff_hash": "8ffa2f187d3e20b26cceb6ff16f95408829912c457379a780eef150184a5e8bb",
+        "decision": "REPAIR",
+        "repair_reason": "fixture repair required",
+        "repair_reason_hash": "146a3a4af8d94206ba152e51b58fc979bfe62333ee20c8bb5c9d787a6e9e6f9d",
+        "reviewer": {
+          "provider": "openai",
+          "model": "gpt-5.6-sol"
+        },
+        "decided_at": "2026-08-27T15:16:37.005Z",
+        "decision_hash": "78183571016b2ab717346875bcfe192b564f64305a2c3a0f4b05f149709f43fd"
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": true,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260827-221645-ingg",
+        "task_kind": "implementation",
+        "contract_hash": "8419c336040f94fa0ea1221d95b4e0fdb714a1b14b291202bdf8f33e47a73c08",
+        "allowed_paths": [
+          "s0066/s0040"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 4,
+        "status": "REVIEWED",
+        "created_at": "2026-08-27T15:16:45.605Z",
+        "updated_at": "2026-08-27T15:25:55.654Z",
+        "postcondition_reasons": [],
+        "terminal_outcome": {
+          "delegation_id": "20260827-221645-ingg",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": true,
+          "worker_failure_code": null,
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [
+            "s0066/s0040"
+          ],
+          "successful_write_count": 2,
+          "denied_write_count": 0,
+          "delta_hash": "e07cea0643cb650c165d4594f28b561ce12a46b33c5ce4cb640ae3b18f6f3bc5"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260827-221645-ingg",
+          "task_kind": "implementation",
+          "contract_hash": "8419c336040f94fa0ea1221d95b4e0fdb714a1b14b291202bdf8f33e47a73c08",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "8308b643180810ce3985635813887e249edbc09c10dcfe5f492940ea0849218d",
+          "commit_marker": "delegation-v2:20260827-221645-ingg:implementation:8419c336040f94fa0ea1221d95b4e0fdb714a1b14b291202bdf8f33e47a73c08:1:2:8308b643180810ce3985635813887e249edbc09c10dcfe5f492940ea0849218d"
+        },
+        "review": {
+          "delegation_id": "20260827-221645-ingg",
+          "generation": 1,
+          "transaction_revision": 3,
+          "review_hash": "e3f8464f9ef7497dd0c2d4ee8b71209475a02cd26d39a6ba82dc7922351b0cc6",
+          "reviewed_at": "2026-08-27T15:25:55.654Z",
+          "reviewer": "sol"
+        },
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260827-184140-1h4t",
+          "repair_of": "20260827-220723-8yxw",
+          "root_decision_hash": "58f44f5860464cdea4be0d8d89d2f6f9b562c51e8be3dfa973e451cb8346a2e1",
+          "continuation_decision_delegation_id": "20260827-220723-8yxw",
+          "continuation_decision_hash": "78183571016b2ab717346875bcfe192b564f64305a2c3a0f4b05f149709f43fd",
+          "parent_lineage_hash": "d2c6a566cb28d172b32b4ee234d9f3ccd39cc1f9a9bd237b626c6e8b5480f432",
+          "depth": 3,
+          "carried_paths": [
+            "s0066/s0040"
+          ],
+          "lineage_hash": "3fc4e0a07a5dbe163d3c177785f7dfdf6874c896db6a53384b1d2939bae90bf9"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": true,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-071148-asck",
+        "task_kind": "implementation",
+        "contract_hash": "648074cde50837de031447630fe898180fafbe5addd47b77d3109d14a9271900",
+        "allowed_paths": [
+          "s0006",
+          "s0051/s0056/s0016/s0044"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-28T00:11:48.424Z",
+        "updated_at": "2026-08-28T00:15:19.372Z",
+        "postcondition_reasons": [
+          "WORKER_RUN_FAILED"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260828-071148-asck",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": false,
+          "worker_failure_code": "COMMAND_EFFECT_RUN_FAILED",
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [
+            "s0006"
+          ],
+          "successful_write_count": 3,
+          "denied_write_count": 0,
+          "delta_hash": "af94e817433e05ff976ffe9cf7c2e7c95edd7d2cc3cc1884032886183c018294"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-071148-asck",
+          "task_kind": "implementation",
+          "contract_hash": "648074cde50837de031447630fe898180fafbe5addd47b77d3109d14a9271900",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "2fc5bc1778e261ae1db21e6eba3e8f61f7f8aaebae0fa1f38224a8376318f626",
+          "commit_marker": "delegation-v2:20260828-071148-asck:implementation:648074cde50837de031447630fe898180fafbe5addd47b77d3109d14a9271900:1:2:2fc5bc1778e261ae1db21e6eba3e8f61f7f8aaebae0fa1f38224a8376318f626"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260827-183531-hbiv",
+          "repair_of": "20260827-183531-hbiv",
+          "root_decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382",
+          "continuation_decision_delegation_id": "20260827-183531-hbiv",
+          "continuation_decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382",
+          "parent_lineage_hash": null,
+          "depth": 1,
+          "carried_paths": [
+            "s0006",
+            "s0051/s0056/s0016/s0044"
+          ],
+          "lineage_hash": "b3f80b69c98aa1ea1d9f03c324e93dca5022ec979866d5bebb884326c8402341"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-071522-ucym",
+        "task_kind": "implementation",
+        "contract_hash": "c7884b943b0f7540624bdf6cc7909d1ff0a6a900d5aa77e5af44d1f4f241fbd1",
+        "allowed_paths": [
+          "s0006",
+          "s0051/s0056/s0016/s0044"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-28T00:15:22.949Z",
+        "updated_at": "2026-08-28T00:17:28.410Z",
+        "postcondition_reasons": [
+          "WORKER_RUN_FAILED"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260828-071522-ucym",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": false,
+          "worker_failure_code": "COMMAND_EFFECT_RUN_FAILED",
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [
+            "s0051/s0056/s0016/s0044"
+          ],
+          "successful_write_count": 1,
+          "denied_write_count": 0,
+          "delta_hash": "7075ce91974ff295d81c61a37065391f21da684983358587321e454491229478"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-071522-ucym",
+          "task_kind": "implementation",
+          "contract_hash": "c7884b943b0f7540624bdf6cc7909d1ff0a6a900d5aa77e5af44d1f4f241fbd1",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "1b7ba1926c663c7881c6a74e2d45039c60adc4d359aa825af99537f185928e70",
+          "commit_marker": "delegation-v2:20260828-071522-ucym:implementation:c7884b943b0f7540624bdf6cc7909d1ff0a6a900d5aa77e5af44d1f4f241fbd1:1:2:1b7ba1926c663c7881c6a74e2d45039c60adc4d359aa825af99537f185928e70"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260827-183531-hbiv",
+          "repair_of": "20260828-071148-asck",
+          "root_decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382",
+          "continuation_decision_delegation_id": "20260827-183531-hbiv",
+          "continuation_decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382",
+          "parent_lineage_hash": "b3f80b69c98aa1ea1d9f03c324e93dca5022ec979866d5bebb884326c8402341",
+          "depth": 2,
+          "carried_paths": [
+            "s0006",
+            "s0051/s0056/s0016/s0044"
+          ],
+          "lineage_hash": "b442e4f40da8d06a8e93457cb4723c253aae89ee1bf189efc94159c949a66291"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-071733-c9na",
+        "task_kind": "implementation",
+        "contract_hash": "dfb70c0adcd52aa64dc5e765f2272a4e961583fb51db960523833fb7530f438e",
+        "allowed_paths": [
+          "s0006",
+          "s0051/s0056/s0016/s0044"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-28T00:17:33.481Z",
+        "updated_at": "2026-08-28T00:21:16.655Z",
+        "postcondition_reasons": [
+          "WORKER_RUN_FAILED"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260828-071733-c9na",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": false,
+          "worker_failure_code": "COMMAND_EFFECT_RUN_FAILED",
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [
+            "s0006",
+            "s0051/s0056/s0016/s0044"
+          ],
+          "successful_write_count": 3,
+          "denied_write_count": 0,
+          "delta_hash": "0f00bc1b2fa6cb02823078c4e311ed24f5da98114f6a79422050472325777f90"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-071733-c9na",
+          "task_kind": "implementation",
+          "contract_hash": "dfb70c0adcd52aa64dc5e765f2272a4e961583fb51db960523833fb7530f438e",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "6a53fb8e26d5ef283305602ef18f03952b700ee17b02afa20eeea65b6e96beb8",
+          "commit_marker": "delegation-v2:20260828-071733-c9na:implementation:dfb70c0adcd52aa64dc5e765f2272a4e961583fb51db960523833fb7530f438e:1:2:6a53fb8e26d5ef283305602ef18f03952b700ee17b02afa20eeea65b6e96beb8"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260827-183531-hbiv",
+          "repair_of": "20260828-071522-ucym",
+          "root_decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382",
+          "continuation_decision_delegation_id": "20260827-183531-hbiv",
+          "continuation_decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382",
+          "parent_lineage_hash": "b442e4f40da8d06a8e93457cb4723c253aae89ee1bf189efc94159c949a66291",
+          "depth": 3,
+          "carried_paths": [
+            "s0006",
+            "s0051/s0056/s0016/s0044"
+          ],
+          "lineage_hash": "22bf56e877e3d03e72cda30eb3348f11401045393d4dbe97baa0a4699a0b4bd5"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-072121-w5zf",
+        "task_kind": "implementation",
+        "contract_hash": "ca1afcdc3cb4d6b6741fd340ed5048b31c50b1868698caba19e3967e9cedd770",
+        "allowed_paths": [
+          "s0006",
+          "s0051/s0056/s0016/s0044"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-28T00:21:21.963Z",
+        "updated_at": "2026-08-28T00:22:13.910Z",
+        "postcondition_reasons": [
+          "IMPLEMENTATION_DELTA_REQUIRED"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260828-072121-w5zf",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": true,
+          "worker_failure_code": null,
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [],
+          "successful_write_count": 0,
+          "denied_write_count": 0,
+          "delta_hash": "0fdb8a4a0e0c1097fb22e0c89e18225140f74ef07024815e1083019c9f745dbe"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-072121-w5zf",
+          "task_kind": "implementation",
+          "contract_hash": "ca1afcdc3cb4d6b6741fd340ed5048b31c50b1868698caba19e3967e9cedd770",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "b5a4ba5370f6aade755eb736f4eac5f9948c8a56b5b4662597561734060e37d1",
+          "commit_marker": "delegation-v2:20260828-072121-w5zf:implementation:ca1afcdc3cb4d6b6741fd340ed5048b31c50b1868698caba19e3967e9cedd770:1:2:b5a4ba5370f6aade755eb736f4eac5f9948c8a56b5b4662597561734060e37d1"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260827-183531-hbiv",
+          "repair_of": "20260828-071733-c9na",
+          "root_decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382",
+          "continuation_decision_delegation_id": "20260827-183531-hbiv",
+          "continuation_decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382",
+          "parent_lineage_hash": "22bf56e877e3d03e72cda30eb3348f11401045393d4dbe97baa0a4699a0b4bd5",
+          "depth": 4,
+          "carried_paths": [
+            "s0006",
+            "s0051/s0056/s0016/s0044"
+          ],
+          "lineage_hash": "94759b87c2251d431ec7b5701c15e01f606d10008ab16c9f9293f1c49e3d570d"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-072218-joj8",
+        "task_kind": "implementation",
+        "contract_hash": "3af0f11a503ebbe16deca316a74165c4e27c2083318ed5db4e622d4a012096cf",
+        "allowed_paths": [
+          "s0006",
+          "s0051/s0056/s0016/s0044"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-28T00:22:18.442Z",
+        "updated_at": "2026-08-28T00:24:51.461Z",
+        "postcondition_reasons": [
+          "WORKER_RUN_FAILED"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260828-072218-joj8",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": false,
+          "worker_failure_code": "COMMAND_EFFECT_RUN_FAILED",
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [
+            "s0006"
+          ],
+          "successful_write_count": 3,
+          "denied_write_count": 0,
+          "delta_hash": "0f35cef63c6a78c8959b4915cb3f9c15cb55ef0a5ecf468c962c01dc9f431326"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-072218-joj8",
+          "task_kind": "implementation",
+          "contract_hash": "3af0f11a503ebbe16deca316a74165c4e27c2083318ed5db4e622d4a012096cf",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "164f48943b5a06e17bf31b9b2d7f229212a6cf3a552a881456519d6fcb26edb8",
+          "commit_marker": "delegation-v2:20260828-072218-joj8:implementation:3af0f11a503ebbe16deca316a74165c4e27c2083318ed5db4e622d4a012096cf:1:2:164f48943b5a06e17bf31b9b2d7f229212a6cf3a552a881456519d6fcb26edb8"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260827-183531-hbiv",
+          "repair_of": "20260828-072121-w5zf",
+          "root_decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382",
+          "continuation_decision_delegation_id": "20260827-183531-hbiv",
+          "continuation_decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382",
+          "parent_lineage_hash": "94759b87c2251d431ec7b5701c15e01f606d10008ab16c9f9293f1c49e3d570d",
+          "depth": 5,
+          "carried_paths": [
+            "s0006",
+            "s0051/s0056/s0016/s0044"
+          ],
+          "lineage_hash": "3947fc78cec19e0a5bad045ea9f3d34a3081eead4da94e950c5928a1be7a831b"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-072456-hn6g",
+        "task_kind": "implementation",
+        "contract_hash": "3dec0ed087173fd9fd95fee1696083e020353fa5c3cd08ec5e7a1ddf861757fd",
+        "allowed_paths": [
+          "s0006",
+          "s0051/s0056/s0016/s0044"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-28T00:24:56.939Z",
+        "updated_at": "2026-08-28T00:27:41.741Z",
+        "postcondition_reasons": [
+          "WORKER_RUN_FAILED",
+          "IMPLEMENTATION_DELTA_REQUIRED"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260828-072456-hn6g",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": false,
+          "worker_failure_code": "COMMAND_EFFECT_RUN_FAILED",
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [],
+          "successful_write_count": 2,
+          "denied_write_count": 0,
+          "delta_hash": "a681a0ce08309e25d7ce01a9cbb7ac6c86c54ed5d43c677f58ad7e32a14e1ebf"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-072456-hn6g",
+          "task_kind": "implementation",
+          "contract_hash": "3dec0ed087173fd9fd95fee1696083e020353fa5c3cd08ec5e7a1ddf861757fd",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "a58ead7088acd3161621d1c350cfebf1f8cc6e8714014c584f32957e988d60f5",
+          "commit_marker": "delegation-v2:20260828-072456-hn6g:implementation:3dec0ed087173fd9fd95fee1696083e020353fa5c3cd08ec5e7a1ddf861757fd:1:2:a58ead7088acd3161621d1c350cfebf1f8cc6e8714014c584f32957e988d60f5"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260827-183531-hbiv",
+          "repair_of": "20260828-072218-joj8",
+          "root_decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382",
+          "continuation_decision_delegation_id": "20260827-183531-hbiv",
+          "continuation_decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382",
+          "parent_lineage_hash": "3947fc78cec19e0a5bad045ea9f3d34a3081eead4da94e950c5928a1be7a831b",
+          "depth": 6,
+          "carried_paths": [
+            "s0006",
+            "s0051/s0056/s0016/s0044"
+          ],
+          "lineage_hash": "25238a5934195273cfaa53db1dd0d9e4848e9e85cbddac6debc9f408ac2fd920"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-072747-exoq",
+        "task_kind": "implementation",
+        "contract_hash": "8ea9d3b835c7239462119be3ea75afe88d67f676a5254cacaced0f05a1070a07",
+        "allowed_paths": [
+          "s0006",
+          "s0051/s0056/s0016/s0044"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-28T00:27:48.162Z",
+        "updated_at": "2026-08-28T00:28:49.548Z",
+        "postcondition_reasons": [
+          "IMPLEMENTATION_DELTA_REQUIRED"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260828-072747-exoq",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": true,
+          "worker_failure_code": null,
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [],
+          "successful_write_count": 0,
+          "denied_write_count": 0,
+          "delta_hash": "dbd7d432f03fae046b6bb293ffa05fefce109fe19024a14d33940dd449bc68aa"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-072747-exoq",
+          "task_kind": "implementation",
+          "contract_hash": "8ea9d3b835c7239462119be3ea75afe88d67f676a5254cacaced0f05a1070a07",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "4bc1a5e9e6115a204d3c093a98a5e02d0a91827f5c2a3171164395ecb8f4d696",
+          "commit_marker": "delegation-v2:20260828-072747-exoq:implementation:8ea9d3b835c7239462119be3ea75afe88d67f676a5254cacaced0f05a1070a07:1:2:4bc1a5e9e6115a204d3c093a98a5e02d0a91827f5c2a3171164395ecb8f4d696"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260827-183531-hbiv",
+          "repair_of": "20260828-072456-hn6g",
+          "root_decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382",
+          "continuation_decision_delegation_id": "20260827-183531-hbiv",
+          "continuation_decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382",
+          "parent_lineage_hash": "25238a5934195273cfaa53db1dd0d9e4848e9e85cbddac6debc9f408ac2fd920",
+          "depth": 7,
+          "carried_paths": [
+            "s0006",
+            "s0051/s0056/s0016/s0044"
+          ],
+          "lineage_hash": "bfa8e398c2b034047a263a1bb4eb3bd5290c97d4665e45deda07c482f878f94f"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-080830-y9h4",
+        "task_kind": "implementation",
+        "contract_hash": "8f0f1b397e15eb2fe9de946adf9f9fe4449e9b542ae5c193b9beddf9136333ec",
+        "allowed_paths": [
+          "s0006",
+          "s0051/s0056/s0016/s0044"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-28T01:08:31.135Z",
+        "updated_at": "2026-08-28T01:11:49.506Z",
+        "postcondition_reasons": [
+          "WORKER_RUN_FAILED"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260828-080830-y9h4",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": false,
+          "worker_failure_code": "COMMAND_EFFECT_RUN_FAILED",
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [
+            "s0006"
+          ],
+          "successful_write_count": 3,
+          "denied_write_count": 0,
+          "delta_hash": "44bc1ebdb7d4874c016009bbf1add67656646e7bc2b0580a67dc1f5d10386c81"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-080830-y9h4",
+          "task_kind": "implementation",
+          "contract_hash": "8f0f1b397e15eb2fe9de946adf9f9fe4449e9b542ae5c193b9beddf9136333ec",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "955f6b402622ec5c83b1321465c45d2e7fbda686ff12cb2821f024dc0cce2382",
+          "commit_marker": "delegation-v2:20260828-080830-y9h4:implementation:8f0f1b397e15eb2fe9de946adf9f9fe4449e9b542ae5c193b9beddf9136333ec:1:2:955f6b402622ec5c83b1321465c45d2e7fbda686ff12cb2821f024dc0cce2382"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260827-183531-hbiv",
+          "repair_of": "20260828-072747-exoq",
+          "root_decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382",
+          "continuation_decision_delegation_id": "20260827-183531-hbiv",
+          "continuation_decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382",
+          "parent_lineage_hash": "bfa8e398c2b034047a263a1bb4eb3bd5290c97d4665e45deda07c482f878f94f",
+          "depth": 8,
+          "carried_paths": [
+            "s0006",
+            "s0051/s0056/s0016/s0044"
+          ],
+          "lineage_hash": "900cbcbf1693f927feb04b89772d3d4d58279d85995ad5c93406c653196cdb53"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-081154-bete",
+        "task_kind": "implementation",
+        "contract_hash": "aa1f7a7c78a9877d0032108c699a7f83de5e78d7be9501a7da7cba86cb4554cf",
+        "allowed_paths": [
+          "s0006",
+          "s0051/s0056/s0016/s0044"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-28T01:11:55.297Z",
+        "updated_at": "2026-08-28T01:14:45.923Z",
+        "postcondition_reasons": [
+          "WORKER_RUN_FAILED"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260828-081154-bete",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": false,
+          "worker_failure_code": "COMMAND_EFFECT_RUN_FAILED",
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [],
+          "successful_write_count": 2,
+          "denied_write_count": 0,
+          "delta_hash": "ee845ef91e34bd8aacee5eee72a4bc8fb5d9db4e99ff655b38ddac4d4f9f73cc"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-081154-bete",
+          "task_kind": "implementation",
+          "contract_hash": "aa1f7a7c78a9877d0032108c699a7f83de5e78d7be9501a7da7cba86cb4554cf",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "925bc09d27e7d0c33a40dd993e6a6e53482bbaf7d22475683bcf945bde1e400a",
+          "commit_marker": "delegation-v2:20260828-081154-bete:implementation:aa1f7a7c78a9877d0032108c699a7f83de5e78d7be9501a7da7cba86cb4554cf:1:2:925bc09d27e7d0c33a40dd993e6a6e53482bbaf7d22475683bcf945bde1e400a"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260827-183531-hbiv",
+          "repair_of": "20260828-080830-y9h4",
+          "root_decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382",
+          "continuation_decision_delegation_id": "20260827-183531-hbiv",
+          "continuation_decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382",
+          "parent_lineage_hash": "900cbcbf1693f927feb04b89772d3d4d58279d85995ad5c93406c653196cdb53",
+          "depth": 9,
+          "carried_paths": [
+            "s0006",
+            "s0051/s0056/s0016/s0044"
+          ],
+          "lineage_hash": "6e644fab03d4006604eb27be14e644296e50ee7a2bf69f6780e1d321fc2077a4"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-081454-nrhr",
+        "task_kind": "implementation",
+        "contract_hash": "06af5649fb3958dcf9f0756ba3d8d242c419ad0f7a2ff9a38004a55f11a02031",
+        "allowed_paths": [
+          "s0006",
+          "s0051/s0056/s0016/s0044"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-28T01:14:55.043Z",
+        "updated_at": "2026-08-28T01:17:45.260Z",
+        "postcondition_reasons": [
+          "WORKER_RUN_FAILED"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260828-081454-nrhr",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": false,
+          "worker_failure_code": "COMMAND_EFFECT_RUN_FAILED",
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [],
+          "successful_write_count": 2,
+          "denied_write_count": 0,
+          "delta_hash": "f07f3e7434f7fcbff72cd28036a0e11689d5244ce8aa9deb5d9fceb8c86b2d1a"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-081454-nrhr",
+          "task_kind": "implementation",
+          "contract_hash": "06af5649fb3958dcf9f0756ba3d8d242c419ad0f7a2ff9a38004a55f11a02031",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "c29eb60ba10531d02f2bd0945fcce2a334878b26260ed15a18a41210640b3dbe",
+          "commit_marker": "delegation-v2:20260828-081454-nrhr:implementation:06af5649fb3958dcf9f0756ba3d8d242c419ad0f7a2ff9a38004a55f11a02031:1:2:c29eb60ba10531d02f2bd0945fcce2a334878b26260ed15a18a41210640b3dbe"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260827-183531-hbiv",
+          "repair_of": "20260828-081154-bete",
+          "root_decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382",
+          "continuation_decision_delegation_id": "20260827-183531-hbiv",
+          "continuation_decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382",
+          "parent_lineage_hash": "6e644fab03d4006604eb27be14e644296e50ee7a2bf69f6780e1d321fc2077a4",
+          "depth": 10,
+          "carried_paths": [
+            "s0006",
+            "s0051/s0056/s0016/s0044"
+          ],
+          "lineage_hash": "b505cc954cdfa974315e379d62ecfc9b6b4cd46ab367746eab16d89c3d5702a5"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-084234-jgk2",
+        "task_kind": "implementation",
+        "contract_hash": "26c663845d2baff5eb9648bb3bd6153f705b0b35280883bd49b8405d4bfa4698",
+        "allowed_paths": [
+          "s0006",
+          "s0051/s0056/s0016/s0044"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 4,
+        "status": "REVIEWED",
+        "created_at": "2026-08-28T01:42:35.087Z",
+        "updated_at": "2026-08-28T01:45:04.068Z",
+        "postcondition_reasons": [],
+        "terminal_outcome": {
+          "delegation_id": "20260828-084234-jgk2",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": true,
+          "worker_failure_code": null,
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [],
+          "successful_write_count": 0,
+          "denied_write_count": 0,
+          "delta_hash": "ef30df599be8eaa778dab103a3a022658a2932810b68788c3755e96f6a5f5dde"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-084234-jgk2",
+          "task_kind": "implementation",
+          "contract_hash": "26c663845d2baff5eb9648bb3bd6153f705b0b35280883bd49b8405d4bfa4698",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "be244fa590e2f893f6078da4ac969d4350d8f597f89666de391524959a44518d",
+          "commit_marker": "delegation-v2:20260828-084234-jgk2:implementation:26c663845d2baff5eb9648bb3bd6153f705b0b35280883bd49b8405d4bfa4698:1:2:be244fa590e2f893f6078da4ac969d4350d8f597f89666de391524959a44518d"
+        },
+        "review": {
+          "delegation_id": "20260828-084234-jgk2",
+          "generation": 1,
+          "transaction_revision": 3,
+          "review_hash": "cabb2cbb323e5ccbb62ce3c4797ad644f5987286dae4d11b8f33d750b49e6854",
+          "reviewed_at": "2026-08-28T01:45:04.068Z",
+          "reviewer": "sol"
+        },
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260827-183531-hbiv",
+          "repair_of": "20260828-081454-nrhr",
+          "root_decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382",
+          "continuation_decision_delegation_id": "20260827-183531-hbiv",
+          "continuation_decision_hash": "a697067ebab091fbe8ccd9e3348d0d1f00c3e7d52f49a77e261aac6e503fb382",
+          "parent_lineage_hash": "b505cc954cdfa974315e379d62ecfc9b6b4cd46ab367746eab16d89c3d5702a5",
+          "depth": 11,
+          "carried_paths": [
+            "s0006",
+            "s0051/s0056/s0016/s0044"
+          ],
+          "lineage_hash": "43e96c0cc63a63ab82ba88f05987b6dcb6623ef46d060cd463cb9686141582a1"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": true,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-092653-5kt3",
+        "task_kind": "implementation",
+        "contract_hash": "2d22335e490f393b8c5c38cdb75ddd60ca440b247e0cf24ba4a82a3cd1be76d2",
+        "allowed_paths": [
+          "s0066/s0064"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "PENDING_REVIEW",
+        "created_at": "2026-08-28T02:26:53.999Z",
+        "updated_at": "2026-08-28T02:28:43.008Z",
+        "postcondition_reasons": [],
+        "terminal_outcome": {
+          "delegation_id": "20260828-092653-5kt3",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": true,
+          "worker_failure_code": null,
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [
+            "s0066/s0064"
+          ],
+          "successful_write_count": 1,
+          "denied_write_count": 0,
+          "delta_hash": "b6d861d98647281f06e4c5fbee690dbe0594b785fc66315cc5a3e596eba514ae"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-092653-5kt3",
+          "task_kind": "implementation",
+          "contract_hash": "2d22335e490f393b8c5c38cdb75ddd60ca440b247e0cf24ba4a82a3cd1be76d2",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "7f6b65cb1ab46f6027eaa3c65bac693895bebcf06d08ff52f02390660d46e56e",
+          "commit_marker": "delegation-v2:20260828-092653-5kt3:implementation:2d22335e490f393b8c5c38cdb75ddd60ca440b247e0cf24ba4a82a3cd1be76d2:1:2:7f6b65cb1ab46f6027eaa3c65bac693895bebcf06d08ff52f02390660d46e56e"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260827-183007-gtsm",
+          "repair_of": "20260827-183007-gtsm",
+          "root_decision_hash": "0811e560265d1b75ff5bd45e973ad64f9147773d4099f811599449ea2a1c4ad9",
+          "continuation_decision_delegation_id": "20260827-183007-gtsm",
+          "continuation_decision_hash": "0811e560265d1b75ff5bd45e973ad64f9147773d4099f811599449ea2a1c4ad9",
+          "parent_lineage_hash": null,
+          "depth": 1,
+          "carried_paths": [
+            "s0019/s0020/s0007",
+            "s0019/s0020/s0008",
+            "s0053/s0043/s0003/s0004/s0009",
+            "s0053/s0043/s0003/s0004/s0010",
+            "s0053/s0043/s0003/s0004/s0011",
+            "s0066/s0064"
+          ],
+          "lineage_hash": "d89d95d178d3fe16427d8803b3921e10b8ef59d31fe5089692aaf8abca40cf00"
+        }
+      },
+      "semantic_repair_decision": {
+        "schema_version": 1,
+        "delegation_id": "20260828-092653-5kt3",
+        "contract_hash": "2d22335e490f393b8c5c38cdb75ddd60ca440b247e0cf24ba4a82a3cd1be76d2",
+        "generation": 1,
+        "transaction_revision": 3,
+        "generation_content_hash": "7f6b65cb1ab46f6027eaa3c65bac693895bebcf06d08ff52f02390660d46e56e",
+        "base_review_hash": "e8e0abde4083871f127c32be06f7f1abb98a7687c71c51a62aa17d0b1495e4fd",
+        "expected_bound_diff_hash": "23eab388c7a9bcdf7d57fdefbd3bde6be36481c301a31d8fe363a4c3f218a94a",
+        "decision": "REPAIR",
+        "repair_reason": "fixture repair required",
+        "repair_reason_hash": "146a3a4af8d94206ba152e51b58fc979bfe62333ee20c8bb5c9d787a6e9e6f9d",
+        "reviewer": {
+          "provider": "openai",
+          "model": "gpt-5.6-sol"
+        },
+        "decided_at": "2026-08-28T04:18:43.788Z",
+        "decision_hash": "92428a963f0671f76f8a8cbfd94dab3c89425ec41323aa03b6b8914dbc7e1d24"
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": true,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-111848-619r",
+        "task_kind": "implementation",
+        "contract_hash": "169af0b55a418887e113373d2e22cd5a75be684ad41937c0909b3c60b5a6e03b",
+        "allowed_paths": [
+          "s0066/s0064"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 4,
+        "status": "REVIEWED",
+        "created_at": "2026-08-28T04:18:48.784Z",
+        "updated_at": "2026-08-28T04:22:23.117Z",
+        "postcondition_reasons": [],
+        "terminal_outcome": {
+          "delegation_id": "20260828-111848-619r",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": true,
+          "worker_failure_code": null,
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [
+            "s0066/s0064"
+          ],
+          "successful_write_count": 1,
+          "denied_write_count": 0,
+          "delta_hash": "2675bfd2083fda3d6885119befa521ecf0dc94a913fc0cca1a585b95376d3cb4"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-111848-619r",
+          "task_kind": "implementation",
+          "contract_hash": "169af0b55a418887e113373d2e22cd5a75be684ad41937c0909b3c60b5a6e03b",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "c90cd8eb7436dcea9e0e63257123801a036916b97de0c932b6d70ffafea943c4",
+          "commit_marker": "delegation-v2:20260828-111848-619r:implementation:169af0b55a418887e113373d2e22cd5a75be684ad41937c0909b3c60b5a6e03b:1:2:c90cd8eb7436dcea9e0e63257123801a036916b97de0c932b6d70ffafea943c4"
+        },
+        "review": {
+          "delegation_id": "20260828-111848-619r",
+          "generation": 1,
+          "transaction_revision": 3,
+          "review_hash": "591be1dfb028466d70e3ad9235eda046cb429391ffef646d757b188fa08ba050",
+          "reviewed_at": "2026-08-28T04:22:23.117Z",
+          "reviewer": "sol"
+        },
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260827-183007-gtsm",
+          "repair_of": "20260828-092653-5kt3",
+          "root_decision_hash": "0811e560265d1b75ff5bd45e973ad64f9147773d4099f811599449ea2a1c4ad9",
+          "continuation_decision_delegation_id": "20260828-092653-5kt3",
+          "continuation_decision_hash": "92428a963f0671f76f8a8cbfd94dab3c89425ec41323aa03b6b8914dbc7e1d24",
+          "parent_lineage_hash": "d89d95d178d3fe16427d8803b3921e10b8ef59d31fe5089692aaf8abca40cf00",
+          "depth": 2,
+          "carried_paths": [
+            "s0019/s0020/s0007",
+            "s0019/s0020/s0008",
+            "s0053/s0043/s0003/s0004/s0009",
+            "s0053/s0043/s0003/s0004/s0010",
+            "s0053/s0043/s0003/s0004/s0011",
+            "s0066/s0064"
+          ],
+          "lineage_hash": "577c44f1fee43b5a516e4e1b41e2d7bb9da6799df8dda453ec06f2b1dd094ba8"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": true,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-112331-lqkf",
+        "task_kind": "implementation",
+        "contract_hash": "61dd0f2ed672d3433d9cd1d065470ea674717557727e779f0ca3cabe86d66bec",
+        "allowed_paths": [
+          "s0001/s0067/s0052",
+          "s0006",
+          "s0019/s0020/s0002",
+          "s0019/s0020/s0012",
+          "s0019/s0020/s0013",
+          "s0023/s0055/s0059/s0022",
+          "s0023/s0055/s0059/s0024/",
+          "s0023/s0055/s0059/s0025",
+          "s0023/s0055/s0059/s0035",
+          "s0023/s0055/s0059/s0037",
+          "s0023/s0055/s0059/s0054",
+          "s0023/s0055/s0065/s0027",
+          "s0051/s0056/s0014",
+          "s0051/s0056/s0015/",
+          "s0051/s0056/s0021",
+          "s0051/s0056/s0026",
+          "s0051/s0056/s0034",
+          "s0051/s0056/s0058",
+          "s0053/s0043/s0003/s0005/",
+          "s0057/s0024/",
+          "s0065/s0020/s0062",
+          "s0065/s0036/s0005/",
+          "s0066/s0038",
+          "s0066/s0039",
+          "s0066/s0063"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-28T04:23:33.005Z",
+        "updated_at": "2026-08-28T04:23:45.295Z",
+        "postcondition_reasons": [
+          "IMPLEMENTATION_DELTA_REQUIRED"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260828-112331-lqkf",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": true,
+          "worker_failure_code": null,
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [],
+          "successful_write_count": 0,
+          "denied_write_count": 0,
+          "delta_hash": "53b7acd57655f7babf03e1fc02a789fa42f9b99bac3db32c6ede1553c2639bd4"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-112331-lqkf",
+          "task_kind": "implementation",
+          "contract_hash": "61dd0f2ed672d3433d9cd1d065470ea674717557727e779f0ca3cabe86d66bec",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "74e0594caa26fe0661ab863e1f8e0a4ea819d0b570a7669b6bb73078e69e1289",
+          "commit_marker": "delegation-v2:20260828-112331-lqkf:implementation:61dd0f2ed672d3433d9cd1d065470ea674717557727e779f0ca3cabe86d66bec:1:2:74e0594caa26fe0661ab863e1f8e0a4ea819d0b570a7669b6bb73078e69e1289"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-112437-fnlb",
+        "task_kind": "implementation",
+        "contract_hash": "2a9e30ddedd091eef1dd5fe193c3ff5d5e60d06c2eb6cfcde10a6bebf5113dbb",
+        "allowed_paths": [
+          "s0001/s0067/s0052",
+          "s0006",
+          "s0019/s0020/s0002",
+          "s0019/s0020/s0012",
+          "s0019/s0020/s0013",
+          "s0023/s0055/s0059/s0022",
+          "s0023/s0055/s0059/s0024/",
+          "s0023/s0055/s0059/s0025",
+          "s0023/s0055/s0059/s0035",
+          "s0023/s0055/s0059/s0037",
+          "s0023/s0055/s0059/s0054",
+          "s0023/s0055/s0065/s0027",
+          "s0051/s0056/s0014",
+          "s0051/s0056/s0015/",
+          "s0051/s0056/s0021",
+          "s0051/s0056/s0026",
+          "s0051/s0056/s0034",
+          "s0051/s0056/s0058",
+          "s0053/s0043/s0003/s0005/",
+          "s0057/s0024/",
+          "s0065/s0020/s0062",
+          "s0065/s0036/s0005/",
+          "s0066/s0038",
+          "s0066/s0039",
+          "s0066/s0063"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "INTERRUPTED",
+        "created_at": "2026-08-28T04:24:38.984Z",
+        "updated_at": "2026-08-28T04:39:07.713Z",
+        "postcondition_reasons": [
+          "WORKER_RUN_FAILED",
+          "EXIT_CODE_NOT_ZERO",
+          "REPORT_INCOMPLETE"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260828-112437-fnlb",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": false,
+          "worker_failure_code": "SPEND_TURN_LIMIT",
+          "exit_code": 143,
+          "report_complete": false,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [
+            "s0019/s0020/s0002",
+            "s0019/s0020/s0012",
+            "s0019/s0020/s0013",
+            "s0023/s0055/s0059/s0025",
+            "s0023/s0055/s0059/s0035",
+            "s0023/s0055/s0059/s0037",
+            "s0023/s0055/s0059/s0054",
+            "s0051/s0056/s0014",
+            "s0051/s0056/s0026",
+            "s0051/s0056/s0034",
+            "s0057/s0024/s0018",
+            "s0057/s0024/s0029",
+            "s0057/s0024/s0031",
+            "s0057/s0024/s0033",
+            "s0057/s0024/s0042",
+            "s0057/s0024/s0046",
+            "s0057/s0024/s0048",
+            "s0057/s0024/s0050",
+            "s0057/s0024/s0061",
+            "s0065/s0036/s0005/s0017",
+            "s0065/s0036/s0005/s0028",
+            "s0065/s0036/s0005/s0030",
+            "s0065/s0036/s0005/s0032",
+            "s0065/s0036/s0005/s0041",
+            "s0065/s0036/s0005/s0045",
+            "s0065/s0036/s0005/s0047",
+            "s0065/s0036/s0005/s0049",
+            "s0066/s0039"
+          ],
+          "successful_write_count": 29,
+          "denied_write_count": 0,
+          "delta_hash": "4b7b5740cb9caa7daf4cb892f0d6efdc0615f10dffeec7e061df094d6b5e54e9"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-112437-fnlb",
+          "task_kind": "implementation",
+          "contract_hash": "2a9e30ddedd091eef1dd5fe193c3ff5d5e60d06c2eb6cfcde10a6bebf5113dbb",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "af1f3f5117f51968e9ed611c62bfaa1466cbf24e2901eff478b66f71a2240e19",
+          "commit_marker": "delegation-v2:20260828-112437-fnlb:implementation:2a9e30ddedd091eef1dd5fe193c3ff5d5e60d06c2eb6cfcde10a6bebf5113dbb:1:2:af1f3f5117f51968e9ed611c62bfaa1466cbf24e2901eff478b66f71a2240e19"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null
+      },
+      "semantic_repair_decision": {
+        "schema_version": 1,
+        "delegation_id": "20260828-112437-fnlb",
+        "contract_hash": "2a9e30ddedd091eef1dd5fe193c3ff5d5e60d06c2eb6cfcde10a6bebf5113dbb",
+        "generation": 1,
+        "transaction_revision": 3,
+        "generation_content_hash": "af1f3f5117f51968e9ed611c62bfaa1466cbf24e2901eff478b66f71a2240e19",
+        "base_review_hash": "86d366f32e8231e931e3e5ffd1253638b6987fe39b7b1158f6a4594f76cd78b3",
+        "expected_bound_diff_hash": "f1434125f9541ac349b8bda02ea86d500d23ffda9417fa4a16ff8a0199208764",
+        "decision": "REPAIR",
+        "repair_reason": "fixture repair required",
+        "repair_reason_hash": "146a3a4af8d94206ba152e51b58fc979bfe62333ee20c8bb5c9d787a6e9e6f9d",
+        "reviewer": {
+          "provider": "openai",
+          "model": "gpt-5.6-sol"
+        },
+        "decided_at": "2026-08-28T04:41:02.113Z",
+        "decision_hash": "a3b6515e46e7c39a333cdd0ff9d7f7f731495a90e8253836f767fb08b201e704"
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": true
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-114126-41y0",
+        "task_kind": "implementation",
+        "contract_hash": "3521fd1798c4f5dc8fb7e7077bf063144d226194c5f424ba82dce45132917e11",
+        "allowed_paths": [
+          "s0001/s0067/s0052",
+          "s0006",
+          "s0019/s0020/s0002",
+          "s0019/s0020/s0012",
+          "s0019/s0020/s0013",
+          "s0023/s0055/s0059/s0022",
+          "s0023/s0055/s0059/s0024/",
+          "s0023/s0055/s0059/s0025",
+          "s0023/s0055/s0059/s0035",
+          "s0023/s0055/s0059/s0037",
+          "s0023/s0055/s0059/s0054",
+          "s0023/s0055/s0065/s0027",
+          "s0051/s0056/s0014",
+          "s0051/s0056/s0015/",
+          "s0051/s0056/s0021",
+          "s0051/s0056/s0026",
+          "s0051/s0056/s0034",
+          "s0051/s0056/s0058",
+          "s0053/s0043/s0003/s0005/",
+          "s0057/s0024/",
+          "s0065/s0020/s0062",
+          "s0065/s0036/s0005/",
+          "s0066/s0038",
+          "s0066/s0039",
+          "s0066/s0063"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "INTERRUPTED",
+        "created_at": "2026-08-28T04:41:27.477Z",
+        "updated_at": "2026-08-28T04:48:15.129Z",
+        "postcondition_reasons": [
+          "WORKER_RUN_FAILED",
+          "EXIT_CODE_NOT_ZERO",
+          "REPORT_INCOMPLETE"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260828-114126-41y0",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": false,
+          "worker_failure_code": "SPEND_TURN_LIMIT",
+          "exit_code": 143,
+          "report_complete": false,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [
+            "s0001/s0067/s0052",
+            "s0006",
+            "s0023/s0055/s0059/s0025",
+            "s0051/s0056/s0026",
+            "s0065/s0036/s0005/s0060",
+            "s0066/s0038",
+            "s0066/s0039"
+          ],
+          "successful_write_count": 11,
+          "denied_write_count": 0,
+          "delta_hash": "b074ed56cec0399b4ad6d87c719e1be25309210ecd386970eeacacba90020b33"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-114126-41y0",
+          "task_kind": "implementation",
+          "contract_hash": "3521fd1798c4f5dc8fb7e7077bf063144d226194c5f424ba82dce45132917e11",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "c7586579c01f9e809af20bdcc38faac6361d27b7989f7fed9f37402882a7c3fa",
+          "commit_marker": "delegation-v2:20260828-114126-41y0:implementation:3521fd1798c4f5dc8fb7e7077bf063144d226194c5f424ba82dce45132917e11:1:2:c7586579c01f9e809af20bdcc38faac6361d27b7989f7fed9f37402882a7c3fa"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260828-112437-fnlb",
+          "repair_of": "20260828-112437-fnlb",
+          "root_decision_hash": "a3b6515e46e7c39a333cdd0ff9d7f7f731495a90e8253836f767fb08b201e704",
+          "continuation_decision_delegation_id": "20260828-112437-fnlb",
+          "continuation_decision_hash": "a3b6515e46e7c39a333cdd0ff9d7f7f731495a90e8253836f767fb08b201e704",
+          "parent_lineage_hash": null,
+          "depth": 1,
+          "carried_paths": [
+            "s0019/s0020/s0002",
+            "s0019/s0020/s0012",
+            "s0019/s0020/s0013",
+            "s0023/s0055/s0059/s0025",
+            "s0023/s0055/s0059/s0035",
+            "s0023/s0055/s0059/s0037",
+            "s0023/s0055/s0059/s0054",
+            "s0051/s0056/s0014",
+            "s0051/s0056/s0026",
+            "s0051/s0056/s0034",
+            "s0057/s0024/s0018",
+            "s0057/s0024/s0029",
+            "s0057/s0024/s0031",
+            "s0057/s0024/s0033",
+            "s0057/s0024/s0042",
+            "s0057/s0024/s0046",
+            "s0057/s0024/s0048",
+            "s0057/s0024/s0050",
+            "s0057/s0024/s0061",
+            "s0065/s0036/s0005/s0017",
+            "s0065/s0036/s0005/s0028",
+            "s0065/s0036/s0005/s0030",
+            "s0065/s0036/s0005/s0032",
+            "s0065/s0036/s0005/s0041",
+            "s0065/s0036/s0005/s0045",
+            "s0065/s0036/s0005/s0047",
+            "s0065/s0036/s0005/s0049",
+            "s0066/s0039"
+          ],
+          "lineage_hash": "ff201a0a1d1c64cd2d4a2b81bc980c6616309d7dda7dc569d505ce6da01016f4"
+        }
+      },
+      "semantic_repair_decision": {
+        "schema_version": 1,
+        "delegation_id": "20260828-114126-41y0",
+        "contract_hash": "3521fd1798c4f5dc8fb7e7077bf063144d226194c5f424ba82dce45132917e11",
+        "generation": 1,
+        "transaction_revision": 3,
+        "generation_content_hash": "c7586579c01f9e809af20bdcc38faac6361d27b7989f7fed9f37402882a7c3fa",
+        "base_review_hash": "9712d28f3721186858c3ac3e88baf99820f5eaa2a0677ff4e2fbac4ce1615d6a",
+        "expected_bound_diff_hash": "ab2efda8efa56e5fa86c6ef19afdcf71b8ab349694b42e4915083d4d8228dea1",
+        "decision": "REPAIR",
+        "repair_reason": "fixture repair required",
+        "repair_reason_hash": "146a3a4af8d94206ba152e51b58fc979bfe62333ee20c8bb5c9d787a6e9e6f9d",
+        "reviewer": {
+          "provider": "openai",
+          "model": "gpt-5.6-sol"
+        },
+        "decided_at": "2026-08-28T05:41:57.208Z",
+        "decision_hash": "c43e19762ce8965cc8f1f0dbabbc1728608b2ac109e02b6d020caefd251e9f99"
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": true
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-124204-bfk9",
+        "task_kind": "implementation",
+        "contract_hash": "f9abc43a8bf5e8678108725d5f60338a441022fc62fb17e1f6b98d6d41a07bd8",
+        "allowed_paths": [
+          "s0001/s0067/s0052",
+          "s0006",
+          "s0019/s0020/s0002",
+          "s0019/s0020/s0012",
+          "s0019/s0020/s0013",
+          "s0023/s0055/s0059/s0022",
+          "s0023/s0055/s0059/s0024/",
+          "s0023/s0055/s0059/s0025",
+          "s0023/s0055/s0059/s0035",
+          "s0023/s0055/s0059/s0037",
+          "s0023/s0055/s0059/s0054",
+          "s0023/s0055/s0065/s0027",
+          "s0051/s0056/s0014",
+          "s0051/s0056/s0015/",
+          "s0051/s0056/s0021",
+          "s0051/s0056/s0026",
+          "s0051/s0056/s0034",
+          "s0051/s0056/s0058",
+          "s0053/s0043/s0003/s0005/",
+          "s0057/s0024/",
+          "s0065/s0020/s0062",
+          "s0065/s0036/s0005/",
+          "s0066/s0038",
+          "s0066/s0039",
+          "s0066/s0063"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-28T05:42:05.662Z",
+        "updated_at": "2026-08-28T05:48:23.776Z",
+        "postcondition_reasons": [
+          "WORKER_RUN_FAILED"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260828-124204-bfk9",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": false,
+          "worker_failure_code": "COMMAND_EFFECT_RUN_FAILED",
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [
+            "s0023/s0055/s0059/s0025",
+            "s0051/s0056/s0026",
+            "s0066/s0039"
+          ],
+          "successful_write_count": 4,
+          "denied_write_count": 0,
+          "delta_hash": "0b038fee5a8adef858e3ef73e59b8d99097d8ac2fc39d0ce38f2578054b02b35"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-124204-bfk9",
+          "task_kind": "implementation",
+          "contract_hash": "f9abc43a8bf5e8678108725d5f60338a441022fc62fb17e1f6b98d6d41a07bd8",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "3366f626a737ba87f1bda81c5de7b4518e8820de7c1f9e85ba94b9ca369f8423",
+          "commit_marker": "delegation-v2:20260828-124204-bfk9:implementation:f9abc43a8bf5e8678108725d5f60338a441022fc62fb17e1f6b98d6d41a07bd8:1:2:3366f626a737ba87f1bda81c5de7b4518e8820de7c1f9e85ba94b9ca369f8423"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260828-112437-fnlb",
+          "repair_of": "20260828-114126-41y0",
+          "root_decision_hash": "a3b6515e46e7c39a333cdd0ff9d7f7f731495a90e8253836f767fb08b201e704",
+          "continuation_decision_delegation_id": "20260828-114126-41y0",
+          "continuation_decision_hash": "c43e19762ce8965cc8f1f0dbabbc1728608b2ac109e02b6d020caefd251e9f99",
+          "parent_lineage_hash": "ff201a0a1d1c64cd2d4a2b81bc980c6616309d7dda7dc569d505ce6da01016f4",
+          "depth": 2,
+          "carried_paths": [
+            "s0001/s0067/s0052",
+            "s0006",
+            "s0019/s0020/s0002",
+            "s0019/s0020/s0012",
+            "s0019/s0020/s0013",
+            "s0023/s0055/s0059/s0025",
+            "s0023/s0055/s0059/s0035",
+            "s0023/s0055/s0059/s0037",
+            "s0023/s0055/s0059/s0054",
+            "s0051/s0056/s0014",
+            "s0051/s0056/s0026",
+            "s0051/s0056/s0034",
+            "s0057/s0024/s0018",
+            "s0057/s0024/s0029",
+            "s0057/s0024/s0031",
+            "s0057/s0024/s0033",
+            "s0057/s0024/s0042",
+            "s0057/s0024/s0046",
+            "s0057/s0024/s0048",
+            "s0057/s0024/s0050",
+            "s0057/s0024/s0061",
+            "s0065/s0036/s0005/s0017",
+            "s0065/s0036/s0005/s0028",
+            "s0065/s0036/s0005/s0030",
+            "s0065/s0036/s0005/s0032",
+            "s0065/s0036/s0005/s0041",
+            "s0065/s0036/s0005/s0045",
+            "s0065/s0036/s0005/s0047",
+            "s0065/s0036/s0005/s0049",
+            "s0065/s0036/s0005/s0060",
+            "s0066/s0038",
+            "s0066/s0039"
+          ],
+          "lineage_hash": "ca2e0faec37f7b040ca1e409f7c1cdeccc786c4798bad816396f2514eb36d02f"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-132339-n3h2",
+        "task_kind": "implementation",
+        "contract_hash": "509a202828357c6fcaf243ce123536a2363c23fb927a154aaee3eae4eb6e14c0",
+        "allowed_paths": [
+          "s0001/s0067/s0052",
+          "s0006",
+          "s0019/s0020/s0002",
+          "s0019/s0020/s0012",
+          "s0019/s0020/s0013",
+          "s0023/s0055/s0059/s0022",
+          "s0023/s0055/s0059/s0024/",
+          "s0023/s0055/s0059/s0025",
+          "s0023/s0055/s0059/s0035",
+          "s0023/s0055/s0059/s0037",
+          "s0023/s0055/s0059/s0054",
+          "s0023/s0055/s0065/s0027",
+          "s0051/s0056/s0014",
+          "s0051/s0056/s0015/",
+          "s0051/s0056/s0021",
+          "s0051/s0056/s0026",
+          "s0051/s0056/s0034",
+          "s0051/s0056/s0058",
+          "s0053/s0043/s0003/s0005/",
+          "s0057/s0024/",
+          "s0065/s0020/s0062",
+          "s0065/s0036/s0005/",
+          "s0066/s0038",
+          "s0066/s0039",
+          "s0066/s0063"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 2,
+        "status": "ABORTED",
+        "created_at": "2026-08-28T06:23:40.576Z",
+        "updated_at": "2026-08-28T06:24:04.044Z",
+        "postcondition_reasons": [],
+        "terminal_outcome": null,
+        "committed_proof": null,
+        "review": null,
+        "abort_reason": "fixture-abort",
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260828-112437-fnlb",
+          "repair_of": "20260828-124204-bfk9",
+          "root_decision_hash": "21f5605c4b1d10daa71a2903c7d675610189523765b398dca7c624d895e5ec1a",
+          "continuation_decision_delegation_id": "20260828-114126-41y0",
+          "continuation_decision_hash": "21f5605c4b1d10daa71a2903c7d675610189523765b398dca7c624d895e5ec1a",
+          "parent_lineage_hash": "bf2aa0bf077c0c0c568a9c644acf9a7c6d2d8429c9ac6b017416c2f32436b32c",
+          "depth": 3,
+          "carried_paths": [
+            "s0001/s0067/s0052",
+            "s0006",
+            "s0019/s0020/s0002",
+            "s0019/s0020/s0012",
+            "s0019/s0020/s0013",
+            "s0023/s0055/s0059/s0025",
+            "s0023/s0055/s0059/s0035",
+            "s0023/s0055/s0059/s0037",
+            "s0023/s0055/s0059/s0054",
+            "s0051/s0056/s0014",
+            "s0051/s0056/s0026",
+            "s0051/s0056/s0034",
+            "s0057/s0024/s0018",
+            "s0057/s0024/s0029",
+            "s0057/s0024/s0031",
+            "s0057/s0024/s0033",
+            "s0057/s0024/s0042",
+            "s0057/s0024/s0046",
+            "s0057/s0024/s0048",
+            "s0057/s0024/s0050",
+            "s0057/s0024/s0061",
+            "s0065/s0036/s0005/s0017",
+            "s0065/s0036/s0005/s0028",
+            "s0065/s0036/s0005/s0030",
+            "s0065/s0036/s0005/s0032",
+            "s0065/s0036/s0005/s0041",
+            "s0065/s0036/s0005/s0045",
+            "s0065/s0036/s0005/s0047",
+            "s0065/s0036/s0005/s0049",
+            "s0065/s0036/s0005/s0060",
+            "s0066/s0038",
+            "s0066/s0039"
+          ],
+          "lineage_hash": "5c02372ac5370d90302a10caf2b5861acdee51aafb00cd7e5720506ac847186c"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": true,
+        "empty_repair_attempt_supersession": true,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-132445-zo8e",
+        "task_kind": "implementation",
+        "contract_hash": "2f7ef3afebdb8014a60a857894507b00836a1d789237a5a00d1481a268c8f0e8",
+        "allowed_paths": [
+          "s0001/s0067/s0052",
+          "s0006",
+          "s0019/s0020/s0002",
+          "s0019/s0020/s0012",
+          "s0019/s0020/s0013",
+          "s0023/s0055/s0059/s0022",
+          "s0023/s0055/s0059/s0024/",
+          "s0023/s0055/s0059/s0025",
+          "s0023/s0055/s0059/s0035",
+          "s0023/s0055/s0059/s0037",
+          "s0023/s0055/s0059/s0054",
+          "s0023/s0055/s0065/s0027",
+          "s0051/s0056/s0014",
+          "s0051/s0056/s0015/",
+          "s0051/s0056/s0021",
+          "s0051/s0056/s0026",
+          "s0051/s0056/s0034",
+          "s0051/s0056/s0058",
+          "s0053/s0043/s0003/s0005/",
+          "s0057/s0024/",
+          "s0065/s0020/s0062",
+          "s0065/s0036/s0005/",
+          "s0066/s0038",
+          "s0066/s0039",
+          "s0066/s0063"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-28T06:24:46.777Z",
+        "updated_at": "2026-08-28T06:28:56.910Z",
+        "postcondition_reasons": [
+          "WORKER_RUN_FAILED"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260828-132445-zo8e",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": false,
+          "worker_failure_code": "COMMAND_EFFECT_RUN_FAILED",
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [
+            "s0066/s0039"
+          ],
+          "successful_write_count": 2,
+          "denied_write_count": 0,
+          "delta_hash": "c2f6f6cb4fdcc7f7db6586119ea3ad5b68f4993de87ac4ab3eee89d84fe7b835"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-132445-zo8e",
+          "task_kind": "implementation",
+          "contract_hash": "2f7ef3afebdb8014a60a857894507b00836a1d789237a5a00d1481a268c8f0e8",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "3c0037820ce0e0d731084dcdd5bf8d111efc37964b70608b0d698558ee2d935e",
+          "commit_marker": "delegation-v2:20260828-132445-zo8e:implementation:2f7ef3afebdb8014a60a857894507b00836a1d789237a5a00d1481a268c8f0e8:1:2:3c0037820ce0e0d731084dcdd5bf8d111efc37964b70608b0d698558ee2d935e"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260828-112437-fnlb",
+          "repair_of": "20260828-124204-bfk9",
+          "root_decision_hash": "a3b6515e46e7c39a333cdd0ff9d7f7f731495a90e8253836f767fb08b201e704",
+          "continuation_decision_delegation_id": "20260828-114126-41y0",
+          "continuation_decision_hash": "c43e19762ce8965cc8f1f0dbabbc1728608b2ac109e02b6d020caefd251e9f99",
+          "parent_lineage_hash": "ca2e0faec37f7b040ca1e409f7c1cdeccc786c4798bad816396f2514eb36d02f",
+          "depth": 3,
+          "carried_paths": [
+            "s0001/s0067/s0052",
+            "s0006",
+            "s0019/s0020/s0002",
+            "s0019/s0020/s0012",
+            "s0019/s0020/s0013",
+            "s0023/s0055/s0059/s0025",
+            "s0023/s0055/s0059/s0035",
+            "s0023/s0055/s0059/s0037",
+            "s0023/s0055/s0059/s0054",
+            "s0051/s0056/s0014",
+            "s0051/s0056/s0026",
+            "s0051/s0056/s0034",
+            "s0057/s0024/s0018",
+            "s0057/s0024/s0029",
+            "s0057/s0024/s0031",
+            "s0057/s0024/s0033",
+            "s0057/s0024/s0042",
+            "s0057/s0024/s0046",
+            "s0057/s0024/s0048",
+            "s0057/s0024/s0050",
+            "s0057/s0024/s0061",
+            "s0065/s0036/s0005/s0017",
+            "s0065/s0036/s0005/s0028",
+            "s0065/s0036/s0005/s0030",
+            "s0065/s0036/s0005/s0032",
+            "s0065/s0036/s0005/s0041",
+            "s0065/s0036/s0005/s0045",
+            "s0065/s0036/s0005/s0047",
+            "s0065/s0036/s0005/s0049",
+            "s0065/s0036/s0005/s0060",
+            "s0066/s0038",
+            "s0066/s0039"
+          ],
+          "lineage_hash": "899fd8045fef57885f1e1220092012e58b63dfaa319fce529881d7597ba543e5"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-132907-ik6e",
+        "task_kind": "implementation",
+        "contract_hash": "d7847f053ca222d99b8652dbaa671a845d0ded79f3197cef105ddf28de8382e1",
+        "allowed_paths": [
+          "s0001/s0067/s0052",
+          "s0006",
+          "s0019/s0020/s0002",
+          "s0019/s0020/s0012",
+          "s0019/s0020/s0013",
+          "s0023/s0055/s0059/s0022",
+          "s0023/s0055/s0059/s0024/",
+          "s0023/s0055/s0059/s0025",
+          "s0023/s0055/s0059/s0035",
+          "s0023/s0055/s0059/s0037",
+          "s0023/s0055/s0059/s0054",
+          "s0023/s0055/s0065/s0027",
+          "s0051/s0056/s0014",
+          "s0051/s0056/s0015/",
+          "s0051/s0056/s0021",
+          "s0051/s0056/s0026",
+          "s0051/s0056/s0034",
+          "s0051/s0056/s0058",
+          "s0053/s0043/s0003/s0005/",
+          "s0057/s0024/",
+          "s0065/s0020/s0062",
+          "s0065/s0036/s0005/",
+          "s0066/s0038",
+          "s0066/s0039",
+          "s0066/s0063"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-28T06:29:08.553Z",
+        "updated_at": "2026-08-28T06:32:37.252Z",
+        "postcondition_reasons": [
+          "WORKER_RUN_FAILED"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260828-132907-ik6e",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": false,
+          "worker_failure_code": "COMMAND_EFFECT_RUN_FAILED",
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [
+            "s0066/s0039"
+          ],
+          "successful_write_count": 1,
+          "denied_write_count": 0,
+          "delta_hash": "f72ad76777d54f7f9136c10e77f076f13037efecb5d6330cc9e68c935aaea6d3"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-132907-ik6e",
+          "task_kind": "implementation",
+          "contract_hash": "d7847f053ca222d99b8652dbaa671a845d0ded79f3197cef105ddf28de8382e1",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "1afb2ea2c954990edcb758a9417debb9ef66b88e04462d0e6678f28331f92e0d",
+          "commit_marker": "delegation-v2:20260828-132907-ik6e:implementation:d7847f053ca222d99b8652dbaa671a845d0ded79f3197cef105ddf28de8382e1:1:2:1afb2ea2c954990edcb758a9417debb9ef66b88e04462d0e6678f28331f92e0d"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260828-112437-fnlb",
+          "repair_of": "20260828-132445-zo8e",
+          "root_decision_hash": "a3b6515e46e7c39a333cdd0ff9d7f7f731495a90e8253836f767fb08b201e704",
+          "continuation_decision_delegation_id": "20260828-114126-41y0",
+          "continuation_decision_hash": "c43e19762ce8965cc8f1f0dbabbc1728608b2ac109e02b6d020caefd251e9f99",
+          "parent_lineage_hash": "899fd8045fef57885f1e1220092012e58b63dfaa319fce529881d7597ba543e5",
+          "depth": 4,
+          "carried_paths": [
+            "s0001/s0067/s0052",
+            "s0006",
+            "s0019/s0020/s0002",
+            "s0019/s0020/s0012",
+            "s0019/s0020/s0013",
+            "s0023/s0055/s0059/s0025",
+            "s0023/s0055/s0059/s0035",
+            "s0023/s0055/s0059/s0037",
+            "s0023/s0055/s0059/s0054",
+            "s0051/s0056/s0014",
+            "s0051/s0056/s0026",
+            "s0051/s0056/s0034",
+            "s0057/s0024/s0018",
+            "s0057/s0024/s0029",
+            "s0057/s0024/s0031",
+            "s0057/s0024/s0033",
+            "s0057/s0024/s0042",
+            "s0057/s0024/s0046",
+            "s0057/s0024/s0048",
+            "s0057/s0024/s0050",
+            "s0057/s0024/s0061",
+            "s0065/s0036/s0005/s0017",
+            "s0065/s0036/s0005/s0028",
+            "s0065/s0036/s0005/s0030",
+            "s0065/s0036/s0005/s0032",
+            "s0065/s0036/s0005/s0041",
+            "s0065/s0036/s0005/s0045",
+            "s0065/s0036/s0005/s0047",
+            "s0065/s0036/s0005/s0049",
+            "s0065/s0036/s0005/s0060",
+            "s0066/s0038",
+            "s0066/s0039"
+          ],
+          "lineage_hash": "4a1a410ba536dde653f2a344967ce5a256cbe69462ad86279b4f4b50c49e892e"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-133245-jh45",
+        "task_kind": "implementation",
+        "contract_hash": "85eb95e08f33d482a46cd2f45703581dc068ee12d2c68b8c5a149f3ad2d019bc",
+        "allowed_paths": [
+          "s0001/s0067/s0052",
+          "s0006",
+          "s0019/s0020/s0002",
+          "s0019/s0020/s0012",
+          "s0019/s0020/s0013",
+          "s0023/s0055/s0059/s0022",
+          "s0023/s0055/s0059/s0024/",
+          "s0023/s0055/s0059/s0025",
+          "s0023/s0055/s0059/s0035",
+          "s0023/s0055/s0059/s0037",
+          "s0023/s0055/s0059/s0054",
+          "s0023/s0055/s0065/s0027",
+          "s0051/s0056/s0014",
+          "s0051/s0056/s0015/",
+          "s0051/s0056/s0021",
+          "s0051/s0056/s0026",
+          "s0051/s0056/s0034",
+          "s0051/s0056/s0058",
+          "s0053/s0043/s0003/s0005/",
+          "s0057/s0024/",
+          "s0065/s0020/s0062",
+          "s0065/s0036/s0005/",
+          "s0066/s0038",
+          "s0066/s0039",
+          "s0066/s0063"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-28T06:32:47.560Z",
+        "updated_at": "2026-08-28T06:38:47.790Z",
+        "postcondition_reasons": [
+          "WORKER_RUN_FAILED"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260828-133245-jh45",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": false,
+          "worker_failure_code": "COMMAND_EFFECT_RUN_FAILED",
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [],
+          "successful_write_count": 0,
+          "denied_write_count": 0,
+          "delta_hash": "44b3bb5b577cd29cbe6bc193e2819e41d46a9efc50d699fa1ccfc5cf482e272d"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-133245-jh45",
+          "task_kind": "implementation",
+          "contract_hash": "85eb95e08f33d482a46cd2f45703581dc068ee12d2c68b8c5a149f3ad2d019bc",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "99c90750897b6e63ef186148c876758d37f27641b0c2326dde56c1bc0bb8c27a",
+          "commit_marker": "delegation-v2:20260828-133245-jh45:implementation:85eb95e08f33d482a46cd2f45703581dc068ee12d2c68b8c5a149f3ad2d019bc:1:2:99c90750897b6e63ef186148c876758d37f27641b0c2326dde56c1bc0bb8c27a"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260828-112437-fnlb",
+          "repair_of": "20260828-132907-ik6e",
+          "root_decision_hash": "a3b6515e46e7c39a333cdd0ff9d7f7f731495a90e8253836f767fb08b201e704",
+          "continuation_decision_delegation_id": "20260828-114126-41y0",
+          "continuation_decision_hash": "c43e19762ce8965cc8f1f0dbabbc1728608b2ac109e02b6d020caefd251e9f99",
+          "parent_lineage_hash": "4a1a410ba536dde653f2a344967ce5a256cbe69462ad86279b4f4b50c49e892e",
+          "depth": 5,
+          "carried_paths": [
+            "s0001/s0067/s0052",
+            "s0006",
+            "s0019/s0020/s0002",
+            "s0019/s0020/s0012",
+            "s0019/s0020/s0013",
+            "s0023/s0055/s0059/s0025",
+            "s0023/s0055/s0059/s0035",
+            "s0023/s0055/s0059/s0037",
+            "s0023/s0055/s0059/s0054",
+            "s0051/s0056/s0014",
+            "s0051/s0056/s0026",
+            "s0051/s0056/s0034",
+            "s0057/s0024/s0018",
+            "s0057/s0024/s0029",
+            "s0057/s0024/s0031",
+            "s0057/s0024/s0033",
+            "s0057/s0024/s0042",
+            "s0057/s0024/s0046",
+            "s0057/s0024/s0048",
+            "s0057/s0024/s0050",
+            "s0057/s0024/s0061",
+            "s0065/s0036/s0005/s0017",
+            "s0065/s0036/s0005/s0028",
+            "s0065/s0036/s0005/s0030",
+            "s0065/s0036/s0005/s0032",
+            "s0065/s0036/s0005/s0041",
+            "s0065/s0036/s0005/s0045",
+            "s0065/s0036/s0005/s0047",
+            "s0065/s0036/s0005/s0049",
+            "s0065/s0036/s0005/s0060",
+            "s0066/s0038",
+            "s0066/s0039"
+          ],
+          "lineage_hash": "c4cd3f2cb4f34740aa58f7cfe1c7f5da2085fd3bfd85d2e2eb95bf393cfe8b26"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-142438-ynjb",
+        "task_kind": "implementation",
+        "contract_hash": "3bdfc684aa023959fa4844079ffff7dc61e177f0036fd823575f1b4add682a6d",
+        "allowed_paths": [
+          "s0001/s0067/s0052",
+          "s0006",
+          "s0019/s0020/s0002",
+          "s0019/s0020/s0012",
+          "s0019/s0020/s0013",
+          "s0023/s0055/s0059/s0022",
+          "s0023/s0055/s0059/s0024/",
+          "s0023/s0055/s0059/s0025",
+          "s0023/s0055/s0059/s0035",
+          "s0023/s0055/s0059/s0037",
+          "s0023/s0055/s0059/s0054",
+          "s0023/s0055/s0065/s0027",
+          "s0051/s0056/s0014",
+          "s0051/s0056/s0015/",
+          "s0051/s0056/s0021",
+          "s0051/s0056/s0026",
+          "s0051/s0056/s0034",
+          "s0051/s0056/s0058",
+          "s0053/s0043/s0003/s0005/",
+          "s0057/s0024/",
+          "s0065/s0020/s0062",
+          "s0065/s0036/s0005/",
+          "s0066/s0038",
+          "s0066/s0039",
+          "s0066/s0063"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 2,
+        "status": "ABORTED",
+        "created_at": "2026-08-28T07:24:39.128Z",
+        "updated_at": "2026-08-28T07:24:40.982Z",
+        "postcondition_reasons": [],
+        "terminal_outcome": null,
+        "committed_proof": null,
+        "review": null,
+        "abort_reason": "fixture-abort",
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260828-112437-fnlb",
+          "repair_of": "20260828-133245-jh45",
+          "root_decision_hash": "a2570c3836eacdff02ac32629c4d1e29322c3ca1907599528943ae53c516c6d9",
+          "continuation_decision_delegation_id": "20260828-114126-41y0",
+          "continuation_decision_hash": "a2570c3836eacdff02ac32629c4d1e29322c3ca1907599528943ae53c516c6d9",
+          "parent_lineage_hash": "533386a5e3ffdc096296b86a96c08fbd0464a46d15852126131546abeed3c82a",
+          "depth": 6,
+          "carried_paths": [
+            "s0001/s0067/s0052",
+            "s0006",
+            "s0019/s0020/s0002",
+            "s0019/s0020/s0012",
+            "s0019/s0020/s0013",
+            "s0023/s0055/s0059/s0025",
+            "s0023/s0055/s0059/s0035",
+            "s0023/s0055/s0059/s0037",
+            "s0023/s0055/s0059/s0054",
+            "s0051/s0056/s0014",
+            "s0051/s0056/s0026",
+            "s0051/s0056/s0034",
+            "s0057/s0024/s0018",
+            "s0057/s0024/s0029",
+            "s0057/s0024/s0031",
+            "s0057/s0024/s0033",
+            "s0057/s0024/s0042",
+            "s0057/s0024/s0046",
+            "s0057/s0024/s0048",
+            "s0057/s0024/s0050",
+            "s0057/s0024/s0061",
+            "s0065/s0036/s0005/s0017",
+            "s0065/s0036/s0005/s0028",
+            "s0065/s0036/s0005/s0030",
+            "s0065/s0036/s0005/s0032",
+            "s0065/s0036/s0005/s0041",
+            "s0065/s0036/s0005/s0045",
+            "s0065/s0036/s0005/s0047",
+            "s0065/s0036/s0005/s0049",
+            "s0065/s0036/s0005/s0060",
+            "s0066/s0038",
+            "s0066/s0039"
+          ],
+          "lineage_hash": "6c4dd77130e5a7a2657e01a841fcd79f7b1783b27af430ce67e9cb8f98801f8f"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": true,
+        "empty_repair_attempt_supersession": true,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-142551-d7qj",
+        "task_kind": "implementation",
+        "contract_hash": "b6363a18731e747bf38cf7dbc34b0ec67c687453952eeb0da0f91fe8faded722",
+        "allowed_paths": [
+          "s0001/s0067/s0052",
+          "s0006",
+          "s0019/s0020/s0002",
+          "s0019/s0020/s0012",
+          "s0019/s0020/s0013",
+          "s0023/s0055/s0059/s0022",
+          "s0023/s0055/s0059/s0024/",
+          "s0023/s0055/s0059/s0025",
+          "s0023/s0055/s0059/s0035",
+          "s0023/s0055/s0059/s0037",
+          "s0023/s0055/s0059/s0054",
+          "s0023/s0055/s0065/s0027",
+          "s0051/s0056/s0014",
+          "s0051/s0056/s0015/",
+          "s0051/s0056/s0021",
+          "s0051/s0056/s0026",
+          "s0051/s0056/s0034",
+          "s0051/s0056/s0058",
+          "s0053/s0043/s0003/s0005/",
+          "s0057/s0024/",
+          "s0065/s0020/s0062",
+          "s0065/s0036/s0005/",
+          "s0066/s0038",
+          "s0066/s0039",
+          "s0066/s0063"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "INTERRUPTED",
+        "created_at": "2026-08-28T07:25:53.051Z",
+        "updated_at": "2026-08-28T07:34:29.194Z",
+        "postcondition_reasons": [
+          "WORKER_RUN_FAILED",
+          "EXIT_CODE_NOT_ZERO",
+          "REPORT_INCOMPLETE"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260828-142551-d7qj",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": false,
+          "worker_failure_code": "SPEND_TURN_LIMIT",
+          "exit_code": 143,
+          "report_complete": false,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [
+            "s0066/s0039"
+          ],
+          "successful_write_count": 4,
+          "denied_write_count": 0,
+          "delta_hash": "373840ee1434ac5d598ed73185bdd61c4711ee924ed1f57465b8edbceff363a8"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-142551-d7qj",
+          "task_kind": "implementation",
+          "contract_hash": "b6363a18731e747bf38cf7dbc34b0ec67c687453952eeb0da0f91fe8faded722",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "c0d2dc39b75b688125924cc30571dcd14a9360c48618fdc3b98252c89a54fad4",
+          "commit_marker": "delegation-v2:20260828-142551-d7qj:implementation:b6363a18731e747bf38cf7dbc34b0ec67c687453952eeb0da0f91fe8faded722:1:2:c0d2dc39b75b688125924cc30571dcd14a9360c48618fdc3b98252c89a54fad4"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260828-112437-fnlb",
+          "repair_of": "20260828-133245-jh45",
+          "root_decision_hash": "a3b6515e46e7c39a333cdd0ff9d7f7f731495a90e8253836f767fb08b201e704",
+          "continuation_decision_delegation_id": "20260828-114126-41y0",
+          "continuation_decision_hash": "c43e19762ce8965cc8f1f0dbabbc1728608b2ac109e02b6d020caefd251e9f99",
+          "parent_lineage_hash": "c4cd3f2cb4f34740aa58f7cfe1c7f5da2085fd3bfd85d2e2eb95bf393cfe8b26",
+          "depth": 6,
+          "carried_paths": [
+            "s0001/s0067/s0052",
+            "s0006",
+            "s0019/s0020/s0002",
+            "s0019/s0020/s0012",
+            "s0019/s0020/s0013",
+            "s0023/s0055/s0059/s0025",
+            "s0023/s0055/s0059/s0035",
+            "s0023/s0055/s0059/s0037",
+            "s0023/s0055/s0059/s0054",
+            "s0051/s0056/s0014",
+            "s0051/s0056/s0026",
+            "s0051/s0056/s0034",
+            "s0057/s0024/s0018",
+            "s0057/s0024/s0029",
+            "s0057/s0024/s0031",
+            "s0057/s0024/s0033",
+            "s0057/s0024/s0042",
+            "s0057/s0024/s0046",
+            "s0057/s0024/s0048",
+            "s0057/s0024/s0050",
+            "s0057/s0024/s0061",
+            "s0065/s0036/s0005/s0017",
+            "s0065/s0036/s0005/s0028",
+            "s0065/s0036/s0005/s0030",
+            "s0065/s0036/s0005/s0032",
+            "s0065/s0036/s0005/s0041",
+            "s0065/s0036/s0005/s0045",
+            "s0065/s0036/s0005/s0047",
+            "s0065/s0036/s0005/s0049",
+            "s0065/s0036/s0005/s0060",
+            "s0066/s0038",
+            "s0066/s0039"
+          ],
+          "lineage_hash": "ae60ee9839eefe562f0d7ec8e111ad5d14de6bd53588fea4e1dcb7591d8af62e"
+        }
+      },
+      "semantic_repair_decision": {
+        "schema_version": 1,
+        "delegation_id": "20260828-142551-d7qj",
+        "contract_hash": "b6363a18731e747bf38cf7dbc34b0ec67c687453952eeb0da0f91fe8faded722",
+        "generation": 1,
+        "transaction_revision": 3,
+        "generation_content_hash": "c0d2dc39b75b688125924cc30571dcd14a9360c48618fdc3b98252c89a54fad4",
+        "base_review_hash": "6907ce3e4658f5397b23126c87abb78a9ab07e25348d453e4325c5f8272695d7",
+        "expected_bound_diff_hash": "2664e8ef8fa8ff364e1b7cb7011e8597f92d2dcaf0f2a2b6253865b14627ce22",
+        "decision": "REPAIR",
+        "repair_reason": "fixture repair required",
+        "repair_reason_hash": "146a3a4af8d94206ba152e51b58fc979bfe62333ee20c8bb5c9d787a6e9e6f9d",
+        "reviewer": {
+          "provider": "openai",
+          "model": "gpt-5.6-sol"
+        },
+        "decided_at": "2026-08-28T07:36:29.172Z",
+        "decision_hash": "4a834b8f2c438a660cd0ef40335902fcdf84a324cf05701ac73907e5c7c89c4c"
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": true
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-143641-64f4",
+        "task_kind": "implementation",
+        "contract_hash": "a9e2aa7f7e7d746d2c8f26c599e61b45fb98d70283f1d368fa74cb9299a5e10b",
+        "allowed_paths": [
+          "s0001/s0067/s0052",
+          "s0006",
+          "s0019/s0020/s0002",
+          "s0019/s0020/s0012",
+          "s0019/s0020/s0013",
+          "s0023/s0055/s0059/s0022",
+          "s0023/s0055/s0059/s0024/",
+          "s0023/s0055/s0059/s0025",
+          "s0023/s0055/s0059/s0035",
+          "s0023/s0055/s0059/s0037",
+          "s0023/s0055/s0059/s0054",
+          "s0023/s0055/s0065/s0027",
+          "s0051/s0056/s0014",
+          "s0051/s0056/s0015/",
+          "s0051/s0056/s0021",
+          "s0051/s0056/s0026",
+          "s0051/s0056/s0034",
+          "s0051/s0056/s0058",
+          "s0053/s0043/s0003/s0005/",
+          "s0057/s0024/",
+          "s0065/s0020/s0062",
+          "s0065/s0036/s0005/",
+          "s0066/s0038",
+          "s0066/s0039",
+          "s0066/s0063"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-28T07:36:43.739Z",
+        "updated_at": "2026-08-28T07:44:44.590Z",
+        "postcondition_reasons": [
+          "WORKER_RUN_FAILED"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260828-143641-64f4",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": false,
+          "worker_failure_code": "COMMAND_EFFECT_RUN_FAILED",
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [
+            "s0066/s0039"
+          ],
+          "successful_write_count": 2,
+          "denied_write_count": 0,
+          "delta_hash": "8b6053d7feeff7f41e2ae139d190cc8a603270509e3442b45ceea8314c36f40f"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-143641-64f4",
+          "task_kind": "implementation",
+          "contract_hash": "a9e2aa7f7e7d746d2c8f26c599e61b45fb98d70283f1d368fa74cb9299a5e10b",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "a35d43ffc4c3c94c08f833ff004a4b032261f7bd4b6abd83ca6720a4b915e5c9",
+          "commit_marker": "delegation-v2:20260828-143641-64f4:implementation:a9e2aa7f7e7d746d2c8f26c599e61b45fb98d70283f1d368fa74cb9299a5e10b:1:2:a35d43ffc4c3c94c08f833ff004a4b032261f7bd4b6abd83ca6720a4b915e5c9"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260828-112437-fnlb",
+          "repair_of": "20260828-142551-d7qj",
+          "root_decision_hash": "a3b6515e46e7c39a333cdd0ff9d7f7f731495a90e8253836f767fb08b201e704",
+          "continuation_decision_delegation_id": "20260828-142551-d7qj",
+          "continuation_decision_hash": "4a834b8f2c438a660cd0ef40335902fcdf84a324cf05701ac73907e5c7c89c4c",
+          "parent_lineage_hash": "ae60ee9839eefe562f0d7ec8e111ad5d14de6bd53588fea4e1dcb7591d8af62e",
+          "depth": 7,
+          "carried_paths": [
+            "s0001/s0067/s0052",
+            "s0006",
+            "s0019/s0020/s0002",
+            "s0019/s0020/s0012",
+            "s0019/s0020/s0013",
+            "s0023/s0055/s0059/s0025",
+            "s0023/s0055/s0059/s0035",
+            "s0023/s0055/s0059/s0037",
+            "s0023/s0055/s0059/s0054",
+            "s0051/s0056/s0014",
+            "s0051/s0056/s0026",
+            "s0051/s0056/s0034",
+            "s0057/s0024/s0018",
+            "s0057/s0024/s0029",
+            "s0057/s0024/s0031",
+            "s0057/s0024/s0033",
+            "s0057/s0024/s0042",
+            "s0057/s0024/s0046",
+            "s0057/s0024/s0048",
+            "s0057/s0024/s0050",
+            "s0057/s0024/s0061",
+            "s0065/s0036/s0005/s0017",
+            "s0065/s0036/s0005/s0028",
+            "s0065/s0036/s0005/s0030",
+            "s0065/s0036/s0005/s0032",
+            "s0065/s0036/s0005/s0041",
+            "s0065/s0036/s0005/s0045",
+            "s0065/s0036/s0005/s0047",
+            "s0065/s0036/s0005/s0049",
+            "s0065/s0036/s0005/s0060",
+            "s0066/s0038",
+            "s0066/s0039"
+          ],
+          "lineage_hash": "ca9cdb1b419bbcb8e2c5b60c8af57d6406aeb7c43593d65184d85f9d7087ee77"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-144453-qcy8",
+        "task_kind": "implementation",
+        "contract_hash": "ee86152006b4c9e4934d22f34e240b3e14e5b5e779378a95087f5b743bdb8d78",
+        "allowed_paths": [
+          "s0001/s0067/s0052",
+          "s0006",
+          "s0019/s0020/s0002",
+          "s0019/s0020/s0012",
+          "s0019/s0020/s0013",
+          "s0023/s0055/s0059/s0022",
+          "s0023/s0055/s0059/s0024/",
+          "s0023/s0055/s0059/s0025",
+          "s0023/s0055/s0059/s0035",
+          "s0023/s0055/s0059/s0037",
+          "s0023/s0055/s0059/s0054",
+          "s0023/s0055/s0065/s0027",
+          "s0051/s0056/s0014",
+          "s0051/s0056/s0015/",
+          "s0051/s0056/s0021",
+          "s0051/s0056/s0026",
+          "s0051/s0056/s0034",
+          "s0051/s0056/s0058",
+          "s0053/s0043/s0003/s0005/",
+          "s0057/s0024/",
+          "s0065/s0020/s0062",
+          "s0065/s0036/s0005/",
+          "s0066/s0038",
+          "s0066/s0039",
+          "s0066/s0063"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "INTERRUPTED",
+        "created_at": "2026-08-28T07:44:55.142Z",
+        "updated_at": "2026-08-28T07:51:32.263Z",
+        "postcondition_reasons": [
+          "WORKER_RUN_FAILED",
+          "EXIT_CODE_NOT_ZERO",
+          "REPORT_INCOMPLETE"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260828-144453-qcy8",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": false,
+          "worker_failure_code": "SPEND_TURN_LIMIT",
+          "exit_code": 143,
+          "report_complete": false,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [
+            "s0057/s0024/s0018",
+            "s0057/s0024/s0042",
+            "s0065/s0036/s0005/s0017",
+            "s0065/s0036/s0005/s0041",
+            "s0066/s0039"
+          ],
+          "successful_write_count": 9,
+          "denied_write_count": 0,
+          "delta_hash": "1a1daeb261bca3cdf9b64ec51785a8a6c475454453c1ff8b867be46f7b82c0ac"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-144453-qcy8",
+          "task_kind": "implementation",
+          "contract_hash": "ee86152006b4c9e4934d22f34e240b3e14e5b5e779378a95087f5b743bdb8d78",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "c5a51763dd8254d6fc81be326b58822ef9b01d6cacb18c62d38f6c211d97c8ca",
+          "commit_marker": "delegation-v2:20260828-144453-qcy8:implementation:ee86152006b4c9e4934d22f34e240b3e14e5b5e779378a95087f5b743bdb8d78:1:2:c5a51763dd8254d6fc81be326b58822ef9b01d6cacb18c62d38f6c211d97c8ca"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260828-112437-fnlb",
+          "repair_of": "20260828-143641-64f4",
+          "root_decision_hash": "a3b6515e46e7c39a333cdd0ff9d7f7f731495a90e8253836f767fb08b201e704",
+          "continuation_decision_delegation_id": "20260828-142551-d7qj",
+          "continuation_decision_hash": "4a834b8f2c438a660cd0ef40335902fcdf84a324cf05701ac73907e5c7c89c4c",
+          "parent_lineage_hash": "ca9cdb1b419bbcb8e2c5b60c8af57d6406aeb7c43593d65184d85f9d7087ee77",
+          "depth": 8,
+          "carried_paths": [
+            "s0001/s0067/s0052",
+            "s0006",
+            "s0019/s0020/s0002",
+            "s0019/s0020/s0012",
+            "s0019/s0020/s0013",
+            "s0023/s0055/s0059/s0025",
+            "s0023/s0055/s0059/s0035",
+            "s0023/s0055/s0059/s0037",
+            "s0023/s0055/s0059/s0054",
+            "s0051/s0056/s0014",
+            "s0051/s0056/s0026",
+            "s0051/s0056/s0034",
+            "s0057/s0024/s0018",
+            "s0057/s0024/s0029",
+            "s0057/s0024/s0031",
+            "s0057/s0024/s0033",
+            "s0057/s0024/s0042",
+            "s0057/s0024/s0046",
+            "s0057/s0024/s0048",
+            "s0057/s0024/s0050",
+            "s0057/s0024/s0061",
+            "s0065/s0036/s0005/s0017",
+            "s0065/s0036/s0005/s0028",
+            "s0065/s0036/s0005/s0030",
+            "s0065/s0036/s0005/s0032",
+            "s0065/s0036/s0005/s0041",
+            "s0065/s0036/s0005/s0045",
+            "s0065/s0036/s0005/s0047",
+            "s0065/s0036/s0005/s0049",
+            "s0065/s0036/s0005/s0060",
+            "s0066/s0038",
+            "s0066/s0039"
+          ],
+          "lineage_hash": "f6141e9f8f3201caf8ac536ce07590c5b5aeca2530e234770e78755a5278cc3a"
+        }
+      },
+      "semantic_repair_decision": {
+        "schema_version": 1,
+        "delegation_id": "20260828-144453-qcy8",
+        "contract_hash": "ee86152006b4c9e4934d22f34e240b3e14e5b5e779378a95087f5b743bdb8d78",
+        "generation": 1,
+        "transaction_revision": 3,
+        "generation_content_hash": "c5a51763dd8254d6fc81be326b58822ef9b01d6cacb18c62d38f6c211d97c8ca",
+        "base_review_hash": "8e085a6454da692fb6511f542cf91f2af88c11e398c862d6edc04c9697312871",
+        "expected_bound_diff_hash": "ac394478fcbcbe196a8989ed62fa35dd94f2e8c3b31d21a65ef1c1f6eafaab94",
+        "decision": "REPAIR",
+        "repair_reason": "fixture repair required",
+        "repair_reason_hash": "146a3a4af8d94206ba152e51b58fc979bfe62333ee20c8bb5c9d787a6e9e6f9d",
+        "reviewer": {
+          "provider": "openai",
+          "model": "gpt-5.6-sol"
+        },
+        "decided_at": "2026-08-28T07:53:41.895Z",
+        "decision_hash": "f9928426044128c97025c3581e3e2376d74d112b006701ef7484f48530549136"
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": true
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-145352-jchb",
+        "task_kind": "implementation",
+        "contract_hash": "d1f02d70f6f5699db5eb2311c7d2d1eca842303e47cd5039fd1f195b3adb796f",
+        "allowed_paths": [
+          "s0001/s0067/s0052",
+          "s0006",
+          "s0019/s0020/s0002",
+          "s0019/s0020/s0012",
+          "s0019/s0020/s0013",
+          "s0023/s0055/s0059/s0022",
+          "s0023/s0055/s0059/s0024/",
+          "s0023/s0055/s0059/s0025",
+          "s0023/s0055/s0059/s0035",
+          "s0023/s0055/s0059/s0037",
+          "s0023/s0055/s0059/s0054",
+          "s0023/s0055/s0065/s0027",
+          "s0051/s0056/s0014",
+          "s0051/s0056/s0015/",
+          "s0051/s0056/s0021",
+          "s0051/s0056/s0026",
+          "s0051/s0056/s0034",
+          "s0051/s0056/s0058",
+          "s0053/s0043/s0003/s0005/",
+          "s0057/s0024/",
+          "s0065/s0020/s0062",
+          "s0065/s0036/s0005/",
+          "s0066/s0038",
+          "s0066/s0039",
+          "s0066/s0063"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-28T07:53:54.042Z",
+        "updated_at": "2026-08-28T07:58:13.352Z",
+        "postcondition_reasons": [
+          "WORKER_RUN_FAILED"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260828-145352-jchb",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": false,
+          "worker_failure_code": "COMMAND_EFFECT_RUN_FAILED",
+          "exit_code": 0,
+          "report_complete": true,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [
+            "s0066/s0039"
+          ],
+          "successful_write_count": 2,
+          "denied_write_count": 0,
+          "delta_hash": "311bcca2cc929919477b84e52d859767f70bccc51347d7d5fc3597bd7f784fb9"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-145352-jchb",
+          "task_kind": "implementation",
+          "contract_hash": "d1f02d70f6f5699db5eb2311c7d2d1eca842303e47cd5039fd1f195b3adb796f",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "833fda4ff8942da245df953a9b1aa1a86c7c6f122c030f1937764f75fae39348",
+          "commit_marker": "delegation-v2:20260828-145352-jchb:implementation:d1f02d70f6f5699db5eb2311c7d2d1eca842303e47cd5039fd1f195b3adb796f:1:2:833fda4ff8942da245df953a9b1aa1a86c7c6f122c030f1937764f75fae39348"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260828-112437-fnlb",
+          "repair_of": "20260828-144453-qcy8",
+          "root_decision_hash": "a3b6515e46e7c39a333cdd0ff9d7f7f731495a90e8253836f767fb08b201e704",
+          "continuation_decision_delegation_id": "20260828-144453-qcy8",
+          "continuation_decision_hash": "f9928426044128c97025c3581e3e2376d74d112b006701ef7484f48530549136",
+          "parent_lineage_hash": "f6141e9f8f3201caf8ac536ce07590c5b5aeca2530e234770e78755a5278cc3a",
+          "depth": 9,
+          "carried_paths": [
+            "s0001/s0067/s0052",
+            "s0006",
+            "s0019/s0020/s0002",
+            "s0019/s0020/s0012",
+            "s0019/s0020/s0013",
+            "s0023/s0055/s0059/s0025",
+            "s0023/s0055/s0059/s0035",
+            "s0023/s0055/s0059/s0037",
+            "s0023/s0055/s0059/s0054",
+            "s0051/s0056/s0014",
+            "s0051/s0056/s0026",
+            "s0051/s0056/s0034",
+            "s0057/s0024/s0018",
+            "s0057/s0024/s0029",
+            "s0057/s0024/s0031",
+            "s0057/s0024/s0033",
+            "s0057/s0024/s0042",
+            "s0057/s0024/s0046",
+            "s0057/s0024/s0048",
+            "s0057/s0024/s0050",
+            "s0057/s0024/s0061",
+            "s0065/s0036/s0005/s0017",
+            "s0065/s0036/s0005/s0028",
+            "s0065/s0036/s0005/s0030",
+            "s0065/s0036/s0005/s0032",
+            "s0065/s0036/s0005/s0041",
+            "s0065/s0036/s0005/s0045",
+            "s0065/s0036/s0005/s0047",
+            "s0065/s0036/s0005/s0049",
+            "s0065/s0036/s0005/s0060",
+            "s0066/s0038",
+            "s0066/s0039"
+          ],
+          "lineage_hash": "0ca649fef37695c3d45eff42c75de46beef5cf988547059acde66630f5bc8092"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      }
+    },
+    {
+      "state": {
+        "schema_version": 2,
+        "delegation_id": "20260828-145820-71ji",
+        "task_kind": "implementation",
+        "contract_hash": "07f72dc759353874790cf2fc98e2fa02ed03900ddcf6ddd2da87739ea57b75ce",
+        "allowed_paths": [
+          "s0001/s0067/s0052",
+          "s0006",
+          "s0019/s0020/s0002",
+          "s0019/s0020/s0012",
+          "s0019/s0020/s0013",
+          "s0023/s0055/s0059/s0022",
+          "s0023/s0055/s0059/s0024/",
+          "s0023/s0055/s0059/s0025",
+          "s0023/s0055/s0059/s0035",
+          "s0023/s0055/s0059/s0037",
+          "s0023/s0055/s0059/s0054",
+          "s0023/s0055/s0065/s0027",
+          "s0051/s0056/s0014",
+          "s0051/s0056/s0015/",
+          "s0051/s0056/s0021",
+          "s0051/s0056/s0026",
+          "s0051/s0056/s0034",
+          "s0051/s0056/s0058",
+          "s0053/s0043/s0003/s0005/",
+          "s0057/s0024/",
+          "s0065/s0020/s0062",
+          "s0065/s0036/s0005/",
+          "s0066/s0038",
+          "s0066/s0039",
+          "s0066/s0063"
+        ],
+        "worker_identity": {
+          "provider": "openai-codex",
+          "model": "gpt-5.6-luna",
+          "worker_id": "fixture-scalper"
+        },
+        "generation": 1,
+        "revision": 3,
+        "status": "FAILED",
+        "created_at": "2026-08-28T07:58:21.648Z",
+        "updated_at": "2026-08-28T07:58:54.450Z",
+        "postcondition_reasons": [
+          "WORKER_RUN_FAILED",
+          "EXIT_CODE_NOT_ZERO",
+          "REPORT_INCOMPLETE"
+        ],
+        "terminal_outcome": {
+          "delegation_id": "20260828-145820-71ji",
+          "task_kind": "implementation",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "provider_success": true,
+          "worker_success": false,
+          "worker_failure_code": "ABORTED",
+          "exit_code": 143,
+          "report_complete": false,
+          "terminal_facts_complete": true,
+          "scope_complete": true,
+          "change_set_status": "ATTRIBUTED",
+          "changed_paths": [],
+          "successful_write_count": 0,
+          "denied_write_count": 0,
+          "delta_hash": "3f0256f6766ae28295cc1805d72e7a33a751cdd30f1983f3cb8c55fa1d6047cc"
+        },
+        "committed_proof": {
+          "schema_version": 2,
+          "delegation_id": "20260828-145820-71ji",
+          "task_kind": "implementation",
+          "contract_hash": "07f72dc759353874790cf2fc98e2fa02ed03900ddcf6ddd2da87739ea57b75ce",
+          "worker_identity": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-luna",
+            "worker_id": "fixture-scalper"
+          },
+          "generation": 1,
+          "revision": 2,
+          "record_names": [
+            "after.json",
+            "before.json",
+            "identity.json",
+            "review.json",
+            "scope.json",
+            "usage.json",
+            "worker-report.md",
+            "worker-summary.json"
+          ],
+          "record_count": 8,
+          "content_hash": "e185ec01f61a029f94a654578dd074e43fa5499c8daed92629ff2a332f08ecad",
+          "commit_marker": "delegation-v2:20260828-145820-71ji:implementation:07f72dc759353874790cf2fc98e2fa02ed03900ddcf6ddd2da87739ea57b75ce:1:2:e185ec01f61a029f94a654578dd074e43fa5499c8daed92629ff2a332f08ecad"
+        },
+        "review": null,
+        "abort_reason": null,
+        "recovery_reason": null,
+        "repair_lineage": {
+          "schema_version": 1,
+          "kind": "semantic-repair-lineage-v1",
+          "root_delegation_id": "20260828-112437-fnlb",
+          "repair_of": "20260828-145352-jchb",
+          "root_decision_hash": "a3b6515e46e7c39a333cdd0ff9d7f7f731495a90e8253836f767fb08b201e704",
+          "continuation_decision_delegation_id": "20260828-144453-qcy8",
+          "continuation_decision_hash": "f9928426044128c97025c3581e3e2376d74d112b006701ef7484f48530549136",
+          "parent_lineage_hash": "0ca649fef37695c3d45eff42c75de46beef5cf988547059acde66630f5bc8092",
+          "depth": 10,
+          "carried_paths": [
+            "s0001/s0067/s0052",
+            "s0006",
+            "s0019/s0020/s0002",
+            "s0019/s0020/s0012",
+            "s0019/s0020/s0013",
+            "s0023/s0055/s0059/s0025",
+            "s0023/s0055/s0059/s0035",
+            "s0023/s0055/s0059/s0037",
+            "s0023/s0055/s0059/s0054",
+            "s0051/s0056/s0014",
+            "s0051/s0056/s0026",
+            "s0051/s0056/s0034",
+            "s0057/s0024/s0018",
+            "s0057/s0024/s0029",
+            "s0057/s0024/s0031",
+            "s0057/s0024/s0033",
+            "s0057/s0024/s0042",
+            "s0057/s0024/s0046",
+            "s0057/s0024/s0048",
+            "s0057/s0024/s0050",
+            "s0057/s0024/s0061",
+            "s0065/s0036/s0005/s0017",
+            "s0065/s0036/s0005/s0028",
+            "s0065/s0036/s0005/s0030",
+            "s0065/s0036/s0005/s0032",
+            "s0065/s0036/s0005/s0041",
+            "s0065/s0036/s0005/s0045",
+            "s0065/s0036/s0005/s0047",
+            "s0065/s0036/s0005/s0049",
+            "s0065/s0036/s0005/s0060",
+            "s0066/s0038",
+            "s0066/s0039"
+          ],
+          "lineage_hash": "f3a000d52a2e5fc379c67dfd7954e251a83e4857a0d4f02972931e237bad572f"
+        }
+      },
+      "auxiliary": {
+        "inactive_closure": false,
+        "empty_repair_attempt_supersession": false,
+        "repair_abandonment": false,
+        "semantic_review_closure": false,
+        "semantic_repair_sidecar": false,
+        "terminal_negative_repair_sidecar": false
+      },
+      "immutable_paths": {
+        "changed_paths": [],
+        "carried_paths": [
+          "s0001/s0067/s0052",
+          "s0006",
+          "s0019/s0020/s0002",
+          "s0019/s0020/s0012",
+          "s0019/s0020/s0013",
+          "s0023/s0055/s0059/s0025",
+          "s0023/s0055/s0059/s0035",
+          "s0023/s0055/s0059/s0037",
+          "s0023/s0055/s0059/s0054",
+          "s0051/s0056/s0014",
+          "s0051/s0056/s0026",
+          "s0051/s0056/s0034",
+          "s0057/s0024/s0018",
+          "s0057/s0024/s0029",
+          "s0057/s0024/s0031",
+          "s0057/s0024/s0033",
+          "s0057/s0024/s0042",
+          "s0057/s0024/s0046",
+          "s0057/s0024/s0048",
+          "s0057/s0024/s0050",
+          "s0057/s0024/s0061",
+          "s0065/s0036/s0005/s0017",
+          "s0065/s0036/s0005/s0028",
+          "s0065/s0036/s0005/s0030",
+          "s0065/s0036/s0005/s0032",
+          "s0065/s0036/s0005/s0041",
+          "s0065/s0036/s0005/s0045",
+          "s0065/s0036/s0005/s0047",
+          "s0065/s0036/s0005/s0049",
+          "s0065/s0036/s0005/s0060",
+          "s0066/s0038",
+          "s0066/s0039"
+        ]
+      }
+    }
+  ]
+}
