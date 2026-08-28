@@ -16,6 +16,7 @@ import {
 	type DelegationState,
 } from "./delegation-state.ts";
 import type { reviewDelegationV2 } from "./delegation-review-v2.ts";
+import type { DelegationLifecycleResolutionV1 } from "./delegation-lifecycle-resolver.ts";
 import type { readRecoverableUnpublishedDelegationV2 } from "./delegation-project-authority.ts";
 import {
 	isDelegationTerminalNegativeReviewEligibleFromCommittedV1,
@@ -267,6 +268,8 @@ export function registerReviewTool(controller: ReviewToolController): void {
 			let migrationBindingHash: string | undefined;
 			let repairDecisionHash: string | undefined;
 			let repairReasonHash: string | undefined;
+			let regeneratedDerivedReview = false;
+			let lifecycleResolution: DelegationLifecycleResolutionV1 | undefined;
 			let semanticReview: "accepted" | "required" | "not_required" | "repair_required" = "required";
 			let semanticRisk: "low" | "medium" | "high" = "medium";
 			if (v2Preflight.ok) {
@@ -336,6 +339,8 @@ export function registerReviewTool(controller: ReviewToolController): void {
 				migrationBindingHash = v2Result.migration_binding_hash;
 				repairDecisionHash = v2Result.repair_decision_hash;
 				repairReasonHash = v2Result.repair_reason_hash;
+				lifecycleResolution = v2Result.lifecycle_resolution;
+				regeneratedDerivedReview = v2Result.regenerated_derived_review === true && lifecycleResolution !== undefined;
 				if (!result.ok || !result.record) {
 					return {
 						content: [{ type: "text", text: reviewText("workbench_review_worker_diff: v2 review record unavailable") }],
@@ -514,6 +519,12 @@ export function registerReviewTool(controller: ReviewToolController): void {
 					patch_truncated: record.patch_truncated,
 					authority_version: authorityVersion,
 					finalized,
+					...(regeneratedDerivedReview ? {
+						regenerated_derived_review: true,
+						lifecycle_action: lifecycleResolution!.primary_action.action,
+						lifecycle_reason: lifecycleResolution!.primary_action.reason,
+						lifecycle_snapshot_hash: lifecycleResolution!.primary_action.snapshot_hash,
+					} : {}),
 					...(sessionMirrorWarning === undefined ? {} : { session_mirror_warning: sessionMirrorWarning }),
 				},
 			};

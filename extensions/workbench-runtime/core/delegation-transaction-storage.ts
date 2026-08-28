@@ -2663,6 +2663,34 @@ export async function readDelegationSemanticMigrationV1(
 	return { ok: true, value: authority.value.semantic_migration };
 }
 
+/**
+ * Presence-only freeze check for replaceable derived review evidence. Any
+ * entry at either immutable semantic sidecar path blocks regeneration; the
+ * entry is never followed or interpreted without its strict review authority.
+ */
+export async function readDelegationImmutableReviewSidecarPresenceV1(
+	projectRoot: string,
+	delegationId: string,
+	options?: DelegationTransactionStorageOptions,
+): Promise<DelegationTransactionStorageResult<{ semantic_migration: boolean; semantic_repair: boolean }>> {
+	const paths = transactionPaths(projectRoot, delegationId);
+	if (paths === undefined) return failure("invalid_input", "invalid delegation id");
+	const adapter = adapterOf(options);
+	const presence = { semantic_migration: false, semantic_repair: false };
+	for (const [key, path] of [
+		["semantic_migration", paths.semanticMigration],
+		["semantic_repair", paths.semanticRepair],
+	] as const) {
+		try {
+			await adapter.inspect(path);
+			presence[key] = true;
+		} catch (error) {
+			if (!isErrno(error, "ENOENT")) return failure("storage_failure", "semantic sidecar inspection failed");
+		}
+	}
+	return { ok: true, value: presence };
+}
+
 /** Strict optional repair-decision read: legacy absence is a successful `undefined`. */
 export async function readDelegationSemanticRepairDecisionV1(
 	projectRoot: string,

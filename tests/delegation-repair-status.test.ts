@@ -13,6 +13,11 @@ import {
 import type { DelegationAuthorityObservationV2 } from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
 import type { DelegationState } from "../extensions/workbench-runtime/core/delegation-state.ts";
 import type { ExecFn } from "../extensions/workbench-runtime/core/config.ts";
+import {
+	DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+	delegationLifecycleSnapshotFromInvalidDerivedReviewV1,
+	resolveDelegationLifecycleV1,
+} from "../extensions/workbench-runtime/core/delegation-lifecycle-resolver.ts";
 
 const ID = "20260823-205046-jw66";
 const ROOT = "20260823-200000-root";
@@ -154,6 +159,32 @@ test("eligible terminal-negative authority without a sidecar routes to q-review,
 	const corruptAction = delegationNextActionTextV1(state, corrupt) ?? "";
 	assert.match(corruptAction, /quarantine_unreadable_authority/u);
 	assert.doesNotMatch(corruptAction, /\/q-(?:review|repair)/u);
+});
+
+test("a corrupt provisional review over readable committed authority resolves to regeneration, never quarantine", async () => {
+	const resolution = resolveDelegationLifecycleV1(
+		delegationLifecycleSnapshotFromInvalidDerivedReviewV1(ID, { status: "PENDING_REVIEW" }),
+		{ schema_version: 1, kind: DELEGATION_LIFECYCLE_EVENT_KIND_V1, event: "OBSERVE", expected_snapshot_hash: null },
+	);
+	const projected = await readDelegationRepairStatusV1("/tmp/project", state, (async () => {
+		throw new Error("unused");
+	}) as ExecFn, {
+		readRepairClosure: async () => ({ ok: true, unresolvedTipId: null, rootCount: 0, lineageCount: 0 }),
+		readAuthority: async () => ({
+			kind: "derived-review-invalid", transactionStatus: "PENDING_REVIEW", code: "invalid_record", resolution,
+		}),
+		collectBinding: async () => ({ status: "fresh", hash: HASH, kind: "changeset-relevance-v2" }),
+		readRepairCapsule: async () => { throw new Error("derived review regeneration must not read repair authority"); },
+	});
+	assert.equal(projected.kind, "derived_review_invalid");
+	if (projected.kind !== "derived_review_invalid") return;
+	assert.equal(projected.resolution.state, "INVALID_DERIVED_EVIDENCE");
+	assert.equal(projected.resolution.primary_action.action, "REGENERATE_DERIVED_REVIEW");
+	const guidance = delegationNextActionTextV1(state, projected) ?? "";
+	assert.match(guidance, /workbench_review_worker_diff/u);
+	assert.match(guidance, /do not quarantine/u);
+	assert.doesNotMatch(guidance, /quarantine_unreadable_authority/u);
+	assert.match(delegationRepairStatusLinesV1(projected).join("\n"), /typed action : REGENERATE_DERIVED_REVIEW/u);
 });
 
 test("an eligible lineaged INTERRUPTED tip routes to q-review instead of generic recovery", async () => {

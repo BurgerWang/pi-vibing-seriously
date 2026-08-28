@@ -26,6 +26,7 @@ import {
 import { recoverExactRepairCommandAuthorityV1 } from "./exact-repair-authority.ts";
 import { recoverRawLineageExactRepairAuthorityV1 } from "./exact-repair-raw-lineage-authority.ts";
 import { readWorkerRepairCapsule } from "./worker-repair-authority.ts";
+import type { DelegationLifecycleResolutionV1 } from "./delegation-lifecycle-resolver.ts";
 
 export interface DelegationRepairStatusReaderServicesV1 {
 	readAuthority: typeof readDelegationAuthorityObservationV2;
@@ -50,6 +51,12 @@ type V2Observation = Extract<DelegationAuthorityObservationV2, { kind: "v2" }>;
 export type DelegationRepairStatusV1 =
 	| { kind: "none" }
 	| { kind: "authority_invalid"; delegationId: string | null; code: string }
+	| {
+		kind: "derived_review_invalid";
+		delegationId: string;
+		code: "invalid_record";
+		resolution: DelegationLifecycleResolutionV1;
+	}
 	| {
 		kind: "historical_multiplicity";
 		delegationId: string | null;
@@ -314,6 +321,14 @@ export async function readDelegationRepairStatusV1(
 			services.readAuthority(projectRoot, delegationId),
 			services.collectBinding(projectRoot, delegationId, exec),
 		]);
+		if (authority.kind === "derived-review-invalid") {
+			return {
+				kind: "derived_review_invalid",
+				delegationId,
+				code: authority.code,
+				resolution: authority.resolution,
+			};
+		}
 		let terminalNegativeReviewEligible = false;
 		if (authority.kind === "v2"
 			&& (authority.transactionStatus === "INTERRUPTED"
@@ -350,6 +365,9 @@ export function delegationNextActionTextV1(
 	state: DelegationState,
 	repair: DelegationRepairStatusV1 = { kind: "none" },
 ): string | undefined {
+	if (repair.kind === "derived_review_invalid") {
+		return `delegation ${repair.delegationId} has rebuildable derived review evidence (${repair.resolution.primary_action.action}); ${reviewDelegationToolActionV1(repair.delegationId)} to regenerate it; do not quarantine the readable transaction`;
+	}
 	if (repair.kind === "authority_invalid") {
 		const subject = repair.delegationId === null ? "project delegation" : `delegation ${repair.delegationId}`;
 		if (repair.delegationId !== null && ["incomplete_v2_authority", "invalid_record", "unsupported_version"].includes(repair.code)) {
@@ -408,6 +426,13 @@ export function delegationNextActionTextV1(
 /** Human-readable strict repair facts; hashes are shown, free-form reasons are not. */
 export function delegationRepairStatusLinesV1(status: DelegationRepairStatusV1): string[] {
 	if (status.kind === "none") return [];
+	if (status.kind === "derived_review_invalid") {
+		return [
+			`review state : DERIVED_INVALID (${status.code}); transaction and committed generation remain readable`,
+			`typed action : ${status.resolution.primary_action.action} (${status.resolution.primary_action.reason})`,
+			`next action  : ${reviewDelegationToolActionV1(status.delegationId)}; quarantine is not eligible`,
+		];
+	}
 	if (status.kind === "authority_invalid") {
 		return [`repair state : INVALID (${status.code}); no repair or Gate authority is inferred`];
 	}

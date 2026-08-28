@@ -1911,7 +1911,7 @@ test("review v2: committed-record tamper and unsafe mutable review paths fail cl
 	}
 });
 
-test("review v2: wrong id, foreign identity state, unknown state, and truncated provisional review fail closed", async () => {
+test("review v2: wrong id and invalid transaction state fail closed, while a truncated provisional review is regenerated", async () => {
 	const fixture = await setupReviewFixture(["src/a.ts", "src/b.ts"]);
 	try {
 		const wrongId = await reviewDelegationV2({ projectRoot: fixture.root, delegationId: "20260817-170001-nope", exec: spawnExec, now: at(4) });
@@ -1920,8 +1920,16 @@ test("review v2: wrong id, foreign identity state, unknown state, and truncated 
 		assert.equal(first.ok, true, first.ok ? "" : JSON.stringify(first.error));
 		await writeFile(reviewPath(fixture.root), "{\n");
 		const truncated = await reviewDelegationV2({ projectRoot: fixture.root, delegationId: ID, exec: spawnExec, includePaths: ["src/b.ts"], now: at(5) });
-		assert.equal(truncated.ok, false);
-		if (!truncated.ok) assert.equal(truncated.error.code, "authority_invalid");
+		assert.equal(truncated.ok, true, truncated.ok ? "" : JSON.stringify(truncated.error));
+		if (truncated.ok) {
+			assert.equal(truncated.regenerated_derived_review, true);
+			assert.equal(truncated.finalized, false);
+			assert.equal(truncated.lifecycle_resolution?.state, "INVALID_DERIVED_EVIDENCE");
+			assert.equal(truncated.lifecycle_resolution?.primary_action.action, "REGENERATE_DERIVED_REVIEW");
+		}
+		const rebuilt = await readDelegationReviewV2(fixture.root, ID);
+		assert.equal(rebuilt.ok, true, rebuilt.ok ? "" : JSON.stringify(rebuilt.error));
+		if (rebuilt.ok) assert.equal(rebuilt.value.finalized, false);
 		const durable = await readDelegationTransactionV2(fixture.root, ID);
 		assert.equal(durable.ok, true);
 		if (durable.ok) assert.equal(durable.value.status, "PENDING_REVIEW");
@@ -1946,6 +1954,33 @@ test("review v2: wrong id, foreign identity state, unknown state, and truncated 
 		} finally {
 			await cleanup(corrupted);
 		}
+	}
+});
+
+test("review v2: a corrupt provisional review frozen by an immutable REPAIR sidecar is never regenerated", async () => {
+	const fixture = await setupReviewFixture();
+	try {
+		const presented = await reviewDelegationV2({
+			projectRoot: fixture.root, delegationId: ID, exec: spawnExec, includePaths: ["src/a.ts"], now: at(4),
+		});
+		assert.equal(presented.ok, true, presented.ok ? "" : JSON.stringify(presented.error));
+		if (!presented.ok || presented.review.record === undefined) return;
+		const repaired = await repairPresentedReview(
+			fixture,
+			presented.review.record.bound_diff_hash,
+			"The exact provisional implementation requires a bounded semantic correction.",
+			5,
+		);
+		assert.equal(repaired.ok, true, repaired.ok ? "" : JSON.stringify(repaired.error));
+		await writeFile(reviewPath(fixture.root), "{\n");
+		const refused = await reviewDelegationV2({
+			projectRoot: fixture.root, delegationId: ID, exec: spawnExec, now: at(6),
+		});
+		assert.equal(refused.ok, false);
+		if (!refused.ok) assert.equal(refused.error.code, "authority_invalid");
+		assert.equal(await readFile(reviewPath(fixture.root), "utf8"), "{\n");
+	} finally {
+		await cleanup(fixture);
 	}
 });
 

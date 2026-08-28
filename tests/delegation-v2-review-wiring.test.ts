@@ -529,6 +529,30 @@ test("registered review is v2-first, stays provisional until a second Sol ACCEPT
 	});
 });
 
+test("registered review regenerates replaceable derived evidence and exposes the canonical lifecycle action", async () => {
+	await withTempDir(async (root) => {
+		const fixture = await seedV2(root);
+		const { stub, ctx } = await runtimeFor(root, stateEntry(fixture.id, fixture.afterHash));
+		const reviewTool = tool(stub, "workbench_review_worker_diff");
+		const first = await reviewTool.execute("v2-derived-first", { delegation_id: fixture.id }, undefined, undefined, ctx);
+		assert.equal(first.details.ok, true, text(first));
+		const reviewFile = join(root, CONFIG_DIR_NAME, "workbench", "delegations", fixture.id, "v2", "review.json");
+		await writeFile(reviewFile, "{\n", "utf8");
+		const regenerated = await reviewTool.execute(
+			"v2-derived-regenerate", { delegation_id: fixture.id }, undefined, undefined, ctx,
+		);
+		assert.equal(regenerated.details.ok, true, text(regenerated));
+		assert.equal(regenerated.details.regenerated_derived_review, true);
+		assert.equal(regenerated.details.lifecycle_action, "REGENERATE_DERIVED_REVIEW");
+		assert.equal(regenerated.details.lifecycle_reason, "DERIVED_REVIEW_INVALID");
+		assert.match(String(regenerated.details.lifecycle_snapshot_hash), /^[a-f0-9]{64}$/u);
+		assert.doesNotMatch(text(regenerated), /quarantine/u);
+		const strict = await readDelegationReviewV2(root, fixture.id);
+		assert.equal(strict.ok, true, strict.ok ? "" : JSON.stringify(strict.error));
+		if (strict.ok) assert.equal(strict.value.finalized, false);
+	});
+});
+
 test("registered review resumes a 14 KiB ordinary source page and only then permits Sol ACCEPT", async () => {
 	await withTempDir(async (root) => {
 		const source = Array.from({ length: 357 }, (_, index) =>

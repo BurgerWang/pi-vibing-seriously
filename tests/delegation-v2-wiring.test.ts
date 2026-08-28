@@ -1174,6 +1174,10 @@ test("a STALE mirror never bypasses a corrupt finalized v2 authority", async () 
 			ctx,
 		));
 		const firstId = delegationId(first);
+		await acceptCurrentSemanticReview(root, stub, ctx, firstId);
+		const accepted = await readDelegationCommittedGenerationV2(root, firstId);
+		assert.equal(accepted.ok, true);
+		if (accepted.ok) assert.equal(accepted.value.state.status, "REVIEWED");
 		const review = await readDelegationReviewV2(root, firstId);
 		assert.equal(review.ok, true);
 		if (!review.ok) return;

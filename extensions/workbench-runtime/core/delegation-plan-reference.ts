@@ -269,6 +269,8 @@ export async function buildDelegationWorkerFirstGateFacts(
 		const authority = await readDelegationAuthorityObservationV2(projectRoot, state.latestId);
 		if (authority.kind === "invalid-v2") {
 			reviewBlock = `delegation ${state.latestId} v2 authority is ${authority.code}; verification fails closed`;
+		} else if (authority.kind === "derived-review-invalid") {
+			reviewBlock = `delegation ${state.latestId} derived review is ${authority.code}; ${authority.resolution.primary_action.action} is required before verification`;
 		} else if (authority.kind === "legacy") {
 			if (authority.zeroDelta && authority.review && isStrictSemanticAcceptedOrZeroDelta(authority.review)) {
 				reviewVerdict = authority.review.verdict;

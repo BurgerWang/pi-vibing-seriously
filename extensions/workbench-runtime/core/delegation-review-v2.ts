@@ -59,6 +59,7 @@ import {
 	publishHistoricalSemanticMigrationPresentationV2,
 	publishDelegationReviewV2,
 	readDelegationCommittedGenerationV2,
+	readDelegationImmutableReviewSidecarPresenceV1,
 	readDelegationReviewV2,
 	readDelegationTerminalNegativeReviewV1,
 	type DelegationCommittedGenerationV2,
@@ -85,6 +86,12 @@ import {
 	validateSemanticReviewEnvelopeV1,
 	type SemanticReviewEnvelopeV1,
 } from "./semantic-review-envelope.ts";
+import {
+	DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+	delegationLifecycleSnapshotFromInvalidDerivedReviewV1,
+	resolveDelegationLifecycleV1,
+	type DelegationLifecycleResolutionV1,
+} from "./delegation-lifecycle-resolver.ts";
 
 const AFTER_FIELDS = [
 	"schema_version", "delegation_id", "recorded_at", "status", "exit_code", "pinned_identity",
@@ -134,6 +141,8 @@ export interface DelegationReviewV2Success {
 	migration_binding_hash?: string;
 	repair_decision_hash?: string;
 	repair_reason_hash?: string;
+	regenerated_derived_review?: true;
+	lifecycle_resolution?: DelegationLifecycleResolutionV1;
 }
 
 export interface DelegationReviewV2Failure {
@@ -908,6 +917,8 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 			? await readDelegationTerminalNegativeReviewV1(input.projectRoot, state.delegation_id, input.storage)
 			: await readDelegationReviewV2(input.projectRoot, state.delegation_id, input.storage);
 		let priorReview: ReviewRecord | null = null;
+		let regeneratingDerivedReview = false;
+		let regenerationResolution: DelegationLifecycleResolutionV1 | undefined;
 		let priorRepairDecision = priorRead.ok
 			? terminalNegative
 				? (priorRead.value as DelegationTerminalNegativeReviewAuthorityV1).terminal_negative_repair?.decision
@@ -917,7 +928,30 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 			if (priorRead.value.finalized) return fail("review_conflict", "pending transaction conflicts with a finalized review", { transaction: state });
 			priorReview = priorRead.value.review;
 		} else if (priorRead.error.code !== "not_found") {
-			return fail("authority_invalid", "existing provisional review is corrupt or unsafe", { transaction: state });
+			if (!terminalNegative && priorRead.error.code === "invalid_record") {
+				const sidecars = await readDelegationImmutableReviewSidecarPresenceV1(
+					input.projectRoot, state.delegation_id, input.storage,
+				);
+				if (sidecars.ok && !sidecars.value.semantic_repair && !sidecars.value.semantic_migration) {
+					regenerationResolution = resolveDelegationLifecycleV1(
+						delegationLifecycleSnapshotFromInvalidDerivedReviewV1(state.delegation_id, state),
+						{
+							schema_version: 1,
+							kind: DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+							event: "OBSERVE",
+							expected_snapshot_hash: null,
+						},
+					);
+					if (regenerationResolution.primary_action.action !== "REGENERATE_DERIVED_REVIEW") {
+						return fail("authority_invalid", "derived review resolver refused regeneration", { transaction: state });
+					}
+					regeneratingDerivedReview = true;
+				} else {
+					return fail("authority_invalid", "existing provisional review is frozen or unsafe", { transaction: state });
+				}
+			} else {
+				return fail("authority_invalid", "existing provisional review is corrupt or unsafe", { transaction: state });
+			}
 		}
 		if (semanticDecisionSupplied) {
 			if (priorReview === null) {
@@ -1183,6 +1217,8 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 			review_hash: persisted.value.review_hash,
 			review_path: persisted.value.review_path,
 			finalized: persisted.value.finalized,
+			...(regeneratingDerivedReview ? { regenerated_derived_review: true as const } : {}),
+			...(regenerationResolution === undefined ? {} : { lifecycle_resolution: regenerationResolution }),
 		};
 	} catch {
 		return fail("review_invalid", "delegation v2 review failed closed");

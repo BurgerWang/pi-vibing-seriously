@@ -27,6 +27,7 @@ import {
 	isDelegationTerminalNegativeReviewEligibleFromCommittedV1,
 	readDelegationCommittedGenerationV2,
 	readDelegationCurrentSemanticRepairDecisionV1,
+	readDelegationImmutableReviewSidecarPresenceV1,
 	readDelegationReviewV2,
 	readDelegationSemanticRepairDecisionV1,
 	readDelegationTransactionV2,
@@ -90,6 +91,7 @@ import {
 import {
 	DELEGATION_LIFECYCLE_EVENT_KIND_V1,
 	DELEGATION_LIFECYCLE_SNAPSHOT_KIND_V1,
+	delegationLifecycleSnapshotFromInvalidDerivedReviewV1,
 	resolveDelegationLifecycleV1,
 	type DelegationLifecycleResolutionV1,
 	type DelegationLifecycleSnapshotV1,
@@ -165,6 +167,12 @@ export type DelegationAuthorityObservationV2 =
 		};
 	}
 	| { kind: "legacy"; review: ReviewRecord | null; zeroDelta: boolean }
+	| {
+		kind: "derived-review-invalid";
+		transactionStatus: "PENDING_REVIEW";
+		code: "invalid_record";
+		resolution: DelegationLifecycleResolutionV1;
+	}
 	| { kind: "invalid-v2"; code: string };
 
 export interface ProjectDelegationAuthorityIssueV2 {
@@ -1241,6 +1249,23 @@ export async function readDelegationAuthorityObservationV2(
 				semanticAccepted: false, semanticBindingHash: null, semanticSource: null, semanticReviewer: null, semanticAcceptedAt: null,
 				...repairObservation(transaction),
 			};
+		}
+		if (review.error.code === "invalid_record" && transaction.status === "PENDING_REVIEW" && transaction.review === null) {
+			const sidecars = await readDelegationImmutableReviewSidecarPresenceV1(projectRoot, delegationId);
+			if (sidecars.ok && !sidecars.value.semantic_repair && !sidecars.value.semantic_migration) {
+				const resolution = resolveDelegationLifecycleV1(
+					delegationLifecycleSnapshotFromInvalidDerivedReviewV1(delegationId, transaction),
+					{
+						schema_version: 1,
+						kind: DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+						event: "OBSERVE",
+						expected_snapshot_hash: null,
+					},
+				);
+				if (resolution.primary_action.action === "REGENERATE_DERIVED_REVIEW") {
+					return { kind: "derived-review-invalid", transactionStatus: "PENDING_REVIEW", code: "invalid_record", resolution };
+				}
+			}
 		}
 		return { kind: "invalid-v2", code: review.error.code };
 	}

@@ -548,3 +548,30 @@ export function delegationLifecycleSnapshotFromPathLaneAdmissionV1(
 			},
 	};
 }
+
+/** Normalize a readable transaction with only replaceable derived-review damage. */
+export function delegationLifecycleSnapshotFromInvalidDerivedReviewV1(
+	delegationId: string,
+	sourceAuthority: unknown,
+): DelegationLifecycleSnapshotV1 {
+	return {
+		schema_version: 1,
+		kind: DELEGATION_LIFECYCLE_SNAPSHOT_KIND_V1,
+		source_authority_hash: canonicalHash({
+			kind: "delegation-derived-review-source-v1",
+			state: sourceAuthority,
+		}),
+		operation_intent: "DEV",
+		authority: { health: "DERIVED_INVALID", disposition: "INACTIVE" },
+		writer_lock: "ABSENT",
+		binding: "CURRENT",
+		attempt: "AWAITING_REVIEW",
+		candidate: "NONE",
+		runtime_identity: "NOT_REQUIRED",
+		request_valid: true,
+		target: { kind: "DELEGATION", id: delegationId },
+		affected_paths: [],
+		scope_unknown: false,
+		recovery_rank: { unresolved_obligations: 0, unresolved_attempts: 0 },
+	};
+}
