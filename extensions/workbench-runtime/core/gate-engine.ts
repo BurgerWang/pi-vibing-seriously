@@ -42,7 +42,7 @@ import {
 	QUANT_GATE_ID_RE,
 	GATE_STATUSES,
 } from "./gate-schema.ts";
-import { validateQuantResult } from "./quant-result.ts";
+import { validateQuantResearchEvidence, validateQuantResult } from "./quant-result.ts";
 import { validateQuantContract } from "../cache/quant-contracts.ts";
 import { realpathContained } from "./path-guard.ts";
 import { runRecipe } from "./recipe-runner.ts";
@@ -72,6 +72,12 @@ import { validateCommittedArtifactsV2 } from "./artifact-contract.ts";
 import { beginRunTransaction, commitRunTransaction } from "./run-transaction.ts";
 import { readCurrentDelegationPlanAuthority, type CurrentDelegationPlanAuthority } from "./delegation-plan-reference.ts";
 import type { GatePlanValidationFacts } from "./validation-evidence.ts";
+import {
+	gateCandidateSourceAuthorityV1,
+	parseGateCandidateBindingV1,
+	type GateCandidateBindingV1,
+} from "./candidate-binding.ts";
+import { currentRunRuntimeIdentityV1 } from "./candidate-identity.ts";
 
 export const GATE_SCHEMA_VERSION = 1;
 /** Persisted gate/evidence records are authority inputs, never unbounded JSON channels. */
@@ -221,6 +227,8 @@ export interface RunGatesInput {
 	jsonFileReadHooks?: BoundedFileIoHooks;
 	/** Test-only stable-snapshot observation; cannot raise the gate config cap. */
 	gateConfigReadHooks?: GateConfigReadHooks;
+	/** WP5 strict-lane identity; accepted only in VERIFY and persisted everywhere authority is reconstructed. */
+	candidateBinding?: GateCandidateBindingV1;
 }
 
 export interface RunGatesResult {
@@ -231,6 +239,7 @@ export interface RunGatesResult {
 	gates: GateRunEntry[];
 	requested: string[];
 	profile: string | undefined;
+	candidateIdentity?: string;
 }
 
 export interface GateFileRecord {
@@ -239,6 +248,7 @@ export interface GateFileRecord {
 	requested: string[];
 	profile: string | undefined;
 	mode: string;
+	candidate_binding?: GateCandidateBindingV1;
 	gates: GateRunEntry[];
 }
 
@@ -571,6 +581,8 @@ export interface PersistedGateRunFacts {
 		authorityDigest: string;
 		freshness: "current" | "immutable-snapshot";
 	}>;
+	/** Frozen Candidate edge, present only on WP5 strict-lane Gate runs. */
+	candidateBinding?: GateCandidateBindingV1;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -688,6 +700,16 @@ export function validatePersistedGateRunRecords(
 		if (typeof gatesRaw.mode !== "string" || gatesRaw.mode.length === 0 || gatesRaw.mode.length > 200
 			|| typeof evidenceRaw.mode !== "string" || evidenceRaw.mode.length === 0 || evidenceRaw.mode.length > 200) return null;
 		if (gatesRaw.mode !== evidenceRaw.mode || manifest.mode !== gatesRaw.mode) return null;
+		const persistedCandidateBindings = [manifest.candidate_binding, gatesRaw.candidate_binding, evidenceRaw.candidate_binding];
+		const candidateBindingAbsent = persistedCandidateBindings.every((binding) => binding === undefined);
+		let candidateBinding: GateCandidateBindingV1 | undefined;
+		if (!candidateBindingAbsent) {
+			const parsedBindings = persistedCandidateBindings.map((binding) => parseGateCandidateBindingV1(binding));
+			if (parsedBindings.some((binding) => binding === null)) return null;
+			candidateBinding = parsedBindings[0]!;
+			if (!parsedBindings.every((binding) => isDeepStrictEqual(binding, candidateBinding))) return null;
+			if (manifest.mode !== "VERIFY") return null;
+		}
 		// Manifest identity: the run must be a gate run of the same id.
 		if (manifest.recipe !== "gate" || manifest.run_id !== runId) return null;
 		if (!Array.isArray(gatesRaw.gates) || gatesRaw.gates.length === 0 || gatesRaw.gates.length > 500) return null;
@@ -853,7 +875,7 @@ export function validatePersistedGateRunRecords(
 		const successful = overall === "PASS";
 		if (successful !== (manifest.run_outcome === "SUCCESS")) return null;
 		if (successful !== (manifest.exit_code !== null && manifest.expected_exit_codes.includes(manifest.exit_code))) return null;
-		return { requested: gatesRaw.requested, gates, manualEvidence, artifactSources };
+		return { requested: gatesRaw.requested, gates, manualEvidence, artifactSources, candidateBinding };
 	} catch {
 		return null;
 	}
@@ -1571,8 +1593,8 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 				const file = check.json_file as string;
 				const schemaName = check.schema_name ?? "quant-result";
 				const QUANT_CONTRACT_SCHEMAS: readonly string[] = ["data-snapshot", "feature-set", "backtest-result"];
-				if (schemaName !== "quant-result" && !QUANT_CONTRACT_SCHEMAS.includes(schemaName)) {
-					throw new GateSetupError(`${label}: unknown built-in schema "${schemaName}" (supported: quant-result, ${QUANT_CONTRACT_SCHEMAS.join(", ")})`);
+				if (schemaName !== "quant-result" && schemaName !== "quant-research" && !QUANT_CONTRACT_SCHEMAS.includes(schemaName)) {
+					throw new GateSetupError(`${label}: unknown built-in schema "${schemaName}" (supported: quant-result, quant-research, ${QUANT_CONTRACT_SCHEMAS.join(", ")})`);
 				}
 				let resolved: { path: string; value: unknown };
 				try {
@@ -1598,7 +1620,9 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 				const isQuantContract = QUANT_CONTRACT_SCHEMAS.includes(schemaName);
 				const result = isQuantContract
 					? validateQuantContract(resolved.value, { profile: ctx.profile })
-					: validateQuantResult(resolved.value, { profile: ctx.profile });
+					: schemaName === "quant-research"
+						? validateQuantResearchEvidence(resolved.value, { profile: ctx.profile })
+						: validateQuantResult(resolved.value, { profile: ctx.profile });
 				const evidence: EvidenceEntry = isQuantContract
 					? (() => {
 							const q = result as ReturnType<typeof validateQuantContract>;
@@ -1806,6 +1830,13 @@ async function gitState(projectRoot: string, exec: ExecFn): Promise<{ commit: st
  */
 export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 	const { projectRoot, selector, mode, exec } = input;
+	let candidateBinding: GateCandidateBindingV1 | undefined;
+	if (input.candidateBinding !== undefined) {
+		const parsedCandidateBinding = parseGateCandidateBindingV1(input.candidateBinding);
+		if (parsedCandidateBinding === null) throw new GateSetupError("INVALID_CANDIDATE_BINDING");
+		candidateBinding = parsedCandidateBinding;
+	}
+	if (candidateBinding !== undefined && mode !== "VERIFY") throw new GateSetupError("CANDIDATE_GATE_REQUIRES_VERIFY");
 	const now = input.now ?? (() => new Date());
 	const startedAt = now();
 
@@ -1914,6 +1945,7 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 		requested: requestedIds,
 		profile: config.profile,
 		mode,
+		candidate_binding: candidateBinding,
 		checks: evidenceByCheck,
 	};
 
@@ -1923,6 +1955,7 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 		requested: requestedIds,
 		profile: config.profile,
 		mode,
+		candidate_binding: candidateBinding,
 		gates: gateEntries,
 	};
 	// Compile BOTH authority records before opening either destination. The
@@ -1942,6 +1975,7 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 	// gateId → status: sources (which embed run ids) never enter the hash.
 	const prerequisiteStatus: Record<string, string> = {};
 	const sourceAuthority: Record<string, string> = {};
+	if (candidateBinding !== undefined) sourceAuthority.candidate = gateCandidateSourceAuthorityV1(candidateBinding);
 	for (const entry of gateEntries) {
 		for (const [gateId, facts] of Object.entries(entry.prerequisite_status)) {
 			prerequisiteStatus[gateId] = facts.status;
@@ -1997,6 +2031,8 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 		environment_names: [],
 		validation_components: [],
 		cache_request_mode: "no-cache",
+		runtime_identity: currentRunRuntimeIdentityV1(),
+		candidate_binding: candidateBinding,
 		validation_evidence: gateEvidence.ok ? gateEvidence.block : unavailableEvidenceBlock(gateEvidence.reason),
 		run_transaction_schema_version: 2,
 		run_outcome: ok ? "SUCCESS" : "PROCESS_FAILED",
@@ -2050,7 +2086,16 @@ export async function runGates(input: RunGatesInput): Promise<RunGatesResult> {
 	} catch {
 		throw new GateSetupError("RUN_RECORD_COMMIT_FAILED");
 	}
-	return { ok, status: overall, runId, runDir, gates: gateEntries, requested: requestedIds, profile: config.profile };
+	return {
+		ok,
+		status: overall,
+		runId,
+		runDir,
+		gates: gateEntries,
+		requested: requestedIds,
+		profile: config.profile,
+		candidateIdentity: candidateBinding?.candidate_identity,
+	};
 }
 
 /** Project-relative form of a path for display. */

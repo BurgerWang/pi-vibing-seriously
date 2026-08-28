@@ -501,6 +501,32 @@ facts are NOT_RUN (a required NOT_RUN never PASSes), a pending/stale review
 BLOCKs B6, negative compliance facts FAIL it, and model prose can never
 satisfy B6.1-B6.8.
 
+### Candidate promotion and release provenance (WP5)
+
+An ordinary DEV final check composes one Candidate identity from its existing
+validation binding, artifact manifest, and current runtime/toolchain identity.
+The user-only `/q-promote` command is the strict-lane boundary:
+
+```
+/q-promote research|release <candidate-id> <source-run-id> ...
+  → revalidate the exact current ordinary Candidate
+  → write one immutable Candidate version; move current
+  → run selector=all in VERIFY with the same Candidate binding persisted in
+    manifest.json, gates.json, evidence.json and the Gate validation hash
+  → Gate non-PASS: withhold promotion; DEV remains available
+  → Gate PASS: write one immutable promotion version
+    research → move champion
+    release  → require --authorize-release + a current VERIFY artifact run
+             → bind source, recipe definition/invocation, runtime, resolved
+               inputs, artifact-manifest identity and every artifact hash
+             → move release-candidate
+```
+
+`current`, `champion`, and `release-candidate` are movable aliases whose
+targets are immutable content-addressed versions. Promotion never changes the
+Candidate, never deletes failed folds, never infers profitability or a better
+strategy from higher return, and never runs push/publish.
+
 ### Validation composition (Phase 2)
 
 Validation is composed from declared recipe components, never assumed.

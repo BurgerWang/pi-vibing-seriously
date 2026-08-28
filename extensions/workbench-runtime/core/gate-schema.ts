@@ -180,7 +180,7 @@ export interface GateCheck {
 	numeric_max?: number;
 	/** kind=manual: what human evidence is required. */
 	manual_prompt?: string;
-	/** kind=schema: built-in schema name ("quant-result"). */
+	/** kind=schema: built-in schema name ("quant-result" or strict "quant-research"). */
 	schema_name?: string;
 	/** kind=worker-first: which machine-backed compliance assertion to evaluate. */
 	worker_first?: WorkerFirstCheckName;
@@ -378,7 +378,7 @@ export function parseCheck(raw: unknown, gateId: string, index: number): { check
 	const manualPrompt = asString(raw.prompt, `${label}: "prompt"`, errors);
 	const schemaName = asString(raw.schema, `${label}: "schema"`, errors);
 	if (kind === "schema" && schemaName === undefined) {
-		errors.push(`${label}: kind=schema needs "schema" (built-in: quant-result)`);
+		errors.push(`${label}: kind=schema needs "schema" (built-in: quant-result, quant-research)`);
 	}
 	const workerFirst = asString(raw.worker_first, `${label}: "worker_first"`, errors);
 	if (kind === "worker-first") {

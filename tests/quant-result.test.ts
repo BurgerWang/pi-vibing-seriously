@@ -11,7 +11,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { validateQuantResult } from "../extensions/workbench-runtime/core/quant-result.ts";
+import { validateQuantResearchEvidence, validateQuantResult } from "../extensions/workbench-runtime/core/quant-result.ts";
 import { makeValidQuantResult } from "./helpers.ts";
 
 test("a conforming quant-result artifact validates", () => {
@@ -20,6 +20,39 @@ test("a conforming quant-result artifact validates", () => {
 	assert.deepEqual(result.errors, []);
 	assert.ok(result.checked.includes("metrics.return"));
 	assert.ok(result.checked.includes("folds.length"));
+});
+
+test("WP5 quant research evidence machine-validates chronological folds and stability references", () => {
+	const result = validateQuantResearchEvidence(makeValidQuantResult());
+	assert.equal(result.valid, true, result.errors.join("; "));
+	assert.ok(result.checked.includes("split.train.start"));
+	assert.ok(result.checked.includes("folds[2].period.test.end"));
+	assert.ok(result.checked.includes("parameter_stability.references[0].sha256"));
+});
+
+test("WP5 quant research evidence forbids train-on-future and overlapping fold tests", () => {
+	const artifact = makeValidQuantResult();
+	artifact.split = {
+		...(artifact.split as Record<string, unknown>),
+		train: { start: "2020-01-01", end: "2022-01-01" },
+		test: { start: "2021-01-01", end: "2023-01-01" },
+	};
+	const folds = artifact.folds as Array<Record<string, unknown>>;
+	(folds[1]!.period as Record<string, unknown>).test = { start: "2016-12-01", end: "2017-12-31" };
+	const result = validateQuantResearchEvidence(artifact);
+	assert.equal(result.valid, false);
+	assert.ok(result.errors.some((error) => error.includes("split chronology")), result.errors.join("; "));
+	assert.ok(result.errors.some((error) => error.includes("prior fold test")), result.errors.join("; "));
+});
+
+test("WP5 quant research evidence requires explicit gap/embargo applicability and hashed stability refs", () => {
+	const artifact = makeValidQuantResult();
+	delete (artifact.split as Record<string, unknown>).embargo;
+	artifact.parameter_stability = { references: [{ path: "../escape.json", sha256: "not-a-hash" }] };
+	const result = validateQuantResearchEvidence(artifact);
+	assert.equal(result.valid, false);
+	assert.ok(result.errors.some((error) => error.includes("split.embargo")));
+	assert.ok(result.errors.some((error) => error.includes("safe project-relative path")));
 });
 
 test("missing required top-level fields fail validation", () => {

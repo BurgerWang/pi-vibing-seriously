@@ -72,9 +72,12 @@ workbench **validates** this contract — it never computes strategy metrics:
 Gate mechanics: prerequisite resolution (current run first, then latest
 persisted run), statuses exactly `PASS | FAIL | BLOCKED | NOT_RUN`, required
 `NOT_RUN` checks can never PASS a gate, warnings never upgrade a status,
-manual evidence is recorded as type `manual` only. Audit checks that cannot
-be machine-verified (look-ahead, survivorship, parameter stability) are
-manual-evidence checks with explicit prompts.
+manual evidence is recorded as type `manual` only. Audit conclusions that
+cannot be machine-verified (look-ahead, survivorship, substantive parameter
+stability) remain manual-evidence checks with explicit prompts. Q4 also has a
+machine check for chronological train/validation/test ranges, non-overlapping
+fold tests, explicit gap/embargo applicability, retained failed folds, and
+content-addressed parameter-stability evidence references.
 
 ## Quant tooling
 
@@ -86,6 +89,11 @@ manual-evidence checks with explicit prompts.
   automatically interpreted as a better strategy** (the report always
   carries the neutrality statement)
 - `/q-report latest|<run-id>` — manifest, gates, declared quant facts
+- `/q-promote research <candidate-id> <source-run-id>` — user-only VERIFY
+  promotion after one Candidate-bound full Gate run
+- `/q-promote release <candidate-id> <source-run-id> --artifact-run <run-id>
+  --authorize-release` — explicit user release authority with exact
+  source/build/input/artifact provenance; it never pushes or publishes
 - `/q-cache-validate <manifest-path>` — validate a quant cache contract
   manifest (data-snapshot / feature-set / backtest-result): schema
   version, immutable/mutable status, content hash, upstream keys, missing

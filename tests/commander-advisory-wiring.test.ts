@@ -19,7 +19,7 @@
  *     falls back to defaults without crashing
  *   - advisory-only continuation: a HIGH-band session never steers, never
  *     sends messages, never cancels/short-circuits message_end, and leaves
- *     the tool_call guard intact while preserving the exact 30-command
+ *     the tool_call guard intact while preserving the exact 31-command
  *     inventory, including R8's one observation-only status command (no
  *     enforcement path)
  */
@@ -682,7 +682,7 @@ test("q-cost-status with a HIGH band renders the complete cost section (no short
 
 // --------------------------------------------- advisory-only continuation proof
 
-test("advisory paths never enforce and preserve the exact 30-command surface including R8 observation-only status", async () => {
+test("advisory paths never enforce and preserve the exact 31-command surface including R8 observation-only status", async () => {
 	await withTempDir(async (dir) => {
 		const { stub, state } = makeRuntimeStub();
 		workbenchRuntime(stub);

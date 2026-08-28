@@ -27,6 +27,7 @@ import {
 import type { Gate, GateStatus } from "./gate-schema.ts";
 import { runStatusLabel } from "./format.ts";
 import { validateQuantResult, type QuantResultValidation } from "./quant-result.ts";
+import { parseGateCandidateBindingV1, type GateCandidateBindingV1 } from "./candidate-binding.ts";
 import { displayRelative } from "./recipe-runner.ts";
 import {
 	isValidRunId,
@@ -81,6 +82,7 @@ export interface GateFileRecord {
 	requested: string[];
 	profile: string | undefined;
 	mode: string;
+	candidate_binding?: GateCandidateBindingV1;
 	gates: GateRecordGate[];
 }
 
@@ -100,6 +102,7 @@ export interface GateRunSummary {
 	record_state: "AVAILABLE" | "UNAVAILABLE";
 	requested: string[];
 	profile: string | undefined;
+	candidate_identity: string | null;
 	counts: { pass: number; fail: number; blocked: number; not_run: number };
 	gates: { id: string; status: GateStatus; title: string; failure_reason: string | null; blocked_reason: string | null }[];
 	worst_gate: { id: string; status: GateStatus } | null;
@@ -209,6 +212,8 @@ function parseGateRecord(value: unknown, runId: string): GateFileRecord | undefi
 		|| typeof value.mode !== "string"
 	) return undefined;
 	const gates: GateRecordGate[] = [];
+	const candidateBinding = value.candidate_binding === undefined ? undefined : parseGateCandidateBindingV1(value.candidate_binding);
+	if (value.candidate_binding !== undefined && candidateBinding === null) return undefined;
 	for (const candidate of value.gates) {
 		const parsed = parseGate(candidate);
 		if (!parsed) return undefined;
@@ -220,6 +225,7 @@ function parseGateRecord(value: unknown, runId: string): GateFileRecord | undefi
 		requested: [...value.requested],
 		profile: value.profile,
 		mode: value.mode,
+		candidate_binding: candidateBinding ?? undefined,
 		gates,
 	};
 }
@@ -316,6 +322,7 @@ function summarizeGateRecord(record: GateFileRecord): GateRunSummary {
 		record_state: "AVAILABLE",
 		requested: record.requested,
 		profile: record.profile,
+		candidate_identity: record.candidate_binding?.candidate_identity ?? null,
 		counts,
 		gates: gates.map(({ checks: _checks, ...gate }) => gate),
 		worst_gate: worst,
@@ -330,6 +337,7 @@ function unavailableGateSummary(runId: string, reason: string): GateRunSummary {
 		record_state: "UNAVAILABLE",
 		requested: [],
 		profile: undefined,
+		candidate_identity: null,
 		counts: { pass: 0, fail: 0, blocked: 0, not_run: 0 },
 		gates: [],
 		worst_gate: { id: "record", status: "BLOCKED" },
@@ -654,7 +662,9 @@ function normalizedMaxBytes(value: unknown): number | undefined {
 }
 
 function runRows(record: GateFileRecord, include: GateReadInclude): string[] {
-	const rows: string[] = [];
+	const rows: string[] = record.candidate_binding === undefined
+		? []
+		: [`candidate ${record.candidate_binding.candidate_identity} source ${record.candidate_binding.candidate_source_run_id}`];
 	for (const gate of record.gates) {
 		const nonPass = gate.status !== "PASS";
 		if (include === "checks" || nonPass) {

@@ -97,7 +97,14 @@ export function makeValidQuantResult(overrides: Record<string, unknown> = {}): R
 		frequency: "daily",
 		universe: { name: "test universe", point_in_time: true },
 		data_range: { start: "2015-01-01", end: "2025-12-31" },
-		split: { method: "walk-forward", test: { start: "2023-01-01", end: "2025-12-31" } },
+		split: {
+			method: "walk-forward",
+			train: { start: "2015-01-01", end: "2017-12-31" },
+			validation: { start: "2018-01-01", end: "2018-12-31" },
+			test: { start: "2019-01-01", end: "2021-12-31" },
+			gap: { periods: 1, unit: "trading-day" },
+			embargo: { periods: 1, unit: "trading-day" },
+		},
 		benchmark: { name: "index", return: 0.08 },
 		costs: { fees_bps: 5, slippage_bps: 10 },
 		metrics: {
@@ -112,10 +119,13 @@ export function makeValidQuantResult(overrides: Record<string, unknown> = {}): R
 			return_post_cost: 0.12,
 		},
 		folds: [
-			{ id: "f1", status: "passed", period: { start: "2015-01-01", end: "2017-12-31" }, metrics: { return: 0.1, sharpe: 0.7 } },
-			{ id: "f2", status: "passed", period: { start: "2018-01-01", end: "2020-12-31" }, metrics: { return: 0.11, sharpe: 0.75 } },
-			{ id: "f3", status: "passed", period: { start: "2021-01-01", end: "2022-12-31" }, metrics: { return: 0.09, sharpe: 0.65 } },
+			{ id: "f1", status: "passed", period: { train: { start: "2015-01-01", end: "2015-12-31" }, validation: { start: "2016-01-01", end: "2016-06-30" }, test: { start: "2016-07-01", end: "2016-12-31" } }, metrics: { return: 0.1, sharpe: 0.7 } },
+			{ id: "f2", status: "passed", period: { train: { start: "2015-01-01", end: "2016-12-31" }, validation: { start: "2017-01-01", end: "2017-06-30" }, test: { start: "2017-07-01", end: "2017-12-31" } }, metrics: { return: 0.11, sharpe: 0.75 } },
+			{ id: "f3", status: "passed", period: { train: { start: "2015-01-01", end: "2017-12-31" }, validation: { start: "2018-01-01", end: "2018-06-30" }, test: { start: "2018-07-01", end: "2018-12-31" } }, metrics: { return: 0.09, sharpe: 0.65 } },
 		],
+		parameter_stability: {
+			references: [{ path: "results/parameter-stability.json", sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }],
+		},
 		parameters: { lookback: 20, top_n: 50, seed: 42 },
 		artifacts: ["results/quant-result.json"],
 		warnings: [],

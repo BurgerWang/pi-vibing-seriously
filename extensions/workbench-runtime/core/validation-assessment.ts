@@ -73,6 +73,7 @@ import type { Recipe } from "./recipe-schema.ts";
 import { latestRunAttemptForRecipe, readCommittedManifest, runDirFor, type RunRecord } from "./runs.ts";
 import { ARTIFACT_MANIFEST_FILE, validateCommittedArtifactsV2 } from "./artifact-contract.ts";
 import { RUN_COMMIT_FILE } from "./run-transaction.ts";
+import { gateCandidateSourceAuthorityV1 } from "./candidate-binding.ts";
 import {
 	buildGateValidationTarget,
 	buildRecipeValidationTarget,
@@ -414,21 +415,25 @@ async function assessRunValidationInner(input: AssessRunValidationInput): Promis
 		}
 
 		const prerequisiteIds = [...new Set(sourceFacts.gates.flatMap((g) => Object.keys(g.prerequisiteStatus)))];
+		const sourceAuthority = await currentArtifactSourceAuthority(
+			input.projectRoot,
+			config.profile,
+			input.mode,
+			input.exec,
+			config.gates,
+			config.recipes,
+			config.artifactExternalRoots,
+			sourceFacts.artifactSources,
+		);
+		if (sourceFacts.candidateBinding !== undefined) {
+			sourceAuthority.candidate = gateCandidateSourceAuthorityV1(sourceFacts.candidateBinding);
+		}
 		gateState = {
 			manualEvidence: sourceFacts.manualEvidence,
 			workerFirstFacts: input.workerFirstFacts,
 			actorFacts: input.actorFacts,
 			prerequisiteStatus: await currentPrerequisiteStatus(input.projectRoot, prerequisiteIds),
-			sourceAuthority: await currentArtifactSourceAuthority(
-				input.projectRoot,
-				config.profile,
-				input.mode,
-				input.exec,
-				config.gates,
-				config.recipes,
-				config.artifactExternalRoots,
-				sourceFacts.artifactSources,
-			),
+			sourceAuthority,
 		};
 	} else {
 		const sourceTarget = recipeTarget(binding);

@@ -220,6 +220,7 @@ const Q4_CHECKS = [
 	check("q4.4", "Market-stage coverage", "manual", { manual_prompt: "Evidence that results are reported across different market stages/regimes." }),
 	check("q4.5", "Cost sensitivity", "manual", { manual_prompt: "Evidence that results are robust to cost assumptions (sensitivity analysis)." }),
 	check("q4.6", "Failed folds reported", "manual", { manual_prompt: "Evidence that failed folds and out-of-sample underperformance are reported, not hidden." }),
+	check("q4.7", "Time-ordered research evidence", "schema", { json_file: RESULT, schema_name: "quant-research" }, "machine validation proves chronological train/validation/test folds, declared gap/embargo applicability, retained failures, and parameter-stability evidence references"),
 ];
 
 const Q5_CHECKS = [

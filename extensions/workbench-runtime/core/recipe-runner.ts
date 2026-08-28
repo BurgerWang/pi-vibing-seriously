@@ -46,7 +46,6 @@ import { loadProjectConfig, type ExecFn } from "./config.ts";
 import type { WorkbenchMode } from "./mode-policy.ts";
 import { realpathContained, lexicalContain } from "./path-guard.ts";
 import { buildArgv, RecipeParamError, VALIDATION_COMPONENTS, type Recipe } from "./recipe-schema.ts";
-import { WORKBENCH_RUNTIME_BUILD_IDENTITY } from "./runtime-build-identity.ts";
 import {
 	parseWorkerAllowedPaths,
 	parseWorkerTaskKindEnvironment,
@@ -69,7 +68,6 @@ import {
 	runDirFor,
 	RUN_MANIFEST_SCHEMA_VERSION_V2,
 	type RunRecord,
-	type RunRuntimeIdentityV1,
 	type RunSummaryRecord,
 } from "./runs.ts";
 import { EXTENSION_VERSION } from "../cache/cache-types.ts";
@@ -87,21 +85,25 @@ import {
 	type CacheRequestMode,
 } from "../cache/action-cache.ts";
 import type { ActionKey, ActionRecord } from "../cache/action-types.ts";
-import { canonicalHash } from "../cache/canonical-hash.ts";
 import {
 	captureRecipeValidationEvidence,
 	executedArgvHash,
 	ownerFromActorFacts,
 	unavailableEvidenceBlock,
-	validationEvidenceIdentity,
 	validationEvidenceSourceEligible,
 	type ValidationEvidenceBlock,
 } from "./validation-evidence.ts";
 import { assessRunValidation } from "./validation-assessment.ts";
 import {
 	collectRecipeArtifactsV2,
+	readArtifactManifestV2,
 	writeArtifactManifestV2,
 } from "./artifact-contract.ts";
+import {
+	currentRunRuntimeIdentityV1,
+	ordinaryCandidateProjectionFromRunV1,
+	runRuntimeIdentityIsCurrentV1,
+} from "./candidate-identity.ts";
 import { beginRunTransaction, commitRunTransaction } from "./run-transaction.ts";
 import { isWorkerPathAllowedRealpath } from "../worker/path-scope.ts";
 import {
@@ -172,6 +174,8 @@ export interface RunRecipeResult {
 		status: "VERIFIED";
 		candidateIdentity: string;
 		validationIdentity: string;
+		artifactManifestIdentity: string;
+		runtimeIdentityHash: string;
 		sourceRunId: string;
 		authorityScope: "DEVELOPMENT_ONLY";
 	};
@@ -213,44 +217,6 @@ function summaryMatchesCommittedRecordV1(summary: RunSummaryRecord, record: RunR
 		summary.command_effect_status === record.command_effect_status;
 }
 
-function ordinaryCandidateProjectionV1(record: RunRecord, validationIdentity: string): NonNullable<RunRecipeResult["ordinaryCandidate"]> {
-	const runtimeIdentity = record.runtime_identity!;
-	return {
-		schemaVersion: 1,
-		status: "VERIFIED",
-		candidateIdentity: canonicalHash({
-			schema_version: 1,
-			kind: "ordinary-development-candidate-v1",
-			validation_identity: validationIdentity,
-			runtime_identity: runtimeIdentity,
-		}),
-		validationIdentity,
-		sourceRunId: record.run_id,
-		authorityScope: "DEVELOPMENT_ONLY",
-	};
-}
-
-function currentRecipeRuntimeIdentityV1(): RunRuntimeIdentityV1 {
-	return {
-		schema_version: 1,
-		kind: "workbench-run-runtime-v1",
-		workbench_version: WORKBENCH_RUNTIME_BUILD_IDENTITY.version,
-		workbench_build: WORKBENCH_RUNTIME_BUILD_IDENTITY.build,
-		workbench_source_hash: WORKBENCH_RUNTIME_BUILD_IDENTITY.source_hash,
-		node_version: process.version,
-		platform: process.platform,
-		architecture: process.arch,
-	};
-}
-
-function runtimeIdentityIsCurrentV1(value: RunRecord["runtime_identity"]): value is RunRuntimeIdentityV1 {
-	const current = currentRecipeRuntimeIdentityV1();
-	return value !== undefined && value.schema_version === current.schema_version && value.kind === current.kind &&
-		value.workbench_version === current.workbench_version && value.workbench_build === current.workbench_build &&
-		value.workbench_source_hash === current.workbench_source_hash && value.node_version === current.node_version &&
-		value.platform === current.platform && value.architecture === current.architecture;
-}
-
 async function currentOrdinaryCandidateAfterRunV1(input: {
 	projectRoot: string;
 	mode: WorkbenchMode;
@@ -262,7 +228,7 @@ async function currentOrdinaryCandidateAfterRunV1(input: {
 }): Promise<RunRecipeResult["ordinaryCandidate"]> {
 	if (input.mode !== "DEV" || ownerFromActorFacts(input.actorFacts) !== "sol" ||
 		!isOrdinaryFinalVerificationRecipeV1(input.recipe) ||
-		!runtimeIdentityIsCurrentV1(input.record.runtime_identity)) return undefined;
+		!runRuntimeIdentityIsCurrentV1(input.record.runtime_identity)) return undefined;
 	const argvHash = executedArgvHash(input.argv);
 	if (!validationEvidenceSourceEligible(input.record.validation_evidence, {
 		recipe: input.recipe.name,
@@ -276,8 +242,8 @@ async function currentOrdinaryCandidateAfterRunV1(input: {
 		actorFacts: input.actorFacts,
 	});
 	if (assessment.status !== "REUSABLE") return undefined;
-	const validationIdentity = validationEvidenceIdentity(input.record.validation_evidence);
-	return validationIdentity === null ? undefined : ordinaryCandidateProjectionV1(input.record, validationIdentity);
+	const artifactManifest = await readArtifactManifestV2(runDirFor(input.projectRoot, input.record.run_id), input.record.run_id);
+	return artifactManifest === null ? undefined : ordinaryCandidateProjectionFromRunV1(input.record, artifactManifest);
 }
 
 async function reuseCurrentOrdinaryFinalVerificationV1(input: {
@@ -294,7 +260,7 @@ async function reuseCurrentOrdinaryFinalVerificationV1(input: {
 		!isOrdinaryFinalVerificationRecipeV1(input.recipe)) return undefined;
 	const latest = await latestRunAttemptForRecipe(input.projectRoot, input.recipe.name);
 	if (latest.state !== "FOUND") return undefined;
-	if (!runtimeIdentityIsCurrentV1(latest.manifest.runtime_identity)) return undefined;
+	if (!runRuntimeIdentityIsCurrentV1(latest.manifest.runtime_identity)) return undefined;
 	const argvHash = executedArgvHash(input.argv);
 	if (!validationEvidenceSourceEligible(latest.manifest.validation_evidence, {
 		recipe: input.recipe.name,
@@ -310,8 +276,11 @@ async function reuseCurrentOrdinaryFinalVerificationV1(input: {
 	if (assessment.status !== "REUSABLE") return undefined;
 	const summary = await readSummary(input.projectRoot, latest.run_id);
 	const committed = summary === null ? null : await readCommittedManifest(input.projectRoot, latest.run_id);
-	const validationIdentity = committed === null ? null : validationEvidenceIdentity(committed.validation_evidence);
-	if (summary === null || committed === null || validationIdentity === null ||
+	const artifactManifest = committed === null ? null : await readArtifactManifestV2(runDirFor(input.projectRoot, latest.run_id), latest.run_id);
+	const ordinaryCandidate = committed === null || artifactManifest === null
+		? undefined
+		: ordinaryCandidateProjectionFromRunV1(committed, artifactManifest);
+	if (summary === null || committed === null || ordinaryCandidate === undefined ||
 		!summaryMatchesCommittedRecordV1(summary, committed) ||
 		!validationEvidenceSourceEligible(committed.validation_evidence, {
 			recipe: input.recipe.name,
@@ -336,10 +305,10 @@ async function reuseCurrentOrdinaryFinalVerificationV1(input: {
 		validationReuse: {
 			status: "REUSED_CURRENT_CANDIDATE",
 			sourceRunId: latest.run_id,
-			validationIdentity,
+			validationIdentity: ordinaryCandidate.validationIdentity,
 			executionSkipped: true,
 		},
-		ordinaryCandidate: ordinaryCandidateProjectionV1(committed, validationIdentity),
+		ordinaryCandidate,
 	};
 }
 
@@ -606,7 +575,7 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 				now,
 				authorizedExternalRoots: config.artifactExternalRoots,
 				exec,
-				runtimeIdentity: currentRecipeRuntimeIdentityV1(),
+				runtimeIdentity: currentRunRuntimeIdentityV1(),
 			});
 			return { materialized, record: outcome.record };
 		} catch {
@@ -792,7 +761,7 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 			environment_names: recipe.environment,
 			validation_components: recipe.validation_components,
 			cache_request_mode: cacheMode,
-			runtime_identity: currentRecipeRuntimeIdentityV1(),
+			runtime_identity: currentRunRuntimeIdentityV1(),
 			argv_hash: executedArgvHashValue,
 			run_transaction_schema_version: 2,
 			// The subprocess did not start. The existing closed manifest schema
@@ -957,7 +926,7 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		environment_names: recipe.environment,
 		validation_components: recipe.validation_components,
 		cache_request_mode: cacheMode,
-		runtime_identity: currentRecipeRuntimeIdentityV1(),
+		runtime_identity: currentRunRuntimeIdentityV1(),
 		execution_source: "exec",
 		argv_hash: executedArgvHashValue,
 		run_transaction_schema_version: 2,

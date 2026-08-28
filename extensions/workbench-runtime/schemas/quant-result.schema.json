@@ -49,9 +49,11 @@
 			"required": ["method"],
 			"properties": {
 				"method": { "enum": ["walk-forward", "train/validation/test", "time-series", "custom"] },
-				"train": { "type": "object" },
-				"validation": { "type": "object" },
-				"test": { "type": "object" },
+				"train": { "$ref": "#/$defs/timeRange" },
+				"validation": { "$ref": "#/$defs/timeRange" },
+				"test": { "$ref": "#/$defs/timeRange" },
+				"gap": { "$ref": "#/$defs/leakageControl" },
+				"embargo": { "$ref": "#/$defs/leakageControl" },
 				"walk_forward": { "type": "object" }
 			}
 		},
@@ -83,7 +85,14 @@
 				"properties": {
 					"id": { "type": "string", "minLength": 1 },
 					"status": { "enum": ["passed", "failed", "skipped", "pending"] },
-					"period": { "type": "object" },
+					"period": {
+						"type": "object",
+						"properties": {
+							"train": { "$ref": "#/$defs/timeRange" },
+							"validation": { "$ref": "#/$defs/timeRange" },
+							"test": { "$ref": "#/$defs/timeRange" }
+						}
+					},
 					"parameters": { "type": "object" },
 					"metrics": { "type": "object" }
 				}
@@ -92,6 +101,23 @@
 		"parameters": {
 			"type": "object",
 			"description": "Declared search space / parameter values. All numbers must be finite."
+		},
+		"parameter_stability": {
+			"type": "object",
+			"properties": {
+				"references": {
+					"type": "array",
+					"minItems": 1,
+					"items": {
+						"type": "object",
+						"required": ["path", "sha256"],
+						"properties": {
+							"path": { "type": "string", "minLength": 1 },
+							"sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+						}
+					}
+				}
+			}
 		},
 		"artifacts": {
 			"type": "array",
@@ -135,6 +161,29 @@
 				"method": { "type": "string" },
 				"max_position": { "type": "number" }
 			}
+		}
+	},
+	"$defs": {
+		"timeRange": {
+			"type": "object",
+			"required": ["start", "end"],
+			"properties": {
+				"start": { "type": "string", "minLength": 1 },
+				"end": { "type": "string", "minLength": 1 }
+			}
+		},
+		"leakageControl": {
+			"oneOf": [
+				{ "type": "null" },
+				{
+					"type": "object",
+					"required": ["periods", "unit"],
+					"properties": {
+						"periods": { "type": "integer", "minimum": 0 },
+						"unit": { "type": "string", "minLength": 1 }
+					}
+				}
+			]
 		}
 	}
 }

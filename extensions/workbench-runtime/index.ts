@@ -184,6 +184,7 @@ import {
 } from "./core/command-output.ts";
 import { registerRunCommands } from "./core/run-commands.ts";
 import { gateParentSummaryLines, registerGateCommands } from "./core/gate-commands.ts";
+import { registerPromotionCommandV1 } from "./core/promotion-command.ts";
 import { registerInitCommand } from "./core/init-command.ts";
 import { registerCacheCommands } from "./core/cache-commands.ts";
 import { registerStatusCommands, registerWidgetCommand } from "./core/status-commands.ts";
@@ -1871,6 +1872,28 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	// ------------------------------------------------------------ /q-gate
 
 	registerGateCommands({
+		pi,
+		getMode: () => mode,
+		getDelegationState: delegationSession.getState,
+		getActorFacts: () => ({
+			role: workerRoleContext.role,
+			provider: currentModelFacts.provider,
+			model: currentModelFacts.model,
+		}),
+		getProjectAuthorityBlockReason: delegationSession.projectAuthorityBlockReason,
+		reconcileProjectAuthority: delegationSession.reconcileProjectAuthority,
+		buildWorkerFirstFacts: buildWorkerFirstGateFacts,
+		exec: execFn,
+		trustedOrError: (ctx) => trustedMutationOrError(ctx, "workbench_run_gate"),
+		projectRootFor,
+		output,
+		refreshStatus,
+		refreshWidget,
+	});
+
+	// --------------------------------------------------------- /q-promote
+
+	registerPromotionCommandV1({
 		pi,
 		getMode: () => mode,
 		getDelegationState: delegationSession.getState,

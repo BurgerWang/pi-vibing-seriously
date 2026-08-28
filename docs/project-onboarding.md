@@ -176,6 +176,7 @@ verification.
 | Gates | `/q-gate`, `/q-gates`, `/q-gate-show <gate-id>`, `/q-evidence <run-id>` |
 | Reports | `/q-report latest\|<run-id>` |
 | Compare runs | `/q-compare <a> <b>`, `workbench_compare_runs` |
+| Promote Candidate | `/q-promote research <candidate-id> <source-run-id>`; release additionally requires `--artifact-run <run-id> --authorize-release` |
 | Widget | `/q-widget on\|off` (auto-shows during tasks and gate failures) |
 
 ## 6. Modes

@@ -258,6 +258,9 @@ The benchmark figures are arithmetic facts for the frozen 20-control /
 /q-run <recipe> [key=value]       run a declared recipe
 /q-runs                           list durable runs
 /q-gate base                      run the base validation ladder
+/q-promote research <id> <run>    freeze and Gate one Candidate for research acceptance
+/q-promote release <id> <run> --artifact-run <run> --authorize-release
+                                  explicitly authorize a provenance-bound release Candidate
 /q-delegation-status              inspect delegation/review recovery state
 /q-runtime-doctor                 compare loaded and on-disk runtime fingerprints
 /q-review <delegation-id>         directly resume one durable Sol semantic review
@@ -269,6 +272,12 @@ The benchmark figures are arithmetic facts for the frozen 20-control /
 `/q-review` is reserved for the deterministic durable-review command. The
 former read-only code-review prompt is `/q-code-review [scope]`; the old prompt
 name has no alias so a review request cannot accidentally start a model turn.
+
+`/q-promote` is user-only and requires VERIFY mode. It never pushes or
+publishes. A failed Gate withholds promotion but leaves DEV available for a
+new Candidate; release promotion additionally binds the exact source, recipe,
+runtime, resolved inputs, and artifact hashes. Neither promotion nor run
+comparison grants profitability or “better strategy” authority.
 
 ## Security boundary
 

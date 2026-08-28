@@ -487,6 +487,15 @@ export async function compareRuns(
 	let gateDelta: RunComparison["generic"]["gate_delta"] = null;
 	let testCounts: RunComparison["generic"]["test_counts"] = null;
 	if (kindA === "gate" && kindB === "gate") {
+		const candidateA = a.candidate_binding?.candidate_identity;
+		const candidateB = b.candidate_binding?.candidate_identity;
+		if (candidateA && candidateB) {
+			notes.push(candidateA === candidateB
+				? `both Gate runs bind the same frozen Candidate ${candidateA}`
+				: `Gate runs bind different frozen Candidates (${candidateA} -> ${candidateB}); metric deltas remain descriptive only`);
+		} else if (candidateA || candidateB) {
+			notes.push("Candidate binding is present on only one Gate run; strict-lane authority is not comparable");
+		}
 		const recordA = await readGateRecordBounded(projectRoot, a.run_id, options.artifactIoHooks);
 		const recordB = await readGateRecordBounded(projectRoot, b.run_id, options.artifactIoHooks);
 		if (recordA.ok && recordB.ok) {

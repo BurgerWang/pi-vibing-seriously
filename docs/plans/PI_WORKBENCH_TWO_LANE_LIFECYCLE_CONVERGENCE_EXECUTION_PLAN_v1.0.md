@@ -4,7 +4,7 @@
 | --- | --- |
 | Plan ID | `pi-workbench-two-lane-lifecycle-convergence-v1` |
 | 版本 | `1.0` |
-| 状态 | **APPROVED / READY_FOR_IMPLEMENTATION** |
+| 状态 | **IN_PROGRESS — WP0–WP5 源码与自动化测试已推进；WP6 NEXT** |
 | 批准日期 | `2026-08-28` |
 | 执行仓库 | `/home/hanbaoji/Projects/pi-vibing-seriously` |
 | 基线 HEAD | `main@d003fdf` |
@@ -529,6 +529,29 @@ resolver 将其与 committed generation、review、lock、binding 和 lineage �
 ---
 
 ## 9. 工作包与执行顺序
+
+### 9.1 当前推进快照（2026-08-28）
+
+下表记录仓库开发进度，不替代运行中的 Pi runtime identity、真实 Candidate Gate、
+外部项目 canary 或发布授权：
+
+| 工作包 | 当前源码推进状态 | 当前证据 |
+| --- | --- | --- |
+| WP0 | 已收束并提交 | `3fce7db`，原 29 个 tracked 修改独立收束 |
+| WP1 | 已实现并提交 | `5c3bb7b`，三项目脱敏 fixtures 与 replay tests |
+| WP2 | 已实现并提交 | `5552222`，canonical lifecycle resolver 与矩阵测试 |
+| WP3 | 已分阶段实现并提交 | `513d9b7` 至 `357f84b`，统一 effect/review/status/continuation 收敛 |
+| WP4 | 已实现、测试并提交 | `7391000`，普通开发通道与回归测试 |
+| WP5 | 源码与自动化测试完成，纳入本次提交 | Candidate identity/version/alias、Candidate-bound Gates、research/release promotion、Q4 机验、release provenance、report/compare |
+| WP6 | `NOT_STARTED` | 下一工作包：模型化、并发与故障注入测试 |
+| WP7 | `NOT_STARTED` | 等待 WP6 证据 |
+| WP8 | `NOT_STARTED` | 等待 WP6–WP7；三项目部署与最终出口尚未执行 |
+
+WP5 当前验证证据为 `npm run typecheck` PASS、`npm test` PASS、相关 focused tests
+PASS 和 `git diff --check` PASS。该结果只证明当前源码候选及自动化测试通过；真实
+Candidate 的 research/release promotion、运行中的 Pi reload/runtime identity、三个外部
+项目 canary、release 授权、push 和 publish 均为 `NOT_RUN`。因此本计划仍为
+`IN_PROGRESS`，不得标记 `COMPLETE`；下一执行入口是 WP6。
 
 ### WP0 — 收束现有恢复候选
 

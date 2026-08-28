@@ -34,6 +34,7 @@ import type { ValidationComponent } from "./recipe-schema.ts";
 import type { ValidationEvidenceBlock } from "./validation-evidence.ts";
 import type { CacheRequestMode } from "../cache/action-types.ts";
 import type { CommandEffectStatus } from "./command-effect.ts";
+import { parseGateCandidateBindingV1, type GateCandidateBindingV1 } from "./candidate-binding.ts";
 
 /** Frozen legacy manifest version. Existing v1 records remain read-only. */
 export const RUN_SCHEMA_VERSION = 1;
@@ -118,6 +119,8 @@ export interface RunRecord {
 	cache_validated_at?: string;
 	/** WP4 runtime/toolchain identity required for ordinary Candidate reuse. */
 	runtime_identity?: RunRuntimeIdentityV1;
+	/** WP5 frozen Candidate identity required for strict Gate/promotion authority. */
+	candidate_binding?: GateCandidateBindingV1;
 	/** P6-C: artifact restore/verification facts of a cached run. */
 	artifact_validation?: {
 		mode: string;
@@ -263,6 +266,7 @@ export function parseCommittedRunManifestV2(value: unknown, runId: string): RunR
 	if (!(value.cache_created_at === undefined || finiteIso(value.cache_created_at))) return null;
 	if (!(value.cache_validated_at === undefined || finiteIso(value.cache_validated_at))) return null;
 	if (!(value.runtime_identity === undefined || validRunRuntimeIdentityV1(value.runtime_identity))) return null;
+	if (!(value.candidate_binding === undefined || parseGateCandidateBindingV1(value.candidate_binding) !== null)) return null;
 	if (!(value.evidence_paths === undefined || boundedStringArray(value.evidence_paths, 10_000, 4_096))) return null;
 	if (!(value.artifact_manifest_path === undefined || value.artifact_manifest_path === "artifact-manifest.json")) return null;
 	if (!(value.validation_evidence === undefined || plainRecord(value.validation_evidence))) return null;

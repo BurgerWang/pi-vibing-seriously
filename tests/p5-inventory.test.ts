@@ -45,6 +45,8 @@ export const EXPECTED_COMMANDS = [
 	"q-evidence",
 	"q-report",
 	"q-compare",
+	// WP5: explicit user-only Candidate research/release promotion.
+	"q-promote",
 	"q-widget",
 	// P6-A cache telemetry commands.
 	"q-cache-status",
@@ -174,12 +176,12 @@ test("extension registers the lifecycle events it relies on", () => {
 	}
 });
 
-test("the P7 lease commands and the P5 milestone handoff are user-only — never registered as model tools", () => {
+test("lease, milestone, and Candidate-promotion commands are user-only — never registered as model tools", () => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
 	const commands = stub.commands as Map<string, unknown>;
 	const tools = stub.tools as Map<string, unknown>;
-	for (const name of ["q-write-policy", "q-commander-write-unlock", "q-commander-write-lock", "q-milestone-handoff"]) {
+	for (const name of ["q-write-policy", "q-commander-write-unlock", "q-commander-write-lock", "q-milestone-handoff", "q-promote"]) {
 		assert.ok(commands.has(name), `${name} must be registered as a command`);
 		assert.ok(!tools.has(name), `${name} must NOT be registered as a model tool`);
 	}

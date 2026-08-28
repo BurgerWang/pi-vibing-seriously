@@ -297,3 +297,109 @@ export function validateQuantResult(value: unknown, options?: { profile?: string
 	v.valid = v.errors.length === 0;
 	return v;
 }
+
+type TimeRange = { start: number; end: number };
+
+function strictTimeRange(v: QuantResultValidation, value: unknown, path: string): TimeRange | null {
+	if (!isRecord(value) || typeof value.start !== "string" || typeof value.end !== "string") {
+		addError(v, `${path} must be an object with string start/end timestamps`);
+		return null;
+	}
+	const start = Date.parse(value.start);
+	const end = Date.parse(value.end);
+	if (!Number.isFinite(start) || !Number.isFinite(end) || start >= end) {
+		addError(v, `${path} must have parseable start < end timestamps`);
+		return null;
+	}
+	v.checked.push(`${path}.start`, `${path}.end`);
+	return { start, end };
+}
+
+function strictLeakageControl(v: QuantResultValidation, value: unknown, path: string): void {
+	if (value === null) {
+		v.checked.push(path);
+		return;
+	}
+	if (!isRecord(value) || typeof value.periods !== "number" || !Number.isSafeInteger(value.periods) || value.periods < 0 ||
+		typeof value.unit !== "string" || value.unit.trim().length === 0) {
+		addError(v, `${path} must be null (not applicable) or { periods: non-negative integer, unit: non-empty string }`);
+		return;
+	}
+	v.checked.push(`${path}.periods`, `${path}.unit`);
+}
+
+/**
+ * WP5 Q4 machine contract. It builds on the base result contract, then proves
+ * explicit chronological train/validation/test ordering for the overall split
+ * and every retained fold, ordered non-overlapping fold tests, declared
+ * gap/embargo applicability, and content-addressed parameter-stability refs.
+ */
+export function validateQuantResearchEvidence(value: unknown, options?: { profile?: string }): QuantResultValidation {
+	const v = validateQuantResult(value, options);
+	if (!isRecord(value)) return v;
+	const split = value.split;
+	if (!isRecord(split)) {
+		v.valid = false;
+		return v;
+	}
+	const train = strictTimeRange(v, split.train, "split.train");
+	const validation = split.validation === undefined ? null : strictTimeRange(v, split.validation, "split.validation");
+	const test = strictTimeRange(v, split.test, "split.test");
+	if (train && test) {
+		if (validation) {
+			if (train.end >= validation.start || validation.end >= test.start) addError(v, "split chronology must be train < validation < test with no overlap");
+		} else if (train.end >= test.start) {
+			addError(v, "split chronology must be train < test with no overlap");
+		}
+	}
+	if (!("gap" in split)) addError(v, "split.gap must explicitly declare a control or null when not applicable");
+	else strictLeakageControl(v, split.gap, "split.gap");
+	if (!("embargo" in split)) addError(v, "split.embargo must explicitly declare a control or null when not applicable");
+	else strictLeakageControl(v, split.embargo, "split.embargo");
+
+	let previousTestEnd: number | undefined;
+	if (Array.isArray(value.folds)) {
+		if (value.folds.length < 2) addError(v, "folds must contain at least two time-ordered out-of-sample folds");
+		value.folds.forEach((fold, index) => {
+			if (!isRecord(fold)) return;
+			const path = `folds[${index}].period`;
+			if (!isRecord(fold.period)) {
+				addError(v, `${path} must bind train/test time ranges`);
+				return;
+			}
+			const foldTrain = strictTimeRange(v, fold.period.train, `${path}.train`);
+			const foldValidation = fold.period.validation === undefined ? null : strictTimeRange(v, fold.period.validation, `${path}.validation`);
+			const foldTest = strictTimeRange(v, fold.period.test, `${path}.test`);
+			if (foldTrain && foldTest) {
+				if (foldValidation) {
+					if (foldTrain.end >= foldValidation.start || foldValidation.end >= foldTest.start) addError(v, `${path} chronology must be train < validation < test with no overlap`);
+				} else if (foldTrain.end >= foldTest.start) {
+					addError(v, `${path} chronology must be train < test with no overlap`);
+				}
+			}
+			if (foldTest) {
+				if (previousTestEnd !== undefined && previousTestEnd >= foldTest.start) addError(v, `${path}.test must follow the prior fold test without overlap`);
+				previousTestEnd = foldTest.end;
+			}
+		});
+	}
+
+	const stability = value.parameter_stability;
+	if (!isRecord(stability) || !Array.isArray(stability.references) || stability.references.length === 0) {
+		addError(v, "parameter_stability.references must be a non-empty array of content-addressed evidence refs");
+	} else {
+		for (let index = 0; index < stability.references.length; index += 1) {
+			const reference = stability.references[index];
+			const path = `parameter_stability.references[${index}]`;
+			if (!isRecord(reference) || typeof reference.path !== "string" || reference.path.length === 0 ||
+				reference.path.startsWith("/") || reference.path.split("/").includes("..") ||
+				typeof reference.sha256 !== "string" || !/^[0-9a-f]{64}$/u.test(reference.sha256)) {
+				addError(v, `${path} must contain a safe project-relative path and 64-hex sha256`);
+			} else {
+				v.checked.push(`${path}.path`, `${path}.sha256`);
+			}
+		}
+	}
+	v.valid = v.errors.length === 0;
+	return v;
+}
