@@ -20,7 +20,10 @@ import {
 	executeDelegationV2,
 	type ExecuteDelegationV2Input,
 } from "../extensions/workbench-runtime/core/delegation-execution-v2.ts";
-import { reviewDelegationV2 } from "../extensions/workbench-runtime/core/delegation-review-v2.ts";
+import {
+	committedStructuredReviewAuthorityV2,
+	reviewDelegationV2,
+} from "../extensions/workbench-runtime/core/delegation-review-v2.ts";
 import {
 	abortPristinePreparedDelegationUnderStartLockV2,
 	RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2,
@@ -39,15 +42,25 @@ import {
 } from "../extensions/workbench-runtime/core/delegation-ledger.ts";
 import {
 	createNodeDelegationTransactionStorageAdapter,
+	isDelegationTerminalNegativeReviewEligibleFromCommittedV1,
 	isDelegationTerminalNegativeReviewEligibleV1,
 	readDelegationCommittedGenerationV2,
+	readDelegationReviewV2,
+	readDelegationTerminalNegativeSolAuthorityV1,
 	readDelegationTransactionV2,
 } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
 import {
 	closeInactiveProjectDelegationBlockerV2,
+	collectCurrentDelegationBindingV2,
 	readProjectDelegationBlockerV2,
+	readProjectDelegationRepairClosureV1,
 	readRecoverableUnpublishedDelegationV2,
 } from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
+import { recoverExactRepairCommandAuthorityV1 } from "../extensions/workbench-runtime/core/exact-repair-authority.ts";
+import {
+	collectStructuredReviewPresentationV1,
+	COMPACT_MIN_BYTES,
+} from "../extensions/workbench-runtime/core/diff-review.ts";
 import { readWorkerRepairCapsule } from "../extensions/workbench-runtime/core/worker-repair-authority.ts";
 import { SEMANTIC_REVIEW_ENVELOPE_MAX_STREAM_BYTES_V1 } from "../extensions/workbench-runtime/core/semantic-review-envelope.ts";
 import {
@@ -266,6 +279,8 @@ async function commitCleanWorkerRecipe(
 		startedAt: string;
 		finishedAt: string;
 		outcome: "SUCCESS" | "PROCESS_FAILED";
+		mutate?: () => Promise<void>;
+		expectedEffectStatus?: "CLEAN" | "RECIPE_DECLARATION_VIOLATION";
 	},
 ): Promise<void> {
 	const started = await beginRecipeCommandEffectCapture({
@@ -273,6 +288,7 @@ async function commitCleanWorkerRecipe(
 		exec: realExec,
 		declared_writes: [],
 	});
+	await options.mutate?.();
 	const effect = await completeRecipeCommandEffectCapture({
 		project_root: projectRoot,
 		exec: realExec,
@@ -285,7 +301,7 @@ async function commitCleanWorkerRecipe(
 		mutation_declaration: "none",
 		declared_writes: [],
 	});
-	assert.equal(effect.status, "CLEAN");
+	assert.equal(effect.status, options.expectedEffectStatus ?? "CLEAN");
 	const transaction = await beginRunTransaction(projectRoot, options.runId);
 	const manifest = {
 		schema_version: 2,
@@ -483,6 +499,200 @@ test("execution v2: a failed CLEAN recipe fails the worker without inventing wor
 	assert.equal(scope.command_provenance.effective_status, "ATTRIBUTED");
 	assert.deepEqual(scope.command_provenance.remaining_workspace_drift, []);
 	assert.deepEqual(scope.command_provenance.terminal_reasons, ["COMMAND_EFFECT_RUN_FAILED"]);
+});
+
+test("execution v2: a historical undeclared recipe mutation is REPAIR-only and carries every unsafe path", async (t) => {
+	const projectRoot = await root(t);
+	const delegationId = id(54);
+	const workerPath = "src/historical-command-drift.ts";
+	const unsafeCommandPath = "generated/undeclared-output.json";
+	const bound = bindDelegationBoundedTaskContractV2({
+		task_kind: "implementation",
+		task: "Repair one exact historical worker path.",
+		allowed_paths: [workerPath],
+		acceptance_criteria: ["The worker path and every historical unsafe dependency receive explicit review."],
+		verification: ["recipe:focused-check"],
+		timeout_seconds: 600,
+		budget_profile: "standard",
+	});
+	assert.equal(bound.ok, true, bound.ok ? "" : bound.error.code);
+	if (!bound.ok) return;
+	const report = completeReport([workerPath]);
+	const executionInput = await input(
+		projectRoot,
+		delegationId,
+		"implementation",
+		after([workerPath]),
+		worker(report),
+		{ contract: bound.value },
+	);
+	executionInput.runWorker = async () => {
+		const result = await journalWorker(
+			projectRoot,
+			delegationId,
+			executionInput.contract.contract_hash,
+			[workerPath],
+			worker(report),
+		);
+		await commitCleanWorkerRecipe(projectRoot, delegationId, executionInput.contract.contract_hash, {
+			runId: "20260827-185443-tf04",
+			recipe: "focused-check",
+			startedAt: "2026-08-27T11:54:43.000Z",
+			finishedAt: "2026-08-27T11:54:43.100Z",
+			outcome: "PROCESS_FAILED",
+			expectedEffectStatus: "RECIPE_DECLARATION_VIOLATION",
+			mutate: async () => {
+				await mkdir(dirname(join(projectRoot, unsafeCommandPath)), { recursive: true });
+				await writeFile(join(projectRoot, unsafeCommandPath), JSON.stringify({
+					unexpected: true,
+					payload: "x".repeat(COMPACT_MIN_BYTES),
+				}) + "\n", "utf8");
+			},
+		});
+		return result;
+	};
+	const result = await executeDelegationV2(executionInput);
+	assert.equal(result.ok, false);
+	if (result.ok) return;
+	assert.equal(result.durable_state?.status, "FAILED");
+	assert.equal(result.durable_state?.terminal_outcome?.change_set_status, "WORKSPACE_DRIFT");
+	assert.deepEqual(result.durable_state?.terminal_outcome?.changed_paths, [workerPath]);
+
+	const committed = await readDelegationCommittedGenerationV2(projectRoot, delegationId);
+	assert.equal(committed.ok, true, committed.ok ? "" : committed.error.code);
+	if (!committed.ok) return;
+	assert.equal(isDelegationTerminalNegativeReviewEligibleV1(committed.value.state), false);
+	assert.equal(isDelegationTerminalNegativeReviewEligibleFromCommittedV1(
+		committed.value.state,
+		committed.value.records,
+	), true, "a complete negative generation opens REPAIR-only recovery");
+	const scope = committed.value.records["scope.json"] as Record<string, any>;
+	assert.deepEqual(scope.command_provenance.terminal_reasons, [
+		"RECIPE_DECLARATION_VIOLATION",
+		"COMMAND_EFFECT_RUN_FAILED",
+	]);
+	assert.deepEqual(scope.command_provenance.remaining_workspace_drift.map((entry: { path: string }) => entry.path), [
+		unsafeCommandPath,
+	]);
+
+	const presented = await reviewDelegationV2({
+		projectRoot,
+		delegationId,
+		exec: realExec,
+		now: "2026-08-28T01:00:00.000Z",
+	});
+	assert.equal(presented.ok, true, presented.ok ? "" : JSON.stringify(presented.error));
+	if (!presented.ok || presented.review.record === undefined) return;
+	assert.deepEqual(presented.review.record.checked_paths, [workerPath],
+		"the provisional negative review does not accept the unsafe command path");
+	const repaired = await reviewDelegationV2({
+		projectRoot,
+		delegationId,
+		exec: realExec,
+		now: "2026-08-28T01:00:01.000Z",
+		semanticDecision: "REPAIR",
+		expectedBoundDiffHash: presented.review.record.bound_diff_hash,
+		repairReason: "Repair the worker result and preserve every unsafe historical command path for final successor review.",
+		reviewer: { provider: "openai", model: "gpt-5.6-sol" },
+	});
+	assert.equal(repaired.ok, true, repaired.ok ? "" : JSON.stringify(repaired.error));
+	if (!repaired.ok) return;
+	const terminal = await readDelegationTerminalNegativeSolAuthorityV1(projectRoot, delegationId);
+	assert.equal(terminal.ok, true, terminal.ok ? "" : terminal.error.code);
+	if (!terminal.ok) return;
+	const binding = await collectCurrentDelegationBindingV2(projectRoot, delegationId, realExec);
+	assert.equal(binding.status, "fresh");
+	if (binding.status !== "fresh") return;
+	const authority = recoverExactRepairCommandAuthorityV1({
+		repairOf: delegationId,
+		committed: committed.value,
+		terminalNegativeRepair: terminal.value,
+		currentBindingHash: binding.hash,
+	});
+	assert.equal(authority.ok, true, authority.ok ? "" : authority.code);
+	if (!authority.ok) return;
+	assert.deepEqual(authority.value.arguments.allowed_paths, [workerPath], "successor write authority stays exact");
+	assert.deepEqual(authority.value.successor_lineage.carried_paths, [unsafeCommandPath, workerPath],
+		"unsafe command drift is review-carried instead of silently discarded");
+
+	const successorId = id(55);
+	const successorContract = bindDelegationBoundedTaskContractV2(authority.value.arguments);
+	assert.equal(successorContract.ok, true, successorContract.ok ? "" : successorContract.error.code);
+	if (!successorContract.ok) return;
+	let successorSecond = 2;
+	const successor = await executeDelegationV2(await input(
+		projectRoot,
+		successorId,
+		"implementation",
+		after([]),
+		worker(completeReport([])),
+		{
+			contract: successorContract.value,
+			dependencyPaths: authority.value.successor_lineage.carried_paths,
+			repairLineage: authority.value.successor_lineage,
+			clock: () => `2026-08-28T01:01:${String(successorSecond++).padStart(2, "0")}.000Z`,
+		},
+	));
+	assert.equal(successor.ok, true, successor.ok ? "" : JSON.stringify(successor));
+	if (!successor.ok) return;
+	assert.equal(successor.status, "PENDING_REVIEW");
+	assert.deepEqual(successor.durable_state.terminal_outcome?.changed_paths, []);
+	const successorPresented = await reviewDelegationV2({
+		projectRoot,
+		delegationId: successorId,
+		exec: realExec,
+		now: "2026-08-28T01:02:00.000Z",
+	});
+	assert.equal(successorPresented.ok, true, successorPresented.ok ? "" : JSON.stringify(successorPresented.error));
+	if (!successorPresented.ok || successorPresented.review.record === undefined) return;
+	assert.equal(successorPresented.review.record.presentation_complete, true);
+	assert.deepEqual(successorPresented.review.record.checked_paths, [unsafeCommandPath, workerPath],
+		"final review explicitly presents the inherited unsafe path before it can close the lineage");
+	const inheritedCompact = successorPresented.review.record.patch.find((entry) => entry.path === unsafeCommandPath);
+	assert.equal(inheritedCompact?.source, "compact");
+	assert.equal(inheritedCompact?.truncated, true, "bounded compact previews remain honestly marked truncated");
+	assert.equal(inheritedCompact?.compact?.digest_matches_after, true,
+		"the carried compact packet binds the current relevance-projection digest");
+	const compactProgress = successorPresented.review.record.presentation_progress?.find((item) => item.path === unsafeCommandPath);
+	assert.equal(compactProgress?.source, "compact");
+	assert.equal(compactProgress?.next_byte, compactProgress?.total_bytes,
+		"the one-page compact fact stream is complete and never enters an impossible pagination loop");
+	const successorCommitted = await readDelegationCommittedGenerationV2(projectRoot, successorId);
+	const successorReview = await readDelegationReviewV2(projectRoot, successorId);
+	assert.equal(successorCommitted.ok, true, successorCommitted.ok ? "" : successorCommitted.error.code);
+	assert.equal(successorReview.ok, true, successorReview.ok ? "" : successorReview.error.code);
+	if (!successorCommitted.ok || !successorReview.ok) return;
+	const structuredAuthority = committedStructuredReviewAuthorityV2(successorCommitted.value, successorReview.value);
+	assert.equal(structuredAuthority.ok, true, structuredAuthority.ok ? "" : structuredAuthority.code);
+	if (!structuredAuthority.ok) return;
+	const structuredPresentation = await collectStructuredReviewPresentationV1({
+		projectRoot,
+		authority: structuredAuthority.value.authority,
+		exec: realExec,
+	});
+	assert.equal(structuredPresentation.ok, true, structuredPresentation.ok ? "" : structuredPresentation.code);
+	if (!structuredPresentation.ok) return;
+	assert.equal(structuredPresentation.value.pages.filter((page) => page.path === unsafeCommandPath).length, 1,
+		"committed structured review reproduces the compact stream as one immutable page");
+	const accepted = await reviewDelegationV2({
+		projectRoot,
+		delegationId: successorId,
+		exec: realExec,
+		now: "2026-08-28T01:02:01.000Z",
+		semanticDecision: "ACCEPT",
+		expectedBoundDiffHash: successorPresented.review.record.bound_diff_hash,
+		reviewer: { provider: "openai", model: "gpt-5.6-sol" },
+	});
+	assert.equal(accepted.ok, true, accepted.ok ? "" : JSON.stringify(accepted.error));
+	if (!accepted.ok) return;
+	assert.equal(accepted.transaction.status, "REVIEWED");
+	assert.deepEqual(await readProjectDelegationRepairClosureV1(projectRoot), {
+		ok: true,
+		unresolvedTipId: null,
+		rootCount: 1,
+		lineageCount: 1,
+	});
+	assert.deepEqual(await readProjectDelegationBlockerV2(projectRoot), { ok: true, value: null });
 });
 
 test("execution v2: the same recipe's final SUCCESS closes its earlier CLEAN process failure", async (t) => {

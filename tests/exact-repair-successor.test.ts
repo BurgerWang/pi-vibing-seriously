@@ -20,7 +20,10 @@ import type {
 	ExactRepairCommandAuthorityV1,
 	ExactRepairToolArgumentsV1,
 } from "../extensions/workbench-runtime/core/exact-repair-authority.ts";
-import { readExactRepairSuccessorV1 } from "../extensions/workbench-runtime/core/exact-repair-successor.ts";
+import {
+	classifyExactRepairSuccessorV1,
+	readExactRepairSuccessorV1,
+} from "../extensions/workbench-runtime/core/exact-repair-successor.ts";
 import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { collectWorkspaceGuard } from "../extensions/workbench-runtime/core/workspace-guard.ts";
 import { spawnExec, withTempDir } from "./helpers.ts";
@@ -155,6 +158,77 @@ test("successor scan returns the one durable transaction with exact contract and
 			assert.equal(result.value.committed_proof_content_hash, null);
 		}
 	});
+});
+
+test("zero-delta lineaged FAILED successor stays exact-repair pending without a terminal-negative sidecar", async () => {
+	let terminalReads = 0;
+	const candidate = {
+		delegation_id: SUCCESSOR_ID,
+		status: "FAILED",
+		task_kind: "implementation",
+		revision: 3,
+		committed_proof: { revision: 2, content_hash: PROOF_HASH },
+		repair_lineage: { depth: 2 },
+		terminal_outcome: {
+			terminal_facts_complete: true,
+			scope_complete: true,
+			changed_paths: [],
+			delta_hash: "f".repeat(64),
+			change_set_status: "ATTRIBUTED",
+		},
+	} as unknown as DelegationCommittedGenerationV2["state"];
+	const committed = {
+		state: structuredClone(candidate),
+		proof: structuredClone(candidate.committed_proof),
+		records: {},
+	} as unknown as DelegationCommittedGenerationV2;
+	const result = await classifyExactRepairSuccessorV1("/project", candidate, {
+		readCommittedGeneration: (async () => ({ ok: true, value: committed })) as never,
+		readReview: (async () => { throw new Error("must not read ordinary review"); }) as never,
+		readTerminalNegativeRepair: (async () => {
+			terminalReads += 1;
+			return { ok: false, error: { code: "invalid_record" } };
+		}) as never,
+		recoverExactRepairAuthority: (() => ({ ok: true, value: authority() })) as never,
+	});
+	assert.deepEqual(result, {
+		ok: true,
+		committed_proof_content_hash: PROOF_HASH,
+		disposition: "EXACT_REPAIR_PENDING",
+	});
+	assert.equal(terminalReads, 0);
+});
+
+test("non-empty lineaged FAILED successor still fails closed on a corrupt terminal-negative sidecar", async () => {
+	const candidate = {
+		delegation_id: SUCCESSOR_ID,
+		status: "FAILED",
+		task_kind: "implementation",
+		revision: 3,
+		allowed_paths: ["src/**"],
+		committed_proof: { revision: 2, content_hash: PROOF_HASH },
+		review: null,
+		repair_lineage: { depth: 2 },
+		terminal_outcome: {
+			terminal_facts_complete: true,
+			scope_complete: true,
+			changed_paths: ["src/repaired.ts"],
+			delta_hash: "f".repeat(64),
+			change_set_status: "ATTRIBUTED",
+		},
+	} as unknown as DelegationCommittedGenerationV2["state"];
+	const committed = {
+		state: structuredClone(candidate),
+		proof: structuredClone(candidate.committed_proof),
+		records: {},
+	} as unknown as DelegationCommittedGenerationV2;
+	const result = await classifyExactRepairSuccessorV1("/project", candidate, {
+		readCommittedGeneration: (async () => ({ ok: true, value: committed })) as never,
+		readReview: (async () => { throw new Error("must not read ordinary review"); }) as never,
+		readTerminalNegativeRepair: (async () => ({ ok: false, error: { code: "invalid_record" } })) as never,
+		recoverExactRepairAuthority: (() => { throw new Error("corrupt sidecar must not fall back to lineage"); }) as never,
+	});
+	assert.deepEqual(result, { ok: false, code: "AUTHORITY_INVALID" });
 });
 
 test("successor replay keeps carried review dependencies separate from worker write capability", async () => {

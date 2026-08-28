@@ -295,7 +295,7 @@ function chainNextAction(chain: DeliveryChainCoordinatorResultV1): string | null
 		case "CHAIN_CLOSED":
 			return successor.status === "REVIEWED" ? null : delegationStatusToolActionV1();
 		case "REVIEW_PENDING":
-			return successor.status === "PENDING_REVIEW"
+			return successor.status === "PENDING_REVIEW" || successor.status === "INTERRUPTED"
 				? reviewDelegationToolActionV1(successor.delegation_id)
 				: delegationStatusToolActionV1();
 		case "REPAIR_PENDING":

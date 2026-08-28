@@ -72,7 +72,6 @@ import {
 import { validateSemanticReviewEnvelopeV1 } from "./semantic-review-envelope.ts";
 import { validateChangeSet, type ChangeSetRecord } from "./change-set.ts";
 import {
-	isDelegationCommandScopeAttributedV1,
 	validateDelegationCommandProvenance,
 	type DelegationCommandProvenanceRecord,
 } from "./delegation-command-effect-provenance.ts";
@@ -489,12 +488,10 @@ export interface DelegationReviewAuthorityV2 {
 	/** Optional immutable Sol decision that rejects this provisional delta for repair. */
 	semantic_repair?: DelegationSemanticRepairDecisionV1;
 	/**
-	 * Read-time compatibility proof for immutable records that predate the
-	 * separation of a failed CLEAN recipe from spatial workspace drift. This
-	 * bit is derived only from a fully verified committed generation and is
-	 * never persisted or accepted as caller authority by itself.
+	 * Read-only compatibility proof for a strictly revalidated historical
+	 * negative lifecycle. It is derived, never persisted as caller authority.
 	 */
-	terminal_negative_legacy_clean_command?: true;
+	terminal_negative_committed_compatibility?: true;
 }
 
 export interface PublishDelegationReviewV2Input extends DelegationCasInput {
@@ -1305,28 +1302,20 @@ export function isDelegationTerminalNegativeReviewEligibleV1(
 }
 
 /**
- * Strict read compatibility for the historical failed-CLEAN-recipe defect.
- * The stale WORKSPACE_DRIFT label is accepted only after the complete
- * committed generation revalidates and its command provenance proves an
- * attributed spatial delta with no remaining drift or conflict.
+ * Strict read compatibility for historical committed negative lifecycles.
+ * This predicate grants only terminal-negative REPAIR review, never ACCEPT.
+ * Every generation record must revalidate and the worker delta must remain
+ * non-empty, exact-file scoped, and bound to the immutable terminal outcome.
+ * Command drift/conflicts remain negative evidence and are carried into the
+ * successor review scope by exact-repair recovery.
  */
 export function isDelegationTerminalNegativeReviewEligibleFromCommittedV1(
 	state: Readonly<DelegationTransactionRecord>,
 	records: DelegationCommittedRecords,
 ): state is DelegationTransactionRecord & { status: DelegationTerminalNegativeStatusV1 } {
 	if (isDelegationTerminalNegativeReviewEligibleV1(state)) return true;
-	if (!isDelegationTerminalNegativeReviewStateCandidateV1(state)
-		|| state.terminal_outcome!.change_set_status !== "WORKSPACE_DRIFT"
-		|| !validateCommittedRecordBindings(state, records, true)) return false;
-	const scope = records["scope.json"];
-	if (!isRecord(scope)) return false;
-	const changeSet = scope.change_set;
-	const command = scope.command_provenance;
-	if (!isRecord(changeSet) || !isDelegationCommandScopeAttributedV1(command, changeSet as unknown as ChangeSetRecord)) {
-		return false;
-	}
-	return sameJson(state.terminal_outcome!.changed_paths, command.effective_paths)
-		&& state.terminal_outcome!.delta_hash === command.effective_delta_hash;
+	return isDelegationTerminalNegativeReviewStateCandidateV1(state)
+		&& validateCommittedRecordBindings(state, records, true);
 }
 
 function terminalNegativeFailureFactsHash(state: Readonly<DelegationTransactionRecord>): string {
@@ -1341,7 +1330,7 @@ function terminalNegativeFailureFactsHash(state: Readonly<DelegationTransactionR
 
 function terminalNegativeDecisionEligible(authority: DelegationReviewAuthorityV2): authority is DelegationTerminalNegativeReviewAuthorityV1 {
 	return (isDelegationTerminalNegativeReviewEligibleV1(authority.state)
-		|| authority.terminal_negative_legacy_clean_command === true) && !authority.finalized
+		|| authority.terminal_negative_committed_compatibility === true) && !authority.finalized
 		&& authority.artifact.schema_version === 2 && authority.artifact.transaction_revision === 3
 		&& authority.review.schema_version === 2 && authority.review.checked_paths.length > 0
 		&& authority.review.verdict === "PASS" && authority.review.mismatch === false
@@ -1777,14 +1766,14 @@ async function readReviewArtifactAt(
 		}
 		const reviewHash = hashBytes(bytes);
 		let finalized = false;
-		let terminalNegativeLegacyCleanCommand = false;
+		let terminalNegativeCommittedCompatibility = false;
 		if (state.status === "PENDING_REVIEW") {
 			if (state.revision !== 3 || state.review !== null) return failure("invalid_record", "pending review state is inconsistent", point);
 		} else if (state.status === "INTERRUPTED" || state.status === "FAILED") {
 			if (!isDelegationTerminalNegativeReviewEligibleFromCommittedV1(state, records)) {
 				return failure("invalid_record", "terminal-negative review state is ineligible or incomplete", point);
 			}
-			terminalNegativeLegacyCleanCommand = !isDelegationTerminalNegativeReviewEligibleV1(state);
+			terminalNegativeCommittedCompatibility = !isDelegationTerminalNegativeReviewEligibleV1(state);
 		} else if (state.status === "REVIEWED") {
 			const review = state.review;
 			if (state.revision !== 4 || review === null || review.delegation_id !== state.delegation_id ||
@@ -1805,7 +1794,7 @@ async function readReviewArtifactAt(
 				review_hash: reviewHash,
 				review_path: delegationReviewRelativePathV2(state.delegation_id)!,
 				finalized,
-				...(terminalNegativeLegacyCleanCommand ? { terminal_negative_legacy_clean_command: true as const } : {}),
+				...(terminalNegativeCommittedCompatibility ? { terminal_negative_committed_compatibility: true as const } : {}),
 				bytes: Uint8Array.from(bytes),
 			},
 		};
@@ -2693,6 +2682,42 @@ export async function readDelegationSemanticRepairDecisionV1(
 	const authority = await readDelegationReviewV2(projectRoot, delegationId, options);
 	if (!authority.ok) return authority;
 	return { ok: true, value: authority.value.semantic_repair };
+}
+
+/**
+ * Read the semantic REPAIR decision which currently governs one exact
+ * committed generation.  A terminal-negative decision may belong to either
+ * a lineage root or a later repair tip: lineage position does not change the
+ * sidecar's binding to this committed parent.
+ */
+export async function readDelegationCurrentSemanticRepairDecisionV1(
+	projectRoot: string,
+	committed: DelegationCommittedGenerationV2,
+	options?: DelegationTransactionStorageOptions,
+): Promise<DelegationTransactionStorageResult<DelegationSemanticRepairDecisionV1 | undefined>> {
+	const state = committed.state;
+	if (state.status === "PENDING_REVIEW") {
+		const read = await readDelegationSemanticRepairDecisionV1(projectRoot, state.delegation_id, options);
+		if (!read.ok || read.value === undefined) return read;
+		return read.value.delegation_id === state.delegation_id
+			&& read.value.contract_hash === state.contract_hash
+			? read
+			: failure("invalid_record", "semantic repair decision does not bind the committed delegation");
+	}
+	if ((state.status !== "FAILED" && state.status !== "INTERRUPTED")
+		|| !isDelegationTerminalNegativeReviewEligibleFromCommittedV1(state, committed.records)) {
+		return { ok: true, value: undefined };
+	}
+	const read = await readDelegationTerminalNegativeSolAuthorityV1(projectRoot, state.delegation_id, options);
+	if (!read.ok) {
+		return read.error.code === "not_found" ? { ok: true, value: undefined } : read;
+	}
+	if (canonicalHash(read.value.state) !== canonicalHash(state)
+		|| read.value.decision.delegation_id !== state.delegation_id
+		|| read.value.decision.contract_hash !== state.contract_hash) {
+		return failure("invalid_record", "terminal-negative repair decision does not bind the committed delegation");
+	}
+	return { ok: true, value: read.value.decision };
 }
 
 async function writeReviewArtifactLocked(

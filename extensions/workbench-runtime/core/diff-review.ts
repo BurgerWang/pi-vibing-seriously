@@ -343,7 +343,12 @@ export interface ReviewCompactFacts {
 	digest_kind: ReviewDigestKind;
 	/** Fixed byte boundary at which the historical display digest switches form (MAX_DIGEST_BYTES). */
 	digest_max_bytes: number;
-	/** True when the current digest exactly equals the worker's recorded-after digest. */
+	/**
+	 * Historical field name: true when the current digest equals the review's
+	 * bound reference digest. That is the worker after-digest for an ordinary
+	 * delta and the current relevance-projection digest for a lineage-carried
+	 * read-only dependency.
+	 */
 	digest_matches_after: boolean;
 	/** Always "NOT_VERIFIED" — never fabricated, never claimed by review. */
 	generator_equality: "NOT_VERIFIED";
@@ -1416,6 +1421,35 @@ async function rebuildRedactedReviewStream(input: {
 }
 
 /**
+ * Compact packets need one authoritative current-content reference. New-v2
+ * review authority already binds current path identities through its strict
+ * relevance projection; repair-carried paths intentionally have no successor
+ * worker after-digest. Legacy/v1 review keeps using the recorded after facts.
+ */
+function compactReferenceDigests(authority: Readonly<ReviewAuthorityFacts>): Readonly<Record<string, string>> {
+	const currentIsBound = authority.current !== undefined && authority.relevance_binding !== undefined &&
+		authority.relevance_projection !== undefined && authority.current_diff_hash === authority.relevance_binding.projection_hash;
+	return currentIsBound ? authority.current!.pathDigests : authority.after.pathDigests;
+}
+
+/**
+ * A repair successor may need to inspect an immutable path carried from a
+ * rejected ancestor even though Luna is deliberately not allowed to write
+ * that path. Keep those authorities separate: ordinary allowed paths retain
+ * their existing subtree semantics, while a lineage-carried path is readable
+ * only as one exact, project-contained realpath-safe path.
+ */
+async function isReviewPathReadableRealpath(
+	projectRoot: string,
+	path: string,
+	allowedPaths: readonly string[],
+	lineageCarriedPaths: readonly string[] = [],
+): Promise<boolean> {
+	if (await isWorkerPathAllowedRealpath(projectRoot, path, allowedPaths)) return true;
+	return lineageCarriedPaths.includes(path) && isWorkerPathAllowedRealpath(projectRoot, path, [path]);
+}
+
+/**
  * Compute the exact current presentation-stream admission proof before a
  * generation is published PENDING_REVIEW.  The same compact/full-stream
  * constructors are used by review itself, so oversize, aggregate and record
@@ -1426,6 +1460,8 @@ export async function preflightSemanticReviewEnvelopeV1(input: {
 	projectRoot: string;
 	workerPaths: readonly string[];
 	allowedPaths: readonly string[];
+	/** Exact read-only review scope authenticated by a repair lineage. */
+	lineageCarriedPaths?: readonly string[];
 	afterDigests: Readonly<Record<string, string>>;
 	pathStatuses: Readonly<Record<string, string>>;
 	relevanceProjection: ReviewRelevanceProjectionV2;
@@ -1435,15 +1471,22 @@ export async function preflightSemanticReviewEnvelopeV1(input: {
 }): Promise<SemanticReviewEnvelopePreflightResult> {
 	try {
 		const workerPaths = [...input.workerPaths];
+		const lineageCarriedPaths = [...(input.lineageCarriedPaths ?? [])];
 		if (workerPaths.length > REVIEW_PRESENTATION_PROGRESS_MAX_ITEMS ||
-			workerPaths.some((path, index) => index > 0 && Buffer.from(workerPaths[index - 1]!, "utf8").compare(Buffer.from(path, "utf8")) >= 0)) {
+			workerPaths.some((path, index) => index > 0 && Buffer.from(workerPaths[index - 1]!, "utf8").compare(Buffer.from(path, "utf8")) >= 0) ||
+			!byteSortedUnique(lineageCarriedPaths) || lineageCarriedPaths.some((path) => !workerPaths.includes(path))) {
 			return { ok: false, code: "invalid_input" };
 		}
 		const streams: SemanticReviewStreamDescriptorV1[] = [];
 		let totalPages = 0;
 		const secrets = input.secrets ?? [];
 		for (const path of workerPaths) {
-			if (!(await isWorkerPathAllowedRealpath(input.projectRoot, path, input.allowedPaths))) {
+			if (!(await isReviewPathReadableRealpath(
+				input.projectRoot,
+				path,
+				input.allowedPaths,
+				lineageCarriedPaths,
+			))) {
 				return { ok: false, code: "presentation_unavailable" };
 			}
 			const rebuiltStream = await rebuildRedactedReviewStream({
@@ -1636,13 +1679,18 @@ export async function collectStructuredReviewPresentationV1(
 		const legacyStreams: SemanticReviewStreamDescriptorV1[] = [];
 		const pages: StructuredReviewPresentationPageV1[] = [];
 		for (const path of input.authority.worker_paths) {
-			if (!(await isWorkerPathAllowedRealpath(input.projectRoot, path, input.authority.allowed_paths))) {
+			if (!(await isReviewPathReadableRealpath(
+				input.projectRoot,
+				path,
+				input.authority.allowed_paths,
+				input.authority.lineage_carried_paths,
+			))) {
 				return { ok: false, code: "PRESENTATION_UNAVAILABLE" };
 			}
 			const rebuilt = await rebuildRedactedReviewStream({
 				projectRoot: input.projectRoot,
 				path,
-				afterDigests: input.authority.after.pathDigests,
+				afterDigests: compactReferenceDigests(input.authority),
 				pathStatus: current.pathStatuses[path] ?? "",
 				exec: input.exec,
 				secrets,
@@ -2085,7 +2133,7 @@ async function rebuildLegacySemanticReviewEnvelopeV1(input: {
 			input.projectRoot,
 			path,
 			input.secrets,
-			input.authority.after.pathDigests,
+			compactReferenceDigests(input.authority),
 			input.current.pathStatuses[path] ?? "",
 			"legacy-text-only",
 		);
@@ -2167,7 +2215,7 @@ export async function validateReviewPresentationAgainstAuthority(
 					input.projectRoot,
 					item.path,
 					secrets,
-					input.authority.after.pathDigests,
+					compactReferenceDigests(input.authority),
 					current.pathStatuses[item.path] ?? "",
 				);
 				if (facts === null) return false;
@@ -2309,19 +2357,24 @@ async function reviewDelegationInner(
 	const workerPaths = [...authority.worker_paths];
 	const allowedPaths = [...authority.allowed_paths];
 
-	// Scope check over ALL worker paths — include_paths can never hide a
-	// violation. The check is realpath-safe: a symlink inside an approved
-	// subtree that resolves OUTSIDE the subtree (or the project) is a
-	// violation. It runs FIRST — before any git/content collection —
+	// Scope check over ALL review paths — include_paths can never hide a
+	// violation. Ordinary worker paths require the writable contract; exact
+	// immutable lineage-carried paths receive read-only review authority. Both
+	// checks are realpath-safe. This runs FIRST — before git/content collection —
 	// because it gates the review's entire per-path content pipeline: a
 	// violating path is withheld below (deterministic bounded marker) and
 	// is never git-diffed, opened, read, digested or rendered.
 	const violations: ReviewViolation[] = [];
 	for (const path of workerPaths) {
-		if (!(await isWorkerPathAllowedRealpath(projectRoot, path, allowedPaths))) {
+		if (!(await isReviewPathReadableRealpath(
+			projectRoot,
+			path,
+			allowedPaths,
+			authority.lineage_carried_paths,
+		))) {
 			violations.push({
 				path,
-				reason: "outside the parent-approved scope (realpath/symlink check)",
+				reason: "outside the parent-approved scope (write or lineage-carried review; realpath/symlink check)",
 			});
 		}
 	}
@@ -2461,7 +2514,7 @@ async function reviewDelegationInner(
 			input.exec,
 			secrets,
 			Math.min(maxBytes, REVIEW_PATCH_MAX_BYTES),
-			authority.after.pathDigests,
+			compactReferenceDigests(authority),
 			current.pathStatuses[path] ?? "",
 			pageOnePath ? {
 				prior: priorProgressByPath.get(path),

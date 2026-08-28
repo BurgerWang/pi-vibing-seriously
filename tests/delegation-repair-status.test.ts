@@ -156,6 +156,44 @@ test("eligible terminal-negative authority without a sidecar routes to q-review,
 	assert.doesNotMatch(corruptAction, /\/q-(?:review|repair)/u);
 });
 
+test("an eligible lineaged INTERRUPTED tip routes to q-review instead of generic recovery", async () => {
+	const lineage = {
+		rootDelegationId: ROOT,
+		repairOf: ROOT,
+		rootDecisionHash: DECISION,
+		continuationDecisionDelegationId: ROOT,
+		continuationDecisionHash: DECISION,
+		lineageHash: LINEAGE,
+		depth: 1,
+		carriedPathCount: 1,
+	};
+	const committed = terminalCommitted("INTERRUPTED") as any;
+	committed.state.repair_lineage = {
+		schema_version: 1,
+		kind: "semantic-repair-lineage-v1",
+		root_delegation_id: ROOT,
+		repair_of: ROOT,
+		root_decision_hash: DECISION,
+		continuation_decision_delegation_id: ROOT,
+		continuation_decision_hash: DECISION,
+		parent_lineage_hash: null,
+		lineage_hash: LINEAGE,
+		depth: 1,
+		carried_paths: ["src/root.ts"],
+	};
+	const projected = await readDelegationRepairStatusV1("/tmp/project", state, (async () => {
+		throw new Error("unused");
+	}) as ExecFn, {
+		readRepairClosure: async () => ({ ok: true, unresolvedTipId: ID, rootCount: 1, lineageCount: 1 }),
+		readAuthority: async () => observation({ transactionStatus: "INTERRUPTED", repairLineage: lineage }),
+		collectBinding: async () => ({ status: "fresh", hash: HASH, kind: "changeset-relevance-v2" }),
+		readCommittedGeneration: async () => ({ ok: true, value: committed }),
+		readRepairCapsule: async () => { throw new Error("review route must not read the retry capsule"); },
+	});
+	assert.equal(projected.kind, "terminal_negative_review");
+	assert.match(delegationNextActionTextV1(state, projected) ?? "", new RegExp(`workbench_review_worker_diff with delegation_id=${ID}`));
+});
+
 test("ineligible lineageless FAILED authority remains on strict recovery and never invents q-review", async () => {
 	const projected = await readDelegationRepairStatusV1("/tmp/project", state, (async () => {
 		throw new Error("unused");

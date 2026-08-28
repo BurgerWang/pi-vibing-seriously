@@ -139,7 +139,7 @@ test("terminal repair rebase rejects unmerged status even on a carried path", as
 	});
 });
 
-test("terminal repair rebase validates carried paths against immutable subtree semantics", async () => {
+test("terminal repair rebase keeps carried review paths separate from immutable write scope", async () => {
 	await withTempDir(async (root) => {
 		await initialize(root);
 		await writeFile(join(root, "src", "child.ts"), "child\n", "utf8");
@@ -159,10 +159,10 @@ test("terminal repair rebase validates carried paths against immutable subtree s
 			committed: committed(sealed.guard, ["src/child.ts"], ["src"]),
 			exec: spawnExec,
 		});
-		assert.deepEqual(exactParent, {
-			ok: false,
-			code: "lineage_outside_allowed_scope",
-			path: "src/child.ts",
-		});
+		assert.equal(exactParent.ok, true, exactParent.ok ? "" : exactParent.code);
+		if (!exactParent.ok) return;
+		assert.deepEqual(exactParent.value.relevant_paths, ["src/child.ts"]);
+		assert.deepEqual(exactParent.value.relevant_paths, subtree.ok ? subtree.value.relevant_paths : [],
+			"the read-only rebase is bound to carried paths, never to Luna's write rule");
 	});
 });

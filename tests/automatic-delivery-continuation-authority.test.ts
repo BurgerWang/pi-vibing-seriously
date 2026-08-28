@@ -580,6 +580,21 @@ test("missing is non-authority, corrupt sidecars fail closed, and closed or inel
 		status: "BLOCKED", code: "TERMINAL_REPAIR_SIDECAR_INVALID",
 	});
 
+	const inactive = fixture();
+	const inactivePending = published(ID_A, 30, "pending", ["src/inactive-pending.ts"]);
+	const inactiveTerminal = published(ID_TERM, 31, "interrupted", ["src/inactive-terminal.ts"]);
+	inactive.transactions.set(ID_A, inactivePending);
+	inactive.transactions.set(ID_TERM, inactiveTerminal);
+	inactive.committed.set(ID_A, committed(inactivePending, AFTER_A));
+	inactive.committed.set(ID_TERM, committed(inactiveTerminal, AFTER_B));
+	inactive.semanticErrors.set(ID_A, "invalid_record");
+	inactive.terminalErrors.set(ID_TERM, "invalid_record");
+	assert.deepEqual(await resolveAutomaticDeliveryContinuationCandidateV1(
+		resolveInput([ID_A, ID_TERM]), readers(inactive),
+	), { status: "NOOP", code: "NO_CANDIDATE" });
+	assert.equal(inactive.sidecarReads, 0,
+		"durably closed locator noise is filtered by project authority before historical sidecars are read");
+
 	const filtered = fixture();
 	const zero = published(ID_ZERO, 40, "failed-zero", []);
 	const depth = published(ID_DEPTH, 50, "failed", ["src/depth.ts"], lineage(ID_A));

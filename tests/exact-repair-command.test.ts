@@ -33,7 +33,7 @@ import {
 	registerExactRepairCommandV1,
 } from "../extensions/workbench-runtime/core/exact-repair-command.ts";
 import { buildSemanticReviewEnvelopeV1 } from "../extensions/workbench-runtime/core/semantic-review-envelope.ts";
-import { withTempDir } from "./helpers.ts";
+import { withTempDir, writeConfigFile } from "./helpers.ts";
 
 const ID = "20260827-010203-qrep";
 const BOUND_DIFF_HASH = "9".repeat(64);
@@ -108,13 +108,18 @@ function sha(value: string): string {
 function terminalNegativeCommitted(
 	status: "INTERRUPTED" | "FAILED",
 	legacyOutcome = false,
+	options: {
+		readonly allowedPaths?: readonly string[];
+		readonly verification?: readonly string[];
+	} = {},
 ): DelegationCommittedGenerationV2 {
+	const allowedPaths = [...(options.allowedPaths ?? ["src/**"])];
 	const contract = normalizeDelegationBoundedTaskContractV2({
 		task_kind: "implementation",
 		task: "Continue the bounded partial implementation.",
-		allowed_paths: ["src/**"],
+		allowed_paths: allowedPaths,
 		acceptance_criteria: ["The interrupted implementation is completed."],
-		verification: [],
+		verification: [...(options.verification ?? [])],
 		timeout_seconds: 600,
 		budget_profile: "extended",
 	});
@@ -140,7 +145,7 @@ function terminalNegativeCommitted(
 			status,
 			task_kind: "implementation",
 			contract_hash: contract.value.contract_hash,
-			allowed_paths: ["src/**"],
+			allowed_paths: allowedPaths,
 			worker_identity: { provider: "openai", model: "gpt-5.6-luna", worker_id: "worker:test" },
 			generation: 1,
 			revision: 3,
@@ -171,7 +176,7 @@ function terminalNegativeCommitted(
 		records: {
 			"before.json": { contract: contract.value },
 			"scope.json": {
-				allowed_paths: ["src/**"],
+				allowed_paths: allowedPaths,
 				changed_paths: ["src/exact.ts"],
 				change_set: changeSet,
 			},
@@ -211,6 +216,7 @@ function terminalNegativeAuthority(
 function exactTipLaneAdmission(
 	repairTipId: string,
 	authorityHash = "a".repeat(64),
+	allowedPaths: readonly string[] = ["src/**"],
 ): DelegationPathLaneAdmissionV1 {
 	return {
 		schema_version: 1,
@@ -231,7 +237,7 @@ function exactTipLaneAdmission(
 			kind: "delegation-path-lane-decision-v1",
 			decision: "ALLOW",
 			block_reasons: [],
-			normalized_allowed_paths: ["src/**"],
+			normalized_allowed_paths: [...allowedPaths],
 			conflicts: [],
 			authority_failures: [],
 			maintenance_warnings: [],
@@ -754,6 +760,106 @@ test("delegate controller exact bridge injects the recovered subtree lineage int
 		assert.equal(capturedInput?.contract.repair_of, ID);
 		assert.deepEqual(capturedInput?.dependencyPaths, ["src/exact.ts"]);
 		assert.deepEqual(capturedInput?.repairLineage, recovered.value.successor_lineage);
+	});
+});
+
+test("exact repair can restore its own malformed verification catalog through both prelaunch checks", async () => {
+	await withTempDir(async (projectRoot) => {
+		await writeConfigFile(projectRoot, "recipes.yaml", "recipes: [\n");
+		const committed = terminalNegativeCommitted("INTERRUPTED", false, {
+			allowedPaths: [".pi/workbench/recipes.yaml", "src/**"],
+			verification: ["recipe:focused-check"],
+		});
+		const sidecar = terminalNegativeAuthority(committed);
+		const recovered = recoverExactRepairCommandAuthorityV1({
+			repairOf: ID,
+			committed,
+			terminalNegativeRepair: sidecar,
+			currentBindingHash: BOUND_DIFF_HASH,
+		});
+		assert.equal(recovered.ok, true, recovered.ok ? "" : recovered.code);
+		if (!recovered.ok) return;
+
+		let executionCalls = 0;
+		let preparedCallbacks = 0;
+		let released = 0;
+		let state = {
+			...emptyDelegationState(),
+			latestId: ID,
+			status: "PENDING_REVIEW" as const,
+			currentDiffHash: BOUND_DIFF_HASH,
+			updatedAt: TERMINAL_TIME,
+		};
+		const handle = registerDelegateTool({
+			pi: { registerTool() {} },
+			services: {
+				now: () => new Date(DECISION_TIME),
+				makeDelegationId: () => "20260827-010205-cfgx",
+				acquireStartLock: async (input: { project_root: string; delegation_id: string; now: string }) => ({
+					ok: true,
+					value: {
+						schema_version: 1,
+						project_root: input.project_root,
+						delegation_id: input.delegation_id,
+						token: "c".repeat(32),
+						process_id: 1,
+						process_start_ticks: "1",
+						boot_id: "11111111-1111-4111-8111-111111111111",
+						acquired_at: input.now,
+					},
+				}),
+				releaseStartLock: async () => { released += 1; return { ok: true, value: undefined }; },
+				readCommittedGeneration: async () => ({ ok: true, value: committed }),
+				readReview: async () => ({ ok: false, error: { code: "not_found" } }),
+				readTerminalNegativeRepair: async () => ({ ok: true, value: sidecar }),
+				readPlanContractAuthority: async () => ({ status: "absent" }),
+				admitPathLane: async () => exactTipLaneAdmission(ID, "a".repeat(64), [".pi/workbench/recipes.yaml", "src/**"]),
+				revalidatePathLane: async (input: Parameters<NonNullable<DelegateToolServices["revalidatePathLane"]>>[0]) => ({
+					schema_version: 1,
+					kind: "delegation-path-lane-revalidation-v1",
+					expected_authority_hash: input.expected_authority_hash,
+					observed_authority_hash: input.expected_authority_hash,
+					unchanged: true,
+					admission: exactTipLaneAdmission(ID, input.expected_authority_hash, [".pi/workbench/recipes.yaml", "src/**"]),
+				}),
+				readRecoverableUnpublished: async () => ({ ok: false, error: { code: "not_recoverable" } }),
+				readLegacyLedger: async () => null,
+				executeDelegation: async (input: {
+					onPrepared: (transaction: unknown, before: { diffHash: string }) => Promise<void>;
+				}) => {
+					executionCalls += 1;
+					await input.onPrepared({ status: "PREPARED" }, { diffHash: BOUND_DIFF_HASH });
+					preparedCallbacks += 1;
+					throw new Error("intentional worker boundary after verification preflights");
+				},
+				completeDefaultDelivery: async () => { throw new Error("must not deliver"); },
+				buildTrustedRecoveryAuthority: async () => undefined,
+			},
+			exec: async () => ({ code: 0, stdout: "", stderr: "" }),
+			secrets: [],
+			trustedOrError: () => undefined,
+			projectRootFor: async () => projectRoot,
+			reconcileProjectAuthority: async () => true,
+			getProjectAuthorityBlockReason: () => undefined,
+			collectCurrentDelegationBinding: async () => ({ status: "fresh", hash: BOUND_DIFF_HASH }),
+			projectTerminalReviewedBinding: async () => null,
+			getDelegationState: () => state,
+			setDelegationState: (next: typeof state) => { state = next; },
+			persistDelegationState: () => {},
+			persistDelegationStateStrict: (next: typeof state) => { state = next; },
+			markTerminalMirrorBlocked: () => {},
+			refreshStatus: async () => {},
+			bindTrustedIngressAuthority: () => undefined,
+			rememberTrustedIngressAuthority: () => {},
+		} as never);
+
+		await assert.rejects(
+			handle.executeExactRepair(recovered.value, undefined, undefined, context() as never),
+			/intentional worker boundary after verification preflights/u,
+		);
+		assert.equal(executionCalls, 1, "malformed recipes no longer prevents the exact repair worker from starting");
+		assert.equal(preparedCallbacks, 1, "the under-lease PREPARED recheck permits the same exact catalog repair");
+		assert.equal(released, 0, "an injected post-PREPARED failure retains the crash-evidence lease");
 	});
 });
 

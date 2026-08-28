@@ -566,6 +566,7 @@ test("agent follow-up and next_action use only the strict durable successor disp
 		{ status: "REVIEWED", disposition: "BLOCKED", serviceStatus: "SUCCESSOR_BLOCKED", triggerTurn: false, nextAction: "call workbench_delegation_status" },
 		{ status: "FINISHED", disposition: "BLOCKED", serviceStatus: "SUCCESSOR_BLOCKED", triggerTurn: false, nextAction: "call workbench_delegation_status" },
 		{ status: "PENDING_REVIEW", disposition: "REVIEW_PENDING", triggerTurn: false, nextAction: `call workbench_review_worker_diff with delegation_id=${CHILD}` },
+		{ status: "INTERRUPTED", disposition: "REVIEW_PENDING", triggerTurn: false, nextAction: `call workbench_review_worker_diff with delegation_id=${CHILD}` },
 		{ status: "PENDING_REVIEW", disposition: "REPAIR_PENDING", triggerTurn: false, nextAction: `call workbench_repair_delegation with delegation_id=${CHILD}` },
 		{ status: "FAILED", disposition: "EXACT_REPAIR_PENDING", serviceStatus: "EXACT_REPAIR_PENDING", triggerTurn: false, nextAction: `call workbench_repair_delegation with delegation_id=${CHILD}` },
 		{ status: "PREPARED", disposition: "ACTIVE", serviceStatus: "SUCCESSOR_ACTIVE", triggerTurn: false, nextAction: "call workbench_delegation_status" },

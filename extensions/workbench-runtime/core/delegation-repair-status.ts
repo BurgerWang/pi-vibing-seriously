@@ -191,8 +191,8 @@ export function classifyDelegationRepairStatusV1(input: {
 			};
 	}
 	if (input.terminalNegativeReviewEligible === true) {
-		if (authority.repairLineage !== undefined ||
-			(authority.transactionStatus !== "INTERRUPTED" && authority.transactionStatus !== "FAILED")) {
+		if ((authority.transactionStatus !== "INTERRUPTED" && authority.transactionStatus !== "FAILED")
+			|| (authority.repairLineage !== undefined && authority.transactionStatus !== "INTERRUPTED")) {
 			return { kind: "authority_invalid", delegationId: input.delegationId, code: "terminal_negative_authority_mismatch" };
 		}
 		return {
@@ -315,11 +315,13 @@ export async function readDelegationRepairStatusV1(
 			services.collectBinding(projectRoot, delegationId, exec),
 		]);
 		let terminalNegativeReviewEligible = false;
-		if (authority.kind === "v2" && authority.repairLineage === undefined &&
-			(authority.transactionStatus === "INTERRUPTED" || authority.transactionStatus === "FAILED")) {
+		if (authority.kind === "v2"
+			&& (authority.transactionStatus === "INTERRUPTED"
+				|| (authority.transactionStatus === "FAILED" && authority.repairLineage === undefined))) {
 			const committed = await (services.readCommittedGeneration ?? readDelegationCommittedGenerationV2)(projectRoot, delegationId);
 			if (!committed.ok || committed.value.state.delegation_id !== delegationId ||
-				committed.value.state.status !== authority.transactionStatus || committed.value.state.repair_lineage !== undefined) {
+				committed.value.state.status !== authority.transactionStatus
+				|| (committed.value.state.repair_lineage === undefined) !== (authority.repairLineage === undefined)) {
 				return { kind: "authority_invalid", delegationId, code: committed.ok ? "terminal_negative_authority_mismatch" : committed.error.code };
 			}
 			terminalNegativeReviewEligible = isDelegationTerminalNegativeReviewEligibleFromCommittedV1(
@@ -441,7 +443,7 @@ export function delegationRepairStatusLinesV1(status: DelegationRepairStatusV1):
 	}
 	if (status.kind === "terminal_negative_review") {
 		return [
-			`completion v2: ${status.transactionStatus} — committed attributed delta requires REPAIR-only Sol review`,
+			`completion v2: ${status.transactionStatus} — committed non-empty delta requires REPAIR-only Sol review`,
 			`next action  : ${reviewDelegationToolActionV1(status.delegationId)}`,
 		];
 	}

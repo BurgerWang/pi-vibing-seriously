@@ -26,11 +26,10 @@ import {
 import { delegationsDir, isValidDelegationId } from "./delegation-ledger.ts";
 import {
 	hasDelegationSemanticReviewAuthorityV2,
-	isDelegationTerminalNegativeReviewEligibleFromCommittedV1,
 	readDelegationCommittedGenerationV2,
+	readDelegationCurrentSemanticRepairDecisionV1,
 	readDelegationReviewV2,
 	readDelegationSemanticRepairDecisionV1,
-	readDelegationTerminalNegativeSolAuthorityV1,
 	readDelegationTransactionV2,
 	type DelegationCommittedGenerationV2,
 	type DelegationSemanticRepairDecisionV1,
@@ -274,8 +273,7 @@ const DEFAULT_READERS: DelegationPathLaneAdmissionReadersV1 = {
 	readTransaction: async (projectRoot, delegationId) => readDelegationTransactionV2(projectRoot, delegationId),
 	readSemanticRepairDecision: async (projectRoot, delegationId) => readDelegationSemanticRepairDecisionV1(projectRoot, delegationId),
 	readTerminalNegativeRepairDecision: async (projectRoot, transaction) => {
-		if (transaction.repair_lineage !== undefined
-			|| (transaction.status !== "FAILED" && transaction.status !== "INTERRUPTED")) {
+		if (transaction.status !== "FAILED" && transaction.status !== "INTERRUPTED") {
 			return { ok: true, value: undefined };
 		}
 		const committed = await readDelegationCommittedGenerationV2(projectRoot, transaction.delegation_id);
@@ -283,14 +281,7 @@ const DEFAULT_READERS: DelegationPathLaneAdmissionReadersV1 = {
 		if (canonicalHash(committed.value.state) !== canonicalHash(transaction)) {
 			return { ok: false, error: { code: "invalid_record" } };
 		}
-		if (!isDelegationTerminalNegativeReviewEligibleFromCommittedV1(transaction, committed.value.records)) {
-			return { ok: true, value: undefined };
-		}
-		const read = await readDelegationTerminalNegativeSolAuthorityV1(projectRoot, transaction.delegation_id);
-		if (!read.ok) return read.error.code === "not_found" ? { ok: true, value: undefined } : read;
-		return canonicalHash(read.value.state) === canonicalHash(transaction)
-			? { ok: true, value: read.value.decision }
-			: { ok: false, error: { code: "invalid_record" } };
+		return readDelegationCurrentSemanticRepairDecisionV1(projectRoot, committed.value);
 	},
 	readInactiveClosure: async (projectRoot, transaction) => {
 		const read = await readDelegationInactiveBlockerClosureV2(projectRoot, transaction);
@@ -387,13 +378,25 @@ async function scanAuthority(
 		transactions.set(id, parsed.state);
 	}
 
+	// Supersession receipts bind an exact proof-null, zero-write terminal
+	// attempt. Read them before continuation validation so a later decision on
+	// the parent cannot resurrect the closed attempt as invalid authority.
+	const supersededAttempts = new Set<string>();
+	for (const transaction of transactions.values()) {
+		if (transaction.repair_lineage === undefined) continue;
+		const superseded = await readers.readEmptyRepairAttemptSupersession(projectRoot, transaction);
+		if (!superseded.ok) {
+			return { ok: false, failure: errorFailure(superseded.error.code, transaction.delegation_id) };
+		}
+		if (superseded.value) supersededAttempts.add(transaction.delegation_id);
+	}
+
 	const decisions = new Map<string, DelegationSemanticRepairDecisionV1>();
 	for (const transaction of transactions.values()) {
 		let read: AuthorityRead<DelegationSemanticRepairDecisionV1 | undefined>;
 		if (transaction.status === "PENDING_REVIEW") {
 			read = await readers.readSemanticRepairDecision(projectRoot, transaction.delegation_id);
-		} else if (transaction.repair_lineage === undefined
-			&& (transaction.status === "FAILED" || transaction.status === "INTERRUPTED")) {
+		} else if (transaction.status === "FAILED" || transaction.status === "INTERRUPTED") {
 			read = await readers.readTerminalNegativeRepairDecision(projectRoot, transaction);
 		} else {
 			continue;
@@ -413,9 +416,15 @@ async function scanAuthority(
 		if (transaction.repair_lineage !== undefined) lineaged.set(transaction.delegation_id, transaction);
 		else if (decisions.has(transaction.delegation_id)) roots.set(transaction.delegation_id, transaction);
 	}
-	const children = new Map<string, string>();
-	const supersededAttempts = new Set<string>();
 	for (const child of lineaged.values()) {
+		if (!supersededAttempts.has(child.delegation_id) &&
+			supersededAttempts.has(child.repair_lineage!.repair_of)) {
+			return { ok: false, failure: invalidGraph(child.repair_lineage!.repair_of) };
+		}
+	}
+	const children = new Map<string, string>();
+	for (const child of lineaged.values()) {
+		if (supersededAttempts.has(child.delegation_id)) continue;
 		const lineage = child.repair_lineage!;
 		const root = roots.get(lineage.root_delegation_id);
 		const rootDecision = decisions.get(lineage.root_delegation_id);
@@ -441,30 +450,34 @@ async function scanAuthority(
 			}
 			if (decisions.has(parent.delegation_id)) {
 				const parentDecision = decisions.get(parent.delegation_id);
-				if (parentDecision === undefined || lineage.continuation_decision_delegation_id !== parent.delegation_id ||
-					lineage.continuation_decision_hash !== parentDecision.decision_hash) {
-					return { ok: false, failure: invalidGraph(child.delegation_id) };
+				const bindsCurrentParent = parentDecision !== undefined &&
+					lineage.continuation_decision_delegation_id === parent.delegation_id &&
+					lineage.continuation_decision_hash === parentDecision.decision_hash;
+				if (!bindsCurrentParent) {
+					const inheritsPriorParentAuthority =
+						lineage.continuation_decision_delegation_id === parentLineage.continuation_decision_delegation_id &&
+						lineage.continuation_decision_hash === parentLineage.continuation_decision_hash;
+					let hasOwnSemanticAuthority = decisions.has(child.delegation_id);
+					if (!hasOwnSemanticAuthority && child.status === "REVIEWED") {
+						const reviewed = await readers.readSemanticReviewClosure(projectRoot, child);
+						if (!reviewed.ok) {
+							return { ok: false, failure: errorFailure(reviewed.error.code, child.delegation_id) };
+						}
+						hasOwnSemanticAuthority = reviewed.value;
+					}
+					if (!inheritsPriorParentAuthority || !hasOwnSemanticAuthority) {
+						return { ok: false, failure: invalidGraph(child.delegation_id) };
+					}
 				}
 			} else if (lineage.continuation_decision_delegation_id !== parentLineage.continuation_decision_delegation_id ||
 				lineage.continuation_decision_hash !== parentLineage.continuation_decision_hash) {
 				return { ok: false, failure: invalidGraph(child.delegation_id) };
 			}
 		}
-		const superseded = await readers.readEmptyRepairAttemptSupersession(projectRoot, child);
-		if (!superseded.ok) {
-			return { ok: false, failure: errorFailure(superseded.error.code, child.delegation_id) };
-		}
-		if (superseded.value) {
-			supersededAttempts.add(child.delegation_id);
-			continue;
-		}
 		if (children.has(parent.delegation_id)) {
 			return { ok: false, failure: invalidGraph(child.delegation_id) };
 		}
 		children.set(parent.delegation_id, child.delegation_id);
-	}
-	for (const supersededId of supersededAttempts) {
-		if (children.has(supersededId)) return { ok: false, failure: invalidGraph(supersededId) };
 	}
 
 	const reached = new Set<string>(supersededAttempts);

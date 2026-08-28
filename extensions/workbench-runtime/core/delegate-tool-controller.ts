@@ -95,6 +95,7 @@ type CurrentDelegationBinding =
 	| { readonly status: "fresh" | "conflict"; readonly hash: string };
 
 const DELEGATION_FAILURE_SUMMARY_MAX_BYTES = 2_048 as const;
+const WORKBENCH_RECIPES_CONFIG_PATH = ".pi/workbench/recipes.yaml" as const;
 
 interface DelegateSessionMirrorWarning {
 	code: "session_mirror_append_failed";
@@ -217,6 +218,26 @@ function pathLaneAllowsSessionBindingBypass(
 
 function pathLaneMayResolveProjectIssue(code: string | undefined): boolean {
 	return isDelegationPathLaneBypassableProjectIssueV1(code);
+}
+
+/**
+ * An exact repair may need to repair the verification catalog that its parent
+ * worker left malformed.  The immutable repair contract still has to grant
+ * the exact recipes.yaml path; every ordinary delegation and every other
+ * verification failure keeps the normal fail-closed preflight.
+ *
+ * This exception applies only before the worker starts.  The immutable worker
+ * contract still requires the original recipe verification after the catalog
+ * is repaired; no post-worker review or final-verification authority changes.
+ */
+function exactRepairMayRepairVerificationCatalogV1(
+	exactRepairAuthority: ExactRepairCommandAuthorityV1 | undefined,
+	allowedPaths: readonly string[],
+	code: string,
+): boolean {
+	return exactRepairAuthority !== undefined &&
+		(code === "config_invalid" || code === "recipe_missing") &&
+		allowedPaths.includes(WORKBENCH_RECIPES_CONFIG_PATH);
 }
 
 function strictCommittedChangeSet(value: DelegationCommittedGenerationV2): ChangeSetRecord | undefined {
@@ -444,7 +465,13 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					throw new Error("workbench_delegate_worker: invalid verification recipe reference");
 				}
 				const initialVerification = await validateWorkerVerificationRecipes(projectRoot, verificationRecipes);
-				if (!initialVerification.ok) {
+				const repairMayRestoreVerificationCatalog = !initialVerification.ok &&
+					exactRepairMayRepairVerificationCatalogV1(
+						exactRepairAuthority,
+						contract.value.allowed_paths,
+						initialVerification.code,
+					);
+				if (!initialVerification.ok && !repairMayRestoreVerificationCatalog) {
 					const recipe = initialVerification.recipe === undefined ? undefined : boundedInlineDetail(initialVerification.recipe, 200);
 					const configRepair = initialVerification.code === "config_invalid" || initialVerification.code === "recipe_missing";
 					const nextAction = configRepair
@@ -466,7 +493,11 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 				}
 				const verifyRecipesBeforeLaunch = async (): Promise<void> => {
 					const preflight = await validateWorkerVerificationRecipes(projectRoot, verificationRecipes);
-					if (!preflight.ok) {
+					if (!preflight.ok && !exactRepairMayRepairVerificationCatalogV1(
+						exactRepairAuthority,
+						contract.value.allowed_paths,
+						preflight.code,
+					)) {
 						const recipe = preflight.recipe === undefined ? "" : `; recipe=${preflight.recipe}`;
 						throw new Error(`workbench_delegate_worker: verification ${preflight.code}${recipe}`);
 					}

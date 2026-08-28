@@ -413,6 +413,31 @@ test("lineaged recovery accepts only the legacy CLEAN command-failure shape as a
 	}, "evidence loss remains fail-closed and is never treated as the legacy CLEAN exception");
 });
 
+test("a new terminal-negative decision on a lineaged FAILED parent replaces stale continuation authority", () => {
+	const source = committed({
+		status: "FAILED",
+		commandPath: "src/generated.ts",
+		legacyCleanRunFailure: true,
+	});
+	const sidecar = terminalNegativeAuthority(source, {
+		decisionReason: "Repair the current failed continuation using its newly reviewed failure facts.",
+	});
+	const recovered = recoverExactRepairCommandAuthorityV1({
+		repairOf: ID,
+		committed: source,
+		terminalNegativeRepair: sidecar,
+		currentBindingHash: sidecar.bound_diff_hash,
+	});
+	assert.equal(recovered.ok, true, recovered.ok ? "" : recovered.code);
+	if (!recovered.ok) return;
+	assert.equal(recovered.value.authority_kind, "terminal-negative-repair");
+	assert.equal(recovered.value.successor_lineage.depth, 2);
+	assert.equal(recovered.value.successor_lineage.repair_of, ID);
+	assert.equal(recovered.value.successor_lineage.continuation_decision_delegation_id, ID);
+	assert.equal(recovered.value.successor_lineage.continuation_decision_hash, sidecar.decision.decision_hash);
+	assert.equal(recovered.value.successor_lineage.parent_lineage_hash, source.state.repair_lineage?.lineage_hash);
+});
+
 test("lineaged terminal recovery does not reinterpret carried review dependencies as write scope", () => {
 	const source = committed({
 		allowedPaths: ["src/worker.ts"],

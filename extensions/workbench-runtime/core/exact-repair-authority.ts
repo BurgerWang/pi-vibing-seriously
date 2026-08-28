@@ -15,6 +15,7 @@ import {
 } from "./delegation-transaction-artifacts.ts";
 import {
 	hasDelegationSemanticRepairAuthorityV2,
+	isDelegationTerminalNegativeReviewEligibleFromCommittedV1,
 	type DelegationCommittedGenerationV2,
 	type DelegationReviewAuthorityV2,
 	type DelegationSemanticRepairDecisionV1,
@@ -212,11 +213,14 @@ function byteSortedUnion(...sets: ReadonlyArray<readonly string[]>): string[] | 
 
 /**
  * Recover only concrete, committed facts. Allowed-path rules remain immutable
- * successor write authority; they are never expanded into artificial carried
- * paths. Command-owned paths are accepted only through their closed provenance.
+ * successor write authority; they are never expanded into artificial write
+ * paths. A terminal-negative compatibility repair additionally carries every
+ * unresolved drift/conflict path into later semantic review without granting
+ * the worker write authority over it.
  */
 function strictCommittedRepairScopeV1(
 	committed: DelegationCommittedGenerationV2,
+	allowTerminalNegativeCompatibility = false,
 ): StrictCommittedRepairScopeV1 | undefined {
 	const state = committed.state;
 	const scope = committed.records["scope.json"];
@@ -231,6 +235,8 @@ function strictCommittedRepairScopeV1(
 		: [...commandProvenance.effective_paths];
 	const effectiveStatus = commandProvenance?.effective_status ?? changeSet.status;
 	const effectiveHash = commandProvenance?.effective_delta_hash ?? changeSet.worker_delta_hash;
+	const terminalNegativeCompatibility = allowTerminalNegativeCompatibility
+		&& isDelegationTerminalNegativeReviewEligibleFromCommittedV1(state, committed.records);
 	const scopeChangedPaths = scope.changed_paths;
 	const scopeAllowedPaths = scope.allowed_paths;
 	const outcome = state.terminal_outcome;
@@ -239,9 +245,9 @@ function strictCommittedRepairScopeV1(
 		!Array.isArray(scopeAllowedPaths) || !scopeAllowedPaths.every((path): path is string => typeof path === "string") ||
 		!sameStrings(scopeChangedPaths, effectivePaths) || !sameStrings(scopeAllowedPaths, state.allowed_paths) ||
 		!sameStrings(outcome.changed_paths, effectivePaths) || outcome.change_set_status !== effectiveStatus ||
-		(commandProvenance === undefined
+		(!terminalNegativeCompatibility && (commandProvenance === undefined
 			? effectiveStatus !== "ATTRIBUTED"
-			: !isDelegationCommandScopeAttributedV1(commandProvenance, changeSet)) ||
+			: !isDelegationCommandScopeAttributedV1(commandProvenance, changeSet))) ||
 		outcome.delta_hash !== effectiveHash ||
 		outcome.terminal_facts_complete !== true || outcome.scope_complete !== true) return undefined;
 	if (commandProvenance !== undefined &&
@@ -257,6 +263,10 @@ function strictCommittedRepairScopeV1(
 		parentLineage?.carried_paths ?? [],
 		effectivePaths,
 		changeSet.dependency_paths,
+		...(terminalNegativeCompatibility ? [
+			(commandProvenance?.remaining_workspace_drift ?? changeSet.workspace_drift).map((entry) => entry.path),
+			changeSet.conflicts.map((entry) => entry.path),
+		] : []),
 	);
 	// Only this transaction's effective W∪C is write authority. Inherited
 	// carried paths and dependency paths remain review/conflict provenance and
@@ -376,7 +386,10 @@ export function recoverExactRepairCommandAuthorityV1(input: {
 	if (!sameStrings(arguments_.allowed_paths, state.allowed_paths)) {
 		return { ok: false, code: "CONTRACT_RECOVERY_FAILED" };
 	}
-	const scope = strictCommittedRepairScopeV1(input.committed);
+	const scope = strictCommittedRepairScopeV1(
+		input.committed,
+		input.terminalNegativeRepair !== undefined,
+	);
 	if (scope === undefined) return { ok: false, code: "INVALID_COMMITTED_SCOPE" };
 	const commonProjection = {
 		schema_version: 1 as const,

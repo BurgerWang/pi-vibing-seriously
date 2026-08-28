@@ -1015,7 +1015,7 @@ test("storage v2 terminal-negative eligibility rejects missing proof, empty delt
 	}
 });
 
-test("storage v2 terminal-negative compatibility accepts only a strictly proven historical failed CLEAN recipe", async () => {
+test("storage v2 terminal-negative compatibility accepts a strictly proven historical failed CLEAN recipe", async () => {
 	const root = await tempProject();
 	try {
 		await completeProvisionalSemanticReview(root, "FAILED");

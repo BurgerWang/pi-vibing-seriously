@@ -26,6 +26,7 @@ import {
 	type ExactRepairSuccessorReadCodeV1,
 } from "./exact-repair-successor.ts";
 import {
+	isDelegationTerminalNegativeReviewEligibleFromCommittedV1,
 	readDelegationCommittedGenerationV2,
 	readDelegationReviewV2,
 	readDelegationTerminalNegativeSolAuthorityV1,
@@ -275,15 +276,27 @@ export async function runExactRepairServiceV1(
 					return { status: "AUTHORITY_UNAVAILABLE", repair_of: repairOf, source: "semantic-repair", code: read.error.code };
 				}
 				review = read.value;
-			} else if (committed.value.state.status === "INTERRUPTED" ||
-				(committed.value.state.status === "FAILED" && committed.value.state.repair_lineage === undefined)) {
-				const read = await readTerminalNegative(input.project_root, repairOf);
-				if (!read.ok) {
-					return { status: "AUTHORITY_UNAVAILABLE", repair_of: repairOf, source: "terminal-negative-repair", code: read.error.code };
+			} else if (committed.value.state.status === "INTERRUPTED" || committed.value.state.status === "FAILED") {
+				const lineagedFailed = committed.value.state.status === "FAILED"
+					&& committed.value.state.repair_lineage !== undefined;
+				const inspectTerminalNegative = !lineagedFailed ||
+					isDelegationTerminalNegativeReviewEligibleFromCommittedV1(
+						committed.value.state,
+						committed.value.records,
+					);
+				if (inspectTerminalNegative) {
+					const read = await readTerminalNegative(input.project_root, repairOf);
+					const terminalNegativeRequired = committed.value.state.status === "INTERRUPTED"
+						|| committed.value.state.repair_lineage === undefined;
+					if (!read.ok && (terminalNegativeRequired || read.error.code !== "not_found")) {
+						return { status: "AUTHORITY_UNAVAILABLE", repair_of: repairOf, source: "terminal-negative-repair", code: read.error.code };
+					}
+					if (read.ok) {
+						terminalNegativeRepair = read.value;
+						currentBindingHash = read.value.bound_diff_hash;
+						terminalNegativeNeedsFreshBinding = true;
+					}
 				}
-				terminalNegativeRepair = read.value;
-				currentBindingHash = read.value.bound_diff_hash;
-				terminalNegativeNeedsFreshBinding = true;
 			}
 			const recovered = recoverAuthority({
 				repairOf,

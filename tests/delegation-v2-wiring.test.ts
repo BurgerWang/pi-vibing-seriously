@@ -26,6 +26,7 @@ import {
 	publishDelegationSemanticRepairDecisionV1,
 	readDelegationCommittedGenerationV2,
 	readDelegationReviewV2,
+	readDelegationTerminalNegativeReviewV1,
 	readDelegationTransactionV2,
 } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
 import {
@@ -359,6 +360,50 @@ async function completeCurrentSemanticPresentation(
 	throw new Error("semantic presentation did not converge");
 }
 
+async function requireCurrentTerminalSemanticRepair(
+	root: string,
+	stub: StubAPI,
+	ctx: ExtensionContext,
+	delegationId: string,
+	reason: string,
+): Promise<RuntimeResult> {
+	const tool = reviewTool(stub);
+	for (let segment = 0; segment < 500; segment += 1) {
+		const current = await readDelegationTerminalNegativeReviewV1(root, delegationId);
+		if (!current.ok) {
+			assert.equal(current.error.code, "not_found");
+			const initialized = await tool.execute(`terminal-repair-initialize-${segment}`, {
+				delegation_id: delegationId,
+			}, undefined, undefined, ctx);
+			assert.equal(initialized.details.ok, true, resultText(initialized));
+			continue;
+		}
+		const record = current.value.review as unknown as Record<string, unknown>;
+		if (record.presentation_complete === true) {
+			const bound = record.bound_diff_hash;
+			assert.equal(typeof bound, "string");
+			const repaired = await tool.execute("terminal-semantic-repair", {
+				delegation_id: delegationId,
+				semantic_decision: "REPAIR",
+				expected_bound_diff_hash: bound,
+				repair_reason: reason,
+			}, undefined, undefined, ctx);
+			assert.equal(repaired.details.ok, true, resultText(repaired));
+			return repaired;
+		}
+		const remaining = record.presentation_remaining_paths;
+		assert.ok(Array.isArray(remaining) && remaining.length > 0);
+		const presented = await tool.execute(`terminal-repair-segment-${segment}`, {
+			delegation_id: delegationId,
+			include_paths: [remaining[0]],
+			max_lines: 400,
+			max_bytes: 32768,
+		}, undefined, undefined, ctx);
+		assert.equal(presented.details.ok, true, resultText(presented));
+	}
+	throw new Error("terminal semantic repair presentation did not converge");
+}
+
 async function publishCompletedSemanticRepairFixture(
 	root: string,
 	delegationId: string,
@@ -508,6 +553,7 @@ async function writeFakeWorker(
 		changedPaths?: readonly string[];
 		deniedWrite?: boolean;
 		body?: string;
+		exitCode?: number;
 		launchMarkerPath?: string;
 		unownedPath?: string;
 	},
@@ -557,6 +603,7 @@ async function writeFakeWorker(
 		"  usage: { input: 8, output: 4, cacheRead: 0, cacheWrite: 0, totalTokens: 12, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },",
 		"};",
 		"process.stdout.write(JSON.stringify({ type: 'message_end', message }) + '\\n');",
+		...(options.exitCode === undefined ? [] : [`process.exitCode = ${options.exitCode};`]),
 		"}",
 		"main().catch((error) => { process.stderr.write(String(error && error.message || error)); process.exitCode = 1; });",
 		"",
@@ -1296,7 +1343,7 @@ test("implementation omission defaults to implementation, zero diff durably FAIL
 	});
 });
 
-test("public WORKSPACE_DRIFT failure keeps a nonzero binding PENDING and never auto-releases the next delegation", async () => {
+test("public WORKSPACE_DRIFT failure routes to REPAIR-only review and never auto-releases the next delegation", async () => {
 	await withTempDir(async (root) => {
 		await initializeProject(root);
 		const script = await writeFakeWorker(root, {
@@ -1324,7 +1371,8 @@ test("public WORKSPACE_DRIFT failure keeps a nonzero binding PENDING and never a
 			const status = await delegationStatusTool(stub).execute("implementation-drift-status", {}, undefined, undefined, ctx);
 			const statusOutput = resultText(status);
 			assert.match(statusOutput, new RegExp(`latest\\s+: ${state.latestId} FAILED`, "u"));
-			assert.match(statusOutput, /next action\s+: inspect workbench_delegation_status; do not retry review/u);
+			assert.match(statusOutput, new RegExp(`next action\\s+: call workbench_review_worker_diff with delegation_id=${state.latestId}`, "u"));
+			assert.match(statusOutput, /committed non-empty delta requires REPAIR-only Sol review/u);
 			assert.doesNotMatch(statusOutput, /repair_of=/u, "non-attributed drift has no fabricated exact-repair authority");
 			assert.doesNotMatch(statusOutput, /latest\s+: .* PENDING_REVIEW/u);
 			assert.equal((statusOutput.match(/next action\s+:/gu) ?? []).length, 1, "FAILED reports one durable recovery action");
@@ -2066,6 +2114,177 @@ test("an exact semantic REPAIR sidecar launches one bounded implementation linea
 		const forked = await readProjectDelegationRepairClosureV1(root);
 		assert.equal(forked.ok, false);
 		if (!forked.ok) assert.equal(forked.issue.code, "repair_lineage_fork");
+	});
+});
+
+test("a lineaged terminal-negative REPAIR remains valid through capsule, graph, lane, and depth-two execution", async () => {
+	await withTempDir(async (root) => {
+		await initializeProject(root);
+		await writeFile(join(root, ".gitignore"), [
+			`${CONFIG_DIR_NAME}/workbench/delegations/`,
+			`${CONFIG_DIR_NAME}/workbench/tool-results/`,
+			`${CONFIG_DIR_NAME}/workbench/runs/`,
+			`${CONFIG_DIR_NAME}/workbench/delegation-start.lock`,
+			"fake-worker-*.cjs",
+			"",
+		].join("\n"), "utf8");
+		assert.equal((await spawnExec("git", ["add", ".gitignore", `${CONFIG_DIR_NAME}/workbench/project.yaml`], { cwd: root })).code, 0);
+		const baseline = await spawnExec("git", [
+			"-c", "user.name=Workbench Test", "-c", "user.email=workbench@example.invalid",
+			"commit", "-q", "-m", "test baseline",
+		], { cwd: root });
+		assert.equal(baseline.code, 0, baseline.stderr);
+		const rejectedPath = "src/lineaged-terminal-negative.ts";
+		const initialScript = await writeFakeWorker(root, { changedPath: rejectedPath, body: "known-bad\n" });
+		const failedRepairScript = await writeFakeWorker(root, {
+			changedPath: rejectedPath,
+			body: "partial-repair\n",
+			exitCode: 1,
+		});
+		const finalRepairScript = await writeFakeWorker(root, { changedPath: rejectedPath, body: "fixed\n" });
+		const stub = commanderRuntime();
+		const ctx = commanderContext(root, "lineaged-terminal-negative-continuation");
+		const initial = await withFakeWorker(initialScript, () => delegateTool(stub).execute(
+			"lineaged-terminal-negative-root",
+			delegateParams({ task_kind: "implementation", allowed_paths: [rejectedPath] }),
+			undefined,
+			undefined,
+			ctx,
+		));
+		const rootId = delegationId(initial);
+		await requireCurrentSemanticRepair(
+			root,
+			stub,
+			ctx,
+			rootId,
+			"The original implementation must be repaired.",
+		);
+
+		const beforeFailedRepair = await delegationDirectories(root);
+		const firstNotices: string[] = [];
+		await withFakeWorker(failedRepairScript, () => exactRepairCommand(stub).handler(
+			rootId,
+			exactRepairCommandContext(root, "lineaged-terminal-negative-first", firstNotices, () => {}),
+		));
+		const failedId = (await delegationDirectories(root)).find((id) => !beforeFailedRepair.includes(id));
+		assert.equal(typeof failedId, "string", firstNotices.at(-1));
+		if (failedId === undefined) return;
+		const failed = await readDelegationCommittedGenerationV2(root, failedId);
+		assert.equal(failed.ok, true, failed.ok ? "" : failed.error.code);
+		if (!failed.ok) return;
+		assert.equal(failed.value.state.status, "INTERRUPTED");
+		assert.equal(failed.value.state.repair_lineage?.depth, 1);
+		const parentLineage = failed.value.state.repair_lineage!;
+		const staleLineage = bindDelegationRepairLineageV1({
+			schema_version: 1,
+			kind: "semantic-repair-lineage-v1",
+			root_delegation_id: parentLineage.root_delegation_id,
+			repair_of: failedId,
+			root_decision_hash: parentLineage.root_decision_hash,
+			continuation_decision_delegation_id: parentLineage.continuation_decision_delegation_id,
+			continuation_decision_hash: parentLineage.continuation_decision_hash,
+			parent_lineage_hash: parentLineage.lineage_hash,
+			depth: parentLineage.depth + 1,
+			carried_paths: [...parentLineage.carried_paths],
+		});
+		assert.ok(staleLineage);
+		const staleContract = normalizeDelegationBoundedTaskContractV2({
+			task_kind: "implementation",
+			task: "Perform the bounded delegated task.",
+			allowed_paths: [rejectedPath],
+			acceptance_criteria: ["The requested bounded behavior is observed."],
+			verification: [],
+			timeout_seconds: 60,
+			budget_profile: "standard",
+			repair_of: failedId,
+		});
+		assert.equal(staleContract.ok, true);
+		if (!staleContract.ok) return;
+		const staleId = "20991231-235956-stal";
+		const stalePrepared = await persistPreparedDelegationTransaction(root, {
+			delegation_id: staleId,
+			task_kind: "implementation",
+			contract_hash: staleContract.value.contract_hash,
+			allowed_paths: [rejectedPath],
+			worker_identity: { provider: WORKER_PROVIDER, model: WORKER_MODEL_ID, worker_id: `worker:${staleId}` },
+			generation: 1,
+			now: new Date().toISOString(),
+			repair_lineage: staleLineage,
+		});
+		assert.equal(stalePrepared.ok, true, stalePrepared.ok ? "" : stalePrepared.error.code);
+		if (!stalePrepared.ok) return;
+		const staleAborted = await persistAbortedDelegationTransaction(root, {
+			delegation_id: staleId,
+			contract_hash: stalePrepared.value.contract_hash,
+			worker_identity: stalePrepared.value.worker_identity,
+			expected_generation: stalePrepared.value.generation,
+			expected_revision: stalePrepared.value.revision,
+			now: new Date(Date.parse(stalePrepared.value.updated_at) + 1_000).toISOString(),
+			reason: RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.preparedCallbackFailed,
+		});
+		assert.equal(staleAborted.ok, true, staleAborted.ok ? "" : staleAborted.error.code);
+		if (!staleAborted.ok) return;
+		const staleGuard = await collectWorkspaceGuard({ project_root: root, exec: spawnExec });
+		assert.equal(staleGuard.ok, true, staleGuard.ok ? "" : staleGuard.error.code);
+		if (!staleGuard.ok) return;
+		const staleClosed = await publishDelegationInactiveBlockerClosureV2({
+			project_root: root,
+			transaction: staleAborted.value,
+			workspace_guard: staleGuard.guard,
+			now: new Date(Date.parse(staleAborted.value.updated_at) + 2_000).toISOString(),
+			closed_by: { provider: "openai", model: "gpt-5.6-sol" },
+		});
+		assert.equal(staleClosed.ok, true, staleClosed.ok ? "" : staleClosed.error.code);
+		assert.deepEqual(await readProjectDelegationRepairClosureV1(root), {
+			ok: true,
+			unresolvedTipId: failedId,
+			rootCount: 1,
+			lineageCount: 2,
+		});
+
+		const reason = "The first repair still violates the exact requested behavior.";
+		const terminalDecision = await requireCurrentTerminalSemanticRepair(root, stub, ctx, failedId, reason);
+		const terminalDecisionHash = terminalDecision.details.repair_decision_hash;
+		assert.equal(typeof terminalDecisionHash, "string");
+		const capsule = await readWorkerRepairCapsule(root, failedId);
+		assert.equal(capsule.ok, true, capsule.ok ? "" : capsule.code);
+		if (capsule.ok) {
+			assert.equal(capsule.capsule.semantic_repair?.delegation_id, failedId);
+			assert.equal(capsule.capsule.semantic_repair?.decision_hash, terminalDecisionHash);
+			assert.equal(capsule.capsule.semantic_repair?.repair_reason, reason);
+		}
+		assert.deepEqual(await readProjectDelegationRepairClosureV1(root), {
+			ok: true,
+			unresolvedTipId: failedId,
+			rootCount: 1,
+			lineageCount: 2,
+		});
+
+		const beforeFinalRepair = await delegationDirectories(root);
+		const secondNotices: string[] = [];
+		await withFakeWorker(finalRepairScript, () => exactRepairCommand(stub).handler(
+			failedId,
+			exactRepairCommandContext(root, "lineaged-terminal-negative-second", secondNotices, () => {}),
+		));
+		const closureAfterFinalExecution = await readProjectDelegationRepairClosureV1(root);
+		assert.equal(closureAfterFinalExecution.ok, true, JSON.stringify(closureAfterFinalExecution));
+		assert.doesNotMatch(secondNotices.at(-1) ?? "", /AUTHORITY_INVALID|repair_lineage_continuation_invalid/u);
+		const finalId = (await delegationDirectories(root)).find((id) => !beforeFinalRepair.includes(id));
+		assert.equal(typeof finalId, "string", secondNotices.at(-1));
+		if (finalId === undefined) return;
+		const final = await readDelegationCommittedGenerationV2(root, finalId);
+		assert.equal(final.ok, true, final.ok ? "" : final.error.code);
+		if (!final.ok) return;
+		assert.equal(final.value.state.repair_lineage?.depth, 2);
+		assert.equal(final.value.state.repair_lineage?.repair_of, failedId);
+		assert.equal(final.value.state.repair_lineage?.continuation_decision_delegation_id, failedId);
+		assert.equal(final.value.state.repair_lineage?.continuation_decision_hash, terminalDecisionHash);
+		assert.deepEqual(await readProjectDelegationRepairClosureV1(root), {
+			ok: true,
+			unresolvedTipId: finalId,
+			rootCount: 1,
+			lineageCount: 3,
+		});
 	});
 });
 

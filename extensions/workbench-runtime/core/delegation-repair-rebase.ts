@@ -18,7 +18,6 @@ import { canonicalHash } from "../cache/canonical-hash.ts";
 import type { ExecFn } from "./config.ts";
 import type { DelegationCommittedGenerationV2 } from "./delegation-transaction-storage.ts";
 import {
-	delegationPathAllowedV2,
 	parseDelegationRepairLineageV1,
 } from "./delegation-transaction.ts";
 import {
@@ -34,7 +33,6 @@ export type TerminalRepairRebaseErrorCodeV1 =
 	| "invalid_committed_after"
 	| "workspace_unavailable"
 	| "head_changed"
-	| "lineage_outside_allowed_scope"
 	| "clean_workspace"
 	| "unmerged_path"
 	| "path_outside_lineage";
@@ -106,11 +104,6 @@ export async function collectTerminalRepairRebaseAuthorityV1(input: {
 	}
 	const lineage = parseDelegationRepairLineageV1(state.repair_lineage);
 	if (lineage === undefined) return { ok: false, code: "not_terminal_lineage" };
-	const outsideAllowed = lineage.carried_paths.find((path) =>
-		!delegationPathAllowedV2(path, state.allowed_paths));
-	if (outsideAllowed !== undefined) {
-		return { ok: false, code: "lineage_outside_allowed_scope", path: outsideAllowed };
-	}
 	const sealedAfter = afterGuard(input.committed);
 	if (sealedAfter?.git_head === null || sealedAfter === undefined) {
 		return { ok: false, code: "invalid_committed_after" };

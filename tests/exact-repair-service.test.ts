@@ -12,25 +12,44 @@ import type { DelegationCommittedGenerationV2 } from "../extensions/workbench-ru
 const ID = "20260827-010203-qrep";
 const BOUND = "9".repeat(64);
 
-function committed(status: "PENDING_REVIEW" | "INTERRUPTED" | "FAILED", lineaged = false): DelegationCommittedGenerationV2 {
+function committed(
+	status: "PENDING_REVIEW" | "INTERRUPTED" | "FAILED",
+	lineaged = false,
+	changedPaths: readonly string[] = ["src/repaired.ts"],
+): DelegationCommittedGenerationV2 {
 	return {
 		state: {
 			delegation_id: ID,
 			status,
+			task_kind: "implementation",
+			revision: 3,
+			allowed_paths: ["src/**"],
+			committed_proof: { revision: 2, content_hash: "c".repeat(64) },
+			review: null,
+			terminal_outcome: {
+				terminal_facts_complete: true,
+				scope_complete: true,
+				changed_paths: [...changedPaths],
+				delta_hash: "f".repeat(64),
+				change_set_status: "ATTRIBUTED",
+			},
 			...(lineaged ? { repair_lineage: { depth: 1 } } : {}),
 		},
-		proof: { content_hash: "c".repeat(64) },
+		proof: { revision: 2, content_hash: "c".repeat(64) },
+		records: {},
 	} as unknown as DelegationCommittedGenerationV2;
 }
 
-function authority(kind: "semantic-repair" | "terminal-negative-repair"): ExactRepairCommandAuthorityV1 {
+function authority(kind: "semantic-repair" | "terminal-negative-repair" | "terminal-lineage"): ExactRepairCommandAuthorityV1 {
 	return {
 		schema_version: 1,
 		kind: "exact-repair-command-execution-v1",
 		repair_of: ID,
 		committed_proof_content_hash: "c".repeat(64),
 		authority_kind: kind,
-		semantic_decision_hash: "d".repeat(64),
+		...(kind === "terminal-lineage"
+			? { lineage_hash: "6".repeat(64) }
+			: { semantic_decision_hash: "d".repeat(64) }),
 		...(kind === "terminal-negative-repair" ? { expected_bound_diff_hash: BOUND } : {}),
 		arguments: {
 			task_kind: "implementation",
@@ -145,6 +164,80 @@ test("UI-free service routes INTERRUPTED and legacy FAILED through terminal-nega
 			terminalReads: 1, successorReads: 2, executions: 1, bindingReads: 1,
 		}, status);
 	}
+});
+
+test("a lineaged FAILED parent prefers a newer terminal-negative decision and otherwise retains lineage retry", async () => {
+	for (const hasNewDecision of [true, false] as const) {
+		let terminalReads = 0;
+		let recoveredWithTerminal = false;
+		const expected = authority(hasNewDecision ? "terminal-negative-repair" : "semantic-repair") as ExactRepairCommandAuthorityV1;
+		const result = await runExactRepairServiceV1(input(), {
+			readCommittedGeneration: (async () => ({ ok: true, value: committed("FAILED", true) })) as never,
+			readReview: (async () => { throw new Error("must not read ordinary review"); }) as never,
+			readTerminalNegativeRepair: (async () => {
+				terminalReads += 1;
+				return hasNewDecision
+					? { ok: true, value: { bound_diff_hash: BOUND } }
+					: { ok: false, error: { code: "not_found" } };
+			}) as never,
+			recoverAuthority: ((recoveryInput: { terminalNegativeRepair?: unknown }) => {
+				recoveredWithTerminal = recoveryInput.terminalNegativeRepair !== undefined;
+				return { ok: true, value: expected };
+			}) as never,
+			readSuccessor: (async () => ({ ok: true, kind: "existing", value: successor("PENDING_REVIEW") })) as never,
+			collectCurrentBinding: async () => ({ status: "fresh", hash: BOUND }),
+			executeExactRepair: (async () => { throw new Error("durable replay must not execute"); }) as never,
+		});
+		assert.equal(result.status, "SUCCESSOR_RECORDED");
+		assert.equal(terminalReads, 1);
+		assert.equal(recoveredWithTerminal, hasNewDecision);
+	}
+});
+
+test("a zero-delta lineaged FAILED parent bypasses the inapplicable terminal-negative reader", async () => {
+	let terminalReads = 0;
+	let recoveredWithTerminal = true;
+	const result = await runExactRepairServiceV1(input(), {
+		readCommittedGeneration: (async () => ({ ok: true, value: committed("FAILED", true, []) })) as never,
+		readReview: (async () => { throw new Error("must not read ordinary review"); }) as never,
+		readTerminalNegativeRepair: (async () => {
+			terminalReads += 1;
+			return { ok: false, error: { code: "invalid_record" } };
+		}) as never,
+		recoverAuthority: ((recoveryInput: { terminalNegativeRepair?: unknown }) => {
+			recoveredWithTerminal = recoveryInput.terminalNegativeRepair !== undefined;
+		return { ok: true, value: authority("terminal-lineage") };
+		}) as never,
+		readSuccessor: (async () => ({ ok: true, kind: "existing", value: successor("PENDING_REVIEW") })) as never,
+		collectCurrentBinding: async () => ({ status: "fresh", hash: BOUND }),
+		executeExactRepair: (async () => { throw new Error("durable replay must not execute"); }) as never,
+	});
+	assert.equal(result.status, "SUCCESSOR_RECORDED");
+	assert.equal(terminalReads, 0);
+	assert.equal(recoveredWithTerminal, false);
+});
+
+test("an eligible lineaged FAILED parent still rejects a corrupt terminal-negative sidecar", async () => {
+	let recoveries = 0;
+	const result = await runExactRepairServiceV1(input(), {
+		readCommittedGeneration: (async () => ({ ok: true, value: committed("FAILED", true) })) as never,
+		readReview: (async () => { throw new Error("must not read ordinary review"); }) as never,
+		readTerminalNegativeRepair: (async () => ({ ok: false, error: { code: "invalid_record" } })) as never,
+		recoverAuthority: (() => {
+			recoveries += 1;
+			return { ok: true, value: authority("terminal-lineage") };
+		}) as never,
+		readSuccessor: (async () => { throw new Error("corrupt authority must stop before successor replay"); }) as never,
+		collectCurrentBinding: async () => ({ status: "fresh", hash: BOUND }),
+		executeExactRepair: (async () => { throw new Error("corrupt authority must not execute"); }) as never,
+	});
+	assert.deepEqual(result, {
+		status: "AUTHORITY_UNAVAILABLE",
+		repair_of: ID,
+		source: "terminal-negative-repair",
+		code: "invalid_record",
+	});
+	assert.equal(recoveries, 0);
 });
 
 test("durable replay precedes live binding and never executes a second worker", async () => {

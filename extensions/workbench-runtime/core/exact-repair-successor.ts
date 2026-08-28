@@ -17,6 +17,7 @@ import { normalizeDelegationBoundedTaskContractV2 } from "./delegation-transacti
 import {
 	hasDelegationSemanticRepairAuthorityV2,
 	hasDelegationSemanticReviewAuthorityV2,
+	isDelegationTerminalNegativeReviewEligibleFromCommittedV1,
 	readDelegationCommittedGenerationV2,
 	readDelegationReviewV2,
 	readDelegationTerminalNegativeSolAuthorityV1,
@@ -130,19 +131,34 @@ export type ClassifyExactRepairSuccessorResultV1 =
 	}
 	| { readonly ok: false; readonly code: "AUTHORITY_INVALID" | "STORAGE_FAILURE" };
 
+export interface ClassifyExactRepairSuccessorReadersV1 {
+	readonly readCommittedGeneration: typeof readDelegationCommittedGenerationV2;
+	readonly readReview: typeof readDelegationReviewV2;
+	readonly readTerminalNegativeRepair: typeof readDelegationTerminalNegativeSolAuthorityV1;
+	readonly recoverExactRepairAuthority: typeof recoverExactRepairCommandAuthorityV1;
+}
+
+const DEFAULT_CLASSIFIER_READERS = Object.freeze({
+	readCommittedGeneration: readDelegationCommittedGenerationV2,
+	readReview: readDelegationReviewV2,
+	readTerminalNegativeRepair: readDelegationTerminalNegativeSolAuthorityV1,
+	recoverExactRepairAuthority: recoverExactRepairCommandAuthorityV1,
+}) satisfies ClassifyExactRepairSuccessorReadersV1;
+
 /** Strict machine disposition shared by command replay and runtime chaining. */
 export async function classifyExactRepairSuccessorV1(
 	projectRoot: string,
 	candidate: DelegationTransactionRecord,
+	readers: ClassifyExactRepairSuccessorReadersV1 = DEFAULT_CLASSIFIER_READERS,
 ): Promise<ClassifyExactRepairSuccessorResultV1> {
 	if (candidate.committed_proof !== null) {
-		const committed = await readDelegationCommittedGenerationV2(projectRoot, candidate.delegation_id);
+		const committed = await readers.readCommittedGeneration(projectRoot, candidate.delegation_id);
 		if (!committed.ok || canonicalHash(committed.value.state) !== canonicalHash(candidate)) {
 			return { ok: false, code: committed.ok || committed.error.code !== "storage_failure" ? "AUTHORITY_INVALID" : "STORAGE_FAILURE" };
 		}
 		let disposition: ExactRepairExistingSuccessorV1["disposition"];
 		if (candidate.status === "PENDING_REVIEW") {
-			const review = await readDelegationReviewV2(projectRoot, candidate.delegation_id);
+			const review = await readers.readReview(projectRoot, candidate.delegation_id);
 			if (!review.ok) {
 				if (review.error.code === "not_found") disposition = "REVIEW_PENDING";
 				else return { ok: false, code: review.error.code === "storage_failure" ? "STORAGE_FAILURE" : "AUTHORITY_INVALID" };
@@ -150,17 +166,41 @@ export async function classifyExactRepairSuccessorV1(
 				disposition = hasDelegationSemanticRepairAuthorityV2(review.value) ? "REPAIR_PENDING" : "REVIEW_PENDING";
 			}
 		} else if (candidate.status === "REVIEWED") {
-			const review = await readDelegationReviewV2(projectRoot, candidate.delegation_id);
+			const review = await readers.readReview(projectRoot, candidate.delegation_id);
 			if (!review.ok) return { ok: false, code: review.error.code === "storage_failure" ? "STORAGE_FAILURE" : "AUTHORITY_INVALID" };
 			disposition = review.value.finalized && hasDelegationSemanticReviewAuthorityV2(review.value)
 				? "CHAIN_CLOSED" : "BLOCKED";
-		} else if (candidate.status === "INTERRUPTED") {
-			const negative = await readDelegationTerminalNegativeSolAuthorityV1(projectRoot, candidate.delegation_id);
-			if (negative.ok) disposition = "REPAIR_PENDING";
-			else if (negative.error.code === "not_found") disposition = "REVIEW_PENDING";
-			else return { ok: false, code: negative.error.code === "storage_failure" ? "STORAGE_FAILURE" : "AUTHORITY_INVALID" };
-		} else if ((candidate.status === "FAILED" || candidate.status === "RECOVERY_REQUIRED") &&
-			recoverExactRepairCommandAuthorityV1({ repairOf: candidate.delegation_id, committed: committed.value }).ok) {
+		} else if (candidate.status === "INTERRUPTED" || candidate.status === "FAILED") {
+			const terminalNegativeEligible = isDelegationTerminalNegativeReviewEligibleFromCommittedV1(
+				candidate,
+				committed.value.records,
+			);
+			const lineagedFailed = candidate.status === "FAILED" && candidate.repair_lineage !== undefined;
+			if (!terminalNegativeEligible && lineagedFailed && readers.recoverExactRepairAuthority({
+				repairOf: candidate.delegation_id,
+				committed: committed.value,
+			}).ok) {
+				// An empty repair child owns no new terminal-negative review. Its
+				// immutable inherited lineage remains the exact retry authority.
+				disposition = "EXACT_REPAIR_PENDING";
+			} else if (!terminalNegativeEligible) {
+				disposition = "BLOCKED";
+			} else {
+				const negative = await readers.readTerminalNegativeRepair(projectRoot, candidate.delegation_id);
+				if (negative.ok) disposition = "REPAIR_PENDING";
+				else if (negative.error.code !== "not_found") {
+					return { ok: false, code: negative.error.code === "storage_failure" ? "STORAGE_FAILURE" : "AUTHORITY_INVALID" };
+				} else if (lineagedFailed && readers.recoverExactRepairAuthority({
+					repairOf: candidate.delegation_id,
+					committed: committed.value,
+				}).ok) {
+					disposition = "EXACT_REPAIR_PENDING";
+				} else {
+					disposition = "REVIEW_PENDING";
+				}
+			}
+		} else if (candidate.status === "RECOVERY_REQUIRED" &&
+			readers.recoverExactRepairAuthority({ repairOf: candidate.delegation_id, committed: committed.value }).ok) {
 			disposition = "EXACT_REPAIR_PENDING";
 		} else {
 			disposition = "BLOCKED";

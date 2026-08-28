@@ -524,7 +524,7 @@ function committedStructuredReviewAuthorityForLifecycleV2(
 			? generation.state.status === "PENDING_REVIEW" && reviewAuthority.state.status === "PENDING_REVIEW"
 			: isDelegationTerminalNegativeReviewEligibleFromCommittedV1(generation.state, generation.records)
 				&& (isDelegationTerminalNegativeReviewEligibleV1(reviewAuthority.state)
-					|| reviewAuthority.terminal_negative_legacy_clean_command === true);
+					|| reviewAuthority.terminal_negative_committed_compatibility === true);
 		if (info === undefined || !lifecycleMatches
 			|| reviewAuthority.state.delegation_id !== generation.state.delegation_id
 			|| reviewAuthority.state.contract_hash !== generation.state.contract_hash
@@ -555,7 +555,7 @@ function committedStructuredReviewAuthorityForLifecycleV2(
 		const lineageGap = missingRepairLineageStructuredPresentationPathsV2(generation.state.repair_lineage, projection);
 		if (lineageGap === undefined) return { ok: false, code: "PROVISIONAL_REVIEW_INVALID" };
 		if (lineageGap.length > 0) return { ok: false, code: "LINEAGE_PRESENTATION_GAP" };
-		if (!sameJson(effectivePaths, info.authority.worker_paths) || !sameJson(effectivePaths, record.checked_paths)
+		if (!sameJson(baseEffectivePaths, info.authority.worker_paths) || !sameJson(effectivePaths, record.checked_paths)
 			|| envelope.path_count !== effectivePaths.length) return { ok: false, code: "PROVISIONAL_REVIEW_INVALID" };
 		const authority = authorityWithRelevance(info.authority, {
 			binding,
@@ -927,7 +927,7 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 				return fail("review_conflict", "semantic decision hash does not match the prior scope/integrity packet", { transaction: state });
 			}
 			if (!isScopeIntegrityPacketComplete(priorReview)) {
-				return fail("review_invalid", "semantic decision requires a complete untruncated and drift-free scope/integrity packet", { transaction: state });
+				return fail("review_invalid", "semantic decision requires a complete hash-bound presentation and drift-free scope/integrity packet", { transaction: state });
 			}
 			if (priorReview.semantic_review !== "required" || priorReview.semantic_acceptance !== undefined) {
 				return fail("review_invalid", "semantic decision requires a provisional semantic-review-required packet, never self-asserted authority", { transaction: state });
@@ -1004,6 +1004,9 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 				projectRoot: input.projectRoot,
 				workerPaths: authority.worker_paths,
 				allowedPaths: state.allowed_paths,
+				...(state.repair_lineage === undefined ? {} : {
+					lineageCarriedPaths: state.repair_lineage.carried_paths,
+				}),
 				afterDigests: authority.after.pathDigests,
 				pathStatuses: authority.current?.pathStatuses ?? {},
 				relevanceProjection: relevance.value.projection,

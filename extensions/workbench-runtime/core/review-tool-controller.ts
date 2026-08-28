@@ -345,7 +345,8 @@ export function registerReviewTool(controller: ReviewToolController): void {
 
 				const semantic = classifySemanticReviewRisk(result.record.checked_paths);
 				semanticRisk = semantic.risk;
-				semanticReview = v2Result.semantic_authority === "repair_required"
+				semanticReview = v2Result.semantic_authority === "repair_required" ||
+					v2Result.semantic_authority === "terminal_repair_required"
 					? "repair_required"
 					: v2Result.semantic_authority === "migration_accepted" || result.record.semantic_review === "accepted"
 					? "accepted"

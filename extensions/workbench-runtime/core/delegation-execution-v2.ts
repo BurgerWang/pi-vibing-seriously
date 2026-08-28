@@ -764,6 +764,9 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 				projectRoot: checked.projectRoot,
 				workerPaths: reviewPaths,
 				allowedPaths: checked.contract.allowed_paths,
+				...(state.repair_lineage === undefined ? {} : {
+					lineageCarriedPaths: state.repair_lineage.carried_paths,
+				}),
 				afterDigests: relevanceDigests,
 				pathStatuses: relevanceStatuses,
 				relevanceProjection: relevance.value.projection,

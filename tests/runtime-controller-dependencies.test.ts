@@ -467,7 +467,7 @@ test("review controller routes an eligible committed FAILED packet and reserves 
 			readCommittedGeneration: async () => ({ ok: true, value: { state: { status: "FAILED" }, records: {} } }),
 			isTerminalNegativeReviewEligible: () => true,
 			readRecoverableUnpublished: async () => ({ ok: false, error: { code: "not_recoverable" } }),
-			reviewV2: async (input: { maxBytes: number; maxLines: number }) => {
+			reviewV2: async (input: { maxBytes: number; maxLines: number; semanticDecision?: "ACCEPT" | "REPAIR" }) => {
 				packetMaxBytes = input.maxBytes;
 				packetMaxLines = input.maxLines;
 				packetText = "x".repeat(packetMaxBytes);
@@ -478,6 +478,11 @@ test("review controller routes an eligible committed FAILED packet and reserves 
 					review_hash: "b".repeat(64),
 					review_path: record.review_path,
 					finalized: false,
+					...(input.semanticDecision === "REPAIR" ? {
+						semantic_authority: "terminal_repair_required",
+						repair_decision_hash: "c".repeat(64),
+						repair_reason_hash: "d".repeat(64),
+					} : {}),
 				};
 			},
 			reviewLegacy: async () => { throw new Error("must use v2"); },
@@ -526,6 +531,27 @@ test("review controller routes an eligible committed FAILED packet and reserves 
 	);
 	assert.equal(unboundDecision.details.error, "invalid_semantic_accept");
 	assert.match(resultText(unboundDecision), /exact delegation_id/);
+
+	const repair = await tool.execute(
+		"review-terminal-repair",
+		{
+			delegation_id: delegationId,
+			semantic_decision: "REPAIR",
+			expected_bound_diff_hash: boundHash,
+			repair_reason: "Complete the interrupted implementation under the exact committed scope.",
+		},
+		undefined,
+		undefined,
+		context(),
+	);
+	assert.equal(repair.details.ok, true, resultText(repair));
+	assert.equal(repair.details.semantic_review, "repair_required");
+	assert.equal(repair.details.repair_of, delegationId);
+	assert.equal(repair.details.next_action, `call workbench_repair_delegation with delegation_id=${delegationId}`);
+	assert.equal(repair.details.repair_decision_hash, "c".repeat(64));
+	assert.equal(repair.details.repair_reason_hash, "d".repeat(64));
+	assert.match(resultText(repair), /semantic review: REPAIR_REQUIRED/u);
+	assert.match(resultText(repair), new RegExp(`workbench_repair_delegation with delegation_id=${delegationId}`));
 });
 
 test("review controller rejects active durable transactions with one actionable status", async () => {

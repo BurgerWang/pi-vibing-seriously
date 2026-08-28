@@ -253,6 +253,13 @@ async function readDescriptor(
 	if (transaction.repair_lineage !== undefined ||
 		transaction.status === "REVIEWED" || transaction.status === "FINISHED" ||
 		transaction.status === "ABORTED") return { status: "NONE", missing_sidecar: false };
+	const ordinaryBlocker = metadataAdmission.ordinary_blocker_ids.includes(delegationId);
+	const repairTip = metadataAdmission.repair_tip_ids.includes(delegationId);
+	// Event locators are selectors, never authority. A depth-zero transaction
+	// that no longer appears in either project-authoritative live set has been
+	// superseded or durably closed; do not let its stale/corrupt historical
+	// sidecar re-block the current project after closure has converged.
+	if (!ordinaryBlocker && !repairTip) return { status: "NONE", missing_sidecar: false };
 
 	if (transaction.status === "PENDING_REVIEW") {
 		const review = await readers.readReview(projectRoot, delegationId);
@@ -267,7 +274,7 @@ async function readDescriptor(
 		if (!readers.hasSemanticRepairAuthority(review.value)) {
 			return { status: "NONE", missing_sidecar: true };
 		}
-		if (!metadataAdmission.repair_tip_ids.includes(delegationId)) {
+		if (!repairTip) {
 			return { status: "BLOCKED", code: "PROJECT_AUTHORITY_CHANGED" };
 		}
 		return { status: "DESCRIPTOR", descriptor: { kind: "semantic-repair", transaction, review: review.value } };
@@ -297,13 +304,12 @@ async function readDescriptor(
 			return readFailure(terminal.error.code, "TERMINAL_REPAIR_SIDECAR_INVALID");
 		}
 		if (!allowNeedsReview) return { status: "NONE", missing_sidecar: true };
-		if (!metadataAdmission.ordinary_blocker_ids.includes(delegationId)) {
+		if (!ordinaryBlocker) {
 			return { status: "BLOCKED", code: "PROJECT_AUTHORITY_CHANGED" };
 		}
 		return { status: "DESCRIPTOR", descriptor: { kind: "terminal-needs-review", transaction } };
 	}
-	if (canonicalHash(terminal.value.state) !== canonicalHash(transaction) ||
-		!metadataAdmission.repair_tip_ids.includes(delegationId)) {
+	if (canonicalHash(terminal.value.state) !== canonicalHash(transaction) || !repairTip) {
 		return { status: "BLOCKED", code: "TERMINAL_REPAIR_SIDECAR_INVALID" };
 	}
 	return {

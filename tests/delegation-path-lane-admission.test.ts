@@ -14,6 +14,7 @@ import {
 	DELEGATION_COMMITTED_RECORD_NAMES,
 	delegationCommitMarker,
 	publishDelegationCommit,
+	reviewDelegationTransaction,
 	startDelegationTransaction,
 	type DelegationCommittedGenerationProof,
 	type DelegationRepairLineageV1,
@@ -132,6 +133,13 @@ function decision(transaction: DelegationTransactionRecord, hash: string, offset
 	};
 }
 
+function reviewed(transaction: DelegationTransactionRecord, offset: number): DelegationTransactionRecord {
+	return state(reviewDelegationTransaction(transaction, {
+		...cas(transaction, at(offset)),
+		review_hash: "9".repeat(64),
+	}));
+}
+
 function lineage(root: string, decisionHash: string, carriedPaths: readonly string[]): DelegationRepairLineageV1 {
 	const bound = bindDelegationRepairLineageV1({
 		schema_version: 1,
@@ -149,6 +157,29 @@ function lineage(root: string, decisionHash: string, carriedPaths: readonly stri
 	return bound;
 }
 
+function continuedLineage(
+	parent: DelegationTransactionRecord,
+	decisionHash: string,
+	carriedPaths: readonly string[],
+): DelegationRepairLineageV1 {
+	const parentLineage = parent.repair_lineage;
+	if (parentLineage === undefined) throw new Error("continued lineage requires a lineaged parent");
+	const bound = bindDelegationRepairLineageV1({
+		schema_version: 1,
+		kind: "semantic-repair-lineage-v1",
+		root_delegation_id: parentLineage.root_delegation_id,
+		repair_of: parent.delegation_id,
+		root_decision_hash: parentLineage.root_decision_hash,
+		continuation_decision_delegation_id: parent.delegation_id,
+		continuation_decision_hash: decisionHash,
+		parent_lineage_hash: parentLineage.lineage_hash,
+		depth: parentLineage.depth + 1,
+		carried_paths: [...carriedPaths],
+	});
+	if (bound === undefined) throw new Error("invalid continued lineage fixture");
+	return bound;
+}
+
 interface ReaderFixture {
 	transactions: Map<string, DelegationTransactionRecord>;
 	decisions: Map<string, DelegationSemanticRepairDecisionV1>;
@@ -156,6 +187,7 @@ interface ReaderFixture {
 	changed: Map<string, readonly string[]>;
 	closed: Set<string>;
 	superseded?: Set<string>;
+	semanticReviewed?: Set<string>;
 	pathErrors: Map<string, "invalid_record" | "not_found" | "storage_failure">;
 	order?: readonly string[];
 	pathReads: string[];
@@ -179,7 +211,10 @@ function readers(fixture: ReaderFixture): DelegationPathLaneAdmissionReadersV1 {
 			value: fixture.superseded?.has(transaction.delegation_id) ?? false,
 		}),
 		readRepairAbandonment: async () => ({ ok: true, value: false }),
-		readSemanticReviewClosure: async () => ({ ok: true, value: false }),
+		readSemanticReviewClosure: async (_root, transaction) => ({
+			ok: true,
+			value: fixture.semanticReviewed?.has(transaction.delegation_id) ?? false,
+		}),
 		readImmutablePaths: async (_root, transaction) => {
 			fixture.pathReads.push(transaction.delegation_id);
 			const error = fixture.pathErrors.get(transaction.delegation_id);
@@ -252,6 +287,81 @@ test("a superseded empty attempt does not form a fork with its replacement sibli
 	assert.deepEqual(fixture.pathReads, [TIP_B, replacementId]);
 });
 
+test("a superseded empty attempt stays excluded after its parent receives a newer continuation decision", async () => {
+	const staleId = "20260827-100005-stal";
+	const replacementId = "20260827-100006-rpl2";
+	const root = pending(ROOT_A, 0, ["src/root.ts"]);
+	const rootDecision = decision(root, DECISION_A, 4);
+	const parent = pending(
+		TIP_A,
+		10,
+		["src/partial.ts"],
+		lineage(ROOT_A, DECISION_A, ["src/root.ts"]),
+		true,
+	);
+	const parentDecision = decision(parent, DECISION_B, 14);
+	const parentLineage = parent.repair_lineage!;
+	const staleLineage = bindDelegationRepairLineageV1({
+		schema_version: 1,
+		kind: "semantic-repair-lineage-v1",
+		root_delegation_id: parentLineage.root_delegation_id,
+		repair_of: parent.delegation_id,
+		root_decision_hash: parentLineage.root_decision_hash,
+		continuation_decision_delegation_id: parentLineage.continuation_decision_delegation_id,
+		continuation_decision_hash: parentLineage.continuation_decision_hash,
+		parent_lineage_hash: parentLineage.lineage_hash,
+		depth: parentLineage.depth + 1,
+		carried_paths: ["src/partial.ts", "src/root.ts"],
+	});
+	assert.ok(staleLineage);
+	const stale = pending(staleId, 20, [], staleLineage);
+	const replacement = pending(
+		replacementId,
+		22,
+		["src/repaired.ts"],
+		continuedLineage(parent, DECISION_B, ["src/partial.ts", "src/root.ts"]),
+	);
+	const fixture: ReaderFixture = {
+		transactions: new Map([[staleId, stale], [replacementId, replacement], [TIP_A, parent], [ROOT_A, root]]),
+		decisions: new Map([[ROOT_A, rootDecision]]),
+		terminalDecisions: new Map([[TIP_A, parentDecision]]),
+		changed: new Map([[replacementId, ["src/repaired.ts"]]]),
+		closed: new Set(),
+		superseded: new Set([staleId]),
+		pathErrors: new Map(),
+		pathReads: [],
+	};
+	const admission = await admitProjectDelegationPathLaneV1(
+		{ project_root: "/project", allowed_paths: ["tests/**"] },
+		readers(fixture),
+	);
+	assert.equal(admission.decision.decision, "ALLOW", JSON.stringify(admission));
+	assert.deepEqual(admission.repair_tip_ids, [replacementId]);
+	assert.deepEqual(fixture.pathReads, [replacementId]);
+});
+
+test("a chain of strictly superseded empty attempts grants no child authority", async () => {
+	const childId = "20260827-100005-chld";
+	const fixture = twoLineages();
+	const parent = fixture.transactions.get(TIP_A)!;
+	const child = pending(
+		childId,
+		20,
+		[],
+		continuedLineage(parent, DECISION_A, ["src/rejected-a.ts"]),
+	);
+	fixture.transactions.set(childId, child);
+	fixture.superseded = new Set([TIP_A, childId]);
+
+	const admission = await admitProjectDelegationPathLaneV1(
+		{ project_root: "/project", allowed_paths: ["tests/**"] },
+		readers(fixture),
+	);
+	assert.equal(admission.decision.decision, "ALLOW", JSON.stringify(admission));
+	assert.deepEqual(admission.repair_tip_ids, [ROOT_A, TIP_B]);
+	assert.deepEqual(fixture.pathReads, [ROOT_A, TIP_B]);
+});
+
 test("an INTERRUPTED terminal-negative Sol root and its successor form one valid lineage", async () => {
 	const root = pending(ROOT_A, 0, ["src/partial.ts"], undefined, true);
 	const rootDecision = decision(root, DECISION_A, 4);
@@ -279,6 +389,149 @@ test("an INTERRUPTED terminal-negative Sol root and its successor form one valid
 		carried_paths: ["src/partial.ts"],
 		rename_sources: {},
 	}]);
+});
+
+test("a terminal-negative decision on a lineaged parent authorizes its depth-two successor", async () => {
+	const childId = "20260827-100005-c001";
+	const root = pending(ROOT_A, 0, ["src/root.ts"]);
+	const rootDecision = decision(root, DECISION_A, 4);
+	const parent = pending(
+		TIP_A,
+		10,
+		["src/partial.ts"],
+		lineage(ROOT_A, DECISION_A, ["src/root.ts"]),
+		true,
+	);
+	const parentDecision = decision(parent, DECISION_B, 14);
+	const child = pending(
+		childId,
+		20,
+		["src/repaired.ts"],
+		continuedLineage(parent, DECISION_B, ["src/partial.ts", "src/root.ts"]),
+	);
+	const fixture: ReaderFixture = {
+		transactions: new Map([[childId, child], [TIP_A, parent], [ROOT_A, root]]),
+		decisions: new Map([[ROOT_A, rootDecision]]),
+		terminalDecisions: new Map([[TIP_A, parentDecision]]),
+		changed: new Map([[childId, ["src/repaired.ts"]]]),
+		closed: new Set(),
+		pathErrors: new Map(),
+		pathReads: [],
+	};
+	const admission = await admitProjectDelegationPathLaneV1(
+		{ project_root: "/project", allowed_paths: ["tests/**"] },
+		readers(fixture),
+	);
+	assert.equal(admission.decision.decision, "ALLOW", JSON.stringify(admission));
+	assert.deepEqual(admission.repair_tip_ids, [childId]);
+	assert.deepEqual(admission.blockers, [{
+		kind: "known",
+		delegation_id: childId,
+		changed_paths: ["src/repaired.ts"],
+		carried_paths: ["src/partial.ts", "src/root.ts"],
+		rename_sources: {},
+	}]);
+});
+
+test("a child's own REPAIR decision ratifies a historical inherited continuation and authorizes its successor", async () => {
+	const legacyId = "20260827-100005-lgcy";
+	const successorId = "20260827-100006-next";
+	const childDecisionHash = "f".repeat(64);
+	const root = pending(ROOT_A, 0, ["src/root.ts"]);
+	const rootDecision = decision(root, DECISION_A, 4);
+	const parent = pending(
+		TIP_A,
+		10,
+		["src/partial.ts"],
+		lineage(ROOT_A, DECISION_A, ["src/root.ts"]),
+		true,
+	);
+	const parentDecision = decision(parent, DECISION_B, 14);
+	const parentLineage = parent.repair_lineage!;
+	const legacyLineage = bindDelegationRepairLineageV1({
+		schema_version: 1,
+		kind: "semantic-repair-lineage-v1",
+		root_delegation_id: parentLineage.root_delegation_id,
+		repair_of: parent.delegation_id,
+		root_decision_hash: parentLineage.root_decision_hash,
+		continuation_decision_delegation_id: parentLineage.continuation_decision_delegation_id,
+		continuation_decision_hash: parentLineage.continuation_decision_hash,
+		parent_lineage_hash: parentLineage.lineage_hash,
+		depth: parentLineage.depth + 1,
+		carried_paths: ["src/partial.ts", "src/root.ts"],
+	});
+	assert.ok(legacyLineage);
+	const legacy = pending(legacyId, 20, ["src/legacy.ts"], legacyLineage, true);
+	const legacyDecision = decision(legacy, childDecisionHash, 24);
+	const successor = pending(
+		successorId,
+		30,
+		["src/repaired.ts"],
+		continuedLineage(legacy, childDecisionHash, ["src/legacy.ts", "src/partial.ts", "src/root.ts"]),
+	);
+	const fixture: ReaderFixture = {
+		transactions: new Map([[successorId, successor], [legacyId, legacy], [TIP_A, parent], [ROOT_A, root]]),
+		decisions: new Map([[ROOT_A, rootDecision]]),
+		terminalDecisions: new Map([[TIP_A, parentDecision], [legacyId, legacyDecision]]),
+		changed: new Map([[successorId, ["src/repaired.ts"]]]),
+		closed: new Set(),
+		pathErrors: new Map(),
+		pathReads: [],
+	};
+	const admission = await admitProjectDelegationPathLaneV1(
+		{ project_root: "/project", allowed_paths: ["tests/**"] },
+		readers(fixture),
+	);
+	assert.equal(admission.decision.decision, "ALLOW", JSON.stringify(admission));
+	assert.deepEqual(admission.repair_tip_ids, [successorId]);
+	assert.deepEqual(fixture.pathReads, [successorId]);
+});
+
+test("a child's own ACCEPT review closes a historical inherited continuation", async () => {
+	const acceptedId = "20260827-100005-acpt";
+	const root = pending(ROOT_A, 0, ["src/root.ts"]);
+	const rootDecision = decision(root, DECISION_A, 4);
+	const parent = pending(
+		TIP_A,
+		10,
+		["src/partial.ts"],
+		lineage(ROOT_A, DECISION_A, ["src/root.ts"]),
+		true,
+	);
+	const parentDecision = decision(parent, DECISION_B, 14);
+	const parentLineage = parent.repair_lineage!;
+	const acceptedLineage = bindDelegationRepairLineageV1({
+		schema_version: 1,
+		kind: "semantic-repair-lineage-v1",
+		root_delegation_id: parentLineage.root_delegation_id,
+		repair_of: parent.delegation_id,
+		root_decision_hash: parentLineage.root_decision_hash,
+		continuation_decision_delegation_id: parentLineage.continuation_decision_delegation_id,
+		continuation_decision_hash: parentLineage.continuation_decision_hash,
+		parent_lineage_hash: parentLineage.lineage_hash,
+		depth: parentLineage.depth + 1,
+		carried_paths: ["src/partial.ts", "src/root.ts"],
+	});
+	assert.ok(acceptedLineage);
+	const accepted = reviewed(pending(acceptedId, 20, [], acceptedLineage), 24);
+	const fixture: ReaderFixture = {
+		transactions: new Map([[acceptedId, accepted], [TIP_A, parent], [ROOT_A, root]]),
+		decisions: new Map([[ROOT_A, rootDecision]]),
+		terminalDecisions: new Map([[TIP_A, parentDecision]]),
+		changed: new Map(),
+		closed: new Set(),
+		semanticReviewed: new Set([acceptedId]),
+		pathErrors: new Map(),
+		pathReads: [],
+	};
+	const admission = await admitProjectDelegationPathLaneV1(
+		{ project_root: "/project", allowed_paths: ["tests/**"] },
+		readers(fixture),
+	);
+	assert.equal(admission.decision.decision, "ALLOW", JSON.stringify(admission));
+	assert.deepEqual(admission.repair_tip_ids, []);
+	assert.deepEqual(admission.blockers, []);
+	assert.deepEqual(fixture.pathReads, []);
 });
 
 test("any immutable changed or carried path overlap blocks the requested lane", async () => {
