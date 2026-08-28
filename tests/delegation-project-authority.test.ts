@@ -270,6 +270,13 @@ test("an unreadable ownerless v2 envelope can be quarantined without deleting it
 		assert.deepEqual(await readProjectDelegationRepairClosureV1(root), {
 			ok: true, unresolvedTipId: null, rootCount: 0, lineageCount: 0,
 		});
+		const replayed = await quarantineProjectDelegationAuthorityV1({
+			project_root: root,
+			delegation_id: id,
+			now: at(2),
+			quarantined_by: { provider: "openai", model: "gpt-5.6-sol" },
+		});
+		assert.deepEqual(replayed, quarantined);
 
 		await writeFile(join(v2, "late.tmp"), "changed after quarantine\n", "utf8");
 		const changed = await readProjectDelegationRepairClosureV1(root);
@@ -278,12 +285,24 @@ test("an unreadable ownerless v2 envelope can be quarantined without deleting it
 		const requarantined = await quarantineProjectDelegationAuthorityV1({
 			project_root: root,
 			delegation_id: id,
-			now: at(2),
+			now: at(3),
 			quarantined_by: { provider: "openai", model: "gpt-5.6-sol" },
 		});
 		assert.equal(requarantined.ok, true, requarantined.ok ? "" : requarantined.code);
 		assert.equal(requarantined.ok && quarantined.ok && requarantined.value.inventory_hash !== quarantined.value.inventory_hash, true);
 		assert.deepEqual(await readLatestProjectDelegationTransactionV2(root), { ok: true, value: null });
+	});
+});
+
+test("quarantine preserves the public not-found refusal for an absent authority envelope", async () => {
+	await withTempDir(async (root) => {
+		const id = "20260820-100000-qnil";
+		assert.deepEqual(await quarantineProjectDelegationAuthorityV1({
+			project_root: root,
+			delegation_id: id,
+			now: at(1),
+			quarantined_by: { provider: "openai", model: "gpt-5.6-sol" },
+		}), { ok: false, code: "authority_not_found", delegation_id: id });
 	});
 });
 

@@ -45,6 +45,7 @@ function snapshot(patch: Partial<DelegationLifecycleSnapshotV1> = {}): Delegatio
 		target: { kind: "DELEGATION", id: "20260828-100000-r001" },
 		affected_paths: ["src/current.ts"],
 		scope_unknown: false,
+		recovery_rank: { unresolved_obligations: 0, unresolved_attempts: 0 },
 		...patch,
 	};
 }
@@ -201,6 +202,13 @@ test("the canonical lifecycle matrix returns one typed primary action for every 
 		assert.equal(resolution.primary_action.snapshot_hash, delegationLifecycleSnapshotHashV1(fixture.input), fixture.name);
 		assert.equal(resolution.primary_action.safe_automatic, fixture.automatic ?? true, fixture.name);
 		assert.equal(resolution.primary_action.requires_user_authorization, fixture.authorized ?? false, fixture.name);
+		assert.equal(
+			resolution.primary_action.recovery_effect,
+			["CLOSE_SATISFIED_NO_DELTA", "SUPERSEDE_EMPTY_ATTEMPT", "CLOSE_ACCEPTED_OBLIGATION", "QUARANTINE_CORRUPT_AUTHORITY"].includes(fixture.action)
+				? "MUST_DECREASE_RANK"
+				: fixture.action === "EXECUTE_EXACT_REPAIR" ? "MAY_CREATE_DELTA" : "NONE",
+			fixture.name,
+		);
 		observedActions.add(resolution.primary_action.action);
 	}
 	assert.deepEqual([...observedActions].sort(), [...DELEGATION_LIFECYCLE_PRIMARY_ACTIONS_V1].sort());
@@ -316,6 +324,10 @@ test("unknown, malformed, hostile and cyclic input is total and fail-closed", ()
 test("resolution bytes and hashes are deterministic across object insertion order", () => {
 	const firstInput = snapshot({ affected_paths: ["docs/a.md", "src/current.ts"] });
 	const reordered = {
+		recovery_rank: firstInput.recovery_rank === null ? null : {
+			unresolved_attempts: firstInput.recovery_rank.unresolved_attempts,
+			unresolved_obligations: firstInput.recovery_rank.unresolved_obligations,
+		},
 		scope_unknown: firstInput.scope_unknown,
 		target: { id: firstInput.target.id, kind: firstInput.target.kind },
 		runtime_identity: firstInput.runtime_identity,

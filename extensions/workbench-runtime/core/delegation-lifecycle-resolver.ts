@@ -94,6 +94,12 @@ export type DelegationLifecycleAttemptV1 =
 	| "TERMINAL";
 export type DelegationLifecycleCandidateV1 = "BLOCKED" | "INCOMPLETE" | "NONE" | "READY";
 export type DelegationLifecycleRuntimeIdentityV1 = "CURRENT" | "NOT_REQUIRED" | "STALE" | "UNKNOWN";
+export type DelegationLifecycleRecoveryEffectV1 = "MAY_CREATE_DELTA" | "MUST_DECREASE_RANK" | "NONE";
+
+export interface DelegationLifecycleRecoveryRankV1 {
+	readonly unresolved_obligations: number;
+	readonly unresolved_attempts: number;
+}
 
 export interface DelegationLifecycleTargetV1 {
 	readonly kind: "CANDIDATE" | "DELEGATION" | "PROJECT_AUTHORITY";
@@ -119,6 +125,8 @@ export interface DelegationLifecycleSnapshotV1 {
 	readonly target: DelegationLifecycleTargetV1;
 	readonly affected_paths: readonly string[];
 	readonly scope_unknown: boolean;
+	/** Null only when source authority is too incomplete to count safely. */
+	readonly recovery_rank: DelegationLifecycleRecoveryRankV1 | null;
 }
 
 export interface DelegationLifecycleEventV1 {
@@ -141,6 +149,8 @@ export interface DelegationLifecyclePrimaryActionV1 {
 	readonly safe_automatic: boolean;
 	readonly requires_user_authorization: boolean;
 	readonly expected_state: DelegationLifecycleStateV1;
+	readonly recovery_effect: DelegationLifecycleRecoveryEffectV1;
+	readonly expected_recovery_rank: DelegationLifecycleRecoveryRankV1 | null;
 }
 
 export interface DelegationLifecycleResolutionV1 {
@@ -156,10 +166,11 @@ const TARGET_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const SNAPSHOT_FIELDS = [
 	"schema_version", "kind", "source_authority_hash", "operation_intent", "authority", "writer_lock", "binding",
 	"attempt", "candidate", "runtime_identity", "target", "affected_paths", "scope_unknown",
-	"request_valid",
+	"request_valid", "recovery_rank",
 ] as const;
 const AUTHORITY_FIELDS = ["health", "disposition"] as const;
 const TARGET_FIELDS = ["kind", "id"] as const;
+const RECOVERY_RANK_FIELDS = ["unresolved_obligations", "unresolved_attempts"] as const;
 const EVENT_FIELDS = ["schema_version", "kind", "event", "expected_snapshot_hash"] as const;
 const INVALID_SNAPSHOT_HASH = canonicalHash({ kind: "delegation-lifecycle-invalid-snapshot-v1", schema_version: 1 });
 
@@ -204,6 +215,20 @@ function parseTarget(value: unknown): DelegationLifecycleTargetV1 | undefined {
 	return { kind: value.kind, id: value.id };
 }
 
+function parseRecoveryRank(value: unknown): DelegationLifecycleRecoveryRankV1 | null | undefined {
+	if (value === null) return null;
+	if (!isRecord(value) || !exactFields(value, RECOVERY_RANK_FIELDS) ||
+		!Number.isSafeInteger(value.unresolved_obligations) || Number(value.unresolved_obligations) < 0 ||
+		Number(value.unresolved_obligations) > 10_000 ||
+		!Number.isSafeInteger(value.unresolved_attempts) || Number(value.unresolved_attempts) < 0 ||
+		Number(value.unresolved_attempts) > 10_000 ||
+		Number(value.unresolved_attempts) < Number(value.unresolved_obligations)) return undefined;
+	return {
+		unresolved_obligations: Number(value.unresolved_obligations),
+		unresolved_attempts: Number(value.unresolved_attempts),
+	};
+}
+
 function parseSnapshot(value: unknown): DelegationLifecycleSnapshotV1 | undefined {
 	if (!isRecord(value) || !exactFields(value, SNAPSHOT_FIELDS) || value.schema_version !== 1 ||
 		value.kind !== DELEGATION_LIFECYCLE_SNAPSHOT_KIND_V1 ||
@@ -221,7 +246,8 @@ function parseSnapshot(value: unknown): DelegationLifecycleSnapshotV1 | undefine
 		typeof value.scope_unknown !== "boolean") return undefined;
 	const target = parseTarget(value.target);
 	const affectedPaths = parsePaths(value.affected_paths);
-	if (target === undefined || affectedPaths === undefined) return undefined;
+	const recoveryRank = parseRecoveryRank(value.recovery_rank);
+	if (target === undefined || affectedPaths === undefined || recoveryRank === undefined) return undefined;
 	return {
 		schema_version: 1,
 		kind: DELEGATION_LIFECYCLE_SNAPSHOT_KIND_V1,
@@ -237,6 +263,7 @@ function parseSnapshot(value: unknown): DelegationLifecycleSnapshotV1 | undefine
 		target,
 		affected_paths: affectedPaths,
 		scope_unknown: value.scope_unknown,
+		recovery_rank: recoveryRank,
 	};
 }
 
@@ -263,25 +290,26 @@ interface ActionFlags {
 	readonly safe: boolean;
 	readonly user: boolean;
 	readonly expected: DelegationLifecycleStateV1;
+	readonly recovery: DelegationLifecycleRecoveryEffectV1;
 }
 
 function actionFlags(action: DelegationLifecyclePrimaryActionNameV1): ActionFlags {
 	switch (action) {
-		case "CONTINUE_DEVELOPMENT": return { safe: true, user: false, expected: "TERMINAL_NON_BLOCKING" };
-		case "WAIT_FOR_ACTIVE_WRITER": return { safe: true, user: false, expected: "ACTIVE" };
-		case "REVIEW_CANDIDATE": return { safe: false, user: false, expected: "AWAITING_REVIEW" };
-		case "EXECUTE_EXACT_REPAIR": return { safe: false, user: false, expected: "REPAIRABLE" };
-		case "CLOSE_SATISFIED_NO_DELTA": return { safe: true, user: false, expected: "TERMINAL_NON_BLOCKING" };
-		case "SUPERSEDE_EMPTY_ATTEMPT": return { safe: true, user: false, expected: "SUPERSEDED" };
-		case "CLOSE_ACCEPTED_OBLIGATION": return { safe: true, user: false, expected: "ACCEPTED" };
-		case "REGENERATE_DERIVED_REVIEW": return { safe: true, user: false, expected: "AWAITING_REVIEW" };
-		case "QUARANTINE_CORRUPT_AUTHORITY": return { safe: false, user: true, expected: "CORRUPT_AUTHORITY" };
-		case "REBASE_CURRENT_BINDING": return { safe: true, user: false, expected: "TERMINAL_NON_BLOCKING" };
-		case "BLOCK_OVERLAPPING_PATHS": return { safe: true, user: false, expected: "BINDING_CONFLICT" };
-		case "RECLAIM_STALE_LOCK": return { safe: true, user: false, expected: "TERMINAL_NON_BLOCKING" };
-		case "PROMOTE_CANDIDATE": return { safe: false, user: true, expected: "PROMOTION_READY" };
-		case "BLOCK_PROMOTION": return { safe: true, user: false, expected: "PROMOTION_BLOCKED" };
-		case "REPORT_STORAGE_FAILURE": return { safe: true, user: false, expected: "CORRUPT_AUTHORITY" };
+		case "CONTINUE_DEVELOPMENT": return { safe: true, user: false, expected: "TERMINAL_NON_BLOCKING", recovery: "NONE" };
+		case "WAIT_FOR_ACTIVE_WRITER": return { safe: true, user: false, expected: "ACTIVE", recovery: "NONE" };
+		case "REVIEW_CANDIDATE": return { safe: false, user: false, expected: "AWAITING_REVIEW", recovery: "NONE" };
+		case "EXECUTE_EXACT_REPAIR": return { safe: false, user: false, expected: "REPAIRABLE", recovery: "MAY_CREATE_DELTA" };
+		case "CLOSE_SATISFIED_NO_DELTA": return { safe: true, user: false, expected: "TERMINAL_NON_BLOCKING", recovery: "MUST_DECREASE_RANK" };
+		case "SUPERSEDE_EMPTY_ATTEMPT": return { safe: true, user: false, expected: "TERMINAL_NON_BLOCKING", recovery: "MUST_DECREASE_RANK" };
+		case "CLOSE_ACCEPTED_OBLIGATION": return { safe: true, user: false, expected: "TERMINAL_NON_BLOCKING", recovery: "MUST_DECREASE_RANK" };
+		case "REGENERATE_DERIVED_REVIEW": return { safe: true, user: false, expected: "AWAITING_REVIEW", recovery: "NONE" };
+		case "QUARANTINE_CORRUPT_AUTHORITY": return { safe: false, user: true, expected: "TERMINAL_NON_BLOCKING", recovery: "MUST_DECREASE_RANK" };
+		case "REBASE_CURRENT_BINDING": return { safe: true, user: false, expected: "TERMINAL_NON_BLOCKING", recovery: "NONE" };
+		case "BLOCK_OVERLAPPING_PATHS": return { safe: true, user: false, expected: "BINDING_CONFLICT", recovery: "NONE" };
+		case "RECLAIM_STALE_LOCK": return { safe: true, user: false, expected: "TERMINAL_NON_BLOCKING", recovery: "NONE" };
+		case "PROMOTE_CANDIDATE": return { safe: false, user: true, expected: "PROMOTION_READY", recovery: "NONE" };
+		case "BLOCK_PROMOTION": return { safe: true, user: false, expected: "PROMOTION_BLOCKED", recovery: "NONE" };
+		case "REPORT_STORAGE_FAILURE": return { safe: true, user: false, expected: "CORRUPT_AUTHORITY", recovery: "NONE" };
 		default: return assertNever(action);
 	}
 }
@@ -294,6 +322,7 @@ function makeResolution(
 	target: DelegationLifecycleTargetV1,
 	affectedPaths: readonly string[],
 	scopeUnknown: boolean,
+	expectedRecoveryRank: DelegationLifecycleRecoveryRankV1 | null,
 	override?: Partial<ActionFlags>,
 ): DelegationLifecycleResolutionV1 {
 	const flags = { ...actionFlags(actionName), ...override };
@@ -309,6 +338,8 @@ function makeResolution(
 		safe_automatic: flags.safe,
 		requires_user_authorization: flags.user,
 		expected_state: flags.expected,
+		recovery_effect: flags.recovery,
+		expected_recovery_rank: expectedRecoveryRank === null ? null : { ...expectedRecoveryRank },
 	};
 	const projection = {
 		schema_version: DELEGATION_LIFECYCLE_SCHEMA_VERSION_V1,
@@ -328,6 +359,7 @@ function invalidResolution(reason: "INVALID_EVENT" | "INVALID_SNAPSHOT"): Delega
 		{ kind: "PROJECT_AUTHORITY", id: "project-authority" },
 		[],
 		true,
+		null,
 	);
 }
 
@@ -335,7 +367,7 @@ function resolveAttempt(
 	snapshot: DelegationLifecycleSnapshotV1,
 	snapshotHash: string,
 ): DelegationLifecycleResolutionV1 | undefined {
-	const args = [snapshotHash, snapshot.target, snapshot.affected_paths, snapshot.scope_unknown] as const;
+	const args = [snapshotHash, snapshot.target, snapshot.affected_paths, snapshot.scope_unknown, snapshot.recovery_rank] as const;
 	switch (snapshot.attempt) {
 		case "ACTIVE":
 			return makeResolution("ACTIVE", "WAIT_FOR_ACTIVE_WRITER", "ACTIVE_WRITER_PRESENT", ...args);
@@ -361,7 +393,7 @@ function resolveCandidate(
 	snapshot: DelegationLifecycleSnapshotV1,
 	snapshotHash: string,
 ): DelegationLifecycleResolutionV1 {
-	const args = [snapshotHash, snapshot.target, snapshot.affected_paths, snapshot.scope_unknown] as const;
+	const args = [snapshotHash, snapshot.target, snapshot.affected_paths, snapshot.scope_unknown, snapshot.recovery_rank] as const;
 	if (snapshot.operation_intent === "DEV") {
 		return makeResolution("TERMINAL_NON_BLOCKING", "CONTINUE_DEVELOPMENT", "NO_CURRENT_BLOCKER", ...args);
 	}
@@ -394,7 +426,7 @@ export function resolveDelegationLifecycleV1(
 		const event = parseEvent(eventInput);
 		if (event === undefined) return invalidResolution("INVALID_EVENT");
 		const snapshotHash = canonicalHash(snapshot);
-		const args = [snapshotHash, snapshot.target, snapshot.affected_paths, snapshot.scope_unknown] as const;
+		const args = [snapshotHash, snapshot.target, snapshot.affected_paths, snapshot.scope_unknown, snapshot.recovery_rank] as const;
 		if (event.event === "EXECUTE" && event.expected_snapshot_hash !== snapshotHash) {
 			return makeResolution("BINDING_CONFLICT", "REBASE_CURRENT_BINDING", "SNAPSHOT_CHANGED", ...args);
 		}
@@ -449,6 +481,20 @@ export function delegationLifecycleSnapshotHashV1(snapshot: DelegationLifecycleS
 	return parsed === undefined ? INVALID_SNAPSHOT_HASH : canonicalHash(parsed);
 }
 
+export type ParseDelegationLifecycleSnapshotResultV1 =
+	| { readonly ok: true; readonly value: DelegationLifecycleSnapshotV1 }
+	| { readonly ok: false; readonly code: "INVALID_SNAPSHOT" };
+
+/** Closed runtime parser shared by read adapters and the effect boundary. */
+export function parseDelegationLifecycleSnapshotV1(value: unknown): ParseDelegationLifecycleSnapshotResultV1 {
+	try {
+		const parsed = parseSnapshot(value);
+		return parsed === undefined ? { ok: false, code: "INVALID_SNAPSHOT" } : { ok: true, value: parsed };
+	} catch {
+		return { ok: false, code: "INVALID_SNAPSHOT" };
+	}
+}
+
 export function serializeDelegationLifecycleResolutionV1(resolution: DelegationLifecycleResolutionV1): string {
 	return canonicalJson(resolution);
 }
@@ -469,6 +515,10 @@ export function delegationLifecycleSnapshotFromPathLaneAdmissionV1(
 	const failure = admission.decision.authority_failures[0];
 	const exactId = failure?.delegation_id ?? conflict?.delegation_id ?? admission.repair_tip_ids[0] ??
 		admission.ordinary_blocker_ids[0] ?? "project-authority";
+	const unresolvedObligations = new Set([
+		...admission.ordinary_blocker_ids,
+		...admission.repair_tip_ids,
+	]).size;
 	return {
 		schema_version: 1,
 		kind: DELEGATION_LIFECYCLE_SNAPSHOT_KIND_V1,
@@ -490,5 +540,11 @@ export function delegationLifecycleSnapshotFromPathLaneAdmissionV1(
 		},
 		affected_paths: [...admission.decision.normalized_allowed_paths],
 		scope_unknown: authorityFailure || invalidRequest,
+		recovery_rank: authorityFailure
+			? null
+			: {
+				unresolved_obligations: unresolvedObligations,
+				unresolved_attempts: Math.max(unresolvedObligations, admission.blockers.length),
+			},
 	};
 }

@@ -62,6 +62,7 @@ import { readWorkerRepairCapsule } from "../extensions/workbench-runtime/core/wo
 import {
 	collectCurrentDelegationBindingV2,
 	readProjectDelegationBlockerV2,
+	readProjectDelegationRepairObligationProjectionV1,
 	readProjectDelegationRepairClosureV1,
 } from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
 import { collectWorkspaceGuard } from "../extensions/workbench-runtime/core/workspace-guard.ts";
@@ -1876,6 +1877,21 @@ test("a no-write aborted repair attempt can be superseded without discarding its
 			rootCount: 1,
 			lineageCount: 1,
 		});
+		const obligation = await readProjectDelegationRepairObligationProjectionV1(root);
+		assert.equal(obligation.ok, true, obligation.ok ? "" : obligation.issue.code);
+		if (!obligation.ok) return;
+		assert.equal(obligation.value.historical_obligation_count, 1);
+		assert.equal(obligation.value.historical_attempt_count, 2);
+		assert.deepEqual(obligation.value.unresolved_obligations, [{
+			obligation_id: parentId,
+			current_attempt_id: parentId,
+			legacy_attempt_depth: 0,
+		}]);
+		assert.deepEqual(obligation.value.recovery_rank, {
+			unresolved_obligations: 1,
+			unresolved_attempts: 1,
+		});
+		assert.match(obligation.value.projection_hash, /^[a-f0-9]{64}$/u);
 
 		const beforeReplacement = await delegationDirectories(root);
 		const notices: string[] = [];

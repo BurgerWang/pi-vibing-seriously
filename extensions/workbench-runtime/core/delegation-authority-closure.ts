@@ -101,6 +101,12 @@ interface DelegationAuthorityInventoryV1 {
 	total_bytes: number;
 }
 
+export interface DelegationAuthorityInventoryFactsV1 {
+	inventory_hash: string;
+	inventory_entry_count: number;
+	inventory_total_bytes: number;
+}
+
 const BLOCKER_FIELDS = [
 	"schema_version", "kind", "delegation_id", "contract_hash", "generation", "transaction_revision",
 	"transaction_status", "transaction_hash", "relevant_paths", "relevant_paths_hash", "observed_git_head",
@@ -705,6 +711,27 @@ async function collectAuthorityInventoryV1(projectRoot: string, delegationId: st
 			? { ok: false, error: { code: "not_found" } }
 			: { ok: false, error: { code: "not_recoverable" } };
 	}
+}
+
+/**
+ * Privacy-safe exact inventory identity for lifecycle snapshot/CAS adapters.
+ * Entry paths and source bytes remain private to this storage owner.
+ */
+export async function readDelegationAuthorityInventoryFactsV1(
+	projectRoot: string,
+	delegationId: string,
+): Promise<DelegationAuthorityClosureResult<DelegationAuthorityInventoryFactsV1>> {
+	const inventory = await collectAuthorityInventoryV1(projectRoot, delegationId);
+	return inventory.ok
+		? {
+			ok: true,
+			value: {
+				inventory_hash: inventory.value.inventory_hash,
+				inventory_entry_count: inventory.value.entries.length,
+				inventory_total_bytes: inventory.value.total_bytes,
+			},
+		}
+		: inventory;
 }
 
 function quarantinePayloadHash(value: Omit<DelegationAuthorityQuarantineV1, "quarantine_hash">): string {
