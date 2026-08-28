@@ -407,6 +407,18 @@ test("inactive blocker closure requires only its exact changed paths clean and p
 			closed_by: { provider: "openai", model: "gpt-5.6-sol" },
 		});
 		assert.equal(closed.ok, true, closed.ok ? "" : closed.code);
+		if (!closed.ok) return;
+		assert.equal(closed.lifecycle_resolution?.primary_action.action, "CLOSE_SATISFIED_NO_DELTA");
+		assert.equal(closed.lifecycle_resolution?.primary_action.recovery_effect, "MUST_DECREASE_RANK");
+		const replay = await closeInactiveProjectDelegationBlockerV2({
+			project_root: root, expected_delegation_id: id, now: at(6), exec: spawnExec,
+			closed_by: { provider: "openai", model: "gpt-5.6-sol" },
+		});
+		assert.equal(replay.ok, true, replay.ok ? "" : replay.code);
+		if (replay.ok) {
+			assert.equal(replay.value.closure_hash, closed.value.closure_hash);
+			assert.deepEqual(replay.closed_delegation_ids, [id]);
+		}
 		assert.equal(await readFile(join(root, "notes.txt"), "utf8"), "unrelated user work\n");
 		assert.deepEqual(await readProjectDelegationBlockerV2(root), { ok: true, value: null });
 	});

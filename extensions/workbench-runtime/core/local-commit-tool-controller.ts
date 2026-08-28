@@ -107,6 +107,11 @@ export function registerGitTool(controller: GitToolController): void {
 						git_mutation: "NONE",
 						authority: "NOT_ACCEPTED",
 						unrelated_work: "PRESERVED",
+						...(result.lifecycle_resolution === undefined ? {} : {
+							lifecycle_action: result.lifecycle_resolution.primary_action.action,
+							lifecycle_reason: result.lifecycle_resolution.primary_action.reason,
+							lifecycle_snapshot_hash: result.lifecycle_resolution.primary_action.snapshot_hash,
+						}),
 						...(result.remaining_blocker_id === undefined ? {} : { remaining_blocker_id: result.remaining_blocker_id }),
 					},
 				};

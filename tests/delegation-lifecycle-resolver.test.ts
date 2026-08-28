@@ -10,6 +10,7 @@ import {
 	delegationLifecycleSnapshotHashV1,
 	delegationLifecycleSnapshotFromCleanRepairClosureV1,
 	delegationLifecycleSnapshotFromExactRepairAuthorityV1,
+	delegationLifecycleSnapshotFromInactiveBlockerClosureV1,
 	delegationLifecycleSnapshotFromPathLaneAdmissionV1,
 	resolveDelegationLifecycleV1,
 	serializeDelegationLifecycleResolutionV1,
@@ -78,6 +79,43 @@ test("the exact-repair adapter yields the same canonical action and a binding ch
 	);
 	assert.equal(rebased.primary_action.action, "REBASE_CURRENT_BINDING");
 	assert.equal(rebased.primary_action.reason, "REBASEABLE_BINDING_CHANGED");
+});
+
+test("inactive blocker facts select one close, empty-attempt supersession, rebase, or terminal action", () => {
+	const base = {
+		delegation_id: "20260828-100000-r001",
+		source_authority: { transaction_hash: HASH_A },
+		affected_paths: ["src/current.ts"],
+		relevant_paths_clean: true,
+		execution_active: false,
+		empty_attempt: false,
+		closed: false,
+	};
+	assert.equal(
+		resolveDelegationLifecycleV1(delegationLifecycleSnapshotFromInactiveBlockerClosureV1(base), OBSERVE)
+			.primary_action.action,
+		"CLOSE_SATISFIED_NO_DELTA",
+	);
+	assert.equal(
+		resolveDelegationLifecycleV1(
+			delegationLifecycleSnapshotFromInactiveBlockerClosureV1({ ...base, empty_attempt: true }),
+			OBSERVE,
+		).primary_action.action,
+		"SUPERSEDE_EMPTY_ATTEMPT",
+	);
+	assert.equal(
+		resolveDelegationLifecycleV1(
+			delegationLifecycleSnapshotFromInactiveBlockerClosureV1({ ...base, relevant_paths_clean: false }),
+			OBSERVE,
+		).primary_action.action,
+		"REBASE_CURRENT_BINDING",
+	);
+	const closed = resolveDelegationLifecycleV1(
+		delegationLifecycleSnapshotFromInactiveBlockerClosureV1({ ...base, closed: true }),
+		OBSERVE,
+	);
+	assert.equal(closed.state, "TERMINAL_NON_BLOCKING");
+	assert.equal(closed.primary_action.action, "CONTINUE_DEVELOPMENT");
 });
 
 test("the clean-repair adapter closes only a clean unresolved obligation and strictly lowers its rank", () => {

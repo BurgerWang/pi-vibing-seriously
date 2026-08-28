@@ -275,6 +275,11 @@ interface ResolvedInactiveBlockerPathsV2 {
 	journal_before: StreamingPathIdentity[];
 }
 
+export interface DelegationInactiveBlockerRelevantScopeV2 {
+	readonly relevant_paths: readonly string[];
+	readonly clean: boolean;
+}
+
 function journalRelevantPathsV2(
 	transaction: DelegationTransactionRecord,
 	journal: WorkerWriteJournalRecord,
@@ -484,6 +489,33 @@ async function journalBaselineRestoredV2(
 		current.identities.every((identity, index) => sameContentIdentity(identity, baseline[index]!));
 }
 
+/**
+ * Read the exact relevant-scope facts used by inactive-blocker closure.
+ * This is a read-only fact adapter: the lifecycle resolver remains the sole
+ * owner of whether those facts select a close, supersede, or rebase action.
+ */
+export async function readDelegationInactiveBlockerRelevantScopeV2(input: {
+	project_root: string;
+	transaction: DelegationTransactionRecord;
+	workspace_guard: WorkspaceGuardRecord;
+}): Promise<DelegationAuthorityClosureResult<DelegationInactiveBlockerRelevantScopeV2>> {
+	if (!validateWorkspaceGuard(input.workspace_guard) || input.workspace_guard.git_head === null) {
+		return { ok: false, error: { code: "invalid_input" } };
+	}
+	const resolved = await resolveInactiveBlockerRelevantPathsV2(input.project_root, input.transaction);
+	if (!resolved.ok) return resolved;
+	const relevant = new Set(resolved.value.paths);
+	const clean = !input.workspace_guard.entries.some((entry) => relevant.has(entry.path)) &&
+		await journalBaselineRestoredV2(input.project_root, resolved.value.journal_before);
+	return {
+		ok: true,
+		value: Object.freeze({
+			relevant_paths: Object.freeze([...resolved.value.paths]),
+			clean,
+		}),
+	};
+}
+
 function isInactiveClosableStatus(transaction: DelegationTransactionRecord): boolean {
 	if (["PREPARED", "RUNNING", "COMMITTING", "FINISHED", "REVIEWED"].includes(transaction.status)) return false;
 	if (transaction.status === "ABORTED") return transaction.repair_lineage !== undefined;
@@ -609,19 +641,15 @@ export async function publishDelegationInactiveBlockerClosureV2(input: {
 	const existing = await readDelegationInactiveBlockerClosureV2(input.project_root, input.transaction);
 	if (!existing.ok) return existing;
 	if (existing.value !== undefined) return { ok: true, value: existing.value };
-	const resolved = await resolveInactiveBlockerRelevantPathsV2(input.project_root, input.transaction);
-	if (!resolved.ok) return resolved;
-	const relevantPaths = resolved.value.paths;
+	const scope = await readDelegationInactiveBlockerRelevantScopeV2(input);
+	if (!scope.ok) return scope;
+	const relevantPaths = [...scope.value.relevant_paths];
 	const supersession = isEmptyRepairAttemptSupersessionCandidateV1(input.transaction) && relevantPaths.length === 0;
 	const path = supersession
 		? emptyRepairAttemptSupersessionPath(input.project_root, input.transaction.delegation_id, transactionHash)
 		: legacyPath;
 	if (path === undefined) return { ok: false, error: { code: "invalid_input" } };
-	const relevant = new Set(relevantPaths);
-	if (input.workspace_guard.entries.some((entry) => relevant.has(entry.path))) {
-		return { ok: false, error: { code: "not_recoverable" } };
-	}
-	if (!await journalBaselineRestoredV2(input.project_root, resolved.value.journal_before)) {
+	if (!scope.value.clean) {
 		return { ok: false, error: { code: "not_recoverable" } };
 	}
 	const payload: Omit<DelegationInactiveBlockerClosureV2, "closure_hash"> = {
