@@ -13,6 +13,7 @@ import {
 	delegationLifecycleSnapshotFromExactRepairAuthorityV1,
 	delegationLifecycleSnapshotFromInactiveBlockerClosureV1,
 	delegationLifecycleSnapshotFromPathLaneAdmissionV1,
+	delegationLifecycleSnapshotFromReviewCandidateV1,
 	resolveDelegationLifecycleV1,
 	serializeDelegationLifecycleResolutionV1,
 	type DelegationLifecycleEventV1,
@@ -80,6 +81,30 @@ test("the exact-repair adapter yields the same canonical action and a binding ch
 	);
 	assert.equal(rebased.primary_action.action, "REBASE_CURRENT_BINDING");
 	assert.equal(rebased.primary_action.reason, "REBASEABLE_BINDING_CHANGED");
+});
+
+test("the public-review adapter selects review exactly while immutable replay continues", () => {
+	const base = {
+		delegation_id: "20260828-100000-r001",
+		source_authority: { state_hash: HASH_A },
+		affected_paths: ["src/current.ts"],
+	};
+	const review = resolveDelegationLifecycleV1(
+		delegationLifecycleSnapshotFromReviewCandidateV1({ ...base, review_required: true }),
+		OBSERVE,
+	);
+	assert.equal(review.primary_action.action, "REVIEW_CANDIDATE");
+	assert.equal(review.primary_action.reason, "CURRENT_DELTA_REVIEW_REQUIRED");
+	assert.equal(review.primary_action.safe_automatic, false);
+	assert.equal(review.primary_action.requires_user_authorization, false);
+	assert.deepEqual(review.primary_action.affected_paths, ["src/current.ts"]);
+
+	const replay = resolveDelegationLifecycleV1(
+		delegationLifecycleSnapshotFromReviewCandidateV1({ ...base, review_required: false }),
+		OBSERVE,
+	);
+	assert.equal(replay.primary_action.action, "CONTINUE_DEVELOPMENT");
+	assert.equal(replay.primary_action.reason, "NO_CURRENT_BLOCKER");
 });
 
 test("inactive blocker facts select one close, empty-attempt supersession, rebase, or terminal action", () => {

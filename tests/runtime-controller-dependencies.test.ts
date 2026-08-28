@@ -419,6 +419,7 @@ test("review controller routes an eligible committed FAILED packet and reserves 
 	let packetMaxBytes = 0;
 	let packetMaxLines = 0;
 	let packetText = "";
+	let lifecycleSnapshotHash = "";
 	const state = {
 		latestId: delegationId,
 		status: "PENDING_REVIEW" as const,
@@ -464,12 +465,20 @@ test("review controller routes an eligible committed FAILED packet and reserves 
 		services: {
 			now: () => fixed,
 			readTransaction: async () => ({ ok: true, value: { status: "FAILED" } }),
-			readCommittedGeneration: async () => ({ ok: true, value: { state: { status: "FAILED" }, records: {} } }),
+			readCommittedGeneration: async () => ({
+				ok: true,
+				value: {
+					state: { status: "FAILED", delegation_id: delegationId, allowed_paths: ["src/**"] },
+					proof: { content_hash: "e".repeat(64) },
+					records: {},
+				},
+			}),
 			isTerminalNegativeReviewEligible: () => true,
 			readRecoverableUnpublished: async () => ({ ok: false, error: { code: "not_recoverable" } }),
-			reviewV2: async (input: { maxBytes: number; maxLines: number; semanticDecision?: "ACCEPT" | "REPAIR" }) => {
+			reviewV2: async (input: { maxBytes: number; maxLines: number; semanticDecision?: "ACCEPT" | "REPAIR"; expectedLifecycleSnapshotHash?: string }) => {
 				packetMaxBytes = input.maxBytes;
 				packetMaxLines = input.maxLines;
+				lifecycleSnapshotHash = input.expectedLifecycleSnapshotHash ?? "";
 				packetText = "x".repeat(packetMaxBytes);
 				return {
 					ok: true,
@@ -519,6 +528,10 @@ test("review controller routes an eligible committed FAILED packet and reserves 
 	assert.equal(resultText(result).split("\n").at(-1), packetText, "the outer clamp presents the complete saturated packet");
 	assert.ok(Buffer.byteLength(resultText(result), "utf8") <= 4_096);
 	assert.equal(result.details.presentation_complete, true);
+	assert.match(lifecycleSnapshotHash, /^[a-f0-9]{64}$/u);
+	assert.equal(result.details.lifecycle_action, "REVIEW_CANDIDATE");
+	assert.equal(result.details.lifecycle_reason, "CURRENT_DELTA_REVIEW_REQUIRED");
+	assert.equal(result.details.lifecycle_snapshot_hash, lifecycleSnapshotHash);
 	assert.notEqual(result.details.error, "repair_required", "strict terminal-negative eligibility reaches the v2 review service");
 	assert.equal(result.details.delegation_id, delegationId, "a presentation call defaults to the durable latest id");
 

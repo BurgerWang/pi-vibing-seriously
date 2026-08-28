@@ -89,6 +89,7 @@ import {
 import {
 	DELEGATION_LIFECYCLE_EVENT_KIND_V1,
 	delegationLifecycleSnapshotFromInvalidDerivedReviewV1,
+	delegationLifecycleSnapshotFromReviewCandidateV1,
 	resolveDelegationLifecycleV1,
 	type DelegationLifecycleResolutionV1,
 } from "./delegation-lifecycle-resolver.ts";
@@ -176,6 +177,8 @@ export interface ReviewDelegationV2Input {
 	reviewer?: { provider: string; model: string };
 	/** Runtime model identity used to bind a historical migration presentation. */
 	presenter?: { provider: string; model: string };
+	/** Public adapter CAS over the exact committed review candidate snapshot. */
+	expectedLifecycleSnapshotHash?: string;
 	storage?: DelegationTransactionStorageOptions;
 }
 
@@ -677,6 +680,30 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 		}
 		const authorityInfo = authorityFromGeneration(generation.value);
 		if (authorityInfo === undefined) return fail("invalid_state", "delegation is not a strictly bound implementation review", { transaction: state });
+		const requestedLifecycleResolution = resolveDelegationLifecycleV1(
+			delegationLifecycleSnapshotFromReviewCandidateV1({
+				delegation_id: state.delegation_id,
+				source_authority: { state, proof: generation.value.proof },
+				affected_paths: [...state.allowed_paths].sort((left, right) =>
+					Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8"))),
+				review_required: state.status !== "REVIEWED",
+			}),
+			{
+				schema_version: 1,
+				kind: DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+				event: "OBSERVE",
+				expected_snapshot_hash: null,
+			},
+		);
+		const expectedLifecycleAction = state.status === "REVIEWED" ? "CONTINUE_DEVELOPMENT" : "REVIEW_CANDIDATE";
+		if (requestedLifecycleResolution.primary_action.action !== expectedLifecycleAction) {
+			return fail("invalid_state", "canonical lifecycle resolver refused the review action", { transaction: state });
+		}
+		if (input.expectedLifecycleSnapshotHash !== undefined &&
+			input.expectedLifecycleSnapshotHash !== requestedLifecycleResolution.primary_action.snapshot_hash) {
+			return fail("review_conflict", "review candidate changed after public lifecycle preflight", { transaction: state });
+		}
+		let effectiveLifecycleResolution = requestedLifecycleResolution;
 		const reviewPath = delegationReviewRelativePathV2(state.delegation_id);
 		if (reviewPath === undefined) return fail("authority_invalid", "delegation review path is invalid", { transaction: state });
 		if (authorityInfo.kind === "guard-v2" && !(await workerScopeIsSafeBeforeContent(
@@ -705,6 +732,27 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 					afterGuard: authorityInfo.after_guard,
 					exec: input.exec,
 				});
+				if (candidate.ok) {
+					effectiveLifecycleResolution = resolveDelegationLifecycleV1(
+						delegationLifecycleSnapshotFromReviewCandidateV1({
+							delegation_id: state.delegation_id,
+							source_authority: {
+								state,
+								proof: generation.value.proof,
+								migration: candidate.projection,
+							},
+							affected_paths: [...state.allowed_paths].sort((left, right) =>
+								Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8"))),
+							review_required: true,
+						}),
+						{
+							schema_version: 1,
+							kind: DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+							event: "OBSERVE",
+							expected_snapshot_hash: null,
+						},
+					);
+				}
 				if (!candidate.ok) {
 					const acceptedMigration = existing.value.semantic_migration?.status === "ACCEPTED"
 						? existing.value.semantic_migration
@@ -793,6 +841,7 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 						finalized: true,
 						semantic_authority: "migration_accepted",
 						migration_binding_hash: candidate.projection.migration_binding_hash,
+						lifecycle_resolution: effectiveLifecycleResolution,
 					};
 				}
 				if (!semanticDecisionSupplied) {
@@ -806,6 +855,7 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 							finalized: true,
 							semantic_authority: "migration_presented",
 							migration_binding_hash: candidate.projection.migration_binding_hash,
+							lifecycle_resolution: effectiveLifecycleResolution,
 						};
 					}
 					const presented = await publishHistoricalSemanticMigrationPresentationV2(input.projectRoot, {
@@ -822,6 +872,7 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 						finalized: true,
 						semantic_authority: presented.value.status === "ACCEPTED" ? "migration_accepted" : "migration_presented",
 						migration_binding_hash: candidate.projection.migration_binding_hash,
+						lifecycle_resolution: effectiveLifecycleResolution,
 					};
 				}
 				if (input.expectedMigrationBindingHash === undefined) {
@@ -846,6 +897,7 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 					finalized: true,
 					semantic_authority: "migration_accepted",
 					migration_binding_hash: candidate.projection.migration_binding_hash,
+					lifecycle_resolution: effectiveLifecycleResolution,
 				};
 			}
 			if (input.expectedMigrationBindingHash !== undefined) {
@@ -910,6 +962,7 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 				review_hash: existing.value.review_hash,
 				review_path: existing.value.review_path,
 				finalized: true,
+				lifecycle_resolution: effectiveLifecycleResolution,
 			};
 		}
 
@@ -990,6 +1043,7 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 				review_hash: priorRead.ok ? priorRead.value.review_hash : "",
 				review_path: reviewPath,
 				finalized: false,
+				lifecycle_resolution: effectiveLifecycleResolution,
 			};
 		}
 		const expectedProjection = priorReview === null ? undefined : projectionFromReview(priorReview);
@@ -1118,6 +1172,7 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 					semantic_authority: terminalNegative ? "terminal_repair_required" : "repair_required",
 					repair_decision_hash: repairDecisionHash,
 					repair_reason_hash: repairReasonHash,
+					lifecycle_resolution: effectiveLifecycleResolution,
 				};
 			}
 			const acceptedRecord: ReviewRecord = {
@@ -1184,6 +1239,7 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 				semantic_authority: terminalNegative ? "terminal_repair_required" : "repair_required",
 				repair_decision_hash: priorRepairDecision.decision_hash,
 				repair_reason_hash: priorRepairDecision.repair_reason_hash,
+				lifecycle_resolution: effectiveLifecycleResolution,
 			};
 		}
 		const artifact = artifactFor(state, reviewedAt, review.record);
@@ -1218,7 +1274,7 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 			review_path: persisted.value.review_path,
 			finalized: persisted.value.finalized,
 			...(regeneratingDerivedReview ? { regenerated_derived_review: true as const } : {}),
-			...(regenerationResolution === undefined ? {} : { lifecycle_resolution: regenerationResolution }),
+			lifecycle_resolution: regenerationResolution ?? effectiveLifecycleResolution,
 		};
 	} catch {
 		return fail("review_invalid", "delegation v2 review failed closed");

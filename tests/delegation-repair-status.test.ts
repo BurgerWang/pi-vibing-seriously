@@ -16,6 +16,7 @@ import type { ExecFn } from "../extensions/workbench-runtime/core/config.ts";
 import {
 	DELEGATION_LIFECYCLE_EVENT_KIND_V1,
 	delegationLifecycleSnapshotFromInvalidDerivedReviewV1,
+	delegationLifecycleSnapshotFromReviewCandidateV1,
 	resolveDelegationLifecycleV1,
 } from "../extensions/workbench-runtime/core/delegation-lifecycle-resolver.ts";
 
@@ -53,6 +54,7 @@ function observation(overrides: Partial<Extract<DelegationAuthorityObservationV2
 
 function terminalCommitted(status: "INTERRUPTED" | "FAILED", changedPaths: readonly string[] = ["src/repaired.ts"]) {
 	return {
+		proof: { schema_version: 2, delegation_id: ID, revision: 2, content_hash: "f".repeat(64) },
 		state: {
 			schema_version: 2,
 			delegation_id: ID,
@@ -146,8 +148,10 @@ test("eligible terminal-negative authority without a sidecar routes to q-review,
 		throw new Error("unused");
 	}) as ExecFn, services);
 	assert.equal(missing.kind, "terminal_negative_review");
+	assert.equal(missing.resolution?.primary_action.action, "REVIEW_CANDIDATE");
 	assert.match(delegationNextActionTextV1(state, missing) ?? "", new RegExp(`workbench_review_worker_diff with delegation_id=${ID}`));
 	assert.match(delegationRepairStatusLinesV1(missing).join("\n"), /REPAIR-only Sol review/u);
+	assert.match(delegationRepairStatusLinesV1(missing).join("\n"), /typed action : REVIEW_CANDIDATE/u);
 
 	const corrupt = await readDelegationRepairStatusV1("/tmp/project", state, (async () => {
 		throw new Error("unused");
@@ -419,6 +423,30 @@ test("lineaged terminal retry, active execution, and pending review have distinc
 	});
 	assert.equal(pending.kind, "repair_review");
 	assert.match(delegationNextActionTextV1(state, pending) ?? "", /explicitly ACCEPT.*or issue another REPAIR/);
+});
+
+test("status lines expose the canonical typed action recovered by the status reader", () => {
+	const resolution = resolveDelegationLifecycleV1(
+		delegationLifecycleSnapshotFromReviewCandidateV1({
+			delegation_id: ID,
+			source_authority: { proof: HASH },
+			affected_paths: ["src/repaired.ts"],
+			review_required: true,
+		}),
+		{ schema_version: 1, kind: DELEGATION_LIFECYCLE_EVENT_KIND_V1, event: "OBSERVE", expected_snapshot_hash: null },
+	);
+	const status = {
+		kind: "repair_review" as const,
+		delegationId: ID,
+		transactionStatus: "PENDING_REVIEW",
+		rootDelegationId: ROOT,
+		lineageHash: LINEAGE,
+		depth: 1,
+		resolution,
+	};
+	const lines = delegationRepairStatusLinesV1(status);
+	assert.equal(lines.filter((line) => line.startsWith("typed action :")).length, 1);
+	assert.match(lines.join("\n"), /typed action : REVIEW_CANDIDATE \(CURRENT_DELTA_REVIEW_REQUIRED\)/u);
 });
 
 test("ordinary active and failed v2 transactions never inherit the mirror's review instruction", () => {

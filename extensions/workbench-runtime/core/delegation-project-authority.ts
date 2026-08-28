@@ -1375,6 +1375,10 @@ type InactiveBlockerLifecycleObservationV1 =
 	}
 	| { ok: false; code: string; delegation_id?: string };
 
+export type InactiveProjectDelegationBlockerLifecycleResolutionV1 =
+	| { ok: true; delegation_id: string; resolution: DelegationLifecycleResolutionV1 }
+	| { ok: false; code: string; delegation_id?: string };
+
 async function readInactiveBlockerLifecycleObservationV1(input: {
 	project_root: string;
 	exec: ExecFn;
@@ -1513,6 +1517,18 @@ async function readInactiveBlockerLifecycleObservationV1(input: {
 			expected_snapshot_hash: null,
 		}),
 	};
+}
+
+/** Read-only public adapter used by status; it never acquires a lock or writes closure authority. */
+export async function readInactiveProjectDelegationBlockerLifecycleResolutionV1(input: {
+	project_root: string;
+	exec: ExecFn;
+	expected_delegation_id?: string;
+}): Promise<InactiveProjectDelegationBlockerLifecycleResolutionV1> {
+	const observed = await readInactiveBlockerLifecycleObservationV1(input);
+	return observed.ok
+		? { ok: true, delegation_id: observed.delegation_id, resolution: observed.resolution }
+		: observed;
 }
 
 function inactiveBlockerEffectFailureCodeV1(code: DelegationLifecycleEffectFailureCodeV1): string {

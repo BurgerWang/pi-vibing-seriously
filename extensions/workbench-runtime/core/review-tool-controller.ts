@@ -16,7 +16,12 @@ import {
 	type DelegationState,
 } from "./delegation-state.ts";
 import type { reviewDelegationV2 } from "./delegation-review-v2.ts";
-import type { DelegationLifecycleResolutionV1 } from "./delegation-lifecycle-resolver.ts";
+import {
+	DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+	delegationLifecycleSnapshotFromReviewCandidateV1,
+	resolveDelegationLifecycleV1,
+	type DelegationLifecycleResolutionV1,
+} from "./delegation-lifecycle-resolver.ts";
 import type { readRecoverableUnpublishedDelegationV2 } from "./delegation-project-authority.ts";
 import {
 	isDelegationTerminalNegativeReviewEligibleFromCommittedV1,
@@ -273,6 +278,28 @@ export function registerReviewTool(controller: ReviewToolController): void {
 			let semanticReview: "accepted" | "required" | "not_required" | "repair_required" = "required";
 			let semanticRisk: "low" | "medium" | "high" = "medium";
 			if (v2Preflight.ok) {
+				const reviewSnapshot = delegationLifecycleSnapshotFromReviewCandidateV1({
+					delegation_id: delegationId,
+					source_authority: { state: v2Preflight.value.state, proof: v2Preflight.value.proof },
+					affected_paths: [...v2Preflight.value.state.allowed_paths].sort((left, right) =>
+						Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8")),
+					),
+					review_required: v2Preflight.value.state.status !== "REVIEWED",
+				});
+				lifecycleResolution = resolveDelegationLifecycleV1(reviewSnapshot, {
+					schema_version: 1,
+					kind: DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+					event: "OBSERVE",
+					expected_snapshot_hash: null,
+				});
+				const expectedReviewAction = v2Preflight.value.state.status === "REVIEWED"
+					? "CONTINUE_DEVELOPMENT" : "REVIEW_CANDIDATE";
+				if (lifecycleResolution.primary_action.action !== expectedReviewAction) {
+					return {
+						content: [{ type: "text", text: reviewText("workbench_review_worker_diff: canonical lifecycle action refused review") }],
+						details: { ok: false, error: "lifecycle_action_refused", authority_version: 2 },
+					};
+				}
 				const terminalNegativeEligible = controller.services.isTerminalNegativeReviewEligible ??
 					isDelegationTerminalNegativeReviewEligibleFromCommittedV1;
 				if (v2Preflight.value.state.status === "FAILED" &&
@@ -292,6 +319,7 @@ export function registerReviewTool(controller: ReviewToolController): void {
 					maxBytes: packetMaxBytes,
 					secrets: controller.secrets,
 					now,
+					expectedLifecycleSnapshotHash: lifecycleResolution.primary_action.snapshot_hash,
 					...(ctx.model === undefined ? {} : { presenter: { provider: ctx.model.provider, model: ctx.model.id } }),
 					...(semanticDecisionSupplied ? {
 						semanticDecision: semanticDecisionRaw as "ACCEPT" | "REPAIR",
@@ -339,7 +367,7 @@ export function registerReviewTool(controller: ReviewToolController): void {
 				migrationBindingHash = v2Result.migration_binding_hash;
 				repairDecisionHash = v2Result.repair_decision_hash;
 				repairReasonHash = v2Result.repair_reason_hash;
-				lifecycleResolution = v2Result.lifecycle_resolution;
+				lifecycleResolution = v2Result.lifecycle_resolution ?? lifecycleResolution;
 				regeneratedDerivedReview = v2Result.regenerated_derived_review === true && lifecycleResolution !== undefined;
 				if (!result.ok || !result.record) {
 					return {
@@ -519,12 +547,12 @@ export function registerReviewTool(controller: ReviewToolController): void {
 					patch_truncated: record.patch_truncated,
 					authority_version: authorityVersion,
 					finalized,
-					...(regeneratedDerivedReview ? {
-						regenerated_derived_review: true,
+					...(regeneratedDerivedReview ? { regenerated_derived_review: true } : {}),
+					...(lifecycleResolution === undefined ? {} : {
 						lifecycle_action: lifecycleResolution!.primary_action.action,
 						lifecycle_reason: lifecycleResolution!.primary_action.reason,
 						lifecycle_snapshot_hash: lifecycleResolution!.primary_action.snapshot_hash,
-					} : {}),
+					}),
 					...(sessionMirrorWarning === undefined ? {} : { session_mirror_warning: sessionMirrorWarning }),
 				},
 			};

@@ -9,6 +9,7 @@ import type { ExecFn } from "./config.ts";
 import {
 	collectCurrentDelegationBindingV2,
 	readDelegationAuthorityObservationV2,
+	readInactiveProjectDelegationBlockerLifecycleResolutionV1,
 	readProjectDelegationRepairClosureV1,
 	type CurrentDelegationBindingV2,
 	type DelegationAuthorityObservationV2,
@@ -26,13 +27,20 @@ import {
 import { recoverExactRepairCommandAuthorityV1 } from "./exact-repair-authority.ts";
 import { recoverRawLineageExactRepairAuthorityV1 } from "./exact-repair-raw-lineage-authority.ts";
 import { readWorkerRepairCapsule } from "./worker-repair-authority.ts";
-import type { DelegationLifecycleResolutionV1 } from "./delegation-lifecycle-resolver.ts";
+import {
+	DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+	delegationLifecycleSnapshotFromExactRepairAuthorityV1,
+	delegationLifecycleSnapshotFromReviewCandidateV1,
+	resolveDelegationLifecycleV1,
+	type DelegationLifecycleResolutionV1,
+} from "./delegation-lifecycle-resolver.ts";
 
 export interface DelegationRepairStatusReaderServicesV1 {
 	readAuthority: typeof readDelegationAuthorityObservationV2;
 	collectBinding: typeof collectCurrentDelegationBindingV2;
 	readRepairCapsule: typeof readWorkerRepairCapsule;
 	readRepairClosure?: typeof readProjectDelegationRepairClosureV1;
+	readInactiveLifecycle?: typeof readInactiveProjectDelegationBlockerLifecycleResolutionV1;
 	readCommittedGeneration?: typeof readDelegationCommittedGenerationV2;
 	readTerminalNegativeRepair?: typeof readDelegationTerminalNegativeSolAuthorityV1;
 }
@@ -42,13 +50,14 @@ const DEFAULT_READER_SERVICES = Object.freeze({
 	collectBinding: collectCurrentDelegationBindingV2,
 	readRepairCapsule: readWorkerRepairCapsule,
 	readRepairClosure: readProjectDelegationRepairClosureV1,
+	readInactiveLifecycle: readInactiveProjectDelegationBlockerLifecycleResolutionV1,
 	readCommittedGeneration: readDelegationCommittedGenerationV2,
 	readTerminalNegativeRepair: readDelegationTerminalNegativeSolAuthorityV1,
 }) satisfies DelegationRepairStatusReaderServicesV1;
 
 type V2Observation = Extract<DelegationAuthorityObservationV2, { kind: "v2" }>;
 
-export type DelegationRepairStatusV1 =
+type DelegationRepairStatusShapeV1 =
 	| { kind: "none" }
 	| { kind: "authority_invalid"; delegationId: string | null; code: string }
 	| {
@@ -127,6 +136,10 @@ export type DelegationRepairStatusV1 =
 		lineageHash: string;
 		depth: number;
 	};
+
+export type DelegationRepairStatusV1 = DelegationRepairStatusShapeV1 & {
+	readonly resolution?: DelegationLifecycleResolutionV1;
+};
 
 /**
  * Project-level corruption overrides every session-local hint.  The two
@@ -273,7 +286,21 @@ async function hasExecutableExactRepairAuthorityV1(input: {
 	delegationId: string;
 	exec: ExecFn;
 	services: DelegationRepairStatusReaderServicesV1;
-}): Promise<boolean> {
+}): Promise<DelegationLifecycleResolutionV1 | undefined> {
+	const fromAuthority = (authority: { repair_of: string; arguments: { allowed_paths: readonly string[] } }): DelegationLifecycleResolutionV1 | undefined => {
+		const snapshot = delegationLifecycleSnapshotFromExactRepairAuthorityV1({
+			repair_of: authority.repair_of,
+			source_authority: authority,
+			affected_paths: authority.arguments.allowed_paths,
+		});
+		const resolution = resolveDelegationLifecycleV1(snapshot, {
+			schema_version: 1,
+			kind: DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+			event: "OBSERVE",
+			expected_snapshot_hash: null,
+		});
+		return resolution.primary_action.action === "EXECUTE_EXACT_REPAIR" ? resolution : undefined;
+	};
 	const readCommitted = input.services.readCommittedGeneration ?? readDelegationCommittedGenerationV2;
 	const committed = await readCommitted(input.projectRoot, input.delegationId);
 	if (committed.ok) {
@@ -282,26 +309,58 @@ async function hasExecutableExactRepairAuthorityV1(input: {
 				input.projectRoot,
 				input.delegationId,
 			);
-			if (!negative.ok) return false;
+			if (!negative.ok) return undefined;
 			const binding = await input.services.collectBinding(input.projectRoot, input.delegationId, input.exec);
-			return binding.status === "fresh" && recoverExactRepairCommandAuthorityV1({
+			if (binding.status !== "fresh") return undefined;
+			const recovered = recoverExactRepairCommandAuthorityV1({
 				repairOf: input.delegationId,
 				committed: committed.value,
 				terminalNegativeRepair: negative.value,
 				currentBindingHash: binding.hash,
-			}).ok;
+			});
+			return recovered.ok ? fromAuthority(recovered.value) : undefined;
 		}
-		return recoverExactRepairCommandAuthorityV1({
+		const recovered = recoverExactRepairCommandAuthorityV1({
 			repairOf: input.delegationId,
 			committed: committed.value,
-		}).ok;
+		});
+		return recovered.ok ? fromAuthority(recovered.value) : undefined;
 	}
-	if (committed.error.code === "storage_failure") return false;
-	return (await recoverRawLineageExactRepairAuthorityV1({
+	if (committed.error.code === "storage_failure") return undefined;
+	const recovered = await recoverRawLineageExactRepairAuthorityV1({
 		project_root: input.projectRoot,
 		repair_of: input.delegationId,
 		collectCurrentBinding: (root, id) => input.services.collectBinding(root, id, input.exec),
-	})).ok;
+	});
+	return recovered.ok ? fromAuthority(recovered.value) : undefined;
+}
+
+async function reviewLifecycleResolutionV1(input: {
+	projectRoot: string;
+	delegationId: string;
+	services: DelegationRepairStatusReaderServicesV1;
+}): Promise<DelegationLifecycleResolutionV1 | undefined> {
+	const committed = await (input.services.readCommittedGeneration ?? readDelegationCommittedGenerationV2)(
+		input.projectRoot,
+		input.delegationId,
+	);
+	if (!committed.ok) return undefined;
+	const state = committed.value.state;
+	const snapshot = delegationLifecycleSnapshotFromReviewCandidateV1({
+		delegation_id: state.delegation_id,
+		source_authority: { state, proof: committed.value.proof },
+		affected_paths: [...state.allowed_paths].sort((left, right) =>
+			Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8")),
+		),
+		review_required: true,
+	});
+	const resolution = resolveDelegationLifecycleV1(snapshot, {
+		schema_version: 1,
+		kind: DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+		event: "OBSERVE",
+		expected_snapshot_hash: null,
+	});
+	return resolution.primary_action.action === "REVIEW_CANDIDATE" ? resolution : undefined;
 }
 
 export async function readDelegationRepairStatusV1(
@@ -344,17 +403,41 @@ export async function readDelegationRepairStatusV1(
 				committed.value.records,
 			);
 		}
-			const retryable = !terminalNegativeReviewEligible && authority.kind === "v2" &&
-				["ABORTED", "FAILED", "INTERRUPTED", "RECOVERY_REQUIRED"].includes(authority.transactionStatus)
-				? await hasExecutableExactRepairAuthorityV1({ projectRoot, delegationId, exec, services })
-				: false;
-		return classifyDelegationRepairStatusV1({
+		const exactRepairResolution = authority.kind === "v2" &&
+			(authority.semanticRepair !== undefined ||
+				(!terminalNegativeReviewEligible &&
+					["ABORTED", "FAILED", "INTERRUPTED", "RECOVERY_REQUIRED"].includes(authority.transactionStatus)))
+			? await hasExecutableExactRepairAuthorityV1({ projectRoot, delegationId, exec, services })
+			: undefined;
+		const classified = classifyDelegationRepairStatusV1({
 			delegationId,
 			authority,
 			binding,
-			retryable,
+			retryable: exactRepairResolution !== undefined,
 			terminalNegativeReviewEligible,
 		});
+		let resolution = exactRepairResolution;
+		if (resolution === undefined &&
+			(classified.kind === "terminal_negative_review" || classified.kind === "repair_review")) {
+			resolution = await reviewLifecycleResolutionV1({ projectRoot, delegationId, services });
+		}
+		if (resolution === undefined && services.readInactiveLifecycle !== undefined && [
+			"delegation_active",
+			"delegation_retry",
+			"delegation_recovery",
+			"repair_required",
+			"repair_retry",
+			"repair_active",
+			"repair_recovery",
+		].includes(classified.kind)) {
+			const inactive = await services.readInactiveLifecycle({
+				project_root: projectRoot,
+				exec,
+				expected_delegation_id: delegationId,
+			});
+			if (inactive.ok) resolution = inactive.resolution;
+		}
+		return resolution === undefined ? classified : { ...classified, resolution };
 	} catch {
 		return { kind: "authority_invalid", delegationId: state.latestId ?? null, code: "status_unavailable" };
 	}
@@ -424,7 +507,7 @@ export function delegationNextActionTextV1(
 }
 
 /** Human-readable strict repair facts; hashes are shown, free-form reasons are not. */
-export function delegationRepairStatusLinesV1(status: DelegationRepairStatusV1): string[] {
+function delegationRepairStatusBaseLinesV1(status: DelegationRepairStatusV1): string[] {
 	if (status.kind === "none") return [];
 	if (status.kind === "derived_review_invalid") {
 		return [
@@ -510,6 +593,19 @@ export function delegationRepairStatusLinesV1(status: DelegationRepairStatusV1):
 		);
 	}
 	return lines;
+}
+
+/** Prepend the one canonical action whenever status recovered typed lifecycle authority. */
+export function delegationRepairStatusLinesV1(status: DelegationRepairStatusV1): string[] {
+	const lines = delegationRepairStatusBaseLinesV1(status);
+	if (status.kind === "none" || status.kind === "derived_review_invalid" || status.resolution === undefined) {
+		return lines;
+	}
+	return [
+		lines[0]!,
+		`typed action : ${status.resolution.primary_action.action} (${status.resolution.primary_action.reason})`,
+		...lines.slice(1),
+	];
 }
 
 /** Clarify the exact semantic-repair exception to the ordinary pending-review blocker. */

@@ -455,6 +455,15 @@ test("review v2 fixture: reverse journal order builds, commits, and strict-reads
 		assert.equal(strict.ok, true, strict.ok ? "" : JSON.stringify(strict.error));
 		assert.equal(after.worker_success, true);
 		assert.equal(after.worker_failure_code, null);
+		const stalePreflight = await reviewDelegationV2({
+			projectRoot: fixture.root,
+			delegationId: ID,
+			exec: spawnExec,
+			now: at(4),
+			expectedLifecycleSnapshotHash: "0".repeat(64),
+		});
+		assert.equal(stalePreflight.ok, false);
+		if (!stalePreflight.ok) assert.equal(stalePreflight.error.code, "review_conflict");
 		const reviewed = await reviewDelegationV2({
 			projectRoot: fixture.root,
 			delegationId: ID,
@@ -462,6 +471,10 @@ test("review v2 fixture: reverse journal order builds, commits, and strict-reads
 			now: at(4),
 		});
 		assert.equal(reviewed.ok, true, reviewed.ok ? "" : JSON.stringify(reviewed.error));
+		if (reviewed.ok) {
+			assert.equal(reviewed.lifecycle_resolution?.primary_action.action, "REVIEW_CANDIDATE");
+			assert.equal(reviewed.lifecycle_resolution?.primary_action.reason, "CURRENT_DELTA_REVIEW_REQUIRED");
+		}
 	} finally {
 		await cleanup(fixture);
 	}
