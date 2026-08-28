@@ -2452,6 +2452,9 @@ test("a deliberately discarded repair closes on a clean repository and the same 
 		assert.equal(closed.details.delegation_id, parentId);
 		assert.equal(closed.details.git_mutation, "NONE");
 		assert.equal(closed.details.rejected_authority, "NOT_ACCEPTED");
+		assert.equal(closed.details.lifecycle_action, "CLOSE_SATISFIED_NO_DELTA");
+		assert.equal(closed.details.lifecycle_reason, "SATISFIED_WITHOUT_NEW_DELTA");
+		assert.match(String(closed.details.lifecycle_snapshot_hash), /^[a-f0-9]{64}$/u);
 		assert.match(String(closed.details.abandonment_hash), /^[0-9a-f]{64}$/u);
 		assert.deepEqual(await readProjectDelegationRepairClosureV1(root), {
 			ok: true,

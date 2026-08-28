@@ -91,6 +91,7 @@ import {
 import {
 	DELEGATION_LIFECYCLE_EVENT_KIND_V1,
 	DELEGATION_LIFECYCLE_SNAPSHOT_KIND_V1,
+	delegationLifecycleSnapshotFromCleanRepairClosureV1,
 	delegationLifecycleSnapshotFromInvalidDerivedReviewV1,
 	resolveDelegationLifecycleV1,
 	type DelegationLifecycleResolutionV1,
@@ -211,7 +212,7 @@ export type ReconcileProjectDelegationAuthorityV2Result =
 	| { ok: true; state: DelegationState | null };
 
 export type AbandonCleanProjectDelegationRepairV1Result =
-	| { ok: true; value: DelegationCleanRepairAbandonmentV1 }
+	| { ok: true; value: DelegationCleanRepairAbandonmentV1; lifecycle_resolution?: DelegationLifecycleResolutionV1 }
 	| { ok: false; code: string; delegation_id?: string };
 
 export type CloseInactiveProjectDelegationBlockerV2Result =
@@ -1676,10 +1677,93 @@ export async function quarantineProjectDelegationAuthorityV1(input: {
 	return { ok: true, value: verified.value };
 }
 
+type CleanRepairLifecycleObservationV1 =
+	| {
+		ok: true;
+		closed: boolean;
+		delegation_id: string;
+		snapshot: DelegationLifecycleSnapshotV1;
+		resolution: DelegationLifecycleResolutionV1;
+		tip?: DelegationTransactionRecord;
+		root_decision?: DelegationSemanticRepairDecisionV1;
+		clean_guard?: WorkspaceGuardRecord;
+	}
+	| { ok: false; code: string; delegation_id?: string };
+
+async function readCleanRepairLifecycleObservationV1(input: {
+	project_root: string;
+	exec: ExecFn;
+	expected_tip_id?: string;
+}): Promise<CleanRepairLifecycleObservationV1> {
+	const closure = await readProjectDelegationRepairClosureV1(input.project_root);
+	if (!closure.ok) {
+		return { ok: false, code: closure.issue.code, ...(closure.issue.delegationId === undefined ? {} : { delegation_id: closure.issue.delegationId }) };
+	}
+	if (closure.unresolvedTipId === null) {
+		if (input.expected_tip_id === undefined) return { ok: false, code: "no_unresolved_repair" };
+		const snapshot = delegationLifecycleSnapshotFromCleanRepairClosureV1({
+			delegation_id: input.expected_tip_id,
+			source_authority: closure,
+			workspace_clean: true,
+			closed: true,
+		});
+		return {
+			ok: true,
+			closed: true,
+			delegation_id: input.expected_tip_id,
+			snapshot,
+			resolution: resolveDelegationLifecycleV1(snapshot, {
+				schema_version: 1,
+				kind: DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+				event: "OBSERVE",
+				expected_snapshot_hash: null,
+			}),
+		};
+	}
+	if (input.expected_tip_id !== undefined && closure.unresolvedTipId !== input.expected_tip_id) {
+		return { ok: false, code: "repair_authority_changed", delegation_id: closure.unresolvedTipId };
+	}
+	const tip = await readDelegationTransactionV2(input.project_root, closure.unresolvedTipId);
+	if (!tip.ok) return { ok: false, code: tip.error.code, delegation_id: closure.unresolvedTipId };
+	const rootDelegationId = tip.value.repair_lineage?.root_delegation_id ?? tip.value.delegation_id;
+	const rootDecision = await readRepairRootDecisionV1(input.project_root, rootDelegationId);
+	if (!rootDecision.ok || rootDecision.value === undefined) {
+		return {
+			ok: false,
+			code: rootDecision.ok ? "repair_decision_missing" : rootDecision.issue.code,
+			delegation_id: rootDelegationId,
+		};
+	}
+	const guard = await collectWorkspaceGuard({ project_root: input.project_root, exec: input.exec });
+	if (!guard.ok) return { ok: false, code: `workspace_${guard.error.code}`, delegation_id: tip.value.delegation_id };
+	const workspaceClean = guard.guard.entries.length === 0 && guard.guard.git_head !== null;
+	const snapshot = delegationLifecycleSnapshotFromCleanRepairClosureV1({
+		delegation_id: tip.value.delegation_id,
+		source_authority: { closure, tip: tip.value, root_decision: rootDecision.value, guard: guard.guard },
+		workspace_clean: workspaceClean,
+		closed: false,
+	});
+	return {
+		ok: true,
+		closed: false,
+		delegation_id: tip.value.delegation_id,
+		snapshot,
+		resolution: resolveDelegationLifecycleV1(snapshot, {
+			schema_version: 1,
+			kind: DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+			event: "OBSERVE",
+			expected_snapshot_hash: null,
+		}),
+		tip: tip.value,
+		root_decision: rootDecision.value,
+		clean_guard: guard.guard,
+	};
+}
+
 /**
  * Close one exact unresolved semantic repair after Sol observes a strictly
- * clean Git workspace. No project file or Git ref is changed; the old rejected
- * transaction remains immutable and is closed only by the new bound receipt.
+ * clean Git workspace. The public action now executes through the canonical
+ * lifecycle effect boundary and must lower the logical recovery rank.
  */
 export async function abandonCleanProjectDelegationRepairV1(input: {
 	project_root: string;
@@ -1687,61 +1771,115 @@ export async function abandonCleanProjectDelegationRepairV1(input: {
 	exec: ExecFn;
 	abandoned_by: DelegationCleanRepairAbandonmentV1["abandoned_by"];
 }): Promise<AbandonCleanProjectDelegationRepairV1Result> {
-	const initial = await readProjectDelegationRepairClosureV1(input.project_root);
-	if (!initial.ok) return { ok: false, code: initial.issue.code, ...(initial.issue.delegationId === undefined ? {} : { delegation_id: initial.issue.delegationId }) };
-	if (initial.unresolvedTipId === null) return { ok: false, code: "no_unresolved_repair" };
-	const initialTipId = initial.unresolvedTipId;
-	const acquired = await acquireProjectDelegationStartLockV1({
+	const initial = await readCleanRepairLifecycleObservationV1({ project_root: input.project_root, exec: input.exec });
+	if (!initial.ok) return initial;
+	if (initial.closed || initial.tip === undefined || initial.root_decision === undefined || initial.clean_guard === undefined) {
+		return { ok: false, code: "no_unresolved_repair" };
+	}
+	if (initial.resolution.primary_action.action !== "CLOSE_SATISFIED_NO_DELTA") {
+		return {
+			ok: false,
+			code: initial.resolution.primary_action.action === "REBASE_CURRENT_BINDING"
+				? "workspace_not_clean"
+				: "repair_authority_changed",
+			delegation_id: initial.delegation_id,
+		};
+	}
+	let current = initial;
+	let published: DelegationCleanRepairAbandonmentV1 | undefined;
+	let exactFailureCode: string | undefined;
+	const executed = await executeDelegationLifecycleEffectV1({
 		project_root: input.project_root,
-		delegation_id: initialTipId,
+		resolution: initial.resolution,
+		expected_snapshot_hash: initial.resolution.primary_action.snapshot_hash,
+		execution_mode: "EXPLICIT",
+		user_authorized: true,
 		now: input.now,
+	}, {
+		with_writer_lock: async (request, operation) => {
+			const locked = await withProjectDelegationStartLockV1({
+				project_root: request.project_root,
+				delegation_id: initial.delegation_id,
+				now: request.now,
+			}, async (lease) => operation({ owner: lease }));
+			if (locked.ok) return locked;
+			exactFailureCode = `start_lock_${locked.error.code}`;
+			return {
+				ok: false,
+				code: locked.error.code === "conflict" ? "CONFLICT" as const
+					: locked.error.code === "storage_failure" ? "STORAGE_FAILURE" as const
+						: "FAILED" as const,
+			};
+		},
+		read_snapshot: async () => {
+			const observed = await readCleanRepairLifecycleObservationV1({
+				project_root: input.project_root,
+				exec: input.exec,
+				expected_tip_id: initial.delegation_id,
+			});
+			if (!observed.ok) {
+				exactFailureCode = observed.code;
+				throw new Error("clean repair lifecycle snapshot unavailable");
+			}
+			current = observed;
+			return observed.snapshot;
+		},
+		handlers: {
+			CLOSE_SATISFIED_NO_DELTA: {
+				is_complete: ({ snapshot }) => snapshot.attempt === "TERMINAL" &&
+					snapshot.recovery_rank?.unresolved_obligations === 0,
+				execute: async () => {
+					if (current.closed || current.tip === undefined || current.root_decision === undefined || current.clean_guard === undefined) {
+						return { ok: false, code: "CONFLICT" as const };
+					}
+					const write = await publishDelegationCleanRepairAbandonmentV1({
+						project_root: input.project_root,
+						tip: current.tip,
+						root_decision: current.root_decision,
+						clean_guard: current.clean_guard,
+						abandoned_by: input.abandoned_by,
+						now: input.now,
+					});
+					if (write.ok) {
+						published = write.value;
+						return { ok: true };
+					}
+					exactFailureCode = `repair_abandonment_${write.error.code}`;
+					return {
+						ok: false,
+						code: write.error.code === "conflict" ? "CONFLICT" as const
+							: write.error.code === "storage_failure" ? "STORAGE_FAILURE" as const
+								: "FAILED" as const,
+					};
+				},
+			},
+		},
 	});
-	if (!acquired.ok) return { ok: false, code: `start_lock_${acquired.error.code}`, delegation_id: initialTipId };
-
-	const outcome = await (async (): Promise<AbandonCleanProjectDelegationRepairV1Result> => {
-		const closure = await readProjectDelegationRepairClosureV1(input.project_root);
-		if (!closure.ok) return { ok: false, code: closure.issue.code, ...(closure.issue.delegationId === undefined ? {} : { delegation_id: closure.issue.delegationId }) };
-		if (closure.unresolvedTipId !== initialTipId) {
-			return { ok: false, code: "repair_authority_changed", ...(closure.unresolvedTipId === null ? {} : { delegation_id: closure.unresolvedTipId }) };
-		}
-		const tip = await readDelegationTransactionV2(input.project_root, initialTipId);
-		if (!tip.ok) return { ok: false, code: tip.error.code, delegation_id: initialTipId };
-		const rootDelegationId = tip.value.repair_lineage?.root_delegation_id ?? tip.value.delegation_id;
-		const rootDecision = await readRepairRootDecisionV1(input.project_root, rootDelegationId);
-		if (!rootDecision.ok || rootDecision.value === undefined) {
+	if (!executed.ok) {
+		const changedToRebase = executed.code === "ACTION_CHANGED" &&
+			executed.observed?.primary_action.action === "REBASE_CURRENT_BINDING";
+		return {
+			ok: false,
+			code: exactFailureCode ?? (changedToRebase ? "workspace_not_clean" : `lifecycle_${executed.code.toLowerCase()}`),
+			delegation_id: initial.delegation_id,
+		};
+	}
+	if (published === undefined) {
+		const replay = await readDelegationCleanRepairAbandonmentV1(
+			input.project_root,
+			initial.tip,
+			initial.root_decision,
+		);
+		if (!replay.ok || replay.value === undefined) {
 			return {
 				ok: false,
-				code: rootDecision.ok ? "repair_decision_missing" : rootDecision.issue.code,
-				delegation_id: rootDelegationId,
+				code: replay.ok ? "repair_abandonment_not_closed" : `repair_abandonment_${replay.error.code}`,
+				delegation_id: initial.delegation_id,
 			};
 		}
-		const guard = await collectWorkspaceGuard({ project_root: input.project_root, exec: input.exec });
-		if (!guard.ok) return { ok: false, code: `workspace_${guard.error.code}`, delegation_id: tip.value.delegation_id };
-		if (guard.guard.entries.length !== 0 || guard.guard.git_head === null) {
-			return { ok: false, code: "workspace_not_clean", delegation_id: tip.value.delegation_id };
-		}
-		const published = await publishDelegationCleanRepairAbandonmentV1({
-			project_root: input.project_root,
-			tip: tip.value,
-			root_decision: rootDecision.value,
-			clean_guard: guard.guard,
-			abandoned_by: input.abandoned_by,
-			now: input.now,
-		});
-		if (!published.ok) return { ok: false, code: `repair_abandonment_${published.error.code}`, delegation_id: tip.value.delegation_id };
-		const verified = await readProjectDelegationRepairClosureV1(input.project_root);
-		if (!verified.ok || verified.unresolvedTipId !== null) {
-			return {
-				ok: false,
-				code: verified.ok ? "repair_abandonment_not_closed" : verified.issue.code,
-				...(verified.ok || verified.issue.delegationId === undefined ? {} : { delegation_id: verified.issue.delegationId }),
-			};
-		}
-		return { ok: true, value: published.value };
-	})();
-	const released = await releaseProjectDelegationStartLockV1(acquired.value);
-	if (!released.ok) return { ok: false, code: `start_lock_release_${released.error.code}`, delegation_id: initialTipId };
-	return outcome;
+		published = replay.value;
+	}
+	return { ok: true, value: published, lifecycle_resolution: initial.resolution };
 }
 
 /** Pure-result reconciliation over strict project authority; persistence remains caller-owned. */

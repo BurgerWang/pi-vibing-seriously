@@ -184,6 +184,11 @@ export function registerGitTool(controller: GitToolController): void {
 						git_mutation: "NONE",
 						rejected_authority: "NOT_ACCEPTED",
 						next_action: "CONTINUE_DELEGATION_IN_CURRENT_WORKTREE",
+						...(result.lifecycle_resolution === undefined ? {} : {
+							lifecycle_action: result.lifecycle_resolution.primary_action.action,
+							lifecycle_reason: result.lifecycle_resolution.primary_action.reason,
+							lifecycle_snapshot_hash: result.lifecycle_resolution.primary_action.snapshot_hash,
+						}),
 					},
 				};
 			}

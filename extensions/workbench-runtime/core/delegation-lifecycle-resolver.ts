@@ -604,3 +604,34 @@ export function delegationLifecycleSnapshotFromExactRepairAuthorityV1(input: {
 		recovery_rank: { unresolved_obligations: 1, unresolved_attempts: 1 },
 	};
 }
+
+/** Normalize the strict-clean compatibility closure without persisting shadow state. */
+export function delegationLifecycleSnapshotFromCleanRepairClosureV1(input: {
+	delegation_id: string;
+	source_authority: unknown;
+	workspace_clean: boolean;
+	closed: boolean;
+}): DelegationLifecycleSnapshotV1 {
+	return {
+		schema_version: 1,
+		kind: DELEGATION_LIFECYCLE_SNAPSHOT_KIND_V1,
+		source_authority_hash: canonicalHash({
+			kind: "delegation-clean-repair-closure-source-v1",
+			authority: input.source_authority,
+		}),
+		operation_intent: "DEV",
+		authority: { health: "VALID", disposition: "INACTIVE" },
+		writer_lock: "ABSENT",
+		binding: input.closed || input.workspace_clean ? "CURRENT" : "REBASEABLE",
+		attempt: input.closed ? "TERMINAL" : "SATISFIED_NO_DELTA",
+		candidate: "NONE",
+		runtime_identity: "NOT_REQUIRED",
+		request_valid: true,
+		target: { kind: "DELEGATION", id: input.delegation_id },
+		affected_paths: [],
+		scope_unknown: false,
+		recovery_rank: input.closed
+			? { unresolved_obligations: 0, unresolved_attempts: 0 }
+			: { unresolved_obligations: 1, unresolved_attempts: 1 },
+	};
+}

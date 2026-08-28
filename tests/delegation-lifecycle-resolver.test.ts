@@ -8,6 +8,7 @@ import {
 	DELEGATION_LIFECYCLE_PRIMARY_ACTIONS_V1,
 	DELEGATION_LIFECYCLE_SNAPSHOT_KIND_V1,
 	delegationLifecycleSnapshotHashV1,
+	delegationLifecycleSnapshotFromCleanRepairClosureV1,
 	delegationLifecycleSnapshotFromExactRepairAuthorityV1,
 	delegationLifecycleSnapshotFromPathLaneAdmissionV1,
 	resolveDelegationLifecycleV1,
@@ -77,6 +78,39 @@ test("the exact-repair adapter yields the same canonical action and a binding ch
 	);
 	assert.equal(rebased.primary_action.action, "REBASE_CURRENT_BINDING");
 	assert.equal(rebased.primary_action.reason, "REBASEABLE_BINDING_CHANGED");
+});
+
+test("the clean-repair adapter closes only a clean unresolved obligation and strictly lowers its rank", () => {
+	const open = delegationLifecycleSnapshotFromCleanRepairClosureV1({
+		delegation_id: "20260828-100000-r001",
+		source_authority: { closure: "open" },
+		workspace_clean: true,
+		closed: false,
+	});
+	const closing = resolveDelegationLifecycleV1(open, OBSERVE);
+	assert.equal(closing.primary_action.action, "CLOSE_SATISFIED_NO_DELTA");
+	assert.equal(closing.primary_action.recovery_effect, "MUST_DECREASE_RANK");
+	assert.deepEqual(closing.primary_action.expected_recovery_rank, {
+		unresolved_obligations: 1, unresolved_attempts: 1,
+	});
+	const dirty = resolveDelegationLifecycleV1(
+		delegationLifecycleSnapshotFromCleanRepairClosureV1({
+			delegation_id: "20260828-100000-r001",
+			source_authority: { closure: "open" },
+			workspace_clean: false,
+			closed: false,
+		}),
+		OBSERVE,
+	);
+	assert.equal(dirty.primary_action.action, "REBASE_CURRENT_BINDING");
+	const closed = delegationLifecycleSnapshotFromCleanRepairClosureV1({
+		delegation_id: "20260828-100000-r001",
+		source_authority: { closure: "closed" },
+		workspace_clean: true,
+		closed: true,
+	});
+	assert.deepEqual(closed.recovery_rank, { unresolved_obligations: 0, unresolved_attempts: 0 });
+	assert.equal(resolveDelegationLifecycleV1(closed, OBSERVE).primary_action.action, "CONTINUE_DEVELOPMENT");
 });
 
 test("the canonical lifecycle matrix returns one typed primary action for every known condition", () => {
