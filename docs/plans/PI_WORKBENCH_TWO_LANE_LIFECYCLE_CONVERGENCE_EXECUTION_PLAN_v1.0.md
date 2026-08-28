@@ -542,20 +542,20 @@ resolver 将其与 committed generation、review、lock、binding 和 lineage �
 | WP2 | 已实现并提交 | `5552222`，canonical lifecycle resolver 与矩阵测试 |
 | WP3 | 已分阶段实现并提交 | `513d9b7` 至 `357f84b`，统一 effect/review/status/continuation 收敛 |
 | WP4 | 已实现、测试并提交 | `7391000`，普通开发通道与回归测试 |
-| WP5 | 源码与自动化测试完成，纳入本次提交 | Candidate identity/version/alias、Candidate-bound Gates、research/release promotion、Q4 机验、release provenance、report/compare |
-| WP6 | 已实现、自动化测试完成，未提交 | 10,000 个固定 seed 模型序列、缩减/replay、review/repair/lock 调度、逐 publish boundary 故障注入、三项目兼容零写入回放 |
-| WP7 | 源码与自动化测试完成，未提交 | 唯一 resolver/action owner、status 纯投影、v1 writer fail-closed、六份最终行为文档与结构回归 |
-| WP8 | `NOT_STARTED` | 下一工作包：三项目部署与最终出口 |
+| WP5 | 已实现并提交 | Candidate identity/version/alias、Candidate-bound Gates、research/release promotion、Q4 机验、release provenance、report/compare |
+| WP6 | 已实现、测试并提交 | `b8a4ad2`，10,000 个固定 seed 模型序列、缩减/replay、review/repair/lock 调度、逐 publish boundary 故障注入、三项目兼容零写入回放 |
+| WP7 | 已实现、测试并提交 | `a625af2`，唯一 resolver/action owner、status 纯投影、v1 writer fail-closed、六份最终行为文档与结构回归 |
+| WP8 | 实机部署与普通 canary 已完成；strict Candidate 出口按当前证据 `BLOCKED/NOT_RUN` | `9b911b8`，三项目当前 runtime、status、DEV canary、B6 与 restart 证据；没有可冻结的 evidence-complete Candidate |
 
-WP6 当前验证证据为 lifecycle focused 组 160/160 PASS；WP7 focused lifecycle、
-兼容、回放、打包组 244/244 PASS，最新 `npm run check` PASS，其中 typecheck PASS、
-全量测试 3101 项（3100 PASS、1 项按普通测试合同 SKIP）且 `git diff --check` PASS。
+WP6 验证证据为 lifecycle focused 组 160/160 PASS；WP7 focused lifecycle、兼容、
+回放、打包组 244/244 PASS。WP8 最终候选 focused 170/170 PASS，release/package/
+stable compatibility 83/83 PASS，最新 `npm run check` PASS，其中 typecheck PASS、全量
+测试 3101 项（3100 PASS、1 项按普通测试合同 SKIP）且 `git diff --check` PASS。
 模型测试覆盖 10,000 个固定 seed 序列、全部 37 个模型
 命令、15 个主动作和 12 个 canonical state；失败输出携带 seed、完整 replay 序列和
-缩减结果。该结果只证明当前源码候选及自动化测试通过；运行中的 Pi
-reload/runtime identity、三个外部项目 canary、release 授权、push 和 publish 均为
-`NOT_RUN`。因此本计划仍为 `IN_PROGRESS`，不得标记 `COMPLETE`；下一执行入口是
-WP8。
+缩减结果。三项目实机结果见 WP8；release 授权、push 和 publish 均为 `NOT_RUN`。
+由于 `S2.2–S2.6` 仍缺少可比的前后吞吐/持久化基线，且三个项目当前没有可冻结的
+evidence-complete Candidate，本计划仍为 `IN_PROGRESS`，不得标记 `COMPLETE`。
 
 ### WP0 — 收束现有恢复候选
 
@@ -867,6 +867,48 @@ reload、三个外部项目 canary、Gate、release、push 或 publish，均留�
   Gate；测试不替代 Gate verdict。
 - `WP8-AC07` restart/reload 后结果保持一致。
 - `WP8-AC08` 无项目业务文件被 Workbench 迁移脚本改写。
+
+**当前执行证据（2026-08-28）：**
+
+- 最终 Workbench runtime source 为
+  `sha256:5a21e90bb756bd37b9c7ff94c520d5670afaae499a498eb34c8eee882de65a7e`；
+  Scalper、Mace、Onchain 的两个独立新进程轮次均报告 loaded/disk `CURRENT`，旧的
+  三个交互 Pi PID 已退出，因此没有遗留的已知 stale live process。
+- 实机 status canary 发现并修复两处旧 mirror 泄漏：`/q-status` 现在直接渲染 durable
+  canonical projection；semantic REPAIR status 会严格恢复 review authority，并返回
+  `EXECUTE_EXACT_REPAIR`；`/q-mode-verify` 的阻塞理由也消费同一 resolver action，
+  不再把 Scalper 的 durable `FAILED` 错写成 `PENDING_REVIEW`。
+- 普通 DEV diagnosis canary 均以零业务 delta 收敛：Scalper
+  `20260828-195149-av5j`、Mace `20260828-195235-t5a8`、Onchain
+  `20260828-195405-o136`。Onchain 的第一次探针 `20260828-195312-wmwg` 指向不存在
+  的 `AGENTS.md`，虽安全零差异关闭但不计入验收，随后使用现有 `spec/README.md`
+  重跑成功。
+- Scalper canary 前后原 repair tip 保持 `20260828-145820-71ji`、depth 10、
+  `EXECUTE_EXACT_REPAIR`，没有 lineage 增长或矛盾动作；严格 VERIFY 正确
+  fail-closed，未运行 Gate。Mace 的不重叠 canary 后为 `FINISHED /
+  CONTINUE_DEVELOPMENT`；Onchain 的 accepted ancestor 后新 canary 同样为
+  `FINISHED / CONTINUE_DEVELOPMENT`。
+- Mace B6 run `20260828-200401-up8n` 与 Onchain B6 run
+  `20260828-200406-najn` 在 VERIFY、最终 runtime hash 下均 PASS；两者持久 manifest
+  的 `candidate_binding` 都是 `null`，因此只算 Development Safety Gate，不算
+  Candidate-bound Gate，也不授予 research、release、production 或 profitability
+  authority。
+- Mace 当前 `git-diff-check` run `20260828-200526-yfka` 与 Onchain 当前
+  `m1-verify-uv-lock` run `20260828-200530-eupp` 均 PASS，但项目 recipe 没有单次完整
+  `typecheck + unit-test + whitespace` validation components，Candidate projection 为
+  unavailable；三个项目也都没有 candidate version/alias。因此 strict Candidate→Gate
+  的真实状态为 Scalper `BLOCKED`、Mace/Onchain `NOT_RUN (CANDIDATE_INCOMPLETE)`，
+  没有伪造 candidate id 或扩大项目配置范围。
+- 所有外部项目命令前后业务工作树摘要完全一致：Scalper status/tracked/untracked
+  为 `a43aa9c1/6172301a/912e49c5`，Mace 为
+  `6e30f360/026b1c70/b460de11`，Onchain 为
+  `11aded00/2f92a7b5/08233597`；只有 `.pi/workbench` 下的授权 canary 与 Gate/run
+  元数据按预期新增。没有改写或删除历史 authority，没有 push、release 或 publish。
+
+因此 WP8 的部署、普通 DEV、fail-closed 严格入口、restart 和零业务改写证据已经
+完成；evidence-complete Candidate-bound Gate 与 `S2.2–S2.6` 实际前后效率指标仍为
+计划级出口 blocker，保持 `BLOCKED/NOT_RUN`，不得把两个未绑定 Candidate 的 B6
+PASS 写成最终 Gate 或计划完成。
 
 ---
 
