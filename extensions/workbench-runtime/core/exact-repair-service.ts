@@ -39,6 +39,12 @@ import {
 	DELEGATION_TRANSACTION_ID_RE,
 	type DelegationTransactionRecord,
 } from "./delegation-transaction.ts";
+import {
+	DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+	delegationLifecycleSnapshotFromExactRepairAuthorityV1,
+	resolveDelegationLifecycleV1,
+	type DelegationLifecycleResolutionV1,
+} from "./delegation-lifecycle-resolver.ts";
 
 export type ExactRepairExecutionResultV1 = Awaited<ReturnType<DelegateExactRepairExecuteV1>>;
 
@@ -75,6 +81,7 @@ export interface ExactRepairServiceDependenciesV1 {
 interface ExactRepairRecoveredBaseV1 {
 	readonly repair_of: string;
 	readonly authority: Readonly<ExactRepairCommandAuthorityV1>;
+	readonly lifecycle_resolution?: DelegationLifecycleResolutionV1;
 }
 
 export interface ExactRepairAuthorityUnavailableV1 {
@@ -87,7 +94,7 @@ export interface ExactRepairAuthorityUnavailableV1 {
 export interface ExactRepairRecoveryRefusedV1 {
 	readonly status: "RECOVERY_REFUSED";
 	readonly repair_of: string;
-	readonly code: "INVALID_DELEGATION_ID" | ExactRepairAuthorityRecoveryCodeV1 | RawLineageExactRepairAuthorityCodeV1;
+	readonly code: "INVALID_DELEGATION_ID" | "LIFECYCLE_ACTION_REFUSED" | ExactRepairAuthorityRecoveryCodeV1 | RawLineageExactRepairAuthorityCodeV1;
 }
 
 export interface ExactRepairIdempotencyRefusedV1 extends ExactRepairRecoveredBaseV1 {
@@ -209,6 +216,7 @@ function rawSuccessorReplayResult(input: {
 function existingSuccessorResult(input: {
 	repair_of: string;
 	authority: Readonly<ExactRepairCommandAuthorityV1>;
+	lifecycle_resolution: DelegationLifecycleResolutionV1;
 	successor: Readonly<ExactRepairExistingSuccessorV1>;
 	replayed: boolean;
 	execution_attempted: boolean;
@@ -220,6 +228,7 @@ function existingSuccessorResult(input: {
 	const common = {
 		repair_of: input.repair_of,
 		authority: input.authority,
+		lifecycle_resolution: input.lifecycle_resolution,
 		successor: input.successor,
 		replayed: input.replayed,
 		execution_attempted: input.execution_attempted,
@@ -235,6 +244,34 @@ function existingSuccessorResult(input: {
 		...common,
 		...(input.execution_status === undefined ? {} : { execution_status: input.execution_status }),
 	};
+}
+
+function exactRepairLifecycleResolutionV1(
+	authority: Readonly<ExactRepairCommandAuthorityV1>,
+	binding: "CURRENT" | "REBASEABLE" = "CURRENT",
+): DelegationLifecycleResolutionV1 {
+	const carried = authority.successor_lineage.carried_paths;
+	const snapshot = delegationLifecycleSnapshotFromExactRepairAuthorityV1({
+		repair_of: authority.repair_of,
+		source_authority: authority,
+		affected_paths: Array.isArray(carried) ? carried : [],
+		binding,
+	});
+	const observed = resolveDelegationLifecycleV1(snapshot, {
+		schema_version: 1,
+		kind: DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+		event: "OBSERVE",
+		expected_snapshot_hash: null,
+	});
+	return resolveDelegationLifecycleV1(
+		snapshot,
+		{
+			schema_version: 1,
+			kind: DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+			event: "EXECUTE",
+			expected_snapshot_hash: observed.primary_action.snapshot_hash,
+		},
+	);
 }
 
 /**
@@ -368,6 +405,10 @@ export async function runExactRepairServiceV1(
 			parent = raw.value;
 			authority = rawRecovered.value;
 		}
+		const lifecycleResolution = exactRepairLifecycleResolutionV1(authority);
+		if (lifecycleResolution.primary_action.action !== "EXECUTE_EXACT_REPAIR") {
+			return { status: "RECOVERY_REFUSED", repair_of: repairOf, code: "LIFECYCLE_ACTION_REFUSED" };
+		}
 		const priorSuccessor = await readSuccessor({
 			projectRoot: input.project_root,
 			parent,
@@ -378,6 +419,7 @@ export async function runExactRepairServiceV1(
 				status: "IDEMPOTENCY_REFUSED",
 				repair_of: repairOf,
 				authority,
+				lifecycle_resolution: lifecycleResolution,
 				code: priorSuccessor.code,
 				...(priorSuccessor.delegation_id === undefined ? {} : { conflicting_delegation: priorSuccessor.delegation_id }),
 			};
@@ -386,6 +428,7 @@ export async function runExactRepairServiceV1(
 			return existingSuccessorResult({
 				repair_of: repairOf,
 				authority,
+				lifecycle_resolution: lifecycleResolution,
 				successor: priorSuccessor.value,
 				replayed: true,
 				execution_attempted: false,
@@ -396,7 +439,12 @@ export async function runExactRepairServiceV1(
 		if (terminalNegativeNeedsFreshBinding) {
 			const binding = await dependencies.collectCurrentBinding(input.project_root, repairOf);
 			if (binding.status !== "fresh" || binding.hash !== currentBindingHash) {
-				return { status: "CURRENT_BINDING_CHANGED", repair_of: repairOf, authority };
+				return {
+					status: "CURRENT_BINDING_CHANGED",
+					repair_of: repairOf,
+					authority,
+					lifecycle_resolution: exactRepairLifecycleResolutionV1(authority, "REBASEABLE"),
+				};
 			}
 		}
 
@@ -417,6 +465,7 @@ export async function runExactRepairServiceV1(
 				return existingSuccessorResult({
 					repair_of: repairOf,
 					authority,
+					lifecycle_resolution: lifecycleResolution,
 					successor: durableSuccessor.value,
 					replayed: false,
 					execution_attempted: true,
@@ -430,6 +479,7 @@ export async function runExactRepairServiceV1(
 					status: "EXECUTION_REFUSED",
 					repair_of: repairOf,
 					authority,
+					lifecycle_resolution: lifecycleResolution,
 					execution_attempted: true,
 					execution_result: executionResult,
 				};
@@ -438,6 +488,7 @@ export async function runExactRepairServiceV1(
 				status: "EXECUTION_READBACK_FAILED",
 				repair_of: repairOf,
 				authority,
+				lifecycle_resolution: lifecycleResolution,
 				execution_attempted: true,
 				code: durableSuccessor.ok ? "SUCCESSOR_MISSING" : durableSuccessor.code,
 				execution_result: executionResult,
@@ -453,6 +504,7 @@ export async function runExactRepairServiceV1(
 				return existingSuccessorResult({
 					repair_of: repairOf,
 					authority,
+					lifecycle_resolution: lifecycleResolution,
 					successor: durableSuccessor.value,
 					replayed: false,
 					execution_attempted: true,
@@ -464,6 +516,7 @@ export async function runExactRepairServiceV1(
 				status: "EXECUTION_FAILED",
 				repair_of: repairOf,
 				authority,
+				lifecycle_resolution: lifecycleResolution,
 				execution_attempted: true,
 				error: message,
 				successor_readback: durableSuccessor.ok

@@ -125,6 +125,8 @@ test("UI-free service reads ordinary semantic REPAIR and records one strict succ
 	assert.equal(result.replayed, false);
 	assert.equal(result.execution_outcome, "returned");
 	assert.equal(result.successor.status, "PENDING_REVIEW");
+	assert.equal(result.lifecycle_resolution?.primary_action.action, "EXECUTE_EXACT_REPAIR");
+	assert.equal(result.lifecycle_resolution?.primary_action.exact_target.id, ID);
 	assert.deepEqual({ reviewReads, terminalReads, successorReads, executions, bindingReads }, {
 		reviewReads: 1, terminalReads: 0, successorReads: 2, executions: 1, bindingReads: 0,
 	});
@@ -406,6 +408,8 @@ test("stale terminal binding and idempotency conflict both fail before exact exe
 			executeExactRepair: (async () => { executions += 1; throw new Error("must not execute"); }) as never,
 		});
 		assert.equal(result.status, scenario === "binding" ? "CURRENT_BINDING_CHANGED" : "IDEMPOTENCY_REFUSED");
+		assert.equal(result.lifecycle_resolution?.primary_action.action,
+			scenario === "binding" ? "REBASE_CURRENT_BINDING" : "EXECUTE_EXACT_REPAIR");
 		assert.equal(executions, 0);
 	}
 });

@@ -575,3 +575,32 @@ export function delegationLifecycleSnapshotFromInvalidDerivedReviewV1(
 		recovery_rank: { unresolved_obligations: 0, unresolved_attempts: 0 },
 	};
 }
+
+/** Normalize one already-strict exact-repair command authority for public routing. */
+export function delegationLifecycleSnapshotFromExactRepairAuthorityV1(input: {
+	repair_of: string;
+	source_authority: unknown;
+	affected_paths: readonly string[];
+	binding?: "CURRENT" | "REBASEABLE";
+}): DelegationLifecycleSnapshotV1 {
+	return {
+		schema_version: 1,
+		kind: DELEGATION_LIFECYCLE_SNAPSHOT_KIND_V1,
+		source_authority_hash: canonicalHash({
+			kind: "delegation-exact-repair-source-v1",
+			authority: input.source_authority,
+		}),
+		operation_intent: "DEV",
+		authority: { health: "VALID", disposition: "INACTIVE" },
+		writer_lock: "ABSENT",
+		binding: input.binding ?? "CURRENT",
+		attempt: "REPAIRABLE",
+		candidate: "NONE",
+		runtime_identity: "NOT_REQUIRED",
+		request_valid: true,
+		target: { kind: "DELEGATION", id: input.repair_of },
+		affected_paths: [...input.affected_paths],
+		scope_unknown: false,
+		recovery_rank: { unresolved_obligations: 1, unresolved_attempts: 1 },
+	};
+}

@@ -8,6 +8,7 @@ import {
 	DELEGATION_LIFECYCLE_PRIMARY_ACTIONS_V1,
 	DELEGATION_LIFECYCLE_SNAPSHOT_KIND_V1,
 	delegationLifecycleSnapshotHashV1,
+	delegationLifecycleSnapshotFromExactRepairAuthorityV1,
 	delegationLifecycleSnapshotFromPathLaneAdmissionV1,
 	resolveDelegationLifecycleV1,
 	serializeDelegationLifecycleResolutionV1,
@@ -49,6 +50,34 @@ function snapshot(patch: Partial<DelegationLifecycleSnapshotV1> = {}): Delegatio
 		...patch,
 	};
 }
+
+test("the exact-repair adapter yields the same canonical action and a binding change yields one rebase action", () => {
+	const authority = {
+		kind: "exact-repair-command-execution-v1",
+		repair_of: "20260828-100000-r001",
+		idempotency_key: "b".repeat(64),
+	};
+	const current = delegationLifecycleSnapshotFromExactRepairAuthorityV1({
+		repair_of: "20260828-100000-r001",
+		source_authority: authority,
+		affected_paths: ["src/current.ts"],
+	});
+	const repair = resolveDelegationLifecycleV1(current, OBSERVE);
+	assert.equal(repair.primary_action.action, "EXECUTE_EXACT_REPAIR");
+	assert.equal(repair.primary_action.reason, "EXACT_REPAIR_DECISION_CURRENT");
+	assert.deepEqual(repair.primary_action.affected_paths, ["src/current.ts"]);
+	const rebased = resolveDelegationLifecycleV1(
+		delegationLifecycleSnapshotFromExactRepairAuthorityV1({
+			repair_of: "20260828-100000-r001",
+			source_authority: authority,
+			affected_paths: ["src/current.ts"],
+			binding: "REBASEABLE",
+		}),
+		OBSERVE,
+	);
+	assert.equal(rebased.primary_action.action, "REBASE_CURRENT_BINDING");
+	assert.equal(rebased.primary_action.reason, "REBASEABLE_BINDING_CHANGED");
+});
 
 test("the canonical lifecycle matrix returns one typed primary action for every known condition", () => {
 	const cases: Array<{

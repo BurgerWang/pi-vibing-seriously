@@ -48,6 +48,7 @@ function resultDetails(
 ): Record<string, unknown> {
 	const successor = "successor" in result ? result.successor : undefined;
 	const authority = "authority" in result ? result.authority : undefined;
+	const lifecycle = "lifecycle_resolution" in result ? result.lifecycle_resolution : undefined;
 	const nextAction = successor === undefined
 		? ("next_action" in result ? result.next_action : null)
 		: exactRepairSuccessorNextActionV1(successor);
@@ -61,6 +62,11 @@ function resultDetails(
 		...(authority === undefined ? {} : {
 			authority_kind: authority.authority_kind,
 			idempotency_key: authority.idempotency_key,
+		}),
+		...(lifecycle === undefined ? {} : {
+			lifecycle_action: lifecycle.primary_action.action,
+			lifecycle_reason: lifecycle.primary_action.reason,
+			lifecycle_snapshot_hash: lifecycle.primary_action.snapshot_hash,
 		}),
 		...(successor === undefined ? {} : {
 			delegation_id: successor.delegation_id,

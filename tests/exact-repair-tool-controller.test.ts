@@ -116,6 +116,9 @@ test("model-callable exact repair accepts only an id and starts one immutable su
 	assert.equal(result.details.status, "SUCCESSOR_RECORDED");
 	assert.equal(result.details.delegation_id, CHILD);
 	assert.equal(result.details.next_action, `call workbench_review_worker_diff with delegation_id=${CHILD}`);
+	assert.equal(result.details.lifecycle_action, "EXECUTE_EXACT_REPAIR");
+	assert.equal(result.details.lifecycle_reason, "EXACT_REPAIR_DECISION_CURRENT");
+	assert.match(String(result.details.lifecycle_snapshot_hash), /^[a-f0-9]{64}$/u);
 	assert.equal(testHarness.facts().executions, 1);
 	assert.equal(testHarness.facts().executedAuthority?.arguments.task, "Immutable authority task");
 });

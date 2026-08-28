@@ -2540,7 +2540,11 @@ test("two sessions route raw repair_of through one idempotent exact successor", 
 		assert.equal(attempts.filter((attempt) => attempt.status === "fulfilled").length, 2);
 		assert.equal(attempts.filter((attempt) => attempt.status === "rejected").length, 0);
 		for (const attempt of attempts) {
-			if (attempt.status === "fulfilled") assert.equal(attempt.value.details.caller_contract_ignored, true);
+			if (attempt.status === "fulfilled") {
+				assert.equal(attempt.value.details.caller_contract_ignored, true);
+				assert.equal(attempt.value.details.lifecycle_action, "EXECUTE_EXACT_REPAIR");
+				assert.match(String(attempt.value.details.lifecycle_snapshot_hash), /^[a-f0-9]{64}$/u);
+			}
 		}
 		assert.equal((await delegationDirectories(root)).length, 2, "raw compatibility calls converge on one repair child");
 		assert.equal((await readFile(launchMarkerPath, "utf8")).trim().split("\n").length, 1, "concurrent compatibility calls start one worker");
