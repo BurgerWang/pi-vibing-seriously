@@ -7,6 +7,11 @@ import test from "node:test";
 
 import { canonicalHash } from "../extensions/workbench-runtime/cache/canonical-hash.ts";
 import {
+	DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+	delegationLifecycleSnapshotFromPathLaneAdmissionV1,
+	resolveDelegationLifecycleV1,
+} from "../extensions/workbench-runtime/core/delegation-lifecycle-resolver.ts";
+import {
 	admitProjectDelegationPathLaneV1,
 	type DelegationPathLaneAdmissionReadersV1,
 	type DelegationPathLaneAdmissionV1,
@@ -175,6 +180,18 @@ test("real-history fixtures replay independently through the production path-lan
 			assert.deepEqual(first.repair_tip_ids, reparsed.expected.repair_tip_ids);
 			assert.deepEqual(first.blockers, reparsed.expected.blockers);
 			assert.deepEqual(first.decision, reparsed.expected.decision);
+			const lifecycle = resolveDelegationLifecycleV1(
+				delegationLifecycleSnapshotFromPathLaneAdmissionV1(first),
+				{
+					schema_version: 1,
+					kind: DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+					event: "OBSERVE",
+					expected_snapshot_hash: null,
+				},
+			);
+			assert.equal(lifecycle.state, "TERMINAL_NON_BLOCKING");
+			assert.equal(lifecycle.primary_action.action, "CONTINUE_DEVELOPMENT");
+			assert.equal(lifecycle.primary_action.reason, "NO_CURRENT_BLOCKER");
 		});
 	}
 });
