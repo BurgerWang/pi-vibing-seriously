@@ -8,6 +8,7 @@ import {
 	delegationNextActionTextV1,
 	delegationProjectIssueRepairStatusV1,
 	delegationRepairStatusLinesV1,
+	delegationVerifyBlockReasonV1,
 	readDelegationRepairStatusV1,
 } from "../extensions/workbench-runtime/core/delegation-repair-status.ts";
 import type { DelegationAuthorityObservationV2 } from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
@@ -97,6 +98,11 @@ test("repair status projects a fresh negative decision into one exact next actio
 	assert.match(delegationRepairStatusLinesV1(status).join("\n"), /REPAIR_REQUIRED/);
 	assert.match(delegationRepairStatusLinesV1(status).join("\n"), new RegExp(`workbench_repair_delegation with delegation_id=${ID}`));
 	assert.doesNotMatch(delegationRepairStatusLinesV1(status).join("\n"), /call workbench_delegate_worker/u);
+	assert.equal(
+		delegationVerifyBlockReasonV1({ ...state, status: "PENDING_REVIEW" }, status),
+		`VERIFY mode / final gate verification is blocked by canonical lifecycle action EXECUTE_EXACT_REPAIR (EXACT_REPAIR_DECISION_CURRENT) for delegation ${ID}; call workbench_repair_delegation with delegation_id=${ID} to execute the exact repair from durable authority`,
+		"VERIFY guidance follows the resolver action and never repeats a stale session-status label",
+	);
 	assert.equal(
 		delegationExactRepairRouteLineV1(status),
 		`repair route : ALLOWED — ordinary/new delegations remain blocked; call workbench_repair_delegation with delegation_id=${ID} to execute the exact repair from durable authority`,

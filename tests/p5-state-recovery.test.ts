@@ -2016,7 +2016,7 @@ test("session_start derives worker-first facts and the compaction note names the
 	assert.ok(note.includes("development writes: Sol plans, Luna implements"), note);
 	assert.ok(note.includes("commander writes: locked (temporary lease required)"), note);
 	assert.ok(note.includes("delegation: 20260801-120000-abcd PENDING_REVIEW"), note);
-	assert.ok(note.includes("next delegation action: review delegation 20260801-120000-abcd"), note);
+	assert.ok(note.includes("next delegation action: call workbench_review_worker_diff with delegation_id=20260801-120000-abcd"), note);
 });
 
 test("a reviewed delegation restores and the compaction note shows REVIEWED with the bound hash and next action", async () => {
@@ -2039,7 +2039,7 @@ test("a reviewed delegation restores and the compaction note shows REVIEWED with
 	const note = stub.messages[0]?.content ?? "";
 	assert.ok(note.includes("delegation: 20260801-120000-abcd REVIEWED"), note);
 	assert.ok(note.includes(`(hash ${"a".repeat(12)})`), note);
-	assert.ok(note.includes("next delegation action: delegation 20260801-120000-abcd REVIEWED"), note);
+	assert.ok(note.includes("next delegation action: continue ordinary development; no lifecycle command is required"), note);
 });
 
 test("the compaction mirror never weakens the hard guards (note text is not consulted)", async () => {

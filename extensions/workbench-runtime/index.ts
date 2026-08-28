@@ -108,7 +108,7 @@ import {
 	readRecoverableUnpublishedDelegationV2,
 	readDelegationAuthorityObservationV2 as readDelegationAuthorityObservation,
 } from "./core/delegation-project-authority.ts";
-import { delegationDisplayedStatusV1, delegationExactRepairRouteLineV1, delegationNextActionTextV1, delegationProjectIssueRepairStatusV1, delegationRepairStatusLinesV1, readDelegationRepairStatusV1,
+import { delegationDisplayedStatusV1, delegationExactRepairRouteLineV1, delegationNextActionTextV1, delegationProjectIssueRepairStatusV1, delegationRepairStatusLinesV1, delegationVerifyBlockReasonV1, readDelegationRepairStatusV1,
 	type DelegationRepairStatusV1 } from "./core/delegation-repair-status.ts";
 import { buildDelegationWorkerFirstGateFacts } from "./core/delegation-plan-reference.ts";
 import { resolveToolOutputPolicy } from "./core/output-policy.ts";
@@ -894,7 +894,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	 * UNAVAILABLE — the persisted hashes are never presented as freshly
 	 * verified.
 	 */
-	async function delegationStatusLines(projectRoot: string): Promise<{ lines: string[]; gitRefresh: "fresh" | "unavailable" }> {
+	async function delegationStatusLines(projectRoot: string): Promise<{ lines: string[]; gitRefresh: "fresh" | "unavailable"; verifyBlockReason: string | null }> {
 		const now = new Date().toISOString();
 		let gitRefresh: "fresh" | "unavailable" = "fresh";
 		let delegationState = delegationSession.getState();
@@ -1029,7 +1029,11 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		if (gitRefresh === "unavailable") {
 			lines.push(`git refresh  : UNAVAILABLE — git status failed; the hashes above are persisted state, NOT freshly verified`);
 		}
-		return { lines, gitRefresh };
+		return {
+			lines,
+			gitRefresh,
+			verifyBlockReason: delegationVerifyBlockReasonV1(delegationState, latestRepairStatus) ?? null,
+		};
 	}
 
 	// -------------------------------------------------------------- lifecycle

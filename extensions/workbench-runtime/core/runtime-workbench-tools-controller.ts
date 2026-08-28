@@ -89,7 +89,7 @@ export interface RuntimeWorkbenchToolsControllerV1 {
 	readonly buildWorkerFirstGateFacts: (projectRoot: string, now: string) => Promise<WorkerFirstGateFacts>;
 	readonly refreshStatus: (ctx: ExtensionContext) => Promise<void>;
 	readonly refreshCompactFacts: () => void;
-	readonly delegationStatusLines: (projectRoot: string) => Promise<{ lines: string[]; gitRefresh: "fresh" | "unavailable" }>;
+	readonly delegationStatusLines: (projectRoot: string) => Promise<{ lines: string[]; gitRefresh: "fresh" | "unavailable"; verifyBlockReason?: string | null }>;
 	readonly syncLease: (now?: string) => void;
 	readonly compactionPending: () => boolean;
 	readonly streamingToolCallBlockReason: (toolName: unknown) => string | undefined;

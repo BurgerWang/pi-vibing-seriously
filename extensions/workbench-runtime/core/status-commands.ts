@@ -46,7 +46,7 @@ export interface StatusCommandController {
 	getProjectAuthorityBlockReason(action: "verify"): string | undefined;
 	trustedOrError(ctx: ExtensionCommandContext): string | undefined;
 	projectRootFor(ctx: ExtensionCommandContext): Promise<string>;
-	delegationStatusLines(projectRoot: string): Promise<{ lines: string[] }>;
+	delegationStatusLines(projectRoot: string): Promise<{ lines: string[]; verifyBlockReason?: string | null }>;
 	getOutputTelemetry(): OutputControlTelemetryAccumulator;
 	getWidgetForced(): boolean;
 	setWidgetForced(forced: boolean): void;
@@ -76,8 +76,16 @@ export function registerStatusCommands(controller: StatusCommandController): voi
 		handler: async (_args, ctx) => {
 			const projectRoot = await controller.projectRootFor(ctx);
 			await controller.reconcileProjectAuthority(projectRoot, now());
+			let canonicalBlock: string | null | undefined;
+			try {
+				canonicalBlock = (await controller.delegationStatusLines(projectRoot)).verifyBlockReason;
+			} catch {
+				canonicalBlock = "canonical delegation lifecycle status is unavailable; VERIFY fails closed";
+			}
 			const block = controller.getProjectAuthorityBlockReason("verify")
-				?? reviewBlockReason(controller.getDelegationState(), "verify");
+				?? (canonicalBlock === undefined
+					? reviewBlockReason(controller.getDelegationState(), "verify")
+					: canonicalBlock ?? undefined);
 			if (block) {
 				controller.output(ctx, [`/q-mode-verify: ${block}`]);
 				return;
@@ -92,14 +100,14 @@ export function registerStatusCommands(controller: StatusCommandController): voi
 			controller.syncLease();
 			const mode = controller.getMode();
 			const identity = controller.getIdentity();
-			let projectAuthorityBlock: string | undefined;
+			let canonicalDelegationLines: string[] | undefined;
+			let projectionUnavailable: string | undefined;
 			if (ctx.isProjectTrusted()) {
 				try {
 					const projectRoot = await controller.projectRootFor(ctx);
-					await controller.reconcileProjectAuthority(projectRoot, now());
-					projectAuthorityBlock = controller.getProjectAuthorityBlockReason("verify");
+					canonicalDelegationLines = (await controller.delegationStatusLines(projectRoot)).lines;
 				} catch {
-					projectAuthorityBlock = "project delegation authority status is unavailable; delegation and VERIFY fail closed";
+					projectionUnavailable = "project delegation authority status is unavailable; delegation and VERIFY fail closed";
 				}
 			}
 			const delegationState = controller.getDelegationState();
@@ -114,12 +122,14 @@ export function registerStatusCommands(controller: StatusCommandController): voi
 				`active tools   : ${controller.pi.getActiveTools().join(", ") || "(none)"}`,
 				`mode tool set  : ${MODE_TOOLS[mode].join(", ")}`,
 				`workbench tools: ${workbenchTools.length > 0 ? workbenchTools.join(", ") : "(none registered)"}`,
-				`agent role     : ${identity.roleEnv ?? "commander"}`,
-				`actor identity : ${detectActorRole(identity)} (${identity.provider ?? "(none)"}/${identity.model ?? "(none)"})`,
-				`write policy   : ${defaultWritePolicy(identity.provider, identity.model) ?? "not-applicable"}`,
-				`write lease    : ${leaseCompactSummary(controller.getLease(), now())}`,
-				`delegation     : ${delegationCompactSummary(delegationState)}`,
-				`project auth   : ${projectAuthorityBlock ?? "available"}`,
+				...(canonicalDelegationLines ?? [
+					`agent role     : ${identity.roleEnv ?? "commander"}`,
+					`actor identity : ${detectActorRole(identity)} (${identity.provider ?? "(none)"}/${identity.model ?? "(none)"})`,
+					`write policy   : ${defaultWritePolicy(identity.provider, identity.model) ?? "not-applicable"}`,
+					`write lease    : ${leaseCompactSummary(controller.getLease(), now())}`,
+					`delegation     : ${delegationCompactSummary(delegationState)}`,
+					`project auth   : ${projectionUnavailable ?? (ctx.isProjectTrusted() ? "available" : "not inspected (project not trusted)")}`,
+				]),
 				"path policy    : write .env/.pem/.key/credentials.*/secrets.*/auth.json blocked in all modes; read blocked in AUDIT/VERIFY, allowed in DEV",
 				"command guard  : rm -rf / or ~, git reset --hard, git clean -fd, git push --force, git checkout -- ., git restore ., git remote changes, rm .git, git config --global writes, sudo, npm/yarn/pnpm/bun publish",
 			];

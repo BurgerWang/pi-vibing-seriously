@@ -13,7 +13,7 @@ import {
 	type CurrentDelegationBindingV2,
 	type DelegationAuthorityObservationV2,
 } from "./delegation-project-authority.ts";
-import type { DelegationState } from "./delegation-state.ts";
+import { emptyDelegationState, type DelegationState } from "./delegation-state.ts";
 import {
 	isDelegationPathLaneBypassableProjectIssueV1,
 	type DelegationPathLaneBypassableProjectIssueV1,
@@ -21,6 +21,7 @@ import {
 import {
 	isDelegationTerminalNegativeReviewEligibleFromCommittedV1,
 	readDelegationCommittedGenerationV2,
+	readDelegationReviewV2,
 	readDelegationTerminalNegativeSolAuthorityV1,
 } from "./delegation-transaction-storage.ts";
 import { recoverExactRepairCommandAuthorityV1 } from "./exact-repair-authority.ts";
@@ -45,6 +46,7 @@ export interface DelegationRepairStatusReaderServicesV1 {
 	readRepairClosure?: typeof readProjectDelegationRepairClosureV1;
 	readInactiveLifecycle?: typeof readInactiveProjectDelegationBlockerLifecycleResolutionV1;
 	readCommittedGeneration?: typeof readDelegationCommittedGenerationV2;
+	readReview?: typeof readDelegationReviewV2;
 	readTerminalNegativeRepair?: typeof readDelegationTerminalNegativeSolAuthorityV1;
 }
 
@@ -54,6 +56,7 @@ const DEFAULT_READER_SERVICES = Object.freeze({
 	readRepairClosure: readProjectDelegationRepairClosureV1,
 	readInactiveLifecycle: readInactiveProjectDelegationBlockerLifecycleResolutionV1,
 	readCommittedGeneration: readDelegationCommittedGenerationV2,
+	readReview: readDelegationReviewV2,
 	readTerminalNegativeRepair: readDelegationTerminalNegativeSolAuthorityV1,
 }) satisfies DelegationRepairStatusReaderServicesV1;
 
@@ -418,6 +421,19 @@ async function hasExecutableExactRepairAuthorityV1(input: {
 	const readCommitted = input.services.readCommittedGeneration ?? readDelegationCommittedGenerationV2;
 	const committed = await readCommitted(input.projectRoot, input.delegationId);
 	if (committed.ok) {
+		if (committed.value.state.status === "PENDING_REVIEW") {
+			const review = await (input.services.readReview ?? readDelegationReviewV2)(
+				input.projectRoot,
+				input.delegationId,
+			);
+			if (!review.ok) return undefined;
+			const recovered = recoverExactRepairCommandAuthorityV1({
+				repairOf: input.delegationId,
+				committed: committed.value,
+				review: review.value,
+			});
+			return recovered.ok ? fromAuthority(recovered.value) : undefined;
+		}
 		if (committed.value.state.status === "INTERRUPTED") {
 			const negative = await (input.services.readTerminalNegativeRepair ?? readDelegationTerminalNegativeSolAuthorityV1)(
 				input.projectRoot,
@@ -570,10 +586,31 @@ export function delegationNextActionTextV1(
 	state: DelegationState,
 	repair: DelegationRepairStatusV1 = { kind: "none" },
 ): string | undefined {
-	const resolution = repair.kind === "none"
+	const resolution = delegationLifecycleResolutionForStatusV1(state, repair);
+	return delegationLifecycleActionTextV1(resolution.primary_action);
+}
+
+/** One canonical lifecycle projection shared by status, mode and Gate boundaries. */
+export function delegationLifecycleResolutionForStatusV1(
+	state: DelegationState,
+	repair: DelegationRepairStatusV1 = { kind: "none" },
+): DelegationLifecycleResolutionV1 {
+	return repair.kind === "none"
 		? compatibilityLifecycleResolutionV1(repair, state)
 		: repair.resolution ?? compatibilityLifecycleResolutionV1(repair, state);
-	return delegationLifecycleActionTextV1(resolution.primary_action);
+}
+
+/** VERIFY blocks on the resolver action, never on a stale session-status label. */
+export function delegationVerifyBlockReasonV1(
+	state: DelegationState,
+	repair: DelegationRepairStatusV1 = { kind: "none" },
+): string | undefined {
+	const action = delegationLifecycleResolutionForStatusV1(state, repair).primary_action;
+	if (action.action === "CONTINUE_DEVELOPMENT") return undefined;
+	const target = action.exact_target.kind === "DELEGATION"
+		? `delegation ${action.exact_target.id}`
+		: `project authority ${action.exact_target.id}`;
+	return `VERIFY mode / final gate verification is blocked by canonical lifecycle action ${action.action} (${action.reason}) for ${target}; ${delegationLifecycleActionTextV1(action)}`;
 }
 
 /** Human-readable strict repair facts; hashes are shown, free-form reasons are not. */
@@ -654,9 +691,7 @@ export function delegationRepairStatusLinesV1(
 ): string[] {
 	const lines = delegationRepairStatusBaseLinesV1(status);
 	if (status.kind === "none" && state === undefined) return lines;
-	const resolution = status.kind === "none"
-		? compatibilityLifecycleResolutionV1(status, state)
-		: status.resolution ?? compatibilityLifecycleResolutionV1(status, state);
+	const resolution = delegationLifecycleResolutionForStatusV1(state ?? emptyDelegationState(), status);
 	const actionLines = [
 		`typed action : ${resolution.primary_action.action} (${resolution.primary_action.reason})`,
 		`next action  : ${delegationLifecycleActionTextV1(resolution.primary_action)}`,
@@ -672,7 +707,7 @@ export function delegationRepairStatusLinesV1(
 /** v1 compatibility line derived only from the resolver's exact-repair action. */
 export function delegationExactRepairRouteLineV1(status: DelegationRepairStatusV1): string | undefined {
 	if (status.kind === "none") return undefined;
-	const resolution = status.resolution ?? compatibilityLifecycleResolutionV1(status);
+	const resolution = delegationLifecycleResolutionForStatusV1(emptyDelegationState(), status);
 	return resolution.primary_action.action === "EXECUTE_EXACT_REPAIR"
 		? `repair route : ALLOWED — ordinary/new delegations remain blocked; ${delegationLifecycleActionTextV1(resolution.primary_action)}`
 		: undefined;

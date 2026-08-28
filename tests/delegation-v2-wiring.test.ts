@@ -218,6 +218,22 @@ function exactRepairCommand(stub: StubAPI): RuntimeCommand {
 	return command;
 }
 
+async function runtimeCommandText(stub: StubAPI, name: string, ctx: ExtensionContext): Promise<string> {
+	const command = stub.commands.get(name);
+	assert.ok(command);
+	let output = "";
+	const commandContext = {
+		...ctx,
+		hasUI: true,
+		ui: {
+			...ctx.ui,
+			notify: (text: string) => { output = text; },
+		},
+	} as unknown as ExtensionCommandContext;
+	await command.handler("", commandContext);
+	return output;
+}
+
 function exactRepairCommandContext(
 	root: string,
 	sessionId: string,
@@ -2996,6 +3012,10 @@ test("a corrupt newest project transaction overrides an optimistic REVIEWED sess
 		const status = await delegationStatusTool(stub).execute("project-corrupt-status", {}, undefined, undefined, ctx);
 		assert.match(resultText(status), /project auth\s+: INVALID \(invalid_record\)/);
 		assert.match(resultText(status), /PROJECT_AUTHORITY_INVALID/);
+		const generalStatus = await runtimeCommandText(stub, "q-status", ctx);
+		assert.match(generalStatus, /project auth\s+: INVALID \(invalid_record\)/);
+		assert.match(generalStatus, /typed action\s+: QUARANTINE_CORRUPT_AUTHORITY/u);
+		assert.doesNotMatch(generalStatus, /DELEGATION .* REVIEWED/u, "q-status must not render the optimistic session mirror");
 	});
 });
 

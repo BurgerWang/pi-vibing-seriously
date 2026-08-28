@@ -437,9 +437,9 @@ test("worker-delegation documentation defines fixed Sol/Luna boundaries and stri
 	assert.match(doc, /`WF:LOCKED` otherwise/);
 	assert.match(doc, /## Recommended development workflow/);
 	assert.match(doc, /Give Luna one bounded contract for the coherent source, test, and\s+documentation slice/);
-	assert.match(doc, /Inspect the provisional scope\/integrity packet returned with every non-zero\s+implementation/);
-	assert.match(doc, /explicitly\s+ACCEPT the unchanged packet hash/);
-	assert.match(doc, /If the complete unchanged packet is wrong,\s+publish hash-bound REPAIR and follow only the exact `repair_of` action shown\s+by status; `repair_of` cannot replace that negative semantic decision/);
+	assert.match(doc, /Let the delivery path complete bounded presentation and semantic review/);
+	assert.match(doc, /Exceptional pending or rejected outcomes expose exactly one typed machine\s+action/);
+	assert.match(doc, /runtime executes safe lifecycle effects at mutation boundaries/);
 	assert.match(doc, /run one final recipe or\s+gate set proportionate to task or release risk/);
 	assert.match(doc, /## Delegation transaction and review lifecycle \(P7\)/);
 	assert.match(doc, /\.pi\/workbench\/delegations\/<id>\/v2\/transaction\.json/);

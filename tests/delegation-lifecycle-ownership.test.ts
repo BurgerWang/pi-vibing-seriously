@@ -47,6 +47,14 @@ test("status is a read-only projection with one typed next-action renderer", asy
 	assert.equal(repairStatus.includes("readWorkerRepairCapsule"), false);
 	assert.equal(repairStatus.includes("readRepairCapsule"), false);
 	assert.equal(repairStatus.match(/`next action  :/g)?.length, 1);
+
+	const statusCommands = await source("core/status-commands.ts");
+	const qStatusStart = statusCommands.indexOf('controller.pi.registerCommand("q-status"');
+	const qStatusEnd = statusCommands.indexOf('controller.pi.registerCommand("q-runtime-doctor"', qStatusStart);
+	assert.ok(qStatusStart >= 0 && qStatusEnd > qStatusStart, "q-status source slice must remain discoverable");
+	const qStatusSource = statusCommands.slice(qStatusStart, qStatusEnd);
+	assert.match(qStatusSource, /controller\.delegationStatusLines\(projectRoot\)/);
+	assert.equal(qStatusSource.includes("controller.reconcileProjectAuthority"), false);
 });
 
 test("machine-call compatibility strings have one production owner", async () => {
