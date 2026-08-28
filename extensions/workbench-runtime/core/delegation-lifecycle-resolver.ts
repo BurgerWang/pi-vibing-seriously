@@ -372,9 +372,15 @@ function resolveAttempt(
 		case "ACTIVE":
 			return makeResolution("ACTIVE", "WAIT_FOR_ACTIVE_WRITER", "ACTIVE_WRITER_PRESENT", ...args);
 		case "AWAITING_REVIEW":
-			return makeResolution("AWAITING_REVIEW", "REVIEW_CANDIDATE", "CURRENT_DELTA_REVIEW_REQUIRED", ...args);
+			return makeResolution(
+				"AWAITING_REVIEW", "REVIEW_CANDIDATE", "CURRENT_DELTA_REVIEW_REQUIRED", ...args,
+				snapshot.runtime_identity === "CURRENT" ? { safe: true } : undefined,
+			);
 		case "REPAIRABLE":
-			return makeResolution("REPAIRABLE", "EXECUTE_EXACT_REPAIR", "EXACT_REPAIR_DECISION_CURRENT", ...args);
+			return makeResolution(
+				"REPAIRABLE", "EXECUTE_EXACT_REPAIR", "EXACT_REPAIR_DECISION_CURRENT", ...args,
+				snapshot.runtime_identity === "CURRENT" ? { safe: true } : undefined,
+			);
 		case "SATISFIED_NO_DELTA":
 			return makeResolution("SATISFIED_NO_DELTA", "CLOSE_SATISFIED_NO_DELTA", "SATISFIED_WITHOUT_NEW_DELTA", ...args);
 		case "SUPERSEDED":
@@ -670,5 +676,38 @@ export function delegationLifecycleSnapshotFromInactiveBlockerClosureV1(input: {
 		recovery_rank: input.closed
 			? { unresolved_obligations: 0, unresolved_attempts: 0 }
 			: { unresolved_obligations: 1, unresolved_attempts: 1 },
+	};
+}
+
+/** Normalize one strictly discovered automatic-continuation candidate. */
+export function delegationLifecycleSnapshotFromAutomaticContinuationCandidateV1(input: {
+	candidate: {
+		delegation_id: string;
+		authority_hash: string;
+		durable_decision: "NEEDS_REVIEW" | "REPAIR";
+		affected_paths: readonly string[];
+	};
+}): DelegationLifecycleSnapshotV1 {
+	return {
+		schema_version: 1,
+		kind: DELEGATION_LIFECYCLE_SNAPSHOT_KIND_V1,
+		source_authority_hash: canonicalHash({
+			kind: "delegation-automatic-continuation-source-v1",
+			candidate: input.candidate,
+		}),
+		operation_intent: "DEV",
+		authority: { health: "VALID", disposition: "INACTIVE" },
+		writer_lock: "ABSENT",
+		binding: "CURRENT",
+		attempt: input.candidate.durable_decision === "NEEDS_REVIEW" ? "AWAITING_REVIEW" : "REPAIRABLE",
+		candidate: "NONE",
+		runtime_identity: "CURRENT",
+		request_valid: true,
+		target: { kind: "DELEGATION", id: input.candidate.delegation_id },
+		affected_paths: [...input.candidate.affected_paths],
+		scope_unknown: false,
+		recovery_rank: input.candidate.durable_decision === "REPAIR"
+			? { unresolved_obligations: 1, unresolved_attempts: 1 }
+			: { unresolved_obligations: 0, unresolved_attempts: 0 },
 	};
 }

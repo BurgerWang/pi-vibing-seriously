@@ -473,6 +473,7 @@ test("locator sets select one exact depth-zero sidecar while reload and two live
 	if (exact.status !== "CANDIDATE") return;
 	assert.equal(exact.candidate.delegation_id, ID_A);
 	assert.equal(exact.candidate.sidecar_kind, "semantic-repair");
+	assert.deepEqual(exact.candidate.affected_paths, ["src/**"]);
 	assert.deepEqual(source.admissionCalls.at(-1), {
 		project_root: ROOT,
 		allowed_paths: ["src/**"],
@@ -517,6 +518,7 @@ test("exact agent-settled terminal candidates use the dedicated metadata lane an
 		assert.equal(resolved.candidate.review_authority, "ELIGIBLE_TERMINAL_NEEDS_REVIEW");
 		assert.equal(resolved.candidate.terminal_status, transaction.status);
 		assert.equal(resolved.candidate.bound_diff_hash, afterHash);
+		assert.deepEqual(resolved.candidate.affected_paths, [AUTOMATIC_DELIVERY_CONTINUATION_METADATA_LANE_V1]);
 		assert.deepEqual(source.admissionCalls, [{
 			project_root: ROOT,
 			allowed_paths: [AUTOMATIC_DELIVERY_CONTINUATION_METADATA_LANE_V1],

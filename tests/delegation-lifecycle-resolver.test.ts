@@ -8,6 +8,7 @@ import {
 	DELEGATION_LIFECYCLE_PRIMARY_ACTIONS_V1,
 	DELEGATION_LIFECYCLE_SNAPSHOT_KIND_V1,
 	delegationLifecycleSnapshotHashV1,
+	delegationLifecycleSnapshotFromAutomaticContinuationCandidateV1,
 	delegationLifecycleSnapshotFromCleanRepairClosureV1,
 	delegationLifecycleSnapshotFromExactRepairAuthorityV1,
 	delegationLifecycleSnapshotFromInactiveBlockerClosureV1,
@@ -116,6 +117,32 @@ test("inactive blocker facts select one close, empty-attempt supersession, rebas
 	);
 	assert.equal(closed.state, "TERMINAL_NON_BLOCKING");
 	assert.equal(closed.primary_action.action, "CONTINUE_DEVELOPMENT");
+});
+
+test("automatic continuation candidates select the same review and exact-repair actions", () => {
+	const base = {
+		delegation_id: "20260828-100000-r001",
+		authority_hash: HASH_A,
+		affected_paths: ["src/**"],
+	};
+	const review = resolveDelegationLifecycleV1(
+		delegationLifecycleSnapshotFromAutomaticContinuationCandidateV1({
+			candidate: { ...base, durable_decision: "NEEDS_REVIEW" },
+		}),
+		OBSERVE,
+	);
+	assert.equal(review.primary_action.action, "REVIEW_CANDIDATE");
+	assert.equal(review.primary_action.reason, "CURRENT_DELTA_REVIEW_REQUIRED");
+	assert.equal(review.primary_action.safe_automatic, true);
+	const repair = resolveDelegationLifecycleV1(
+		delegationLifecycleSnapshotFromAutomaticContinuationCandidateV1({
+			candidate: { ...base, durable_decision: "REPAIR" },
+		}),
+		OBSERVE,
+	);
+	assert.equal(repair.primary_action.action, "EXECUTE_EXACT_REPAIR");
+	assert.equal(repair.primary_action.reason, "EXACT_REPAIR_DECISION_CURRENT");
+	assert.equal(repair.primary_action.safe_automatic, true);
 });
 
 test("the clean-repair adapter closes only a clean unresolved obligation and strictly lowers its rank", () => {

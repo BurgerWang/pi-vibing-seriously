@@ -8,13 +8,19 @@
  * this module so listener ordering can be verified independently.
  */
 
-import { isAbsolute } from "node:path";
+import { isAbsolute, posix } from "node:path";
 import { types as utilTypes } from "node:util";
 
 import {
 	DELIVERY_CHAIN_MAX_SUCCESSOR_ATTEMPTS_V1,
 	type DeliveryChainCoordinatorResultV1,
 } from "./delivery-chain-coordinator.ts";
+import {
+	DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+	delegationLifecycleSnapshotFromAutomaticContinuationCandidateV1,
+	resolveDelegationLifecycleV1,
+	type DelegationLifecycleResolutionV1,
+} from "./delegation-lifecycle-resolver.ts";
 import { DELEGATION_TRANSACTION_ID_RE } from "./delegation-transaction.ts";
 import {
 	COMMANDER_MODEL_ID,
@@ -60,6 +66,8 @@ export interface AutomaticDeliveryContinuationCandidateV1 {
 	/** Hash of the complete strict tip/review-stage/admission authority snapshot. */
 	readonly authority_hash: string;
 	readonly bound_diff_hash: string;
+	/** Exact path grant already admitted by the durable candidate reader. */
+	readonly affected_paths: readonly string[];
 	readonly lineage_depth: number;
 	readonly review_authority: "DURABLE_REPAIR_SIDECAR" | "ELIGIBLE_TERMINAL_NEEDS_REVIEW";
 	readonly sidecar_kind: "semantic-repair" | "terminal-negative-repair" | "none";
@@ -121,6 +129,7 @@ export interface AutomaticDeliveryContinuationRunInputV1 {
 	readonly trigger: AutomaticDeliveryContinuationTriggerV1;
 	readonly candidate: Readonly<AutomaticDeliveryContinuationCandidateV1>;
 	readonly settled_authority: Readonly<AutomaticDeliveryContinuationSettledAuthorityV1>;
+	readonly lifecycle_resolution: DelegationLifecycleResolutionV1;
 	readonly max_successor_attempts: typeof DELIVERY_CHAIN_MAX_SUCCESSOR_ATTEMPTS_V1;
 	readonly signal?: AbortSignal;
 	readonly runtime_context?: unknown;
@@ -231,6 +240,7 @@ export type AutomaticDeliveryContinuationLifecycleResultV1 =
 		readonly status: "CHAIN_RESULT";
 		readonly delegation_id: string;
 		readonly authority_hash: string;
+		readonly lifecycle_resolution: DelegationLifecycleResolutionV1;
 		readonly chain: DeliveryChainCoordinatorResultV1;
 	});
 
@@ -319,6 +329,24 @@ function validCanonicalRoot(value: unknown): value is string {
 		!value.includes("\0") && isAbsolute(value);
 }
 
+function canonicalAffectedPaths(value: unknown): readonly string[] | undefined {
+	if (!Array.isArray(value) || value.length === 0 || value.length > 500) return undefined;
+	const paths: string[] = [];
+	for (const entry of value) {
+		if (typeof entry !== "string" || entry.length === 0 || entry.length > 400 || entry !== entry.trim() ||
+			isAbsolute(entry) || entry.includes("\\") || entry.includes("\0")) return undefined;
+		const subtree = entry.endsWith("/**");
+		const base = subtree ? entry.slice(0, -3) : entry;
+		if (base.length === 0 || posix.normalize(base) !== base || base === "." || base === ".." || base.startsWith("../")) {
+			return undefined;
+		}
+		paths.push(entry);
+	}
+	return paths.every((path, index) => index === 0 || byteCompare(paths[index - 1]!, path) < 0)
+		? Object.freeze(paths)
+		: undefined;
+}
+
 function strictMachineDelegationId(details: unknown): string | undefined {
 	if (!isDataRecord(details)) return undefined;
 	try {
@@ -357,10 +385,12 @@ export function parseAutomaticDeliveryContinuationCandidateV1(
 ): Readonly<AutomaticDeliveryContinuationCandidateV1> | undefined {
 	const record = exactDataRecord(value, [
 		"schema_version", "project_root", "delegation_id", "authority_hash", "bound_diff_hash",
+		"affected_paths",
 		"lineage_depth", "review_authority", "sidecar_kind", "durable_decision", "strict_sidecar", "terminal_status",
 		"unique_unresolved_tip", "path_admission", "path_admission_authority_hash",
 	]);
-	if (record === undefined || record.schema_version !== 1 || !validCanonicalRoot(record.project_root) ||
+	const affectedPaths = record === undefined ? undefined : canonicalAffectedPaths(record.affected_paths);
+	if (record === undefined || affectedPaths === undefined || record.schema_version !== 1 || !validCanonicalRoot(record.project_root) ||
 		typeof record.delegation_id !== "string" || !DELEGATION_TRANSACTION_ID_RE.test(record.delegation_id) ||
 		typeof record.authority_hash !== "string" || !SHA256_RE.test(record.authority_hash) ||
 		typeof record.bound_diff_hash !== "string" || !SHA256_RE.test(record.bound_diff_hash) ||
@@ -381,6 +411,7 @@ export function parseAutomaticDeliveryContinuationCandidateV1(
 		delegation_id: record.delegation_id,
 		authority_hash: record.authority_hash,
 		bound_diff_hash: record.bound_diff_hash,
+		affected_paths: affectedPaths,
 		lineage_depth: record.lineage_depth as number,
 		review_authority: record.review_authority as AutomaticDeliveryContinuationCandidateV1["review_authority"],
 		sidecar_kind: record.sidecar_kind as AutomaticDeliveryContinuationCandidateV1["sidecar_kind"],
@@ -391,6 +422,33 @@ export function parseAutomaticDeliveryContinuationCandidateV1(
 		path_admission: "ALLOW",
 		path_admission_authority_hash: record.path_admission_authority_hash,
 	});
+}
+
+/**
+ * Canonical action adapter shared by the scheduler and the writer-lane CAS.
+ * It grants no authority: only a strict candidate accepted by the parser can
+ * yield the one matching review or exact-repair action.
+ */
+export function resolveAutomaticDeliveryContinuationLifecycleActionV1(
+	value: unknown,
+): DelegationLifecycleResolutionV1 | undefined {
+	const candidate = parseAutomaticDeliveryContinuationCandidateV1(value);
+	if (candidate === undefined) return undefined;
+	const snapshot = delegationLifecycleSnapshotFromAutomaticContinuationCandidateV1({ candidate });
+	const resolution = resolveDelegationLifecycleV1(snapshot, {
+		schema_version: 1,
+		kind: DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+		event: "OBSERVE",
+		expected_snapshot_hash: null,
+	});
+	const expectedAction = candidate.durable_decision === "NEEDS_REVIEW"
+		? "REVIEW_CANDIDATE" : "EXECUTE_EXACT_REPAIR";
+	return resolution.primary_action.action === expectedAction &&
+		resolution.primary_action.safe_automatic && !resolution.primary_action.requires_user_authorization &&
+		resolution.primary_action.exact_target.kind === "DELEGATION" &&
+		resolution.primary_action.exact_target.id === candidate.delegation_id
+		? resolution
+		: undefined;
 }
 
 export function parseAutomaticDeliveryContinuationSettledAuthorityV1(
@@ -629,6 +687,10 @@ export function createAutomaticDeliveryContinuationLifecycleV1(
 			if (candidate.lineage_depth !== 0) {
 				return { trigger, status: "BLOCKED", code: "CANDIDATE_AUTHORITY_INVALID" };
 			}
+			const lifecycleResolution = resolveAutomaticDeliveryContinuationLifecycleActionV1(candidate);
+			if (lifecycleResolution === undefined) {
+				return { trigger, status: "BLOCKED", code: "CANDIDATE_AUTHORITY_INVALID", delegation_id: candidate.delegation_id };
+			}
 			const priorAuthority = state.last_authority_by_root.get(projectRoot);
 			if (priorAuthority?.session_epoch === invocationSessionEpoch &&
 				priorAuthority.authority_hash === candidate.authority_hash) {
@@ -700,6 +762,7 @@ export function createAutomaticDeliveryContinuationLifecycleV1(
 					trigger,
 					candidate,
 					settled_authority: settled,
+					lifecycle_resolution: lifecycleResolution,
 					max_successor_attempts: DELIVERY_CHAIN_MAX_SUCCESSOR_ATTEMPTS_V1,
 					signal: input.signal,
 					runtime_context: input.runtime_context,
@@ -738,6 +801,7 @@ export function createAutomaticDeliveryContinuationLifecycleV1(
 				status: "CHAIN_RESULT",
 				delegation_id: candidate.delegation_id,
 				authority_hash: runAuthorityHash,
+				lifecycle_resolution: lifecycleResolution,
 				chain,
 			};
 		})();

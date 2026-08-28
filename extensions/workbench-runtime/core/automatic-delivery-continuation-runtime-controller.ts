@@ -27,6 +27,7 @@ import {
 	createAutomaticDeliveryContinuationLifecycleV1,
 	parseAutomaticDeliveryContinuationCandidateV1,
 	parseAutomaticDeliveryContinuationSettledAuthorityV1,
+	resolveAutomaticDeliveryContinuationLifecycleActionV1,
 	type AutomaticDeliveryContinuationCandidateResolutionV1,
 	type AutomaticDeliveryContinuationGateResultV1,
 	type AutomaticDeliveryContinuationLifecycleDependenciesV1,
@@ -133,6 +134,9 @@ export interface AutomaticDeliveryContinuationProjectionV1 {
 	readonly code: string | null;
 	readonly delegation_id: string | null;
 	readonly authority_hash: string | null;
+	readonly lifecycle_action: string | null;
+	readonly lifecycle_reason: string | null;
+	readonly lifecycle_snapshot_hash: string | null;
 	readonly chain_status: DeliveryChainCoordinatorResultV1["status"] | null;
 	readonly successor_attempts_used: 0 | 1 | null;
 	readonly successor_delegation_id: string | null;
@@ -331,6 +335,9 @@ function projection(result: AutomaticDeliveryContinuationLifecycleResultV1): Aut
 		code: lifecycleCode(result),
 		delegation_id: "delegation_id" in result ? result.delegation_id ?? null : null,
 		authority_hash: "authority_hash" in result ? result.authority_hash ?? null : null,
+		lifecycle_action: result.status === "CHAIN_RESULT" ? result.lifecycle_resolution.primary_action.action : null,
+		lifecycle_reason: result.status === "CHAIN_RESULT" ? result.lifecycle_resolution.primary_action.reason : null,
+		lifecycle_snapshot_hash: result.status === "CHAIN_RESULT" ? result.lifecycle_resolution.primary_action.snapshot_hash : null,
 		chain_status: chain?.status ?? null,
 		successor_attempts_used: chain?.successor_attempts_used ?? null,
 		successor_delegation_id: successor?.delegation_id ?? null,
@@ -416,6 +423,11 @@ export function createAutomaticDeliveryContinuationRuntimeControllerV1(
 			if (ctx === undefined || input.max_successor_attempts !== DELIVERY_CHAIN_MAX_SUCCESSOR_ATTEMPTS_V1) {
 				throw new Error("automatic continuation runtime context is invalid");
 			}
+			const requestedLifecycle = resolveAutomaticDeliveryContinuationLifecycleActionV1(input.candidate);
+			if (requestedLifecycle === undefined ||
+				requestedLifecycle.resolution_hash !== input.lifecycle_resolution.resolution_hash) {
+				throw new Error("automatic continuation lifecycle action is invalid");
+			}
 			const lane = await runReviewOperation({
 				project_root: input.project_root,
 				operation_kind: "command",
@@ -428,10 +440,14 @@ export function createAutomaticDeliveryContinuationRuntimeControllerV1(
 				// operation owns the fixed checkout lane. The event locator is absent
 				// from the authority hash and cannot expand the metadata path grant.
 				const revalidated = await revalidateCandidate({ candidate: input.candidate });
+				const revalidatedLifecycle = revalidated.resolution.status === "CANDIDATE"
+					? resolveAutomaticDeliveryContinuationLifecycleActionV1(revalidated.resolution.candidate)
+					: undefined;
 				if (revalidated.schema_version !== 1 || revalidated.unchanged !== true ||
 					revalidated.expected_authority_hash !== input.candidate.authority_hash ||
 					revalidated.observed_authority_hash !== input.candidate.authority_hash ||
-					revalidated.resolution.status !== "CANDIDATE") {
+					revalidated.resolution.status !== "CANDIDATE" || revalidatedLifecycle === undefined ||
+					revalidatedLifecycle.resolution_hash !== requestedLifecycle.resolution_hash) {
 					throw new Error("automatic review authority changed after lane acquisition");
 				}
 				return review({

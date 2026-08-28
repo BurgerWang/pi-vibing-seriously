@@ -372,6 +372,7 @@ async function buildCandidate(
 				delegation_id: state.delegation_id,
 				authority_hash: authorityHash,
 				bound_diff_hash: boundDiffHash,
+				affected_paths: Object.freeze([AUTOMATIC_DELIVERY_CONTINUATION_METADATA_LANE_V1]),
 				lineage_depth: 0,
 				review_authority: "ELIGIBLE_TERMINAL_NEEDS_REVIEW",
 				sidecar_kind: "none",
@@ -445,6 +446,7 @@ async function buildCandidate(
 			delegation_id: state.delegation_id,
 			authority_hash: authorityHash,
 			bound_diff_hash: boundDiffHash,
+			affected_paths: Object.freeze([...authority.arguments.allowed_paths]),
 			lineage_depth: 0,
 			review_authority: "DURABLE_REPAIR_SIDECAR",
 			sidecar_kind: descriptor.kind,
@@ -554,6 +556,7 @@ export async function revalidateAutomaticDeliveryContinuationCandidateV1(
 	const unchanged = observed !== undefined && observed.delegation_id === expected.delegation_id &&
 		observed.authority_hash === expected.authority_hash &&
 		observed.bound_diff_hash === expected.bound_diff_hash &&
+		sameStrings(observed.affected_paths, expected.affected_paths) &&
 		observed.review_authority === expected.review_authority &&
 		observed.sidecar_kind === expected.sidecar_kind && observed.lineage_depth === 0;
 	return {

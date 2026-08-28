@@ -58,6 +58,7 @@ function candidate(
 		delegation_id: ID,
 		authority_hash: AUTHORITY_HASH,
 		bound_diff_hash: BOUND_DIFF_HASH,
+		affected_paths: ["src/**"],
 		lineage_depth: 0,
 		review_authority: "DURABLE_REPAIR_SIDECAR",
 		sidecar_kind: "semantic-repair",

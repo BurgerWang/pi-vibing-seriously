@@ -101,6 +101,7 @@ function candidate(
 		delegation_id: ID,
 		authority_hash: OLD_AUTHORITY,
 		bound_diff_hash: BOUND,
+		affected_paths: ["src/**"],
 		lineage_depth: 0,
 		review_authority: "DURABLE_REPAIR_SIDECAR",
 		sidecar_kind: "semantic-repair",
@@ -370,6 +371,9 @@ test("failure tool_result captures the pending guard lease before middleware cle
 	assert.equal(h.exactCalls, 1);
 	assert.equal(h.pi.sent.length, 1);
 	assert.equal(h.pi.sent[0]?.options?.triggerTurn, false);
+	assert.equal(h.pi.sent[0]?.message.details.lifecycle_action, "EXECUTE_EXACT_REPAIR");
+	assert.equal(h.pi.sent[0]?.message.details.lifecycle_reason, "EXACT_REPAIR_DECISION_CURRENT");
+	assert.match(String(h.pi.sent[0]?.message.details.lifecycle_snapshot_hash), /^[a-f0-9]{64}$/u);
 });
 
 test("settled generic checkout recovery precedes authority reconciliation and a failed cleanup is retryable after reload", async () => {
@@ -512,6 +516,27 @@ test("NEEDS_REVIEW uses only the delegation metadata lane and proves the new sid
 	assert.ok(order.indexOf("lane-release") < order.lastIndexOf("confirm-8"));
 	assert.ok(order.lastIndexOf("confirm-8") < order.indexOf("exact"));
 	assert.equal(h.exactCalls, 1);
+	assert.equal(h.pi.sent[0]?.message.details.lifecycle_action, "REVIEW_CANDIDATE");
+	assert.equal(h.pi.sent[0]?.message.details.lifecycle_reason, "CURRENT_DELTA_REVIEW_REQUIRED");
+});
+
+test("writer-lane CAS refuses a candidate whose canonical lifecycle action changes", async () => {
+	let h: ReturnType<typeof harness>;
+	h = harness({
+		onLane: (phase) => {
+			if (phase === "acquire") h.current = candidate({ affected_paths: ["other/**"] });
+		},
+	});
+	h.runtime.registerToolResultLocatorCaptureBeforeMiddleware();
+	h.runtime.registerLifecycleListenersAfterMiddleware();
+	await h.pi.emit("tool_execution_end", {
+		type: "tool_execution_end", toolCallId: "lifecycle-cas", toolName: "workbench_delegate_worker",
+		result: { details: { delegation_id: ID } }, isError: false,
+	}, h.ctx);
+	await h.pi.emit("agent_settled", { type: "agent_settled" }, h.ctx);
+	assert.deepEqual({ review: h.reviewCalls, exact: h.exactCalls }, { review: 0, exact: 0 });
+	assert.equal(h.pi.sent[0]?.message.details.status, "DEFER");
+	assert.equal(h.pi.sent[0]?.message.details.code, "CHAIN_FAILED");
 });
 
 test("lost exact response replays once after reload and before_agent_start injects, never self-sends", async () => {
