@@ -196,6 +196,51 @@ test("real-history fixtures replay independently through the production path-lan
 	}
 });
 
+test("WP3 AC08: three real histories converge or expose one exact external blocker", async () => {
+	const externalBlockers: Array<{ project: string; delegation_id: string }> = [];
+	for (const id of FIXTURE_IDS) {
+		const { fixture } = await readFixture(id);
+		const readers = fixtureReaders(fixture);
+		const unresolvedTip = fixture.expected.closure.unresolvedTipId;
+		if (unresolvedTip === null) {
+			assert.deepEqual(fixture.expected.ordinary_blocker_ids, [], fixture.source_project);
+			assert.deepEqual(fixture.expected.repair_tip_ids, [], fixture.source_project);
+			continue;
+		}
+		assert.deepEqual(fixture.expected.repair_tip_ids, [unresolvedTip], fixture.source_project);
+		assert.equal(fixture.expected.blockers.length, 1, fixture.source_project);
+		const blocker = fixture.expected.blockers[0];
+		assert.equal(blocker?.kind, "known", fixture.source_project);
+		if (blocker?.kind !== "known") continue;
+		assert.equal(blocker.delegation_id, unresolvedTip, fixture.source_project);
+		const overlapPath = blocker.changed_paths[0] ?? blocker.carried_paths[0];
+		assert.notEqual(overlapPath, undefined, fixture.source_project);
+		if (overlapPath === undefined) continue;
+		const admission = await admitProjectDelegationPathLaneV1({
+			project_root: `/fixture/${id}`,
+			allowed_paths: [overlapPath],
+		}, readers);
+		assert.equal(admission.decision.decision, "BLOCK", fixture.source_project);
+		assert.equal(admission.decision.conflicts.length, 1, fixture.source_project);
+		assert.equal(admission.decision.conflicts[0]?.delegation_id, unresolvedTip, fixture.source_project);
+		const lifecycle = resolveDelegationLifecycleV1(
+			delegationLifecycleSnapshotFromPathLaneAdmissionV1(admission),
+			{
+				schema_version: 1,
+				kind: DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+				event: "OBSERVE",
+				expected_snapshot_hash: null,
+			},
+		);
+		assert.equal(lifecycle.primary_action.action, "BLOCK_OVERLAPPING_PATHS", fixture.source_project);
+		externalBlockers.push({ project: fixture.source_project, delegation_id: unresolvedTip });
+	}
+	assert.deepEqual(externalBlockers, [{
+		project: "Scalper_V2",
+		delegation_id: "20260828-145820-71ji",
+	}]);
+});
+
 test("fixture lifecycle records and every derived hash remain internally valid after sanitization", async () => {
 	for (const id of FIXTURE_IDS) {
 		const { fixture } = await readFixture(id);
