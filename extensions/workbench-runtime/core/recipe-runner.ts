@@ -25,6 +25,16 @@
  *     but executes and (re)writes on success
  *   - ANY cache machinery failure degrades to normal execution — the cache
  *     never blocks the task and never bypasses gates
+ *
+ * WP4 ordinary final-verification reuse (separate from the action cache):
+ *   - DEV-only, strict Sol-only, read-only recipes declaring the complete
+ *     typecheck + unit-test + whitespace component set are final checks
+ *   - a default invocation may reuse the newest strict Sol run only when its
+ *     validation binding is REUSABLE for the current Candidate and the exact
+ *     requested argv identity still matches
+ *   - reuse executes zero subprocesses and creates no duplicate run; explicit
+ *     no-cache/refresh-cache requests still execute, and every uncertainty
+ *     falls through to a fresh run
  */
 
 import { writeFile } from "node:fs/promises";
@@ -35,7 +45,8 @@ import { truncateHead, truncateTail } from "@earendil-works/pi-coding-agent";
 import { loadProjectConfig, type ExecFn } from "./config.ts";
 import type { WorkbenchMode } from "./mode-policy.ts";
 import { realpathContained, lexicalContain } from "./path-guard.ts";
-import { buildArgv, RecipeParamError, type Recipe } from "./recipe-schema.ts";
+import { buildArgv, RecipeParamError, VALIDATION_COMPONENTS, type Recipe } from "./recipe-schema.ts";
+import { WORKBENCH_RUNTIME_BUILD_IDENTITY } from "./runtime-build-identity.ts";
 import {
 	parseWorkerAllowedPaths,
 	parseWorkerTaskKindEnvironment,
@@ -50,7 +61,17 @@ import {
 	type WorkerRecipeMutationScope,
 } from "./worker-policy.ts";
 import { collectSecretValues, redactArgvEntry, redactEnvValue, redactText } from "./redact.ts";
-import { makeRunId, RUN_MANIFEST_SCHEMA_VERSION_V2, type RunRecord, type RunSummaryRecord } from "./runs.ts";
+import {
+	latestRunAttemptForRecipe,
+	makeRunId,
+	readCommittedManifest,
+	readSummary,
+	runDirFor,
+	RUN_MANIFEST_SCHEMA_VERSION_V2,
+	type RunRecord,
+	type RunRuntimeIdentityV1,
+	type RunSummaryRecord,
+} from "./runs.ts";
 import { EXTENSION_VERSION } from "../cache/cache-types.ts";
 import { ActionCacheStore, type LockHandle } from "../cache/action-store.ts";
 import { ARTIFACT_RESTORE_ENABLED } from "../cache/action-types.ts";
@@ -66,7 +87,17 @@ import {
 	type CacheRequestMode,
 } from "../cache/action-cache.ts";
 import type { ActionKey, ActionRecord } from "../cache/action-types.ts";
-import { captureRecipeValidationEvidence, executedArgvHash, unavailableEvidenceBlock, type ValidationEvidenceBlock } from "./validation-evidence.ts";
+import { canonicalHash } from "../cache/canonical-hash.ts";
+import {
+	captureRecipeValidationEvidence,
+	executedArgvHash,
+	ownerFromActorFacts,
+	unavailableEvidenceBlock,
+	validationEvidenceIdentity,
+	validationEvidenceSourceEligible,
+	type ValidationEvidenceBlock,
+} from "./validation-evidence.ts";
+import { assessRunValidation } from "./validation-assessment.ts";
 import {
 	collectRecipeArtifactsV2,
 	writeArtifactManifestV2,
@@ -128,6 +159,22 @@ export interface RunRecipeResult {
 	/** Durable command-effect evidence for an actual Workbench/worker exec. */
 	commandEffect?: Readonly<CommandEffectRecord>;
 	warnings?: string[];
+	/** WP4: an unchanged final Candidate reused strict current validation without execution. */
+	validationReuse?: {
+		status: "REUSED_CURRENT_CANDIDATE";
+		sourceRunId: string;
+		validationIdentity: string;
+		executionSkipped: true;
+	};
+	/** WP4 stable DEV Candidate backed by complete current final verification. */
+	ordinaryCandidate?: {
+		schemaVersion: 1;
+		status: "VERIFIED";
+		candidateIdentity: string;
+		validationIdentity: string;
+		sourceRunId: string;
+		authorityScope: "DEVELOPMENT_ONLY";
+	};
 }
 
 export class RecipeSetupError extends Error {
@@ -142,6 +189,158 @@ class RecipeCommandEffectPreCaptureError extends Error {
 		super("command-effect evidence is unavailable before process start");
 		this.name = "RecipeCommandEffectPreCaptureError";
 	}
+}
+
+/** Complete ordinary final-check declaration; focused recipes never qualify. */
+export function isOrdinaryFinalVerificationRecipeV1(recipe: Recipe): boolean {
+	return recipe.mutation === "none" && recipe.writes.length === 0 &&
+		recipe.validation_components.length === VALIDATION_COMPONENTS.length &&
+		VALIDATION_COMPONENTS.every((component) => recipe.validation_components.includes(component));
+}
+
+function summaryMatchesCommittedRecordV1(summary: RunSummaryRecord, record: RunRecord): boolean {
+	return summary.run_id === record.run_id && summary.recipe === record.recipe &&
+		summary.profile === record.profile &&
+		summary.started_at === record.started_at && summary.finished_at === record.finished_at &&
+		summary.duration_ms === record.duration_ms && summary.cwd === record.cwd &&
+		summary.exit_code === record.exit_code && summary.timed_out === record.timed_out &&
+		summary.cancelled === record.cancelled && summary.git_commit === record.git_commit &&
+		summary.git_dirty === record.git_dirty &&
+		JSON.stringify(summary.argv) === JSON.stringify(record.argv) &&
+		JSON.stringify(summary.artifact_paths) === JSON.stringify(record.artifact_paths) &&
+		summary.stdout_truncated === record.stdout_truncated &&
+		summary.stderr_truncated === record.stderr_truncated &&
+		summary.command_effect_status === record.command_effect_status;
+}
+
+function ordinaryCandidateProjectionV1(record: RunRecord, validationIdentity: string): NonNullable<RunRecipeResult["ordinaryCandidate"]> {
+	const runtimeIdentity = record.runtime_identity!;
+	return {
+		schemaVersion: 1,
+		status: "VERIFIED",
+		candidateIdentity: canonicalHash({
+			schema_version: 1,
+			kind: "ordinary-development-candidate-v1",
+			validation_identity: validationIdentity,
+			runtime_identity: runtimeIdentity,
+		}),
+		validationIdentity,
+		sourceRunId: record.run_id,
+		authorityScope: "DEVELOPMENT_ONLY",
+	};
+}
+
+function currentRecipeRuntimeIdentityV1(): RunRuntimeIdentityV1 {
+	return {
+		schema_version: 1,
+		kind: "workbench-run-runtime-v1",
+		workbench_version: WORKBENCH_RUNTIME_BUILD_IDENTITY.version,
+		workbench_build: WORKBENCH_RUNTIME_BUILD_IDENTITY.build,
+		workbench_source_hash: WORKBENCH_RUNTIME_BUILD_IDENTITY.source_hash,
+		node_version: process.version,
+		platform: process.platform,
+		architecture: process.arch,
+	};
+}
+
+function runtimeIdentityIsCurrentV1(value: RunRecord["runtime_identity"]): value is RunRuntimeIdentityV1 {
+	const current = currentRecipeRuntimeIdentityV1();
+	return value !== undefined && value.schema_version === current.schema_version && value.kind === current.kind &&
+		value.workbench_version === current.workbench_version && value.workbench_build === current.workbench_build &&
+		value.workbench_source_hash === current.workbench_source_hash && value.node_version === current.node_version &&
+		value.platform === current.platform && value.architecture === current.architecture;
+}
+
+async function currentOrdinaryCandidateAfterRunV1(input: {
+	projectRoot: string;
+	mode: WorkbenchMode;
+	exec: ExecFn;
+	recipe: Recipe;
+	argv: readonly string[];
+	record: RunRecord;
+	actorFacts?: RecipeMutationFacts;
+}): Promise<RunRecipeResult["ordinaryCandidate"]> {
+	if (input.mode !== "DEV" || ownerFromActorFacts(input.actorFacts) !== "sol" ||
+		!isOrdinaryFinalVerificationRecipeV1(input.recipe) ||
+		!runtimeIdentityIsCurrentV1(input.record.runtime_identity)) return undefined;
+	const argvHash = executedArgvHash(input.argv);
+	if (!validationEvidenceSourceEligible(input.record.validation_evidence, {
+		recipe: input.recipe.name,
+		argvHash,
+	})) return undefined;
+	const assessment = await assessRunValidation({
+		projectRoot: input.projectRoot,
+		mode: input.mode,
+		exec: input.exec,
+		manifest: input.record,
+		actorFacts: input.actorFacts,
+	});
+	if (assessment.status !== "REUSABLE") return undefined;
+	const validationIdentity = validationEvidenceIdentity(input.record.validation_evidence);
+	return validationIdentity === null ? undefined : ordinaryCandidateProjectionV1(input.record, validationIdentity);
+}
+
+async function reuseCurrentOrdinaryFinalVerificationV1(input: {
+	projectRoot: string;
+	mode: WorkbenchMode;
+	exec: ExecFn;
+	recipe: Recipe;
+	argv: readonly string[];
+	actorFacts?: RecipeMutationFacts;
+	requestedCacheMode: CacheRequestMode;
+}): Promise<RunRecipeResult | undefined> {
+	if (input.mode !== "DEV" || input.requestedCacheMode !== "default" ||
+		ownerFromActorFacts(input.actorFacts) !== "sol" ||
+		!isOrdinaryFinalVerificationRecipeV1(input.recipe)) return undefined;
+	const latest = await latestRunAttemptForRecipe(input.projectRoot, input.recipe.name);
+	if (latest.state !== "FOUND") return undefined;
+	if (!runtimeIdentityIsCurrentV1(latest.manifest.runtime_identity)) return undefined;
+	const argvHash = executedArgvHash(input.argv);
+	if (!validationEvidenceSourceEligible(latest.manifest.validation_evidence, {
+		recipe: input.recipe.name,
+		argvHash,
+	})) return undefined;
+	const assessment = await assessRunValidation({
+		projectRoot: input.projectRoot,
+		mode: input.mode,
+		exec: input.exec,
+		manifest: latest.manifest,
+		actorFacts: input.actorFacts,
+	});
+	if (assessment.status !== "REUSABLE") return undefined;
+	const summary = await readSummary(input.projectRoot, latest.run_id);
+	const committed = summary === null ? null : await readCommittedManifest(input.projectRoot, latest.run_id);
+	const validationIdentity = committed === null ? null : validationEvidenceIdentity(committed.validation_evidence);
+	if (summary === null || committed === null || validationIdentity === null ||
+		!summaryMatchesCommittedRecordV1(summary, committed) ||
+		!validationEvidenceSourceEligible(committed.validation_evidence, {
+			recipe: input.recipe.name,
+			argvHash,
+		})) return undefined;
+	// Re-collect the current Candidate after the committed source and summary
+	// have both been re-opened. This closes the useful assessment/read window:
+	// a concurrent Candidate change cannot inherit the earlier verdict.
+	const finalAssessment = await assessRunValidation({
+		projectRoot: input.projectRoot,
+		mode: input.mode,
+		exec: input.exec,
+		manifest: committed,
+		actorFacts: input.actorFacts,
+	});
+	if (finalAssessment.status !== "REUSABLE") return undefined;
+	return {
+		ok: true,
+		record: committed,
+		summary,
+		runDir: runDirFor(input.projectRoot, latest.run_id),
+		validationReuse: {
+			status: "REUSED_CURRENT_CANDIDATE",
+			sourceRunId: latest.run_id,
+			validationIdentity,
+			executionSkipped: true,
+		},
+		ordinaryCandidate: ordinaryCandidateProjectionV1(committed, validationIdentity),
+	};
 }
 
 function buildEnvironment(recipe: Recipe): Record<string, string> {
@@ -354,6 +553,17 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		}
 	}
 
+	const reusedFinalVerification = await reuseCurrentOrdinaryFinalVerificationV1({
+		projectRoot,
+		mode,
+		exec,
+		recipe,
+		argv,
+		actorFacts: input.actorFacts,
+		requestedCacheMode,
+	});
+	if (reusedFinalVerification !== undefined) return reusedFinalVerification;
+
 	// ------------------------------------------------------------ P6-C cache
 	const store = new ActionCacheStore(projectRoot, { maxBytes: config.actionCacheMaxBytes, now });
 	const cacheCtx: ActionCacheContext = {
@@ -396,6 +606,7 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 				now,
 				authorizedExternalRoots: config.artifactExternalRoots,
 				exec,
+				runtimeIdentity: currentRecipeRuntimeIdentityV1(),
 			});
 			return { materialized, record: outcome.record };
 		} catch {
@@ -434,6 +645,15 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		} catch {
 			return { ok: false, error: "RUN_RECORD_COMMIT_FAILED" };
 		}
+		const ordinaryCandidate = await currentOrdinaryCandidateAfterRunV1({
+			projectRoot,
+			mode,
+			exec,
+			recipe,
+			argv,
+			record: patched,
+			actorFacts: input.actorFacts,
+		});
 		return {
 			ok: hit.record.success,
 			record: patched,
@@ -445,6 +665,7 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 				reusedFromRunId: hit.record.sourceRunId,
 				reason,
 			},
+			...(ordinaryCandidate === undefined ? {} : { ordinaryCandidate }),
 		};
 	};
 
@@ -571,6 +792,7 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 			environment_names: recipe.environment,
 			validation_components: recipe.validation_components,
 			cache_request_mode: cacheMode,
+			runtime_identity: currentRecipeRuntimeIdentityV1(),
 			argv_hash: executedArgvHashValue,
 			run_transaction_schema_version: 2,
 			// The subprocess did not start. The existing closed manifest schema
@@ -735,6 +957,7 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		environment_names: recipe.environment,
 		validation_components: recipe.validation_components,
 		cache_request_mode: cacheMode,
+		runtime_identity: currentRecipeRuntimeIdentityV1(),
 		execution_source: "exec",
 		argv_hash: executedArgvHashValue,
 		run_transaction_schema_version: 2,
@@ -902,6 +1125,17 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 			...(commandEffectWarnings === undefined ? {} : { warnings: commandEffectWarnings }),
 		};
 	}
+	const ordinaryCandidate = runOk
+		? await currentOrdinaryCandidateAfterRunV1({
+			projectRoot,
+			mode,
+			exec,
+			recipe,
+			argv,
+			record: patched,
+			actorFacts: input.actorFacts,
+		})
+		: undefined;
 
 	return {
 		ok: runOk,
@@ -910,6 +1144,7 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 		summary,
 		runDir,
 		cache: cacheStatus,
+		...(ordinaryCandidate === undefined ? {} : { ordinaryCandidate }),
 		...(commandEffect === undefined ? {} : { commandEffect }),
 		...(commandEffectWarnings === undefined ? {} : { warnings: commandEffectWarnings }),
 	};

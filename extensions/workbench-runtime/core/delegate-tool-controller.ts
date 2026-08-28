@@ -1504,13 +1504,18 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 						toolResult.details.semantic_review_receipt_hash = automaticSemanticReview.receipt_hash;
 					}
 					if (automaticSemanticReview.next_action !== undefined) toolResult.details.next_action = automaticSemanticReview.next_action;
-					const recovery = automaticSemanticReview.status === "RETRYABLE_FAILURE"
-						? `; next action: ${automaticSemanticReview.next_action}`
-						: automaticSemanticReview.status === "REPAIR" ? `; next action: ${automaticSemanticReview.next_action}` : "";
-					toolResult.content = toolResult.content.map((item) => ({
-						...item,
-						text: `${item.text}\nautomatic Sol review: ${automaticSemanticReview!.status}${"code" in automaticSemanticReview! ? ` (${automaticSemanticReview!.code})` : ""}${recovery}`,
-					}));
+					// ACCEPT is already represented as a ready ordinary Candidate by the
+					// bounded handoff. Keep successful DEV output free of lifecycle
+					// choreography; only unresolved outcomes expose their one action.
+					if (automaticSemanticReview.status !== "ACCEPT") {
+						const recovery = automaticSemanticReview.status === "RETRYABLE_FAILURE"
+							? `; next action: ${automaticSemanticReview.next_action}`
+							: automaticSemanticReview.status === "REPAIR" ? `; next action: ${automaticSemanticReview.next_action}` : "";
+						toolResult.content = toolResult.content.map((item) => ({
+							...item,
+							text: `${item.text}\nautomatic Sol review: ${automaticSemanticReview!.status}${"code" in automaticSemanticReview! ? ` (${automaticSemanticReview!.code})` : ""}${recovery}`,
+						}));
+					}
 				}
 				attachDelegateSessionMirrorWarning(toolResult, sessionMirrorWarnings);
 				void controller.refreshStatus(ctx);

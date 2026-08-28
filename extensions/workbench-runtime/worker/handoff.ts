@@ -469,9 +469,9 @@ export const HANDOFF_COMMANDER_ACTION_LINES = [
 /** Completion tail for the ordinary one-call delivery path. */
 export const HANDOFF_DEFAULT_DELIVERY_COMPLETE_LINES = [
 	"",
-	"--- Zero-delta delivery complete ---",
-	"Scope/integrity is complete and semantic_review:not_required because the implementation produced no actual delta.",
-	"The session mirror is closed, but this is not Gate authority; run final verification only at the appropriate boundary.",
+	"--- Ordinary delivery complete ---",
+	"Internal scope/review closure is complete; no manual review/status/repair command is required.",
+	"This is DEV evidence only; applicable final verification, Gates, research, release, and profit authority remain separate.",
 ];
 
 /** Project-relative sibling artifact path derived from the report path. */
@@ -553,6 +553,8 @@ export function buildDelegateWorkerResult(input: BuildDelegateWorkerResultInput)
 		required.push(`failure       : ${sanitizeSummaryItem(input.failureMessage, MAX_HANDOFF_FAILURE_CHARS).text}`);
 	}
 	const scopePacket = input.scopeIntegrityPacket;
+	const ordinaryCandidateReady = input.reviewStatus === "REVIEWED" && scopePacket !== undefined &&
+		(scopePacket.semantic_review === "accepted" || scopePacket.semantic_review === "not_required");
 	let packetStatusIndex = -1;
 	if (scopePacket) {
 		required.push(`review kind   : ${scopePacket.review_kind} — mechanical scope/integrity only; not semantic quality or Gate authority`);
@@ -560,6 +562,9 @@ export function buildDelegateWorkerResult(input: BuildDelegateWorkerResultInput)
 		required.push(`bound diff    : ${scopePacket.bound_diff_hash}`);
 		required.push(`scope artifact: ${scopePacket.review_record}`);
 		required.push(`semantic review: ${scopePacket.semantic_review} | risk=${scopePacket.semantic_risk}`);
+		if (ordinaryCandidateReady) {
+			required.push(`candidate     : READY_FOR_FINAL_VERIFICATION | binding=${scopePacket.bound_diff_hash} | authority=DEVELOPMENT_ONLY`);
+		}
 		packetStatusIndex = required.length;
 		required.push("packet display: PENDING");
 	}
@@ -720,6 +725,17 @@ export function buildDelegateWorkerResult(input: BuildDelegateWorkerResultInput)
 		details.semantic_review = scopePacket.semantic_review;
 		details.semantic_risk = scopePacket.semantic_risk;
 		details.gate_authority = false;
+		if (ordinaryCandidateReady) {
+			details.ordinary_candidate = {
+				status: "READY_FOR_FINAL_VERIFICATION",
+				binding_hash: scopePacket.bound_diff_hash,
+				authority_scope: "DEVELOPMENT_ONLY",
+				gate_authority: false,
+				research_authority: false,
+				release_authority: false,
+				profit_authority: false,
+			};
+		}
 	}
 	// Phase 3: the nested bounded spend details — the exact canonical spend
 	// object persisted in worker-summary.json (same fields, same values,

@@ -492,11 +492,12 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 		name: "workbench_run_recipe",
 		label: "Workbench run recipe",
 		description:
-			"Run a declared recipe from .pi/workbench/recipes.yaml by name with schema-approved parameters. Only declared recipes run — arbitrary commands are never accepted. Full output is written to the run directory; a truncated summary is returned. Use workbench_project_inspect to list recipes.",
+			"Resolve a declared recipe from .pi/workbench/recipes.yaml by name with schema-approved parameters. Only declared recipes run — arbitrary commands are never accepted. In DEV, an unchanged complete Sol final-check Candidate may reuse its exact current validation without a subprocess or duplicate run; no-cache/refresh and every uncertainty execute. Full executed output is written to the run directory; a bounded summary is returned. Use workbench_project_inspect to list recipes.",
 		promptSnippet: "Run a declared workbench recipe by name (controlled execution)",
 		promptGuidelines: [
 			"Use workbench_run_recipe instead of bash for project commands that are declared as recipes — the model must not improvise shell commands in VERIFY mode.",
 			"Only pass parameters declared in the recipe's params schema.",
+			"Focused recipes remain development feedback. A DEV recipe declaring the complete typecheck/unit-test/whitespace set returns a DEVELOPMENT_ONLY Candidate; an exact unchanged repeat may report REUSED_CURRENT_CANDIDATE with execution skipped. This never grants Gate, research, release, or profit authority.",
 			"recipe_not_found and config_invalid return a structured agent-owned next action. Use the narrow review-gated recipes.yaml maintenance delegation in DEV or VERIFY; do not ask the user to edit the file or change worktrees.",
 		],
 	},
@@ -587,7 +588,7 @@ export const WORKBENCH_TOOL_METADATA: { [K in WorkbenchToolName]: WorkbenchToolM
 		description:
 				"Show the write-authority and delegation-review state: actor, write policy, lease status, latest delegation, review status, current and reviewed hashes, blocked writes, latest verdict, and durable repair state. REPAIR_REQUIRED reports exact repair_of only while fresh. An inactive discarded blocker reports close_inactive_blocker, which requires only its exact changed, journal-touched, or carried paths clean, preserves unrelated work, writes immutable non-acceptance, and is available in DEV or VERIFY. An incomplete or unreadable ownerless v2 envelope reports quarantine_unreadable_authority; its source bytes remain in place, and later bytes re-block until the new stable inventory is explicitly quarantined. Active execution and ambiguous/corrupt recovery remain fail-closed. Tagged v2 uses W/D/S relevance; historical v2/v1 retains complete-diff binding. Emits an explicit CONTEXT RISK line when the latest handoff is too large for safe context compaction.",
 		promptGuidelines: [
-			"Successful non-zero implementation delivery returns a provisional scope/integrity packet and stays PENDING_REVIEW; after inspecting a complete unchanged packet, use workbench_review_worker_diff for hash-bound Sol ACCEPT. Use status only for diagnostics or recovery.",
+			"Successful ordinary implementation delivery performs its bounded scope/integrity and Sol semantic review internally. ACCEPT or zero-delta closure returns one DEV Candidate ready for final verification, with no manual review/status/repair chain. Only an unresolved result exposes its single durable recovery action; status remains diagnostic/recovery-only.",
 			"If a complete packet is wrong, publish semantic_decision=REPAIR with the exact bound hash and a bounded reason, then follow only the exact repair_of shown by status. A fresh exact repair route is executable even though ordinary/new delegations and VERIFY remain blocked; call it next without repeating status/review. REPAIR and every unresolved lineage remain Gate-blocking.",
 			"Use workbench_recover_tool_result only with an exact receipt id returned by a real tool result. If no workbench_delegate_worker call occurred, never describe the unchanged delegation state as a registry reload or persistence failure.",
 			"If rejected changes were deliberately discarded, use the exact close_inactive_blocker action reported by status. It checks only the delegation's changed, journal-touched, or carried paths, preserves unrelated work, never accepts rejected code, and must not be replaced with a new worktree.",

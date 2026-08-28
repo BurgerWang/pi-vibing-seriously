@@ -11,9 +11,10 @@
  * (`evaluateValidationReuse`) unchanged.
  *
  * Observation only. Assessment NEVER:
- *   - skips or schedules recipe/gate execution (the P6-C action cache
- *     still decides execution exactly as before; this module never
- *     consults or alters cache keys/decisions/hits/misses/run counts);
+ *   - skips or schedules recipe/gate execution. The WP4 runner may consume a
+ *     REUSABLE verdict only for its closed DEV final-check contract; this
+ *     module itself never consults or alters cache keys/decisions/hits/misses
+ *     or run counts;
  *   - rewrites run artifacts (no file under runs/ is ever written);
  *   - appends session/delegation entries or mutates in-memory delegation
  *     authority (worker-first facts are supplied by the caller as a

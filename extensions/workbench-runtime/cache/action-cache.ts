@@ -29,7 +29,7 @@ import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import type { WorkbenchMode } from "../core/mode-policy.ts";
 import type { ExecFn } from "../core/config.ts";
 import type { Recipe } from "../core/recipe-schema.ts";
-import { makeRunId, RUN_MANIFEST_SCHEMA_VERSION_V2, type RunRecord, type RunSummaryRecord } from "../core/runs.ts";
+import { makeRunId, RUN_MANIFEST_SCHEMA_VERSION_V2, type RunRecord, type RunRuntimeIdentityV1, type RunSummaryRecord } from "../core/runs.ts";
 import { sha256Hex } from "./canonical-hash.ts";
 import type { ActionCacheStore } from "./action-store.ts";
 import {
@@ -353,6 +353,7 @@ export interface MaterializeInput {
 	now?: () => Date;
 	authorizedExternalRoots?: Readonly<Record<string, string>>;
 	exec: ExecFn;
+	runtimeIdentity: RunRuntimeIdentityV1;
 }
 
 /**
@@ -405,6 +406,7 @@ export async function materializeCachedRun(input: MaterializeInput): Promise<Mat
 		reused_from_run_id: record.sourceRunId,
 		cache_created_at: record.createdAt,
 		cache_validated_at: validatedAt.toISOString(),
+		runtime_identity: input.runtimeIdentity,
 		argv_hash: record.argvHash,
 		artifact_validation: {
 			mode: record.mode,

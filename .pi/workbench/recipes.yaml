@@ -486,6 +486,10 @@ recipes:
   # path. Cached focused recipes are DEVELOPMENT-ONLY feedback: they never
   # substitute for the single Commander-owned final no-cache `check` run
   # and the formal gates (a cached hit never skips recipe/gate execution).
+  # Separately, WP4 may reuse this exact successful DEV validation when its
+  # Candidate, invocation, runtime identity and full binding are unchanged;
+  # that creates no duplicate run and grants no Gate/research/release/profit
+  # authority. Explicit no-cache/refresh or any uncertainty executes again.
   - name: check
     description: Full check (typecheck + unit tests + whitespace) — intentionally not cached
     validation_components: [typecheck, unit-test, whitespace]

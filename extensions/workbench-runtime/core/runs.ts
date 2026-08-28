@@ -116,6 +116,8 @@ export interface RunRecord {
 	/** P6-C: when the cached result was produced / re-validated. */
 	cache_created_at?: string;
 	cache_validated_at?: string;
+	/** WP4 runtime/toolchain identity required for ordinary Candidate reuse. */
+	runtime_identity?: RunRuntimeIdentityV1;
 	/** P6-C: artifact restore/verification facts of a cached run. */
 	artifact_validation?: {
 		mode: string;
@@ -154,6 +156,17 @@ export interface RunRecord {
 	command_effect_status?: CommandEffectStatus;
 }
 
+export interface RunRuntimeIdentityV1 {
+	schema_version: 1;
+	kind: "workbench-run-runtime-v1";
+	workbench_version: string;
+	workbench_build: string;
+	workbench_source_hash: string;
+	node_version: string;
+	platform: string;
+	architecture: string;
+}
+
 function plainRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -180,6 +193,17 @@ function integerArray(value: unknown, maxItems: number): value is number[] {
 		&& value.length > 0
 		&& value.length <= maxItems
 		&& value.every((entry) => typeof entry === "number" && Number.isInteger(entry));
+}
+
+function validRunRuntimeIdentityV1(value: unknown): value is RunRuntimeIdentityV1 {
+	if (!plainRecord(value)) return false;
+	const keys = Object.keys(value).sort();
+	if (keys.join("\u0000") !== ["architecture", "kind", "node_version", "platform", "schema_version", "workbench_build", "workbench_source_hash", "workbench_version"].join("\u0000")) return false;
+	return value.schema_version === 1 && value.kind === "workbench-run-runtime-v1" &&
+		boundedString(value.workbench_version, 128) && boundedString(value.workbench_build, 256) &&
+		typeof value.workbench_source_hash === "string" && /^sha256:[0-9a-f]{64}$/.test(value.workbench_source_hash) &&
+		boundedString(value.node_version, 128) &&
+		boundedString(value.platform, 64) && boundedString(value.architecture, 64);
 }
 
 /**
@@ -238,6 +262,7 @@ export function parseCommittedRunManifestV2(value: unknown, runId: string): RunR
 	if (!(value.reused_from_run_id === undefined || (typeof value.reused_from_run_id === "string" && isValidRunId(value.reused_from_run_id)))) return null;
 	if (!(value.cache_created_at === undefined || finiteIso(value.cache_created_at))) return null;
 	if (!(value.cache_validated_at === undefined || finiteIso(value.cache_validated_at))) return null;
+	if (!(value.runtime_identity === undefined || validRunRuntimeIdentityV1(value.runtime_identity))) return null;
 	if (!(value.evidence_paths === undefined || boundedStringArray(value.evidence_paths, 10_000, 4_096))) return null;
 	if (!(value.artifact_manifest_path === undefined || value.artifact_manifest_path === "artifact-manifest.json")) return null;
 	if (!(value.validation_evidence === undefined || plainRecord(value.validation_evidence))) return null;

@@ -153,7 +153,7 @@ export function registerRecipeTools<TIngress>(controller: RecipeToolsController<
 				// decision. The controller must not reintroduce the old blanket
 				// "all writes denied" rule or duplicate a weaker scope check.
 				onUpdate?.({
-					content: [{ type: "text", text: "Running declared recipe..." }],
+					content: [{ type: "text", text: "Resolving declared recipe..." }],
 					details: { phase: "started", recipe: boundedInlineDetail(params.recipe, 256) },
 				});
 				const result = await runRecipe({
@@ -193,10 +193,18 @@ export function registerRecipeTools<TIngress>(controller: RecipeToolsController<
 					? undefined
 					: displayRelative(projectRoot, summary.command_effect_path);
 				const commandEffectWarning = result.warnings?.[0];
+				const validationReuseLine = result.validationReuse === undefined
+					? undefined
+					: `validation : ${result.validationReuse.status}; execution=SKIPPED; source_run=${boundedInlineDetail(result.validationReuse.sourceRunId, 128)}; identity=${boundedInlineDetail(result.validationReuse.validationIdentity, 64)}`;
+				const ordinaryCandidateLine = result.ordinaryCandidate === undefined
+					? undefined
+					: `candidate  : ${result.ordinaryCandidate.status}; id=${boundedInlineDetail(result.ordinaryCandidate.candidateIdentity, 64)}; authority=${result.ordinaryCandidate.authorityScope}; Gate/research/release/profit=NOT_GRANTED`;
 				const text = boundedCommandText([
 					...(result.error ? [`error      : ${boundedInlineDetail(result.error, 128)}`] : []),
 					...(commandEffectStatus ? [`cmd effect : ${boundedInlineDetail(commandEffectStatus, 128)}; semantic_acceptance=NOT_GRANTED`] : []),
 					...(commandEffectWarning ? [`warning    : ${boundedInlineDetail(commandEffectWarning, 128)}`] : []),
+					...(validationReuseLine === undefined ? [] : [validationReuseLine]),
+					...(ordinaryCandidateLine === undefined ? [] : [ordinaryCandidateLine]),
 					parentSummary.text,
 				].join("\n"));
 				const artifactPaths = summary.artifact_paths
@@ -227,6 +235,28 @@ export function registerRecipeTools<TIngress>(controller: RecipeToolsController<
 						}
 						: {}),
 					cache: result.cache,
+					...(result.validationReuse === undefined ? {} : {
+						validation_reuse: {
+							status: result.validationReuse.status,
+							source_run_id: boundedInlineDetail(result.validationReuse.sourceRunId, 128),
+							validation_identity: boundedInlineDetail(result.validationReuse.validationIdentity, 64),
+							execution_skipped: true as const,
+						},
+					}),
+					...(result.ordinaryCandidate === undefined ? {} : {
+						ordinary_candidate: {
+							schema_version: 1 as const,
+							status: result.ordinaryCandidate.status,
+							candidate_identity: boundedInlineDetail(result.ordinaryCandidate.candidateIdentity, 64),
+							validation_identity: boundedInlineDetail(result.ordinaryCandidate.validationIdentity, 64),
+							source_run_id: boundedInlineDetail(result.ordinaryCandidate.sourceRunId, 128),
+							authority_scope: result.ordinaryCandidate.authorityScope,
+							gate_authority: false as const,
+							research_authority: false as const,
+							release_authority: false as const,
+							profit_authority: false as const,
+						},
+					}),
 					phase: "finished",
 				};
 				onUpdate?.({ content: [{ type: "text", text }], details: { ...details } });

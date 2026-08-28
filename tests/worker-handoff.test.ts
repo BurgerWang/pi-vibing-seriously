@@ -656,17 +656,65 @@ test("the fixed commander-action tail is exactly the documented four lines", () 
 	assert.ok(HANDOFF_COMMANDER_ACTION_LINES[3]?.includes("workbench_review_worker_diff"));
 });
 
-test("REVIEWED zero-delta handoff states semantic review is not required and never implies Gate authority", () => {
-	const result = buildDelegateWorkerResult(handoffInput({ reviewStatus: "REVIEWED", changedPaths: [] }));
+test("REVIEWED zero-delta handoff returns an ordinary Candidate without lifecycle choreography or strict authority", () => {
+	const result = buildDelegateWorkerResult(handoffInput({
+		reviewStatus: "REVIEWED",
+		changedPaths: [],
+		scopeIntegrityPacket: {
+			lines: ["review: PASS"],
+			review_kind: "scope_integrity",
+			scope_integrity_verdict: "PASS",
+			bound_diff_hash: "b".repeat(64),
+			review_record: ".pi/workbench/delegations/20260601-120000-abcd/v2/review.json",
+			presentation_complete: true,
+			patch_truncated: false,
+			semantic_review: "not_required",
+			semantic_risk: "low",
+		},
+	}));
 	const text = result.content[0]?.text ?? "";
 	assert.match(text, /review\s+: REVIEWED — semantic acceptance recorded or zero-delta closure/);
-	assert.match(text, /--- Zero-delta delivery complete ---/);
-	assert.match(text, /semantic_review:not_required/);
-	assert.match(text, /not Gate authority/);
+	assert.match(text, /candidate\s+: READY_FOR_FINAL_VERIFICATION/);
+	assert.match(text, /--- Ordinary delivery complete ---/);
+	assert.match(text, /no manual review\/status\/repair command is required/);
+	assert.match(text, /Gates, research, release, and profit authority remain separate/);
 	assert.doesNotMatch(text, /--- Commander action required ---/);
+	assert.deepEqual(result.details.ordinary_candidate, {
+		status: "READY_FOR_FINAL_VERIFICATION",
+		binding_hash: "b".repeat(64),
+		authority_scope: "DEVELOPMENT_ONLY",
+		gate_authority: false,
+		research_authority: false,
+		release_authority: false,
+		profit_authority: false,
+	});
 	assert.equal(HANDOFF_DEFAULT_DELIVERY_COMPLETE_LINES.length, 4);
 	assert.ok(Buffer.byteLength(text, "utf8") <= MAX_PARENT_HANDOFF_BYTES);
 	assert.ok(text.split("\n").length <= MAX_PARENT_HANDOFF_LINES);
+});
+
+test("semantic ACCEPT returns the same ordinary Candidate presentation and no manual lifecycle action", () => {
+	const result = buildDelegateWorkerResult(handoffInput({
+		reviewStatus: "REVIEWED",
+		changedPaths: ["src/a.ts"],
+		scopeIntegrityPacket: {
+			lines: ["review: PASS"],
+			review_kind: "scope_integrity",
+			scope_integrity_verdict: "PASS",
+			bound_diff_hash: "b".repeat(64),
+			review_record: ".pi/workbench/delegations/20260601-120000-abcd/v2/review.json",
+			presentation_complete: true,
+			patch_truncated: false,
+			semantic_review: "accepted",
+			semantic_risk: "medium",
+		},
+	}));
+	const text = result.content[0]?.text ?? "";
+	assert.match(text, /candidate\s+: READY_FOR_FINAL_VERIFICATION/);
+	assert.match(text, /--- Ordinary delivery complete ---/);
+	assert.doesNotMatch(text, /Commander action required|workbench_review_worker_diff|workbench_delegation_status|workbench_repair_delegation/);
+	assert.equal((result.details.ordinary_candidate as { authority_scope?: string }).authority_scope, "DEVELOPMENT_ONLY");
+	assert.equal(result.details.gate_authority, false);
 });
 
 test("complete handoff-sized scope/integrity packet is embedded wholly before worker prose under worst-case path pressure", () => {

@@ -184,11 +184,11 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 	assert.equal(a.toolOrderHash, canonicalHash(VERIFY_TOOLS), "order hash = canonical hash of the explicit MODE_TOOLS order");
 });
 
-test("current public tool surface has the intentional exact-repair transition hash", () => {
+test("current public tool surface has the intentional ordinary-development transition hash", () => {
 	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
-	const currentHash = "500227ecb3461a35028bfda935d070f17547f24329ff4bd2c5ef2b2e3452fe39";
+	const currentHash = "cc036a76ff472ca3b2fc6b8e61d54baa7a787b4c42b67f3514ddd5a174ef9851";
 	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
-	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the exact-repair transition hash");
+	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the ordinary-development transition hash");
 });
 
 test("the stable-zone contract constants are explicit and disjoint", () => {
@@ -656,7 +656,7 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 		"the established status prompt snippet stays byte-identical",
 	);
 	assert.deepEqual(meta.promptGuidelines, [
-		"Successful non-zero implementation delivery returns a provisional scope/integrity packet and stays PENDING_REVIEW; after inspecting a complete unchanged packet, use workbench_review_worker_diff for hash-bound Sol ACCEPT. Use status only for diagnostics or recovery.",
+		"Successful ordinary implementation delivery performs its bounded scope/integrity and Sol semantic review internally. ACCEPT or zero-delta closure returns one DEV Candidate ready for final verification, with no manual review/status/repair chain. Only an unresolved result exposes its single durable recovery action; status remains diagnostic/recovery-only.",
 		"If a complete packet is wrong, publish semantic_decision=REPAIR with the exact bound hash and a bounded reason, then follow only the exact repair_of shown by status. A fresh exact repair route is executable even though ordinary/new delegations and VERIFY remain blocked; call it next without repeating status/review. REPAIR and every unresolved lineage remain Gate-blocking.",
 		"Use workbench_recover_tool_result only with an exact receipt id returned by a real tool result. If no workbench_delegate_worker call occurred, never describe the unchanged delegation state as a registry reload or persistence failure.",
 		"If rejected changes were deliberately discarded, use the exact close_inactive_blocker action reported by status. It checks only the delegation's changed, journal-touched, or carried paths, preserves unrelated work, never accepts rejected code, and must not be replaced with a new worktree.",
@@ -674,8 +674,8 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	assert.doesNotMatch(meta.description, /real git diff \(any change after REVIEWED turns it STALE\)/);
 	assert.equal(
 		canonicalHash(meta),
-		"e3f677c97fd4d2922f38b7035e5170dfb132539e3985f69a426ce649f2259aa0",
-		"current status metadata hash is machine-pinned after full authority recovery",
+		"efa581c6aeeb301b4709843c4b45cf0ad6b9169a7117b74a78f19bbeff5582d0",
+		"current status metadata hash is machine-pinned after ordinary Candidate convergence",
 	);
 	assert.equal(
 		canonicalHash(WORKBENCH_TOOL_PARAMETERS.workbench_delegation_status),
@@ -684,8 +684,8 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.equal(
 		canonicalHash(workbenchToolMetadataOrdered()),
-		"6e624d8e5df34ab0c79f87909d5f956f9271491f48c508098af88797e8b472fb",
-		"current public catalog hash is machine-pinned after model-callable exact repair was added",
+		"1624c47f655a05744fa2597a14055d2e5e333ab13ab55f3daa25b82dee812d69",
+		"current public catalog hash is machine-pinned after ordinary Candidate convergence",
 	);
 });
 

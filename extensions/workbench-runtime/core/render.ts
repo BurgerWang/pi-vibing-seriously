@@ -48,6 +48,25 @@ export interface RecipeToolDetails {
 		reusedFromRunId?: string;
 		reason?: string;
 	};
+	/** WP4 DEV final-verification reuse; distinct from the action cache. */
+	validation_reuse?: {
+		status: "REUSED_CURRENT_CANDIDATE";
+		source_run_id: string;
+		validation_identity: string;
+		execution_skipped: true;
+	};
+	ordinary_candidate?: {
+		schema_version: 1;
+		status: "VERIFIED";
+		candidate_identity: string;
+		validation_identity: string;
+		source_run_id: string;
+		authority_scope: "DEVELOPMENT_ONLY";
+		gate_authority: false;
+		research_authority: false;
+		release_authority: false;
+		profit_authority: false;
+	};
 	/**
 	 * Phase 2B: the recipe's exact declared validation components. Copied by
 	 * the tool ONLY from the persisted/returned run record — absent when no
@@ -351,6 +370,12 @@ export function renderRecipeLines(d: RecipeToolDetails, expanded: boolean): stri
 		`exit code  : ${fmtExit(d.exit_code)} (expected: ${(d.expected_exit_codes ?? []).join(", ") || "(none)"})`,
 		`validation : ${validationComponents}`,
 		`cache mode : ${cacheRequestMode}`,
+		...(d.validation_reuse === undefined ? [] : [
+			`verify reuse: ${boundedBytes(d.validation_reuse.status, 64)}; execution=${d.validation_reuse.execution_skipped ? "SKIPPED" : "UNKNOWN"}; source=${boundedBytes(d.validation_reuse.source_run_id, 128)}; identity=${boundedBytes(d.validation_reuse.validation_identity, 64)}`,
+		]),
+		...(d.ordinary_candidate === undefined ? [] : [
+			`candidate   : ${boundedBytes(d.ordinary_candidate.status, 32)} id=${boundedBytes(d.ordinary_candidate.candidate_identity, 64)} authority=${d.ordinary_candidate.authority_scope}; Gate/research/release/profit=NOT_GRANTED`,
+		]),
 		...(d.command_effect_status || d.command_effect_warning
 			? [`cmd effect : ${boundedBytes(d.command_effect_status ?? "EVIDENCE_UNAVAILABLE", 128)}${d.command_effect_warning ? `; ${boundedBytes(d.command_effect_warning, 256)}` : ""}`]
 			: []),
