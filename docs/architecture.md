@@ -87,7 +87,7 @@ extensions/workbench-runtime/
     │                        #   selection and ledger/handoff persistence: Phase 3;
     │                        #   numeric-only progress counters/band: Phase 4;
     │                        #   task-contract profile wording + granularity guidance: Phase 5)
-    ├── write-authority.ts   # fixed Sol/Luna policy: actor identity, leased
+    ├── write-authority.ts   # development-first policy: actor identity, direct
     │                        #   ordinary writes, high-risk path guard, temporary
     │                        #   lease (legacy policy id retained for compatibility)
     ├── lease-command.ts     # P7 user-only lease slash commands: argument parsing,
@@ -382,17 +382,18 @@ clean, stash, and branch switching remain unavailable. Checkpoint and push are
 operational Git facts, never review, Gate, release, Formal, or production
 authority.
 
-Responsibility split is fixed Sol -> Luna. Sol owns the contract,
-cross-cutting architecture, scope, review, and verdict; Luna owns routine
-source, test, and documentation implementation inside one bounded task. A
-successful delegation owns its local implementation decisions; the same
-public call scope-checks and presents the delivery, while Sol makes the
-separate semantic ACCEPT/repair decision inside the same agent cycle.
+Responsibility split is development-first. Sol may make ordinary source,
+test, and documentation edits directly in DEV. Delegation is optional for a
+useful bounded task, not a write or defect-repair prerequisite. A successful
+delegation owns its local implementation decisions; the same public call
+scope-checks and presents the delivery, while Sol makes the separate semantic
+ACCEPT/repair decision inside the same agent cycle.
 Semantic review remains distinct from final recipes/Gates. The serialized
 `worker-first-strict` policy name and
-the gate check kind remain stable identifiers and describe the fixed product
-workflow. Any direct Sol edit/write requires a user-issued temporary lease;
-it is an explicit exception, not the routine path. See
+the gate check kind remain stable compatibility identifiers; they do not force
+the user workflow through delegation. Dependency, security/permission/policy,
+deployment/migration, release, and Pi control paths still require a
+user-issued temporary lease. See
 [worker-delegation.md](worker-delegation.md) for the
 transaction, risk, and recovery contracts.
 
@@ -1716,13 +1717,13 @@ run/cache/gate/delegation artifacts or execution counts.
   rejection, budget/compaction facts in the worker report
 - Historical P7 introduced the serialized `worker-first-strict` policy id,
   bounded leases, delegation records, review state, and the B6 machine check
-kind. Current DEV behavior is fixed Sol -> Luna: routine writes are delegated,
-direct Sol edit/write requires the bounded temporary lease, a successful v2
+kind. Current DEV behavior is development-first: ordinary edit/write is
+direct, protected high-risk paths retain the bounded temporary lease, and a successful v2
   delegation returns a provisional scope/integrity packet and stays pending
   until explicit hash-bound Sol semantic acceptance, and B6 is presented as Development
   Safety. Historical records remain readable for compatibility. Generated
-  project AGENTS files own the complete fixed Sol -> Luna policy; q-build and
-  the implementation skill carry a mandatory pointer without duplicating the
+  project AGENTS files own the complete development-first policy; q-build and
+  the implementation skill carry a compact pointer without duplicating the
   lease and review clauses in every prompt.
 - P8 (this release): safe nested project support — optional `project.yaml`
   `project_dir` (default `.`) resolved after config load into the safe

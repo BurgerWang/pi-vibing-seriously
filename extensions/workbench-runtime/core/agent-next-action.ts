@@ -1,6 +1,10 @@
 /** Machine-callable recovery actions returned to the Sol commander. */
 
-import type { DelegationLifecyclePrimaryActionV1 } from "./delegation-lifecycle-resolver.ts";
+import {
+	validateLifecycleActionSnapshotV2,
+	type DelegationLifecyclePrimaryActionV1,
+	type LifecycleActionSnapshotV2,
+} from "./delegation-lifecycle-resolver.ts";
 
 export const EXACT_REPAIR_TOOL_NAME_V1 = "workbench_repair_delegation" as const;
 
@@ -88,5 +92,36 @@ export function delegationLifecycleActionTextV1(action: DelegationLifecyclePrima
 			return "report and repair the authority storage failure; no lifecycle success is inferred";
 		default:
 			return assertNever(action.action);
+	}
+}
+
+/** Render the exact machine-selected V2 command without reclassifying lifecycle state. */
+export function lifecycleActionSnapshotCommandV2(snapshot: unknown): string | null {
+	if (!validateLifecycleActionSnapshotV2(snapshot) || snapshot.tool === null) return null;
+	const argumentsText = snapshot.arguments === null || Object.keys(snapshot.arguments).length === 0
+		? ""
+		: ` ${Object.entries(snapshot.arguments).map(([key, value]) => `${key}=${String(value)}`).join(" ")}`;
+	return `call ${snapshot.tool}${argumentsText}`;
+}
+
+/** One bounded human guidance line sourced only from LifecycleActionSnapshotV2. */
+export function lifecycleActionSnapshotTextV2(snapshot: Readonly<LifecycleActionSnapshotV2>): string {
+	if (!validateLifecycleActionSnapshotV2(snapshot)) return "recover lifecycle authority; the current action snapshot is invalid";
+	const command = lifecycleActionSnapshotCommandV2(snapshot);
+	switch (snapshot.action) {
+		case "NONE": return snapshot.reason_code === "OVERLAPPING_PATHS" || snapshot.reason_code === "INVALID_PATH_REQUEST"
+			? "overlapping or unknown path authority remains blocked; use strict path-lane admission"
+			: "no lifecycle action is currently eligible";
+		case "CONTINUE_DIRECT_DEVELOPMENT": return "continue ordinary direct development; no lifecycle command is required";
+		case "START_DELEGATION": return command ?? "start only the snapshot-bound delegation";
+		case "CONTINUE_CHECKPOINT": return `continue the exact checkpoint ${snapshot.exact_target.bound_hash ?? "(unavailable)"}; do not resume prior conversation state`;
+		case "REVIEW_CANDIDATE": return command ?? "review only the snapshot-bound candidate";
+		case "RETRY_REVIEW_JOB": return command ?? "retry only the snapshot-bound review job";
+		case "START_EXACT_REPAIR": return command ?? "start only the exact snapshot-bound repair";
+		case "PAUSED_BUDGET": return "budget is paused; explicit user authorization is required to extend or split the task";
+		case "PROMOTE_CANDIDATE": return `request explicit promotion of Candidate ${snapshot.exact_target.candidate_id ?? "(unavailable)"}`;
+		case "RUN_GATE": return command ?? "run only the snapshot-bound Gate";
+		case "RECOVER_AUTHORITY": return command ?? "recover the exact snapshot-bound authority";
+		default: return assertNever(snapshot.action);
 	}
 }

@@ -23,6 +23,7 @@ export const WORKER_TASK_KIND_ENV = "WORKBENCH_WORKER_TASK_KIND";
 export const WORKER_DELEGATION_ID_ENV = "WORKBENCH_WORKER_DELEGATION_ID";
 export const WORKER_CONTRACT_HASH_ENV = "WORKBENCH_WORKER_CONTRACT_HASH";
 export const WORKER_TIMEOUT_MS_ENV = "WORKBENCH_WORKER_TIMEOUT_MS";
+export const WORKER_ATTEMPT_ENV = "WORKBENCH_WORKER_ATTEMPT";
 export const WORKER_ROLE = "worker";
 
 export type WorkerTaskKind = "implementation" | "diagnosis";
@@ -86,6 +87,8 @@ export interface WorkerRoleContext {
 	taskKind?: WorkerRuntimeTaskKind;
 	/** Advisory wall-clock budget inherited from the parent runner. */
 	timeoutMs?: number;
+	/** One-based fresh-child continuation attempt. */
+	attempt?: number;
 }
 
 export type ResolveWorkerTaskKindResult =
@@ -110,6 +113,12 @@ export function parseWorkerTimeoutMsEnvironment(raw: string | undefined): number
 	if (raw === undefined || !/^[1-9][0-9]*$/u.test(raw)) return undefined;
 	const value = Number(raw);
 	return Number.isSafeInteger(value) && value <= 24 * 60 * 60 * 1_000 ? value : undefined;
+}
+
+export function parseWorkerAttemptEnvironment(raw: string | undefined): number {
+	if (raw === undefined || !/^[1-9][0-9]*$/u.test(raw)) return 1;
+	const value = Number(raw);
+	return Number.isSafeInteger(value) && value <= 1_000 ? value : 1;
 }
 
 function effectiveWorkerTaskKind(taskKind: WorkerRuntimeTaskKind | undefined): WorkerRuntimeTaskKind {

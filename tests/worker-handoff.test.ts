@@ -697,8 +697,17 @@ test("semantic ACCEPT returns the same ordinary Candidate presentation and no ma
 	const result = buildDelegateWorkerResult(handoffInput({
 		reviewStatus: "REVIEWED",
 		changedPaths: ["src/a.ts"],
+		summary: {
+			completed: ["Worker says the review is still pending."],
+			verification_commands: ["workbench_review_worker_diff"],
+			verification_observations: ["stale worker observation"],
+			remaining_risks: ["Call status again."],
+			parse_warning: null,
+			parse_reliable: true,
+			truncated_items: false,
+		},
 		scopeIntegrityPacket: {
-			lines: ["review: PASS"],
+			lines: ["review: PASS", `+ ${"raw-packet ".repeat(300)}`],
 			review_kind: "scope_integrity",
 			scope_integrity_verdict: "PASS",
 			bound_diff_hash: "b".repeat(64),
@@ -713,6 +722,8 @@ test("semantic ACCEPT returns the same ordinary Candidate presentation and no ma
 	assert.match(text, /candidate\s+: READY_FOR_FINAL_VERIFICATION/);
 	assert.match(text, /--- Ordinary delivery complete ---/);
 	assert.doesNotMatch(text, /Commander action required|workbench_review_worker_diff|workbench_delegation_status|workbench_repair_delegation/);
+	assert.doesNotMatch(text, /raw-packet|review is still pending|stale worker observation|Call status again/u);
+	assert.ok(Buffer.byteLength(text, "utf8") < 4 * 1024, "accepted handoff stays inside the trusted ingress tail without raw packet/prose");
 	assert.equal((result.details.ordinary_candidate as { authority_scope?: string }).authority_scope, "DEVELOPMENT_ONLY");
 	assert.equal(result.details.gate_authority, false);
 });

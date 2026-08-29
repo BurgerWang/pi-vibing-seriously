@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "kind": "pi-workbench-lco-baseline-v1",
+  "plan_id": "pi-workbench-long-chain-throughput-context-optimization-v1",
+  "frozen_at": "2026-08-29T00:00:00.000Z",
+  "source_identity": {
+    "git_head": "231c3931e93295095e6c6b4f7a7013deff6443e3",
+    "pre_lco_tracked_diff_sha256": "4dc03c8bd11472b7a942d9fe0699ac059c57ccf77a139c74ea4e2a68090f895e",
+    "pre_lco_tracked_file_count": 54,
+    "pre_lco_untracked_paths": [
+      ".pi/workbench/delegation-start.lock",
+      "docs/baselines/pi-development-throughput-exit-v1.json",
+      "docs/baselines/pi-development-throughput-exit-v1.md",
+      "docs/plans/PI_WORKBENCH_LONG_CHAIN_THROUGHPUT_CONTEXT_OPTIMIZATION_EXECUTION_PLAN_v1.0.md"
+    ],
+    "runtime_build": "pi-dev-workbench/workbench-runtime@0.10.0+sha256.61bca194fdfb6600",
+    "runtime_source_hash": "sha256:61bca194fdfb66002418111381cd1b961eb6dac89163db7086f38aae80581df1",
+    "runtime_reload_performed": false
+  },
+  "sources": {
+    "commander_session": {
+      "locator": "Scalper_V2 commander session 2026-08-29T00-41-07-117Z",
+      "sha256": "7c7e66f82b214e71a8034b93ad11f41f153de0466d3ae25f2dd31ba21721c993"
+    },
+    "retrospective_projection": {
+      "locator": "pi_scalper_retrospective_artifact.json",
+      "sha256": "ce18e254d4dbca424103e5bb5acdd4da293d6ad127355d07914aa8cd77952ce7"
+    },
+    "ordinary_dev_exit": {
+      "locator": "pi-development-throughput-exit-v1.json",
+      "sha256": "9b4937eaf4708a3f6338c541ab73f54b411c3f387ad108ed989ead53aa2ee9b7"
+    },
+    "aggregation_script": {
+      "locator": "scripts/lco-throughput-baseline.ts",
+      "version": 1
+    }
+  },
+  "classification": {
+    "commander_request_total": 399,
+    "tool_result_total": 423,
+    "requests": [
+      { "category": "DIFF_REVIEW", "requests": 223, "cost_usd": 16.986, "tool_name": "workbench_review_worker_diff" },
+      { "category": "REASONING_RESPONSE", "requests": 71, "cost_usd": 5.956 },
+      { "category": "PROJECT_INSPECTION", "requests": 33, "cost_usd": 3.140 },
+      { "category": "STATUS", "requests": 28, "cost_usd": 1.767, "tool_name": "workbench_delegation_status" },
+      { "category": "DELEGATION_REPAIR", "requests": 25, "cost_usd": 1.662, "tool_name": "workbench_repair_delegation" },
+      { "category": "RECIPE_RECEIPT", "requests": 15, "cost_usd": 0.888 },
+      { "category": "GIT", "requests": 4, "cost_usd": 0.517 }
+    ],
+    "exclusions": [
+      "system and user messages are never copied into the baseline",
+      "tool arguments and tool result bodies are never copied into the baseline",
+      "worker transcript and reasoning are never copied into the baseline",
+      "cost categories are the reviewed non-overlapping projection, not inferred from prose"
+    ]
+  },
+  "wall_clock": {
+    "window_minutes": 224.4,
+    "phases": [
+      { "category": "PRODUCT_WORKER", "minutes": 92.6 },
+      { "category": "WORKBENCH_REPAIR", "minutes": 31.4 },
+      { "category": "DIFF_REVIEW_PRESENTATION", "minutes": 71.8 },
+      { "category": "ORIENTATION_STATUS_COORDINATION", "minutes": 28.6 }
+    ]
+  },
+  "long_chain": {
+    "worker_activity_windows": 12,
+    "review_tool_calls": 223,
+    "raw_tool_text_bytes_approx": 3010000,
+    "active_projection_bytes": 129700,
+    "raw_review_output_share": 0.839,
+    "repair_calls": 25,
+    "worker_generations": 11,
+    "no_worker_repairs": 14,
+    "normal_worker_successes": 2,
+    "recipe_runs": 63,
+    "recipe_process_seconds": 46.8,
+    "final_scope_paths": 42,
+    "final_scope_pages": 47,
+    "target_window_minutes": { "minimum": 125, "maximum": 140 }
+  },
+  "ordinary_dev_guardrail": {
+    "first_effective_write_median_seconds": 3.707,
+    "exit_maximum_seconds": 4.960,
+    "samples": 3,
+    "worker_calls_per_sample": 0,
+    "lifecycle_tool_calls_per_sample": 0,
+    "authority_only_persisted_files": 0,
+    "authority_only_persisted_bytes": 0,
+    "exact_edit_pre_reads": 0
+  },
+  "fixture": {
+    "locator": "tests/fixtures/lco-long-chain-replay-v1.json",
+    "paths": 42,
+    "pages": 47,
+    "contains_real_project_content": false
+  },
+  "protocol_freeze": {
+    "legacy_reader": "V1_READ_ONLY",
+    "v2_selector": "EXPLICIT_OPT_IN_UNTIL_LCO_WP6_PASS",
+    "dual_write": false,
+    "prompt_cache": "NONE",
+    "programmatic_tool_calling": "NOT_RUN",
+    "allowed_new_core_modules": [
+      "semantic-review-evidence-v2.ts",
+      "worker-checkpoint.ts"
+    ]
+  },
+  "quality_stop_conditions": [
+    "BLOCKING_FALSE_ACCEPT",
+    "FALSE_INHERITANCE",
+    "AUTHORITY_OR_RUNTIME_DRIFT_REUSED",
+    "DUPLICATE_WORKER_OR_REVIEW_OWNER",
+    "COMPLETED_BATCH_REPLAYED",
+    "OPERATIONAL_FAILURE_BECAME_SEMANTIC_DECISION",
+    "ORDINARY_DEV_LIFECYCLE_ESCALATION",
+    "STRICT_CANDIDATE_GATE_REGRESSION"
+  ],
+  "external_project_boundary": [
+    { "project": "Scalper_V2", "head": "790df94287c4108934f86bce0d334ad850adc183", "status_sha256": "eb84bab87a48ac5142be166320e3d41d2542c6266eae5a56cff6675c10871997", "written_by_lco_wp0": false },
+    { "project": "Mace_h4_v3", "head": "e84e06f77d37d09929bff3dd5c5477d8efded638", "status_sha256": "e87b95027852e8a038eebc04ca801f7815ae317778b6e0639b08f67de4b84fce", "written_by_lco_wp0": false },
+    { "project": "Onchain_profit", "head": "9faf631c301b3c0bb1c3a73a2e1c7dd9f8ab8c39", "status_sha256": "38785db7c79caf0a8549d418f7cffe36e49aac7aaf69314917d8165caafaadf9", "written_by_lco_wp0": false }
+  ]
+}

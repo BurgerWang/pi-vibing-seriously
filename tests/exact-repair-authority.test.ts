@@ -80,8 +80,28 @@ function delta(path: string, marker: string): ChangeSetAttributedEntry {
 	return { path, change: "new", operation_count: 1, before: missing(path), after: file(path, marker) };
 }
 
-function changeSet(contractHash: string, workerPaths: readonly string[], dependencies: readonly string[]): ChangeSetRecord {
+function changeSet(
+	contractHash: string,
+	workerPaths: readonly string[],
+	dependencies: readonly string[],
+	workspaceDriftPaths: readonly string[] = [],
+): ChangeSetRecord {
 	const workerDelta = sorted(workerPaths).map((path, index) => delta(path, `worker-${index}`));
+	const workspaceDrift = sorted(workspaceDriftPaths).map((path) => ({
+		path,
+		classification: "unknown_origin" as const,
+		before: null,
+		after: {
+			path,
+			status: "??",
+			identity: {
+				kind: "file" as const,
+				byte_size: 1,
+				stat: { dev: "1", ino: "2", mtime_ns: "3", ctime_ns: "4" },
+			},
+		},
+	}));
+	const touchedPaths = workerDelta.length + workspaceDrift.length;
 	const withoutHash: Omit<ChangeSetRecord, "change_set_hash"> = {
 		schema_version: 2,
 		delegation_id: ID,
@@ -90,22 +110,22 @@ function changeSet(contractHash: string, workerPaths: readonly string[], depende
 		before_workspace_guard_hash: "2".repeat(64),
 		after_workspace_guard_hash: "3".repeat(64),
 		dependency_paths: sorted(dependencies),
-		status: "ATTRIBUTED",
+		status: workspaceDrift.length === 0 ? "ATTRIBUTED" : "WORKSPACE_DRIFT",
 		worker_delta: workerDelta,
-		workspace_drift: [],
+		workspace_drift: workspaceDrift,
 		conflicts: [],
 		finalization_meter: {
-			paths_attempted: workerDelta.length,
-			paths_completed: workerDelta.length,
-			bytes_read: workerDelta.length,
+			paths_attempted: touchedPaths,
+			paths_completed: touchedPaths,
+			bytes_read: touchedPaths,
 		},
 		counts: {
-			touched_paths: workerDelta.length,
+			touched_paths: touchedPaths,
 			attributed_paths: workerDelta.length,
-			zero_delta_paths: 0,
-			workspace_drift_paths: 0,
+			zero_delta_paths: workspaceDrift.length,
+			workspace_drift_paths: workspaceDrift.length,
 			dependency_drift_paths: 0,
-			unknown_origin_drift_paths: 0,
+			unknown_origin_drift_paths: workspaceDrift.length,
 			conflict_paths: 0,
 		},
 		worker_delta_hash: computeWorkerDeltaHash(workerDelta, []),
@@ -231,6 +251,7 @@ interface CommittedOptions {
 	workerPaths?: readonly string[];
 	dependencyPaths?: readonly string[];
 	commandPath?: string;
+	commandPathWasWorkspaceDrift?: boolean;
 	legacyCleanRunFailure?: boolean;
 	withLineage?: boolean;
 	legacyOutcome?: boolean;
@@ -243,7 +264,12 @@ interface CommittedOptions {
 function committed(options: CommittedOptions = {}): DelegationCommittedGenerationV2 {
 	const persistedContract = contract(options.allowedPaths);
 	const stateContractHash = options.stateContractHash ?? persistedContract.contract_hash;
-	const change = changeSet(stateContractHash, options.workerPaths ?? ["src/worker.ts"], options.dependencyPaths ?? ["src/dependency.ts"]);
+	const change = changeSet(
+		stateContractHash,
+		options.workerPaths ?? ["src/worker.ts"],
+		options.dependencyPaths ?? ["src/dependency.ts"],
+		options.commandPathWasWorkspaceDrift && options.commandPath !== undefined ? [options.commandPath] : [],
+	);
 	const command = options.commandPath === undefined
 		? undefined
 		: commandProvenance(change, options.commandPath, { legacyCleanRunFailure: options.legacyCleanRunFailure });
@@ -377,6 +403,28 @@ test("lineaged terminal recovery preserves subtree rules and binds proof plus th
 	const rebound = recoverExactRepairCommandAuthorityV1({ repairOf: ID, committed: differentProof });
 	assert.equal(rebound.ok, true);
 	if (rebound.ok) assert.notEqual(rebound.value.idempotency_key, idempotencyKey);
+});
+
+test("lineaged recovery accepts base drift fully attributed by durable command provenance", () => {
+	const source = committed({
+		commandPath: "src/generated.ts",
+		commandPathWasWorkspaceDrift: true,
+	});
+	const scope = source.records["scope.json"] as {
+		change_set: ChangeSetRecord;
+		command_provenance: DelegationCommandProvenanceRecord;
+	};
+	assert.equal(scope.change_set.status, "WORKSPACE_DRIFT");
+	assert.deepEqual(scope.command_provenance.remaining_workspace_drift, []);
+	assert.equal(scope.command_provenance.effective_status, "ATTRIBUTED");
+
+	const recovered = recoverExactRepairCommandAuthorityV1({ repairOf: ID, committed: source });
+	assert.equal(recovered.ok, true, recovered.ok ? "" : recovered.code);
+	if (recovered.ok) {
+		assert.deepEqual(recovered.value.successor_lineage.carried_paths, [
+			"src/dependency.ts", "src/generated.ts", "src/root.ts", "src/worker.ts",
+		]);
+	}
 });
 
 test("lineaged recovery accepts only the legacy CLEAN command-failure shape as attributed scope", () => {

@@ -4,7 +4,7 @@
 | --- | --- |
 | Plan ID | `pi-workbench-two-lane-lifecycle-convergence-v1` |
 | 版本 | `1.0` |
-| 状态 | **IN_PROGRESS — WP0–WP7 源码与自动化测试已推进；WP8 NEXT** |
+| 状态 | **IN_PROGRESS — WP0–WP8 Workbench 开发与吞吐出口已完成；外部 strict Candidate/Gate 与 exact-repair 验收仍为 FAIL/BLOCKED** |
 | 批准日期 | `2026-08-28` |
 | 执行仓库 | `/home/hanbaoji/Projects/pi-vibing-seriously` |
 | 基线 HEAD | `main@d003fdf` |
@@ -545,17 +545,22 @@ resolver 将其与 committed generation、review、lock、binding 和 lineage �
 | WP5 | 已实现并提交 | Candidate identity/version/alias、Candidate-bound Gates、research/release promotion、Q4 机验、release provenance、report/compare |
 | WP6 | 已实现、测试并提交 | `b8a4ad2`，10,000 个固定 seed 模型序列、缩减/replay、review/repair/lock 调度、逐 publish boundary 故障注入、三项目兼容零写入回放 |
 | WP7 | 已实现、测试并提交 | `a625af2`，唯一 resolver/action owner、status 纯投影、v1 writer fail-closed、六份最终行为文档与结构回归 |
-| WP8 | 实机部署与普通 canary 已完成；strict Candidate 出口按当前证据 `BLOCKED/NOT_RUN` | `9b911b8`，三项目当前 runtime、status、DEV canary、B6 与 restart 证据；没有可冻结的 evidence-complete Candidate |
+| WP8 | 实机部署、普通 canary、当前吞吐架构与出口测量已完成；吞吐出口 `PASS`，外部 strict/exact-repair 结果按当前证据保持 `FAIL/BLOCKED` | `9b911b8` 加当前未提交候选；三项目 runtime doctor `CURRENT`；Onchain Candidate-bound Gate 已真实运行并 FAIL；Mace validation FAIL；Scalper exact repair successor FAIL |
 
 WP6 验证证据为 lifecycle focused 组 160/160 PASS；WP7 focused lifecycle、兼容、
-回放、打包组 244/244 PASS。WP8 最终候选 focused 170/170 PASS，release/package/
-stable compatibility 83/83 PASS，最新 `npm run check` PASS，其中 typecheck PASS、全量
-测试 3101 项（3100 PASS、1 项按普通测试合同 SKIP）且 `git diff --check` PASS。
+回放、打包组 244/244 PASS。WP8 原最终候选 focused 170/170 PASS，release/package/
+stable compatibility 83/83 PASS；当前吞吐候选最终 focused 217/217 PASS。最新
+`npm run check` PASS，其中 typecheck PASS、全量测试 3102 项（3101 PASS、1 项按普通
+测试合同 SKIP）且 `git diff --check` PASS。
 模型测试覆盖 10,000 个固定 seed 序列、全部 37 个模型
 命令、15 个主动作和 12 个 canonical state；失败输出携带 seed、完整 replay 序列和
 缩减结果。三项目实机结果见 WP8；release 授权、push 和 publish 均为 `NOT_RUN`。
-由于 `S2.2–S2.6` 仍缺少可比的前后吞吐/持久化基线，且三个项目当前没有可冻结的
-evidence-complete Candidate，本计划仍为 `IN_PROGRESS`，不得标记 `COMPLETE`。
+`S2.2–S2.6` 已完成实测。普通小改首次有效写入中位数为 3.707 秒，相对 S2.0
+的 9.919 秒下降 62.6%；跨文件完整治理持久化由 21 文件 / 60,424 B 降至 1 文件 /
+11,528 B，文件数和字节数分别下降 95.2% 和 80.9%；普通实现不再启动 worker，三个
+exact-edit 样本也没有 pre-edit read。吞吐出口因此为 `PASS`。本计划仍为
+`IN_PROGRESS`，原因不再是 Workbench 开发或吞吐，而是三个外部项目的当前严格
+验证/精确修复结果仍有真实 `FAIL/BLOCKED`，且当前候选尚未提交。
 
 ### WP0 — 收束现有恢复候选
 
@@ -833,8 +838,9 @@ action 文本 owner 和 v1 writer 禁止，`delegation-v2-wiring` 另以实际�
 断言 status 前后无 transaction rewrite、session append 或 receipt。六份指定文档均
 已更新为普通开发零手工 lifecycle choreography。当前生产 runtime/core 受影响文件
 为 `+411/-435`，净删除 24 行；focused 244/244 PASS，最新 `npm run check` PASS。
-`S2.2–S2.6` 没有本轮实际基线/吞吐指标，继续保持 `NOT_RUN`；这也不证明 runtime
-reload、三个外部项目 canary、Gate、release、push 或 publish，均留给 WP8。
+WP7 完成时 `S2.2–S2.6` 尚无实际出口测量，因此当时保持 `NOT_RUN`；随后 WP8
+测量结果见 §13.5，不能回写为 PASS。这也不由 WP7 自身证明 runtime reload、三个
+外部项目 canary、Gate、release、push 或 publish，相关实机结果仍以 WP8 为准。
 
 ### WP8 — 三项目部署与最终出口
 
@@ -870,10 +876,12 @@ reload、三个外部项目 canary、Gate、release、push 或 publish，均留�
 
 **当前执行证据（2026-08-28）：**
 
-- 最终 Workbench runtime source 为
-  `sha256:5a21e90bb756bd37b9c7ff94c520d5670afaae499a498eb34c8eee882de65a7e`；
-  Scalper、Mace、Onchain 的两个独立新进程轮次均报告 loaded/disk `CURRENT`，旧的
-  三个交互 Pi PID 已退出，因此没有遗留的已知 stale live process。
+- 当前 Workbench runtime source 为
+  `sha256:03b824564577808d104ddd7edb19125f6a8dbb6e510a1b3a6a485cfe2e95e25f`；
+  Scalper、Mace、Onchain 的独立离线、无会话 runtime doctor 均报告 loaded/disk
+  `CURRENT`，因此当前源码身份已在三个真实项目中复核。严格 validation/Gate 结果
+  产生于同日的前一 runtime 候选；它们的项目证据失败不会因 runtime 更新而自动
+  升级为 PASS，也没有为此重跑 Mace 的长时间完整验证。
 - 实机 status canary 发现并修复两处旧 mirror 泄漏：`/q-status` 现在直接渲染 durable
   canonical projection；semantic REPAIR status 会严格恢复 review authority，并返回
   `EXECUTE_EXACT_REPAIR`；`/q-mode-verify` 的阻塞理由也消费同一 resolver action，
@@ -893,22 +901,45 @@ reload、三个外部项目 canary、Gate、release、push 或 publish，均留�
   的 `candidate_binding` 都是 `null`，因此只算 Development Safety Gate，不算
   Candidate-bound Gate，也不授予 research、release、production 或 profitability
   authority。
-- Mace 当前 `git-diff-check` run `20260828-200526-yfka` 与 Onchain 当前
-  `m1-verify-uv-lock` run `20260828-200530-eupp` 均 PASS，但项目 recipe 没有单次完整
-  `typecheck + unit-test + whitespace` validation components，Candidate projection 为
-  unavailable；三个项目也都没有 candidate version/alias。因此 strict Candidate→Gate
-  的真实状态为 Scalper `BLOCKED`、Mace/Onchain `NOT_RUN (CANDIDATE_INCOMPLETE)`，
-  没有伪造 candidate id 或扩大项目配置范围。
-- 所有外部项目命令前后业务工作树摘要完全一致：Scalper status/tracked/untracked
-  为 `a43aa9c1/6172301a/912e49c5`，Mace 为
-  `6e30f360/026b1c70/b460de11`，Onchain 为
-  `11aded00/2f92a7b5/08233597`；只有 `.pi/workbench` 下的授权 canary 与 Gate/run
-  元数据按预期新增。没有改写或删除历史 authority，没有 push、release 或 publish。
+- 经用户授权，只在 Mace 与 Onchain 的 ignored `.pi/workbench/recipes.yaml` 增加零业务
+  写入的 `workbench-candidate-final-check` recipe。Onchain run
+  `20260828-205808-h61x` 形成 Candidate
+  `9582cce9562fb787f6eea1b7b822dfd34c79e940373bf9ea55015968fcc46328`；其绑定 Gate
+  run `20260828-210758-zg11` 真实执行后 FAIL：B0 PASS，B1 因缺少标准
+  format/lint/typecheck/static recipe 证据 FAIL，B2–B5 blocked，B6 PASS，自定义 M0
+  PASS。该结果不授予 research/release/production authority。
+- Mace 的完整 recipe run `20260828-205807-g5fj` 运行约 62 分钟后失败：
+  `19 failed, 3681 passed, 56 errors, 34 warnings`，Workbench 以
+  `RECIPE_DECLARATION_VIOLATION` fail-closed，没有形成 Candidate。此处保留项目真实
+  失败，不通过改写业务代码或缩窄测试集制造 PASS。
+- Scalper 仅对用户授权的 exact root `20260828-145820-71ji` 执行一次精确修复，唯一
+  successor 为 `20260828-210134-t1jt`；successor 在 contract check 后保持
+  `FAILED / EXACT_REPAIR_PENDING`。没有递归启动第二个 repair，也没有并行委派或猜测
+  新 root。其 contract run `20260828-210737-d0r6` PROCESS_FAILED，parameter run
+  `20260828-210742-c8ku` SUCCESS。
+- 三个外部项目在本轮前均已有各自的 dirty business worktree；这些既有差异被保留，
+  不能归因于 Workbench。Mace/Onchain 的 canary、recipe 与 Gate 没有改写业务路径；
+  Scalper 获授权的 exact repair 仅归因到
+  `crates/scalp-contracts/src/domain.rs` 与
+  `python/scalp_research/domain_contracts.py` 两个 exact allowed path。没有自动清理、
+  覆盖或扩大到其他既有差异，没有改写或删除历史 authority，也没有 push、release
+  或 publish。
+- 当前 runtime 的 Stage 2 exit comparison 已落盘到
+  `docs/baselines/pi-development-throughput-exit-v1.{json,md}`。普通 DEV 对 canonical
+  project source/test/docs 路径可直接 edit/write；依赖与 lockfile、安全/权限/策略、
+  部署/迁移/release、`.pi` 与仓库自动化路径仍要求用户激活的有界 lease，bash 与
+  foreign tools 仍被阻止，Candidate/Gate/receipt/repair 合同未改变。
+- 三个 exact-edit 普通小改样本首次有效写入为 3.707 / 4.037 / 2.947 秒，中位数
+  3.707 秒，相对 9.919 秒基线下降 62.6%；每个样本只有一次 native edit，没有
+  worker、delegation、receipt、run 或 authority。跨文件样本完整持久化为 1 文件 /
+  11,528 B，相对 21 文件 / 60,424 B 下降 95.2% / 80.9%。只读 status 新增 receipt
+  为 0；`index.ts` 为 1,994 行。全部冻结吞吐指标均 PASS。
 
-因此 WP8 的部署、普通 DEV、fail-closed 严格入口、restart 和零业务改写证据已经
-完成；evidence-complete Candidate-bound Gate 与 `S2.2–S2.6` 实际前后效率指标仍为
-计划级出口 blocker，保持 `BLOCKED/NOT_RUN`，不得把两个未绑定 Candidate 的 B6
-PASS 写成最终 Gate 或计划完成。
+因此 WP8 的 Workbench 开发、部署、普通 DEV、fail-closed 严格入口、restart、零业务
+改写和吞吐出口证据已经完成，吞吐实际为 `PASS`。外部验收仍忠实保留 Onchain Gate
+FAIL、Mace validation FAIL、Scalper exact-repair pending；这些结果不回滚普通 DEV，
+也不得被描述为 Gate、发布或盈利成功。当前候选尚未提交，整份计划保持
+`IN_PROGRESS`。
 
 ---
 
@@ -1037,6 +1068,31 @@ Pi E2E；三个外部项目必须分别验证，不能从一个项目推断另�
 - 新增持久 authority/store：0（除非后续发现不可替代事实并另行批准）。
 - 新 resolver 落地增量必须删除旧 predicates/next-action 分支。
 - `index.ts` 保持 composition root，不重新吸收业务状态机。
+
+### 13.5 当前出口测量（2026-08-28）
+
+机器报告：`docs/baselines/pi-development-throughput-exit-v1.json`；人类摘要：
+`docs/baselines/pi-development-throughput-exit-v1.md`。原始 Pi sessions 不提交，只保存
+SHA-256、聚合时序、计数与合成 delegation id；不保存 prompt、文件内容、secret 或
+用户数据。
+
+| 指标 | S2.0 | 当前 | 目标 | 判定 |
+| --- | ---: | ---: | ---: | --- |
+| 普通任务用户显式 lifecycle 调用 | 3 | 0 | 0 | PASS |
+| 普通小改首次有效写入 | 9.919 s | 3.707 s 中位数 | ≤ 4.960 s | PASS |
+| 普通小改 authority 持久化 | 12 文件 / 24,022 B | 0 文件 / 0 B | 下降 ≥ 80% | PASS |
+| 跨文件完整治理持久化 | 21 文件 / 60,424 B | 1 文件 / 11,528 B | ≤ 4 文件 / 12,084 B | PASS |
+| 只读 status 新增 receipt | 2 文件 | 0 文件 | 0 | PASS |
+| 相同 Candidate 重复完整验证 | 0 | 0 | 0 | PASS |
+| 重复 worker orientation | 普通实现需要 worker | 0 worker calls / 0 worker tokens；exact-edit pre-read 为 0 | 下降 ≥ 50% | PASS |
+| `index.ts` 行数 | 6,263 | 1,994 | 1,500–2,000 | PASS |
+
+当前普通通道不再把每次低风险源码实现强制路由到 worker：直接路径消除了 worker
+orientation 与 12 个 immutable delegation authority 文件。该变化没有开放 bash、
+foreign tools 或高风险路径，也没有改变 strict Candidate/Gate/receipt/repair 合同。
+父请求 token 聚合仍受 provider 与上下文影响，机器报告只用“无 worker 调用、无
+worker token、exact-edit 无 pre-read”证明重复 orientation 出口，不宣称不可比的
+端到端总 token 节省。
 
 ---
 

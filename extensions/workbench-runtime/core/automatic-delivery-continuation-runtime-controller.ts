@@ -14,6 +14,10 @@ import { types as utilTypes } from "node:util";
 import {
 	delegationStatusToolActionV1,
 } from "./agent-next-action.ts";
+import {
+	buildLifecycleActionSnapshotV2,
+	validateLifecycleActionExecutionV2,
+} from "./delegation-lifecycle-resolver.ts";
 
 import type {
 	BeforeAgentStartEventResult,
@@ -416,6 +420,15 @@ export function createAutomaticDeliveryContinuationRuntimeControllerV1(
 				requestedLifecycle.resolution_hash !== input.lifecycle_resolution.resolution_hash) {
 				throw new Error("automatic continuation lifecycle action is invalid");
 			}
+			const requestedSnapshot = buildLifecycleActionSnapshotV2({
+				project_root: input.project_root,
+				mode: "DEV",
+				resolution: requestedLifecycle,
+			});
+			if (!requestedSnapshot.ok || !requestedSnapshot.value.safe_automatic
+				|| requestedSnapshot.value.authorization !== "EXISTING") {
+				throw new Error("automatic continuation action snapshot is not eligible");
+			}
 			const lane = await runReviewOperation({
 				project_root: input.project_root,
 				operation_kind: "command",
@@ -438,6 +451,18 @@ export function createAutomaticDeliveryContinuationRuntimeControllerV1(
 					revalidatedLifecycle.resolution_hash !== requestedLifecycle.resolution_hash) {
 					throw new Error("automatic review authority changed after lane acquisition");
 				}
+				const revalidatedSnapshot = buildLifecycleActionSnapshotV2({
+					project_root: input.project_root,
+					mode: "DEV",
+					resolution: revalidatedLifecycle,
+				});
+				if (!revalidatedSnapshot.ok || !validateLifecycleActionExecutionV2(revalidatedSnapshot.value, {
+					project_root_hash: requestedSnapshot.value.project_root_hash,
+					mode: requestedSnapshot.value.mode,
+					authority_hash: requestedSnapshot.value.authority_hash,
+					action: requestedSnapshot.value.action,
+					exact_target: requestedSnapshot.value.exact_target,
+				})) throw new Error("automatic review action snapshot changed after lane acquisition");
 				return review({
 					project_root: input.project_root,
 					delegation_id: input.candidate.delegation_id,

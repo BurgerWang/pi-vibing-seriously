@@ -134,7 +134,7 @@ export type DelegationExecutionOwnerResultV2<T> =
 export interface StrictRetryableRawRepairEvidenceV1 {
 	readonly schema_version: 1;
 	readonly kind: "strict-retryable-raw-repair-evidence-v1";
-	readonly retry_kind: "ABORTED" | "EMPTY_RECOVERY";
+	readonly retry_kind: "ABORTED" | "EMPTY_RECOVERY" | "FINALIZATION_RECOVERY";
 	readonly delegation_id: string;
 	readonly contract_hash: string;
 	readonly transaction_hash: string;
@@ -497,6 +497,14 @@ function emptyRecoveryJournal(journal: WorkerWriteJournalRecord): boolean {
 			|| (journal.state === "SEALED" && journal.revision === 1 && journal.journal_hash !== null));
 }
 
+function finalizationRecoveryJournal(journal: WorkerWriteJournalRecord): boolean {
+	return journal.state === "SEALED" && journal.journal_hash !== null
+		&& journal.operations.length > 0
+		&& journal.operations.every((operation) => operation.status === "completed")
+		&& journal.meter.paths_attempted > 0
+		&& journal.meter.paths_completed === journal.meter.paths_attempted;
+}
+
 /**
  * Revalidate an already-persisted lineaged ABORTED transaction before it can
  * authorize another exact repair. Only the recovery-produced, before-write
@@ -589,6 +597,31 @@ export async function isStrictRetryableEmptyRepairRecoveryV2(
 }
 
 /**
+ * Strict retry authority for the post-worker rev2 crash window. The worker
+ * journal is complete and sealed, but ChangeSet finalization never published
+ * terminal facts. Current byte identity is deliberately checked by the
+ * separate finalization-rebase reader before this evidence can launch work.
+ */
+export async function isStrictRetryableFinalizationRepairRecoveryV2(
+	projectRoot: string,
+	transaction: DelegationTransactionRecord,
+	options?: DelegationExecutionOwnerOptionsV2,
+): Promise<boolean> {
+	if (transaction.status !== "RECOVERY_REQUIRED" || transaction.revision !== 2 ||
+		transaction.repair_lineage === undefined || transaction.committed_proof !== null ||
+		transaction.terminal_outcome !== null || transaction.review !== null || transaction.abort_reason !== null ||
+		transaction.postcondition_reasons.length !== 0 ||
+		transaction.recovery_reason !== RETRYABLE_EMPTY_RECOVERY_REASONS_V2.changeSetFinalizeFailed ||
+		!await hasStrictReleasedRepairRecoveryEnvelopeV2(projectRoot, transaction, options)) return false;
+	const journal = await readWorkerWriteJournal({
+		project_root: projectRoot,
+		delegation_id: transaction.delegation_id,
+		contract_hash: transaction.contract_hash,
+	});
+	return journal.ok && finalizationRecoveryJournal(journal.value);
+}
+
+/**
  * Return the complete immutable evidence used by deterministic `/q-repair`
  * for a no-write raw lineage tip.  The boolean helpers above remain useful to
  * callers that only classify state; this reader additionally binds the exact
@@ -603,7 +636,9 @@ export async function readStrictRetryableRawRepairEvidenceV1(
 		? "ABORTED" as const
 		: await isStrictRetryableEmptyRepairRecoveryV2(projectRoot, transaction, options)
 			? "EMPTY_RECOVERY" as const
-			: undefined;
+			: await isStrictRetryableFinalizationRepairRecoveryV2(projectRoot, transaction, options)
+				? "FINALIZATION_RECOVERY" as const
+				: undefined;
 	if (retryKind === undefined) return { ok: false, code: "NOT_RETRYABLE" };
 
 	const owner = await readDelegationExecutionOwnerV2(projectRoot, transaction, options);
@@ -621,7 +656,9 @@ export async function readStrictRetryableRawRepairEvidenceV1(
 		if (journalMissing ? transaction.revision !== 1 : !journal.ok || !pristineJournal(journal.value)) {
 			return { ok: false, code: !journal.ok && journal.error.code === "storage_failure" ? "STORAGE_FAILURE" : "NOT_RETRYABLE" };
 		}
-	} else if (!journal.ok || !emptyRecoveryJournal(journal.value)) {
+	} else if (!journal.ok || (retryKind === "EMPTY_RECOVERY"
+		? !emptyRecoveryJournal(journal.value)
+		: !finalizationRecoveryJournal(journal.value))) {
 		return { ok: false, code: !journal.ok && journal.error.code === "storage_failure" ? "STORAGE_FAILURE" : "NOT_RETRYABLE" };
 	}
 

@@ -8,8 +8,9 @@ argument-hint: "<task>"
 Task: $ARGUMENTS
 
 Use `skill:implementation-workflow` as the primary workflow. Follow the
-active project AGENTS contract: fixed Sol → Luna delivery is mandatory, not
-optional; Sol owns the decision and Luna owns routine implementation.
+active project AGENTS contract: ordinary development is direct in DEV,
+delegation is an optional bounded execution path, and protected high-risk
+paths retain explicit user authorization.
 
 Define observable acceptance criteria and affected paths, implement complete
 behavior with tests, use focused checks while iterating, then run one

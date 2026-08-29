@@ -36,6 +36,7 @@ import {
 import {
 	coordinateStructuredSolReview,
 	coordinateStructuredSolTerminalNegativeReview,
+	deriveStructuredSolRepairAffectedPathsV2,
 	type CoordinateStructuredSolReviewInput,
 } from "../extensions/workbench-runtime/core/structured-sol-review-coordinator.ts";
 import {
@@ -47,6 +48,30 @@ import {
 
 const DELEGATION_ID = "20260827-020202-sc01";
 const PATH = "src/a.ts";
+
+test("V2 repair affected paths stay page-local unless a blocking finding has no path binding", () => {
+	const assessments = new Map([
+		["src/a.ts", [{ decision: "PASS" as const, findings: [] }]],
+		["src/b.ts", [{
+			decision: "REPAIR" as const,
+			findings: [{ finding_id: "P2-F1", severity: "BLOCKING" as const }],
+		}]],
+	]);
+	assert.deepEqual(deriveStructuredSolRepairAffectedPathsV2({
+		status: "REPAIR",
+		fresh_paths: ["src/a.ts", "src/b.ts"],
+		assessments_by_path: assessments,
+		blocking_finding_ids: ["P2-F1"],
+		cross_blocking_finding_ids: [],
+	}), ["src/b.ts"]);
+	assert.deepEqual(deriveStructuredSolRepairAffectedPathsV2({
+		status: "REPAIR",
+		fresh_paths: ["src/a.ts", "src/b.ts"],
+		assessments_by_path: assessments,
+		blocking_finding_ids: ["X-F1"],
+		cross_blocking_finding_ids: ["X-F1"],
+	}), ["src/a.ts", "src/b.ts"]);
+});
 
 function sha256(value: string): string {
 	return createHash("sha256").update(value, "utf8").digest("hex");

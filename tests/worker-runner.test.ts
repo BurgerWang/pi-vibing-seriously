@@ -295,7 +295,10 @@ test("worker system prompt grants local implementation ownership inside the appr
 	assert.match(WORKER_SYSTEM_PROMPT, /Edit\/write only approved paths/);
 	assert.match(WORKER_SYSTEM_PROMPT, /issue writes sequentially/);
 	assert.match(WORKER_SYSTEM_PROMPT, /never delegate, never use free-form bash and never run final Gates/);
-	assert.match(WORKER_SYSTEM_PROMPT, /requested declared mutation:none recipes/);
+	assert.match(WORKER_SYSTEM_PROMPT, /Run only explicitly requested declared recipes/);
+	assert.match(WORKER_SYSTEM_PROMPT, /mutating recipe is permitted only when the task names it as an implementation materializer and every declared write\/artifact path is approved/);
+	assert.match(WORKER_SYSTEM_PROMPT, /never report it as verification/);
+	assert.match(WORKER_SYSTEM_PROMPT, /Requested verification recipes remain mutation:none/);
 	assert.match(WORKER_SYSTEM_PROMPT, /no stubs or TODO shells/);
 	assert.match(WORKER_SYSTEM_PROMPT, /Stop for unapproved architecture, security\/policy, destructive action or scope expansion/);
 	assert.match(WORKER_SYSTEM_PROMPT, /Finish with exactly:/);

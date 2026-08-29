@@ -8,7 +8,7 @@ standalone agent framework, daemon, queue, or background service.
 
 | Role | Model | Authority |
 | --- | --- | --- |
-| Commander | `openai-codex/gpt-5.6-sol` or `openai/gpt-5.6-sol` | Requirements, cross-cutting architecture, bounded worker contracts, review, high-risk decisions, final verification |
+| Commander | `openai-codex/gpt-5.6-sol` or `openai/gpt-5.6-sol` | Direct ordinary development, requirements, cross-cutting architecture, optional bounded worker contracts, high-risk decisions, final verification |
 | Worker | `openai-codex/gpt-5.6-luna:xhigh` | Routine local implementation decisions inside the approved contract: concrete design, naming, file structure within scope, production source changes, tests, docs, and declared recipe effects confined to exact approved paths |
 
 The worker report is never acceptance evidence. Its Verification section
@@ -19,11 +19,11 @@ requires it.
 
 ### Responsibility split
 
-| Owned by Sol | Owned by Luna (inside the approved contract) |
+| Owned by the caller | Owned by an optional Worker (inside the approved contract) |
 | --- | --- |
 | Requirements and acceptance criteria | Concrete design and naming choices |
 | Cross-cutting architecture and scope | File structure within the approved paths |
-| Delegation contract, cross-cutting decisions, exceptional lease decision, and final verdict | Production source changes, tests, and docs in a bounded task |
+| Direct ordinary edits, delegation choice, high-risk decisions, and final verdict | Production source changes, tests, and docs in a bounded task |
 | Risk-proportionate final verification and the verdict | Investigation, declared in-scope recipe checks/effects, in-scope repair |
 
 The worker is expected to implement the complete delegated slice — relevant
@@ -36,25 +36,25 @@ approved contract, and every final judgment, belongs to Sol.
 
 | Risk | Shape | Delegation |
 | --- | --- | --- |
-| Low | One contained change with a clear contract | One bounded Luna implementation plus focused tests |
-| Medium | Touches several files or modules, but the contract is unambiguous | One coherent bounded Luna implementation; split only at a real contract boundary |
-| High | Dependency, security/policy, deployment/migration, Pi control paths, destructive action, or release authority | Sol owns the decision and bounds Luna's writes; a user-issued lease is only an explicit Sol direct-write exception |
+| Low | One contained change with a clear contract | Direct edit/write plus focused tests |
+| Medium | Touches several files or modules, but the contract is unambiguous | Direct coherent implementation; optionally delegate one bounded task when it materially reduces work |
+| High | Dependency, security/permission/policy, deployment/migration, Pi control paths, destructive action, or release authority | Caller owns the decision; protected paths require an explicit user-issued temporary write lease, and delegation never expands authority |
 
 Ordinary work does not become high risk merely because it changes source,
-tests, documentation, or repairs a defect. It is still implemented by Luna
-inside one bounded contract. A partial result is repaired through one new
-bounded Luna call only when recovery is actually needed; routine work does
-not require a manual status call or separate review step. High-risk
-classification must name the concrete permission, security, migration,
-destructive, or release concern.
+tests, documentation, or repairs a defect. Delegation is an optional execution
+tool. A partial result may be repaired directly in the same coherent change;
+a second worker, manual status call, or separate review step is not a
+prerequisite. High-risk classification must name the concrete permission,
+security, migration, destructive, or release concern.
 
-## Bounded worker continuation
+## Optional worker continuation
 
 Every delegation is a brand-new `--no-session` worker and cannot recurse. If
 another delegation is required, Sol supplies a new bounded contract and the
 current worktree is the source of truth. Continuation is used only for a real
-remaining slice or recovery condition; it is not a mandatory ceremony after
-a complete delivery. Worker prose is never durable authority.
+remaining slice or recovery condition; direct repair is the shorter default
+when it stays inside one coherent ordinary-development change. Worker prose is
+never durable authority.
 
 ## Worker execution discipline (prompt contract)
 
@@ -373,13 +373,14 @@ whole group on abort, timeout, invalid output, and after the pinned leader
 exits normally, preventing an unawaited background descendant from outliving
 the delegation and performing late writes.
 
-## Fixed Sol -> Luna write authority (current; legacy id P7)
+## Development-first write authority (current; legacy id P7)
 
-Approved GPT-5.6 Sol in DEV receives the fixed 17-tool
-read/control/delegation/Git-completion/exact-repair surface. `bash`, `edit`, `write`, and foreign tools
-remain unavailable by default. The persisted policy id
-`worker-first-strict` describes the active product behavior: routine source,
-test, and documentation edits are delegated to Luna.
+Approved GPT-5.6 Sol in DEV receives the historical 17-tool
+read/control/delegation/Git-completion/exact-repair surface plus ordinary
+`edit` and `write` — an exact 19-tool development surface. `bash` and foreign
+tools remain unavailable. The persisted policy id `worker-first-strict` is a
+compatibility identifier; it does not mean that routine source, test, or
+documentation edits require delegation.
 Actor identity comes only from the existing
 `WORKBENCH_AGENT_ROLE=worker` env contract and the provider/model pair;
 project config can never self-label a controller as Sol or as a worker.
@@ -391,8 +392,9 @@ Consequences for the commander workflow:
 
 - `bash` is always blocked for strict Sol — project commands run through
   declared workbench recipes only.
-- Sol does not receive ordinary `edit`/`write`; routine implementation is a
-  bounded Luna delegation.
+- Ordinary canonical project-relative `edit`/`write` calls are allowed
+  directly after realpath containment. Delegation remains available for a
+  useful bounded slice.
 - After non-zero implementations have finalized semantic ACCEPT authority and
   the relevant checks are complete, Sol may call `workbench_git` with
   `action=checkpoint` and a commit message. The runtime scans all durable
@@ -416,8 +418,10 @@ Consequences for the commander workflow:
   the push is non-force and the remote ref is read back for exact verification.
   The tool cannot amend, reset, clean, stash, switch branches, delete refs,
   force-push, or accept caller-selected checkpoint paths.
-- Any direct Sol `edit`/`write` requires a **temporary write lease exception**, issued by the
-  human through user-only slash commands (never by prompts or config):
+- Direct Sol `edit`/`write` on dependency, security/permission/policy,
+  deployment/migration, release, or Pi control paths requires a **temporary
+  high-risk write lease**, issued by the human through user-only slash commands
+  (never by prompts or config):
   `/q-commander-write-unlock <reason> --paths <comma-list> --calls <N>
   --minutes <N>`, with fixed reasons `bootstrap-policy`,
   `worker-unavailable`, `security-emergency`, `user-directed`; project-
@@ -434,14 +438,15 @@ Consequences for the commander workflow:
   required and both are consumed on success. Token parts never appear in
   status or compact summaries.
 - Expiry (30 min), exhaustion (10 calls) and revocation (leaving DEV, model/
-  provider change, session end, or `/q-commander-write-lock`) restore the
-  locked 17-tool Sol surface. Concurrent edit/write requests consume the
+  provider change, session end, or `/q-commander-write-lock`) remove the
+  high-risk exception while the exact 19-tool development surface remains.
+  Concurrent high-risk edit/write requests consume the
   bounded call count serially, and a consume is authorized only after its
   updated lease entry is durably appended. A reload/session replacement never
   reactivates a previously confirmed lease; a fresh human grant is required.
   The footer
   shows `WF:LEASE <used>/<max>` while an active confirmed lease exists and
-  `WF:LOCKED` otherwise; `WF:REVIEW` is
+  `WF:DIRECT` otherwise; `WF:REVIEW` is
   appended independently while a delegation review is pending or stale.
   `/q-write-policy status` (which accepts exactly the trimmed `status`
   subcommand) prints the actor, the fixed policy, the lock/lease status and a
@@ -1376,10 +1381,10 @@ command can still write despite an empty declaration.
    execution mode; parallel writes to one worktree are not supported.
 7. **Existing command/path guards:** the normal workbench P5 protections
    still apply inside the child.
-8. **Fixed Sol/Luna write authority:** approved Sol in DEV receives the
-   locked read/control/delegation surface. The second-layer `tool_call` guard
-   blocks bash and foreign tools; any direct edit/write requires an active
-   human-issued lease within its exact scope.
+8. **Development-first write authority:** approved Sol in DEV receives the
+   exact ordinary edit/write plus read/control/delegation surface. The
+   second-layer `tool_call` guard blocks bash and foreign tools; only protected
+   high-risk paths require an active human-issued lease within its exact scope.
 9. **Review gating:** a pending or stale delegation review blocks VERIFY and
    normally blocks the next delegation. Exact latest `STALE` backed by strict
    committed v2 FINAL/PASS plus explicit Sol semantic acceptance may start
@@ -1397,14 +1402,15 @@ untrusted repositories or unattended automation.
 
 1. Orient only enough to define the current task, its acceptance criteria,
    affected files, and concrete risk.
-2. Give Luna one bounded contract for the coherent source, test, and
-   documentation slice. Use focused recipes while the candidate is changing.
-3. Let the delivery path complete bounded presentation and semantic review.
+2. Implement ordinary source, tests, and documentation directly in DEV. When
+   delegation materially helps, give Luna one bounded coherent contract. Use
+   focused recipes while the candidate is changing.
+3. Let an optional delivery path complete bounded presentation and semantic review.
    Exceptional pending or rejected outcomes expose exactly one typed machine
    action; the runtime executes safe lifecycle effects at mutation boundaries,
    while slash commands remain optional human recovery conveniences.
-4. Use the temporary Sol lease only for an explicit user-authorized exception;
-   never turn it into the routine implementation path.
+4. Use the temporary lease only for an explicit user-authorized high-risk
+   path; ordinary development must not pay that authority ceremony.
 5. Once the candidate is stable, switch to VERIFY and run one final recipe or
    gate set proportionate to task or release risk. Base the verdict on current
    records and code, never worker prose or a historical handoff document.

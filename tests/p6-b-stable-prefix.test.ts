@@ -186,7 +186,7 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 
 test("current public tool surface has the intentional ordinary-development transition hash", () => {
 	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
-	const currentHash = "cc036a76ff472ca3b2fc6b8e61d54baa7a787b4c42b67f3514ddd5a174ef9851";
+	const currentHash = "f58f921761395f57fa4d1c22a9cf7cc2d068fd3bfbd03e16a132a316793cef16";
 	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
 	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the ordinary-development transition hash");
 });
@@ -661,7 +661,7 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 		"Use workbench_recover_tool_result only with an exact receipt id returned by a real tool result. If no workbench_delegate_worker call occurred, never describe the unchanged delegation state as a registry reload or persistence failure.",
 		"If rejected changes were deliberately discarded, use the exact close_inactive_blocker action reported by status. It checks only the delegation's changed, journal-touched, or carried paths, preserves unrelated work, never accepts rejected code, and must not be replaced with a new worktree.",
 		"When STALE is backed by strict v2 FINAL/PASS plus explicit Sol semantic authority, follow the reported successor action instead of retrying immutable review; a mechanical FINAL/PASS remains blocked and VERIFY stays blocked until a valid successor is reviewed.",
-		"In the TUI, WF:LOCKED means routine writes belong to Luna, WF:LEASE means a bounded temporary Sol write exception is active, and WF:REVIEW means recovery review is outstanding.",
+		"In the TUI, WF:DIRECT means ordinary edits are available, WF:LEASE means a high-risk scope is authorized, and WF:REVIEW means recovery review is outstanding.",
 	], "current status guidelines keep routine work out of the recovery chain");
 	assert.match(meta.description, /durable repair state/);
 	assert.match(meta.description, /REPAIR_REQUIRED reports exact repair_of only while fresh/);
@@ -674,7 +674,7 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	assert.doesNotMatch(meta.description, /real git diff \(any change after REVIEWED turns it STALE\)/);
 	assert.equal(
 		canonicalHash(meta),
-		"efa581c6aeeb301b4709843c4b45cf0ad6b9169a7117b74a78f19bbeff5582d0",
+		"fcad203cebd0e7cec74710ca318a81b4a98ee4268deaae7cd8c73585b46ff5bc",
 		"current status metadata hash is machine-pinned after ordinary Candidate convergence",
 	);
 	assert.equal(
@@ -684,7 +684,7 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.equal(
 		canonicalHash(workbenchToolMetadataOrdered()),
-		"1624c47f655a05744fa2597a14055d2e5e333ab13ab55f3daa25b82dee812d69",
+		"26f5554785bf80c08bdfc9193754d8bc5159338b57241c9f1a24c97f2689756e",
 		"current public catalog hash is machine-pinned after ordinary Candidate convergence",
 	);
 });

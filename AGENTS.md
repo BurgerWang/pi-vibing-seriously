@@ -16,9 +16,9 @@ Guidance for Codex and other development agents working in this repository.
   temporary write lease, workbench delegation, or workbench diff review.
 - This exemption applies only to external repository-maintenance agents such
   as Codex. When this checkout is loaded as the Pi product, its generated
-  project AGENTS files and runtime enforce the fixed Sol commander -> Luna
-  worker delivery model; do not reinterpret that product behavior as
-  optional because repository maintenance is direct.
+  project AGENTS files and runtime expose development-first DEV behavior:
+  ordinary edits are direct, protected high-risk paths retain a user-issued
+  lease, and Sol -> Luna delegation is optional and bounded.
 
 ## Normal development workflow
 

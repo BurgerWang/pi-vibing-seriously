@@ -5,6 +5,7 @@ import {
 	readStrictRetryableRawRepairEvidenceV1,
 	type StrictRetryableRawRepairEvidenceV1,
 } from "./delegation-execution-owner.ts";
+import type { CollectFinalizationRepairRebaseResultV1 } from "./delegation-repair-rebase.ts";
 import {
 	admitProjectDelegationPathLaneV1,
 	isDelegationPathLaneBypassableProjectIssueV1,
@@ -158,6 +159,7 @@ export interface RawLineageImmutableRepairV1 {
 	readonly lineage_hash: string;
 	readonly raw_tip_transaction_hash: string;
 	readonly raw_tip_evidence_hash: string;
+	readonly raw_tip_retry_kind: StrictRetryableRawRepairEvidenceV1["retry_kind"];
 	readonly immutable_hash: string;
 }
 
@@ -176,14 +178,17 @@ export async function readRawLineageImmutableRepairV1(
 	const tip = tipRead.value;
 	const lineage = parseDelegationRepairLineageV1(tip.repair_lineage);
 	if (tip.task_kind !== "implementation" || tip.committed_proof !== null || lineage === undefined ||
-		lineage.repair_of === tip.delegation_id || lineage.depth >= DELEGATION_REPAIR_LINEAGE_MAX_DEPTH ||
-		lineage.depth > EXACT_REPAIR_RAW_LINEAGE_MAX_RETRYABLE_DEPTH_V1) {
+		lineage.repair_of === tip.delegation_id || lineage.depth >= DELEGATION_REPAIR_LINEAGE_MAX_DEPTH) {
 		return { ok: false, code: "RAW_TIP_NOT_RETRYABLE" };
 	}
 	const evidence = await readers.readRawEvidence(projectRoot, tip);
 	if (!evidence.ok) {
 		return { ok: false, code: evidence.code === "STORAGE_FAILURE" ? "STORAGE_FAILURE" :
 			evidence.code === "AUTHORITY_CHANGED" ? "AUTHORITY_CHANGED" : "RAW_TIP_NOT_RETRYABLE" };
+	}
+	if (evidence.value.retry_kind !== "FINALIZATION_RECOVERY" &&
+		lineage.depth > EXACT_REPAIR_RAW_LINEAGE_MAX_RETRYABLE_DEPTH_V1) {
+		return { ok: false, code: "RAW_TIP_NOT_RETRYABLE" };
 	}
 	const rootRead = await readers.readCommitted(projectRoot, lineage.root_delegation_id);
 	if (!rootRead.ok) return { ok: false, code: rootRead.error.code === "storage_failure" ? "STORAGE_FAILURE" : "ROOT_AUTHORITY_INVALID" };
@@ -255,6 +260,7 @@ export async function readRawLineageImmutableRepairV1(
 		lineage_hash: lineage.lineage_hash,
 		raw_tip_transaction_hash: canonicalHash(tip),
 		raw_tip_evidence_hash: (evidence.value as StrictRetryableRawRepairEvidenceV1).evidence_hash,
+		raw_tip_retry_kind: evidence.value.retry_kind,
 	};
 	return {
 		ok: true,
@@ -274,6 +280,10 @@ export async function recoverRawLineageExactRepairAuthorityV1(input: {
 		projectRoot: string,
 		delegationId: string,
 	) => Promise<RawLineageCurrentBindingV1>;
+	readonly collectFinalizationRebase?: (
+		projectRoot: string,
+		transaction: DelegationTransactionRecord,
+	) => Promise<CollectFinalizationRepairRebaseResultV1>;
 }, readers: RawLineageExactRepairAuthorityReadersV1 = DEFAULT_READERS): Promise<RecoverRawLineageExactRepairAuthorityResultV1> {
 	const closure = await readers.readClosure(input.project_root);
 	if (!closure.ok && !isDelegationPathLaneBypassableProjectIssueV1(closure.issue.code)) {
@@ -290,9 +300,20 @@ export async function recoverRawLineageExactRepairAuthorityV1(input: {
 		!admission.repair_tip_ids.includes(immutable.value.repair_of)) {
 		return { ok: false, code: "PROJECT_CLOSURE_INVALID" };
 	}
-	const binding = await input.collectCurrentBinding(input.project_root, immutable.value.continuation_decision_delegation_id);
+	const finalizationRebase = immutable.value.raw_tip_retry_kind === "FINALIZATION_RECOVERY"
+		? await input.collectFinalizationRebase?.(input.project_root, immutable.value.parent)
+		: undefined;
+	if (immutable.value.raw_tip_retry_kind === "FINALIZATION_RECOVERY" &&
+		(finalizationRebase === undefined || !finalizationRebase.ok)) {
+		return { ok: false, code: "CURRENT_BINDING_CHANGED" };
+	}
+	const bindingTarget = immutable.value.raw_tip_retry_kind === "FINALIZATION_RECOVERY"
+		? immutable.value.repair_of
+		: immutable.value.continuation_decision_delegation_id;
+	const binding = await input.collectCurrentBinding(input.project_root, bindingTarget);
 	if (binding.status !== "fresh" || typeof binding.hash !== "string" || !/^[a-f0-9]{64}$/u.test(binding.hash) ||
-		binding.hash !== immutable.value.continuation_expected_binding_hash) {
+		(immutable.value.raw_tip_retry_kind !== "FINALIZATION_RECOVERY" &&
+			binding.hash !== immutable.value.continuation_expected_binding_hash)) {
 		return { ok: false, code: "CURRENT_BINDING_CHANGED" };
 	}
 	const closureProjection = closure.ok ? {
@@ -327,6 +348,8 @@ export async function recoverRawLineageExactRepairAuthorityV1(input: {
 		lineage_hash: immutable.value.lineage_hash,
 		raw_tip_transaction_hash: immutable.value.raw_tip_transaction_hash,
 		raw_tip_evidence_hash: immutable.value.raw_tip_evidence_hash,
+		raw_tip_retry_kind: immutable.value.raw_tip_retry_kind,
+		raw_tip_rebase_hash: finalizationRebase?.ok === true ? finalizationRebase.value.rebase_hash : null,
 		expected_current_binding_hash: binding.hash,
 		closure_root_count: closure.ok ? closure.rootCount : null,
 		closure_lineage_count: closure.ok ? closure.lineageCount : null,
@@ -352,11 +375,18 @@ export async function revalidateRawLineageExactRepairAuthorityV1(input: {
 		projectRoot: string,
 		delegationId: string,
 	) => Promise<RawLineageCurrentBindingV1>;
+	readonly collectFinalizationRebase?: (
+		projectRoot: string,
+		transaction: DelegationTransactionRecord,
+	) => Promise<CollectFinalizationRepairRebaseResultV1>;
 }, readers: RawLineageExactRepairAuthorityReadersV1 = DEFAULT_READERS): Promise<boolean> {
 	const recovered = await recoverRawLineageExactRepairAuthorityV1({
 		project_root: input.project_root,
 		repair_of: input.authority.repair_of,
 		collectCurrentBinding: input.collectCurrentBinding,
+		...(input.collectFinalizationRebase === undefined ? {} : {
+			collectFinalizationRebase: input.collectFinalizationRebase,
+		}),
 	}, readers);
 	return recovered.ok && canonicalHash(recovered.value) === canonicalHash(input.authority);
 }

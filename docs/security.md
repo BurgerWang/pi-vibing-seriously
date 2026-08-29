@@ -110,13 +110,13 @@ diagnosis, but cannot mutate until `/reload` or restart followed by
 uses Pi's selected branch (`getBranch()`); later entries on sibling branches
 cannot overwrite the active projection.
 
-### Fixed Sol -> Luna write authority (current; legacy id P7)
+### Development-first write authority (current; legacy id P7)
 
-Approved GPT-5.6 Sol in DEV receives the fixed 17-tool
-read/control/delegation/Git-completion/exact-repair surface; `bash`, `edit`, `write`, and
-foreign tools stay unavailable by
-default. The serialized `worker-first-strict` policy id describes the active
-product behavior: routine development is implemented by Luna. Actor identity comes only from the
+Approved GPT-5.6 Sol in DEV receives the historical 17-tool
+read/control/delegation/Git-completion/exact-repair surface plus ordinary
+`edit` and `write`; `bash` and foreign tools stay unavailable. The serialized
+`worker-first-strict` policy id remains for compatibility and does not force
+routine development through worker delegation. Actor identity comes only from the
 `WORKBENCH_AGENT_ROLE=worker` env contract and the provider/model pair;
 project config can never self-label a controller as Sol or as a worker.
 Workers and other controllers are outside the policy (the existing worker
@@ -147,9 +147,11 @@ force-with-lease, amend, worktree reset, clean, stash, branch switching, and
 review/Gate bypass are absent by construction. A checkpoint or push is an
 operational fact, never Gate/Formal/production authority.
 
-Second-layer `tool_call` guard for Sol: `bash` is always blocked; any direct
-canonical project-relative `edit`/`write` requires an ACTIVE user-issued
-temporary write lease plus project realpath containment. Every tool
+Second-layer `tool_call` guard for Sol: `bash` is always blocked; ordinary
+canonical project-relative `edit`/`write` is direct after project realpath
+containment. Dependency, security/auth/permission/policy,
+deployment/migration, release, and Pi control paths require an ACTIVE
+user-issued temporary write lease. Every tool
 outside the allowlist is blocked despite any re-enable. Leases are user-only
 (`/q-commander-write-unlock`, `/q-commander-write-lock`, `/q-write-policy
 status` — commands, never model tools), with fixed reasons
@@ -164,11 +166,11 @@ lease whose two bounded distinct token parts are displayed exactly once and
 must both be confirmed by a second invocation — both parts are consumed on
 success and a confirmed lease can never be re-confirmed. Token parts never
 appear in status/compact summaries or persisted summaries (`/q-write-policy
-status` and the footer show only `WF:LEASE used/max` / `WF:LOCKED` facts).
+status` and the footer show only `WF:LEASE used/max` / `WF:DIRECT` facts).
 Leases are revoked on leaving DEV, commander model/provider change, session
 end, explicit lock, and they expire (30 min) or exhaust (10 calls) —
-restoring the locked Sol surface. Invalid lease records fail closed for all
-direct commander edit/write paths. Edit/write authorization is serialized per
+removing only the high-risk exception; ordinary direct edit/write remains
+available. Invalid lease records fail closed for high-risk paths. Edit/write authorization is serialized per
 runtime, and the consumed-call state must be durably appended before the tool
 is allowed to proceed; append failure revokes the in-memory lease and locks the
 surface. A confirmed ACTIVE record is audit-restored but never reactivated by
@@ -869,7 +871,8 @@ properties:
   mode, delegation/run/gate/evidence pointers — never run logs.
 - **No lease transfer.** The target never receives a write-lease entry;
   even a source with an ACTIVE commander lease yields a target whose
-  commander writes stay locked (exact canonical tool set restored).
+  ordinary writes remain direct while protected high-risk paths require a
+  fresh user authorization (the exact canonical tool set is restored).
 - **Fail-closed restore and legacy compatibility.** Unknown schema
   versions, unknown lifecycles, missing/empty/overlong required fields and
   malformed snapshots are ignored on load; other custom-entry types are

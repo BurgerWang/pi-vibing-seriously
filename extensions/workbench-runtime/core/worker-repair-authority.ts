@@ -10,6 +10,7 @@ import { readDelegationLedger, type LedgerWorkerSummaryRecord } from "./delegati
 import {
 	isStrictRetryableAbortedRepairV2,
 	isStrictRetryableEmptyRepairRecoveryV2,
+	isStrictRetryableFinalizationRepairRecoveryV2,
 } from "./delegation-execution-owner.ts";
 import { readRecoverableUnpublishedDelegationV2 } from "./delegation-project-authority.ts";
 import {
@@ -22,6 +23,7 @@ import {
 import type { DelegationRepairLineageV1, DelegationTransactionRecord } from "./delegation-transaction.ts";
 import { parsePlanReference } from "./plan-reference.ts";
 import { readCommittedManifest, RUN_ID_RE } from "./runs.ts";
+import { readWorkerWriteJournal } from "./write-journal.ts";
 import {
 	WORKER_REPAIR_CAPSULE_MAX_CHANGED_PATHS,
 	WORKER_REPAIR_CAPSULE_MAX_FAILED_RUNS,
@@ -257,14 +259,35 @@ export async function readWorkerRepairCapsule(
 	}
 	if (!committedAbsent) {
 		const raw = await readDelegationTransactionV2(projectRoot, repairOf);
-		const safeRawLineage = raw.ok && raw.value.repair_lineage !== undefined &&
-			(await isStrictRetryableAbortedRepairV2(projectRoot, raw.value) ||
-				await isStrictRetryableEmptyRepairRecoveryV2(projectRoot, raw.value));
+		const rawRetryKind = raw.ok && raw.value.repair_lineage !== undefined
+			? await isStrictRetryableAbortedRepairV2(projectRoot, raw.value)
+				? "ABORTED" as const
+				: await isStrictRetryableEmptyRepairRecoveryV2(projectRoot, raw.value)
+					? "EMPTY_RECOVERY" as const
+					: await isStrictRetryableFinalizationRepairRecoveryV2(projectRoot, raw.value)
+						? "FINALIZATION_RECOVERY" as const
+						: undefined
+			: undefined;
+		const safeRawLineage = rawRetryKind !== undefined;
 		if (raw.ok && safeRawLineage) {
 			const semanticDecision = await strictRepairLineageDecision(projectRoot, raw.value);
 			if (semanticDecision === undefined) return { ok: false, code: "authority_invalid" };
 			const plan = await strictRepairPlanFact(projectRoot, raw.value);
 			if (!plan.ok) return { ok: false, code: "authority_invalid" };
+			const finalizationJournal = rawRetryKind === "FINALIZATION_RECOVERY"
+				? await readWorkerWriteJournal({
+					project_root: projectRoot,
+					delegation_id: raw.value.delegation_id,
+					contract_hash: raw.value.contract_hash,
+				})
+				: undefined;
+			if (rawRetryKind === "FINALIZATION_RECOVERY" &&
+				(finalizationJournal === undefined || !finalizationJournal.ok || finalizationJournal.value.journal_hash === null)) {
+				return { ok: false, code: "authority_invalid" };
+			}
+			const finalizationPaths = finalizationJournal?.ok === true
+				? boundedChangedPaths(finalizationJournal.value.operations.map((operation) => operation.path))
+				: { paths: [], omitted: 0 };
 			return ensureBounded({
 				schema: WORKER_REPAIR_CAPSULE_SCHEMA,
 				repair_of: repairOf,
@@ -272,16 +295,20 @@ export async function readWorkerRepairCapsule(
 				authority_status: raw.value.status,
 				contract_hash: raw.value.contract_hash,
 				generation_content_hash: null,
-				journal_hash: null,
+				journal_hash: finalizationJournal?.ok === true ? finalizationJournal.value.journal_hash : null,
 				failure: {
 					exit_code: null,
 					reason_codes: ["SEMANTIC_REPAIR_REQUIRED",
-						raw.value.status === "ABORTED" ? "REPAIR_ATTEMPT_ABORTED" : "REPAIR_EMPTY_RECOVERY_REQUIRED"],
+						rawRetryKind === "ABORTED"
+							? "REPAIR_ATTEMPT_ABORTED"
+							: rawRetryKind === "FINALIZATION_RECOVERY"
+								? "REPAIR_FINALIZATION_RECOVERY_REQUIRED"
+								: "REPAIR_EMPTY_RECOVERY_REQUIRED"],
 					successful_write_count: null,
 					denied_write_count: null,
 				},
-				changed_paths: [],
-				changed_paths_omitted: 0,
+				changed_paths: finalizationPaths.paths,
+				changed_paths_omitted: finalizationPaths.omitted,
 				failed_runs: [],
 				plan_ref: plan.value,
 				repair_lineage: lineageFact(raw.value.repair_lineage),

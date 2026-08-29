@@ -29,7 +29,6 @@ import {
 	readDelegationCommittedGenerationV2,
 	readDelegationCurrentSemanticRepairDecisionV1,
 	readDelegationReviewV2,
-	readDelegationSemanticRepairDecisionV1,
 	readDelegationTransactionV2,
 	type DelegationCommittedGenerationV2,
 	type DelegationSemanticRepairDecisionV1,
@@ -42,6 +41,7 @@ import {
 	readDelegationInactiveBlockerClosureV2,
 } from "./delegation-authority-closure.ts";
 import {
+	DELEGATION_REPAIR_LINEAGE_MAX_DEPTH,
 	DELEGATION_TRANSACTION_ID_RE,
 	parseDelegationTransaction,
 	type DelegationTransactionRecord,
@@ -271,7 +271,11 @@ async function listDelegationIds(projectRoot: string): Promise<InventoryRead> {
 const DEFAULT_READERS: DelegationPathLaneAdmissionReadersV1 = {
 	listDelegationIds,
 	readTransaction: async (projectRoot, delegationId) => readDelegationTransactionV2(projectRoot, delegationId),
-	readSemanticRepairDecision: async (projectRoot, delegationId) => readDelegationSemanticRepairDecisionV1(projectRoot, delegationId),
+	readSemanticRepairDecision: async (projectRoot, delegationId) => {
+		const committed = await readDelegationCommittedGenerationV2(projectRoot, delegationId);
+		if (!committed.ok) return committed;
+		return readDelegationCurrentSemanticRepairDecisionV1(projectRoot, committed.value);
+	},
 	readTerminalNegativeRepairDecision: async (projectRoot, transaction) => {
 		if (transaction.status !== "FAILED" && transaction.status !== "INTERRUPTED") {
 			return { ok: true, value: undefined };
@@ -444,7 +448,8 @@ async function scanAuthority(
 		} else {
 			const parentLineage = parent.repair_lineage;
 			if (parentLineage === undefined || lineage.parent_lineage_hash !== parentLineage.lineage_hash ||
-				parentLineage.root_delegation_id !== lineage.root_delegation_id || lineage.depth !== parentLineage.depth + 1 ||
+				parentLineage.root_delegation_id !== lineage.root_delegation_id ||
+				lineage.depth !== Math.min(parentLineage.depth + 1, DELEGATION_REPAIR_LINEAGE_MAX_DEPTH) ||
 				!pathSubset(parentLineage.carried_paths, lineage.carried_paths)) {
 				return { ok: false, failure: invalidGraph(child.delegation_id) };
 			}

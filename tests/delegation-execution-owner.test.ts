@@ -44,7 +44,12 @@ import {
 	markProjectCheckoutOperationSettledV1,
 } from "../extensions/workbench-runtime/core/project-checkout-operation.ts";
 import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtime/core/worker-policy.ts";
-import { beginWriteJournalOperation, createWorkerWriteJournal } from "../extensions/workbench-runtime/core/write-journal.ts";
+import {
+	beginWriteJournalOperation,
+	completeWriteJournalOperation,
+	createWorkerWriteJournal,
+	sealWorkerWriteJournal,
+} from "../extensions/workbench-runtime/core/write-journal.ts";
 import { withTempDir } from "./helpers.ts";
 
 const CONTRACT = "c".repeat(64);
@@ -579,6 +584,75 @@ test("lineaged empty recovery requires released owner, known reason, and exact i
 			ok: false,
 			code: "NOT_RETRYABLE",
 		});
+	});
+});
+
+test("lineaged post-worker finalization recovery binds a non-empty sealed journal", async () => {
+	await withTempDir(async (root) => {
+		const rootId = "20260822-172342-root";
+		const id = "20260822-172343-fin1";
+		const initial = await preparedTransactionOnly(root, id, repairLineage(rootId));
+		const created = await createWorkerWriteJournal({ project_root: root, delegation_id: id, contract_hash: CONTRACT });
+		assert.equal(created.ok, true);
+		const runningState = await persistRunningDelegationTransaction(root, {
+			delegation_id: id,
+			contract_hash: CONTRACT,
+			worker_identity: initial.worker_identity,
+			expected_generation: 1,
+			expected_revision: 0,
+			now: time(42),
+		});
+		assert.equal(runningState.ok, true);
+		const begun = await beginWriteJournalOperation({
+			project_root: root,
+			delegation_id: id,
+			contract_hash: CONTRACT,
+			expected_revision: 0,
+			operation_id: "f".repeat(64),
+			kind: "write",
+			path: "src/rejected.ts",
+		});
+		assert.equal(begun.ok, true);
+		if (!begun.ok) return;
+		await mkdir(join(root, "src"), { recursive: true });
+		await writeFile(join(root, "src", "rejected.ts"), "worker-final\n", "utf8");
+		const completed = await completeWriteJournalOperation({
+			project_root: root,
+			delegation_id: id,
+			contract_hash: CONTRACT,
+			expected_revision: begun.value.revision,
+			operation_id: "f".repeat(64),
+			kind: "write",
+			path: "src/rejected.ts",
+			outcome: "succeeded",
+		});
+		assert.equal(completed.ok, true);
+		if (!completed.ok) return;
+		const sealed = await sealWorkerWriteJournal({
+			project_root: root,
+			delegation_id: id,
+			contract_hash: CONTRACT,
+			expected_revision: completed.value.revision,
+		});
+		assert.equal(sealed.ok, true);
+		const recovery = await persistRecoveryRequiredDelegationTransaction(root, {
+			delegation_id: id,
+			contract_hash: CONTRACT,
+			worker_identity: initial.worker_identity,
+			expected_generation: 1,
+			expected_revision: 1,
+			now: time(43),
+			reason: RETRYABLE_EMPTY_RECOVERY_REASONS_V2.changeSetFinalizeFailed,
+		});
+		assert.equal(recovery.ok, true);
+		if (!recovery.ok) return;
+		const evidence = await readStrictRetryableRawRepairEvidenceV1(root, recovery.value);
+		assert.equal(evidence.ok, true, evidence.ok ? "" : evidence.code);
+		if (evidence.ok) {
+			assert.equal(evidence.value.retry_kind, "FINALIZATION_RECOVERY");
+			assert.equal(evidence.value.journal_present, true);
+			assert.match(evidence.value.evidence_hash, /^[a-f0-9]{64}$/u);
+		}
 	});
 });
 

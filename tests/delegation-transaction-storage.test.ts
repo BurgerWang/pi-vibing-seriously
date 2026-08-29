@@ -7,19 +7,26 @@ import test from "node:test";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
-import { readProjectDelegationRepairClosureV1 } from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
+import {
+	readDelegationAuthorityObservationV2,
+	readProjectDelegationRepairClosureV1,
+} from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
 import {
 	commitDelegationGeneration,
 	computeHistoricalSemanticMigrationBindingHashV2,
 	createNodeDelegationTransactionStorageAdapter,
 	DELEGATION_SEMANTIC_MIGRATION_STORAGE_FAULT_POINTS,
 	DELEGATION_SEMANTIC_REPAIR_STORAGE_FAULT_POINTS,
+	DELEGATION_SEMANTIC_REVIEW_EVIDENCE_V2_STORAGE_FAULT_POINTS,
+	DELEGATION_SEMANTIC_REVIEW_PROGRESS_V2_STORAGE_FAULT_POINTS,
 	DELEGATION_TERMINAL_NEGATIVE_REPAIR_STORAGE_FAULT_POINTS,
 	DELEGATION_TRANSACTION_REPORT_MAX_BYTES,
 	DELEGATION_TRANSACTION_SCOPE_RECORD_MAX_BYTES,
 	DELEGATION_TRANSACTION_STORAGE_FAULT_POINTS,
 	delegationGenerationRecordRelativePathV2,
 	delegationReviewRelativePathV2,
+	delegationSemanticReviewEvidenceRelativePathV2,
+	delegationSemanticReviewProgressRelativePathV2,
 	hashDelegationCommittedRecords,
 	hasDelegationSemanticRepairAuthorityV2,
 	hasDelegationSemanticReviewAuthorityV2,
@@ -35,18 +42,23 @@ import {
 	persistDelegationReviewProvisionalV2,
 	persistDelegationTerminalNegativeReviewProvisionalV1,
 	publishDelegationReviewV2,
+	publishDelegationSemanticReviewEvidenceV2,
+	publishDelegationSemanticReviewProgressV2,
 	publishDelegationSemanticRepairDecisionV1,
 	publishDelegationTerminalNegativeRepairDecisionV1,
 	publishHistoricalSemanticMigrationAcceptanceV2,
 	publishHistoricalSemanticMigrationPresentationV2,
 	readDelegationCommittedGenerationV2,
 	readDelegationReviewV2,
+	readDelegationSemanticReviewEvidenceV2,
+	readDelegationSemanticReviewProgressV2,
 	readDelegationSemanticMigrationV1,
 	readDelegationSemanticRepairDecisionV1,
 	readDelegationTerminalNegativeReviewV1,
 	readDelegationTerminalNegativeSolAuthorityV1,
 	readDelegationTransactionV2,
 	verifyDelegationGenerationV2,
+	withDelegationSemanticReviewJobV2,
 	type CommitDelegationGenerationInput,
 	type DelegationCommittedRecords,
 	type DelegationReviewArtifactV2,
@@ -84,6 +96,20 @@ import {
 	type ReviewRelevanceProjectionV2,
 } from "../extensions/workbench-runtime/core/review-relevance-v2.ts";
 import type { ReviewRecord } from "../extensions/workbench-runtime/core/diff-review.ts";
+import {
+	buildSemanticReviewEnvelopeV1,
+	type SemanticReviewEnvelopeV1,
+} from "../extensions/workbench-runtime/core/semantic-review-envelope.ts";
+import {
+	buildSemanticReviewEvidenceV2,
+	computeCrossFileAssessmentHashV2,
+	type SemanticReviewEvidenceV2,
+} from "../extensions/workbench-runtime/core/semantic-review-evidence-v2.ts";
+import {
+	computeReviewBatchProgressHashV2,
+	computeSemanticReviewProgressHashV2,
+	type SemanticReviewProgressV2,
+} from "../extensions/workbench-runtime/core/structured-sol-review.ts";
 
 const ID = "20260817-150000-abcd";
 const ID_2 = "20260817-150001-efgh";
@@ -214,6 +240,10 @@ function semanticMigrationPath(root: string, id = ID): string {
 
 function semanticRepairPath(root: string, id = ID): string {
 	return join(transactionDir(root, id), "repair-decision.json");
+}
+
+function semanticEvidenceV2Path(root: string, id = ID): string {
+	return join(transactionDir(root, id), "semantic-review-evidence-v2.json");
 }
 
 function terminalNegativeRepairPath(root: string, id = ID): string {
@@ -447,6 +477,7 @@ function commitInput(state: DelegationTransactionRecord, records = recordsFor(st
 async function completeProvisionalSemanticReview(
 	root: string,
 	terminalStatus?: "FAILED" | "INTERRUPTED",
+	withEnvelope = false,
 ): Promise<{
 	state: DelegationTransactionRecord;
 	artifact: DelegationReviewArtifactV2;
@@ -455,11 +486,8 @@ async function completeProvisionalSemanticReview(
 	const committing = terminalStatus === undefined
 		? await committingState(root)
 		: await terminalNegativeCommittingState(root, terminalStatus);
-	const committed = await commitDelegationGeneration(root, commitInput(committing));
-	assert.equal(committed.ok, true);
-	if (!committed.ok) throw new Error("commit failed");
 	const facts = authority("implementation");
-	const changedPaths = [...committed.value.terminal_outcome!.changed_paths];
+	const changedPaths = [...committing.terminal_outcome!.changed_paths];
 	const relevanceProjection: ReviewRelevanceProjectionV2 = {
 		schema_version: 2,
 		diff_identity_kind: REVIEW_RELEVANCE_KIND_V2,
@@ -476,9 +504,25 @@ async function completeProvisionalSemanticReview(
 		})),
 	};
 	const boundDiffHash = computeReviewRelevanceProjectionHashV2(relevanceProjection);
-	const reviewedAt = at(4);
 	const patchText = "changed\n";
 	const patchHash = createHash("sha256").update(patchText, "utf8").digest("hex");
+	let envelope: SemanticReviewEnvelopeV1 | undefined;
+	if (withEnvelope) {
+		const built = buildSemanticReviewEnvelopeV1({
+			streams: changedPaths.map((path) => ({ path, source: "file-content" as const, stream_bytes: 8, stream_sha256: patchHash, page_count: 1 })),
+			projected_review_record_bytes: 300_000,
+			relevance_projection_hash: boundDiffHash,
+		});
+		assert.equal(built.ok, true);
+		if (!built.ok) throw new Error("envelope failed");
+		envelope = built.value;
+	}
+	const records = recordsFor(committing);
+	if (envelope !== undefined) (records["after.json"] as Record<string, unknown>).review_envelope = envelope;
+	const committed = await commitDelegationGeneration(root, commitInput(committing, records));
+	assert.equal(committed.ok, true);
+	if (!committed.ok) throw new Error("commit failed");
+	const reviewedAt = at(4);
 	const review: ReviewRecord = {
 		schema_version: 2,
 		delegation_id: ID,
@@ -519,6 +563,7 @@ async function completeProvisionalSemanticReview(
 			projection_hash: boundDiffHash,
 		},
 		relevance_projection: relevanceProjection,
+		...(envelope === undefined ? {} : { review_envelope: envelope }),
 	};
 	const artifact: DelegationReviewArtifactV2 = {
 		schema_version: 2,
@@ -567,6 +612,89 @@ function acceptedReviewArtifact(
 		accepted_at: at(second),
 	};
 	return artifact;
+}
+
+function semanticEvidenceFor(
+	fixture: Awaited<ReturnType<typeof completeProvisionalSemanticReview>>,
+	decision: "ACCEPT" | "REPAIR",
+	second = 5,
+): SemanticReviewEvidenceV2 {
+	const envelope = fixture.artifact.review.review_envelope!;
+	const progress = fixture.artifact.review.presentation_progress!;
+	const streams = progress.map((entry) => ({
+		source: "FRESH" as const,
+		stream_id: canonicalHash({ path: entry.path }),
+		path: entry.path,
+		content_hash: entry.stream_sha256,
+		page_binding_hashes: entry.segments.map((segment) => canonicalHash({
+			path: entry.path, start_byte: segment.start_byte, end_byte: segment.end_byte, page_sha256: segment.page_sha256,
+		})).sort(),
+		assessment_hash: canonicalHash({ path: entry.path, decision }),
+		verdict: decision === "ACCEPT" ? "PASS" as const : "REPAIR" as const,
+	}));
+	const crossPayload = {
+		fresh: true as const,
+		page_assessment_set_hash: canonicalHash(streams.map((stream) => stream.assessment_hash)),
+		reviewed_stream_set_hash: envelope.stream_set_hash,
+		decision,
+		blocking_finding_ids: decision === "ACCEPT" ? [] : ["P1-F1"],
+		affected_paths: decision === "ACCEPT" ? [] : streams.map((stream) => stream.path).sort(),
+		summary_hash: canonicalHash({ decision }),
+	};
+	const built = buildSemanticReviewEvidenceV2({
+		delegation_id: fixture.state.delegation_id,
+		generation: fixture.state.generation,
+		generation_content_hash: fixture.state.committed_proof!.content_hash,
+		contract_hash: fixture.state.contract_hash,
+		bound_diff_hash: fixture.artifact.review.bound_diff_hash,
+		relevance_projection_hash: fixture.artifact.review.relevance_binding!.projection_hash,
+		review_envelope_hash: canonicalHash(envelope),
+		review_policy_hash: canonicalHash({ policy: "lco-v2" }),
+		model_identity: { provider: "openai-codex", model: "gpt-5.6-sol", api: "openai-codex-responses" },
+		runtime_build_identity: canonicalHash({ runtime: "test" }),
+		stream_set_hash: envelope.stream_set_hash,
+		parent_evidence_hash: null,
+		streams,
+		cross_file_assessment: { ...crossPayload, assessment_hash: computeCrossFileAssessmentHashV2(crossPayload) },
+		final_decision: decision,
+		repair_reason: decision === "REPAIR" ? "The frozen semantic corpus contains a blocking defect." : null,
+		nested_usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		completed_at: at(second),
+	});
+	assert.equal(built.ok, true);
+	if (!built.ok) throw new Error("semantic evidence build failed");
+	return structuredClone(built.value);
+}
+
+function semanticProgressFor(fixture: Awaited<ReturnType<typeof completeProvisionalSemanticReview>>): SemanticReviewProgressV2 {
+	const batchPayload = {
+		batch_ordinal: 1,
+		page_binding_hashes: [canonicalHash({ page: 1 })],
+		request_hash: canonicalHash({ request: 1 }),
+		status: "PENDING" as const,
+		response_projection: null,
+		assessments: [],
+		usage: null,
+		outcome: null,
+		error_hash: null,
+	};
+	const batch = { ...batchPayload, batch_hash: computeReviewBatchProgressHashV2(batchPayload) };
+	const payload = {
+		schema_version: 2 as const,
+		kind: "semantic-review-progress-v2" as const,
+		review_job_id: `review-${canonicalHash({ id: fixture.state.delegation_id }).slice(0, 24)}`,
+		delegation_id: fixture.state.delegation_id,
+		generation: fixture.state.generation,
+		input_identity_hash: canonicalHash({ input: fixture.state.committed_proof!.content_hash }),
+		review_policy_hash: canonicalHash({ policy: "lco-v2" }),
+		status: "PREPARED" as const,
+		batches: [batch],
+		completed_batch_set_hash: canonicalHash([]),
+		final_evidence_hash: null,
+		cumulative_usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+		updated_at: at(5),
+	};
+	return { ...payload, progress_hash: computeSemanticReviewProgressHashV2(payload) };
 }
 
 async function finalizedHistoricalMechanicalReview(root: string): Promise<{
@@ -920,7 +1048,7 @@ test("storage v2 semantic repair: immutable packet-bound decision is strict, ide
 		assert.deepEqual(await readFile(semanticRepairPath(root)), decisionBytes);
 
 		const strict = await readDelegationReviewV2(root, ID);
-		assert.equal(strict.ok, true, strict.ok ? "" : strict.error.code);
+		assert.equal(strict.ok, true, strict.ok ? "" : `${strict.error.code}: ${strict.error.message}`);
 		if (strict.ok) {
 			assert.equal(strict.value.finalized, false);
 			assert.equal(strict.value.state.status, "PENDING_REVIEW");
@@ -930,6 +1058,156 @@ test("storage v2 semantic repair: immutable packet-bound decision is strict, ide
 		}
 		assert.deepEqual(await readFile(transactionPath(root)), transactionBytes);
 		assert.deepEqual(await readFile(reviewPath(root)), reviewBytes);
+	} finally {
+		await cleanup(root);
+	}
+});
+
+test("storage V2 evidence is the sole semantic owner, idempotently finalizes ACCEPT, and projects REPAIR", async () => {
+	assert.equal(
+		delegationSemanticReviewEvidenceRelativePathV2(ID),
+		`.pi/workbench/delegations/${ID}/v2/semantic-review-evidence-v2.json`,
+	);
+	const acceptRoot = await tempProject();
+	const repairRoot = await tempProject();
+	try {
+		const fixture = await completeProvisionalSemanticReview(acceptRoot, undefined, true);
+		const evidence = semanticEvidenceFor(fixture, "ACCEPT");
+		const input = { ...cas(fixture.state, 5), base_review_hash: fixture.reviewHash, evidence };
+		const published = await publishDelegationSemanticReviewEvidenceV2(acceptRoot, input);
+		assert.equal(published.ok, true, published.ok ? "" : published.error.code);
+		const strict = await readDelegationReviewV2(acceptRoot, ID);
+		assert.equal(strict.ok, true, strict.ok ? "" : `${strict.error.code}: ${strict.error.message}`);
+		if (strict.ok) {
+			assert.equal(strict.value.state.status, "REVIEWED");
+			assert.equal(strict.value.review.semantic_review, "required", "compatibility packet must not become a second ACCEPT owner");
+			assert.equal(strict.value.review.semantic_acceptance, undefined);
+			assert.equal(strict.value.semantic_evidence_v2?.evidence_hash, evidence.evidence_hash);
+			assert.equal(hasDelegationSemanticReviewAuthorityV2(strict.value), true);
+		}
+		const observation = await readDelegationAuthorityObservationV2(acceptRoot, ID);
+		assert.equal(observation.kind, "v2");
+		if (observation.kind === "v2") {
+			assert.equal(observation.semanticSource, "evidence_v2");
+			assert.equal(observation.semanticReviewer, "openai-codex/gpt-5.6-sol");
+			assert.equal(observation.semanticAcceptedAt, evidence.completed_at);
+			assert.equal(observation.semanticBindingHash, evidence.bound_diff_hash);
+		}
+		const evidenceBytes = await readFile(semanticEvidenceV2Path(acceptRoot));
+		const replay = await publishDelegationSemanticReviewEvidenceV2(acceptRoot, input);
+		assert.equal(replay.ok, true, replay.ok ? "" : replay.error.code);
+		assert.deepEqual(await readFile(semanticEvidenceV2Path(acceptRoot)), evidenceBytes);
+		const readback = await readDelegationSemanticReviewEvidenceV2(acceptRoot, ID);
+		assert.equal(readback.ok, true);
+		if (readback.ok) assert.equal(readback.value?.evidence_hash, evidence.evidence_hash);
+
+		const repairFixture = await completeProvisionalSemanticReview(repairRoot, undefined, true);
+		const repairEvidence = semanticEvidenceFor(repairFixture, "REPAIR");
+		const rejected = await publishDelegationSemanticReviewEvidenceV2(repairRoot, {
+			...cas(repairFixture.state, 5), base_review_hash: repairFixture.reviewHash, evidence: repairEvidence,
+		});
+		assert.equal(rejected.ok, true, rejected.ok ? "" : rejected.error.code);
+		const repairAuthority = await readDelegationReviewV2(repairRoot, ID);
+		assert.equal(repairAuthority.ok, true);
+		if (repairAuthority.ok) {
+			assert.equal(repairAuthority.value.state.status, "PENDING_REVIEW");
+			assert.equal(repairAuthority.value.semantic_evidence_v2?.final_decision, "REPAIR");
+			assert.equal(repairAuthority.value.semantic_repair?.repair_reason, repairEvidence.repair_reason);
+			assert.equal(hasDelegationSemanticRepairAuthorityV2(repairAuthority.value), true);
+			assert.equal(hasDelegationSemanticReviewAuthorityV2(repairAuthority.value), false);
+		}
+	} finally {
+		await Promise.all([cleanup(acceptRoot), cleanup(repairRoot)]);
+	}
+});
+
+test("storage V2 evidence fails closed at every atomic publish fault and recovers lost final response", async () => {
+	for (const point of DELEGATION_SEMANTIC_REVIEW_EVIDENCE_V2_STORAGE_FAULT_POINTS) {
+		const root = await tempProject();
+		try {
+			const fixture = await completeProvisionalSemanticReview(root, undefined, true);
+			const evidence = semanticEvidenceFor(fixture, "ACCEPT");
+			let injected = false;
+			const adapter = createNodeDelegationTransactionStorageAdapter((actual, bytes) => {
+				if (!injected && actual === point) {
+					injected = true;
+					if (bytes !== undefined) return Uint8Array.of(0x7b);
+					throw new Error(`injected ${point}`);
+				}
+			});
+			const failed = await publishDelegationSemanticReviewEvidenceV2(root, {
+				...cas(fixture.state, 5), base_review_hash: fixture.reviewHash, evidence,
+			}, { adapter });
+			assert.equal(failed.ok, false, point);
+			const transaction = await readDelegationTransactionV2(root, ID);
+			assert.equal(transaction.ok, true);
+			if (transaction.ok) assert.equal(transaction.value.status, "PENDING_REVIEW", point);
+			if (point === "semantic_evidence_v2.final.read") {
+				const recovered = await publishDelegationSemanticReviewEvidenceV2(root, {
+					...cas(fixture.state, 5), base_review_hash: fixture.reviewHash, evidence,
+				});
+				assert.equal(recovered.ok, true, "published evidence must survive a lost/corrupt response read");
+			}
+		} finally {
+			await cleanup(root);
+		}
+	}
+});
+
+test("storage V2 progress is monotonic, read-back verified, and recoverable at every atomic fault", async () => {
+	assert.equal(
+		delegationSemanticReviewProgressRelativePathV2(ID),
+		`.pi/workbench/delegations/${ID}/v2/semantic-review-progress-v2.json`,
+	);
+	for (const point of DELEGATION_SEMANTIC_REVIEW_PROGRESS_V2_STORAGE_FAULT_POINTS) {
+		const root = await tempProject();
+		try {
+			const fixture = await completeProvisionalSemanticReview(root, undefined, true);
+			const progress = semanticProgressFor(fixture);
+			let tripped = false;
+			const adapter = createNodeDelegationTransactionStorageAdapter((actual) => {
+				if (!tripped && actual === point) { tripped = true; throw new Error(`injected ${point}`); }
+			});
+			const failed = await withDelegationSemanticReviewJobV2(root, ID, at(5), async ({ publishProgress }) =>
+				publishProgress(progress), { adapter });
+			assert.equal(tripped, true, point);
+			assert.equal(failed.ok, true, "the locked callback result is returned even when progress publication fails");
+			if (failed.ok) assert.equal(failed.value.ok, false, point);
+
+			const retry = await withDelegationSemanticReviewJobV2(root, ID, at(5), async ({ publishProgress }) =>
+				publishProgress(progress));
+			assert.equal(retry.ok, true, point);
+			if (retry.ok) assert.equal(retry.value.ok, true, point);
+			const readback = await readDelegationSemanticReviewProgressV2(root, ID);
+			assert.equal(readback.ok, true, point);
+			if (readback.ok) assert.equal(readback.value?.progress_hash, progress.progress_hash, point);
+		} finally {
+			await cleanup(root);
+		}
+	}
+});
+
+test("storage V2 permits only one active review-job owner for a generation", async () => {
+	const root = await tempProject();
+	try {
+		await completeProvisionalSemanticReview(root, undefined, true);
+		let release!: () => void;
+		let entered!: () => void;
+		const gate = new Promise<void>((resolve) => { release = resolve; });
+		const started = new Promise<void>((resolve) => { entered = resolve; });
+		const first = withDelegationSemanticReviewJobV2(root, ID, at(5), async () => {
+			entered();
+			await gate;
+			return "winner" as const;
+		});
+		await started;
+		const second = await withDelegationSemanticReviewJobV2(root, ID, at(5), async () => "loser" as const);
+		assert.equal(second.ok, false);
+		if (!second.ok) assert.equal(second.error.code, "conflict");
+		release();
+		const winner = await first;
+		assert.equal(winner.ok, true);
+		if (winner.ok) assert.equal(winner.value, "winner");
 	} finally {
 		await cleanup(root);
 	}

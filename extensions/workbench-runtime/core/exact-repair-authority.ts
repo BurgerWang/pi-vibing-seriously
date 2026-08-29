@@ -80,12 +80,15 @@ export interface ExactRepairTerminalNegativeAuthorityV1 extends ExactRepairComma
 }
 
 /**
- * Exact continuation of a no-write raw repair tip.  For this authority kind
- * `committed_proof_content_hash` is the immutable root generation proof; the
- * selected `repair_of` transaction itself deliberately has no proof.
+ * Exact continuation of a strictly evidenced raw repair tip. For this
+ * authority kind `committed_proof_content_hash` is the immutable root
+ * generation proof; the selected `repair_of` transaction itself deliberately
+ * has no proof. A post-worker finalization crash additionally carries a
+ * journal/current-byte rebase hash.
  */
 export interface ExactRepairRawLineageAuthorityV1 extends ExactRepairCommandAuthorityBaseV1 {
 	readonly authority_kind: "raw-lineage-retry";
+	readonly raw_tip_retry_kind: "ABORTED" | "EMPTY_RECOVERY" | "FINALIZATION_RECOVERY";
 	readonly root_delegation_id: string;
 	readonly root_authority_kind: "semantic-repair" | "terminal-negative-repair";
 	readonly root_transaction_hash: string;
@@ -96,6 +99,7 @@ export interface ExactRepairRawLineageAuthorityV1 extends ExactRepairCommandAuth
 	readonly lineage_hash: string;
 	readonly raw_tip_transaction_hash: string;
 	readonly raw_tip_evidence_hash: string;
+	readonly raw_tip_rebase_hash: string | null;
 	readonly expected_current_binding_hash: string;
 	readonly closure_root_count: number | null;
 	readonly closure_lineage_count: number | null;

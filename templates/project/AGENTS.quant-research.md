@@ -8,6 +8,9 @@
   re-check a stable candidate.
 - The workbench validates project outputs; it does not compute strategy
   metrics.
+- For an ordinary replacement where the user supplies the exact path and exact
+  old/new text, try one direct `edit` first. If it does not match, inspect and
+  retry; do not pre-read only to rediscover the supplied text.
 
 ## Research contract
 
@@ -21,18 +24,19 @@ The project writes `research/contract.json` for the research contract and
 research gates `q0`–`q5` return only PASS / FAIL / BLOCKED / NOT_RUN. Required
 NOT_RUN checks cannot pass; model prose cannot satisfy machine checks.
 
-## Fixed Sol -> Luna execution
+## Development-first execution
 
-- Sol owns requirements, acceptance criteria, research architecture,
-  approved paths, review, and the final verdict. Routine source, test, and
-  documentation writes in DEV belong to one bounded Luna delegation.
-- Use one bounded delegation call for a coherent implementation slice.
-  Complete delivery is reviewed and closed automatically; explicit
-  review/status is only for incomplete coverage, conflict, or recovery. A
-  worker report is never acceptance.
-- Sol may edit/write directly only through an active user-issued temporary
-  lease bounded by paths, tools, calls, and time. It is an exceptional path
-  and never authorizes bash.
+- Ordinary source, test, and documentation edits are direct in DEV after
+  scope is understood. Delegation is optional; it is not required for a
+  write or defect repair.
+- When delegation is useful, use one bounded call. Complete delivery is
+  reviewed and closed automatically; explicit review/status is only for
+  incomplete coverage, conflict, or recovery. A worker report is never
+  acceptance.
+- Dependency, security/permission/policy, deployment/migration, release, and
+  Pi control paths require an explicit user-issued temporary write lease.
+  The lease is bounded by paths, tools, calls, and time and never authorizes
+  bash.
 - After semantic ACCEPT and the relevant final checks, Sol may use
   `workbench_git action=checkpoint` once to batch all compatible sealed
   reviewed paths while preserving unrelated dirty/staged work. Use

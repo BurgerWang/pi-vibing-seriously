@@ -7,7 +7,10 @@ import type { Api, AssistantMessage, Context, Model, Usage } from "@earendil-wor
 import {
 	STRUCTURED_SOL_FINAL_REPAIR_REVIEW_TOOL,
 	STRUCTURED_SOL_FINAL_REVIEW_TOOL,
+	STRUCTURED_SOL_FINAL_REVIEW_TOOL_V2,
 	STRUCTURED_SOL_FINAL_TOOL_NAME,
+	STRUCTURED_SOL_BATCH_REVIEW_TOOL,
+	STRUCTURED_SOL_BATCH_REVIEW_TOOL_NAME,
 	STRUCTURED_SOL_PAGE_REVIEW_TOOL,
 	STRUCTURED_SOL_PAGE_TOOL_NAME,
 	STRUCTURED_SOL_REVIEW_API,
@@ -16,8 +19,11 @@ import {
 	STRUCTURED_SOL_REVIEW_MODEL,
 	STRUCTURED_SOL_REVIEW_PROVIDER,
 	STRUCTURED_SOL_REVIEW_REQUEST_POLICY_HASH,
+	STRUCTURED_SOL_REVIEW_BATCH_REQUEST_POLICY_HASH_V2,
 	STRUCTURED_SOL_TERMINAL_NEGATIVE_REQUEST_POLICY_HASH,
 	runStructuredSolReview,
+	runStructuredSolReviewBatchedV2,
+	validateSemanticReviewProgressV2,
 	validateStructuredSolReviewReceipt,
 	type RunStructuredSolReviewInput,
 	type StructuredSolFinding,
@@ -44,6 +50,20 @@ const MODEL: Model<Api> = {
 
 function sha256(value: string): string {
 	return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function passBatch(context: Context): AssistantMessage {
+	const payload = requestPayload(context);
+	const pages = payload.pages as Array<{ review_page_index: number; page_binding_hash: string; page: { page_content_sha256: string } }>;
+	return assistant(STRUCTURED_SOL_BATCH_REVIEW_TOOL_NAME, {
+		assessments: pages.map(({ page, page_binding_hash }) => ({
+			page_binding_hash,
+			page_content_sha256: page.page_content_sha256,
+			decision: "PASS",
+			summary: "No blocking defect on this page.",
+			findings: [],
+		})),
+	});
 }
 
 function usage(seed = 0): Usage {
@@ -558,4 +578,146 @@ test("page assessment aggregation is byte-bounded before the final model call", 
 	assert.equal(result.receipt?.calls.length, pageCount);
 	assert.equal(validateStructuredSolReviewReceipt(result.receipt), true);
 	assert.ok(Buffer.byteLength(JSON.stringify(result.receipt?.page_assessments), "utf8") > STRUCTURED_SOL_REVIEW_MAX_ASSESSMENT_AGGREGATE_BYTES);
+});
+
+test("V2 batches 47 pages into six bounded calls plus one raw-free final call", async () => {
+	const fake = fakeRegistry((index, context) => index < 6 ? passBatch(context) : finalFromContext(context));
+	const base = reviewInput(fake.registry, [{ path: "src/long.ts", parts: Array.from({ length: 47 }, (_, index) => `page-${index + 1}\n`) }]);
+	const progress: unknown[] = [];
+	const result = await runStructuredSolReviewBatchedV2({
+		...base,
+		generation: 1,
+		on_progress: (value) => { progress.push(structuredClone(value)); },
+	});
+
+	assert.equal(result.status, "ACCEPT");
+	assert.equal(fake.calls.length, 7);
+	assert.equal(fake.calls.slice(0, 6).every((call) => call.context.tools?.[0] === STRUCTURED_SOL_BATCH_REVIEW_TOOL), true);
+	assert.equal(fake.calls.at(-1)?.context.tools?.[0], STRUCTURED_SOL_FINAL_REVIEW_TOOL_V2);
+	assert.equal(result.progress.batches.length, 6);
+	assert.deepEqual(result.progress.batches.map((batch) => batch.assessments.length), [8, 8, 8, 8, 8, 7]);
+	assert.equal(result.page_assessments.length, 47);
+	assert.equal(new Set(result.page_assessments.map((assessment) => assessment.page_content_sha256)).size, 47);
+	assert.equal(validateSemanticReviewProgressV2(result.progress), true);
+	assert.equal(progress.every(validateSemanticReviewProgressV2), true);
+	const firstBatchPayload = requestPayload(fake.calls[0]!.context);
+	assert.match(String(firstBatchPayload.instruction), /W is attributed worker delta/u);
+	assert.match(String(firstBatchPayload.instruction), /D\/S-only entries are read-only context/u);
+	assert.match(String(firstBatchPayload.instruction), /must never be reported as worker changes or scope violations/u);
+	const finalPayload = requestPayload(fake.calls.at(-1)!.context);
+	assert.equal(JSON.stringify(finalPayload).includes("page-1\\n"), false, "raw page content is absent from final context");
+	assert.match(STRUCTURED_SOL_REVIEW_BATCH_REQUEST_POLICY_HASH_V2, /^[0-9a-f]{64}$/u);
+});
+
+test("V2 resume after the batch containing page 17 skips every completed batch", async () => {
+	const first = fakeRegistry((index, context) => {
+		if (index === 2) throw new Error("provider unavailable after page 16");
+		return passBatch(context);
+	});
+	const fixture = [{ path: "src/long.ts", parts: Array.from({ length: 47 }, (_, index) => `segment-${index}\n`) }];
+	const interrupted = await runStructuredSolReviewBatchedV2({ ...reviewInput(first.registry, fixture), generation: 1 });
+	assert.equal(interrupted.status, "RETRYABLE_FAILURE");
+	assert.equal(first.calls.length, 3);
+	assert.deepEqual(interrupted.progress.batches.map((batch) => batch.status).slice(0, 3), ["COMPLETED", "COMPLETED", "RETRYABLE_FAILURE"]);
+
+	const resumed = fakeRegistry((index, context) => index < 4 ? passBatch(context) : finalFromContext(context));
+	const completed = await runStructuredSolReviewBatchedV2({
+		...reviewInput(resumed.registry, fixture),
+		generation: 1,
+		resume_progress: interrupted.progress,
+	});
+	assert.equal(completed.status, "ACCEPT");
+	assert.equal(resumed.calls.length, 5, "only batches 3-6 and one fresh final call run");
+	assert.equal(completed.progress.batches.every((batch) => batch.status === "COMPLETED"), true);
+});
+
+test("V2 inherited-only review performs zero page calls and one fresh cross-file final call", async () => {
+	const fake = fakeRegistry((_index, context) => finalFromContext(context));
+	const base = reviewInput(fake.registry, [{ path: "src/stable.ts", parts: ["stable\n"] }]);
+	const result = await runStructuredSolReviewBatchedV2({
+		...base,
+		generation: 2,
+		fresh_paths: [],
+		inherited_proof_summary: {
+			parent_evidence_hash: "a".repeat(64),
+			inherited_stream_count: 1,
+			inherited_stream_set_hash: "b".repeat(64),
+			dependency_closure_hash: "c".repeat(64),
+		},
+	});
+	assert.equal(result.status, "ACCEPT");
+	assert.equal(fake.calls.length, 1);
+	assert.equal(result.progress.batches.length, 0);
+	assert.equal("page_assessments" in result ? result.page_assessments.length : -1, 0);
+});
+
+test("V2 accepts carried D streams while reviewing only the fresh W delta", async () => {
+	const fake = fakeRegistry((index, context) => index === 0 ? passBatch(context) : finalFromContext(context));
+	const base = reviewInput(fake.registry, [
+		{ path: "src/inherited.ts", parts: ["stable\n"] },
+		{ path: "src/repaired.ts", parts: ["fixed\n"] },
+	]);
+	const relevanceProjection = {
+		...base.relevance_projection,
+		entries: base.relevance_projection.entries.map((entry) => ({
+			...entry,
+			roles: entry.path === "src/inherited.ts" ? ["D" as const] : ["W" as const],
+		})),
+	};
+	const boundDiffHash = computeReviewRelevanceProjectionHashV2(relevanceProjection);
+	const envelope = buildSemanticReviewEnvelopeV1({
+		streams: base.streams,
+		projected_review_record_bytes: base.semantic_envelope.projected_review_record_bytes,
+		relevance_projection_hash: boundDiffHash,
+	});
+	assert.equal(envelope.ok, true);
+	if (!envelope.ok) return;
+	const result = await runStructuredSolReviewBatchedV2({
+		...base,
+		generation: 2,
+		bound_diff_hash: boundDiffHash,
+		relevance_projection: relevanceProjection,
+		semantic_envelope: envelope.value,
+		fresh_paths: ["src/repaired.ts"],
+		inherited_proof_summary: {
+			parent_evidence_hash: "a".repeat(64),
+			inherited_stream_count: 1,
+			inherited_stream_set_hash: "b".repeat(64),
+			dependency_closure_hash: "c".repeat(64),
+		},
+	});
+	assert.equal(result.status, "ACCEPT");
+	assert.equal(fake.calls.length, 2, "one fresh batch plus one raw-free final call");
+	assert.equal("page_assessments" in result ? result.page_assessments.length : -1, 1);
+});
+
+test("V2 rejects duplicate batch coverage and returns SPLIT_REQUIRED above the explicit large ceiling", async () => {
+	const duplicate = fakeRegistry((_index, context) => {
+		const payload = requestPayload(context);
+		const pages = payload.pages as Array<{ page_binding_hash: string; page: { page_content_sha256: string } }>;
+		return assistant(STRUCTURED_SOL_BATCH_REVIEW_TOOL_NAME, {
+			assessments: pages.map((page) => ({
+				page_binding_hash: page.page_binding_hash,
+				page_content_sha256: pages[0]!.page.page_content_sha256,
+				decision: "PASS",
+				summary: "Duplicate response.",
+				findings: [],
+			})),
+		});
+	});
+	const invalid = await runStructuredSolReviewBatchedV2({
+		...reviewInput(duplicate.registry, [{ path: "src/a.ts", parts: ["a", "b"] }]),
+		generation: 1,
+	});
+	assert.equal(invalid.status, "RETRYABLE_FAILURE");
+	assert.equal(invalid.code, "INVALID_TOOL_RESPONSE");
+
+	const unused = fakeRegistry((_index, context) => passBatch(context));
+	const oversized = await runStructuredSolReviewBatchedV2({
+		...reviewInput(unused.registry, [{ path: "src/huge.ts", parts: Array.from({ length: 129 }, () => "x") }]),
+		generation: 1,
+		capacity: "large",
+	});
+	assert.equal(oversized.status, "SPLIT_REQUIRED");
+	assert.equal(unused.calls.length, 0);
 });

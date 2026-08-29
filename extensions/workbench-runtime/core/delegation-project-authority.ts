@@ -64,6 +64,7 @@ import {
 	releaseOrphanedTerminalExecutionOwnerV2,
 	isStrictRetryableAbortedRepairV2,
 	isStrictRetryableEmptyRepairRecoveryV2,
+	isStrictRetryableFinalizationRepairRecoveryV2,
 	readStrictRetryableRawRepairEvidenceV1,
 	type DelegationExecutionOwnerOptionsV2,
 } from "./delegation-execution-owner.ts";
@@ -145,7 +146,7 @@ export type DelegationAuthorityObservationV2 =
 		finalized: boolean;
 		semanticAccepted: boolean;
 		semanticBindingHash: string | null;
-		semanticSource: "embedded" | "migration" | "not_required" | null;
+		semanticSource: "evidence_v2" | "embedded" | "migration" | "not_required" | null;
 		semanticReviewer: string | null;
 		semanticAcceptedAt: string | null;
 		semanticRepair?: {
@@ -545,6 +546,7 @@ async function validRepairParentState(
 	if (transaction.status !== "RECOVERY_REQUIRED" || transaction.repair_lineage === undefined) return false;
 	if (transaction.committed_proof !== null) return (await strictLineageChangeSet(projectRoot, transaction)).ok;
 	if (await isStrictRetryableEmptyRepairRecoveryV2(projectRoot, transaction)) return true;
+	if (await isStrictRetryableFinalizationRepairRecoveryV2(projectRoot, transaction)) return true;
 	return (await readRecoverableUnpublishedDelegationV2(projectRoot, transaction.delegation_id)).ok;
 }
 
@@ -1253,7 +1255,7 @@ export async function readDelegationAuthorityObservationV2(
 		}
 		if (review.error.code === "invalid_record" && transaction.status === "PENDING_REVIEW" && transaction.review === null) {
 			const sidecars = await readDelegationImmutableReviewSidecarPresenceV1(projectRoot, delegationId);
-			if (sidecars.ok && !sidecars.value.semantic_repair && !sidecars.value.semantic_migration) {
+			if (sidecars.ok && !sidecars.value.semantic_repair && !sidecars.value.semantic_migration && !sidecars.value.semantic_evidence_v2) {
 				const resolution = resolveDelegationLifecycleV1(
 					delegationLifecycleSnapshotFromInvalidDerivedReviewV1(delegationId, transaction),
 					{
@@ -1270,6 +1272,7 @@ export async function readDelegationAuthorityObservationV2(
 		}
 		return { kind: "invalid-v2", code: review.error.code };
 	}
+	const evidence = review.value.semantic_evidence_v2?.final_decision === "ACCEPT" ? review.value.semantic_evidence_v2 : undefined;
 	const migration = review.value.semantic_migration?.status === "ACCEPTED" ? review.value.semantic_migration : undefined;
 	const embedded = review.value.review.semantic_review === "accepted" ? review.value.review.semantic_acceptance : undefined;
 	const zeroDelta = review.value.review.checked_paths.length === 0 && isStrictSemanticAcceptedOrZeroDelta(review.value.review);
@@ -1283,11 +1286,13 @@ export async function readDelegationAuthorityObservationV2(
 		semanticAccepted: hasDelegationSemanticReviewAuthorityV2(review.value),
 		semanticBindingHash: migration?.migration_projection.migration_binding_hash ??
 			(hasDelegationSemanticReviewAuthorityV2(review.value) ? review.value.review.bound_diff_hash : null),
-		semanticSource: migration !== undefined ? "migration" : embedded !== undefined ? "embedded" : zeroDelta ? "not_required" : null,
-		semanticReviewer: migration !== undefined
+		semanticSource: evidence !== undefined ? "evidence_v2" : migration !== undefined ? "migration" : embedded !== undefined ? "embedded" : zeroDelta ? "not_required" : null,
+		semanticReviewer: evidence !== undefined
+			? `${evidence.model_identity.provider}/${evidence.model_identity.model}`
+			: migration !== undefined
 			? `${migration.acceptance.reviewer.provider}/${migration.acceptance.reviewer.model}`
 			: embedded === undefined ? null : `${embedded.reviewer.provider}/${embedded.reviewer.model}`,
-		semanticAcceptedAt: migration?.acceptance.accepted_at ?? embedded?.accepted_at ?? null,
+		semanticAcceptedAt: evidence?.completed_at ?? migration?.acceptance.accepted_at ?? embedded?.accepted_at ?? null,
 		...repairObservation(transaction, review.value.semantic_repair),
 	};
 }

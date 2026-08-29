@@ -1,10 +1,10 @@
 # pi-dev-workbench
 
 <p align="center">
-  <img src="assets/banner.svg" alt="pi-dev-workbench v0.10.0 — fixed Sol and Luna collaboration with evidence-backed delivery" width="720" />
+  <img src="assets/banner.svg" alt="pi-dev-workbench v0.10.0 — development-first Pi workbench with optional Sol and Luna collaboration, evidence-backed delivery" width="720" />
 </p>
 
-<p align="center"><strong>Plan with Sol. Build with Luna. Verify with evidence.</strong></p>
+<p align="center"><strong>Build directly. Delegate when useful. Verify once stable.</strong></p>
 
 **pi-dev-workbench** is a [Pi Package](https://pi.dev) for shipping software
 and quantitative-research work with clear operating modes, reproducible
@@ -17,8 +17,8 @@ runtime.
 
 | Product capability | What it changes |
 | --- | --- |
-| **Fixed Sol → Luna delivery** | GPT-5.6 Sol owns requirements, architecture, scope, review, and verdict; GPT-5.6 Luna xhigh owns routine implementation inside one bounded contract |
-| **Low-ceremony governance** | One successful delegation scope-checks, reviews, and closes itself; explicit review/status is reserved for recovery |
+| **Development-first workflow** | Ordinary source, test, and documentation work stays direct in DEV instead of paying a delegation lifecycle cost |
+| **Optional Sol → Luna collaboration** | GPT-5.6 Sol can delegate one useful bounded slice to GPT-5.6 Luna xhigh; successful delivery scope-checks and closes itself |
 | **Bounded Git completion** | After semantic acceptance, Sol checkpoints all compatible reviewed slices at once while preserving unrelated worktree/index state; an explicitly requested exact-HEAD ordinary push is available without force or history rewriting |
 | **Repeatable verification** | Named recipes create durable evidence; gates return PASS / FAIL / BLOCKED / NOT_RUN |
 | **Context that stays usable** | Bounded results, pagination, history projection, and cumulative worker budgets prevent long sessions from collapsing under their own output |
@@ -49,7 +49,7 @@ Reload the initialized project, approve project trust, then work normally:
 /q-mode-dev
 workbench_project_inspect   # see the exact recipes generated/detected
 /q-run check:typecheck     # example: only when q-init found that package script
-workbench_delegate_worker   # normal bounded implementation path
+workbench_delegate_worker   # optional bounded implementation path
 /q-mode-verify
 /q-gate base               # final evidence pass when risk requires it
 ```
@@ -123,7 +123,7 @@ success and grants no Gate authority.
 | Mode | Use it for | Write behavior |
 | --- | --- | --- |
 | **AUDIT** | Understand the project | Read-only inspection |
-| **DEV** | Build and repair | Sol directs; Luna performs routine writes; temporary Sol writes require an explicit bounded lease |
+| **DEV** | Build and repair | Ordinary canonical edits are direct; protected high-risk paths require an explicit bounded lease |
 | **VERIFY** | Re-check a stable candidate | Declared recipes and gates only |
 
 The normal path is intentionally short. Safe close, supersede, rebase,
@@ -131,7 +131,7 @@ stale-lock reclaim, and continuation are runtime-owned transitions; ordinary
 development does not require user lifecycle choreography:
 
 ```text
-inspect → Sol contract → one Luna delivery → focused feedback → stable candidate → final verification
+inspect → develop directly (or delegate when useful) → focused feedback → stable candidate → final verification
 ```
 
 A successful delegated implementation performs its scope check and completes
@@ -186,12 +186,14 @@ The active worker is pinned to `openai-codex/gpt-5.6-luna:xhigh`.
 
 | Actor | Responsibility |
 | --- | --- |
-| **GPT-5.6 Sol** | Requirements, architecture, scope, acceptance criteria, actual-diff review, final verification, verdict |
-| **GPT-5.6 Luna xhigh** | Routine source, test, and documentation implementation inside one approved, bounded contract |
+| **GPT-5.6 Sol** | Direct ordinary development, requirements, architecture, scope, acceptance criteria, optional delegation, final verification, verdict |
+| **GPT-5.6 Luna xhigh** | Optional bounded implementation inside one approved contract |
 
-Sol does not receive ordinary `edit`/`write` tools. A user may grant a
-short-lived, path- and call-bounded lease for an explicit exceptional direct
-write; locking, expiry, or exhaustion restores the fixed worker-first surface.
+Sol receives ordinary `edit`/`write` tools in DEV while `bash` and foreign
+tools remain unavailable. Dependency, security/permission/policy,
+deployment/migration, release, and `.pi` control paths require a short-lived,
+path- and call-bounded user lease; locking, expiry, or exhaustion removes only
+that high-risk exception and leaves ordinary direct edits available.
 Git completion is separate from that lease: the approved Sol commander in DEV
 may use `workbench_git` to checkpoint still-present non-zero deliveries with
 finalized semantic ACCEPT authority. One call batches all compatible sealed

@@ -1,4 +1,4 @@
-/** Worker-first temporary commander-write exception controller. */
+/** Development-first commander write command controller. */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 
@@ -40,7 +40,7 @@ export interface CommanderWriteCommandController {
 	now?(): string;
 }
 
-/** Register the three user-only temporary lease commands as one owned domain. */
+/** Register the three user-only high-risk lease commands as one owned domain. */
 export function registerCommanderWriteCommands(controller: CommanderWriteCommandController): void {
 	const now = controller.now ?? (() => new Date().toISOString());
 	const persistLease = (): boolean => {
@@ -59,12 +59,12 @@ export function registerCommanderWriteCommands(controller: CommanderWriteCommand
 		return false;
 	};
 	const persistenceFailure = (ctx: ExtensionCommandContext): void => {
-		controller.output(ctx, ["Commander write lease storage unavailable; write authorization remains locked"]);
+		controller.output(ctx, ["High-risk write lease storage unavailable; ordinary direct writes remain available and high-risk paths stay locked"]);
 	};
 
 	controller.pi.registerCommand("q-write-policy", {
 		description:
-			"Show worker-first write status and any bounded temporary Sol write lease (never displays confirmation tokens)",
+			"Show development write status: ordinary edit/write are direct; high-risk paths use a bounded optional lease (never displays confirmation tokens)",
 		handler: async (args, ctx) => {
 			const parsed = parseWritePolicyArgs(args);
 			if (!parsed.ok) {
@@ -87,7 +87,7 @@ export function registerCommanderWriteCommands(controller: CommanderWriteCommand
 
 	controller.pi.registerCommand("q-commander-write-unlock", {
 		description:
-			"Temporary bounded write lease exception for Sol in DEV: /q-commander-write-unlock <reason> --paths <comma-list> --calls <N> --minutes <N>",
+			"Temporary high-risk write lease for Sol in DEV: /q-commander-write-unlock <reason> --paths <comma-list> --calls <N> --minutes <N> (ordinary edit/write does not need this command)",
 		handler: async (args, ctx) => {
 			const timestamp = now();
 			controller.syncLease(timestamp);
@@ -96,13 +96,13 @@ export function registerCommanderWriteCommands(controller: CommanderWriteCommand
 			const policy = defaultWritePolicy(identity.provider, identity.model);
 			if (actor !== "sol-commander" || policy !== "worker-first-strict") {
 				controller.output(ctx, [
-					`/q-commander-write-unlock: refused — only GPT-5.6 Sol on an approved provider may receive a temporary write exception (current actor: ${actor}, policy: ${policy ?? "not-applicable"})`,
+					`/q-commander-write-unlock: refused — only GPT-5.6 Sol on an approved provider may authorize high-risk paths (current actor: ${actor}, policy: ${policy ?? "not-applicable"})`,
 				]);
 				return;
 			}
 			if (controller.getMode() !== "DEV") {
 				controller.output(ctx, [
-					`/q-commander-write-unlock: refused — temporary write leases exist only in DEV mode (current mode: ${controller.getMode()})`,
+					`/q-commander-write-unlock: refused — high-risk write leases exist only in DEV mode (current mode: ${controller.getMode()})`,
 				]);
 				return;
 			}
@@ -128,7 +128,7 @@ export function registerCommanderWriteCommands(controller: CommanderWriteCommand
 				}
 				const confirmed = confirmLease(lease, parsed.partA, parsed.partB, timestamp);
 				if (!confirmed.ok) {
-					controller.output(ctx, [`/q-commander-write-unlock: ${confirmed.error} — the temporary lease remains inactive`]);
+					controller.output(ctx, [`/q-commander-write-unlock: ${confirmed.error} — the high-risk lease remains inactive`]);
 					return;
 				}
 				if (!persistOrLock(confirmed.lease, timestamp)) {
@@ -178,9 +178,9 @@ export function registerCommanderWriteCommands(controller: CommanderWriteCommand
 					minutes: parsed.minutes,
 					now: timestamp,
 				});
-				const accepted = await ctx.ui.confirm("Grant temporary commander write lease?", preview.join("\n"));
+				const accepted = await ctx.ui.confirm("Grant temporary high-risk write lease?", preview.join("\n"));
 				if (!accepted) {
-					controller.output(ctx, ["/q-commander-write-unlock: canceled — commander writes remain locked; use Luna for routine implementation"]);
+					controller.output(ctx, ["/q-commander-write-unlock: canceled — no high-risk lease issued; ordinary direct edits remain available"]);
 					return;
 				}
 				const confirmed = confirmLease(issued.lease, tokens.partA, tokens.partB, timestamp);
@@ -209,7 +209,7 @@ export function registerCommanderWriteCommands(controller: CommanderWriteCommand
 	});
 
 	controller.pi.registerCommand("q-commander-write-lock", {
-		description: "Revoke the temporary commander write lease and restore the locked worker-first tool surface",
+		description: "Revoke the temporary high-risk write lease; ordinary direct edit/write remains available",
 		handler: async (_args, ctx) => {
 			const timestamp = now();
 			controller.syncLease(timestamp);
@@ -221,8 +221,8 @@ export function registerCommanderWriteCommands(controller: CommanderWriteCommand
 			controller.applyModeTools();
 			controller.output(ctx, [
 				lease
-					? `/q-commander-write-lock: lease ${lease.id} revoked (${lease.revokedReason}); commander writes are locked`
-					: "/q-commander-write-lock: no temporary lease is active; commander writes are locked",
+					? `/q-commander-write-lock: high-risk lease ${lease.id} revoked (${lease.revokedReason}); ordinary direct edits remain available`
+					: "/q-commander-write-lock: no high-risk lease is active; ordinary direct edits remain available",
 				leaseCompactSummary(lease, timestamp),
 			]);
 			void controller.refreshStatus(ctx);

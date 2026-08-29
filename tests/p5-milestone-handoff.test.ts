@@ -14,7 +14,7 @@
  * linkage, target setup entries (resumed + hidden note + mode/compact/
  * delegation copies, NO lease), replacement-context announce + reload, a
  * target-runtime restore proof (copied mode/compact/delegation active after
- * reload while commander writes stay locked), and the additive cancelled
+ * reload while ordinary writes stay direct and high-risk authority resets), and the additive cancelled
  * record when the replacement is cancelled.
  */
 
@@ -73,7 +73,7 @@ import {
 } from "../extensions/workbench-runtime/core/delegation-state.ts";
 import {
 	LEASE_STATE_ENTRY_TYPE,
-	STRICT_SOL_DEV_ALLOWLIST,
+	DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST,
 } from "../extensions/workbench-runtime/core/write-authority.ts";
 import { WORKER_ROLE_ENV } from "../extensions/workbench-runtime/core/worker-policy.ts";
 
@@ -361,6 +361,31 @@ async function guardCall(
 			input,
 		} as never, ctx)) as { block?: boolean; reason?: string } | undefined;
 		if (result !== undefined) return result;
+	}
+	// An allowed guard represents a completed tool call in these policy tests.
+	// Drive the real result middleware so the checkout writer lane is released
+	// before the next independent assertion.
+	const resultEvent = {
+		type: "tool_result",
+		toolCallId: `milestone-guard-${milestoneGuardSerial}`,
+		toolName,
+		input,
+		content: [{ type: "text", text: "ok" }],
+		isError: false,
+		output: "ok",
+	};
+	for (const handler of stub.events.get("tool_result") ?? []) {
+		const patch = await handler(resultEvent as never, ctx) as {
+			content?: typeof resultEvent.content;
+			isError?: boolean;
+			output?: string;
+		} | undefined;
+		if (patch?.content !== undefined) resultEvent.content = patch.content;
+		if (patch?.isError !== undefined) resultEvent.isError = patch.isError;
+		if (patch?.output !== undefined) resultEvent.output = patch.output;
+	}
+	for (const handler of stub.events.get("agent_settled") ?? []) {
+		await handler({ type: "agent_settled" } as never, ctx);
 	}
 	return undefined;
 }
@@ -710,7 +735,7 @@ test("the hidden note is deterministic, bounded, redacted and pointers-only", ()
 	assert.ok(note.includes("mode: AUDIT"));
 	assert.ok(note.includes("delegation: 20260801-120000-abcd PENDING_REVIEW"));
 	assert.ok(note.includes("last run: 20260801-120000-abcd (unit-test)"));
-	assert.ok(note.includes("development writes: worker-first; temporary commander lease never carried"));
+	assert.ok(note.includes("development writes: ordinary paths direct; high-risk lease never carried"));
 	assert.ok(!note.includes("stdout") && !note.includes("stderr"), "no log content");
 	assert.ok(!note.includes("[truncated]"), "small note is never truncated");
 	// Hard caps: the note never exceeds the line/char/byte bounds, even when
@@ -930,7 +955,7 @@ test("successful handoff: idle wait, prepared record, parent link, setup entries
 	assert.ok(!note.includes("/tmp/workbench-project/session.jsonl"), "hidden note excludes the absolute source session path");
 	assert.ok(note.includes("next step: run the q3 verification and write the report"));
 	assert.ok(note.includes("mode: AUDIT"));
-	assert.ok(note.includes("development writes: worker-first; temporary commander lease never carried"));
+	assert.ok(note.includes("development writes: ordinary paths direct; high-risk lease never carried"));
 	assert.ok(!note.includes("stdout") && !note.includes("stderr"), "note never carries logs");
 	assert.ok(utf8ByteLength(note) <= MAX_HANDOFF_NOTE_BYTES);
 	assert.ok(note.length <= MAX_HANDOFF_NOTE_CHARS);
@@ -948,7 +973,7 @@ test("successful handoff: idle wait, prepared record, parent link, setup entries
 	// 5) copied serialized DELEGATION state.
 	assert.equal(delegationEntry.customType, DELEGATION_STATE_ENTRY_TYPE);
 	assert.deepEqual(delegationEntry.data, serializeDelegationState(blocked));
-	// NO lease entry anywhere in the target: write authority stays locked.
+	// NO lease entry anywhere in the target: high-risk authority stays locked.
 	assert.ok(!harness.targetEntries.some((e) => e.customType === LEASE_STATE_ENTRY_TYPE), "no lease transfer");
 
 	// withSession used ONLY the replacement context: announce first, reload
@@ -956,7 +981,7 @@ test("successful handoff: idle wait, prepared record, parent link, setup entries
 	const announce = harness.replacementNotifyLines.join("\n");
 	assert.ok(announce.includes(`milestone ${prepared.milestone_id} handed off`));
 	assert.ok(announce.includes("run the q3 verification and write the report"));
-	assert.ok(announce.includes("NOT carried") && announce.includes("commander edit/write is locked"));
+	assert.ok(announce.includes("NOT carried") && announce.includes("ordinary direct edits remain available"));
 	assert.ok(announce.includes("delegation  : DELEGATION 20260801-120000-abcd REVIEWED"));
 	assert.equal(harness.reloadCalls, 1, "reload restores setup entries before continuation");
 	assert.equal(harness.orderEvents[harness.orderEvents.length - 1], "reload", "announce happens before reload");
@@ -990,7 +1015,7 @@ test("successful handoff: idle wait, prepared record, parent link, setup entries
 	);
 });
 
-test("the source lease never transfers: DEV source with an ACTIVE lease yields an exactly-locked target", async () => {
+test("the source lease never transfers: DEV source with an ACTIVE lease yields a development-first target", async () => {
 	await withTempDir(async (projectRoot) => {
 	const stub = makeStub();
 	workbenchRuntime(stub);
@@ -1019,7 +1044,7 @@ test("the source lease never transfers: DEV source with an ACTIVE lease yields a
 	const confirmedOutput = await runPrintCommand(stub, "q-commander-write-unlock", `confirm ${partA} ${partB}`);
 	assert.match(confirmedOutput, /CONFIRMED/);
 	// The source lease is genuinely ACTIVE: edit/write are advertised.
-	assert.deepEqual(stub.activeTools, [...STRICT_SOL_DEV_ALLOWLIST, "edit", "write"]);
+	assert.deepEqual(stub.activeTools, [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST]);
 	const guardContext = { cwd: projectRoot, isProjectTrusted: () => true };
 	assert.equal(await guardCall(stub, "edit", { path: "src/main.ts" }, guardContext), undefined, "source lease authorizes writes");
 
@@ -1029,19 +1054,18 @@ test("the source lease never transfers: DEV source with an ACTIVE lease yields a
 	assert.ok(!harness.targetEntries.some((e) => e.customType === LEASE_STATE_ENTRY_TYPE), "no lease entry in the target");
 	assert.equal(harness.reloadCalls, 1);
 	// Restored target: the source session's lease is absent and the exact
-	// worker-first surface is locked.
-	assert.deepEqual(stub.activeTools, [...STRICT_SOL_DEV_ALLOWLIST]);
-	assert.equal(stub.activeTools.length, 17);
+	// development-first surface remains available.
+	assert.deepEqual(stub.activeTools, [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST]);
+	assert.equal(stub.activeTools.length, 19);
 	const ordinaryBlocked = await guardCall(stub, "edit", { path: "src/main.ts" }, guardContext);
-	assert.ok(ordinaryBlocked && ordinaryBlocked.block === true);
-	assert.match(String(ordinaryBlocked.reason), /lease locked/);
+	assert.equal(ordinaryBlocked, undefined);
 	const blocked = await guardCall(stub, "edit", { path: "package.json" }, guardContext);
 	assert.ok(blocked && blocked.block === true, "direct commander path requires fresh authorization");
 	assert.match(String(blocked.reason), /lease locked/);
-	// The milestone note states the worker-first target fact.
+	// The milestone note states the development-first target fact.
 	const noteEntry = harness.targetEntries.find((e) => e.customType === MILESTONE_HANDOFF_NOTE_ENTRY_TYPE);
 	assert.ok(noteEntry && noteEntry.type === "custom_message");
-	assert.ok(String(noteEntry.content).includes("development writes: worker-first; temporary commander lease never carried"));
+	assert.ok(String(noteEntry.content).includes("development writes: ordinary paths direct; high-risk lease never carried"));
 	});
 });
 

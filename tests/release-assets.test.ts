@@ -82,7 +82,7 @@ test("v0.10.0 release metadata, compatibility and control-plane docs stay synchr
 	assert.match(compatibilityDoc, /Pi 0\.83\.0/);
 	assert.match(controlPlane, /context-output-stress\/context-output-evidence\.json/);
 	assert.match(stablePrefix, /1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd/);
-	assert.match(stablePrefix, /b5938d64d2730119daa0f1b1c833aac09ff4923b52124a833bc2f1e0d5294b11/);
+	assert.match(stablePrefix, /f58f921761395f57fa4d1c22a9cf7cc2d068fd3bfbd03e16a132a316793cef16/);
 	assert.equal(pkg.scripts["test:context-output-stress"], "tsx --test tests/context-output-stress.test.ts");
 });
 
@@ -130,7 +130,7 @@ test("banner.svg exists, is referenced by the README, and is renderer-safe", asy
 	assert.ok(svg.includes(`v${pkg.version}`), `banner carries the package version v${pkg.version}`);
 });
 
-test("product banner design: Pi tile, fixed Sol-Luna title, delivery line and status chips", async () => {
+test("product banner design: Pi tile, development-first title, delivery line and status chips", async () => {
 	const svg = await readFile(join(ROOT, "assets", "banner.svg"), "utf8");
 	const pkg = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8")) as { version: string };
 
@@ -138,7 +138,7 @@ test("product banner design: Pi tile, fixed Sol-Luna title, delivery line and st
 	const ariaMatch = svg.match(/aria-label="([^"]*)"/);
 	assert.ok(ariaMatch, "aria-label present");
 	const ariaLabel = ariaMatch[1] ?? "";
-	assert.ok(ariaLabel.includes("fixed Sol and Luna collaboration"), "aria-label states the product position");
+	assert.ok(ariaLabel.includes("development-first Pi workbench"), "aria-label states the product position");
 	assert.ok(ariaLabel.includes("Sol and Luna"), "aria-label names the collaboration model");
 	assert.ok(ariaLabel.includes("evidence-backed delivery"), "aria-label names the product outcome");
 	assert.ok(ariaLabel.includes(`v${pkg.version}`), "aria-label carries the package version");

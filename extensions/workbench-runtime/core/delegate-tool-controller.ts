@@ -68,7 +68,10 @@ import {
 import { recoverRawLineageExactRepairAuthorityV1 } from "./exact-repair-raw-lineage-authority.ts";
 import { readDelegationInactiveBlockerClosureV2 } from "./delegation-authority-closure.ts";
 import { readDelegationCleanRepairAbandonmentV1 } from "./delegation-repair-abandonment.ts";
-import { collectTerminalRepairRebaseAuthorityV1 } from "./delegation-repair-rebase.ts";
+import {
+	collectFinalizationRepairRebaseAuthorityV1,
+	collectTerminalRepairRebaseAuthorityV1,
+} from "./delegation-repair-rebase.ts";
 import {
 	bindDelegationRepairLineageV1,
 	exactDelegationRepairAllowedPathsV1,
@@ -667,6 +670,8 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 							project_root: projectRoot,
 							repair_of: repairId,
 							collectCurrentBinding: (root, id) => controller.collectCurrentDelegationBinding(root, id),
+							collectFinalizationRebase: (root, transaction) =>
+								collectFinalizationRepairRebaseAuthorityV1({ projectRoot: root, transaction, exec: controller.exec }),
 						});
 						if (!recovered.ok || canonicalHash(recovered.value) !== canonicalHash(expected)) return undefined;
 						const parent = await readTransaction(projectRoot, repairId);
@@ -935,7 +940,8 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 								const raw = await readTransaction(projectRoot, exact.repair_of);
 								if (!raw.ok || canonicalHash(raw.value) !== exact.raw_tip_transaction_hash) return false;
 								const evidence = await readStrictRetryableRawRepairEvidenceV1(projectRoot, raw.value);
-								if (!evidence.ok || evidence.value.evidence_hash !== exact.raw_tip_evidence_hash) return false;
+								if (!evidence.ok || evidence.value.evidence_hash !== exact.raw_tip_evidence_hash ||
+									evidence.value.retry_kind !== exact.raw_tip_retry_kind) return false;
 								const root = await controller.services.readCommittedGeneration(projectRoot, exact.root_delegation_id);
 								if (!root.ok || root.value.proof.content_hash !== exact.committed_proof_content_hash ||
 									canonicalHash(root.value.state) !== exact.root_transaction_hash) return false;
@@ -963,10 +969,18 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 									if (negative.ok) continuationDecisionHash = negative.value.decision.decision_hash;
 								}
 								if (continuationDecisionHash !== exact.continuation_decision_hash) return false;
-								const binding = await controller.collectCurrentDelegationBinding(
-									projectRoot,
-									exact.continuation_decision_delegation_id,
-								);
+								if (exact.raw_tip_retry_kind === "FINALIZATION_RECOVERY") {
+									const rebased = await collectFinalizationRepairRebaseAuthorityV1({
+										projectRoot,
+										transaction: raw.value,
+										exec: controller.exec,
+									});
+									if (!rebased.ok || rebased.value.rebase_hash !== exact.raw_tip_rebase_hash) return false;
+								} else if (exact.raw_tip_rebase_hash !== null) return false;
+								const binding = await controller.collectCurrentDelegationBinding(projectRoot,
+									exact.raw_tip_retry_kind === "FINALIZATION_RECOVERY"
+										? exact.repair_of
+										: exact.continuation_decision_delegation_id);
 								return binding.status === "fresh" && binding.hash === exact.expected_current_binding_hash;
 							}
 							const current = await collectExactCommandRepairAuthority(authority.exactCommandAuthority);
@@ -1377,6 +1391,36 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 						: `workbench_delegate_worker: delegation v2 ${execution.code}${preparedStep}; delegation_id=${delegationId}; durable_status=${status}; postconditions=summary_over_bound${workerReport}${changedPaths}${nextAction}`;
 					throw new Error(boundedSummary);
 				}
+				if (execution.status === "PAUSED_BUDGET") {
+					// The child owner is already released.  Releasing the checkout/start
+					// lease lets the user inspect or explicitly extend/split the task;
+					// the checkpoint binding will reject any intervening drift.
+					preserveStartLock = false;
+					const checkpoint = execution.checkpoint;
+					return {
+						content: [{
+							type: "text" as const,
+							text: [
+								`delegation     : ${delegationId}`,
+								"execution      : PAUSED_BUDGET",
+								`attempt        : ${checkpoint.attempt}`,
+								`checkpoint     : ${checkpoint.checkpoint_hash}`,
+								`remaining      : turns ${checkpoint.remaining_budget.turns}; total ${checkpoint.remaining_budget.total_tokens}; output ${checkpoint.remaining_budget.output_tokens}`,
+								"semantic review: NOT_RUN — no committed generation exists",
+								"next action    : explicitly extend the bounded profile or split the task; do not create semantic repair",
+							].join("\n"),
+						}],
+						details: {
+							delegation_id: delegationId,
+							status: "PAUSED_BUDGET",
+							checkpoint_hash: checkpoint.checkpoint_hash,
+							attempt: checkpoint.attempt,
+							remaining_budget: checkpoint.remaining_budget,
+							semantic_review: "NOT_RUN",
+							next_action: "USER_REQUIRED_EXTEND_OR_SPLIT",
+						},
+					};
+				}
 				const result = execution.result;
 				const handoffSummary = execution.workerSummary;
 				const authority = await controller.services.buildTrustedRecoveryAuthority({
@@ -1504,18 +1548,19 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 						toolResult.details.semantic_review_receipt_hash = automaticSemanticReview.receipt_hash;
 					}
 					if (automaticSemanticReview.next_action !== undefined) toolResult.details.next_action = automaticSemanticReview.next_action;
-					// ACCEPT is already represented as a ready ordinary Candidate by the
-					// bounded handoff. Keep successful DEV output free of lifecycle
-					// choreography; only unresolved outcomes expose their one action.
-					if (automaticSemanticReview.status !== "ACCEPT") {
-						const recovery = automaticSemanticReview.status === "RETRYABLE_FAILURE"
-							? `; next action: ${automaticSemanticReview.next_action}`
-							: automaticSemanticReview.status === "REPAIR" ? `; next action: ${automaticSemanticReview.next_action}` : "";
-						toolResult.content = toolResult.content.map((item) => ({
-							...item,
-							text: `${item.text}\nautomatic Sol review: ${automaticSemanticReview!.status}${"code" in automaticSemanticReview! ? ` (${automaticSemanticReview!.code})` : ""}${recovery}`,
-						}));
-					}
+					const reviewMetrics = automaticSemanticReview.status === "ACCEPT" || automaticSemanticReview.status === "REPAIR"
+						? ` | evidence=${automaticSemanticReview.receipt_hash ?? "(unavailable)"} | pages=${automaticSemanticReview.review_page_count ?? "(unavailable)"} | batches=${automaticSemanticReview.review_batch_count ?? "(unavailable)"} | final_calls=${automaticSemanticReview.final_model_calls ?? "(unavailable)"} | raw_final_bytes=${automaticSemanticReview.raw_page_bytes_in_final ?? "(unavailable)"}`
+						: "";
+					const recovery = automaticSemanticReview.status === "RETRYABLE_FAILURE"
+						? ` | next_action=${automaticSemanticReview.next_action}`
+						: automaticSemanticReview.status === "REPAIR" ? ` | next_action=${automaticSemanticReview.next_action}` : "";
+					const completion = automaticSemanticReview.status === "ACCEPT"
+						? " | no manual review/status/repair command required"
+						: "";
+					toolResult.content = toolResult.content.map((item) => ({
+						...item,
+						text: `${item.text}\nautomatic Sol review: ${automaticSemanticReview!.status}${"code" in automaticSemanticReview! ? ` (${automaticSemanticReview!.code})` : ""}${reviewMetrics}${recovery}${completion}`,
+					}));
 				}
 				attachDelegateSessionMirrorWarning(toolResult, sessionMirrorWarnings);
 				void controller.refreshStatus(ctx);

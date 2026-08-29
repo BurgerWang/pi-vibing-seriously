@@ -6,6 +6,7 @@ coverage/
 .pi/workbench/runs/
 .pi/workbench/cache/
 .pi/workbench/tool-results/
+.pi/workbench/delegation-start.lock
 # Local settings backups and P7 recovery artifacts are never release changes.
 .pi/settings.json.backup-*
 .p7-recovery/

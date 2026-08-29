@@ -491,10 +491,11 @@ test("registered legacy review tool merges scope/integrity segments but keeps no
 		assert.equal(onDisk.coverage_complete, true);
 		assert.deepEqual(onDisk.displayed_paths, ["src/a.ts", "src/b.ts", "src/c.ts"]);
 
-		// No tool/order change: registration, parameter schema and the active
-		// tool set are untouched by the review calls.
+		// Registration and parameter schema stay fixed; the active tool surface
+		// narrows to the one review/resume action plus bounded inspection/status.
 		assert.deepEqual([...stub.tools.keys()], [...NATIVE_OVERRIDE_NAMES, ...WORKBENCH_TOOL_NAMES]);
-		assert.deepEqual(stub.activeTools, activeToolsBefore, "review calls never change the active tool set");
+		assert.notDeepEqual(stub.activeTools, activeToolsBefore);
+		assert.deepEqual(stub.activeTools, ["read", "grep", "find", "ls", "workbench_review_worker_diff", "workbench_delegation_status"]);
 
 		// A stale or guessed selector cannot stall a provisional read. The
 		// controller resolves durable latest and discards path hints that may
@@ -984,8 +985,8 @@ test("registered legacy review tool: a >32 KiB JSON yields complete high-risk co
 		]);
 
 		// Review writes/state behavior remains blocking in legacy: the session
-		// carries no accepted hash, while registration order,
-		// the parameter object and the active tool set are untouched.
+		// carries no accepted hash, while registration order and the parameter
+		// object stay fixed and the active surface narrows to review/status.
 		const state = lastDelegationStateEntry(stub);
 		assert.equal(state.latestId, id);
 		assert.equal(state.status, "PENDING_REVIEW");
@@ -997,7 +998,8 @@ test("registered legacy review tool: a >32 KiB JSON yields complete high-risk co
 			WORKBENCH_TOOL_PARAMETERS.workbench_review_worker_diff,
 			"parameter object unchanged after execution",
 		);
-		assert.deepEqual(stub.activeTools, activeToolsBefore, "review calls never change the active tool set");
+		assert.notDeepEqual(stub.activeTools, activeToolsBefore);
+		assert.deepEqual(stub.activeTools, ["read", "grep", "find", "ls", "workbench_review_worker_diff", "workbench_delegation_status"]);
 	});
 });
 

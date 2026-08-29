@@ -9,6 +9,8 @@
 
 import { isAbsolute, posix } from "node:path";
 
+import { canonicalHash } from "../cache/canonical-hash.ts";
+
 import {
 	bindDelegationBoundedTaskContractV2,
 	buildDelegationCommittedArtifactsV2,
@@ -48,6 +50,7 @@ import {
 	persistPreparedDelegationTransaction,
 	persistRecoveryRequiredDelegationTransaction,
 	persistRunningDelegationTransaction,
+	publishDelegationWorkerCheckpointV1,
 	type DelegationTransactionStorageOptions,
 } from "./delegation-transaction-storage.ts";
 import {
@@ -77,7 +80,12 @@ import {
 } from "./worker-policy.ts";
 import type { WorkerSpendProfile } from "./worker-spend.ts";
 import type { WorkerRunFailureCode } from "./worker-run-failure.ts";
-import { isStrictStreamingIdentityPath } from "./streaming-identity.ts";
+import {
+	captureStreamingIdentities,
+	isStrictStreamingIdentityPath,
+	streamingIdentityEqual,
+	type StreamingPathIdentity,
+} from "./streaming-identity.ts";
 import { truncateUtf8 } from "../worker/handoff.ts";
 import {
 	runPinnedWorker,
@@ -86,11 +94,33 @@ import {
 	type RunWorkerOptions,
 	type WorkerProgress,
 	type WorkerRunResult,
+	type WorkerUsage,
 	type WorkerRunnerPreflightFailureCode,
 } from "../worker/runner.ts";
 import { collectReviewRelevanceV2 } from "./review-relevance-v2.ts";
 import { preflightSemanticReviewEnvelopeV1 } from "./diff-review.ts";
 import type { SemanticReviewEnvelopeV1 } from "./semantic-review-envelope.ts";
+import {
+	buildWorkerCheckpointV1,
+	remainingWorkerBudgetV1,
+	validateWorkerCheckpointContinuationV1,
+	workerCheckpointContinuationCapsuleV1,
+	type WorkerCheckpointV1,
+} from "./worker-checkpoint.ts";
+import { WORKBENCH_RUNTIME_BUILD_IDENTITY } from "./runtime-build-identity.ts";
+import { collectWorkspaceGuard, type WorkspaceGuardEntry, type WorkspaceGuardRecord } from "./workspace-guard.ts";
+import {
+	computeWorkerWriteJournalHash,
+	readWorkerWriteJournal,
+	type WorkerWriteJournalRecord,
+} from "./write-journal.ts";
+import {
+	readStrictBoundCommandEffectReceipt,
+	validateWorkerCommandEffectRuntimeObservation,
+	type WorkerCommandEffectEntry,
+	type WorkerCommandEffectRuntimeObservation,
+} from "./delegation-command-effect-provenance.ts";
+import type { WorkerWriteJournalRuntimeObservation } from "./worker-write-journal-runtime.ts";
 
 export type DelegationExecutionV2FailureCode =
 	| "invalid_input"
@@ -100,6 +130,7 @@ export type DelegationExecutionV2FailureCode =
 	| "start_failed"
 	| "runner_failed"
 	| "worker_identity_invalid"
+	| "checkpoint_failed"
 	| "change_set_finalize_failed"
 	| "after_failed"
 	| "report_invalid"
@@ -178,6 +209,8 @@ interface DelegationExecutionV2Common {
 	runner_preflight_failure_code?: WorkerRunnerPreflightFailureCode;
 	/** Bounded builder category; raw builder messages are never exposed. */
 	artifact_error_code?: DelegationArtifactErrorCode | "internal_error";
+	/** Latest durable execution checkpoint; never semantic review authority. */
+	checkpoint?: Readonly<WorkerCheckpointV1>;
 }
 
 export type DelegationExecutionV2Result =
@@ -188,6 +221,12 @@ export type DelegationExecutionV2Result =
 		after: DelegationWorkspaceAfterFactsV2;
 		result: DelegationExecutionMachineResultV2;
 		workerSummary: LedgerWorkerSummaryRecord;
+	})
+	| (DelegationExecutionV2Common & {
+		ok: true;
+		status: "PAUSED_BUDGET";
+		durable_state: DelegationTransactionRecord;
+		checkpoint: Readonly<WorkerCheckpointV1>;
 	})
 	| (DelegationExecutionV2Common & {
 		ok: false;
@@ -465,6 +504,224 @@ function sameByteSortedPaths(left: readonly string[], right: readonly string[]):
 	return leftSorted.length === rightSorted.length && leftSorted.every((path, index) => path === rightSorted[index]);
 }
 
+function zeroWorkerUsage(): WorkerUsage {
+	return {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
+function addWorkerUsage(target: WorkerUsage, usage: Readonly<WorkerUsage>): void {
+	target.input += usage.input;
+	target.output += usage.output;
+	target.cacheRead += usage.cacheRead;
+	target.cacheWrite += usage.cacheWrite;
+	target.totalTokens += usage.totalTokens;
+	if (usage.cacheWrite1h !== undefined) target.cacheWrite1h = (target.cacheWrite1h ?? 0) + usage.cacheWrite1h;
+	if (usage.reasoning !== undefined) target.reasoning = (target.reasoning ?? 0) + usage.reasoning;
+	target.cost.input += usage.cost.input;
+	target.cost.output += usage.cost.output;
+	target.cost.cacheRead += usage.cost.cacheRead;
+	target.cost.cacheWrite += usage.cost.cacheWrite;
+	target.cost.total += usage.cost.total;
+}
+
+function mergeCommandEffectObservations(
+	left: Readonly<WorkerCommandEffectRuntimeObservation>,
+	right: Readonly<WorkerCommandEffectRuntimeObservation> | undefined,
+): Readonly<WorkerCommandEffectRuntimeObservation> | undefined {
+	if (!validateWorkerCommandEffectRuntimeObservation(left)) return undefined;
+	if (right === undefined) return left;
+	if (!validateWorkerCommandEffectRuntimeObservation(right)) return undefined;
+	const entries: WorkerCommandEffectEntry[] = left.entries.map((entry) => structuredClone(entry));
+	for (const entry of right.entries) {
+		const duplicate = entry.run_id === null ? undefined : entries.find((candidate) => candidate.run_id === entry.run_id);
+		if (duplicate !== undefined) {
+			if (canonicalHash(duplicate) !== canonicalHash(entry)) return undefined;
+			continue;
+		}
+		entries.push(structuredClone(entry));
+	}
+	if (left.state === "failed" || right.state === "failed") {
+		return Object.freeze({
+			state: "failed" as const,
+			code: left.state === "failed" ? left.code : right.code,
+			entries: Object.freeze(entries),
+		});
+	}
+	return Object.freeze(entries.length === 0
+		? { state: "empty" as const, code: "none" as const, entries: Object.freeze(entries) }
+		: { state: "observed" as const, code: "none" as const, entries: Object.freeze(entries) });
+}
+
+function aggregateWorkerAttempts(attempts: readonly WorkerRunResult[]): WorkerRunResult | undefined {
+	const latest = attempts.at(-1);
+	if (latest === undefined) return undefined;
+	const usage = zeroWorkerUsage();
+	let deniedWriteCount = 0;
+	let maxContextTokens = 0;
+	let softBudgetReached = false;
+	let hardBudgetExceeded = false;
+	let compactionCount = 0;
+	const compactionReasons: string[] = [];
+	let writeObservation: Readonly<WorkerWriteJournalRuntimeObservation> | undefined;
+	let commandObservation: Readonly<WorkerCommandEffectRuntimeObservation> = {
+		state: "empty", code: "none", entries: [],
+	};
+	for (const attempt of attempts) {
+		addWorkerUsage(usage, attempt.usage);
+		deniedWriteCount += attempt.deniedWriteCount;
+		maxContextTokens = Math.max(maxContextTokens, attempt.maxContextTokens);
+		softBudgetReached ||= attempt.softBudgetReached;
+		hardBudgetExceeded ||= attempt.hardBudgetExceeded;
+		compactionCount += attempt.compactionCount;
+		for (const reason of attempt.compactionReasons) if (!compactionReasons.includes(reason)) compactionReasons.push(reason);
+		if (attempt.writeJournalObservation.state !== "empty") writeObservation = attempt.writeJournalObservation;
+		const merged = mergeCommandEffectObservations(commandObservation, attempt.commandEffectObservation);
+		if (merged === undefined) return undefined;
+		commandObservation = merged;
+	}
+	const denominator = usage.input + usage.cacheRead;
+	return {
+		...latest,
+		turns: latest.spendState.turns,
+		usage,
+		cacheHitRatio: denominator > 0 ? usage.cacheRead / denominator : null,
+		deniedWriteCount,
+		maxContextTokens,
+		maxContextRatio: maxContextTokens / 272_000,
+		softBudgetReached,
+		hardBudgetExceeded,
+		compactionCount,
+		compactionReasons,
+		writeJournalObservation: writeObservation ?? latest.writeJournalObservation,
+		commandEffectObservation: commandObservation,
+	};
+}
+
+function identityContentHash(identity: StreamingPathIdentity): string | null {
+	return identity.kind === "missing" ? null : identity.sha256;
+}
+
+function guardEntryMap(guard: Readonly<WorkspaceGuardRecord>): Map<string, WorkspaceGuardEntry> {
+	return new Map(guard.entries.map((entry) => [entry.path, entry]));
+}
+
+function guardChangesAreJournalBound(
+	before: Readonly<WorkspaceGuardRecord>,
+	current: Readonly<WorkspaceGuardRecord>,
+	journalPaths: ReadonlySet<string>,
+): boolean {
+	if (before.git_head !== current.git_head) return false;
+	const prior = guardEntryMap(before);
+	const next = guardEntryMap(current);
+	for (const path of new Set([...prior.keys(), ...next.keys()])) {
+		if (canonicalHash(prior.get(path) ?? null) !== canonicalHash(next.get(path) ?? null) && !journalPaths.has(path)) return false;
+	}
+	return true;
+}
+
+async function verifiedRecipeRunIds(
+	checked: CheckedInput,
+	observation: Readonly<WorkerCommandEffectRuntimeObservation>,
+): Promise<string[] | undefined> {
+	if (!validateWorkerCommandEffectRuntimeObservation(observation) || observation.state === "failed") return undefined;
+	const runIds = observation.entries.flatMap((entry) => entry.run_id === null ? [] : [entry.run_id]).sort(byteCompare);
+	if (!sortedUniqueStrings(runIds)) return undefined;
+	for (const runId of runIds) {
+		const receipt = await readStrictBoundCommandEffectReceipt({
+			project_root: checked.projectRoot,
+			delegation_id: checked.delegationId,
+			contract_hash: checked.contract.contract_hash,
+			run_id: runId,
+		});
+		if (!receipt.ok) return undefined;
+	}
+	return runIds;
+}
+
+async function buildDurableWorkerCheckpoint(
+	checked: CheckedInput,
+	prepared: Readonly<PreparedDelegationChangeSetLifecycleV2>,
+	worker: Readonly<WorkerRunResult>,
+	commandObservation: Readonly<WorkerCommandEffectRuntimeObservation>,
+	attempt: number,
+	parentCheckpointHash: string | null,
+	machineState: "CHECKPOINTED" | "PAUSED_BUDGET",
+	createdAt: string,
+	exec: ExecFn,
+	storageOptions: DelegationTransactionStorageOptions | undefined,
+): Promise<Readonly<WorkerCheckpointV1> | undefined> {
+	const journalRead = await readWorkerWriteJournal({
+		project_root: checked.projectRoot,
+		delegation_id: checked.delegationId,
+		contract_hash: checked.contract.contract_hash,
+	});
+	if (!journalRead.ok || journalRead.value.state !== "OPEN"
+		|| journalRead.value.operations.some((operation) => operation.status !== "completed")) return undefined;
+	const journal = journalRead.value;
+	const currentGuard = await collectWorkspaceGuard({ project_root: checked.projectRoot, exec });
+	if (!currentGuard.ok) return undefined;
+	const journalPaths = [...new Set(journal.operations.map((operation) => operation.path))].sort(byteCompare);
+	if (!guardChangesAreJournalBound(prepared.before_guard, currentGuard.guard, new Set(journalPaths))) return undefined;
+	const currentIdentities = await captureStreamingIdentities({
+		project_root: checked.projectRoot,
+		paths: journalPaths,
+	});
+	if (!currentIdentities.ok) return undefined;
+	const currentByPath = new Map(currentIdentities.identities.map((identity) => [identity.path, identity]));
+	const journalHash = computeWorkerWriteJournalHash(journal);
+	const touchedPaths = journalPaths.map((path) => {
+		const operations = journal.operations.filter((operation) => operation.path === path);
+		const first = operations[0];
+		const last = operations.at(-1);
+		const current = currentByPath.get(path);
+		if (first === undefined || last === undefined || last.status !== "completed" || current === undefined
+			|| !streamingIdentityEqual(last.after, current)) return undefined;
+		return {
+			path,
+			before_hash: identityContentHash(first.before),
+			current_hash: identityContentHash(current),
+			journal_hash: journalHash,
+		};
+	});
+	if (touchedPaths.some((entry) => entry === undefined)) return undefined;
+	const completedRecipeRunIds = await verifiedRecipeRunIds(checked, commandObservation);
+	if (completedRecipeRunIds === undefined) return undefined;
+	const profile = worker.spendProfile === "extended" ? "extended" : "standard";
+	const remaining = remainingWorkerBudgetV1(
+		profile,
+		worker.spendState.turns,
+		worker.spendState.totalTokens,
+		worker.spendState.outputTokens,
+	);
+	if (remaining === undefined) return undefined;
+	const built = buildWorkerCheckpointV1({
+		delegation_id: checked.delegationId,
+		contract_hash: checked.contract.contract_hash,
+		attempt,
+		parent_checkpoint_hash: parentCheckpointHash,
+		runtime_build_identity: WORKBENCH_RUNTIME_BUILD_IDENTITY.source_hash,
+		before_binding_hash: prepared.before_guard.workspace_guard_hash,
+		current_binding_hash: currentGuard.guard.workspace_guard_hash,
+		touched_paths: touchedPaths as NonNullable<(typeof touchedPaths)[number]>[],
+		completed_recipe_run_ids: completedRecipeRunIds,
+		cumulative_usage: structuredClone(worker.usage),
+		cumulative_turns: worker.spendState.turns,
+		remaining_budget: remaining,
+		machine_state: machineState,
+		worker_advisory: worker.checkpointRequest?.advisory ?? { completed_criteria: [], remaining_criteria: [] },
+		created_at: createdAt,
+	});
+	if (!built.ok) return undefined;
+	const published = await publishDelegationWorkerCheckpointV1(checked.projectRoot, built.value, storageOptions);
+	return published.ok && published.value.checkpoint_hash === built.value.checkpoint_hash ? published.value : undefined;
+}
+
 /** Execute one fresh generation-1 delegation under the v2 transaction. */
 export async function executeDelegationV2(input: ExecuteDelegationV2Input): Promise<DelegationExecutionV2Result> {
 	const checked = checkInput(input);
@@ -523,6 +780,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 		}
 		return failure("start_failed", checked, input, { durable_state: state });
 	}
+	let releaseIncompleteOwner = false;
 	try {
 	let changeSetPrepared: Readonly<PreparedDelegationChangeSetLifecycleV2>;
 	if (input.exec === undefined) {
@@ -595,43 +853,135 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 	}
 	state = running.value;
 
-	let worker: WorkerRunResult;
-	try {
-		worker = await (input.runWorker ?? runPinnedWorker)({
-			projectRoot: checked.projectRoot,
-			contract: workerTask(checked.contract),
-			runtimeIdentity: {
-				delegationId: checked.delegationId,
-				contractHash: checked.contract.contract_hash,
-				...(input.checkoutOperationToken === undefined
-					? {}
-					: { checkoutOperationToken: input.checkoutOperationToken }),
-			},
-			timeoutMs: checked.contract.timeout_seconds * 1_000,
-			signal: input.signal,
-			onProgress: input.onProgress,
-			spendProfile: checked.contract.budget_profile as WorkerSpendProfile,
-		});
-	} catch (error) {
-		const preflightCode = workerRunnerPreflightFailureCode(error);
-		const recoveryReason = preflightCode === "REPAIR_AUTHORITY_UNAVAILABLE"
-			? RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRepairAuthorityUnavailable
-			: preflightCode === "REPAIR_AUTHORITY_INVALID"
-				? RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRepairAuthorityInvalid
-				: preflightCode === "REPAIR_CAPSULE_TOO_LARGE"
-					? RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRepairCapsuleTooLarge
-					: RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed;
-		state = await attemptRecovery(checked, state, input.clock, storageOptions,
-			recoveryReason);
-		return failure("runner_failed", checked, input, {
-			durable_state: state,
-			...(preflightCode === undefined ? {} : { runner_preflight_failure_code: preflightCode }),
-		});
+	let worker: WorkerRunResult | undefined;
+	const workerAttempts: WorkerRunResult[] = [];
+	let attempt = 1;
+	let initialSpendState: Readonly<{ turns: number; totalTokens: number; outputTokens: number }> | undefined;
+	let continuationCapsule: Readonly<Record<string, unknown>> | undefined;
+	let parentCheckpointHash: string | null = null;
+	for (;;) {
+		let currentAttempt: WorkerRunResult;
+		try {
+			currentAttempt = await (input.runWorker ?? runPinnedWorker)({
+				projectRoot: checked.projectRoot,
+				contract: workerTask(checked.contract),
+				runtimeIdentity: {
+					delegationId: checked.delegationId,
+					contractHash: checked.contract.contract_hash,
+					...(input.checkoutOperationToken === undefined
+						? {}
+						: { checkoutOperationToken: input.checkoutOperationToken }),
+				},
+				timeoutMs: checked.contract.timeout_seconds * 1_000,
+				signal: input.signal,
+				onProgress: input.onProgress,
+				spendProfile: checked.contract.budget_profile as WorkerSpendProfile,
+				attempt,
+				...(initialSpendState === undefined ? {} : { initialSpendState }),
+				...(continuationCapsule === undefined ? {} : { continuationCapsule }),
+			});
+		} catch (error) {
+			const preflightCode = workerRunnerPreflightFailureCode(error);
+			const recoveryReason = preflightCode === "REPAIR_AUTHORITY_UNAVAILABLE"
+				? RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRepairAuthorityUnavailable
+				: preflightCode === "REPAIR_AUTHORITY_INVALID"
+					? RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRepairAuthorityInvalid
+					: preflightCode === "REPAIR_CAPSULE_TOO_LARGE"
+						? RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRepairCapsuleTooLarge
+						: RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed;
+			state = await attemptRecovery(checked, state, input.clock, storageOptions, recoveryReason);
+			return failure("runner_failed", checked, input, {
+				durable_state: state,
+				...(preflightCode === undefined ? {} : { runner_preflight_failure_code: preflightCode }),
+			});
+		}
+		if (!fixedWorkerIdentity(currentAttempt)) {
+			state = await attemptRecovery(checked, state, input.clock, storageOptions,
+				RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerIdentityInvalid);
+			return failure("worker_identity_invalid", checked, input, { durable_state: state });
+		}
+		workerAttempts.push(currentAttempt);
+		const aggregate = aggregateWorkerAttempts(workerAttempts);
+		if (aggregate === undefined || aggregate.commandEffectObservation === undefined) {
+			state = await attemptRecovery(checked, state, input.clock, storageOptions,
+				RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed);
+			return failure("checkpoint_failed", checked, input, { durable_state: state });
+		}
+		const currentFailure = workerRunFailure(currentAttempt);
+		const cumulativeHard = currentAttempt.spendHardExceeded.turns
+			|| currentAttempt.spendHardExceeded.totalTokens || currentAttempt.spendHardExceeded.outputTokens;
+		if (cumulativeHard) {
+			const checkpointAt = safeClock(input.clock);
+			const checkpoint: Readonly<WorkerCheckpointV1> | undefined = checkpointAt === undefined ? undefined : await buildDurableWorkerCheckpoint(
+				checked, changeSetPrepared, aggregate, aggregate.commandEffectObservation, attempt,
+				parentCheckpointHash, "PAUSED_BUDGET", checkpointAt, input.exec, storageOptions,
+			);
+			if (checkpoint === undefined) {
+				state = await attemptRecovery(checked, state, input.clock, storageOptions,
+					RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed);
+				return failure("checkpoint_failed", checked, input, { durable_state: state });
+			}
+			releaseIncompleteOwner = true;
+			return {
+				ok: true,
+				status: "PAUSED_BUDGET",
+				delegation_id: checked.delegationId,
+				before: structuredClone(preparedBefore),
+				durable_state: structuredClone(state),
+				checkpoint,
+				worker_failure_code: currentFailure?.code,
+			};
+		}
+		if (currentAttempt.checkpointRequest !== undefined) {
+			if (currentFailure !== undefined || currentAttempt.checkpointRequest.attempt !== attempt) {
+				state = await attemptRecovery(checked, state, input.clock, storageOptions,
+					RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed);
+				return failure("checkpoint_failed", checked, input, { durable_state: state });
+			}
+			const checkpointAt = safeClock(input.clock);
+			const checkpoint: Readonly<WorkerCheckpointV1> | undefined = checkpointAt === undefined ? undefined : await buildDurableWorkerCheckpoint(
+				checked, changeSetPrepared, aggregate, aggregate.commandEffectObservation, attempt,
+				parentCheckpointHash, "CHECKPOINTED", checkpointAt, input.exec, storageOptions,
+			);
+			if (checkpoint === undefined) {
+				state = await attemptRecovery(checked, state, input.clock, storageOptions,
+					RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed);
+				return failure("checkpoint_failed", checked, input, { durable_state: state });
+			}
+			const currentGuard = await collectWorkspaceGuard({ project_root: checked.projectRoot, exec: input.exec });
+			const capsule = workerCheckpointContinuationCapsuleV1(checkpoint);
+			if (!currentGuard.ok || capsule === undefined || !validateWorkerCheckpointContinuationV1(checkpoint, {
+				delegation_id: checked.delegationId,
+				contract_hash: checked.contract.contract_hash,
+				runtime_build_identity: WORKBENCH_RUNTIME_BUILD_IDENTITY.source_hash,
+				expected_attempt: attempt,
+				parent_checkpoint_hash: parentCheckpointHash,
+				before_binding_hash: changeSetPrepared.before_guard.workspace_guard_hash,
+				current_binding_hash: currentGuard.guard.workspace_guard_hash,
+				allowed_paths: checked.contract.allowed_paths,
+				active_attempt: false,
+			})) {
+				state = await attemptRecovery(checked, state, input.clock, storageOptions,
+					RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed);
+				return failure("checkpoint_failed", checked, input, { durable_state: state, checkpoint });
+			}
+			parentCheckpointHash = checkpoint.checkpoint_hash;
+			initialSpendState = {
+				turns: checkpoint.cumulative_turns,
+				totalTokens: checkpoint.cumulative_usage.totalTokens,
+				outputTokens: checkpoint.cumulative_usage.output,
+			};
+			continuationCapsule = capsule;
+			attempt += 1;
+			continue;
+		}
+		worker = aggregate;
+		break;
 	}
-	if (!fixedWorkerIdentity(worker)) {
+	if (worker === undefined) {
 		state = await attemptRecovery(checked, state, input.clock, storageOptions,
-			RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerIdentityInvalid);
-		return failure("worker_identity_invalid", checked, input, { durable_state: state });
+			RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed);
+		return failure("runner_failed", checked, input, { durable_state: state });
 	}
 	const runnerFailure = workerRunFailure(worker);
 	// Provider transport/identity success is independent from the overall
@@ -868,7 +1218,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 	} finally {
 		// A still-incomplete state retains the owner as crash evidence. Terminal
 		// states remove only the exact token; cleanup never downgrades a result.
-		if (state.status !== "PREPARED" && state.status !== "RUNNING" && state.status !== "COMMITTING") {
+		if (releaseIncompleteOwner || (state.status !== "PREPARED" && state.status !== "RUNNING" && state.status !== "COMMITTING")) {
 			await releaseDelegationExecutionOwnerV2(
 				checked.projectRoot,
 				state,

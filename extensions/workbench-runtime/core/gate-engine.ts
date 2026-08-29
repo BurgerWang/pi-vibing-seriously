@@ -1105,7 +1105,7 @@ export function evaluateWorkerFirstAssertion(
 ): { status: "PASS" | "FAIL" | "NOT_RUN"; detail: string } {
 	switch (name) {
 		case "strict-policy-active": {
-			if (facts.writePolicy === "worker-first-strict") return { status: "PASS", detail: "fixed Sol/Luna worker-first-strict policy is active" };
+			if (facts.writePolicy === "worker-first-strict") return { status: "PASS", detail: "development-first direct-write policy is active (legacy compatibility id worker-first-strict)" };
 			// The runtime always resolves the policy for the current actor
 			// (worker-first-strict for approved Sol, null otherwise) — null is
 			// a negative compliance fact, not a missing one.
@@ -1113,7 +1113,7 @@ export function evaluateWorkerFirstAssertion(
 		}
 		case "no-unauthorized-commander-writes": {
 			if (facts.commanderWritesDenied === true) {
-				return { status: "PASS", detail: "commander edit/write is locked unless an explicit temporary lease is active" };
+				return { status: "PASS", detail: "high-risk commander writes require an explicit lease; ordinary project writes remain direct" };
 			}
 			if (facts.blockedCommanderWriteAttempts !== null && facts.blockedCommanderWriteAttempts === 0) {
 				return { status: "PASS", detail: "zero unauthorized commander write attempts" };

@@ -74,6 +74,7 @@ import { beginWriteJournalOperation, completeWriteJournalOperation } from "../ex
 import { beginRunTransaction, commitRunTransaction } from "../extensions/workbench-runtime/core/run-transaction.ts";
 import {
 	WorkerRunnerPreflightError,
+	type RunWorkerOptions,
 	type WorkerRunResult,
 } from "../extensions/workbench-runtime/worker/runner.ts";
 
@@ -824,7 +825,7 @@ test("execution v2: execution-owner publication failure closes PREPARED before r
 
 test("execution v2: ambiguous owner prepublication failure is closed under the exact start lock before same-process retry", async (t) => {
 	const projectRoot = await root(t);
-	const delegationId = id(48);
+	const delegationId = id(50);
 	const start = await acquireProjectDelegationStartLockV1({
 		project_root: projectRoot,
 		delegation_id: delegationId,
@@ -891,7 +892,7 @@ test("execution v2: ambiguous owner prepublication failure is closed under the e
 	if (retry.ok) assert.equal((await releaseProjectDelegationStartLockV1(retry.value)).ok, true);
 });
 
-test("execution v2: a hard turn boundary with exit 0 commits INTERRUPTED, never PENDING_REVIEW", async (t) => {
+test("execution v2: a cumulative hard turn boundary pauses without commit or semantic repair", async (t) => {
 	const projectRoot = await root(t);
 	const delegationId = id(46);
 	const report = completeReport(["src/changed.ts"]);
@@ -910,23 +911,121 @@ test("execution v2: a hard turn boundary with exit 0 commits INTERRUPTED, never 
 		after(["src/changed.ts"]),
 		markedWorker,
 	));
+	assert.equal(result.ok, true);
+	if (!result.ok) return;
+	assert.equal(result.status, "PAUSED_BUDGET");
+	if (result.status !== "PAUSED_BUDGET") return;
+	assert.equal(result.worker_failure_code, "SPEND_TURN_LIMIT");
+	assert.equal(result.durable_state.status, "RUNNING");
+	assert.deepEqual(result.durable_state.postcondition_reasons, []);
+	assert.equal(result.durable_state.terminal_outcome, null);
+	assert.equal(result.checkpoint.machine_state, "PAUSED_BUDGET");
+	assert.equal(result.checkpoint.cumulative_turns, 64);
+	const committed = await readDelegationCommittedGenerationV2(projectRoot, delegationId);
+	assert.equal(committed.ok, false, "a paused checkpoint is not a committed generation");
+});
+
+test("execution v2: a soft checkpoint continues in one delegation with cumulative spend and one final generation", async (t) => {
+	const projectRoot = await root(t);
+	const delegationId = id(47);
+	const bound = contract("implementation");
+	const calls: RunWorkerOptions[] = [];
+	const first = worker("checkpoint handoff", {
+		turns: 32,
+		spendState: { turns: 32, totalTokens: 480, outputTokens: 64 },
+		spendBand: "soft",
+		spendReasons: ["turns"],
+		spendSoftReached: { turns: true, totalTokens: false, outputTokens: false },
+		checkpointRequest: {
+			attempt: 1,
+			advisory: { completed_criteria: [], remaining_criteria: ["The transaction is complete and authority-bound."] },
+		},
+	});
+	first.usage = {
+		input: 320, output: 64, cacheRead: 96, cacheWrite: 0, totalTokens: 480,
+		cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 },
+	};
+	const second = worker(completeReport(["src/changed.ts"]), {
+		turns: 2,
+		spendState: { turns: 34, totalTokens: 640, outputTokens: 104 },
+		spendBand: "soft",
+		spendReasons: ["turns"],
+		spendSoftReached: { turns: true, totalTokens: false, outputTokens: false },
+	});
+	const before = await collectGitFacts(projectRoot, realExec);
+	const result = await executeDelegationV2({
+		projectRoot,
+		delegationId,
+		contract: bound,
+		before,
+		workerIdentity: { ...WORKER_IDENTITY },
+		clock: clock(),
+		exec: realExec,
+		runWorker: async (options) => {
+			calls.push(options);
+			if (calls.length === 1) {
+				return journalWorker(projectRoot, delegationId, bound.contract_hash, ["src/changed.ts"], first);
+			}
+			return structuredClone(second);
+		},
+	});
+	assert.equal(result.ok, true, result.ok ? "" : result.code);
+	if (!result.ok || result.status === "PAUSED_BUDGET") return;
+	assert.equal(result.status, "PENDING_REVIEW");
+	assert.equal(calls.length, 2);
+	assert.equal(calls[0]!.attempt, 1);
+	assert.equal(calls[1]!.attempt, 2);
+	assert.deepEqual(calls[1]!.initialSpendState, { turns: 32, totalTokens: 480, outputTokens: 64 });
+	assert.equal((calls[1]!.continuationCapsule as { attempt?: number }).attempt, 2);
+	assert.equal(result.result.turns, 34);
+	assert.equal(result.result.usage.totalTokens, 640);
+	const committed = await readDelegationCommittedGenerationV2(projectRoot, delegationId);
+	assert.equal(committed.ok, true);
+	if (committed.ok) assert.equal(committed.value.state.generation, 1);
+});
+
+test("execution v2: unknown out-of-journal drift blocks automatic checkpoint continuation", async (t) => {
+	const projectRoot = await root(t);
+	const delegationId = id(61);
+	const bound = contract("implementation");
+	const first = worker("checkpoint handoff", {
+		turns: 32,
+		spendState: { turns: 32, totalTokens: 480, outputTokens: 64 },
+		spendBand: "soft",
+		spendReasons: ["turns"],
+		spendSoftReached: { turns: true, totalTokens: false, outputTokens: false },
+		checkpointRequest: {
+			attempt: 1,
+			advisory: { completed_criteria: [], remaining_criteria: ["The transaction is complete and authority-bound."] },
+		},
+	});
+	first.usage = {
+		input: 320, output: 64, cacheRead: 96, cacheWrite: 0, totalTokens: 480,
+		cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 },
+	};
+	const before = await collectGitFacts(projectRoot, realExec);
+	let calls = 0;
+	const result = await executeDelegationV2({
+		projectRoot,
+		delegationId,
+		contract: bound,
+		before,
+		workerIdentity: { ...WORKER_IDENTITY },
+		clock: clock(),
+		exec: realExec,
+		runWorker: async () => {
+			calls += 1;
+			const observed = await journalWorker(projectRoot, delegationId, bound.contract_hash, ["src/changed.ts"], first);
+			await writeFile(join(projectRoot, "outside.txt"), "unknown writer\n");
+			return observed;
+		},
+	});
 	assert.equal(result.ok, false);
 	if (result.ok) return;
-	assert.equal(result.code, "postconditions_failed");
-	assert.equal(result.worker_failure_code, "SPEND_TURN_LIMIT");
-	assert.equal(result.durable_state?.status, "INTERRUPTED");
-	assert.deepEqual(result.durable_state?.postcondition_reasons, ["WORKER_RUN_FAILED"]);
-	assert.equal(result.durable_state?.terminal_outcome?.provider_success, true);
-	assert.equal(result.durable_state?.terminal_outcome?.worker_success, false);
+	assert.equal(result.code, "checkpoint_failed");
+	assert.equal(calls, 1, "unknown drift must not start attempt N+1");
 	const committed = await readDelegationCommittedGenerationV2(projectRoot, delegationId);
-	assert.equal(committed.ok, true, committed.ok ? "" : committed.error.code);
-	if (!committed.ok) return;
-	assert.equal(committed.value.state.status, "INTERRUPTED");
-	for (const name of ["after.json", "usage.json", "worker-summary.json"] as const) {
-		const record = committed.value.records[name] as Record<string, unknown>;
-		assert.equal(record.worker_success, false, name);
-		assert.equal(record.worker_failure_code, "SPEND_TURN_LIMIT", name);
-	}
+	assert.equal(committed.ok, false);
 });
 
 test("execution v2: create then edit the same new file commits with missing pre-worker authority", async (t) => {
@@ -1144,25 +1243,6 @@ test("execution v2: complete machine facts commit postcondition failures as fail
 			reason: "EXIT_CODE_NOT_ZERO",
 			absentReason: "PROVIDER_NOT_SUCCESS",
 			workerFailureCode: "EXIT_CODE_NONZERO",
-			expectedStatus: "INTERRUPTED",
-		},
-		{
-			name: "legacy local turn stop is not a provider failure",
-			kind: "implementation",
-			after: after(["src/changed.ts"]),
-			worker: worker(completeReport(["src/changed.ts"]), {
-				exitCode: 143,
-				turns: 64,
-				errorMessage: "Worker cumulative spend hard budget reached (profile standard): turns 64/64.",
-				spendState: { turns: 64, totalTokens: 160, outputTokens: 40 },
-				spendBand: "hard",
-				spendReasons: ["turns"],
-				spendSoftReached: { turns: true, totalTokens: false, outputTokens: false },
-				spendHardExceeded: { turns: true, totalTokens: false, outputTokens: false },
-			}),
-			reason: "EXIT_CODE_NOT_ZERO",
-			absentReason: "PROVIDER_NOT_SUCCESS",
-			workerFailureCode: "SPEND_TURN_LIMIT",
 			expectedStatus: "INTERRUPTED",
 		},
 		{
@@ -1424,6 +1504,7 @@ test("execution v2: a pre-dirty touched path remains journal-attributed without 
 	const result = await executeDelegationV2(await input(projectRoot, delegationId, "implementation", after(["src/predirty.ts"]), worker(report)));
 	assert.equal(result.ok, true);
 	if (!result.ok) return;
+	if (result.status === "PAUSED_BUDGET") assert.fail("unexpected budget pause");
 	const committed = await readDelegationCommittedGenerationV2(projectRoot, delegationId);
 	assert.equal(committed.ok, true);
 	if (!committed.ok) return;
@@ -1538,6 +1619,7 @@ test("execution v2: report, stop reason, and worker summary are redacted from th
 	));
 	assert.equal(result.ok, true);
 	if (!result.ok) return;
+	if (result.status === "PAUSED_BUDGET") assert.fail("unexpected budget pause");
 	const committed = await readDelegationCommittedGenerationV2(projectRoot, delegationId);
 	assert.equal(committed.ok, true);
 	if (!committed.ok) return;

@@ -33,6 +33,7 @@ import {
 	readDelegationTerminalNegativeSolAuthorityV1,
 	readDelegationTransactionV2,
 } from "./delegation-transaction-storage.ts";
+import { collectFinalizationRepairRebaseAuthorityV1 } from "./delegation-repair-rebase.ts";
 import { registerExactRepairCommandV1 } from "./exact-repair-command.ts";
 import { runExactRepairServiceV1 } from "./exact-repair-service.ts";
 import { readExactRepairSuccessorV1 } from "./exact-repair-successor.ts";
@@ -268,6 +269,11 @@ export function registerRuntimeWorkbenchToolsV1(
 			readTransaction: readDelegationTransactionV2,
 		}),
 	});
+	// Automatic delivery continuation is Commander-owned. Registering its
+	// before_agent_start hook in a Luna child injects candidate/Gate recovery
+	// advice into the active implementation turn and can make a valid DEV
+	// worker defer with GATE_NOT_READY.
+	const automaticDeliveryContinuationEnabled = controller.workerRoleContext.role !== "worker";
 	registerExactRepairCommandV1({
 		pi: controller.pi,
 		execution: delegateExecution,
@@ -350,6 +356,8 @@ export function registerRuntimeWorkbenchToolsV1(
 		execution: delegateExecution,
 		serviceDependencies: {
 			collectCurrentBinding: controller.delegationSession.collectCurrentBinding,
+			collectFinalizationRebase: (projectRoot, transaction) =>
+				collectFinalizationRepairRebaseAuthorityV1({ projectRoot, transaction, exec: controller.exec }),
 			readCommittedGeneration: readDelegationCommittedGenerationV2,
 			readReview: readDelegationReviewV2,
 			readTerminalNegativeRepair: readDelegationTerminalNegativeSolAuthorityV1,
@@ -363,7 +371,7 @@ export function registerRuntimeWorkbenchToolsV1(
 		reconcileProjectAuthority: controller.delegationSession.reconcileProjectAuthority,
 	});
 	executeModelRepairAlias = exactRepairToolExecution.executeDelegateAlias;
-	automaticDeliveryContinuation.registerToolResultLocatorCaptureBeforeMiddleware();
+	if (automaticDeliveryContinuationEnabled) automaticDeliveryContinuation.registerToolResultLocatorCaptureBeforeMiddleware();
 	registerToolResultMiddleware({
 		pi: controller.pi,
 		workerJournalActive: controller.workerRoleContext.role === "worker" && controller.workerRoleContext.taskKind === "implementation",
@@ -400,7 +408,7 @@ export function registerRuntimeWorkbenchToolsV1(
 			}
 			: {}),
 	});
-	automaticDeliveryContinuation.registerLifecycleListenersAfterMiddleware();
+	if (automaticDeliveryContinuationEnabled) automaticDeliveryContinuation.registerLifecycleListenersAfterMiddleware();
 	registerToolCallGuard({
 		pi: controller.pi,
 		toolCallBlockReason: controller.streamingToolCallBlockReason,
@@ -428,6 +436,6 @@ export function registerRuntimeWorkbenchToolsV1(
 
 	return {
 		hasPendingAutomaticDeliveryContinuation: () =>
-			automaticDeliveryContinuation.hasPendingBeforeAgentContinuation(),
+			automaticDeliveryContinuationEnabled && automaticDeliveryContinuation.hasPendingBeforeAgentContinuation(),
 	};
 }

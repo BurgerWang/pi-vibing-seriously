@@ -1,0 +1,281 @@
+{
+  "format_version": 2,
+  "observed_at": "2026-08-28T15:41:56+00:00",
+  "purpose": "Stage 2 development-throughput exit comparison against pi-development-throughput-v1; development evidence only",
+  "overall_verdict": "PASS",
+  "authority_boundary": "This report is not Gate, release, production, research-acceptance, or profitability authority.",
+  "privacy": {
+    "contains_prompts": false,
+    "contains_file_contents": false,
+    "contains_secrets": false,
+    "contains_user_data": false,
+    "raw_sessions_committed": false
+  },
+  "baseline": {
+    "path": "docs/baselines/pi-development-throughput-v1.json",
+    "sha256": "4f85200c3a150ba251127cdf78cc344438f8fb1c4c4d73d95492be0caa829ec4"
+  },
+  "pre_remediation_snapshot": {
+    "observed_at": "2026-08-28T13:30:35+00:00",
+    "overall_verdict": "FAIL",
+    "ordinary_first_write_median_ms": 17422,
+    "ordinary_authority_only_file_delta_median": 12,
+    "ordinary_authority_only_byte_delta_median": 26417,
+    "cross_file_complete_file_delta": 15,
+    "cross_file_complete_byte_delta": 49515,
+    "orientation_proxy_worker_total_token_reduction_pct": 19.6
+  },
+  "implemented_architecture": {
+    "ordinary_dev_surface_tools": 19,
+    "ordinary_edit_write": "direct after canonical project-relative path and realpath containment",
+    "high_risk_lease_boundary": [
+      "dependencies and lockfiles",
+      "security, authentication, permission, policy, credentials, secrets, and crypto",
+      "deployment, infrastructure, migration, and release paths",
+      ".pi and repository automation control paths"
+    ],
+    "free_bash": "blocked for approved Sol",
+    "foreign_tools": "blocked for approved Sol",
+    "delegation": "optional bounded execution path",
+    "candidate_gate_receipt_repair_contracts": "unchanged",
+    "exact_edit_fast_path": "When the user supplies the exact ordinary path and exact old/new text, generated project instructions request one direct edit attempt before a read; mismatch falls back to inspection."
+  },
+  "toolchain": {
+    "head": "231c3931e93295095e6c6b4f7a7013deff6443e3",
+    "working_tree_candidate": true,
+    "node": "v26.7.0",
+    "pi": "0.84.2",
+    "parent_model": "openai-codex/gpt-5.6-sol",
+    "parent_reasoning": "high",
+    "worker_process_spawned": false,
+    "runtime_source_hash": "sha256:03b824564577808d104ddd7edb19125f6a8dbb6e510a1b3a6a485cfe2e95e25f",
+    "package_lock_sha256": "b1f6ba0375762a5866fa326d2feb180035c19e1943dd5f3a00a56aff4fa553db",
+    "recipes_sha256": "f4cb7d2aa624054e49a2cc349d5e66b64dc5c091e0e3935f2ae32d4a0468f7c0",
+    "runtime_entry_sha256": "7a8d386aa9024e17a268f1b159689c1192710e368f2442669adcebe4b3ccfefa",
+    "generic_agents_template_sha256": "a87c46d676a03083680db43ca7c5f387b1761db786b0a8869a2d2d1db248e180",
+    "quant_agents_template_sha256": "9e3540763f925b2a1a43cf2b575ff637645d81fe296426577c2c4aa8908dc8e4"
+  },
+  "methodology": {
+    "fixture": "fresh isolated synthetic Git repositories using tracked text files and a generic development-first project contract",
+    "ordinary_sample_count": 3,
+    "cross_file_sample_count": 1,
+    "read_only_status_sample_count": 1,
+    "first_write": "first target-file mtime in milliseconds minus the parent user-message timestamp",
+    "wall": "final parent assistant-message timestamp minus the parent user-message timestamp",
+    "authority_only_persistence": "new files and bytes under .pi/workbench/delegations",
+    "complete_persistence": "all new files and bytes under .pi/workbench except the pre-existing project.yaml",
+    "manual_governance_directives": "explicit lifecycle tools named or sequenced by the ordinary user task",
+    "repeated_orientation": "worker process/call/token activity plus pre-edit read calls; parent request-token aggregate is recorded separately and is not presented as a total-token savings claim",
+    "caveat": "Provider latency is variable. The frozen first-write exit is evaluated on the three-sample median, and the edit-first path applies only when path and old/new text are exact."
+  },
+  "ordinary_small_change": {
+    "baseline": {
+      "manual_governance_directives": 3,
+      "workbench_tool_calls": 3,
+      "time_to_first_effective_write_ms": 9919,
+      "wall_ms": 28233,
+      "authority_only_file_delta": 12,
+      "authority_only_byte_delta": 24022,
+      "worker_uncached_input_tokens": 6157,
+      "worker_total_tokens": 24686
+    },
+    "samples": [
+      {
+        "label": "direct-fast-ordinary-1",
+        "session_sha256": "b1c1ab27eb384e357340f9a6409ddcaf109890ca1421c021f45a74bb016c6c42",
+        "time_to_first_effective_write_ms": 3707,
+        "wall_ms": 3712,
+        "manual_governance_directives": 0,
+        "workbench_tool_calls": 0,
+        "native_tool_calls": ["edit"],
+        "pre_edit_read_calls": 0,
+        "worker_calls": 0,
+        "worker_total_tokens": 0,
+        "authority_only_file_delta": 0,
+        "authority_only_byte_delta": 0,
+        "complete_file_delta": 1,
+        "complete_byte_delta": 3790,
+        "parent_request_token_aggregate": 16423,
+        "parent_uncached_input_token_aggregate": 8677,
+        "outcome": "DIRECT_EDIT_SUCCESS"
+      },
+      {
+        "label": "direct-fast-ordinary-2",
+        "session_sha256": "be9c738c7f2fd7d94260099f14a1161093d938beeb631dcf3356f28d781ff11f",
+        "time_to_first_effective_write_ms": 4037,
+        "wall_ms": 4043,
+        "manual_governance_directives": 0,
+        "workbench_tool_calls": 0,
+        "native_tool_calls": ["edit"],
+        "pre_edit_read_calls": 0,
+        "worker_calls": 0,
+        "worker_total_tokens": 0,
+        "authority_only_file_delta": 0,
+        "authority_only_byte_delta": 0,
+        "complete_file_delta": 1,
+        "complete_byte_delta": 3825,
+        "parent_request_token_aggregate": 16425,
+        "parent_uncached_input_token_aggregate": 998,
+        "outcome": "DIRECT_EDIT_SUCCESS"
+      },
+      {
+        "label": "direct-fast-ordinary-3",
+        "session_sha256": "443fc00ae302e4df50c7518ce04513353e7de0b5ab649e4477ef3cc1e91214f9",
+        "time_to_first_effective_write_ms": 2947,
+        "wall_ms": 2953,
+        "manual_governance_directives": 0,
+        "workbench_tool_calls": 0,
+        "native_tool_calls": ["edit"],
+        "pre_edit_read_calls": 0,
+        "worker_calls": 0,
+        "worker_total_tokens": 0,
+        "authority_only_file_delta": 0,
+        "authority_only_byte_delta": 0,
+        "complete_file_delta": 1,
+        "complete_byte_delta": 3837,
+        "parent_request_token_aggregate": 16415,
+        "parent_uncached_input_token_aggregate": 991,
+        "outcome": "DIRECT_EDIT_SUCCESS"
+      }
+    ],
+    "median": {
+      "time_to_first_effective_write_ms": 3707,
+      "wall_ms": 3712,
+      "manual_governance_directives": 0,
+      "workbench_tool_calls": 0,
+      "pre_edit_read_calls": 0,
+      "worker_calls": 0,
+      "worker_total_tokens": 0,
+      "authority_only_file_delta": 0,
+      "authority_only_byte_delta": 0,
+      "complete_file_delta": 1,
+      "complete_byte_delta": 3825,
+      "parent_request_token_aggregate": 16423,
+      "parent_uncached_input_token_aggregate": 998
+    },
+    "comparison": {
+      "first_write_reduction_pct": 62.6,
+      "wall_reduction_pct": 86.9,
+      "authority_file_reduction_pct": 100.0,
+      "authority_byte_reduction_pct": 100.0,
+      "worker_reorientation_reduction_pct": 100.0
+    }
+  },
+  "cross_file_feature": {
+    "baseline": {
+      "time_to_first_effective_write_ms": 9587,
+      "wall_ms": 26362,
+      "complete_file_delta": 21,
+      "complete_byte_delta": 60424
+    },
+    "current": {
+      "session_sha256": "b946de4a4f75fa6e035558a0e3885f0b2cd74156c7f00e56aa151f8164908089",
+      "time_to_first_effective_write_ms": 6242,
+      "wall_ms": 16210,
+      "manual_governance_directives": 0,
+      "workbench_tool_calls": 1,
+      "native_tool_calls": ["read", "read", "edit", "edit", "workbench_project_inspect", "read", "read"],
+      "worker_calls": 0,
+      "authority_only_file_delta": 0,
+      "authority_only_byte_delta": 0,
+      "complete_file_delta": 1,
+      "complete_byte_delta": 11528,
+      "outcome": "DIRECT_TWO_FILE_SUCCESS"
+    },
+    "comparison": {
+      "first_write_reduction_pct": 34.9,
+      "wall_reduction_pct": 38.5,
+      "complete_file_reduction_pct": 95.2,
+      "complete_byte_reduction_pct": 80.9
+    }
+  },
+  "read_only_status": {
+    "baseline": {
+      "new_receipt_files": 2,
+      "total_appended_or_written_bytes": 5185
+    },
+    "current": {
+      "session_sha256": "88ba7880c632835ed1deaff55455df10f42bdb40ff83efd222e619963c08b4c1",
+      "new_receipt_files": 0,
+      "receipt_bytes_written": 0,
+      "new_delegation_files": 0,
+      "new_cache_telemetry_files": 1,
+      "cache_telemetry_bytes": 3828,
+      "project_business_delta": 0,
+      "outcome": "READ_SUCCESS_WITHOUT_RECEIPT"
+    }
+  },
+  "structural": {
+    "baseline_index_lines": 6263,
+    "current_index_lines": 1994,
+    "index_line_reduction_pct": 68.2,
+    "target_min": 1500,
+    "target_max": 2000,
+    "verdict": "PASS"
+  },
+  "exit_metrics": [
+    {
+      "metric": "ordinary_manual_governance_directives",
+      "target": 0,
+      "observed": 0,
+      "verdict": "PASS"
+    },
+    {
+      "metric": "ordinary_first_write_reduction_pct",
+      "target_min": 50.0,
+      "observed": 62.6,
+      "verdict": "PASS"
+    },
+    {
+      "metric": "ordinary_authority_persistence_reduction_pct",
+      "target_min": 80.0,
+      "observed_files": 100.0,
+      "observed_bytes": 100.0,
+      "verdict": "PASS"
+    },
+    {
+      "metric": "cross_file_complete_persistence_file_reduction_pct",
+      "target_min": 80.0,
+      "observed": 95.2,
+      "verdict": "PASS"
+    },
+    {
+      "metric": "cross_file_complete_persistence_byte_reduction_pct",
+      "target_min": 80.0,
+      "observed": 80.9,
+      "verdict": "PASS"
+    },
+    {
+      "metric": "read_only_new_receipt_files",
+      "target": 0,
+      "observed": 0,
+      "verdict": "PASS"
+    },
+    {
+      "metric": "duplicate_full_validation_for_unchanged_candidate",
+      "target": 0,
+      "observed": 0,
+      "evidence": "tests/ordinary-development-lane.test.ts",
+      "verdict": "PASS"
+    },
+    {
+      "metric": "repeated_worker_orientation_reduction_pct",
+      "target_min": 50.0,
+      "observed": 100.0,
+      "pre_edit_read_calls": 0,
+      "verdict": "PASS"
+    },
+    {
+      "metric": "index_lines",
+      "target": "1500..2000",
+      "observed": 1994,
+      "verdict": "PASS"
+    }
+  ],
+  "remaining_non_throughput_blockers": [
+    "Mace full Candidate validation recipe failed, so no Candidate identity exists.",
+    "Onchain Candidate-bound Gate failed because the project lacks the required standard static, unit, and integration recipe evidence.",
+    "Scalper exact repair successor failed its declared contract check and remains exact-repair pending.",
+    "No release, push, publish, production, research-acceptance, or profitability authority was granted."
+  ]
+}

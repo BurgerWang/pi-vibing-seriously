@@ -31,6 +31,7 @@ import {
 	formatWorkerTask,
 	resolveWorkerTaskKind,
 	WORKER_ALLOWED_PATHS_ENV,
+	WORKER_ATTEMPT_ENV,
 	WORKER_CONTRACT_HASH_ENV,
 	WORKER_DELEGATION_ID_ENV,
 	WORKER_DEPTH_ENV,
@@ -76,10 +77,12 @@ import {
 	addWorkerSpendUsage,
 	EMPTY_WORKER_SPEND_STATE,
 	formatWorkerSpendHardStop,
+	normalizeWorkerSpendState,
 	resolveWorkerSpendProfile,
 	workerSpendBand,
 	workerSpendDimensionFlags,
 	workerSpendReasons,
+	WORKER_INITIAL_SPEND_STATE_ENV,
 	WORKER_SPEND_PROFILE_ENV,
 	type WorkerSpendBand,
 	type WorkerSpendDimensionFlags,
@@ -89,12 +92,16 @@ import {
 } from "../core/worker-spend.ts";
 import { readWorkerRepairCapsule, type WorkerRepairAuthorityResult } from "../core/worker-repair-authority.ts";
 import type { WorkerRepairCapsule } from "../core/worker-repair-capsule.ts";
+import {
+	WORKER_CHECKPOINT_REQUEST_ENTRY_TYPE_V1,
+	type WorkerCheckpointAdvisoryV1,
+} from "../core/worker-checkpoint.ts";
 
 export const WORKER_SYSTEM_PROMPT = `You are the Luna implementation worker in pi-dev-workbench.
 
 Sol owns requirements, cross-cutting architecture, approved scope, semantic diff review, final verification, Gates and verdict. You own local design and the complete source+tests+docs slice inside the contract. Stop for unapproved architecture, security/policy, destructive action or scope expansion.
 
-Inspect relevant files, then implement fully: no stubs or TODO shells. Edit/write only approved paths, issue writes sequentially, never delegate, never use free-form bash and never run final Gates. Run only requested declared mutation:none recipes. A repair uses only its bounded authority facts; do not reopen broad diagnosis or infer prior session/report content.
+Inspect relevant files, then implement fully: no stubs or TODO shells. Edit/write only approved paths, issue writes sequentially, never delegate, never use free-form bash and never run final Gates. Run only explicitly requested declared recipes. A mutating recipe is permitted only when the task names it as an implementation materializer and every declared write/artifact path is approved; never report it as verification. Requested verification recipes remain mutation:none. A repair uses only its bounded authority facts; do not reopen broad diagnosis or infer prior session/report content.
 
 Before the first write, compare planned paths, criteria, requested recipes and remaining spend with the contract; stop if they do not fit. Before reporting, re-read changed paths and check scope, placeholders, generated artifacts and truthful verification without unrelated cleanup.
 
@@ -254,6 +261,8 @@ export interface WorkerRunResult {
 	writeJournalObservation: Readonly<WorkerWriteJournalRuntimeObservation>;
 	/** Machine-only committed recipe identities; assistant report text is never parsed. */
 	commandEffectObservation?: Readonly<WorkerCommandEffectRuntimeObservation>;
+	/** Exact machine checkpoint request observed from the child runtime. */
+	checkpointRequest?: Readonly<{ attempt: number; advisory: WorkerCheckpointAdvisoryV1 }>;
 }
 
 /** Closed, content-free failure categories safe to surface at the public edge. */
@@ -334,6 +343,12 @@ export interface RunWorkerOptions {
 	 * runner accumulates against. Public selection (tool schema) is Phase 3.
 	 */
 	spendProfile?: WorkerSpendProfile;
+	/** Cumulative state from the prior verified checkpoint; never reset between attempts. */
+	initialSpendState?: Readonly<WorkerSpendState>;
+	/** One-based attempt number. Every invocation still uses a fresh --no-session child. */
+	attempt?: number;
+	/** Bounded machine capsule derived from a validated checkpoint, never prior transcript. */
+	continuationCapsule?: Readonly<Record<string, unknown>>;
 	/**
 	 * Optional delegation-v2 runtime identity. Direct/legacy calls omit this
 	 * object and the runner strips any inherited identity values. Present
@@ -347,7 +362,8 @@ export interface RunWorkerOptions {
 export type WorkerRunnerPreflightFailureCode =
 	| "REPAIR_AUTHORITY_UNAVAILABLE"
 	| "REPAIR_AUTHORITY_INVALID"
-	| "REPAIR_CAPSULE_TOO_LARGE";
+	| "REPAIR_CAPSULE_TOO_LARGE"
+	| "CONTINUATION_BUDGET_EXHAUSTED";
 
 /** Closed preflight category; the message never carries provider or worker prose. */
 export class WorkerRunnerPreflightError extends Error {
@@ -442,6 +458,27 @@ function ownDataValue(value: unknown, key: string): unknown {
 	} catch {
 		return undefined;
 	}
+}
+
+function parseWorkerCheckpointRequestV1(entry: unknown, expectedAttempt: number): Readonly<{
+	attempt: number;
+	advisory: WorkerCheckpointAdvisoryV1;
+}> | undefined {
+	if (ownDataValue(entry, "type") !== "custom" || ownDataValue(entry, "customType") !== WORKER_CHECKPOINT_REQUEST_ENTRY_TYPE_V1) return undefined;
+	const data = exactDataRecord(ownDataValue(entry, "data"), [
+		"schema_version", "kind", "attempt", "completed_criteria", "remaining_criteria",
+	]);
+	if (data === undefined || data.schema_version !== 1 || data.kind !== WORKER_CHECKPOINT_REQUEST_ENTRY_TYPE_V1
+		|| data.attempt !== expectedAttempt || !Array.isArray(data.completed_criteria) || !Array.isArray(data.remaining_criteria)) return undefined;
+	const lists = [data.completed_criteria, data.remaining_criteria];
+	if (lists.some((list) => list.length > 64 || !list.every((item) => typeof item === "string" && item.length > 0
+		&& Buffer.byteLength(item, "utf8") <= 400 && !/[\u0000-\u001f\u007f]/u.test(item)))) return undefined;
+	const advisory = {
+		completed_criteria: [...data.completed_criteria].sort(),
+		remaining_criteria: [...data.remaining_criteria].sort(),
+	};
+	if (Buffer.byteLength(JSON.stringify(advisory), "utf8") > 4 * 1024) return undefined;
+	return Object.freeze({ attempt: expectedAttempt, advisory: Object.freeze(advisory) });
 }
 
 function safeCount(value: unknown): value is number {
@@ -593,6 +630,8 @@ function childEnvironment(
 	taskKind: WorkerTaskKind,
 	runtimeIdentity: Readonly<WorkerRuntimeIdentity> | undefined,
 	timeoutMs: number,
+	attempt: number,
+	initialSpendState: Readonly<WorkerSpendState>,
 ): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = { ...process.env };
 	// Parent-session identity/model facts must never masquerade as child facts.
@@ -605,12 +644,16 @@ function childEnvironment(
 	delete env[WORKER_CONTRACT_HASH_ENV];
 	delete env[WORKBENCH_CHECKOUT_OPERATION_TOKEN_ENV];
 	delete env[WORKER_TIMEOUT_MS_ENV];
+	delete env[WORKER_ATTEMPT_ENV];
+	delete env[WORKER_INITIAL_SPEND_STATE_ENV];
 	env[WORKER_ROLE_ENV] = WORKER_ROLE;
 	env[WORKER_DEPTH_ENV] = "1";
 	env[WORKER_PROJECT_ROOT_ENV] = projectRoot;
 	env[WORKER_ALLOWED_PATHS_ENV] = JSON.stringify(allowedPaths);
 	env[WORKER_TASK_KIND_ENV] = taskKind;
 	env[WORKER_TIMEOUT_MS_ENV] = String(timeoutMs);
+	env[WORKER_ATTEMPT_ENV] = String(attempt);
+	env[WORKER_INITIAL_SPEND_STATE_ENV] = JSON.stringify(initialSpendState);
 	// Phase 2: the fixed spend-profile child env contract — the runner ALWAYS
 	// writes a valid resolved profile value here (never empty/malformed).
 	env[WORKER_SPEND_PROFILE_ENV] = spendProfile;
@@ -700,6 +743,15 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 	// retired historical `low` value all resolve to the bounded `standard`
 	// default; explicit `extended` selects the larger bounded-slice profile.
 	const spendProfile = resolveWorkerSpendProfile(options.spendProfile);
+	const initialSpend = normalizeWorkerSpendState(options.initialSpendState);
+	if (options.initialSpendState !== undefined && (
+		initialSpend.turns !== options.initialSpendState.turns
+		|| initialSpend.totalTokens !== options.initialSpendState.totalTokens
+		|| initialSpend.outputTokens !== options.initialSpendState.outputTokens
+	)) throw new WorkerRunnerPreflightError("CONTINUATION_BUDGET_EXHAUSTED");
+	if (workerSpendBand(initialSpend, spendProfile) === "hard") {
+		throw new WorkerRunnerPreflightError("CONTINUATION_BUDGET_EXHAUSTED");
+	}
 	let repairCapsule: WorkerRepairCapsule | undefined;
 	if (options.contract.repairOf !== undefined) {
 		const authority = await (options.readRepairAuthority ?? readWorkerRepairCapsule)(options.projectRoot, options.contract.repairOf);
@@ -715,11 +767,18 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 	// Render the same active profile used by the runner and child env. This
 	// prevents an old/internal `low` contract from advertising a retired
 	// budget while actually running under the defensive standard fallback.
-	const taskText = formatWorkerTask({
+	const baseTaskText = formatWorkerTask({
 		...options.contract,
 		budgetProfile: spendProfile,
 		...(repairCapsule === undefined ? {} : { repairCapsule }),
 	});
+	const attempt = Number.isSafeInteger(options.attempt) && Number(options.attempt) > 0 ? Number(options.attempt) : 1;
+	let taskText = baseTaskText;
+	if (options.continuationCapsule !== undefined) {
+		const capsule = JSON.stringify(options.continuationCapsule);
+		if (attempt < 2 || Buffer.byteLength(capsule, "utf8") > 4 * 1024) throw new Error("Worker continuation capsule is invalid");
+		taskText = `${baseTaskText}\n\nMachine continuation attempt: ${attempt}\n${capsule}`;
+	}
 	if (Buffer.byteLength(taskText, "utf8") > MAX_TASK_ARGUMENT_BYTES) {
 		throw new Error(`Worker task contract exceeds ${MAX_TASK_ARGUMENT_BYTES} bytes`);
 	}
@@ -765,7 +824,9 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 		compactionCount: 0,
 		compactionReasons: [],
 		spendProfile,
-		spendState: { ...EMPTY_WORKER_SPEND_STATE },
+		spendState: options.initialSpendState === undefined
+			? { ...EMPTY_WORKER_SPEND_STATE }
+			: initialSpend,
 		spendBand: "ok",
 		spendReasons: [],
 		spendSoftReached: { turns: false, totalTokens: false, outputTokens: false },
@@ -783,7 +844,7 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 				shell: false,
 				detached: process.platform !== "win32",
 				stdio: ["ignore", "pipe", "pipe"],
-				env: childEnvironment(options.projectRoot, options.contract.allowedPaths, spendProfile, taskKind, runtimeIdentity, options.timeoutMs),
+				env: childEnvironment(options.projectRoot, options.contract.allowedPaths, spendProfile, taskKind, runtimeIdentity, options.timeoutMs, attempt, initialSpend),
 			});
 			const startedAtMs = performance.now();
 			let stdoutBuffer = "";
@@ -860,6 +921,17 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 				// limits before the provider request. The runner trusts exactly two
 				// fixed custom-entry schemas and retains numeric/enum facts only.
 				if (event.type === "entry_appended") {
+					const checkpointRequest = parseWorkerCheckpointRequestV1(event.entry, attempt);
+					if (checkpointRequest !== undefined) {
+						if (result.checkpointRequest !== undefined
+							&& JSON.stringify(result.checkpointRequest) !== JSON.stringify(checkpointRequest)) {
+							streamInvalid = true;
+							result.errorMessage = "Worker emitted conflicting checkpoint requests";
+							terminate("error");
+							return;
+						}
+						result.checkpointRequest = checkpointRequest;
+					}
 					result.writeJournalObservation = observeWorkerWriteJournalRuntimeEntry(
 						event.entry,
 						result.writeJournalObservation,

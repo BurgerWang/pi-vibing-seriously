@@ -1,5 +1,5 @@
 /**
- * Fixed Sol -> Luna default delivery for successful implementation workers.
+ * Optional development-first delivery for successful implementation workers.
  *
  * The public runtime delegates execution once, then this boundary produces one
  * bounded scope/integrity actual-diff packet, then invokes the structured Sol
@@ -243,6 +243,9 @@ export async function completeDefaultDelegationDeliveryV2(
 			...(input.signal === undefined ? {} : { signal: input.signal }),
 			now: completionClock,
 		});
+		if (automaticSemanticReview.status === "ACCEPT" || automaticSemanticReview.status === "REPAIR") {
+			presentationComplete = true;
+		}
 		if (automaticSemanticReview.status === "AUTHORITY_ERROR") {
 			return {
 				ok: false,

@@ -6,26 +6,18 @@
  * output/authorization middleware. Keep public tool order and event order
  * stable; implementation history and feature contracts belong in docs/.
  */
-
 import { readFile } from "node:fs/promises";
-import type {
-	ExtensionAPI,
-	ExtensionCommandContext,
-	ExtensionContext,
-} from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
-import {
-	checkToolCall,
-	computeActiveTools,
-	type WorkbenchMode,
-} from "./core/mode-policy.ts";
+import { checkToolCall, computeActiveTools, computeActiveToolsForLifecycleSnapshotV2, type WorkbenchMode } from "./core/mode-policy.ts";
 import { type ReceiptHandle } from "./core/tool-result-recovery.ts";
 import {
 	computeRoleActiveTools,
 	parseWorkerAllowedPaths,
-	parseWorkerTaskKindEnvironment, parseWorkerTimeoutMsEnvironment,
+	parseWorkerAttemptEnvironment, parseWorkerTaskKindEnvironment, parseWorkerTimeoutMsEnvironment,
 	WORKER_ALLOWED_PATHS_ENV,
+	WORKER_ATTEMPT_ENV,
 	WORKER_CONTRACT_HASH_ENV,
 	WORKER_DELEGATION_ID_ENV,
 	WORKER_PROJECT_ROOT_ENV,
@@ -33,41 +25,18 @@ import {
 	WORKER_TASK_KIND_ENV, WORKER_TIMEOUT_MS_ENV,
 	type RecipeMutationFacts,
 } from "./core/worker-policy.ts";
-import {
-	WORKER_WRITE_JOURNAL_RUNTIME_TELEMETRY_ENTRY_TYPE,
-	createWorkerWriteJournalRuntime,
-} from "./core/worker-write-journal-runtime.ts";
-import {
-	resolveWorkerSpendProfile,
-	WORKER_SPEND_PROFILE_ENV,
-} from "./core/worker-spend.ts";
-import {
-	describeMode,
-	loadModeFromEntries,
-	MODE_ENTRY_TYPE,
-	statusText,
-} from "./core/state.ts";
-import {
-	findProjectRoot,
-	loadProjectConfig,
-	type ExecFn,
-} from "./core/config.ts";
+import { WORKER_WRITE_JOURNAL_RUNTIME_TELEMETRY_ENTRY_TYPE, createWorkerWriteJournalRuntime } from "./core/worker-write-journal-runtime.ts";
+import { parseWorkerInitialSpendStateEnvironment, resolveWorkerSpendProfile, WORKER_INITIAL_SPEND_STATE_ENV, WORKER_SPEND_PROFILE_ENV } from "./core/worker-spend.ts";
+import { describeMode, loadModeFromEntries, MODE_ENTRY_TYPE, statusText } from "./core/state.ts";
+import { findProjectRoot, loadProjectConfig, type ExecFn } from "./core/config.ts";
 import { type WorkerFirstGateFacts } from "./core/gate-schema.ts";
-import {
-	listRuns,
-	readCommittedManifest,
-} from "./core/runs.ts";
+import { listRuns, readCommittedManifest } from "./core/runs.ts";
 import { join } from "node:path";
 import { runStatusLabel, fitToWidth } from "./core/format.ts";
 import { buildStatusLine } from "./core/status.ts";
 import { costStatusSegment } from "./core/cost-breakdown.ts";
 import { RuntimeCostBreakdownCache } from "./core/runtime-cost-breakdown-cache.ts";
-import {
-	advisoryStatusSegment,
-	contextOutputAdvisoryStatusSegment,
-	evaluateAdvisory,
-	type AdvisoryConfig,
-} from "./core/commander-advisory.ts";
+import { advisoryStatusSegment, contextOutputAdvisoryStatusSegment, evaluateAdvisory, type AdvisoryConfig } from "./core/commander-advisory.ts";
 import { buildWidgetLines, widgetAction, type WidgetState } from "./core/widget.ts";
 import { latestGateRunSummary } from "./core/report.ts";
 import {
@@ -96,20 +65,17 @@ import {
 } from "./core/compact-lifecycle.ts";
 import { decideCompactOverflowRecovery } from "./core/compact-overflow.ts";
 import { evaluateCompactSummaryPreflight } from "./core/compact-preflight.ts";
-import {
-	createCacheTelemetry,
-	type CacheTelemetry,
-} from "./cache/cache-telemetry.ts";
+import { createCacheTelemetry, type CacheTelemetry } from "./cache/cache-telemetry.ts";
 import { readDelegationLedger, type GitFacts } from "./core/delegation-ledger.ts";
-import {
-	readDelegationCommittedGenerationV2, readDelegationReviewV2, readDelegationTransactionV2,
-} from "./core/delegation-transaction-storage.ts";
+import { readDelegationCommittedGenerationV2, readDelegationReviewV2, readDelegationTransactionV2, readDelegationWorkerCheckpointV1 } from "./core/delegation-transaction-storage.ts";
 import {
 	readRecoverableUnpublishedDelegationV2,
 	readDelegationAuthorityObservationV2 as readDelegationAuthorityObservation,
 } from "./core/delegation-project-authority.ts";
-import { delegationDisplayedStatusV1, delegationExactRepairRouteLineV1, delegationNextActionTextV1, delegationProjectIssueRepairStatusV1, delegationRepairStatusLinesV1, delegationVerifyBlockReasonV1, readDelegationRepairStatusV1,
+import { delegationDisplayedStatusV1, delegationExactRepairRouteLineV1, delegationLifecycleResolutionForStatusV1, delegationNextActionTextV1, delegationProjectIssueRepairStatusV1, delegationRepairStatusLinesV1, delegationVerifyBlockReasonV1, readDelegationRepairStatusV1,
 	type DelegationRepairStatusV1 } from "./core/delegation-repair-status.ts";
+import { appendLifecycleActionSnapshotIfChangedV2, buildLifecycleActionSnapshotV2, type LifecycleActionSnapshotV2 } from "./core/delegation-lifecycle-resolver.ts";
+import { lifecycleActionSnapshotTextV2 } from "./core/agent-next-action.ts";
 import { buildDelegationWorkerFirstGateFacts } from "./core/delegation-plan-reference.ts";
 import { resolveToolOutputPolicy } from "./core/output-policy.ts";
 import {
@@ -118,9 +84,7 @@ import {
 	type OutputEnvelopeResult,
 	type TextContent as OutputTextContent,
 } from "./core/output-envelope.ts";
-import {
-	projectToolResultDetails,
-} from "./core/details-projection.ts";
+import { projectToolResultDetails } from "./core/details-projection.ts";
 import {
 	COMMANDER_HISTORY_TOOL_TEXT_MAX_BYTES,
 	HISTORY_DESCRIPTOR_MAX_BYTES,
@@ -135,9 +99,7 @@ import {
 	type HistoryProjectionFacts,
 	type HistoryProjectionObservability,
 } from "./core/context-history-budget.ts";
-import {
-	buildTrustedRecoveryAuthority,
-} from "./core/trusted-recovery-authority.ts";
+import { buildTrustedRecoveryAuthority } from "./core/trusted-recovery-authority.ts";
 import { applyExplicitPromptCacheBreakpoints } from "./core/prompt-cache-breakpoints.ts";
 import {
 	blockedControlText,
@@ -272,7 +234,9 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		// standard/extended; retired `low` and malformed/missing child env
 		// resolve defensively to `standard`.
 		spendProfile: resolveWorkerSpendProfile(process.env[WORKER_SPEND_PROFILE_ENV]),
+		initialSpendState: parseWorkerInitialSpendStateEnvironment(process.env[WORKER_INITIAL_SPEND_STATE_ENV]),
 		timeoutMs: parseWorkerTimeoutMsEnvironment(process.env[WORKER_TIMEOUT_MS_ENV]),
+		attempt: parseWorkerAttemptEnvironment(process.env[WORKER_ATTEMPT_ENV]),
 	};
 	const workerWriteJournalRuntime = createWorkerWriteJournalRuntime({
 		role: workerRoleContext.role,
@@ -561,6 +525,8 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	}
 
 	let latestRepairStatus: DelegationRepairStatusV1 = { kind: "none" };
+	let latestLifecycleActionSnapshotV2: Readonly<LifecycleActionSnapshotV2> | undefined;
+	let latestLifecycleActionSnapshotHashV2: string | null = null;
 
 	/** Refresh the non-authoritative compact summary from hard state. */
 	function refreshCompactP7Facts(delegationState = delegationSession.getState()): void {
@@ -583,9 +549,15 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		compactState.activeWriteLease = writeLease ? leaseCompactSummary(writeLease, now) : undefined;
 		compactState.blockedCommanderWriteAttempts =
 			delegationState.blockedWriteAttempts > 0 ? delegationState.blockedWriteAttempts : undefined;
+		const currentLifecycleResolution = delegationLifecycleResolutionForStatusV1(delegationState, latestRepairStatus);
+		const currentLifecycleSnapshot = latestLifecycleActionSnapshotV2?.authority_hash === currentLifecycleResolution.primary_action.snapshot_hash
+			? latestLifecycleActionSnapshotV2
+			: undefined;
 		compactState.nextDelegationAction =
 			actor === "sol-commander" || delegationState.latestId !== undefined
-				? delegationNextActionTextV1(delegationState, latestRepairStatus)
+				? currentLifecycleSnapshot === undefined
+					? delegationNextActionTextV1(delegationState, latestRepairStatus)
+					: lifecycleActionSnapshotTextV2(currentLifecycleSnapshot)
 				: undefined;
 		touchCompactState();
 	}
@@ -654,16 +626,20 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		};
 		const leaseTools =
 			writeLease && leaseStatus(writeLease, new Date().toISOString()) === "active" ? [...writeLease.tools] : [];
+		const baseTools = computeActiveTools(mode, pi.getActiveTools(), actorFacts, leaseTools);
+		const lifecycleTools = workerRoleContext.role === undefined && latestLifecycleActionSnapshotV2 !== undefined
+			? computeActiveToolsForLifecycleSnapshotV2(mode, baseTools, latestLifecycleActionSnapshotV2, actorFacts)
+			: baseTools;
 		pi.setActiveTools(
 			computeRoleActiveTools(
-				computeActiveTools(mode, pi.getActiveTools(), actorFacts, leaseTools),
+				lifecycleTools,
 				workerRoleContext.role,
 				workerRoleContext.taskKind,
 			),
 		);
 	}
 
-	/** Reapply the locked 16-tool surface when a temporary lease is no longer active. */
+	/** Reapply the development-first surface when a high-risk lease is no longer active. */
 	function syncLeaseLock(now?: string): void {
 		if (writeLease && leaseStatus(writeLease, now ?? new Date().toISOString()) !== "active") {
 			applyModeTools();
@@ -684,6 +660,32 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				const repairStatus = delegationProjectIssueRepairStatusV1(delegationSession.getProjectAuthorityIssue()) ?? await readDelegationRepairStatusV1(projectRoot, delegationSession.getState(), execFn);
 				if (refreshSerial !== uiRefreshSerial.status) return;
 				latestRepairStatus = repairStatus;
+				const delegationState = delegationSession.getState();
+				const lifecycleResolution = delegationLifecycleResolutionForStatusV1(delegationState, repairStatus);
+				let checkpoint;
+				if (delegationState.latestId !== undefined) {
+					const transaction = await readDelegationTransactionV2(projectRoot, delegationState.latestId);
+					if (transaction.ok && transaction.value.status === "RUNNING") {
+						const readCheckpoint = await readDelegationWorkerCheckpointV1(projectRoot, delegationState.latestId);
+						if (readCheckpoint.ok) checkpoint = readCheckpoint.value;
+					}
+				}
+				const actionSnapshot = buildLifecycleActionSnapshotV2({
+					project_root: projectRoot,
+					mode,
+					resolution: lifecycleResolution,
+					...(checkpoint === undefined ? {} : { checkpoint }),
+				});
+				if (actionSnapshot.ok) {
+					latestLifecycleActionSnapshotV2 = actionSnapshot.value;
+					const appended = appendLifecycleActionSnapshotIfChangedV2(
+						actionSnapshot.value,
+						latestLifecycleActionSnapshotHashV2,
+						(customType, data) => pi.appendEntry(customType, data),
+					);
+					if (appended !== undefined) latestLifecycleActionSnapshotHashV2 = appended.latest_snapshot_hash;
+					applyModeTools();
+				}
 				refreshCompactP7Facts();
 				const config = await loadProjectConfig(projectRoot, { trusted: true });
 				if (refreshSerial !== uiRefreshSerial.status) return;
@@ -1007,9 +1009,10 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 							"semantic v2  : MISSING — historical scope/integrity FINAL is not hash-bound Sol ACCEPT",
 							authority.review.schema_version === 2 ? "migration     : inspect the immutable packet before any hash-bound ACCEPT" : "migration     : legacy schema-1 FINAL has no automatic semantic migration and remains blocked",
 						);
+						else if (authority.semanticSource === "evidence_v2") lines.push(`semantic v2  : ACCEPT (evidence-v2) by ${authority.semanticReviewer} at ${authority.semanticAcceptedAt}`, `reviewed bind : ${authority.semanticBindingHash}`);
 						else if (authority.semanticSource === "migration") lines.push(`semantic v2  : ACCEPT (migration) by ${authority.semanticReviewer} at ${authority.semanticAcceptedAt}`, `reviewed bind : ${authority.semanticBindingHash}`);
 						else if (authority.semanticSource === "embedded") lines.push(`semantic v2  : ACCEPT by ${authority.semanticReviewer} at ${authority.semanticAcceptedAt}`);
-						else if (strictSemantic) lines.push("semantic v2  : NOT_REQUIRED (zero delta)");
+						else if (authority.semanticSource === "not_required") lines.push("semantic v2  : NOT_REQUIRED (zero delta)");
 					} else if (authority.transactionVerdict !== null) {
 						lines.push(`completion v2: ${authority.transactionVerdict} (strict terminal machine facts; no review artifact)`);
 						if (authority.repairLineage === undefined && authority.transactionStatus === "ABORTED") {
@@ -1055,6 +1058,8 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	pi.on("session_start", async (event, ctx) => {
 		transientState.resetTrustedIngressAuthorities();
 		workerBudgetSteerSent = false;
+		latestLifecycleActionSnapshotV2 = undefined;
+		latestLifecycleActionSnapshotHashV2 = null;
 		// Restore the most recent persisted mode and workbench state from the
 		// current session's custom entries. Custom entries survive compaction
 		// and every session-replacement path (/new, /resume, /fork, /clone,
@@ -1747,6 +1752,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		cacheTelemetry,
 		getWorkerContext: () => ({
 			role: workerRoleContext.role, spendProfile: workerRoleContext.spendProfile, timeoutMs: workerRoleContext.timeoutMs,
+			attempt: workerRoleContext.attempt, initialSpendState: workerRoleContext.initialSpendState,
 		}),
 		projectRootFor,
 		refreshStatus,
@@ -1782,7 +1788,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			if (reason) {
 				writeLease = revokeLease(writeLease, reason, now);
 				persistLease();
-				// Reapply the locked tool set (back to the exact canonical 15).
+				// Reapply the development-first tool set after the high-risk lease ends.
 				applyModeTools();
 			}
 		}

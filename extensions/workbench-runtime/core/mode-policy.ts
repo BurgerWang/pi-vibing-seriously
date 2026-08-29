@@ -34,11 +34,12 @@ import {
 import { WORKBENCH_TOOL_NAMES } from "./tool-catalog.ts";
 import { WORKER_TOOL_NAME } from "./worker-policy.ts";
 import {
+	DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST,
 	defaultWritePolicy,
 	detectActorRole,
-	LEASE_TOOLS,
 	STRICT_SOL_DEV_ALLOWLIST,
 } from "./write-authority.ts";
+import { validateLifecycleActionSnapshotV2, type LifecycleActionSnapshotV2 } from "./delegation-lifecycle-resolver.ts";
 
 /**
  * P7 actor facts for the active-tool decision. Identity comes ONLY from the
@@ -174,10 +175,11 @@ export function isToolHardDenied(mode: WorkbenchMode, toolName: string): boolean
 /**
  * Active-tool set to configure for a mode, based on the currently active set.
  *
- * Worker-first Sol DEV: the approved GPT-5.6 Sol identity receives the
- * canonical 16-tool read/control/delegation/Git-completion surface. Bash and foreign tools
- * remain excluded. An ACTIVE human-issued lease adds only its exact
- * edit/write subset, and the second-layer guard still checks path/tool scope.
+ * Development-first Sol DEV: the approved GPT-5.6 Sol identity retains the
+ * serialized worker-first-strict compatibility id, but DEV advertises the
+ * canonical workbench surface plus ordinary edit/write. Bash and foreign
+ * tools remain excluded. The second-layer write-authority guard—not active
+ * tool presence—requires a lease for high-risk paths.
  * Delegated workers and
  * other controllers remain outside this policy and keep the role-specific
  * behavior below. AUDIT and VERIFY remain strict for every actor.
@@ -191,23 +193,21 @@ export function computeActiveTools(
 	mode: WorkbenchMode,
 	currentlyActive: readonly string[],
 	facts?: ActorToolFacts,
-	/** Exact edit/write subset from an ACTIVE user-issued lease. */
+	/** Compatibility input; leases affect high-risk authorization, not DEV tool presence. */
 	leaseTools: readonly string[] = [],
 ): string[] {
 	if (mode === "DEV" && facts) {
 		const actor = detectActorRole(facts);
 		const policy = defaultWritePolicy(facts.provider, facts.model);
 		if (actor === "sol-commander" && policy === "worker-first-strict") {
-			// The fixed worker-first surface is advertised (every tool is a
+			// The fixed development-first surface is advertised (every tool is a
 			// Pi builtin or a statically registered workbench tool); foreign
 			// tools are dropped by construction. Intersecting with the current
 			// active set would lose tools when switching back from a stricter
-			// mode, so the canonical list is returned directly. Only the fixed
-			// lease-tool order may extend it; malformed/foreign names are ignored.
-			return [
-				...STRICT_SOL_DEV_ALLOWLIST,
-				...LEASE_TOOLS.filter((tool) => leaseTools.includes(tool)),
-			];
+			// mode, so the canonical list is returned directly. Lease input does
+			// not change this surface; the second layer checks high-risk paths.
+			void leaseTools;
+			return [...DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST];
 		}
 	}
 	const active = new Set<string>();
@@ -222,6 +222,29 @@ export function computeActiveTools(
 		for (const tool of foreign) active.add(tool);
 	}
 	return [...active];
+}
+
+/**
+ * State-aware Commander surface derived from the same V2 action snapshot used
+ * by status and executors.  This is presentation reduction only; controller
+ * guards remain authoritative.
+ */
+export function computeActiveToolsForLifecycleSnapshotV2(
+	mode: WorkbenchMode,
+	currentlyActive: readonly string[],
+	snapshot: Readonly<LifecycleActionSnapshotV2>,
+	facts?: ActorToolFacts,
+): string[] {
+	const ordinary = computeActiveTools(mode, currentlyActive, facts);
+	if (!validateLifecycleActionSnapshotV2(snapshot) || snapshot.mode !== mode) {
+		return ordinary.filter((tool) => ["read", "grep", "find", "ls", "workbench_delegation_status"].includes(tool));
+	}
+	if (mode !== "DEV" || snapshot.action === "CONTINUE_DIRECT_DEVELOPMENT") return ordinary;
+	const readOnly = ["read", "grep", "find", "ls", "workbench_delegation_status"];
+	const selected = new Set(readOnly);
+	if (snapshot.tool !== null && ordinary.includes(snapshot.tool)) selected.add(snapshot.tool);
+	if (snapshot.action === "RECOVER_AUTHORITY" && ordinary.includes("workbench_git")) selected.add("workbench_git");
+	return ordinary.filter((tool) => selected.has(tool));
 }
 
 // ---------------------------------------------------------------------------

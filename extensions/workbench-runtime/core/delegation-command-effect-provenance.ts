@@ -1097,7 +1097,14 @@ export function isDelegationCommandScopeAttributedV1(
 	const legacyCleanRunFailure = record.effective_status === "WORKSPACE_DRIFT"
 		&& record.terminal_reasons.length === 1
 		&& record.terminal_reasons[0] === "COMMAND_EFFECT_RUN_FAILED";
-	return changeSet.status === "ATTRIBUTED" && record.remaining_workspace_drift.length === 0 && onlyRunFailure
+	// A base change set can initially classify generated outputs as workspace
+	// drift before the durable command receipts are folded in. The strict
+	// provenance validator above proves that every such path is present in the
+	// command delta when no remaining drift survives, so the effective scope is
+	// just as attributable as an initially clean base change set.
+	const baseScopeFullyAttributed = changeSet.status === "ATTRIBUTED"
+		|| (changeSet.status === "WORKSPACE_DRIFT" && record.remaining_workspace_drift.length === 0);
+	return baseScopeFullyAttributed && record.remaining_workspace_drift.length === 0 && onlyRunFailure
 		&& (record.effective_status === "ATTRIBUTED" || legacyCleanRunFailure);
 }
 

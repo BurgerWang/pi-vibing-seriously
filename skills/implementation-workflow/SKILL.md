@@ -21,11 +21,13 @@ description: Primary workflow for building or changing functionality. Use for im
 
 ## Coordination
 
-- Use this as the single primary development skill. Add at most one domain
-  specialist unless distinct task phases genuinely require more.
+- Use this as the primary development skill. Add at most one domain
+  specialist unless distinct phases require more.
 - Obey the active project's AGENTS and runtime write-authority contract. In a
-  pi-dev-workbench product project, fixed Sol -> Luna delivery is mandatory;
-  this skill neither duplicates nor weakens that authority.
+  pi-dev-workbench product project, ordinary development is direct in DEV,
+  protected high-risk paths retain explicit authority, and delegation is an
+  optional bounded execution path; this skill neither duplicates nor weakens
+  that authority.
 - Use `skill:debugging-workflow` only after an actual failure and
   `skill:validation-ladder` only for a formal verdict, not routine feedback.
 - In a pi-dev-workbench project, after semantic ACCEPT and the relevant final

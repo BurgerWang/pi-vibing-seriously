@@ -22,11 +22,14 @@ import {
 	type WorkerSpendProfile,
 	type WorkerSpendState,
 } from "./worker-spend.ts";
+import { WORKER_CHECKPOINT_REQUEST_ENTRY_TYPE_V1 } from "./worker-checkpoint.ts";
 
 interface WorkerMessageContext {
 	readonly role?: string;
 	readonly spendProfile: WorkerSpendProfile;
 	readonly timeoutMs?: number;
+	readonly attempt?: number;
+	readonly initialSpendState?: Readonly<WorkerSpendState>;
 }
 
 export const WORKER_TIME_CHECKPOINT_MESSAGE_TYPE = "workbench-worker-time-checkpoint";
@@ -47,7 +50,7 @@ export const WORKER_TIME_FINALIZE_TEXT = [
 ].join("\n");
 
 export interface MessageEndController {
-	pi: Pick<ExtensionAPI, "on" | "sendMessage" | "getThinkingLevel" | "getActiveTools" | "getAllTools">;
+	pi: Pick<ExtensionAPI, "on" | "sendMessage" | "appendEntry" | "getThinkingLevel" | "getActiveTools" | "getAllTools">;
 	cacheTelemetry: CacheTelemetry;
 	getWorkerContext(): WorkerMessageContext;
 	projectRootFor(ctx: ExtensionContext): Promise<string>;
@@ -62,6 +65,7 @@ export interface MessageEndController {
 export function registerMessageEndController(controller: MessageEndController): void {
 	let workerSoftSteerSent = false;
 	let workerSpendSoftSteerSent = false;
+	let workerCheckpointRequestAppended = false;
 	let workerSpendState: WorkerSpendState = { ...EMPTY_WORKER_SPEND_STATE };
 	let wallClockTimers: unknown[] = [];
 
@@ -97,8 +101,11 @@ export function registerMessageEndController(controller: MessageEndController): 
 		clearWallClockTimers();
 		workerSoftSteerSent = false;
 		workerSpendSoftSteerSent = false;
-		workerSpendState = { ...EMPTY_WORKER_SPEND_STATE };
+		workerCheckpointRequestAppended = false;
 		const worker = controller.getWorkerContext();
+		workerSpendState = worker.initialSpendState === undefined
+			? { ...EMPTY_WORKER_SPEND_STATE }
+			: { ...worker.initialSpendState };
 		if (worker.role === "worker" && worker.timeoutMs !== undefined) {
 			scheduleWallClockSteer(
 				Math.max(1, Math.floor(worker.timeoutMs * WORKER_TIME_CHECKPOINT_RATIO)),
@@ -132,6 +139,7 @@ export function registerMessageEndController(controller: MessageEndController): 
 			errorMessage?: string;
 		};
 		if (event.message.role === "assistant") {
+			const spendSteerWasSentBeforeMessage = workerSpendSoftSteerSent;
 			try {
 				if (ctx.isProjectTrusted()) {
 					const projectRoot = await controller.projectRootFor(ctx);
@@ -206,6 +214,20 @@ export function registerMessageEndController(controller: MessageEndController): 
 					}
 				} catch {
 					// Spend steering must never alter a model request.
+				}
+				if (spendSteerWasSentBeforeMessage && !workerCheckpointRequestAppended) {
+					try {
+						controller.pi.appendEntry(WORKER_CHECKPOINT_REQUEST_ENTRY_TYPE_V1, {
+							schema_version: 1,
+							kind: WORKER_CHECKPOINT_REQUEST_ENTRY_TYPE_V1,
+							attempt: worker.attempt ?? 1,
+							completed_criteria: [],
+							remaining_criteria: [],
+						});
+						workerCheckpointRequestAppended = true;
+					} catch {
+						// Missing checkpoint telemetry leaves continuation fail closed.
+					}
 				}
 			}
 		}

@@ -35,6 +35,7 @@ import {
 	commanderToolCallBlockReason,
 	consumeLeaseCall,
 	detectActorRole,
+	directDevelopmentWriteBlockReason,
 	leaseStatus,
 	revokeLease,
 	type WriteLease,
@@ -164,10 +165,10 @@ export function registerToolCallGuard(controller: ToolCallGuardController): void
 				try {
 					const projectRoot = await controller.projectRootFor(ctx);
 					if (!(await isWorkerPathAllowedRealpath(projectRoot, path, [path]))) {
-						return { block: true, reason: boundedGuardReason("Commander leased write failed project realpath/symlink containment") };
+						return { block: true, reason: boundedGuardReason("Direct development write failed project realpath/symlink containment") };
 					}
 				} catch {
-					return { block: true, reason: boundedGuardReason("Commander leased write could not verify project containment") };
+					return { block: true, reason: boundedGuardReason("Direct development write could not verify project containment") };
 				}
 			}
 		}
@@ -300,8 +301,9 @@ export function registerToolCallGuard(controller: ToolCallGuardController): void
 			const path = event.input && typeof event.input === "object" && typeof (event.input as { path?: unknown }).path === "string"
 				? (event.input as { path: string }).path
 				: "";
+			const highRisk = directDevelopmentWriteBlockReason(path, event.input)?.includes("high-risk path") === true;
 			const lease = controller.getLease();
-			if (lease && leaseStatus(lease, now) === "active") {
+			if (highRisk && lease && leaseStatus(lease, now) === "active") {
 				const consumed = consumeLeaseCall(lease, event.toolName, path, now);
 				if (!consumed.ok) {
 					if (authorization.authorizationId) controller.turnOutputBudget.releaseAuthorization({ authorizationId: authorization.authorizationId });

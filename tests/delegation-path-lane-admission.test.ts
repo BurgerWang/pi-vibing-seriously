@@ -433,6 +433,59 @@ test("a terminal-negative decision on a lineaged parent authorizes its depth-two
 	}]);
 });
 
+test("a saturated depth-16 repair tip remains valid and can be excluded for its exact successor", async () => {
+	const rootId = "20260827-110000-s000";
+	const root = pending(rootId, 0, ["src/root.ts"]);
+	const rootDecision = decision(root, DECISION_A, 4);
+	const transactions = new Map<string, DelegationTransactionRecord>([[rootId, root]]);
+	const changed = new Map<string, readonly string[]>([[rootId, ["src/root.ts"]]]);
+	let parent = root;
+	let tipId = rootId;
+
+	for (let index = 1; index <= 17; index += 1) {
+		tipId = `20260827-${String(110000 + index).padStart(6, "0")}-s${String(index).padStart(3, "0")}`;
+		const parentLineage = parent.repair_lineage;
+		const nextLineage = parentLineage === undefined
+			? lineage(rootId, DECISION_A, ["src/root.ts"])
+			: bindDelegationRepairLineageV1({
+				schema_version: 1,
+				kind: "semantic-repair-lineage-v1",
+				root_delegation_id: rootId,
+				repair_of: parent.delegation_id,
+				root_decision_hash: DECISION_A,
+				continuation_decision_delegation_id: rootId,
+				continuation_decision_hash: DECISION_A,
+				parent_lineage_hash: parentLineage.lineage_hash,
+				depth: Math.min(parentLineage.depth + 1, 16),
+				carried_paths: ["src/root.ts"],
+			});
+		assert.ok(nextLineage);
+		parent = pending(tipId, index * 10, [`src/repair-${index}.ts`], nextLineage);
+		transactions.set(tipId, parent);
+		changed.set(tipId, [`src/repair-${index}.ts`]);
+	}
+
+	assert.equal(parent.repair_lineage?.depth, 16);
+	const fixture: ReaderFixture = {
+		transactions,
+		decisions: new Map([[rootId, rootDecision]]),
+		terminalDecisions: new Map(),
+		changed,
+		closed: new Set(),
+		pathErrors: new Map(),
+		pathReads: [],
+	};
+	const admission = await admitProjectDelegationPathLaneV1({
+		project_root: "/project",
+		allowed_paths: ["src/final.ts"],
+		repair_tip_exclusion_id: tipId,
+	}, readers(fixture));
+
+	assert.equal(admission.decision.decision, "ALLOW", JSON.stringify(admission));
+	assert.deepEqual(admission.repair_tip_ids, [tipId]);
+	assert.equal(admission.repair_tip_exclusion_id, tipId);
+});
+
 test("a child's own REPAIR decision ratifies a historical inherited continuation and authorizes its successor", async () => {
 	const legacyId = "20260827-100005-lgcy";
 	const successorId = "20260827-100006-next";

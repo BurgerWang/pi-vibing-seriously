@@ -710,6 +710,10 @@ test("production registers the failure locator before middleware and lifecycle o
 	const middleware = source.indexOf("registerToolResultMiddleware({");
 	const post = source.indexOf("automaticDeliveryContinuation.registerLifecycleListenersAfterMiddleware();");
 	assert.ok(pre >= 0 && middleware > pre && post > middleware, "production listener order is pre-capture, cleanup middleware, then lifecycle");
+	assert.match(source, /automaticDeliveryContinuationEnabled = controller\.workerRoleContext\.role !== "worker"/u);
+	assert.match(source, /if \(automaticDeliveryContinuationEnabled\) automaticDeliveryContinuation\.registerToolResultLocatorCaptureBeforeMiddleware\(\)/u);
+	assert.match(source, /if \(automaticDeliveryContinuationEnabled\) automaticDeliveryContinuation\.registerLifecycleListenersAfterMiddleware\(\)/u);
+	assert.match(source, /automaticDeliveryContinuationEnabled && automaticDeliveryContinuation\.hasPendingBeforeAgentContinuation\(\)/u);
 	assert.match(index, /hasPendingAutomaticDeliveryContinuation:\s*\(\)\s*=>\s*hasPendingAutomaticDeliveryContinuation\(\)/u);
 	assert.match(source, /resolveCandidate:\s*resolveAutomaticDeliveryContinuationCandidateV1/u);
 	assert.match(source, /exactRepair:\s*\(input\)\s*=>\s*runExactRepairServiceV1/u);

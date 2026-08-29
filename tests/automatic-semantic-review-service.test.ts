@@ -4,7 +4,9 @@ import test from "node:test";
 import type { Usage } from "@earendil-works/pi-ai";
 
 import {
+	declaredSemanticReviewDependenciesV2,
 	runAutomaticSemanticReview,
+	semanticReviewScopeExpandedV2,
 	type AutomaticSemanticReviewDependencies,
 } from "../extensions/workbench-runtime/core/automatic-semantic-review-service.ts";
 import type { DelegationReviewV2Result } from "../extensions/workbench-runtime/core/delegation-review-v2.ts";
@@ -14,6 +16,33 @@ import type { ReviewRecord } from "../extensions/workbench-runtime/core/diff-rev
 const ID = "20260827-040404-auto";
 const HASH = "a".repeat(64);
 const PATH = "src/a.ts";
+
+test("relevance role co-membership never invents declaration-free dependency edges", () => {
+	const edges = declaredSemanticReviewDependenciesV2({
+		entries: [
+			{ path: "src/a.ts", roles: ["C", "D"] },
+			{ path: "src/b.ts", roles: ["C", "D"] },
+			{ path: ".pi/workbench/project.yaml", roles: ["S"] },
+		] as never,
+	});
+	assert.deepEqual(edges, []);
+});
+
+test("S-only controls do not masquerade as semantic stream scope expansion", () => {
+	const parent = { streams: [{ path: "src/a.ts" }] } as never;
+	assert.equal(semanticReviewScopeExpandedV2({
+		entries: [
+			{ path: "src/a.ts", roles: ["D"] },
+			{ path: ".pi/workbench/project.yaml", roles: ["S"] },
+		] as never,
+	}, parent), false);
+	assert.equal(semanticReviewScopeExpandedV2({
+		entries: [
+			{ path: "src/a.ts", roles: ["D"] },
+			{ path: "src/new.ts", roles: ["W"] },
+		] as never,
+	}, parent), true);
+});
 
 const usage: Usage = {
 	input: 10, output: 5, cacheRead: 2, cacheWrite: 1, totalTokens: 18,

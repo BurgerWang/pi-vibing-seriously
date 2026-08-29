@@ -126,7 +126,9 @@ export function registerAutomaticSemanticReviewCommand(controller: AutomaticSema
 					`mechanical_page_calls: ${result.mechanical_page_calls}`,
 					...(result.next_action === undefined ? [] : [`next_action: ${result.next_action}`]),
 					...(result.status === "RETRYABLE_FAILURE" && result.code === "REVIEW_TOO_LARGE"
-						? ["manual_route: review exceeds the 32-page automatic ceiling; use bounded manual paging or split the change"] : []),
+						? ["compatibility_route: legacy V1 review exceeds its 32-page ceiling; use the resumable V2 review job or split the change"] : []),
+					...(result.status === "RETRYABLE_FAILURE" && result.code === "SPLIT_REQUIRED"
+						? ["next_action: split the review; it exceeds the explicit 128-page/4-MiB large-job ceiling"] : []),
 					...(result.status === "RETRYABLE_FAILURE" && result.code === "LEGACY_ENVELOPE_REQUIRES_MIGRATION"
 						? ["manual_route: legacy page-count authority requires bounded manual paging/migration; repeating automatic review will not advance it"] : []),
 					...(result.status === "RETRYABLE_FAILURE" && result.code === "LINEAGE_PRESENTATION_GAP"

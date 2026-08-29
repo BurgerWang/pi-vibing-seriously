@@ -773,11 +773,11 @@ safe alias that ignores all caller contract fields and recovers immutable
 authority from the id. Machine `next_action` values now name callable tools,
 while `/q-review` and `/q-repair` remain user-only conveniences. This is an
 intentional one-time additive fingerprint transition: the current catalog is
-13 tools, strict Sol DEV is 17 tools (19 with an active edit/write lease), the
+13 tools, strict Sol DEV is an exact 19-tool development-first surface, the
 ordered catalog hash is
-`6e624d8e5df34ab0c79f87909d5f956f9271491f48c508098af88797e8b472fb`,
+`26f5554785bf80c08bdfc9193754d8bc5159338b57241c9f1a24c97f2689756e`,
 and the current public tool-surface hash is
-`500227ecb3461a35028bfda935d070f17547f24329ff4bd2c5ef2b2e3452fe39`.
+`f58f921761395f57fa4d1c22a9cf7cc2d068fd3bfbd03e16a132a316793cef16`.
 AUDIT and VERIFY hard-deny exact repair, and Luna workers neither see nor may
 invoke it.
 

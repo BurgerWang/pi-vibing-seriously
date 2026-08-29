@@ -154,7 +154,7 @@ place. See `docs/context-output-control-plane.md`.
 | AUDIT | read, grep, find, ls, workbench_project_inspect, workbench_read_run, workbench_read_gate, workbench_list_gates, workbench_compare_runs, workbench_recover_tool_result | bash, edit, write, workbench_run_recipe, workbench_run_gate, workbench_delegate_worker |
 | VERIFY | read, grep, find, ls + the 8 inspection/recipe/gate/comparison/recovery tools | bash, edit, write, workbench_delegate_worker |
 | DEV commander | read, grep, find, ls, bash, edit, write + all 13 workbench tools | (none beyond the global guards) |
-| DEV strict Sol (`worker-first-strict`) | read, grep, find, ls + all 13 workbench tools (exact canonical 17; an ACTIVE user lease adds edit/write → 19) | bash always; edit/write without an ACTIVE user-issued lease or outside its paths; any foreign tool |
+| DEV strict Sol (`worker-first-strict`) | read, grep, find, ls, edit, write + all 13 workbench tools (exact canonical 19; policy id retained for compatibility) | bash always; high-risk edit/write without an ACTIVE matching user lease; any foreign tool |
 | DEV worker child | DEV commander set minus bash, workbench_run_gate, workbench_git, workbench_delegate_worker, workbench_repair_delegation | bash, workbench_run_gate, workbench_git, workbench_delegate_worker, workbench_repair_delegation; edit/write also require approved paths |
 
 The worker-role reduction is deterministic and applied inside the same single
@@ -220,7 +220,7 @@ mode-specific built-ins.
 | Surface | Canonical SHA-256 |
 | --- | --- |
 | Baseline commit `8ec8c269c6a3ef699c7e8112e8fec75a73fb7c4c` | `1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd` |
-| v0.10.0 final public surface | `b5938d64d2730119daa0f1b1c833aac09ff4923b52124a833bc2f1e0d5294b11` |
+| v0.10.0 current development-first public surface | `f58f921761395f57fa4d1c22a9cf7cc2d068fd3bfbd03e16a132a316793cef16` |
 
 The hashes are pinned by `tests/p6-b-stable-prefix.test.ts`; the baseline is
 derived read-only from the frozen commit, while the current hash is computed

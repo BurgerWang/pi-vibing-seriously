@@ -402,42 +402,43 @@ test("delegate-tool metadata exposes canonical recipe, size and repair contracts
 	assert.match(schema.properties.repair_of?.description ?? "", /never the old session or Gate authority/);
 });
 
-test("worker-delegation documentation defines fixed Sol/Luna boundaries and strict public v2 delegation authority", async () => {
+test("worker-delegation documentation defines development-first boundaries and strict public v2 delegation authority", async () => {
 	const doc = await readFile(new URL("../docs/worker-delegation.md", import.meta.url), "utf8");
 	// Risk rubric with low/medium/high tiers.
 	assert.match(doc, /## Risk rubric/);
 	assert.match(doc, /\| Low \|/);
 	assert.match(doc, /\| Medium \|/);
 	assert.match(doc, /\| High \|/);
-	// Routine implementation is worker-owned; the lease is an explicit Sol
-	// direct-write exception rather than the normal path.
-	assert.match(doc, /Low \| One contained change with a clear contract \| One bounded Luna implementation plus focused tests/);
-	assert.match(doc, /One coherent bounded Luna implementation/);
+	// Ordinary development is direct; only a concrete protected boundary
+	// activates the lease, and delegation is an optional execution tool.
+	assert.match(doc, /Low \| One contained change with a clear contract \| Direct edit\/write plus focused tests/);
+	assert.match(doc, /optionally delegate one bounded task when it materially reduces work/);
 	assert.match(doc, /Ordinary work does not become high risk merely because it changes source/);
-	assert.match(doc, /A partial result is repaired through one new\s+bounded Luna call only when recovery is actually needed/);
+	assert.match(doc, /A partial result may be repaired directly in the same coherent change/);
 	assert.match(doc, /High-risk\s+classification must name the concrete permission/);
 	// Caller/worker responsibilities are spelled out.
 	assert.match(doc, /### Responsibility split/);
-	assert.match(doc, /\| Owned by Sol \| Owned by Luna \(inside the approved contract\) \|/);
-	// Bounded continuation and one writing worker per worktree.
-	assert.match(doc, /## Bounded worker continuation/);
+	assert.match(doc, /\| Owned by the caller \| Owned by an optional Worker \(inside the approved contract\) \|/);
+	// Optional continuation and one writing worker per worktree.
+	assert.match(doc, /## Optional worker continuation/);
 	assert.match(doc, /brand-new `--no-session` worker and cannot recurse/);
-	assert.match(doc, /not a mandatory ceremony after\s+a complete delivery/);
+	assert.match(doc, /direct repair is the shorter default/);
 	assert.match(doc, /## One mutation-capable operation per worktree/);
 	assert.match(doc, /at most one worker writes to a worktree at any time/);
-	// Current worker-first write authority and the single public v2 transaction.
-	assert.match(doc, /## Fixed Sol -> Luna write authority \(current; legacy id P7\)/);
-	assert.match(doc, /fixed 17-tool\s+read\/control\/delegation\/Git-completion\/exact-repair surface/);
+	// Current development-first write authority and the single public v2 transaction.
+	assert.match(doc, /## Development-first write authority \(current; legacy id P7\)/);
+	assert.match(doc, /historical 17-tool\s+read\/control\/delegation\/Git-completion\/exact-repair surface plus ordinary\s+`edit` and `write`/);
 	assert.match(doc, /`workbench_git`/);
 	assert.match(doc, /`workbench_repair_delegation`/);
 	assert.match(doc, /Only current HEAD to the same named branch on an existing remote is allowed/);
 	assert.match(doc, /cannot amend, reset, clean, stash, switch branches, delete refs,\s+force-push/);
-	assert.match(doc, /routine source,\s+test, and documentation edits are delegated to Luna/);
-	assert.match(doc, /Any direct Sol `edit`\/`write` requires a \*\*temporary write lease exception\*\*/);
-	assert.match(doc, /`WF:LOCKED` otherwise/);
+	assert.match(doc, /does not mean that routine source, test, or\s+documentation edits require delegation/);
+	assert.match(doc, /Ordinary canonical project-relative `edit`\/`write` calls are allowed\s+directly/);
+	assert.match(doc, /\*\*temporary\s+high-risk write lease\*\*/);
+	assert.match(doc, /`WF:DIRECT` otherwise/);
 	assert.match(doc, /## Recommended development workflow/);
-	assert.match(doc, /Give Luna one bounded contract for the coherent source, test, and\s+documentation slice/);
-	assert.match(doc, /Let the delivery path complete bounded presentation and semantic review/);
+	assert.match(doc, /Implement ordinary source, tests, and documentation directly in DEV/);
+	assert.match(doc, /Let an optional delivery path complete bounded presentation and semantic review/);
 	assert.match(doc, /Exceptional pending or rejected outcomes expose exactly one typed machine\s+action/);
 	assert.match(doc, /runtime executes safe lifecycle effects at mutation boundaries/);
 	assert.match(doc, /run one final recipe or\s+gate set proportionate to task or release risk/);

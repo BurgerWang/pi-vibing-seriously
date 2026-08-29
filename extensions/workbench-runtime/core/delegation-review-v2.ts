@@ -985,7 +985,7 @@ export async function reviewDelegationV2(input: ReviewDelegationV2Input): Promis
 				const sidecars = await readDelegationImmutableReviewSidecarPresenceV1(
 					input.projectRoot, state.delegation_id, input.storage,
 				);
-				if (sidecars.ok && !sidecars.value.semantic_repair && !sidecars.value.semantic_migration) {
+				if (sidecars.ok && !sidecars.value.semantic_repair && !sidecars.value.semantic_migration && !sidecars.value.semantic_evidence_v2) {
 					regenerationResolution = resolveDelegationLifecycleV1(
 						delegationLifecycleSnapshotFromInvalidDerivedReviewV1(state.delegation_id, state),
 						{

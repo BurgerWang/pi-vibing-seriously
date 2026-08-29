@@ -67,6 +67,7 @@ import {
 } from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
 import { collectWorkspaceGuard } from "../extensions/workbench-runtime/core/workspace-guard.ts";
 import { buildDelegationWorkerFirstGateFacts } from "../extensions/workbench-runtime/core/delegation-plan-reference.ts";
+import { LIFECYCLE_ACTION_SNAPSHOT_ENTRY_TYPE_V2 } from "../extensions/workbench-runtime/core/delegation-lifecycle-resolver.ts";
 import { spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
 
 interface StubAPI {
@@ -2793,7 +2794,10 @@ test("a fresh session discovers durable ABORTED project authority without report
 		assert.match(resultText(status), /typed action\s+: CONTINUE_DEVELOPMENT/u);
 		assert.match(resultText(status), /next action\s+: continue ordinary development; no lifecycle command is required/u);
 		assert.doesNotMatch(resultText(status), /INVALID|\(no delegation\)/);
-		assert.equal(stub.appendedEntries.length, entriesBeforeStatus, "status adds no session mirror entry");
+		assert.equal(stub.appendedEntries.length, entriesBeforeStatus + 1, "status appends exactly one changed bounded action snapshot");
+		assert.equal(stub.appendedEntries.at(-1)?.customType, LIFECYCLE_ACTION_SNAPSHOT_ENTRY_TYPE_V2);
+		assert.equal(stub.appendedEntries.filter((entry) => entry.customType === DELEGATION_STATE_ENTRY_TYPE).length, 1,
+			"status does not append a delegation-state mirror");
 		assert.equal(await readFile(transactionPath, "utf8"), transactionBeforeStatus, "status never rewrites durable authority");
 
 		const script = await writeFakeWorker(root, {});

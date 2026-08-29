@@ -615,8 +615,8 @@ export function buildDelegateWorkerResult(input: BuildDelegateWorkerResultInput)
 	const tailBytes = Buffer.byteLength(tailText, "utf8");
 	const bodyBudget = Math.max(MAX_PARENT_HANDOFF_BYTES - tailBytes, 0);
 	const maxBodyLines = MAX_PARENT_HANDOFF_LINES - tailLines.length;
-	const packetHeader = scopePacket ? ["", "--- Scope/integrity actual-diff packet (bounded/redacted) ---"] : [];
-	const rawPacketLines = scopePacket
+	const packetHeader = scopePacket && !ordinaryCandidateReady ? ["", "--- Scope/integrity actual-diff packet (bounded/redacted) ---"] : [];
+	const rawPacketLines = scopePacket && !ordinaryCandidateReady
 		? scopePacket.lines.flatMap((line) => (typeof line === "string" ? line : "(invalid)").split("\n"))
 		: [];
 	let keptPacket = [...rawPacketLines];
@@ -661,7 +661,8 @@ export function buildDelegateWorkerResult(input: BuildDelegateWorkerResultInput)
 		required[packetStatusIndex] = `packet display: ${embeddedPresentationComplete ? "COMPLETE" : "INCOMPLETE"}${packetQualifier}`;
 		bodyLines[packetStatusIndex] = required[packetStatusIndex]!;
 	}
-	let kept = [...optional];
+	const optionalForHandoff = ordinaryCandidateReady ? [] : optional;
+	let kept = [...optionalForHandoff];
 	bodyLines = [...bodyLines, ...kept];
 	while (
 		kept.length > 0 &&
@@ -676,7 +677,7 @@ export function buildDelegateWorkerResult(input: BuildDelegateWorkerResultInput)
 			...kept,
 		];
 	}
-	const dropped = optional.length - kept.length;
+	const dropped = optionalForHandoff.length - kept.length;
 	if (dropped > 0) {
 		const marker = `… (${dropped} optional summary line(s) omitted to fit the bounded handoff)`;
 		if (bodyLines.length < maxBodyLines && Buffer.byteLength([...bodyLines, marker].join("\n"), "utf8") <= bodyBudget) {

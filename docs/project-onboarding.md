@@ -184,16 +184,16 @@ verification.
 | Mode | Tools | Blocked |
 | ---- | ----- | ------- |
 | AUDIT | read, grep, find, ls + read-only workbench tools | bash, edit, write, workbench_run_recipe, workbench_run_gate |
-| DEV | Sol read/control/delegation tools; Luna writes only on parent-approved paths; a user lease may temporarily expose exact Sol edit/write tools | commander bash/foreign tools/unleased writes; worker free bash, recursive delegation, out-of-scope writes, final gates |
+| DEV | Sol ordinary edit/write plus read/control/delegation tools; protected high-risk paths use a user-issued lease. Workers write only within parent-approved paths | commander bash/foreign tools/high-risk writes without a lease; worker free bash, recursive delegation, out-of-scope writes, final gates |
 | VERIFY | read, grep, find, ls + all workbench tools | bash, edit, write (recipes only) |
 
-In DEV, GPT-5.6 Sol defines the contract, architecture, scope, and verdict;
-GPT-5.6 Luna performs routine source, test, and documentation writes. A
-successful bounded implementation returns a provisional scope/integrity
+In DEV, GPT-5.6 Sol edits ordinary canonical project files directly and runs
+project commands through declared recipes. Delegation is optional. A
+successful bounded delegation returns a provisional scope/integrity
 packet in the same call and stays pending until Sol explicitly accepts its
 complete unchanged hash; final recipes and Gates remain separate. A temporary commander
-lease is an explicit exception bounded by calls, time, tools, and project-
-relative paths; it never enables bash. Worker edit/write calls remain limited
+lease is bounded by calls, time, tools, and project-relative paths and protects
+only high-risk paths; it never enables bash. Worker edit/write calls remain limited
 to the parent-approved path contract.
 
 The mode is stored in a Pi custom session entry and restored on every

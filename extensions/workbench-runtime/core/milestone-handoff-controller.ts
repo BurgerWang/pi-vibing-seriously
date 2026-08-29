@@ -38,7 +38,8 @@ export interface MilestoneHandoffCommandController {
 /**
  * Register the complete milestone handoff lifecycle behind one thin runtime
  * adapter. The controller deliberately carries no write lease into the new
- * session: Sol edit/write returns to locked and routine work stays with Luna.
+ * session: ordinary development edits remain direct, while high-risk paths
+ * return to requiring fresh user authorization.
  */
 export function registerMilestoneHandoffCommand(controller: MilestoneHandoffCommandController): void {
 	const now = controller.now ?? (() => new Date());
@@ -111,7 +112,7 @@ export function registerMilestoneHandoffCommand(controller: MilestoneHandoffComm
 						`source      : ${record.session}`,
 						`mode        : ${record.state?.mode ?? sourceMode}`,
 						`delegation  : ${sourceDelegationSummary}`,
-						"write lease : NOT carried — commander edit/write is locked; routine implementation belongs to Luna",
+						"write lease : NOT carried — high-risk paths require fresh authorization; ordinary direct edits remain available",
 						"hidden milestone note injected (pointers/status only); reloading to restore copied state…",
 					]);
 					await replacementCtx.reload();

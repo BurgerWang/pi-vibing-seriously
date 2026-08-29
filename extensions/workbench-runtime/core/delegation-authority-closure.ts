@@ -362,8 +362,10 @@ async function resolveInactiveBlockerRelevantPathsV2(
 	// project authority graph deliberately rewinds to the parent.
 	if (transaction.repair_lineage !== undefined && transaction.committed_proof === null) {
 		const emptyAttempt = await readStrictRetryableRawRepairEvidenceV1(projectRoot, transaction);
-		if (emptyAttempt.ok) return { ok: true, value: { paths: [], journal_before: [] } };
-		if (emptyAttempt.code === "STORAGE_FAILURE") {
+		if (emptyAttempt.ok && emptyAttempt.value.retry_kind !== "FINALIZATION_RECOVERY") {
+			return { ok: true, value: { paths: [], journal_before: [] } };
+		}
+		if (!emptyAttempt.ok && emptyAttempt.code === "STORAGE_FAILURE") {
 			return { ok: false, error: { code: "storage_failure" } };
 		}
 	}

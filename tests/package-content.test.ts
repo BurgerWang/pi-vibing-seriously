@@ -487,16 +487,16 @@ test("quant-research-design states the research scope boundary", async () => {
 	assert.ok(/out of scope/i.test(text), "quant-research-design must state its scope boundary");
 });
 
-// ----------------------------------------------- fixed Sol -> Luna contract
+// ----------------------------------------------- development-first contract
 
 /** Project templates own the complete policy; workflow resources carry only
  * a hard pointer so the same governance prose is not injected repeatedly. */
-const FIXED_SOL_LUNA_AUTHORITIES: ReadonlyArray<readonly [string, string]> = [
+const DEVELOPMENT_FIRST_AUTHORITIES: ReadonlyArray<readonly [string, string]> = [
 	["templates/project/AGENTS.generic.md", "AGENTS.generic template"],
 	["templates/project/AGENTS.quant-research.md", "AGENTS.quant-research template"],
 ];
 
-const FIXED_SOL_LUNA_POINTERS: ReadonlyArray<readonly [string, string]> = [
+const DEVELOPMENT_FIRST_POINTERS: ReadonlyArray<readonly [string, string]> = [
 	["prompts/q-build.md", "q-build prompt"],
 	["skills/implementation-workflow/SKILL.md", "implementation-workflow skill"],
 ];
@@ -506,60 +506,71 @@ function normalizeSpace(text: string): string {
 	return text.replace(/\s+/g, " ").trim();
 }
 
-async function fixedSolLunaText(relPath: string): Promise<string> {
+async function developmentFirstText(relPath: string): Promise<string> {
 	return normalizeSpace(await readFile(join(ROOT, relPath), "utf8"));
 }
 
-test("fixed collaboration authority: routine writes belong to one bounded Luna delegation", async () => {
+test("development-first authority: ordinary edits are direct and delegation is optional", async () => {
 	const phrases = [
-		"Sol owns requirements",
-		"Routine source, test, and documentation writes in DEV belong to one bounded Luna delegation",
-		"Use one bounded delegation call",
+		"Ordinary source, test, and documentation edits are direct in DEV",
+		"Delegation is optional",
+		"not required for a write or defect repair",
 	] as const;
-	for (const [relPath, label] of FIXED_SOL_LUNA_AUTHORITIES) {
-		const text = await fixedSolLunaText(relPath);
+	for (const [relPath, label] of DEVELOPMENT_FIRST_AUTHORITIES) {
+		const text = await developmentFirstText(relPath);
 		for (const phrase of phrases) {
 			assert.ok(text.includes(phrase), `${label} (${relPath}) must state \"${phrase}\"`);
 		}
 	}
 });
 
-test("fixed collaboration authority: delegation auto-closes and explicit review is recovery-only", async () => {
+test("development-first authority: exact ordinary replacements use an edit-first fast path", async () => {
+	const phrases = ["exact path and exact old/new text", "try one direct `edit` first", "If it does not match, inspect and retry"] as const;
+	for (const [relPath, label] of DEVELOPMENT_FIRST_AUTHORITIES) {
+		const text = await developmentFirstText(relPath);
+		for (const phrase of phrases) {
+			assert.ok(text.includes(phrase), `${label} (${relPath}) must state "${phrase}"`);
+		}
+	}
+});
+
+test("development-first authority: delegated delivery auto-closes and explicit review is recovery-only", async () => {
 	const phrases = ["reviewed and closed automatically", "explicit review/status", "recovery", "never acceptance"] as const;
-	for (const [relPath, label] of FIXED_SOL_LUNA_AUTHORITIES) {
-		const text = await fixedSolLunaText(relPath);
+	for (const [relPath, label] of DEVELOPMENT_FIRST_AUTHORITIES) {
+		const text = await developmentFirstText(relPath);
 		for (const phrase of phrases) {
 			assert.ok(text.includes(phrase), `${label} (${relPath}) must state \"${phrase}\"`);
 		}
 	}
 });
 
-test("fixed collaboration authority: direct Sol writes require an explicit bounded temporary lease", async () => {
-	const phrase = "Sol may edit/write directly only through an active user-issued temporary lease";
-	for (const [relPath, label] of FIXED_SOL_LUNA_AUTHORITIES) {
-		const text = await fixedSolLunaText(relPath);
+test("development-first authority: only protected high-risk paths require a temporary lease", async () => {
+	const phrase = "require an explicit user-issued temporary write lease";
+	for (const [relPath, label] of DEVELOPMENT_FIRST_AUTHORITIES) {
+		const text = await developmentFirstText(relPath);
 		assert.ok(text.includes(phrase), `${label} (${relPath}) must state \"${phrase}\"`);
 	}
 });
 
-test("fixed collaboration authority: focused feedback and one stable-candidate gate pass replace micro-step full verification", async () => {
+test("development-first authority: focused feedback and one stable-candidate gate pass replace micro-step full verification", async () => {
 	const phrases = ["focused tests", "stable candidate", "final gates once"] as const;
-	for (const [relPath, label] of FIXED_SOL_LUNA_AUTHORITIES) {
-		const text = await fixedSolLunaText(relPath);
+	for (const [relPath, label] of DEVELOPMENT_FIRST_AUTHORITIES) {
+		const text = await developmentFirstText(relPath);
 		for (const phrase of phrases) {
 			assert.ok(text.includes(phrase), `${label} (${relPath}) must state \"${phrase}\"`);
 		}
-		assert.ok(!text.includes("Delegation is optional"), `${label} must not make routine delegation optional`);
-		assert.ok(!text.includes("Ordinary source, test, and documentation edits are direct"), `${label} must not restore direct routine writes`);
+		assert.ok(!text.includes("Routine writes are worker-owned by default"), `${label} must not restore mandatory worker writes`);
+		assert.ok(!text.includes("Defects go to a fresh worker"), `${label} must not restore mandatory fresh-worker repair`);
 	}
 });
 
-test("workflow resources point to the fixed collaboration contract without duplicating it", async () => {
-	for (const [relPath, label] of FIXED_SOL_LUNA_POINTERS) {
-		const text = await fixedSolLunaText(relPath);
-		assert.ok(text.includes("fixed Sol -> Luna") || text.includes("fixed Sol → Luna"), `${label} must retain the fixed collaboration pointer`);
-		assert.ok(text.includes("mandatory"), `${label} must state that fixed delivery is mandatory`);
-		assert.ok(!text.includes("Sol may edit/write directly only through an active user-issued temporary lease"), `${label} must not duplicate the full lease policy`);
+test("workflow resources point to the development-first contract without duplicating it", async () => {
+	for (const [relPath, label] of DEVELOPMENT_FIRST_POINTERS) {
+		const text = await developmentFirstText(relPath);
+		assert.ok(text.includes("ordinary development is direct in DEV"), `${label} must retain the direct-development pointer`);
+		assert.ok(text.includes("delegation is an optional bounded execution path"), `${label} must retain the optional-delegation pointer`);
+		assert.ok(text.includes("high-risk") && text.includes("explicit"), `${label} must retain the protected-path authority pointer`);
+		assert.ok(!text.includes("require an explicit user-issued temporary write lease"), `${label} must not duplicate the full lease policy`);
 		assert.ok(!text.includes("reviewed and closed automatically"), `${label} must not duplicate the full review policy`);
 	}
 });

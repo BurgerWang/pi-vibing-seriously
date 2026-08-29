@@ -70,6 +70,22 @@ import {
 	validateReviewRelevanceProjectionV2,
 } from "./review-relevance-v2.ts";
 import { validateSemanticReviewEnvelopeV1 } from "./semantic-review-envelope.ts";
+import {
+	SEMANTIC_REVIEW_EVIDENCE_MAX_BYTES_V2,
+	validateSemanticReviewEvidenceV2,
+	verifySemanticReviewEvidenceBindingV2,
+	verifySemanticReviewParentEvidenceV2,
+	type SemanticReviewEvidenceV2,
+} from "./semantic-review-evidence-v2.ts";
+import {
+	validateSemanticReviewProgressV2,
+	type SemanticReviewProgressV2,
+} from "./structured-sol-review.ts";
+import {
+	WORKER_CHECKPOINT_MAX_BYTES_V1,
+	validateWorkerCheckpointV1,
+	type WorkerCheckpointV1,
+} from "./worker-checkpoint.ts";
 import { validateChangeSet, type ChangeSetRecord } from "./change-set.ts";
 import {
 	validateDelegationCommandProvenance,
@@ -95,6 +111,9 @@ const COMMIT_MARKER_FILE = "commit-marker.json";
 const TRANSACTION_FILE = "transaction.json";
 const LOCK_FILE = "transaction.lock";
 const REVIEW_FILE = "review.json";
+const SEMANTIC_REVIEW_EVIDENCE_V2_FILE = "semantic-review-evidence-v2.json";
+const SEMANTIC_REVIEW_PROGRESS_V2_FILE = "semantic-review-progress-v2.json";
+const WORKER_CHECKPOINT_V1_FILE = "worker-checkpoint-v1.json";
 const SEMANTIC_MIGRATION_FILE = "semantic-migration.json";
 const SEMANTIC_REPAIR_DECISION_FILE = "repair-decision.json";
 const TERMINAL_NEGATIVE_REPAIR_DECISION_FILE = "terminal-negative-repair-decision.json";
@@ -102,6 +121,9 @@ const TERMINAL_NEGATIVE_REPAIR_DECISION_FILE = "terminal-negative-repair-decisio
 export const DELEGATION_SEMANTIC_MIGRATION_MAX_BYTES = 524_288 as const;
 export const DELEGATION_SEMANTIC_REPAIR_DECISION_MAX_BYTES = 16_384 as const;
 export const DELEGATION_TERMINAL_NEGATIVE_REPAIR_DECISION_MAX_BYTES = 32_768 as const;
+export const DELEGATION_SEMANTIC_REVIEW_EVIDENCE_V2_MAX_BYTES = SEMANTIC_REVIEW_EVIDENCE_MAX_BYTES_V2;
+export const DELEGATION_SEMANTIC_REVIEW_PROGRESS_V2_MAX_BYTES = 4 * 1024 * 1024;
+export const DELEGATION_WORKER_CHECKPOINT_V1_MAX_BYTES = WORKER_CHECKPOINT_MAX_BYTES_V1;
 
 export const DELEGATION_TRANSACTION_STORAGE_FAULT_POINTS = [
 	"layout.mkdir",
@@ -162,12 +184,37 @@ export const DELEGATION_TERMINAL_NEGATIVE_REPAIR_STORAGE_FAULT_POINTS = [
 	"terminal_negative_repair.final.read",
 ] as const;
 
+export const DELEGATION_SEMANTIC_REVIEW_EVIDENCE_V2_STORAGE_FAULT_POINTS = [
+	"semantic_evidence_v2.temp.write",
+	"semantic_evidence_v2.temp.read",
+	"semantic_evidence_v2.rename",
+	"semantic_evidence_v2.final.read",
+] as const;
+
+export const DELEGATION_SEMANTIC_REVIEW_PROGRESS_V2_STORAGE_FAULT_POINTS = [
+	"semantic_progress_v2.write.before",
+	"semantic_progress_v2.rename.before",
+	"semantic_progress_v2.rename.after",
+	"semantic_progress_v2.readback.before",
+	"semantic_progress_v2.readback.after",
+] as const;
+
+export const DELEGATION_WORKER_CHECKPOINT_V1_STORAGE_FAULT_POINTS = [
+	"worker_checkpoint_v1.temp.write",
+	"worker_checkpoint_v1.temp.read",
+	"worker_checkpoint_v1.rename",
+	"worker_checkpoint_v1.final.read",
+] as const;
+
 export type DelegationTransactionStorageFaultPoint =
 	| (typeof DELEGATION_TRANSACTION_STORAGE_FAULT_POINTS)[number]
 	| (typeof DELEGATION_REVIEW_STORAGE_FAULT_POINTS)[number]
 	| (typeof DELEGATION_SEMANTIC_MIGRATION_STORAGE_FAULT_POINTS)[number]
 	| (typeof DELEGATION_SEMANTIC_REPAIR_STORAGE_FAULT_POINTS)[number]
-	| (typeof DELEGATION_TERMINAL_NEGATIVE_REPAIR_STORAGE_FAULT_POINTS)[number];
+	| (typeof DELEGATION_TERMINAL_NEGATIVE_REPAIR_STORAGE_FAULT_POINTS)[number]
+	| (typeof DELEGATION_SEMANTIC_REVIEW_EVIDENCE_V2_STORAGE_FAULT_POINTS)[number]
+	| (typeof DELEGATION_SEMANTIC_REVIEW_PROGRESS_V2_STORAGE_FAULT_POINTS)[number]
+	| (typeof DELEGATION_WORKER_CHECKPOINT_V1_STORAGE_FAULT_POINTS)[number];
 
 export interface DelegationStorageEntry {
 	name: string;
@@ -487,6 +534,8 @@ export interface DelegationReviewAuthorityV2 {
 	semantic_migration?: DelegationSemanticMigrationV1;
 	/** Optional immutable Sol decision that rejects this provisional delta for repair. */
 	semantic_repair?: DelegationSemanticRepairDecisionV1;
+	/** New protocol owner. Legacy embedded/migration authority remains read-only when absent. */
+	semantic_evidence_v2?: SemanticReviewEvidenceV2;
 	/**
 	 * Read-only compatibility proof for a strictly revalidated historical
 	 * negative lifecycle. It is derived, never persisted as caller authority.
@@ -496,6 +545,11 @@ export interface DelegationReviewAuthorityV2 {
 
 export interface PublishDelegationReviewV2Input extends DelegationCasInput {
 	artifact: DelegationReviewArtifactV2;
+}
+
+export interface PublishDelegationSemanticReviewEvidenceV2Input extends DelegationCasInput {
+	base_review_hash: string;
+	evidence: SemanticReviewEvidenceV2;
 }
 
 export interface DelegationSemanticRepairReviewerV1 {
@@ -1281,6 +1335,73 @@ function encodeSemanticRepairDecision(value: DelegationSemanticRepairDecisionV1)
 	return encodeJson(value, DELEGATION_SEMANTIC_REPAIR_DECISION_MAX_BYTES);
 }
 
+function semanticEvidenceV2Eligible(authority: DelegationReviewAuthorityV2): boolean {
+	return authority.state.task_kind === "implementation" && authority.state.committed_proof !== null
+		&& authority.artifact.schema_version === 2 && authority.review.schema_version === 2
+		&& authority.review.semantic_review === "required" && authority.review.semantic_acceptance === undefined
+		&& authority.review.relevance_binding !== undefined && authority.review.relevance_projection !== undefined
+		&& authority.review.review_envelope !== undefined && validateSemanticReviewEnvelopeV1(authority.review.review_envelope)
+		&& isScopeIntegrityPacketComplete(authority.review)
+		&& ((authority.state.status === "PENDING_REVIEW" && authority.state.revision === 3 && !authority.finalized)
+			|| (authority.state.status === "REVIEWED" && authority.state.revision === 4 && authority.finalized));
+}
+
+function parseSemanticReviewEvidenceV2ForAuthority(
+	value: unknown,
+	authority: DelegationReviewAuthorityV2,
+): SemanticReviewEvidenceV2 | undefined {
+	if (!semanticEvidenceV2Eligible(authority) || !validateSemanticReviewEvidenceV2(value)) return undefined;
+	const envelope = authority.review.review_envelope!;
+	if (!verifySemanticReviewEvidenceBindingV2(value, {
+		delegation_id: authority.state.delegation_id,
+		generation: authority.state.generation,
+		generation_content_hash: authority.state.committed_proof!.content_hash,
+		contract_hash: authority.state.contract_hash,
+		bound_diff_hash: authority.review.bound_diff_hash,
+		relevance_projection_hash: authority.review.relevance_binding!.projection_hash,
+		review_envelope_hash: canonicalHash(envelope),
+		review_policy_hash: value.review_policy_hash,
+		model_identity: value.model_identity,
+		runtime_build_identity: value.runtime_build_identity,
+		stream_set_hash: envelope.stream_set_hash,
+		parent_evidence_hash: value.parent_evidence_hash,
+	})) return undefined;
+	if (Date.parse(value.completed_at) < Date.parse(authority.artifact.reviewed_at)
+		|| value.cross_file_assessment.affected_paths.some((path) => !value.streams.some((stream) => stream.path === path))) return undefined;
+	if (value.final_decision === "ACCEPT") {
+		if (authority.state.status !== "PENDING_REVIEW" && authority.state.status !== "REVIEWED") return undefined;
+	} else if (authority.state.status !== "PENDING_REVIEW" || authority.finalized) return undefined;
+	return value;
+}
+
+function encodeSemanticReviewEvidenceV2(value: SemanticReviewEvidenceV2): Uint8Array | undefined {
+	return encodeJson(value, DELEGATION_SEMANTIC_REVIEW_EVIDENCE_V2_MAX_BYTES);
+}
+
+function semanticRepairProjectionFromEvidenceV2(
+	authority: DelegationReviewAuthorityV2,
+	evidence: SemanticReviewEvidenceV2,
+): DelegationSemanticRepairDecisionV1 | undefined {
+	if (evidence.final_decision !== "REPAIR" || evidence.repair_reason === null) return undefined;
+	const payload: Omit<DelegationSemanticRepairDecisionV1, "decision_hash"> = {
+		schema_version: 1,
+		delegation_id: evidence.delegation_id,
+		contract_hash: evidence.contract_hash,
+		generation: evidence.generation,
+		transaction_revision: 3,
+		generation_content_hash: evidence.generation_content_hash,
+		base_review_hash: authority.review_hash,
+		expected_bound_diff_hash: evidence.bound_diff_hash,
+		decision: "REPAIR",
+		repair_reason: evidence.repair_reason,
+		repair_reason_hash: semanticRepairReasonHash(evidence.repair_reason),
+		reviewer: { provider: "openai-codex", model: "gpt-5.6-sol" },
+		decided_at: evidence.completed_at,
+	};
+	const projected = { ...payload, decision_hash: semanticRepairDecisionHash(payload) };
+	return parseSemanticRepairDecisionForAuthority(projected, authority);
+}
+
 function isDelegationTerminalNegativeReviewStateCandidateV1(
 	state: Readonly<DelegationTransactionRecord>,
 ): state is DelegationTransactionRecord & { status: DelegationTerminalNegativeStatusV1 } {
@@ -1402,6 +1523,21 @@ export function delegationReviewRelativePathV2(delegationId: string): string | u
 	return posix.join(CONFIG_DIR_NAME, "workbench", "delegations", delegationId, "v2", REVIEW_FILE);
 }
 
+export function delegationSemanticReviewEvidenceRelativePathV2(delegationId: string): string | undefined {
+	if (!DELEGATION_TRANSACTION_ID_RE.test(delegationId)) return undefined;
+	return posix.join(CONFIG_DIR_NAME, "workbench", "delegations", delegationId, "v2", SEMANTIC_REVIEW_EVIDENCE_V2_FILE);
+}
+
+export function delegationSemanticReviewProgressRelativePathV2(delegationId: string): string | undefined {
+	if (!DELEGATION_TRANSACTION_ID_RE.test(delegationId)) return undefined;
+	return posix.join(CONFIG_DIR_NAME, "workbench", "delegations", delegationId, "v2", SEMANTIC_REVIEW_PROGRESS_V2_FILE);
+}
+
+export function delegationWorkerCheckpointRelativePathV1(delegationId: string): string | undefined {
+	if (!DELEGATION_TRANSACTION_ID_RE.test(delegationId)) return undefined;
+	return posix.join(CONFIG_DIR_NAME, "workbench", "delegations", delegationId, "v2", WORKER_CHECKPOINT_V1_FILE);
+}
+
 export function delegationSemanticMigrationRelativePathV1(delegationId: string): string | undefined {
 	if (!DELEGATION_TRANSACTION_ID_RE.test(delegationId)) return undefined;
 	return posix.join(CONFIG_DIR_NAME, "workbench", "delegations", delegationId, "v2", SEMANTIC_MIGRATION_FILE);
@@ -1438,6 +1574,9 @@ function transactionPaths(projectRoot: string, delegationId: string): {
 	transaction: string;
 	lock: string;
 	review: string;
+	semanticEvidenceV2: string;
+	semanticProgressV2: string;
+	workerCheckpointV1: string;
 	semanticMigration: string;
 	semanticRepair: string;
 	terminalNegativeRepair: string;
@@ -1452,6 +1591,9 @@ function transactionPaths(projectRoot: string, delegationId: string): {
 		transaction: join(v2, TRANSACTION_FILE),
 		lock: join(v2, LOCK_FILE),
 		review: join(v2, REVIEW_FILE),
+		semanticEvidenceV2: join(v2, SEMANTIC_REVIEW_EVIDENCE_V2_FILE),
+		semanticProgressV2: join(v2, SEMANTIC_REVIEW_PROGRESS_V2_FILE),
+		workerCheckpointV1: join(v2, WORKER_CHECKPOINT_V1_FILE),
 		semanticMigration: join(v2, SEMANTIC_MIGRATION_FILE),
 		semanticRepair: join(v2, SEMANTIC_REPAIR_DECISION_FILE),
 		terminalNegativeRepair: join(v2, TERMINAL_NEGATIVE_REPAIR_DECISION_FILE),
@@ -1803,6 +1945,193 @@ async function readReviewArtifactAt(
 			? failure("not_found", "delegation v2 review artifact does not exist", point)
 			: failure("storage_failure", "delegation v2 review artifact read failed", point);
 	}
+}
+
+async function readSemanticReviewEvidenceV2At(
+	paths: NonNullable<ReturnType<typeof transactionPaths>>,
+	authority: DelegationReviewAuthorityV2,
+	adapter: DelegationTransactionStorageAdapter,
+	point?: "semantic_evidence_v2.temp.read" | "semantic_evidence_v2.final.read",
+): Promise<DelegationTransactionStorageResult<SemanticReviewEvidenceV2 | undefined>> {
+	try {
+		const stat = await adapter.inspect(paths.semanticEvidenceV2);
+		if (stat.kind !== "file" || stat.size > DELEGATION_SEMANTIC_REVIEW_EVIDENCE_V2_MAX_BYTES) {
+			return failure("invalid_record", "semantic review evidence v2 path is unsafe or oversized", point);
+		}
+		const bytes = point === undefined
+			? await adapter.readBounded(paths.semanticEvidenceV2, DELEGATION_SEMANTIC_REVIEW_EVIDENCE_V2_MAX_BYTES)
+			: await readBytesAtPoint(adapter, paths.semanticEvidenceV2, DELEGATION_SEMANTIC_REVIEW_EVIDENCE_V2_MAX_BYTES, point);
+		const parsed = parseSemanticReviewEvidenceV2ForAuthority(decodeJson(bytes), authority);
+		const canonical = parsed === undefined ? undefined : encodeSemanticReviewEvidenceV2(parsed);
+		if (parsed === undefined || canonical === undefined || !Buffer.from(canonical).equals(Buffer.from(bytes))) {
+			return failure("invalid_record", "semantic review evidence v2 is corrupt, non-canonical, or unbound", point);
+		}
+		return { ok: true, value: parsed };
+	} catch (error) {
+		return isErrno(error, "ENOENT")
+			? { ok: true, value: undefined }
+			: failure("storage_failure", "semantic review evidence v2 read failed", point);
+	}
+}
+
+function encodeSemanticReviewProgressV2(value: SemanticReviewProgressV2): Uint8Array | undefined {
+	return validateSemanticReviewProgressV2(value)
+		? encodeJson(value, DELEGATION_SEMANTIC_REVIEW_PROGRESS_V2_MAX_BYTES)
+		: undefined;
+}
+
+async function readSemanticReviewProgressV2At(
+	paths: NonNullable<ReturnType<typeof transactionPaths>>,
+	delegationId: string,
+	adapter: DelegationTransactionStorageAdapter,
+): Promise<DelegationTransactionStorageResult<SemanticReviewProgressV2 | undefined>> {
+	try {
+		const stat = await adapter.inspect(paths.semanticProgressV2);
+		if (stat.kind !== "file" || stat.size > DELEGATION_SEMANTIC_REVIEW_PROGRESS_V2_MAX_BYTES) {
+			return failure("invalid_record", "semantic review progress v2 path is unsafe or oversized");
+		}
+		const bytes = await adapter.readBounded(paths.semanticProgressV2, DELEGATION_SEMANTIC_REVIEW_PROGRESS_V2_MAX_BYTES);
+		const value = decodeJson(bytes);
+		if (!validateSemanticReviewProgressV2(value)) {
+			return failure("invalid_record", "semantic review progress v2 is corrupt, non-canonical, or unbound");
+		}
+		const canonical = encodeSemanticReviewProgressV2(value);
+		if (canonical === undefined || !Buffer.from(canonical).equals(Buffer.from(bytes)) || value.delegation_id !== delegationId) {
+			return failure("invalid_record", "semantic review progress v2 is corrupt, non-canonical, or unbound");
+		}
+		return { ok: true, value };
+	} catch (error) {
+		return isErrno(error, "ENOENT")
+			? { ok: true, value: undefined }
+			: failure("storage_failure", "semantic review progress v2 read failed");
+	}
+}
+
+function progressCanAdvanceV2(
+	prior: Readonly<SemanticReviewProgressV2> | undefined,
+	next: Readonly<SemanticReviewProgressV2>,
+): boolean {
+	if (prior === undefined) return true;
+	if (prior.review_job_id !== next.review_job_id || prior.delegation_id !== next.delegation_id
+		|| prior.generation !== next.generation || prior.input_identity_hash !== next.input_identity_hash
+		|| prior.review_policy_hash !== next.review_policy_hash || prior.batches.length !== next.batches.length) return false;
+	if (prior.status === "COMPLETED") return prior.progress_hash === next.progress_hash;
+	if (next.cumulative_usage.totalTokens < prior.cumulative_usage.totalTokens) return false;
+	return prior.batches.every((batch, index) => batch.status !== "COMPLETED"
+		|| next.batches[index]?.status === "COMPLETED" && next.batches[index]?.batch_hash === batch.batch_hash);
+}
+
+async function writeSemanticReviewProgressV2Locked(
+	paths: NonNullable<ReturnType<typeof transactionPaths>>,
+	progress: SemanticReviewProgressV2,
+	adapter: DelegationTransactionStorageAdapter,
+): Promise<DelegationTransactionStorageResult<SemanticReviewProgressV2>> {
+	const encoded = encodeSemanticReviewProgressV2(progress);
+	if (encoded === undefined) return failure("invalid_input", "semantic review progress v2 is invalid or oversized");
+	const existing = await readSemanticReviewProgressV2At(paths, progress.delegation_id, adapter);
+	if (!existing.ok) return existing;
+	if (existing.value?.progress_hash === progress.progress_hash) return { ok: true, value: existing.value };
+	if (!progressCanAdvanceV2(existing.value, progress)) {
+		return failure("conflict", "semantic review progress v2 identity or monotonicity check failed");
+	}
+	const token = storageToken(adapter);
+	if (token === undefined) return failure("storage_failure", "storage random token is invalid", "semantic_progress_v2.write.before");
+	const temp = join(paths.v2, `.semantic-review-progress-v2.${token}.tmp`);
+	try {
+		await invokeFault(adapter, "semantic_progress_v2.write.before");
+		await adapter.write(temp, encoded, true);
+		const tempBytes = await adapter.readBounded(temp, DELEGATION_SEMANTIC_REVIEW_PROGRESS_V2_MAX_BYTES);
+		if (!Buffer.from(tempBytes).equals(Buffer.from(encoded))) throw new Error("progress temp readback mismatch");
+		await invokeFault(adapter, "semantic_progress_v2.rename.before");
+		await adapter.move(temp, paths.semanticProgressV2);
+		await invokeFault(adapter, "semantic_progress_v2.rename.after");
+		await invokeFault(adapter, "semantic_progress_v2.readback.before");
+		const readback = await readSemanticReviewProgressV2At(paths, progress.delegation_id, adapter);
+		await invokeFault(adapter, "semantic_progress_v2.readback.after");
+		if (!readback.ok || readback.value?.progress_hash !== progress.progress_hash) throw new Error("progress final readback mismatch");
+		return { ok: true, value: readback.value };
+	} catch {
+		return failure("storage_failure", "semantic review progress v2 atomic publish failed");
+	}
+}
+
+function encodeWorkerCheckpointV1(value: WorkerCheckpointV1): Uint8Array | undefined {
+	return validateWorkerCheckpointV1(value) ? encodeJson(value, DELEGATION_WORKER_CHECKPOINT_V1_MAX_BYTES) : undefined;
+}
+
+async function readWorkerCheckpointV1At(
+	paths: NonNullable<ReturnType<typeof transactionPaths>>,
+	delegationId: string,
+	contractHash: string,
+	adapter: DelegationTransactionStorageAdapter,
+	point?: "worker_checkpoint_v1.temp.read" | "worker_checkpoint_v1.final.read",
+): Promise<DelegationTransactionStorageResult<WorkerCheckpointV1 | undefined>> {
+	try {
+		const stat = await adapter.inspect(paths.workerCheckpointV1);
+		if (stat.kind !== "file" || stat.size > DELEGATION_WORKER_CHECKPOINT_V1_MAX_BYTES) {
+			return failure("invalid_record", "worker checkpoint path is unsafe or oversized", point);
+		}
+		const bytes = point === undefined
+			? await adapter.readBounded(paths.workerCheckpointV1, DELEGATION_WORKER_CHECKPOINT_V1_MAX_BYTES)
+			: await readBytesAtPoint(adapter, paths.workerCheckpointV1, DELEGATION_WORKER_CHECKPOINT_V1_MAX_BYTES, point);
+		const value = decodeJson(bytes);
+		if (!validateWorkerCheckpointV1(value)) return failure("invalid_record", "worker checkpoint is corrupt or non-canonical", point);
+		const canonical = encodeWorkerCheckpointV1(value);
+		if (canonical === undefined || !Buffer.from(canonical).equals(Buffer.from(bytes))
+			|| value.delegation_id !== delegationId || value.contract_hash !== contractHash) {
+			return failure("invalid_record", "worker checkpoint is unbound", point);
+		}
+		return { ok: true, value };
+	} catch (error) {
+		return isErrno(error, "ENOENT") ? { ok: true, value: undefined }
+			: failure("storage_failure", "worker checkpoint read failed", point);
+	}
+}
+
+function workerCheckpointCanAdvanceV1(prior: WorkerCheckpointV1 | undefined, next: WorkerCheckpointV1): boolean {
+	if (prior === undefined) return next.attempt === 1 && next.parent_checkpoint_hash === null;
+	if (prior.checkpoint_hash === next.checkpoint_hash) return true;
+	if (prior.machine_state === "PAUSED_BUDGET" || next.attempt !== prior.attempt + 1
+		|| next.parent_checkpoint_hash !== prior.checkpoint_hash || next.delegation_id !== prior.delegation_id
+		|| next.contract_hash !== prior.contract_hash || next.runtime_build_identity !== prior.runtime_build_identity
+		|| next.before_binding_hash !== prior.before_binding_hash || next.cumulative_turns < prior.cumulative_turns
+		|| next.cumulative_usage.totalTokens < prior.cumulative_usage.totalTokens
+		|| next.cumulative_usage.output < prior.cumulative_usage.output
+		|| (prior.remaining_budget.profile === "extended" && next.remaining_budget.profile !== "extended")) return false;
+	const recipes = new Set(next.completed_recipe_run_ids);
+	return prior.completed_recipe_run_ids.every((id) => recipes.has(id));
+}
+
+async function writeWorkerCheckpointV1Locked(
+	paths: NonNullable<ReturnType<typeof transactionPaths>>,
+	checkpoint: WorkerCheckpointV1,
+	adapter: DelegationTransactionStorageAdapter,
+): Promise<DelegationTransactionStorageResult<WorkerCheckpointV1>> {
+	const encoded = encodeWorkerCheckpointV1(checkpoint);
+	if (encoded === undefined) return failure("invalid_input", "worker checkpoint is invalid or oversized");
+	const existing = await readWorkerCheckpointV1At(paths, checkpoint.delegation_id, checkpoint.contract_hash, adapter);
+	if (!existing.ok) return existing;
+	if (existing.value?.checkpoint_hash === checkpoint.checkpoint_hash) return { ok: true, value: existing.value };
+	if (!workerCheckpointCanAdvanceV1(existing.value, checkpoint)) return failure("conflict", "worker checkpoint chain is not monotonic");
+	const token = storageToken(adapter);
+	if (token === undefined) return failure("storage_failure", "storage random token is invalid", "worker_checkpoint_v1.temp.write");
+	const temp = join(paths.v2, `.worker-checkpoint-v1.${token}.tmp`);
+	try {
+		await invokeFault(adapter, "worker_checkpoint_v1.temp.write");
+		await adapter.write(temp, encoded, true);
+		const tempBytes = await readBytesAtPoint(adapter, temp, DELEGATION_WORKER_CHECKPOINT_V1_MAX_BYTES, "worker_checkpoint_v1.temp.read");
+		if (!Buffer.from(tempBytes).equals(Buffer.from(encoded))) throw new Error("checkpoint temp readback mismatch");
+		await invokeFault(adapter, "worker_checkpoint_v1.rename");
+		await adapter.move(temp, paths.workerCheckpointV1);
+	} catch {
+		return failure("storage_failure", "worker checkpoint atomic publish failed", "worker_checkpoint_v1.rename");
+	}
+	const finalRead = await readWorkerCheckpointV1At(
+		paths, checkpoint.delegation_id, checkpoint.contract_hash, adapter, "worker_checkpoint_v1.final.read",
+	);
+	return finalRead.ok && finalRead.value?.checkpoint_hash === checkpoint.checkpoint_hash
+		? { ok: true, value: finalRead.value }
+		: failure("storage_failure", "worker checkpoint final readback mismatch", "worker_checkpoint_v1.final.read");
 }
 
 async function readSemanticMigrationAt(
@@ -2533,6 +2862,164 @@ export async function readDelegationCommittedGenerationV2(
 	};
 }
 
+async function readSemanticReviewEvidenceV2Chain(
+	projectRoot: string,
+	committed: DelegationCommittedGenerationV2,
+	authority: DelegationReviewAuthorityV2,
+	adapter: DelegationTransactionStorageAdapter,
+	visited: ReadonlySet<string>,
+): Promise<DelegationTransactionStorageResult<SemanticReviewEvidenceV2 | undefined>> {
+	if (visited.has(committed.state.delegation_id) || visited.size >= 64) {
+		return failure("invalid_record", "semantic review evidence parent chain is cyclic or exceeds its bound");
+	}
+	const paths = transactionPaths(projectRoot, committed.state.delegation_id);
+	if (paths === undefined) return failure("invalid_input", "invalid semantic review evidence delegation id");
+	const read = await readSemanticReviewEvidenceV2At(paths, authority, adapter);
+	if (!read.ok || read.value === undefined) return read;
+	const evidence = read.value;
+	if (evidence.parent_evidence_hash === null) {
+		return verifySemanticReviewParentEvidenceV2(evidence, null)
+			? { ok: true, value: evidence }
+			: failure("invalid_record", "semantic review evidence has inherited streams without a parent");
+	}
+	const parentId = committed.state.repair_lineage?.repair_of;
+	if (parentId === undefined || parentId === committed.state.delegation_id) {
+		return failure("invalid_record", "semantic review evidence parent is not the exact repair predecessor");
+	}
+	const parentCommitted = await readDelegationCommittedGenerationV2(projectRoot, parentId, { adapter });
+	if (!parentCommitted.ok) return failure("invalid_record", "semantic review evidence parent generation is unavailable");
+	const parentPaths = transactionPaths(projectRoot, parentId);
+	if (parentPaths === undefined) return failure("invalid_record", "semantic review evidence parent path is invalid");
+	const parentBase = await readReviewArtifactAt(parentPaths, parentCommitted.value.state, parentCommitted.value.records, adapter);
+	if (!parentBase.ok) return failure("invalid_record", "semantic review evidence parent review is unavailable");
+	const { bytes: _bytes, ...parentAuthority } = parentBase.value;
+	const parent = await readSemanticReviewEvidenceV2Chain(
+		projectRoot,
+		parentCommitted.value,
+		parentAuthority,
+		adapter,
+		new Set([...visited, committed.state.delegation_id]),
+	);
+	if (!parent.ok || parent.value === undefined || !verifySemanticReviewParentEvidenceV2(evidence, parent.value)) {
+		return failure("invalid_record", "semantic review evidence inherited proof does not match the direct parent");
+	}
+	return { ok: true, value: evidence };
+}
+
+/** Strict V2 evidence read. Absence is legacy/V1, malformed and future records fail closed. */
+export async function readDelegationSemanticReviewEvidenceV2(
+	projectRoot: string,
+	delegationId: string,
+	options?: DelegationTransactionStorageOptions,
+): Promise<DelegationTransactionStorageResult<SemanticReviewEvidenceV2 | undefined>> {
+	const committed = await readDelegationCommittedGenerationV2(projectRoot, delegationId, options);
+	if (!committed.ok) return committed;
+	const paths = transactionPaths(projectRoot, delegationId);
+	if (paths === undefined) return failure("invalid_input", "invalid delegation id");
+	const adapter = adapterOf(options);
+	const base = await readReviewArtifactAt(paths, committed.value.state, committed.value.records, adapter);
+	if (!base.ok) return base;
+	const { bytes: _bytes, ...authority } = base.value;
+	return readSemanticReviewEvidenceV2Chain(projectRoot, committed.value, authority, adapter, new Set());
+}
+
+/** Read-only operational progress. It is never semantic ACCEPT authority. */
+export async function readDelegationSemanticReviewProgressV2(
+	projectRoot: string,
+	delegationId: string,
+	options?: DelegationTransactionStorageOptions,
+): Promise<DelegationTransactionStorageResult<SemanticReviewProgressV2 | undefined>> {
+	const paths = transactionPaths(projectRoot, delegationId);
+	if (paths === undefined) return failure("invalid_input", "invalid delegation id");
+	return readSemanticReviewProgressV2At(paths, delegationId, adapterOf(options));
+}
+
+/**
+ * Serialize a complete resumable review runner behind the existing live-owner
+ * transaction lock. The callback may perform model calls, but can publish only
+ * validated monotonic progress through the provided closure.
+ */
+export async function withDelegationSemanticReviewJobV2<T>(
+	projectRoot: string,
+	delegationId: string,
+	now: string,
+	operation: (context: {
+		progress: Readonly<SemanticReviewProgressV2> | undefined;
+		publishProgress: (progress: Readonly<SemanticReviewProgressV2>) => Promise<DelegationTransactionStorageResult<SemanticReviewProgressV2>>;
+	}) => Promise<T>,
+	options?: DelegationTransactionStorageOptions,
+): Promise<DelegationTransactionStorageResult<T>> {
+	if (!isCanonicalTime(now)) return failure("invalid_input", "review job lock time must be canonical ISO-8601");
+	const adapter = adapterOf(options);
+	return withDelegationLock(projectRoot, delegationId, now, adapter, async (paths) => {
+		const state = await readStateAt(paths.transaction, adapter);
+		if (!state.ok) return state;
+		if (state.value.task_kind !== "implementation" || state.value.committed_proof === null
+			|| (state.value.status !== "PENDING_REVIEW" && state.value.status !== "REVIEWED")) {
+			return failure("conflict", "semantic review job requires a committed review lifecycle");
+		}
+		const existing = await readSemanticReviewProgressV2At(paths, delegationId, adapter);
+		if (!existing.ok) return existing;
+		try {
+			const value = await operation({
+				progress: existing.value,
+				publishProgress: async (progress) => {
+					if (progress.delegation_id !== delegationId || progress.generation !== state.value.generation) {
+						return failure("conflict", "semantic review progress does not match locked generation");
+					}
+					return writeSemanticReviewProgressV2Locked(paths, structuredClone(progress), adapter);
+				},
+			});
+			return { ok: true, value };
+		} catch {
+			return failure("storage_failure", "semantic review job callback failed");
+		}
+	});
+}
+
+/** Final progress publication after immutable evidence has been read back. */
+export async function publishDelegationSemanticReviewProgressV2(
+	projectRoot: string,
+	progress: Readonly<SemanticReviewProgressV2>,
+	options?: DelegationTransactionStorageOptions,
+): Promise<DelegationTransactionStorageResult<SemanticReviewProgressV2>> {
+	if (!validateSemanticReviewProgressV2(progress)) return failure("invalid_input", "semantic review progress v2 is invalid");
+	const adapter = adapterOf(options);
+	return withDelegationLock(projectRoot, progress.delegation_id, progress.updated_at, adapter, async (paths) =>
+		writeSemanticReviewProgressV2Locked(paths, structuredClone(progress), adapter));
+}
+
+/** Latest machine checkpoint; it is execution state, never semantic review authority. */
+export async function readDelegationWorkerCheckpointV1(
+	projectRoot: string,
+	delegationId: string,
+	options?: DelegationTransactionStorageOptions,
+): Promise<DelegationTransactionStorageResult<WorkerCheckpointV1 | undefined>> {
+	const state = await readDelegationTransactionV2(projectRoot, delegationId, options);
+	if (!state.ok) return state;
+	const paths = transactionPaths(projectRoot, delegationId);
+	if (paths === undefined) return failure("invalid_input", "invalid delegation id");
+	return readWorkerCheckpointV1At(paths, delegationId, state.value.contract_hash, adapterOf(options));
+}
+
+/** Publish exactly one monotonic checkpoint attempt under the transaction lock. */
+export async function publishDelegationWorkerCheckpointV1(
+	projectRoot: string,
+	checkpoint: Readonly<WorkerCheckpointV1>,
+	options?: DelegationTransactionStorageOptions,
+): Promise<DelegationTransactionStorageResult<WorkerCheckpointV1>> {
+	if (!validateWorkerCheckpointV1(checkpoint)) return failure("invalid_input", "worker checkpoint is invalid");
+	const adapter = adapterOf(options);
+	return withDelegationLock(projectRoot, checkpoint.delegation_id, checkpoint.created_at, adapter, async (paths) => {
+		const state = await readStateAt(paths.transaction, adapter);
+		if (!state.ok) return state;
+		if (state.value.status !== "RUNNING" || state.value.contract_hash !== checkpoint.contract_hash) {
+			return failure("conflict", "worker checkpoint does not bind the active transaction state");
+		}
+		return writeWorkerCheckpointV1Locked(paths, structuredClone(checkpoint), adapter);
+	});
+}
+
 /**
  * Strict v2 review read.  PENDING_REVIEW files are provisional evidence;
  * REVIEWED files are authority only when their exact full-byte hash and all
@@ -2567,12 +3054,26 @@ export async function readDelegationReviewV2(
 	if (!migration.ok) return migration;
 	const repair = await readSemanticRepairDecisionAt(paths, authority, adapter);
 	if (!repair.ok) return repair;
+	const evidence = await readSemanticReviewEvidenceV2Chain(
+		projectRoot, generation.value, authority, adapter, new Set(),
+	);
+	if (!evidence.ok) return evidence;
+	if (evidence.value !== undefined && (migration.value !== undefined || repair.value !== undefined
+		|| authority.review.semantic_review === "accepted" || authority.review.semantic_acceptance !== undefined)) {
+		return failure("invalid_record", "semantic review evidence v2 conflicts with a legacy semantic owner");
+	}
+	const evidenceRepair = evidence.value === undefined ? undefined : semanticRepairProjectionFromEvidenceV2(authority, evidence.value);
+	if (evidence.value?.final_decision === "REPAIR" && evidenceRepair === undefined) {
+		return failure("invalid_record", "semantic review evidence v2 repair projection is invalid");
+	}
 	return {
 		ok: true,
 		value: {
 			...authority,
 			...(migration.value === undefined ? {} : { semantic_migration: migration.value }),
 			...(repair.value === undefined ? {} : { semantic_repair: repair.value }),
+			...(evidence.value === undefined ? {} : { semantic_evidence_v2: evidence.value }),
+			...(evidenceRepair === undefined ? {} : { semantic_repair: evidenceRepair }),
 		},
 	};
 }
@@ -2672,14 +3173,15 @@ export async function readDelegationImmutableReviewSidecarPresenceV1(
 	projectRoot: string,
 	delegationId: string,
 	options?: DelegationTransactionStorageOptions,
-): Promise<DelegationTransactionStorageResult<{ semantic_migration: boolean; semantic_repair: boolean }>> {
+): Promise<DelegationTransactionStorageResult<{ semantic_migration: boolean; semantic_repair: boolean; semantic_evidence_v2: boolean }>> {
 	const paths = transactionPaths(projectRoot, delegationId);
 	if (paths === undefined) return failure("invalid_input", "invalid delegation id");
 	const adapter = adapterOf(options);
-	const presence = { semantic_migration: false, semantic_repair: false };
+	const presence = { semantic_migration: false, semantic_repair: false, semantic_evidence_v2: false };
 	for (const [key, path] of [
 		["semantic_migration", paths.semanticMigration],
 		["semantic_repair", paths.semanticRepair],
+		["semantic_evidence_v2", paths.semanticEvidenceV2],
 	] as const) {
 		try {
 			await adapter.inspect(path);
@@ -2726,7 +3228,16 @@ export async function readDelegationCurrentSemanticRepairDecisionV1(
 	const state = committed.state;
 	if (state.status === "PENDING_REVIEW") {
 		const read = await readDelegationSemanticRepairDecisionV1(projectRoot, state.delegation_id, options);
-		if (!read.ok || read.value === undefined) return read;
+		if (!read.ok) return read;
+		if (read.value === undefined) {
+			const presence = await readDelegationImmutableReviewSidecarPresenceV1(projectRoot, state.delegation_id, options);
+			if (!presence.ok || !presence.value.semantic_evidence_v2) {
+				return presence.ok ? { ok: true, value: undefined } : presence;
+			}
+			const review = await readDelegationReviewV2(projectRoot, state.delegation_id, options);
+			if (!review.ok) return review.error.code === "not_found" ? { ok: true, value: undefined } : review;
+			return { ok: true, value: review.value.semantic_repair };
+		}
 		return read.value.delegation_id === state.delegation_id
 			&& read.value.contract_hash === state.contract_hash
 			? read
@@ -2866,6 +3377,43 @@ async function writeSemanticMigrationLocked(
 	return { ok: true, value: finalRead.value };
 }
 
+async function writeSemanticReviewEvidenceV2Locked(
+	paths: NonNullable<ReturnType<typeof transactionPaths>>,
+	authority: DelegationReviewAuthorityV2,
+	evidence: SemanticReviewEvidenceV2,
+	adapter: DelegationTransactionStorageAdapter,
+): Promise<DelegationTransactionStorageResult<SemanticReviewEvidenceV2>> {
+	const encoded = encodeSemanticReviewEvidenceV2(evidence);
+	if (encoded === undefined || parseSemanticReviewEvidenceV2ForAuthority(evidence, authority) === undefined) {
+		return failure("invalid_input", "semantic review evidence v2 is invalid or exceeds its fixed bound");
+	}
+	const token = storageToken(adapter);
+	if (token === undefined) return failure("storage_failure", "storage random token is invalid", "semantic_evidence_v2.temp.write");
+	const temp = join(paths.v2, `.semantic-review-evidence-v2.${token}.tmp`);
+	try {
+		await invokeFault(adapter, "semantic_evidence_v2.temp.write");
+		await adapter.write(temp, encoded, true);
+		const tempBytes = await readBytesAtPoint(
+			adapter, temp, DELEGATION_SEMANTIC_REVIEW_EVIDENCE_V2_MAX_BYTES, "semantic_evidence_v2.temp.read",
+		);
+		const parsed = parseSemanticReviewEvidenceV2ForAuthority(decodeJson(tempBytes), authority);
+		const canonical = parsed === undefined ? undefined : encodeSemanticReviewEvidenceV2(parsed);
+		if (parsed === undefined || canonical === undefined || !Buffer.from(canonical).equals(Buffer.from(tempBytes))
+			|| !Buffer.from(tempBytes).equals(Buffer.from(encoded))) {
+			return failure("storage_failure", "semantic review evidence v2 temp readback mismatch", "semantic_evidence_v2.temp.read");
+		}
+		await invokeFault(adapter, "semantic_evidence_v2.rename");
+		await adapter.move(temp, paths.semanticEvidenceV2);
+	} catch {
+		return failure("storage_failure", "semantic review evidence v2 atomic publish failed", "semantic_evidence_v2.rename");
+	}
+	const finalRead = await readSemanticReviewEvidenceV2At(paths, authority, adapter, "semantic_evidence_v2.final.read");
+	if (!finalRead.ok || finalRead.value === undefined || finalRead.value.evidence_hash !== evidence.evidence_hash) {
+		return failure("storage_failure", "semantic review evidence v2 final readback mismatch", "semantic_evidence_v2.final.read");
+	}
+	return { ok: true, value: finalRead.value };
+}
+
 async function writeSemanticRepairDecisionLocked(
 	paths: NonNullable<ReturnType<typeof transactionPaths>>,
 	authority: DelegationReviewAuthorityV2,
@@ -2943,6 +3491,110 @@ async function writeTerminalNegativeRepairArtifactLocked(
 		return failure("storage_failure", "terminal-negative repair final readback mismatch", "terminal_negative_repair.final.read");
 	}
 	return { ok: true, value: finalRead.value };
+}
+
+/**
+ * Publish the sole semantic owner for an explicitly selected V2 review.
+ * ACCEPT atomically advances the existing packet to REVIEWED only after the
+ * immutable evidence has been written and read back. REPAIR stays pending.
+ */
+export async function publishDelegationSemanticReviewEvidenceV2(
+	projectRoot: string,
+	input: PublishDelegationSemanticReviewEvidenceV2Input,
+	options?: DelegationTransactionStorageOptions,
+): Promise<DelegationTransactionStorageResult<SemanticReviewEvidenceV2>> {
+	if (!validateSemanticReviewEvidenceV2(input.evidence) || input.now !== input.evidence.completed_at
+		|| input.evidence.delegation_id !== input.delegation_id || input.evidence.contract_hash !== input.contract_hash) {
+		return failure("invalid_input", "semantic review evidence v2 input is invalid or not bound to the CAS request");
+	}
+	const adapter = adapterOf(options);
+	return withDelegationLock(projectRoot, input.delegation_id, input.now, adapter, async (paths) => {
+		const currentResult = await readStateAt(paths.transaction, adapter);
+		if (!currentResult.ok) return currentResult;
+		const current = currentResult.value;
+		const replayedAccept = current.status === "REVIEWED" && current.revision === 4
+			&& input.evidence.final_decision === "ACCEPT" && current.review !== null
+			&& current.review.review_hash === input.base_review_hash;
+		if (!replayedAccept && (current.status !== "PENDING_REVIEW" || current.revision !== 3)) {
+			return failure("conflict", "semantic review evidence v2 lifecycle check failed");
+		}
+		if (current.task_kind !== "implementation" || current.committed_proof === null
+			|| current.generation !== input.expected_generation || current.contract_hash !== input.contract_hash
+			|| !sameIdentity(current.worker_identity, input.worker_identity)
+			|| (!replayedAccept && current.revision !== input.expected_revision)
+			|| (replayedAccept && input.expected_revision !== 3 && input.expected_revision !== 4)) {
+			return failure("conflict", "semantic review evidence v2 CAS, identity, or generation check failed");
+		}
+		const generation = generationName(current.generation);
+		if (generation === undefined) return failure("invalid_record", "semantic review evidence v2 generation is invalid");
+		const verified = await verifyGenerationDirectory(join(paths.generations, generation), {
+			...current,
+			status: "COMMITTING",
+			revision: current.committed_proof.revision,
+			committed_proof: null,
+			review: null,
+		}, adapter);
+		if (!verified.ok || !sameJson(verified.value.inventory.proof, current.committed_proof)) {
+			return failure("invalid_record", "semantic review evidence v2 conflicts with the committed generation");
+		}
+		const baseRead = await readReviewArtifactAt(paths, current, verified.value.records, adapter);
+		if (!baseRead.ok) return baseRead;
+		const { bytes: _bytes, ...authority } = baseRead.value;
+		if (authority.review_hash !== input.base_review_hash || !semanticEvidenceV2Eligible(authority)
+			|| parseSemanticReviewEvidenceV2ForAuthority(input.evidence, authority) === undefined) {
+			return failure("conflict", "semantic review evidence v2 does not match the exact complete review packet");
+		}
+		const [migration, repair] = await Promise.all([
+			readSemanticMigrationAt(paths, authority, adapter),
+			readSemanticRepairDecisionAt(paths, authority, adapter),
+		]);
+		if (!migration.ok) return migration;
+		if (!repair.ok) return repair;
+		if (migration.value !== undefined || repair.value !== undefined || authority.review.semantic_acceptance !== undefined
+			|| authority.review.semantic_review === "accepted") {
+			return failure("conflict", "semantic review evidence v2 cannot dual-write a legacy semantic owner");
+		}
+		let parent: SemanticReviewEvidenceV2 | null = null;
+		if (input.evidence.parent_evidence_hash !== null) {
+			const parentId = current.repair_lineage?.repair_of;
+			if (parentId === undefined) return failure("invalid_record", "semantic review evidence v2 parent is not a repair predecessor");
+			const parentRead = await readDelegationSemanticReviewEvidenceV2(projectRoot, parentId, { adapter });
+			if (!parentRead.ok || parentRead.value === undefined) {
+				return failure("invalid_record", "semantic review evidence v2 parent authority is unavailable");
+			}
+			parent = parentRead.value;
+		}
+		if (!verifySemanticReviewParentEvidenceV2(input.evidence, parent)) {
+			return failure("invalid_record", "semantic review evidence v2 inherited proof is invalid");
+		}
+		const existing = await readSemanticReviewEvidenceV2At(paths, authority, adapter);
+		if (!existing.ok) return existing;
+		let publishedEvidence: SemanticReviewEvidenceV2;
+		if (existing.value !== undefined) {
+			if (existing.value.evidence_hash !== input.evidence.evidence_hash) {
+				return failure("conflict", "semantic review evidence v2 is immutable");
+			}
+			publishedEvidence = existing.value;
+		} else {
+			const written = await writeSemanticReviewEvidenceV2Locked(paths, authority, input.evidence, adapter);
+			if (!written.ok) return written;
+			publishedEvidence = written.value;
+		}
+		if (publishedEvidence.final_decision === "REPAIR" || replayedAccept) return { ok: true, value: publishedEvidence };
+		const next = reviewDelegationTransaction(current, {
+			delegation_id: current.delegation_id,
+			contract_hash: current.contract_hash,
+			worker_identity: current.worker_identity,
+			expected_generation: current.generation,
+			expected_revision: current.revision,
+			now: authority.artifact.reviewed_at,
+			review_hash: authority.review_hash,
+		});
+		if (!next.ok) return failure("conflict", "semantic review evidence v2 state transition failed");
+		const state = await publishState(paths, next.state, adapter, "review_state");
+		if (!state.ok) return state;
+		return { ok: true, value: publishedEvidence };
+	});
 }
 
 /**
@@ -3294,7 +3946,9 @@ export async function publishHistoricalSemanticMigrationAcceptanceV2(
 
 /** Embedded strict acceptance, true zero delta, or an exact accepted migration. */
 export function hasDelegationSemanticReviewAuthorityV2(authority: DelegationReviewAuthorityV2): boolean {
-	return authority.finalized && authority.state.status === "REVIEWED" && (isStrictSemanticAcceptedOrZeroDelta(authority.review) ||
+	const evidenceAccepted = authority.semantic_evidence_v2 !== undefined
+		&& parseSemanticReviewEvidenceV2ForAuthority(authority.semantic_evidence_v2, authority)?.final_decision === "ACCEPT";
+	return authority.finalized && authority.state.status === "REVIEWED" && (evidenceAccepted || isStrictSemanticAcceptedOrZeroDelta(authority.review) ||
 		(authority.semantic_migration !== undefined &&
 			parseSemanticMigrationForAuthority(authority.semantic_migration, authority)?.status === "ACCEPTED"));
 }
@@ -3303,8 +3957,10 @@ export const isDelegationReviewAuthoritySemanticallyAccepted = hasDelegationSema
 
 /** Exact immutable REPAIR provenance only; deliberately never semantic review/Gate authority. */
 export function hasDelegationSemanticRepairAuthorityV2(authority: DelegationReviewAuthorityV2): boolean {
-	return authority.semantic_repair !== undefined &&
-		parseSemanticRepairDecisionForAuthority(authority.semantic_repair, authority) !== undefined;
+	const evidenceRepair = authority.semantic_evidence_v2 !== undefined
+		&& parseSemanticReviewEvidenceV2ForAuthority(authority.semantic_evidence_v2, authority)?.final_decision === "REPAIR";
+	return authority.semantic_repair !== undefined && parseSemanticRepairDecisionForAuthority(authority.semantic_repair, authority) !== undefined
+		&& (authority.semantic_evidence_v2 === undefined || evidenceRepair);
 }
 
 export function hasDelegationTerminalNegativeSemanticRepairAuthorityV1(

@@ -11,6 +11,7 @@ import { isAbsolute, posix } from "node:path";
 
 import { canonicalHash, canonicalJson } from "../cache/canonical-hash.ts";
 import type { DelegationPathLaneAdmissionV1 } from "./delegation-path-lane-admission.ts";
+import { validateWorkerCheckpointV1, type WorkerCheckpointV1 } from "./worker-checkpoint.ts";
 
 export const DELEGATION_LIFECYCLE_SCHEMA_VERSION_V1 = 1 as const;
 export const DELEGATION_LIFECYCLE_SNAPSHOT_KIND_V1 = "delegation-lifecycle-snapshot-v1" as const;
@@ -485,6 +486,281 @@ export function resolveDelegationLifecycleV1(
 export function delegationLifecycleSnapshotHashV1(snapshot: DelegationLifecycleSnapshotV1): string {
 	const parsed = parseSnapshot(snapshot);
 	return parsed === undefined ? INVALID_SNAPSHOT_HASH : canonicalHash(parsed);
+}
+
+// ---------------------------------------------------------------------------
+// Long-chain optimization: one hash-bound action projection for every UI,
+// tool-surface, context-entry, and automatic-executor consumer.
+// ---------------------------------------------------------------------------
+
+export const LIFECYCLE_ACTION_SNAPSHOT_SCHEMA_VERSION_V2 = 2 as const;
+export const LIFECYCLE_ACTION_SNAPSHOT_KIND_V2 = "lifecycle-action-snapshot-v2" as const;
+export const LIFECYCLE_ACTION_SNAPSHOT_ENTRY_TYPE_V2 = "workbench-lifecycle-action-snapshot-v2" as const;
+export const LIFECYCLE_ACTION_SNAPSHOT_MAX_BYTES_V2 = 2 * 1024;
+
+export type LifecycleActionNameV2 =
+	| "NONE"
+	| "CONTINUE_DIRECT_DEVELOPMENT"
+	| "START_DELEGATION"
+	| "CONTINUE_CHECKPOINT"
+	| "REVIEW_CANDIDATE"
+	| "RETRY_REVIEW_JOB"
+	| "START_EXACT_REPAIR"
+	| "PAUSED_BUDGET"
+	| "PROMOTE_CANDIDATE"
+	| "RUN_GATE"
+	| "RECOVER_AUTHORITY";
+
+export interface LifecycleActionExactTargetV2 {
+	readonly delegation_id?: string;
+	readonly generation?: number;
+	readonly review_job_id?: string;
+	readonly repair_of?: string;
+	readonly candidate_id?: string;
+	readonly bound_hash?: string;
+}
+
+export interface LifecycleActionSnapshotV2 {
+	readonly schema_version: typeof LIFECYCLE_ACTION_SNAPSHOT_SCHEMA_VERSION_V2;
+	readonly kind: typeof LIFECYCLE_ACTION_SNAPSHOT_KIND_V2;
+	readonly project_root_hash: string;
+	readonly mode: "AUDIT" | "DEV" | "VERIFY";
+	readonly authority_hash: string;
+	readonly state: string;
+	readonly action: LifecycleActionNameV2;
+	readonly exact_target: Readonly<LifecycleActionExactTargetV2>;
+	readonly tool: string | null;
+	readonly arguments: Readonly<Record<string, unknown>> | null;
+	readonly safe_automatic: boolean;
+	readonly authorization: "NONE" | "EXISTING" | "USER_REQUIRED";
+	readonly retryable: boolean;
+	readonly reason_code: string;
+	readonly invalidation_conditions: readonly string[];
+	readonly snapshot_hash: string;
+}
+
+export interface BuildLifecycleActionSnapshotV2Input {
+	readonly project_root: string;
+	readonly mode: "AUDIT" | "DEV" | "VERIFY";
+	readonly resolution: Readonly<DelegationLifecycleResolutionV1>;
+	/** When present, the execution checkpoint overrides the older ACTIVE label. */
+	readonly checkpoint?: Readonly<WorkerCheckpointV1>;
+}
+
+const LIFECYCLE_ACTIONS_V2: readonly LifecycleActionNameV2[] = [
+	"NONE", "CONTINUE_DIRECT_DEVELOPMENT", "START_DELEGATION", "CONTINUE_CHECKPOINT", "REVIEW_CANDIDATE",
+	"RETRY_REVIEW_JOB", "START_EXACT_REPAIR", "PAUSED_BUDGET", "PROMOTE_CANDIDATE", "RUN_GATE", "RECOVER_AUTHORITY",
+];
+const SNAPSHOT_V2_FIELDS = [
+	"schema_version", "kind", "project_root_hash", "mode", "authority_hash", "state", "action", "exact_target",
+	"tool", "arguments", "safe_automatic", "authorization", "retryable", "reason_code", "invalidation_conditions",
+	"snapshot_hash",
+] as const;
+const EXACT_TARGET_V2_FIELDS = ["delegation_id", "generation", "review_job_id", "repair_of", "candidate_id", "bound_hash"] as const;
+const INVALIDATION_CONDITIONS_V2 = Object.freeze([
+	"authority_hash_changed",
+	"exact_target_changed",
+	"mode_changed",
+	"owner_or_lock_changed",
+	"runtime_identity_changed",
+]);
+
+function validBoundedAtom(value: unknown, maximum = 160): value is string {
+	return typeof value === "string" && value.length > 0 && Buffer.byteLength(value, "utf8") <= maximum
+		&& !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function validExactTargetV2(value: unknown): value is LifecycleActionExactTargetV2 {
+	if (!isRecord(value) || Object.keys(value).some((field) => !EXACT_TARGET_V2_FIELDS.includes(field as never))) return false;
+	if (value.generation !== undefined && (!Number.isSafeInteger(value.generation) || Number(value.generation) < 1)) return false;
+	for (const field of ["delegation_id", "review_job_id", "repair_of", "candidate_id"] as const) {
+		if (value[field] !== undefined && !validBoundedAtom(value[field], 160)) return false;
+	}
+	return value.bound_hash === undefined || typeof value.bound_hash === "string" && HASH_RE.test(value.bound_hash);
+}
+
+function snapshotV2Projection(value: Omit<LifecycleActionSnapshotV2, "snapshot_hash">): unknown {
+	return value;
+}
+
+export function computeLifecycleActionSnapshotHashV2(
+	value: Omit<LifecycleActionSnapshotV2, "snapshot_hash">,
+): string {
+	return canonicalHash(snapshotV2Projection(value));
+}
+
+export function validateLifecycleActionSnapshotV2(value: unknown): value is LifecycleActionSnapshotV2 {
+	if (!isRecord(value) || !exactFields(value, SNAPSHOT_V2_FIELDS)
+		|| value.schema_version !== LIFECYCLE_ACTION_SNAPSHOT_SCHEMA_VERSION_V2
+		|| value.kind !== LIFECYCLE_ACTION_SNAPSHOT_KIND_V2
+		|| typeof value.project_root_hash !== "string" || !HASH_RE.test(value.project_root_hash)
+		|| (value.mode !== "AUDIT" && value.mode !== "DEV" && value.mode !== "VERIFY")
+		|| typeof value.authority_hash !== "string" || !HASH_RE.test(value.authority_hash)
+		|| !validBoundedAtom(value.state, 160) || !member(value.action, LIFECYCLE_ACTIONS_V2)
+		|| !validExactTargetV2(value.exact_target)
+		|| !(value.tool === null || validBoundedAtom(value.tool, 160))
+		|| !(value.arguments === null || isRecord(value.arguments))
+		|| typeof value.safe_automatic !== "boolean"
+		|| (value.authorization !== "NONE" && value.authorization !== "EXISTING" && value.authorization !== "USER_REQUIRED")
+		|| typeof value.retryable !== "boolean" || !validBoundedAtom(value.reason_code, 160)
+		|| !Array.isArray(value.invalidation_conditions) || value.invalidation_conditions.length > 16
+		|| !value.invalidation_conditions.every((condition) => validBoundedAtom(condition, 160))
+		|| typeof value.snapshot_hash !== "string" || !HASH_RE.test(value.snapshot_hash)) return false;
+	try {
+		if (Buffer.byteLength(canonicalJson(value.arguments), "utf8") > 1_024) return false;
+		const { snapshot_hash: supplied, ...payload } = value;
+		return supplied === computeLifecycleActionSnapshotHashV2(payload as Omit<LifecycleActionSnapshotV2, "snapshot_hash">)
+			&& Buffer.byteLength(canonicalJson(value), "utf8") <= LIFECYCLE_ACTION_SNAPSHOT_MAX_BYTES_V2;
+	} catch {
+		return false;
+	}
+}
+
+interface SnapshotActionProjectionV2 {
+	action: LifecycleActionNameV2;
+	exact_target: LifecycleActionExactTargetV2;
+	tool: string | null;
+	arguments: Record<string, unknown> | null;
+	safe_automatic: boolean;
+	authorization: LifecycleActionSnapshotV2["authorization"];
+	retryable: boolean;
+}
+
+function actionProjectionV2(resolution: Readonly<DelegationLifecycleResolutionV1>): SnapshotActionProjectionV2 {
+	const action = resolution.primary_action;
+	const id = action.exact_target.id;
+	switch (action.action) {
+		case "CONTINUE_DEVELOPMENT":
+		case "CLOSE_SATISFIED_NO_DELTA":
+		case "SUPERSEDE_EMPTY_ATTEMPT":
+		case "CLOSE_ACCEPTED_OBLIGATION":
+			return { action: "CONTINUE_DIRECT_DEVELOPMENT", exact_target: {}, tool: null, arguments: null,
+				safe_automatic: action.safe_automatic, authorization: "NONE", retryable: false };
+		case "WAIT_FOR_ACTIVE_WRITER":
+		case "BLOCK_OVERLAPPING_PATHS":
+		case "BLOCK_PROMOTION":
+			return { action: "NONE", exact_target: action.exact_target.kind === "DELEGATION" ? { delegation_id: id } : {},
+				tool: "workbench_delegation_status", arguments: {}, safe_automatic: false, authorization: "NONE", retryable: true };
+		case "REVIEW_CANDIDATE":
+			return { action: "REVIEW_CANDIDATE", exact_target: { delegation_id: id }, tool: "workbench_review_worker_diff",
+				arguments: { delegation_id: id }, safe_automatic: action.safe_automatic, authorization: "EXISTING", retryable: true };
+		case "REGENERATE_DERIVED_REVIEW":
+			return { action: "RETRY_REVIEW_JOB", exact_target: { delegation_id: id }, tool: "workbench_review_worker_diff",
+				arguments: { delegation_id: id }, safe_automatic: action.safe_automatic, authorization: "EXISTING", retryable: true };
+		case "EXECUTE_EXACT_REPAIR":
+			return { action: "START_EXACT_REPAIR", exact_target: { delegation_id: id, repair_of: id },
+				tool: "workbench_repair_delegation", arguments: { delegation_id: id }, safe_automatic: action.safe_automatic,
+				authorization: "EXISTING", retryable: true };
+		case "PROMOTE_CANDIDATE":
+			return { action: "PROMOTE_CANDIDATE", exact_target: { candidate_id: id }, tool: null, arguments: null,
+				safe_automatic: false, authorization: "USER_REQUIRED", retryable: false };
+		case "QUARANTINE_CORRUPT_AUTHORITY":
+		case "REPORT_STORAGE_FAILURE":
+		case "REBASE_CURRENT_BINDING":
+		case "RECLAIM_STALE_LOCK":
+			return { action: "RECOVER_AUTHORITY", exact_target: action.exact_target.kind === "DELEGATION" ? { delegation_id: id } : {},
+				tool: "workbench_delegation_status", arguments: {}, safe_automatic: action.safe_automatic,
+				authorization: action.requires_user_authorization ? "USER_REQUIRED" : "EXISTING", retryable: true };
+		default:
+			return assertNever(action.action);
+	}
+}
+
+/** Build the only primary-action projection from one already-canonical V1 resolution. */
+export function buildLifecycleActionSnapshotV2(
+	input: Readonly<BuildLifecycleActionSnapshotV2Input>,
+): { readonly ok: true; readonly value: Readonly<LifecycleActionSnapshotV2> } | { readonly ok: false; readonly code: "INVALID_INPUT" } {
+	try {
+		if (!isAbsolute(input.project_root) || !member(input.mode, ["AUDIT", "DEV", "VERIFY"] as const)
+			|| canonicalHash({
+				schema_version: input.resolution.schema_version,
+				kind: input.resolution.kind,
+				state: input.resolution.state,
+				primary_action: input.resolution.primary_action,
+			}) !== input.resolution.resolution_hash
+			|| (input.checkpoint !== undefined && !validateWorkerCheckpointV1(input.checkpoint))) {
+			return { ok: false, code: "INVALID_INPUT" };
+		}
+		const checkpoint = input.checkpoint;
+		const projected = checkpoint === undefined ? actionProjectionV2(input.resolution) : checkpoint.machine_state === "PAUSED_BUDGET"
+			? {
+				action: "PAUSED_BUDGET" as const,
+				exact_target: { delegation_id: checkpoint.delegation_id, bound_hash: checkpoint.checkpoint_hash },
+				tool: null,
+				arguments: null,
+				safe_automatic: false,
+				authorization: "USER_REQUIRED" as const,
+				retryable: false,
+			}
+			: {
+				action: "CONTINUE_CHECKPOINT" as const,
+				exact_target: { delegation_id: checkpoint.delegation_id, bound_hash: checkpoint.checkpoint_hash },
+				tool: null,
+				arguments: null,
+				safe_automatic: true,
+				authorization: "EXISTING" as const,
+				retryable: true,
+			};
+		const payload: Omit<LifecycleActionSnapshotV2, "snapshot_hash"> = {
+			schema_version: LIFECYCLE_ACTION_SNAPSHOT_SCHEMA_VERSION_V2,
+			kind: LIFECYCLE_ACTION_SNAPSHOT_KIND_V2,
+			project_root_hash: canonicalHash({ project_root: input.project_root }),
+			mode: input.mode,
+			authority_hash: checkpoint?.checkpoint_hash ?? input.resolution.primary_action.snapshot_hash,
+			state: checkpoint?.machine_state ?? input.resolution.state,
+			...projected,
+			reason_code: checkpoint?.machine_state ?? input.resolution.primary_action.reason,
+			invalidation_conditions: [...INVALIDATION_CONDITIONS_V2],
+		};
+		const value = { ...payload, snapshot_hash: computeLifecycleActionSnapshotHashV2(payload) };
+		return validateLifecycleActionSnapshotV2(value)
+			? { ok: true, value: Object.freeze(structuredClone(value)) }
+			: { ok: false, code: "INVALID_INPUT" };
+	} catch {
+		return { ok: false, code: "INVALID_INPUT" };
+	}
+}
+
+/** Executor guard: stale authority/action/target is rejected and never re-routed. */
+export function validateLifecycleActionExecutionV2(
+	snapshot: unknown,
+	input: Readonly<{
+		project_root_hash: string;
+		mode: "AUDIT" | "DEV" | "VERIFY";
+		authority_hash: string;
+		action: LifecycleActionNameV2;
+		exact_target: Readonly<LifecycleActionExactTargetV2>;
+	}>,
+): snapshot is LifecycleActionSnapshotV2 {
+	return validateLifecycleActionSnapshotV2(snapshot)
+		&& snapshot.project_root_hash === input.project_root_hash
+		&& snapshot.mode === input.mode
+		&& snapshot.authority_hash === input.authority_hash
+		&& snapshot.action === input.action
+		&& canonicalHash(snapshot.exact_target) === canonicalHash(input.exact_target);
+}
+
+export interface LifecycleActionSnapshotAppendResultV2 {
+	readonly appended: boolean;
+	readonly latest_snapshot_hash: string;
+}
+
+/** Append one bounded context entry iff its machine snapshot hash changed. */
+export function appendLifecycleActionSnapshotIfChangedV2(
+	snapshot: unknown,
+	latestSnapshotHash: string | null,
+	appendEntry: (customType: string, data: unknown) => void,
+): LifecycleActionSnapshotAppendResultV2 | undefined {
+	if (!validateLifecycleActionSnapshotV2(snapshot)) return undefined;
+	if (snapshot.snapshot_hash === latestSnapshotHash) {
+		return { appended: false, latest_snapshot_hash: snapshot.snapshot_hash };
+	}
+	try {
+		appendEntry(LIFECYCLE_ACTION_SNAPSHOT_ENTRY_TYPE_V2, structuredClone(snapshot));
+		return { appended: true, latest_snapshot_hash: snapshot.snapshot_hash };
+	} catch {
+		return undefined;
+	}
 }
 
 export type ParseDelegationLifecycleSnapshotResultV1 =

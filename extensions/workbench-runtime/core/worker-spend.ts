@@ -114,6 +114,8 @@ export const WORKER_SPEND_POLICY_ID = "gpt-5.6-luna-xhigh-continuation-v2" as co
  * `standard` (defensive mirror of `resolveWorkerSpendProfile`).
  */
 export const WORKER_SPEND_PROFILE_ENV = "WORKBENCH_WORKER_SPEND_PROFILE";
+/** Exact cumulative counters inherited by a fresh continuation process. */
+export const WORKER_INITIAL_SPEND_STATE_ENV = "WORKBENCH_WORKER_INITIAL_SPEND_STATE";
 
 /** customType of the one-shot hidden cumulative soft-budget steer message. */
 export const WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE = "workbench-worker-spend-soft-steer";
@@ -226,6 +228,24 @@ export function normalizeWorkerSpendState(state: unknown): WorkerSpendState {
 	};
 }
 
+/** Strict JSON environment parser; malformed input never resets to attacker-supplied partial counters. */
+export function parseWorkerInitialSpendStateEnvironment(value: unknown): WorkerSpendState {
+	if (typeof value !== "string" || value.length === 0) return { ...EMPTY_WORKER_SPEND_STATE };
+	try {
+		const parsed = JSON.parse(value) as unknown;
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)
+			|| Object.keys(parsed).sort().join("\0") !== ["outputTokens", "totalTokens", "turns"].sort().join("\0")) {
+			return { ...EMPTY_WORKER_SPEND_STATE };
+		}
+		const normalized = normalizeWorkerSpendState(parsed);
+		const raw = parsed as WorkerSpendState;
+		return normalized.turns === raw.turns && normalized.totalTokens === raw.totalTokens
+			&& normalized.outputTokens === raw.outputTokens ? normalized : { ...EMPTY_WORKER_SPEND_STATE };
+	} catch {
+		return { ...EMPTY_WORKER_SPEND_STATE };
+	}
+}
+
 /**
  * Per-message output component (tokens): non-negative finite `output`,
  * else 0. Independent of which path the per-message total took — this is
@@ -327,10 +347,9 @@ export function formatWorkerSpendSteerText(state: unknown, profile: WorkerSpendP
 			: "no dimension at its soft limit";
 	return [
 		`Worker cumulative spend soft budget reached (profile ${profileName}): ${facts}.`,
-		"The Luna continuation reserve is active; do not stop solely because the soft threshold was reached.",
-		"Stop starting unrelated work and finish the coherent change already in flight, then write a concise handoff",
-		"(## Completed / ## Files Changed / ## Verification / ## Remaining Risks).",
-		"List any remaining work for a bounded follow-up delegation in the current Sol session; never ask the user to open a new Sol session.",
+		"Stop starting unrelated work. Finish only the current atomic edit, refresh the machine write journal, and run only already-declared necessary focused recipes.",
+		"Publish a machine WorkerCheckpointV1 handoff with completed criteria and remaining work, then exit normally.",
+		"The remaining hard limit is the continuation reserve. The next attempt is a fresh --no-session Luna under the same delegation in the current Sol session; never ask the user to open a new Sol session, request a new delegation, or reset cumulative spend.",
 	].join("\n");
 }
 

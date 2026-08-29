@@ -17,6 +17,7 @@ import {
 	recoverRawLineageExactRepairAuthorityV1,
 	type RawLineageExactRepairAuthorityCodeV1,
 } from "./exact-repair-raw-lineage-authority.ts";
+import type { CollectFinalizationRepairRebaseResultV1 } from "./delegation-repair-rebase.ts";
 import {
 	readExactRepairSuccessorV1,
 	readRawLineageExactRepairSuccessorV1,
@@ -64,6 +65,10 @@ export interface ExactRepairServiceDependenciesV1 {
 		| { readonly status: "unavailable" }
 		| { readonly status: "fresh" | "conflict"; readonly hash: string }
 	>;
+	readonly collectFinalizationRebase?: (
+		projectRoot: string,
+		transaction: DelegationTransactionRecord,
+	) => Promise<CollectFinalizationRepairRebaseResultV1>;
 	readonly readCommittedGeneration?: typeof readDelegationCommittedGenerationV2;
 	readonly readReview?: typeof readDelegationReviewV2;
 	readonly readTerminalNegativeRepair?: typeof readDelegationTerminalNegativeSolAuthorityV1;
@@ -360,6 +365,9 @@ export async function runExactRepairServiceV1(
 				project_root: input.project_root,
 				repair_of: repairOf,
 				collectCurrentBinding: dependencies.collectCurrentBinding,
+				...(dependencies.collectFinalizationRebase === undefined ? {} : {
+					collectFinalizationRebase: dependencies.collectFinalizationRebase,
+				}),
 			});
 			if (!rawRecovered.ok) {
 				const racedReplay = await readRawSuccessor({ projectRoot: input.project_root, immutable: immutable.value });
