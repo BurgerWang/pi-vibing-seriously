@@ -65,6 +65,7 @@ import {
 import {
 	EMPTY_WORKER_WRITE_JOURNAL_RUNTIME_OBSERVATION,
 	observeWorkerWriteJournalRuntimeEntry,
+	validateWorkerWriteJournalRuntimeObservation,
 	type WorkerWriteJournalRuntimeObservation,
 } from "../core/worker-write-journal-runtime.ts";
 import {
@@ -349,6 +350,8 @@ export interface RunWorkerOptions {
 	attempt?: number;
 	/** Bounded machine capsule derived from a validated checkpoint, never prior transcript. */
 	continuationCapsule?: Readonly<Record<string, unknown>>;
+	/** Durable journal cursor at fresh-child launch, used only to verify later revision telemetry. */
+	initialWriteJournalObservation?: Readonly<WorkerWriteJournalRuntimeObservation>;
 	/**
 	 * Optional delegation-v2 runtime identity. Direct/legacy calls omit this
 	 * object and the runner strips any inherited identity values. Present
@@ -755,6 +758,10 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 	if (workerSpendBand(initialSpend, spendProfile) === "hard") {
 		throw new WorkerRunnerPreflightError("CONTINUATION_BUDGET_EXHAUSTED");
 	}
+	if (options.initialWriteJournalObservation !== undefined &&
+		!validateWorkerWriteJournalRuntimeObservation(options.initialWriteJournalObservation)) {
+		throw new Error("Worker write-journal continuation cursor is invalid");
+	}
 	let repairCapsule: WorkerRepairCapsule | undefined;
 	if (options.contract.repairOf !== undefined) {
 		const authority = await (options.readRepairAuthority ?? readWorkerRepairCapsule)(options.projectRoot, options.contract.repairOf);
@@ -835,7 +842,9 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 		spendSoftReached: { turns: false, totalTokens: false, outputTokens: false },
 		spendHardExceeded: { turns: false, totalTokens: false, outputTokens: false },
 		outputControl: EMPTY_OUTPUT_CONTROL_FACTS,
-		writeJournalObservation: EMPTY_WORKER_WRITE_JOURNAL_RUNTIME_OBSERVATION,
+		writeJournalObservation: options.initialWriteJournalObservation === undefined
+			? EMPTY_WORKER_WRITE_JOURNAL_RUNTIME_OBSERVATION
+			: Object.freeze(structuredClone(options.initialWriteJournalObservation)),
 		commandEffectObservation: EMPTY_WORKER_COMMAND_EFFECT_RUNTIME_OBSERVATION,
 	};
 

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+	BUDGET_PAUSED_RECOVERY_REASON_V2,
 	abortDelegationTransaction,
 	bindDelegationRepairLineageV1,
 	beginDelegationCommit,
@@ -243,6 +244,8 @@ test("checkpoint recovery resumes the same transaction with a monotonic revision
 	}).ok, false);
 	const unrelated = ok(requireDelegationRecovery(active, { ...cas(active, T2), reason: "ambiguous child state" }));
 	assert.equal(resumeDelegationTransaction(unrelated, cas(unrelated, T3)).ok, false);
+	const paused = ok(requireDelegationRecovery(active, { ...cas(active, T2), reason: BUDGET_PAUSED_RECOVERY_REASON_V2 }));
+	assert.equal(ok(resumeDelegationTransaction(paused, cas(paused, T3))).status, "RUNNING");
 });
 
 test("closed worker failure facts publish attributed partial work as non-reviewable INTERRUPTED", () => {

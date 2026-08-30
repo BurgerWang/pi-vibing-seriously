@@ -1303,6 +1303,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
+		lifecycleActionRefreshV2.clearBudgetContinuationAuthorization();
 		// P7: lazy lease-lock sync before every agent turn — an
 		// expired/exhausted lease is reverted to the exact canonical 15
 		// before the model can see stale edit/write tools. No timers or
@@ -1322,7 +1323,15 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		overflowFollowUpPending = false;
 		touchCompactState();
 		void refreshWidget(ctx);
+		const refreshLifecycleTurn = () => lifecycleActionRefreshV2.refreshTurn({
+			enabled: workerRoleContext.role === undefined && ctx.isProjectTrusted() &&
+				(delegationSession.getState().latestId !== undefined || "projectIssue" in latestRepairStatus),
+			getProjectRoot: () => projectRootFor(ctx), prompt: event.prompt,
+			getActiveTools: () => pi.getActiveTools(),
+		});
 		if (retryCompactNoteReady && pendingRetryCompactNote) {
+			const lifecycle = await refreshLifecycleTurn();
+			if (lifecycle?.budgetAuthorized && lifecycle.message !== undefined) return { message: lifecycle.message };
 			const note = pendingRetryCompactNote;
 			pendingRetryCompactNote = undefined;
 			retryCompactNoteReady = false;
@@ -1335,21 +1344,11 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				},
 			};
 		}
-		if (workerRoleContext.role === undefined && ctx.isProjectTrusted() &&
-			(delegationSession.getState().latestId !== undefined ||
-				latestRepairStatus !== undefined && "projectIssue" in latestRepairStatus)) {
-			try {
-				const projectRoot = await projectRootFor(ctx);
-				const snapshot = await lifecycleActionRefreshV2.refresh(projectRoot);
-				const message = snapshot === undefined ? undefined : lifecycleActionTurnMessageV2(snapshot, pi.getActiveTools());
-				if (message !== undefined) return { message };
-			} catch {
-				// Status/tool surfaces remain fail-closed if the advisory refresh fails.
-			}
-		}
+		const lifecycle = await refreshLifecycleTurn(); if (lifecycle?.message !== undefined) return { message: lifecycle.message };
 		return undefined;
 	});
 	pi.on("agent_end", (event, ctx) => {
+		lifecycleActionRefreshV2.clearBudgetContinuationAuthorization();
 		let assistant: unknown;
 		for (let index = event.messages.length - 1; index >= 0 && index >= event.messages.length - 256; index -= 1) {
 			const candidate = event.messages[index];
@@ -1959,6 +1958,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		secrets,
 		getMode: () => mode,
 		getLifecycleActionSnapshot: () => latestLifecycleActionSnapshotV2,
+		takeBudgetContinuationAuthorization: lifecycleActionRefreshV2.takeBudgetContinuationAuthorization,
 		getIdentity: () => ({ provider: currentModelFacts.provider, model: currentModelFacts.model }),
 		workerRoleContext,
 		workerWriteJournalRuntime,

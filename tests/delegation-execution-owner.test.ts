@@ -26,6 +26,7 @@ import {
 	persistAbortedDelegationTransaction,
 	persistPreparedDelegationTransaction,
 	persistRecoveryRequiredDelegationTransaction,
+	persistResumedRunningDelegationTransaction,
 	persistRunningDelegationTransaction,
 	readDelegationTransactionV2,
 } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
@@ -603,6 +604,28 @@ test("lineaged post-worker finalization recovery binds a non-empty sealed journa
 			now: time(42),
 		});
 		assert.equal(runningState.ok, true);
+		if (!runningState.ok) return;
+		const firstRecovery = await persistRecoveryRequiredDelegationTransaction(root, {
+			delegation_id: id,
+			contract_hash: CONTRACT,
+			worker_identity: initial.worker_identity,
+			expected_generation: 1,
+			expected_revision: runningState.value.revision,
+			now: time(43),
+			reason: RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed,
+		});
+		assert.equal(firstRecovery.ok, true);
+		if (!firstRecovery.ok) return;
+		const resumed = await persistResumedRunningDelegationTransaction(root, {
+			delegation_id: id,
+			contract_hash: CONTRACT,
+			worker_identity: initial.worker_identity,
+			expected_generation: 1,
+			expected_revision: firstRecovery.value.revision,
+			now: time(44),
+		});
+		assert.equal(resumed.ok, true);
+		if (!resumed.ok) return;
 		const begun = await beginWriteJournalOperation({
 			project_root: root,
 			delegation_id: id,
@@ -640,12 +663,13 @@ test("lineaged post-worker finalization recovery binds a non-empty sealed journa
 			contract_hash: CONTRACT,
 			worker_identity: initial.worker_identity,
 			expected_generation: 1,
-			expected_revision: 1,
-			now: time(43),
+			expected_revision: resumed.value.revision,
+			now: time(45),
 			reason: RETRYABLE_EMPTY_RECOVERY_REASONS_V2.changeSetFinalizeFailed,
 		});
 		assert.equal(recovery.ok, true);
 		if (!recovery.ok) return;
+		assert.equal(recovery.value.revision, 4, "a resumed attempt publishes the next even recovery revision");
 		const evidence = await readStrictRetryableRawRepairEvidenceV1(root, recovery.value);
 		assert.equal(evidence.ok, true, evidence.ok ? "" : evidence.code);
 		if (evidence.ok) {

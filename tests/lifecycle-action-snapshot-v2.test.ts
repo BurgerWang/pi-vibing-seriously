@@ -20,6 +20,7 @@ import {
 } from "../extensions/workbench-runtime/core/agent-next-action.ts";
 import { computeActiveToolsForLifecycleSnapshotV2, DEV_TOOLS } from "../extensions/workbench-runtime/core/mode-policy.ts";
 import { buildWorkerCheckpointV1, remainingWorkerBudgetV1 } from "../extensions/workbench-runtime/core/worker-checkpoint.ts";
+import { authorizePausedBudgetContinuationTurnV1 } from "../extensions/workbench-runtime/core/budget-continuation-authorization.ts";
 
 const ID = "20260829-020000-LCO5";
 const HASH = "a".repeat(64);
@@ -53,12 +54,12 @@ function action(attempt: DelegationLifecycleAttemptV1, health: DelegationLifecyc
 	return built.value;
 }
 
-function checkpoint(turns: number) {
+function checkpoint(turns: number, profile: "standard" | "extended" = "standard") {
 	const usage = {
 		input: turns * 10, output: turns * 2, cacheRead: turns * 3, cacheWrite: 0, totalTokens: turns * 15,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
-	const remaining = remainingWorkerBudgetV1("standard", turns, usage.totalTokens, usage.output)!;
+	const remaining = remainingWorkerBudgetV1(profile, turns, usage.totalTokens, usage.output)!;
 	const built = buildWorkerCheckpointV1({
 		delegation_id: ID,
 		contract_hash: HASH,
@@ -71,8 +72,16 @@ function checkpoint(turns: number) {
 		completed_recipe_run_ids: [],
 		cumulative_usage: usage,
 		cumulative_turns: turns,
+		...(profile === "extended" ? {
+			budget_promotion: {
+				from_profile: "standard" as const,
+				to_profile: "extended" as const,
+				authorization_hash: "e".repeat(64),
+			},
+		} : {}),
 		remaining_budget: remaining,
-		machine_state: remaining.turns === 0 ? "PAUSED_BUDGET" : "CHECKPOINTED",
+		machine_state: Object.values(remaining).some((value) => typeof value === "number" && value === 0)
+			? "PAUSED_BUDGET" : "CHECKPOINTED",
 		worker_advisory: { completed_criteria: [], remaining_criteria: [] },
 		created_at: "2026-08-29T02:00:00.000Z",
 	});
@@ -147,7 +156,8 @@ test("checkpoint and budget pause override ACTIVE without creating semantic repa
 	assert.match(directive ?? "", new RegExp(`call the listed exact tool with the supplied delegation_id`, "u"));
 	assert.doesNotMatch(directive ?? "", /invent or reconstruct a new contract.*allowed_paths/u);
 
-	const paused = buildLifecycleActionSnapshotV2({ project_root: "/project", mode: "DEV", resolution: active, checkpoint: checkpoint(64) });
+	const pausedCheckpoint = checkpoint(64);
+	const paused = buildLifecycleActionSnapshotV2({ project_root: "/project", mode: "DEV", resolution: active, checkpoint: pausedCheckpoint });
 	assert.equal(paused.ok, true);
 	if (!paused.ok) return;
 	assert.equal(paused.value.action, "PAUSED_BUDGET");
@@ -155,14 +165,39 @@ test("checkpoint and budget pause override ACTIVE without creating semantic repa
 	assert.equal(lifecycleActionSnapshotTextV2(paused.value).includes("repair"), false);
 	assert.deepEqual(lifecycleActionStatusLinesV2(paused.value), [
 		"lifecycle v2 : PAUSED_BUDGET",
-		"typed action : PAUSED_BUDGET (PAUSED_BUDGET)",
-		"next action  : budget is paused; explicit user authorization is required to extend or split the task",
+		"typed action : PAUSED_BUDGET (PAUSED_BUDGET_STANDARD_PROMOTION_AVAILABLE)",
+		"next action  : the cumulative standard budget is paused; one ordinary explicit continue/authorize instruction promotes this exact checkpoint to the finite extended profile without resetting spend",
 	]);
 	const pausedDirective = lifecycleActionTurnDirectiveV2(paused.value, ["read", "workbench_delegation_status"]);
 	assert.match(pausedDirective ?? "", /Stop execution and request the exact explicit user authorization/u);
-	assert.match(pausedDirective ?? "", /do not call status as a substitute for authorization/u);
+	assert.match(pausedDirective ?? "", /do not call status as a substitute for authorization/iu);
 	assert.match(pausedDirective ?? "", /do not create a successor/u);
 	assert.match(pausedDirective ?? "", /"tool":null/u);
+
+	for (const prompt of ["继续", "好的，那么请继续推进", "授权延长预算", "I authorize you to resume"]) {
+		const authorized = authorizePausedBudgetContinuationTurnV1(paused.value, prompt, pausedCheckpoint);
+		assert.ok(authorized, prompt);
+		assert.equal(authorized.snapshot.action, "CONTINUE_CHECKPOINT");
+		assert.equal(authorized.snapshot.tool, "workbench_repair_delegation");
+		assert.equal(authorized.snapshot.authorization, "EXISTING");
+		assert.equal(authorized.authorization.checkpoint_hash, paused.value.exact_target.bound_hash);
+		assert.equal(authorized.authorization.target_profile, "extended");
+		assert.equal(JSON.stringify(authorized.authorization).includes(prompt), false, "raw prompt must not enter authority");
+	}
+	for (const prompt of ["为什么不能继续？", "是否可以继续", "不要继续", "报告当前状态"]) {
+		assert.equal(authorizePausedBudgetContinuationTurnV1(paused.value, prompt, pausedCheckpoint), undefined, prompt);
+	}
+
+	const extendedCheckpoint = checkpoint(96, "extended");
+	const extended = buildLifecycleActionSnapshotV2({
+		project_root: "/project", mode: "DEV", resolution: active, checkpoint: extendedCheckpoint,
+	});
+	assert.equal(extended.ok, true);
+	if (!extended.ok) return;
+	assert.equal(extended.value.reason_code, "PAUSED_BUDGET_EXTENDED_SPLIT_REQUIRED");
+	assert.match(lifecycleActionSnapshotTextV2(extended.value), /new bounded task split/u);
+	assert.equal(authorizePausedBudgetContinuationTurnV1(extended.value, "继续", extendedCheckpoint), undefined);
+	assert.match(lifecycleActionTurnDirectiveV2(extended.value, ["read"]) ?? "", /SPLIT_REQUIRED/u);
 });
 
 test("executor rejects stale authority or a different exact target and never substitutes another action", () => {

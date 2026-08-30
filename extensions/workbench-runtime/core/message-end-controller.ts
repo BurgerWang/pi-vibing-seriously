@@ -65,6 +65,7 @@ export interface MessageEndController {
 export function registerMessageEndController(controller: MessageEndController): void {
 	let workerSoftSteerSent = false;
 	let workerSpendSoftSteerSent = false;
+	let workerSpendSteerIssuedThisSession = false;
 	let workerCheckpointRequestAppended = false;
 	let workerSpendState: WorkerSpendState = { ...EMPTY_WORKER_SPEND_STATE };
 	let wallClockTimers: unknown[] = [];
@@ -101,11 +102,17 @@ export function registerMessageEndController(controller: MessageEndController): 
 		clearWallClockTimers();
 		workerSoftSteerSent = false;
 		workerSpendSoftSteerSent = false;
+		workerSpendSteerIssuedThisSession = false;
 		workerCheckpointRequestAppended = false;
 		const worker = controller.getWorkerContext();
 		workerSpendState = worker.initialSpendState === undefined
 			? { ...EMPTY_WORKER_SPEND_STATE }
 			: { ...worker.initialSpendState };
+		// Cumulative soft steering is one-shot across fresh checkpoint
+		// processes. A continuation that already inherited soft-band spend must
+		// not immediately emit the same steer and checkpoint again.
+		workerSpendSoftSteerSent = worker.role === "worker"
+			&& workerSpendBand(workerSpendState, worker.spendProfile) !== "ok";
 		if (worker.role === "worker" && worker.timeoutMs !== undefined) {
 			scheduleWallClockSteer(
 				Math.max(1, Math.floor(worker.timeoutMs * WORKER_TIME_CHECKPOINT_RATIO)),
@@ -210,12 +217,13 @@ export function registerMessageEndController(controller: MessageEndController): 
 							},
 						}, { deliverAs: "steer" });
 						workerSpendSoftSteerSent = true;
+						workerSpendSteerIssuedThisSession = true;
 						controller.onWorkerBudgetSteerSent?.();
 					}
 				} catch {
 					// Spend steering must never alter a model request.
 				}
-				if (spendSteerWasSentBeforeMessage && !workerCheckpointRequestAppended) {
+				if (spendSteerWasSentBeforeMessage && workerSpendSteerIssuedThisSession && !workerCheckpointRequestAppended) {
 					try {
 						controller.pi.appendEntry(WORKER_CHECKPOINT_REQUEST_ENTRY_TYPE_V1, {
 							schema_version: 1,

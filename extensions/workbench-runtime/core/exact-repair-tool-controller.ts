@@ -22,7 +22,11 @@ import type { WorkbenchMode } from "./mode-policy.ts";
 import { WORKBENCH_TOOL_METADATA, WORKBENCH_TOOL_PARAMETERS } from "./tool-catalog.ts";
 import { commanderBlockReason } from "./worker-policy.ts";
 import type { ExecFn } from "./config.ts";
-import { collectCheckpointResumeExecutionAuthorityV1 } from "./delegation-resume-authority.ts";
+import type { BudgetContinuationAuthorizationV1 } from "./budget-continuation-authorization.ts";
+import {
+	collectCheckpointResumeExecutionAuthorityV1,
+	preparePausedBudgetContinuationV1,
+} from "./delegation-resume-authority.ts";
 
 type RepairToolExecuteV1 = ToolDefinition<
 	typeof WORKBENCH_TOOL_PARAMETERS.workbench_repair_delegation
@@ -40,6 +44,11 @@ export interface ExactRepairToolControllerV1 {
 	readonly exec?: ExecFn;
 	/** Optional deterministic seam; production uses strict durable checkpoint collection. */
 	readonly collectCheckpointResumeAuthority?: typeof collectCheckpointResumeExecutionAuthorityV1;
+	/** One-turn authority consumed at most once by the exact paused delegation. */
+	readonly takeBudgetContinuationAuthorization?: (
+		delegationId: string,
+	) => Readonly<BudgetContinuationAuthorizationV1> | undefined;
+	readonly preparePausedBudgetContinuation?: typeof preparePausedBudgetContinuationV1;
 }
 
 export interface ExactRepairToolExecutionHandleV1 {
@@ -112,13 +121,26 @@ export function registerExactRepairToolV1(
 
 		try {
 			const projectRoot = await controller.projectRootFor(ctx);
+			const budgetContinuation = controller.takeBudgetContinuationAuthorization?.(repairOf);
+			if (budgetContinuation !== undefined) {
+				const prepare = controller.preparePausedBudgetContinuation ?? preparePausedBudgetContinuationV1;
+				const prepared = await prepare({
+					project_root: projectRoot,
+					delegation_id: repairOf,
+					authorization: budgetContinuation,
+				});
+				if (!prepared.ok) throw new Error(`budget continuation ${prepared.code}`);
+			}
 			const collectCheckpoint = controller.collectCheckpointResumeAuthority
 				?? collectCheckpointResumeExecutionAuthorityV1;
+			const sessionManager = ctx.sessionManager as typeof ctx.sessionManager & { getSessionDir?: () => string };
 			const checkpoint = controller.exec === undefined ? { ok: false as const, code: "CHECKPOINT_NOT_RETRYABLE" } : await collectCheckpoint({
 				project_root: projectRoot,
 				delegation_id: repairOf,
 				exec: controller.exec,
 				session_entries: ctx.sessionManager.getEntries(),
+				...(typeof sessionManager.getSessionDir === "function" ? { session_dir: sessionManager.getSessionDir() } : {}),
+				...(budgetContinuation === undefined ? {} : { budget_continuation: budgetContinuation }),
 			});
 			if (checkpoint.ok) {
 				if (controller.execution.executeCheckpointRecovery === undefined) {

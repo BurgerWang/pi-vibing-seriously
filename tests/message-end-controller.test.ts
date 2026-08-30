@@ -71,3 +71,43 @@ test("commander sessions do not schedule worker wall-clock advisories", () => {
 	for (const handler of handlers.get("session_start") ?? []) handler({});
 	assert.equal(scheduled, 0);
 });
+
+test("a continuation inheriting soft-band spend does not re-steer or checkpoint immediately", async () => {
+	const handlers = new Map<string, Array<(...args: any[]) => unknown>>();
+	const messages: unknown[] = [];
+	const entries: unknown[] = [];
+	registerMessageEndController({
+		pi: {
+			on(name: string, handler: (...args: any[]) => unknown) {
+				const list = handlers.get(name) ?? [];
+				list.push(handler);
+				handlers.set(name, list);
+			},
+			sendMessage(message: unknown) { messages.push(message); },
+			appendEntry(type: string, value: unknown) { entries.push({ type, value }); },
+			getThinkingLevel: () => "xhigh", getActiveTools: () => [], getAllTools: () => [],
+		} as never,
+		cacheTelemetry: {} as never,
+		getWorkerContext: () => ({
+			role: "worker",
+			spendProfile: "extended",
+			attempt: 2,
+			initialSpendState: { turns: 64, totalTokens: 160, outputTokens: 40 },
+		}),
+		projectRootFor: async () => "/project",
+		refreshStatus: async () => {},
+	});
+	for (const handler of handlers.get("session_start") ?? []) handler({});
+	const message = {
+		role: "assistant",
+		usage: {
+			input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+	};
+	for (const handler of handlers.get("message_end") ?? []) {
+		await handler({ type: "message_end", message }, { isProjectTrusted: () => false });
+	}
+	assert.deepEqual(messages, []);
+	assert.deepEqual(entries, []);
+});

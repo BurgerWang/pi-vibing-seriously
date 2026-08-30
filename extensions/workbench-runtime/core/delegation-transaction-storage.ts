@@ -84,6 +84,7 @@ import {
 } from "./structured-sol-review.ts";
 import {
 	WORKER_CHECKPOINT_MAX_BYTES_V1,
+	validateWorkerBudgetPromotionV1,
 	validateWorkerCheckpointV1,
 	type WorkerCheckpointV1,
 } from "./worker-checkpoint.ts";
@@ -519,7 +520,8 @@ export interface DelegationReviewArtifactV2 {
 	contract_hash: string;
 	worker_identity: DelegationWorkerIdentity;
 	generation: number;
-	transaction_revision: 3;
+	/** The exact PENDING_REVIEW/terminal-negative revision that owns this packet. */
+	transaction_revision: number;
 	reviewed_at: string;
 	review: ReviewRecord;
 }
@@ -564,7 +566,7 @@ export interface DelegationSemanticRepairDecisionV1 {
 	delegation_id: string;
 	contract_hash: string;
 	generation: number;
-	transaction_revision: 3;
+	transaction_revision: number;
 	generation_content_hash: string;
 	base_review_hash: string;
 	expected_bound_diff_hash: string;
@@ -598,7 +600,7 @@ export interface DelegationTerminalNegativeRepairDecisionArtifactV1 {
 	delegation_id: string;
 	contract_hash: string;
 	generation: number;
-	transaction_revision: 3;
+	transaction_revision: number;
 	terminal_status: DelegationTerminalNegativeStatusV1;
 	parent_state_hash: string;
 	generation_content_hash: string;
@@ -781,6 +783,10 @@ const SCOPE_RECORD_FIELDS = [
 	"write_journal", "change_set",
 ] as const;
 const SCOPE_RECORD_FIELDS_WITH_COMMAND = [...SCOPE_RECORD_FIELDS, "command_provenance"] as const;
+const SCOPE_RECORD_FIELDS_WITH_PROMOTION = [...SCOPE_RECORD_FIELDS, "budget_promotion"] as const;
+const SCOPE_RECORD_FIELDS_WITH_COMMAND_AND_PROMOTION = [
+	...SCOPE_RECORD_FIELDS, "command_provenance", "budget_promotion",
+] as const;
 const BEFORE_RECORD_FIELDS = [
 	"schema_version", "delegation_id", "recorded_at", "contract", "git_head", "git_dirty", "diff_hash",
 	"changed_paths", "path_statuses", "path_digests", "workspace_guard",
@@ -1191,13 +1197,30 @@ function validReviewRecordForState(value: unknown, state: DelegationTransactionR
 	return expectedPath !== undefined && value.review_path === expectedPath;
 }
 
+function pendingReviewRevisionForState(state: Readonly<DelegationTransactionRecord>): number | undefined {
+	if (state.committed_proof === null) return undefined;
+	if (state.status === "PENDING_REVIEW" || state.status === "INTERRUPTED" || state.status === "FAILED") {
+		return state.revision >= 3 && state.revision % 2 === 1 && state.committed_proof.revision === state.revision - 1
+			? state.revision
+			: undefined;
+	}
+	if (state.status === "REVIEWED") {
+		return state.revision >= 4 && state.revision % 2 === 0 && state.committed_proof.revision === state.revision - 2
+			? state.revision - 1
+			: undefined;
+	}
+	return undefined;
+}
+
 function parseReviewArtifactForState(value: unknown, state: DelegationTransactionRecord): DelegationReviewArtifactV2 | undefined {
+	const pendingRevision = pendingReviewRevisionForState(state);
 	if (!isRecord(value) || !exactFields(value, REVIEW_ARTIFACT_FIELDS) || !isRecord(value.worker_identity)) return undefined;
 	if (value.schema_version !== 2 || value.delegation_id !== state.delegation_id || value.task_kind !== "implementation" ||
 		state.task_kind !== "implementation" || value.contract_hash !== state.contract_hash ||
 		!exactFields(value.worker_identity, ["provider", "model", "worker_id"]) ||
 		!sameIdentity(value.worker_identity as unknown as DelegationWorkerIdentity, state.worker_identity) ||
-		value.generation !== state.generation || value.transaction_revision !== 3 || !isCanonicalTime(value.reviewed_at) ||
+		value.generation !== state.generation || pendingRevision === undefined || value.transaction_revision !== pendingRevision ||
+		!isCanonicalTime(value.reviewed_at) ||
 		!validReviewRecordForState(value.review, state) || (value.review as ReviewRecord).reviewed_at !== value.reviewed_at) return undefined;
 	return value as unknown as DelegationReviewArtifactV2;
 }
@@ -1298,10 +1321,11 @@ function semanticRepairDecisionHash(
 }
 
 function semanticRepairDecisionEligible(authority: DelegationReviewAuthorityV2): boolean {
-	return !authority.finalized && authority.state.status === "PENDING_REVIEW" && authority.state.revision === 3 &&
+	const pendingRevision = pendingReviewRevisionForState(authority.state);
+	return !authority.finalized && authority.state.status === "PENDING_REVIEW" && pendingRevision !== undefined &&
 		authority.state.task_kind === "implementation" && authority.state.review === null &&
-		authority.state.committed_proof !== null && authority.state.committed_proof.revision === 2 &&
-		authority.artifact.schema_version === 2 && authority.artifact.transaction_revision === 3 &&
+		authority.state.committed_proof !== null && authority.artifact.schema_version === 2 &&
+		authority.artifact.transaction_revision === pendingRevision &&
 		authority.review.schema_version === 2 && authority.review.checked_paths.length > 0 &&
 		authority.review.semantic_review === "required" && authority.review.semantic_acceptance === undefined &&
 		isScopeIntegrityPacketComplete(authority.review);
@@ -1314,7 +1338,8 @@ function parseSemanticRepairDecisionForAuthority(
 	if (!semanticRepairDecisionEligible(authority) || !isRecord(value) ||
 		!exactFields(value, SEMANTIC_REPAIR_DECISION_FIELDS) || value.schema_version !== 1 ||
 		value.delegation_id !== authority.state.delegation_id || value.contract_hash !== authority.state.contract_hash ||
-		value.generation !== authority.state.generation || value.transaction_revision !== 3 ||
+		value.generation !== authority.state.generation ||
+		value.transaction_revision !== authority.artifact.transaction_revision ||
 		value.generation_content_hash !== authority.state.committed_proof?.content_hash ||
 		value.base_review_hash !== authority.review_hash ||
 		value.expected_bound_diff_hash !== authority.review.bound_diff_hash || value.decision !== "REPAIR" ||
@@ -1337,14 +1362,16 @@ function encodeSemanticRepairDecision(value: DelegationSemanticRepairDecisionV1)
 }
 
 function semanticEvidenceV2Eligible(authority: DelegationReviewAuthorityV2): boolean {
+	const pendingRevision = pendingReviewRevisionForState(authority.state);
 	return authority.state.task_kind === "implementation" && authority.state.committed_proof !== null
 		&& authority.artifact.schema_version === 2 && authority.review.schema_version === 2
 		&& authority.review.semantic_review === "required" && authority.review.semantic_acceptance === undefined
 		&& authority.review.relevance_binding !== undefined && authority.review.relevance_projection !== undefined
 		&& authority.review.review_envelope !== undefined && validateSemanticReviewEnvelopeV1(authority.review.review_envelope)
 		&& isScopeIntegrityPacketComplete(authority.review)
-		&& ((authority.state.status === "PENDING_REVIEW" && authority.state.revision === 3 && !authority.finalized)
-			|| (authority.state.status === "REVIEWED" && authority.state.revision === 4 && authority.finalized));
+		&& pendingRevision !== undefined && authority.artifact.transaction_revision === pendingRevision
+		&& ((authority.state.status === "PENDING_REVIEW" && !authority.finalized)
+			|| (authority.state.status === "REVIEWED" && authority.finalized));
 }
 
 function parseSemanticReviewEvidenceV2ForAuthority(
@@ -1389,7 +1416,7 @@ function semanticRepairProjectionFromEvidenceV2(
 		delegation_id: evidence.delegation_id,
 		contract_hash: evidence.contract_hash,
 		generation: evidence.generation,
-		transaction_revision: 3,
+		transaction_revision: authority.artifact.transaction_revision,
 		generation_content_hash: evidence.generation_content_hash,
 		base_review_hash: authority.review_hash,
 		expected_bound_diff_hash: evidence.bound_diff_hash,
@@ -1409,7 +1436,7 @@ function isDelegationTerminalNegativeReviewStateCandidateV1(
 	const outcome = state.terminal_outcome;
 	return state.task_kind === "implementation"
 		&& (state.status === "INTERRUPTED" || state.status === "FAILED")
-		&& state.revision === 3 && state.committed_proof !== null && state.committed_proof.revision === 2
+		&& pendingReviewRevisionForState(state) === state.revision
 		&& state.review === null && outcome !== null && outcome.terminal_facts_complete === true
 		&& outcome.scope_complete === true
 		&& outcome.changed_paths.length > 0 && outcome.delta_hash !== null
@@ -1453,7 +1480,8 @@ function terminalNegativeFailureFactsHash(state: Readonly<DelegationTransactionR
 function terminalNegativeDecisionEligible(authority: DelegationReviewAuthorityV2): authority is DelegationTerminalNegativeReviewAuthorityV1 {
 	return (isDelegationTerminalNegativeReviewEligibleV1(authority.state)
 		|| authority.terminal_negative_committed_compatibility === true) && !authority.finalized
-		&& authority.artifact.schema_version === 2 && authority.artifact.transaction_revision === 3
+		&& authority.artifact.schema_version === 2
+		&& authority.artifact.transaction_revision === pendingReviewRevisionForState(authority.state)
 		&& authority.review.schema_version === 2 && authority.review.checked_paths.length > 0
 		&& authority.review.verdict === "PASS" && authority.review.mismatch === false
 		&& authority.review.drift_paths.length === 0 && authority.review.violations.length === 0
@@ -1911,7 +1939,9 @@ async function readReviewArtifactAt(
 		let finalized = false;
 		let terminalNegativeCommittedCompatibility = false;
 		if (state.status === "PENDING_REVIEW") {
-			if (state.revision !== 3 || state.review !== null) return failure("invalid_record", "pending review state is inconsistent", point);
+			if (pendingReviewRevisionForState(state) !== state.revision || state.review !== null) {
+				return failure("invalid_record", "pending review state is inconsistent", point);
+			}
 		} else if (state.status === "INTERRUPTED" || state.status === "FAILED") {
 			if (!isDelegationTerminalNegativeReviewEligibleFromCommittedV1(state, records)) {
 				return failure("invalid_record", "terminal-negative review state is ineligible or incomplete", point);
@@ -1919,7 +1949,8 @@ async function readReviewArtifactAt(
 			terminalNegativeCommittedCompatibility = !isDelegationTerminalNegativeReviewEligibleV1(state);
 		} else if (state.status === "REVIEWED") {
 			const review = state.review;
-			if (state.revision !== 4 || review === null || review.delegation_id !== state.delegation_id ||
+			if (pendingReviewRevisionForState(state) !== artifact.transaction_revision || review === null ||
+				review.transaction_revision !== state.revision - 1 || review.delegation_id !== state.delegation_id ||
 				review.generation !== state.generation || review.transaction_revision !== artifact.transaction_revision ||
 				review.review_hash !== reviewHash || review.reviewed_at !== artifact.reviewed_at || review.reviewer !== "sol") {
 				return failure("invalid_record", "finalized review proof conflicts with exact artifact bytes", point);
@@ -2092,7 +2123,13 @@ async function readWorkerCheckpointV1At(
 function workerCheckpointCanAdvanceV1(prior: WorkerCheckpointV1 | undefined, next: WorkerCheckpointV1): boolean {
 	if (prior === undefined) return next.attempt === 1 && next.parent_checkpoint_hash === null;
 	if (prior.checkpoint_hash === next.checkpoint_hash) return true;
-	if (prior.machine_state === "PAUSED_BUDGET" || next.attempt !== prior.attempt + 1
+	const samePromotion = canonicalHash(prior.budget_promotion ?? null) === canonicalHash(next.budget_promotion ?? null);
+	const authorizedPromotion = prior.machine_state === "PAUSED_BUDGET"
+		&& prior.remaining_budget.profile === "standard" && prior.budget_promotion === undefined
+		&& next.remaining_budget.profile === "extended" && next.budget_promotion?.from_profile === "standard"
+		&& next.budget_promotion.to_profile === "extended";
+	if ((!samePromotion && !authorizedPromotion) || (prior.machine_state === "PAUSED_BUDGET" && !authorizedPromotion)
+		|| next.attempt !== prior.attempt + 1
 		|| next.parent_checkpoint_hash !== prior.checkpoint_hash || next.delegation_id !== prior.delegation_id
 		|| next.contract_hash !== prior.contract_hash || next.runtime_build_identity !== prior.runtime_build_identity
 		|| next.before_binding_hash !== prior.before_binding_hash || next.cumulative_turns < prior.cumulative_turns
@@ -2444,7 +2481,9 @@ function validateIdentityRecord(value: unknown, state: DelegationTransactionReco
 
 function validateScopeRecord(value: unknown, state: DelegationTransactionRecord): boolean {
 	if (!isRecord(value) || !(exactFields(value, SCOPE_RECORD_FIELDS)
-		|| exactFields(value, SCOPE_RECORD_FIELDS_WITH_COMMAND)) || state.terminal_outcome === null) return false;
+		|| exactFields(value, SCOPE_RECORD_FIELDS_WITH_COMMAND)
+		|| exactFields(value, SCOPE_RECORD_FIELDS_WITH_PROMOTION)
+		|| exactFields(value, SCOPE_RECORD_FIELDS_WITH_COMMAND_AND_PROMOTION)) || state.terminal_outcome === null) return false;
 	if (value.schema_version !== DELEGATION_TRANSACTION_SCHEMA_VERSION || value.delegation_id !== state.delegation_id ||
 		value.task_kind !== state.task_kind || value.contract_hash !== state.contract_hash ||
 		!Array.isArray(value.allowed_paths) || !sameJson(value.allowed_paths, state.allowed_paths) ||
@@ -2455,7 +2494,11 @@ function validateScopeRecord(value: unknown, state: DelegationTransactionRecord)
 	const command = Object.prototype.hasOwnProperty.call(value, "command_provenance")
 		? value.command_provenance as DelegationCommandProvenanceRecord
 		: undefined;
+	const promotion = Object.prototype.hasOwnProperty.call(value, "budget_promotion")
+		? value.budget_promotion
+		: undefined;
 	if (command !== undefined && !validateDelegationCommandProvenance(command, changeSet)) return false;
+	if (promotion !== undefined && !validateWorkerBudgetPromotionV1(promotion)) return false;
 	const changedPaths = effectiveDeltaPaths(changeSet, command);
 	const effectiveStatus = command?.effective_status ?? changeSet.status;
 	const effectiveHash = command?.effective_delta_hash ?? changeSet.worker_delta_hash;
@@ -2848,7 +2891,7 @@ export async function readDelegationCommittedGenerationV2(
 		return failure("invalid_record", "delegation transaction has no published committed-generation proof");
 	}
 	const name = generationName(proof.generation);
-	if (name === undefined || proof.generation !== state.generation || proof.revision !== 2) {
+	if (name === undefined || proof.generation !== state.generation || proof.revision < 2 || proof.revision % 2 !== 0) {
 		return failure("invalid_record", "delegation committed-generation proof has an invalid generation binding");
 	}
 	const verified = await verifyGenerationDirectory(join(paths.generations, name), {
@@ -3529,17 +3572,18 @@ export async function publishDelegationSemanticReviewEvidenceV2(
 		const currentResult = await readStateAt(paths.transaction, adapter);
 		if (!currentResult.ok) return currentResult;
 		const current = currentResult.value;
-		const replayedAccept = current.status === "REVIEWED" && current.revision === 4
+		const pendingRevision = pendingReviewRevisionForState(current);
+		const replayedAccept = current.status === "REVIEWED" && pendingRevision !== undefined
 			&& input.evidence.final_decision === "ACCEPT" && current.review !== null
 			&& current.review.review_hash === input.base_review_hash;
-		if (!replayedAccept && (current.status !== "PENDING_REVIEW" || current.revision !== 3)) {
+		if (!replayedAccept && (current.status !== "PENDING_REVIEW" || pendingRevision !== current.revision)) {
 			return failure("conflict", "semantic review evidence v2 lifecycle check failed");
 		}
 		if (current.task_kind !== "implementation" || current.committed_proof === null
 			|| current.generation !== input.expected_generation || current.contract_hash !== input.contract_hash
 			|| !sameIdentity(current.worker_identity, input.worker_identity)
 			|| (!replayedAccept && current.revision !== input.expected_revision)
-			|| (replayedAccept && input.expected_revision !== 3 && input.expected_revision !== 4)) {
+			|| (replayedAccept && input.expected_revision !== pendingRevision && input.expected_revision !== current.revision)) {
 			return failure("conflict", "semantic review evidence v2 CAS, identity, or generation check failed");
 		}
 		const generation = generationName(current.generation);
@@ -3616,7 +3660,7 @@ export async function publishDelegationSemanticReviewEvidenceV2(
 
 /**
  * Publish one immutable, complete-packet-bound Sol REPAIR decision.
- * The transaction deliberately remains PENDING_REVIEW revision 3: this
+ * The transaction deliberately remains at its current PENDING_REVIEW revision: this
  * sidecar authorizes only an exact repair successor and never grants review,
  * successor, verification, or Gate authority.
  */
@@ -3633,9 +3677,10 @@ export async function publishDelegationSemanticRepairDecisionV1(
 		const currentResult = await readStateAt(paths.transaction, adapter);
 		if (!currentResult.ok) return currentResult;
 		const current = currentResult.value;
-		if (current.status !== "PENDING_REVIEW" || current.revision !== 3 || current.task_kind !== "implementation" ||
+		if (current.status !== "PENDING_REVIEW" || pendingReviewRevisionForState(current) !== current.revision ||
+			current.task_kind !== "implementation" ||
 			current.committed_proof === null || current.review !== null || current.generation !== input.expected_generation ||
-			input.expected_revision !== 3 || current.contract_hash !== input.contract_hash ||
+			input.expected_revision !== current.revision || current.contract_hash !== input.contract_hash ||
 			!sameIdentity(current.worker_identity, input.worker_identity) || input.now < current.updated_at) {
 			return failure("conflict", "semantic repair decision CAS, identity, or lifecycle check failed");
 		}
@@ -3666,7 +3711,7 @@ export async function publishDelegationSemanticRepairDecisionV1(
 			delegation_id: current.delegation_id,
 			contract_hash: current.contract_hash,
 			generation: current.generation,
-			transaction_revision: 3,
+			transaction_revision: current.revision,
 			generation_content_hash: current.committed_proof.content_hash,
 			base_review_hash: authority.review_hash,
 			expected_bound_diff_hash: authority.review.bound_diff_hash,
@@ -3754,7 +3799,7 @@ export async function publishDelegationTerminalNegativeRepairDecisionV1(
 			delegation_id: current.delegation_id,
 			contract_hash: current.contract_hash,
 			generation: current.generation,
-			transaction_revision: 3,
+			transaction_revision: current.revision,
 			generation_content_hash: current.committed_proof!.content_hash,
 			base_review_hash: authority.review_hash,
 			expected_bound_diff_hash: authority.review.bound_diff_hash,
@@ -3774,7 +3819,7 @@ export async function publishDelegationTerminalNegativeRepairDecisionV1(
 			delegation_id: current.delegation_id,
 			contract_hash: current.contract_hash,
 			generation: current.generation,
-			transaction_revision: 3,
+			transaction_revision: current.revision,
 			terminal_status: current.status,
 			parent_state_hash: canonicalHash(current),
 			generation_content_hash: current.committed_proof!.content_hash,
@@ -4046,7 +4091,8 @@ export async function persistDelegationReviewProvisionalV2(
 		const currentResult = await readStateAt(paths.transaction, adapter);
 		if (!currentResult.ok) return currentResult;
 		const current = currentResult.value;
-		if (current.status !== "PENDING_REVIEW" || current.revision !== 3 || current.task_kind !== "implementation" ||
+		if (current.status !== "PENDING_REVIEW" || pendingReviewRevisionForState(current) !== current.revision ||
+			current.task_kind !== "implementation" ||
 			current.committed_proof === null || current.review !== null || current.generation !== input.expected_generation ||
 			current.revision !== input.expected_revision || current.contract_hash !== input.contract_hash ||
 			!sameIdentity(current.worker_identity, input.worker_identity) || input.now !== input.artifact.reviewed_at) {
@@ -4083,8 +4129,8 @@ export async function persistDelegationReviewProvisionalV2(
 /**
  * Atomically publish the only valid implementation review authority.
  * The review file is committed first, hashed from a strict full-byte
- * readback, then the PENDING_REVIEW(rev3) transaction is CAS-published as
- * REVIEWED(rev4) while the same per-delegation lock remains held.
+ * readback, then the current odd PENDING_REVIEW revision is CAS-published as
+ * the following even REVIEWED revision while the same lock remains held.
  */
 export async function publishDelegationReviewV2(
 	projectRoot: string,
@@ -4096,7 +4142,8 @@ export async function publishDelegationReviewV2(
 		const currentResult = await readStateAt(paths.transaction, adapter);
 		if (!currentResult.ok) return currentResult;
 		const current = currentResult.value;
-		if (current.status !== "PENDING_REVIEW" || current.revision !== 3 || current.task_kind !== "implementation" ||
+		if (current.status !== "PENDING_REVIEW" || pendingReviewRevisionForState(current) !== current.revision ||
+			current.task_kind !== "implementation" ||
 			current.committed_proof === null || current.review !== null || current.generation !== input.expected_generation ||
 			current.revision !== input.expected_revision || current.contract_hash !== input.contract_hash ||
 			!sameIdentity(current.worker_identity, input.worker_identity) || input.now !== input.artifact.reviewed_at) {

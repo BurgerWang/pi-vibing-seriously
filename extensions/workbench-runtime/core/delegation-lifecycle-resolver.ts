@@ -715,7 +715,11 @@ export function buildLifecycleActionSnapshotV2(
 			authority_hash: checkpoint?.checkpoint_hash ?? input.resolution.primary_action.snapshot_hash,
 			state: checkpoint?.machine_state ?? input.resolution.state,
 			...projected,
-			reason_code: checkpoint?.machine_state ?? input.resolution.primary_action.reason,
+			reason_code: checkpoint?.machine_state === "PAUSED_BUDGET"
+				? checkpoint.remaining_budget.profile === "standard"
+					? "PAUSED_BUDGET_STANDARD_PROMOTION_AVAILABLE"
+					: "PAUSED_BUDGET_EXTENDED_SPLIT_REQUIRED"
+				: checkpoint?.machine_state ?? input.resolution.primary_action.reason,
 			invalidation_conditions: [...INVALIDATION_CONDITIONS_V2],
 		};
 		const value = { ...payload, snapshot_hash: computeLifecycleActionSnapshotHashV2(payload) };

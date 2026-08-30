@@ -227,6 +227,7 @@ interface HarnessOptions {
 	onLane?: (phase: "acquire" | "release", allowedPath: string) => void;
 	processStateSymbol?: symbol;
 	canonicalBudgetPaused?: boolean;
+	canonicalBudgetAuthorized?: boolean;
 }
 
 function harness(options: HarnessOptions = {}) {
@@ -244,7 +245,9 @@ function harness(options: HarnessOptions = {}) {
 		getMode: () => "DEV",
 		getLifecycleActionSnapshot: () => options.canonicalBudgetPaused
 			? { action: "PAUSED_BUDGET", authorization: "USER_REQUIRED" }
-			: undefined,
+			: options.canonicalBudgetAuthorized
+				? { action: "CONTINUE_CHECKPOINT", authorization: "EXISTING" }
+				: undefined,
 		runtimeCurrentOrError: () => undefined,
 		compactionPending: () => options.compaction?.() ?? false,
 		projectRootFor: async () => ROOT,
@@ -717,6 +720,21 @@ test("canonical budget pause clears non-authoritative continuation without revie
 	assert.equal(h.runtime.hasPendingBeforeAgentContinuation(), true);
 	const before = await h.pi.emit("before_agent_start", {
 		type: "before_agent_start", prompt: "continue", systemPrompt: "", systemPromptOptions: {},
+	}, h.ctx);
+	await h.pi.emit("agent_settled", { type: "agent_settled" }, h.ctx);
+	assert.equal(before.every((result) => result === undefined), true);
+	assert.equal(h.runtime.hasPendingBeforeAgentContinuation(), false);
+	assert.deepEqual({ review: h.reviewCalls, exact: h.exactCalls, sent: h.pi.sent.length }, { review: 0, exact: 0, sent: 0 });
+});
+
+test("authorized checkpoint continuation owns the turn and suppresses conflicting delivery advice", async () => {
+	const h = harness({ canonicalBudgetAuthorized: true });
+	h.runtime.registerToolResultLocatorCaptureBeforeMiddleware();
+	h.runtime.registerLifecycleListenersAfterMiddleware();
+	await h.pi.emit("session_start", { type: "session_start", reason: "reload" }, h.ctx);
+	assert.equal(h.runtime.hasPendingBeforeAgentContinuation(), true);
+	const before = await h.pi.emit("before_agent_start", {
+		type: "before_agent_start", prompt: "继续", systemPrompt: "", systemPromptOptions: {},
 	}, h.ctx);
 	await h.pi.emit("agent_settled", { type: "agent_settled" }, h.ctx);
 	assert.equal(before.every((result) => result === undefined), true);

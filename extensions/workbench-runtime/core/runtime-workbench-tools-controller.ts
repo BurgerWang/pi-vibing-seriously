@@ -12,6 +12,7 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 
 import { createAutomaticDeliveryContinuationRuntimeControllerV1 } from "./automatic-delivery-continuation-runtime-controller.ts";
+import type { BudgetContinuationAuthorizationV1 } from "./budget-continuation-authorization.ts";
 import { resolveAutomaticDeliveryContinuationCandidateV1 } from "./automatic-delivery-continuation-authority.ts";
 import { registerAutomaticSemanticReviewCommand } from "./automatic-semantic-review-command.ts";
 import { boundedInlineDetail } from "./command-output.ts";
@@ -80,6 +81,9 @@ export interface RuntimeWorkbenchToolsControllerV1 {
 	readonly secrets: readonly string[];
 	readonly getMode: () => WorkbenchMode;
 	readonly getLifecycleActionSnapshot: () => Readonly<LifecycleActionSnapshotV2> | undefined;
+	readonly takeBudgetContinuationAuthorization: (
+		delegationId: string,
+	) => Readonly<BudgetContinuationAuthorizationV1> | undefined;
 	readonly getIdentity: () => { readonly provider?: string; readonly model?: string };
 	readonly workerRoleContext: WorkerRoleContext;
 	readonly workerWriteJournalRuntime: WorkerWriteJournalRuntime;
@@ -374,6 +378,7 @@ export function registerRuntimeWorkbenchToolsV1(
 		runtimeCurrentOrError: () => runtimeFreshnessError(true),
 		reconcileProjectAuthority: controller.delegationSession.reconcileProjectAuthority,
 		exec: controller.exec,
+		takeBudgetContinuationAuthorization: controller.takeBudgetContinuationAuthorization,
 	});
 	executeModelRepairAlias = exactRepairToolExecution.executeDelegateAlias;
 	if (automaticDeliveryContinuationEnabled) automaticDeliveryContinuation.registerToolResultLocatorCaptureBeforeMiddleware();

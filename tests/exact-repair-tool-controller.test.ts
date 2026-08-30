@@ -6,6 +6,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { DelegateWorkerExecuteV1 } from "../extensions/workbench-runtime/core/delegate-tool-controller.ts";
 import type { ExactRepairCommandAuthorityV1 } from "../extensions/workbench-runtime/core/exact-repair-authority.ts";
 import type { CheckpointResumeExecutionAuthorityV1 } from "../extensions/workbench-runtime/core/delegation-resume-authority.ts";
+import type { BudgetContinuationAuthorizationV1 } from "../extensions/workbench-runtime/core/budget-continuation-authorization.ts";
 import { registerExactRepairToolV1 } from "../extensions/workbench-runtime/core/exact-repair-tool-controller.ts";
 
 const PARENT = "20260827-192913-w7xf";
@@ -200,4 +201,66 @@ test("the exact repair tool resumes a durable checkpoint before considering a su
 	assert.equal(result.details.status, "PENDING_REVIEW");
 	assert.equal(checkpointExecutions, 1);
 	assert.equal(semanticServiceReads, 0);
+});
+
+test("the exact repair tool consumes one paused-budget grant and binds it through collection", async () => {
+	let registered: { execute: (...args: any[]) => Promise<any> } | undefined;
+	let taken = 0;
+	let prepared = 0;
+	const grant = {
+		schema_version: 1,
+		kind: "budget-continuation-authorization-v1",
+		delegation_id: PARENT,
+		checkpoint_hash: "a".repeat(64),
+		target_profile: "extended",
+		prompt_hash: "b".repeat(64),
+		authority_hash: "c".repeat(64),
+	} as const satisfies BudgetContinuationAuthorizationV1;
+	const checkpointAuthority = {
+		schema_version: 1,
+		kind: "checkpoint-resume-execution-authority-v1",
+		delegation_id: PARENT,
+		budget_continuation: grant,
+	} as unknown as CheckpointResumeExecutionAuthorityV1;
+	registerExactRepairToolV1({
+		pi: { registerTool: (tool: any) => { registered = tool; } },
+		execution: {
+			execute: (async () => { throw new Error("broad delegate execute must not be used"); }) as DelegateWorkerExecuteV1,
+			executeExactRepair: (async () => { throw new Error("semantic successor must not be used"); }) as never,
+			executeCheckpointRecovery: (async (_id: string, received: Readonly<CheckpointResumeExecutionAuthorityV1>) => {
+				assert.equal(received, checkpointAuthority);
+				return { content: [{ type: "text", text: "continued" }], details: { ok: true, status: "PENDING_REVIEW" } };
+			}) as never,
+		},
+		serviceDependencies: {
+			readCommittedGeneration: (async () => { throw new Error("must not read semantic authority"); }) as never,
+			readReview: (async () => { throw new Error("must not read review"); }) as never,
+			readSuccessor: (async () => { throw new Error("must not read successor"); }) as never,
+			collectCurrentBinding: async () => ({ status: "unavailable" }),
+		},
+		trustedOrError: () => undefined,
+		projectRootFor: async () => "/project",
+		getMode: () => "DEV",
+		runtimeCurrentOrError: () => undefined,
+		reconcileProjectAuthority: async () => {},
+		exec: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+		takeBudgetContinuationAuthorization: (delegationId) => {
+			taken += 1;
+			return delegationId === PARENT && taken === 1 ? grant : undefined;
+		},
+		preparePausedBudgetContinuation: async (input) => {
+			prepared += 1;
+			assert.equal(input.authorization, grant);
+			return { ok: true };
+		},
+		collectCheckpointResumeAuthority: async (input) => {
+			assert.equal(input.budget_continuation, grant);
+			return { ok: true, value: checkpointAuthority };
+		},
+	});
+	assert.ok(registered);
+	const result = await registered!.execute("budget-call", { delegation_id: PARENT }, undefined, undefined, context());
+	assert.equal(result.details.status, "PENDING_REVIEW");
+	assert.equal(taken, 1);
+	assert.equal(prepared, 1);
 });

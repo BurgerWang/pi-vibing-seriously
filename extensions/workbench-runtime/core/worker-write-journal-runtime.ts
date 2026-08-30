@@ -404,6 +404,13 @@ function exactObservation(value: unknown): Readonly<WorkerWriteJournalRuntimeObs
 	return record as unknown as Readonly<WorkerWriteJournalRuntimeObservation>;
 }
 
+/** Validate a content-free journal cursor before a fresh child observes later revisions. */
+export function validateWorkerWriteJournalRuntimeObservation(
+	value: unknown,
+): value is Readonly<WorkerWriteJournalRuntimeObservation> {
+	return exactObservation(value) !== undefined;
+}
+
 function invalidObservation(revision: number): Readonly<WorkerWriteJournalRuntimeObservation> {
 	return Object.freeze({
 		state: "failed",

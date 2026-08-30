@@ -10,6 +10,8 @@ import {
 	type DelegateToolController,
 	type DelegateToolServices,
 } from "../extensions/workbench-runtime/core/delegate-tool-controller.ts";
+import { bindDelegationBoundedTaskContractV2 } from "../extensions/workbench-runtime/core/delegation-transaction-artifacts.ts";
+import type { CheckpointResumeExecutionAuthorityV1 } from "../extensions/workbench-runtime/core/delegation-resume-authority.ts";
 import type { DelegationPathLaneAdmissionV1 } from "../extensions/workbench-runtime/core/delegation-path-lane-admission.ts";
 import {
 	acquireProjectDelegationStartLockV1,
@@ -35,6 +37,9 @@ interface Deferred {
 interface ExecuteInput {
 	readonly delegationId: string;
 	readonly signal?: AbortSignal;
+	readonly dependencyPaths?: readonly string[];
+	readonly repairLineage?: { readonly carried_paths: readonly string[] };
+	readonly checkpointRecovery?: Readonly<CheckpointResumeExecutionAuthorityV1>;
 	onPrepared?(transaction: unknown, before: { diffHash: string }): Promise<void>;
 }
 
@@ -52,7 +57,7 @@ function context(root: string, sessionId: string): ExtensionContext {
 	return {
 		cwd: root,
 		model: { provider: "openai-codex", id: "gpt-5.6-sol" },
-		sessionManager: { getSessionId: () => sessionId },
+		sessionManager: { getSessionId: () => sessionId, getEntries: () => [] },
 	} as unknown as ExtensionContext;
 }
 
@@ -164,6 +169,7 @@ function controller(input: {
 	readonly completeDefaultDelivery?: (input: DeliveryInput) => Promise<unknown>;
 	readonly persistDelegationStateStrict?: (state: DelegationState) => void;
 	readonly readTransaction?: () => Promise<unknown>;
+	readonly collectCheckpointResumeAuthority?: NonNullable<DelegateToolServices["collectCheckpointResumeAuthority"]>;
 	readonly admitPathLane?: NonNullable<DelegateToolServices["admitPathLane"]>;
 	readonly revalidatePathLane?: NonNullable<DelegateToolServices["revalidatePathLane"]>;
 	readonly releaseStartLock?: DelegateToolServices["releaseStartLock"];
@@ -179,6 +185,9 @@ function controller(input: {
 			acquireStartLock: acquireProjectDelegationStartLockV1,
 			releaseStartLock: input.releaseStartLock ?? releaseProjectDelegationStartLockV1,
 			readCommittedGeneration: async () => ({ ok: false, error: { code: "not_found" } }),
+			...(input.collectCheckpointResumeAuthority === undefined ? {} : {
+				collectCheckpointResumeAuthority: input.collectCheckpointResumeAuthority,
+			}),
 				...(input.readTransaction === undefined ? {} : { readTransaction: input.readTransaction }),
 				...(input.admitPathLane === undefined ? {} : { admitPathLane: input.admitPathLane }),
 				...(input.revalidatePathLane === undefined ? {} : { revalidatePathLane: input.revalidatePathLane }),
@@ -208,6 +217,68 @@ function controller(input: {
 		rememberTrustedIngressAuthority: () => {},
 	} as unknown as DelegateToolController<unknown>);
 }
+
+test("checkpoint recovery resumes the same repair-lineage transaction instead of routing repair_of as a successor", async () => {
+	await withTempDir(async (root) => {
+		const delegationId = "20260830-105348-ibv7";
+		const repairOf = "20260830-103559-pekb";
+		const bound = bindDelegationBoundedTaskContractV2({
+			task_kind: "implementation",
+			task: "Resume the exact checkpointed repair transaction.",
+			allowed_paths: ["src/exact.ts"],
+			acceptance_criteria: ["The existing repair transaction reaches an explicit outcome."],
+			verification: [],
+			timeout_seconds: 60,
+			budget_profile: "standard",
+			repair_of: repairOf,
+		});
+		assert.equal(bound.ok, true);
+		if (!bound.ok) return;
+		const lineage = {
+			carried_paths: ["src/exact.ts"],
+		};
+		const checkpointAuthority = {
+			schema_version: 1,
+			kind: "checkpoint-resume-execution-authority-v1",
+			delegation_id: delegationId,
+			contract: bound.value,
+			transaction: {
+				delegation_id: delegationId,
+				contract_hash: bound.value.contract_hash,
+				worker_identity: {
+					provider: "openai-codex",
+					model: "gpt-5.6-luna",
+					worker_id: `worker:${delegationId}`,
+				},
+				repair_lineage: lineage,
+			},
+			authority_hash: "a".repeat(64),
+		} as unknown as CheckpointResumeExecutionAuthorityV1;
+		let observed: ExecuteInput | undefined;
+		const handle = controller({
+			root,
+			delegationId,
+			collectCheckpointResumeAuthority: async () => ({ ok: true, value: checkpointAuthority }),
+			executeDelegation: async (input) => {
+				observed = input;
+				return terminalFailure();
+			},
+		});
+		await assert.rejects(
+			handle.executeCheckpointRecovery!(
+				"checkpointed-repair",
+				checkpointAuthority,
+				undefined,
+				undefined,
+				context(root, "checkpointed-repair"),
+			),
+			/durable_status=FAILED/u,
+		);
+		assert.equal(observed?.checkpointRecovery, checkpointAuthority);
+		assert.deepEqual(observed?.dependencyPaths, ["src/exact.ts"]);
+		assert.equal(observed?.repairLineage, lineage);
+	});
+});
 
 test("a known non-overlapping historical session blocker does not require its unavailable live binding", async () => {
 	await withTempDir(async (root) => {

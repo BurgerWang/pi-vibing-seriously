@@ -37,6 +37,7 @@ import {
 	persistCommittingDelegationTransaction,
 	persistPreparedDelegationTransaction,
 	persistRecoveryRequiredDelegationTransaction,
+	persistResumedRunningDelegationTransaction,
 	persistReviewedDelegationTransaction,
 	persistRunningDelegationTransaction,
 	persistDelegationReviewProvisionalV2,
@@ -382,6 +383,39 @@ async function committingState(
 	return committing.value;
 }
 
+async function resumedCommittingState(root: string): Promise<DelegationTransactionRecord> {
+	const prepared = await persistPreparedDelegationTransaction(root, {
+		delegation_id: ID,
+		task_kind: "implementation",
+		contract_hash: HASH,
+		allowed_paths: ["src/**"],
+		worker_identity: { ...IDENTITY },
+		generation: 1,
+		now: at(0),
+	});
+	assert.equal(prepared.ok, true);
+	if (!prepared.ok) throw new Error("prepare failed");
+	const running = await persistRunningDelegationTransaction(root, cas(prepared.value, 1));
+	assert.equal(running.ok, true);
+	if (!running.ok) throw new Error("start failed");
+	const paused = await persistRecoveryRequiredDelegationTransaction(root, {
+		...cas(running.value, 2),
+		reason: "worker paused at a bounded budget epoch before terminal facts",
+	});
+	assert.equal(paused.ok, true);
+	if (!paused.ok) throw new Error("pause failed");
+	const resumed = await persistResumedRunningDelegationTransaction(root, cas(paused.value, 3));
+	assert.equal(resumed.ok, true);
+	if (!resumed.ok) throw new Error("resume failed");
+	const committing = await persistCommittingDelegationTransaction(root, {
+		...cas(resumed.value, 4),
+		outcome: outcome("implementation"),
+	});
+	assert.equal(committing.ok, true);
+	if (!committing.ok) throw new Error("resumed commit begin failed");
+	return committing.value;
+}
+
 async function terminalNegativeCommittingState(
 	root: string,
 	status: "FAILED" | "INTERRUPTED",
@@ -478,13 +512,14 @@ async function completeProvisionalSemanticReview(
 	root: string,
 	terminalStatus?: "FAILED" | "INTERRUPTED",
 	withEnvelope = false,
+	fromBudgetResume = false,
 ): Promise<{
 	state: DelegationTransactionRecord;
 	artifact: DelegationReviewArtifactV2;
 	reviewHash: string;
 }> {
 	const committing = terminalStatus === undefined
-		? await committingState(root)
+		? fromBudgetResume ? await resumedCommittingState(root) : await committingState(root)
 		: await terminalNegativeCommittingState(root, terminalStatus);
 	const facts = authority("implementation");
 	const changedPaths = [...committing.terminal_outcome!.changed_paths];
@@ -519,10 +554,11 @@ async function completeProvisionalSemanticReview(
 	}
 	const records = recordsFor(committing);
 	if (envelope !== undefined) (records["after.json"] as Record<string, unknown>).review_envelope = envelope;
-	const committed = await commitDelegationGeneration(root, commitInput(committing, records));
+	const committed = await commitDelegationGeneration(root, commitInput(committing, records, fromBudgetResume ? 5 : 3));
 	assert.equal(committed.ok, true);
 	if (!committed.ok) throw new Error("commit failed");
-	const reviewedAt = at(4);
+	const reviewSecond = fromBudgetResume ? 6 : 4;
+	const reviewedAt = at(reviewSecond);
 	const review: ReviewRecord = {
 		schema_version: 2,
 		delegation_id: ID,
@@ -572,13 +608,13 @@ async function completeProvisionalSemanticReview(
 		contract_hash: HASH,
 		worker_identity: { ...IDENTITY },
 		generation: committed.value.generation,
-		transaction_revision: 3,
+		transaction_revision: committed.value.revision,
 		reviewed_at: reviewedAt,
 		review,
 	};
 	const persisted = terminalStatus === undefined
-		? await persistDelegationReviewProvisionalV2(root, { ...cas(committed.value, 4), artifact })
-		: await persistDelegationTerminalNegativeReviewProvisionalV1(root, { ...cas(committed.value, 4), artifact });
+		? await persistDelegationReviewProvisionalV2(root, { ...cas(committed.value, reviewSecond), artifact })
+		: await persistDelegationTerminalNegativeReviewProvisionalV1(root, { ...cas(committed.value, reviewSecond), artifact });
 	assert.equal(persisted.ok, true, persisted.ok ? "" : persisted.error.code);
 	if (!persisted.ok) throw new Error("provisional review failed");
 	return { state: committed.value, artifact, reviewHash: persisted.value.review_hash };
@@ -1698,6 +1734,28 @@ test("storage v2 committed reader returns the exact verified implementation and 
 		} finally {
 			await cleanup(root);
 		}
+	}
+});
+
+test("storage v2 reviews the same transaction after budget continuation without resetting its revision lineage", async () => {
+	const root = await tempProject();
+	try {
+		const fixture = await completeProvisionalSemanticReview(root, undefined, false, true);
+		assert.equal(fixture.state.status, "PENDING_REVIEW");
+		assert.equal(fixture.state.revision, 5);
+		assert.equal(fixture.state.committed_proof?.revision, 4);
+		assert.equal(fixture.artifact.transaction_revision, 5);
+
+		const committed = await readDelegationCommittedGenerationV2(root, ID);
+		assert.equal(committed.ok, true, committed.ok ? "" : committed.error.message);
+		const review = await readDelegationReviewV2(root, ID);
+		assert.equal(review.ok, true, review.ok ? "" : review.error.message);
+		if (review.ok) {
+			assert.equal(review.value.finalized, false);
+			assert.equal(review.value.artifact.transaction_revision, 5);
+		}
+	} finally {
+		await cleanup(root);
 	}
 });
 

@@ -25,6 +25,8 @@ import {
 	persistAbortedDelegationTransaction,
 	persistCommittingDelegationTransaction,
 	persistPreparedDelegationTransaction,
+	persistRecoveryRequiredDelegationTransaction,
+	persistResumedRunningDelegationTransaction,
 	persistRunningDelegationTransaction,
 	readDelegationCommittedGenerationV2,
 	readDelegationReviewV2,
@@ -152,6 +154,8 @@ async function setupReviewFixture(
 	reportedPaths?: readonly string[],
 	newPaths: readonly string[] = [],
 	terminalStatus?: "FAILED" | "INTERRUPTED",
+	resumeBeforeCommit = false,
+	withBudgetPromotion = false,
 ): Promise<ReviewFixture> {
 	const root = await mkdtemp(join(tmpdir(), "delegation-review-v2-"));
 	await git(root, ["init"]);
@@ -265,7 +269,24 @@ async function setupReviewFixture(
 		denied_write_count: 0,
 		delta_hash: lifecycle.value.change_set.worker_delta_hash,
 	};
-	const committing = await persistCommittingDelegationTransaction(root, { ...cas(running.value, 2), outcome });
+	let executionState = running.value;
+	if (resumeBeforeCommit) {
+		const recovery = await persistRecoveryRequiredDelegationTransaction(root, {
+			...cas(executionState, 2),
+			reason: "worker runner failed before terminal facts",
+		});
+		assert.equal(recovery.ok, true);
+		if (!recovery.ok) throw new Error("recovery persistence failed");
+		const resumed = await persistResumedRunningDelegationTransaction(root, cas(recovery.value, 3));
+		assert.equal(resumed.ok, true);
+		if (!resumed.ok) throw new Error("resume persistence failed");
+		executionState = resumed.value;
+	}
+	const committingSecond = resumeBeforeCommit ? 4 : 2;
+	const committing = await persistCommittingDelegationTransaction(root, {
+		...cas(executionState, committingSecond),
+		outcome,
+	});
 	assert.equal(committing.ok, true);
 	if (!committing.ok) throw new Error("commit begin failed");
 	const report = `## Completed\n- changed fixture files\n## Files Changed\n${(reportedPaths ?? workerPaths).map((path) => `- ${path}`).join("\n")}\n## Verification\n- facts\n## Remaining Risks\n- none\n`;
@@ -287,14 +308,21 @@ async function setupReviewFixture(
 	const built = buildDelegationCommittedArtifactsV2({
 		transaction: committing.value, contract: contract.value, before: workspace.value.before, after: workspace.value.after,
 		changeSetLifecycle: lifecycle.value,
-		worker: workerFacts(report, withExtendedReason ? "extended" : "standard", terminalStatus),
+		worker: workerFacts(report, withExtendedReason || withBudgetPromotion ? "extended" : "standard", terminalStatus),
 		reportText: report,
 		reviewEnvelope: envelope.value,
+		...(withBudgetPromotion ? {
+			budgetPromotion: {
+				from_profile: "standard" as const,
+				to_profile: "extended" as const,
+				authorization_hash: "b".repeat(64),
+			},
+		} : {}),
 	});
 	assert.equal(built.ok, true);
 	if (!built.ok) throw new Error("artifact build failed");
 	const records = built.value.records;
-	const committed = await commitDelegationGeneration(root, { ...cas(committing.value, 3), records });
+	const committed = await commitDelegationGeneration(root, { ...cas(committing.value, resumeBeforeCommit ? 5 : 3), records });
 	assert.equal(committed.ok, true);
 	if (!committed.ok) throw new Error("generation commit failed");
 	return { root, state: committed.value, records };
@@ -474,6 +502,39 @@ test("review v2 fixture: reverse journal order builds, commits, and strict-reads
 		if (reviewed.ok) {
 			assert.equal(reviewed.lifecycle_resolution?.primary_action.action, "REVIEW_CANDIDATE");
 			assert.equal(reviewed.lifecycle_resolution?.primary_action.reason, "CURRENT_DELTA_REVIEW_REQUIRED");
+		}
+	} finally {
+		await cleanup(fixture);
+	}
+});
+
+test("review v2 derives provisional and finalized revisions after same-transaction continuation", async () => {
+	const fixture = await setupReviewFixture(
+		["src/a.ts"], undefined, ["src/a.ts"], false, false, undefined, undefined, [], undefined, true, true,
+	);
+	try {
+		assert.equal(fixture.state.status, "PENDING_REVIEW");
+		assert.equal(fixture.state.revision, 5);
+		assert.equal(fixture.state.committed_proof?.revision, 4);
+		const presented = await reviewDelegationV2({
+			projectRoot: fixture.root,
+			delegationId: ID,
+			exec: spawnExec,
+			now: at(6),
+		});
+		assert.equal(presented.ok, true, presented.ok ? "" : JSON.stringify(presented.error));
+		if (!presented.ok || presented.review.record === undefined) return;
+		assert.equal(presented.finalized, false);
+		const provisional = await readDelegationReviewV2(fixture.root, ID);
+		assert.equal(provisional.ok, true, provisional.ok ? "" : JSON.stringify(provisional.error));
+		if (provisional.ok) assert.equal(provisional.value.artifact.transaction_revision, 5);
+
+		const accepted = await acceptPresentedReview(fixture, presented.review.record.bound_diff_hash, 7);
+		assert.equal(accepted.ok, true, accepted.ok ? "" : JSON.stringify(accepted.error));
+		if (accepted.ok) {
+			assert.equal(accepted.transaction.status, "REVIEWED");
+			assert.equal(accepted.transaction.revision, 6);
+			assert.equal(accepted.transaction.review?.transaction_revision, 5);
 		}
 	} finally {
 		await cleanup(fixture);

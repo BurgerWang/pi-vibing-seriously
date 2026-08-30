@@ -352,6 +352,8 @@ export interface DelegateToolServices {
 	acquireStartLock: typeof acquireProjectDelegationStartLockV1;
 	releaseStartLock: typeof releaseProjectDelegationStartLockV1;
 	readCommittedGeneration: typeof readDelegationCommittedGenerationV2;
+	/** Optional deterministic seam; production re-collects strict durable checkpoint authority. */
+	collectCheckpointResumeAuthority?: typeof collectCheckpointResumeExecutionAuthorityV1;
 	/** Optional injection seam; production falls back to the strict storage reader. */
 	readTransaction?: typeof readDelegationTransactionV2;
 	/** Optional injection seam; production falls back to the strict storage reader. */
@@ -475,7 +477,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 						|| checkpointRecoveryAuthority.contract.contract_hash !== checkpointRecoveryAuthority.transaction.contract_hash)) {
 					throw new Error("workbench_delegate_worker: in-process checkpoint recovery authority binding is invalid");
 				}
-				if (contract.value.repair_of !== undefined && exactRepairAuthority === undefined) {
+				if (contract.value.repair_of !== undefined && exactRepairAuthority === undefined && checkpointRecoveryAuthority === undefined) {
 					throw new Error(`workbench_delegate_worker: unbound repair_of ${contract.value.repair_of} reached the delegation kernel`);
 				}
 				const projectRoot = await controller.projectRootFor(ctx);
@@ -785,7 +787,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					if (v2RepairAuthority === undefined) {
 						throw new Error("workbench_delegate_worker: exact repair authority or current binding changed");
 					}
-				} else if (contract.value.repair_of !== undefined) {
+				} else if (checkpointRecoveryAuthority === undefined && contract.value.repair_of !== undefined) {
 					const repairId = contract.value.repair_of;
 					const priorV2 = await controller.services.readCommittedGeneration(projectRoot, repairId);
 					if (priorV2.ok) {
@@ -1193,12 +1195,17 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 						laneRevalidation.admission.repair_tip_exclusion_id !== verifiedRepairTipExclusionId) {
 						throw new Error("workbench_delegate_worker: path lane repair-tip exclusion lacks exact in-process repair authority");
 					}
-				} else {
-					const revalidatedCheckpoint = await collectCheckpointResumeExecutionAuthorityV1({
+					} else {
+					const collectCheckpointResumeAuthority = controller.services.collectCheckpointResumeAuthority
+						?? collectCheckpointResumeExecutionAuthorityV1;
+					const revalidatedCheckpoint = await collectCheckpointResumeAuthority({
 						project_root: projectRoot,
 						delegation_id: delegationId,
 						exec: controller.exec,
 						session_entries: ctx.sessionManager.getEntries(),
+						...(checkpointRecoveryAuthority?.budget_continuation === undefined ? {} : {
+							budget_continuation: checkpointRecoveryAuthority.budget_continuation,
+						}),
 					});
 					if (!revalidatedCheckpoint.ok || revalidatedCheckpoint.value.authority_hash !== checkpointRecoveryAuthority?.authority_hash) {
 						throw new Error("workbench_delegate_worker: checkpoint recovery authority changed before resume");
@@ -1208,13 +1215,15 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 				let preparedCallbackStep: PreparedCallbackStep | undefined;
 				let execution: Awaited<ReturnType<DelegateToolServices["executeDelegation"]>>;
 				try {
+					const resumedRepairLineage = checkpointRecoveryAuthority?.transaction.repair_lineage;
+					const executionRepairLineage = resumedRepairLineage ?? v2RepairAuthority?.repairLineage;
 					execution = await controller.services.executeDelegation({
 					projectRoot,
 					delegationId,
 					contract: contract.value,
-					...(v2RepairAuthority?.repairLineage === undefined ? {} : {
-						dependencyPaths: [...v2RepairAuthority.repairLineage.carried_paths],
-						repairLineage: v2RepairAuthority.repairLineage,
+					...(executionRepairLineage === undefined ? {} : {
+						dependencyPaths: [...executionRepairLineage.carried_paths],
+						repairLineage: executionRepairLineage,
 					}),
 					workerIdentity: {
 						provider: WORKER_PROVIDER,
@@ -1454,6 +1463,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					// the checkpoint binding will reject any intervening drift.
 					preserveStartLock = false;
 					const checkpoint = execution.checkpoint;
+					const standardPromotion = checkpoint.remaining_budget.profile === "standard";
 					return {
 						content: [{
 							type: "text" as const,
@@ -1464,7 +1474,9 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 								`checkpoint     : ${checkpoint.checkpoint_hash}`,
 								`remaining      : turns ${checkpoint.remaining_budget.turns}; total ${checkpoint.remaining_budget.total_tokens}; output ${checkpoint.remaining_budget.output_tokens}`,
 								"semantic review: NOT_RUN — no committed generation exists",
-								"next action    : explicitly extend the bounded profile or split the task; do not create semantic repair",
+								standardPromotion
+									? "next action    : send one ordinary explicit continue/authorize instruction to promote this exact checkpoint to the cumulative extended profile"
+									: "next action    : SPLIT_REQUIRED — define a new bounded task for the exact remaining objective; cumulative extended budget cannot be renewed",
 							].join("\n"),
 						}],
 						details: {
@@ -1474,7 +1486,9 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 							attempt: checkpoint.attempt,
 							remaining_budget: checkpoint.remaining_budget,
 							semantic_review: "NOT_RUN",
-							next_action: "USER_REQUIRED_EXTEND_OR_SPLIT",
+							next_action: standardPromotion
+								? "USER_CONTINUE_PROMOTES_TO_CUMULATIVE_EXTENDED"
+								: "SPLIT_REQUIRED_AFTER_EXTENDED_BUDGET",
 						},
 					};
 				}

@@ -93,6 +93,7 @@ import {
 	resolveDelegationLifecycleV1,
 	type DelegationLifecycleResolutionV1,
 } from "./delegation-lifecycle-resolver.ts";
+import { validateWorkerBudgetPromotionV1 } from "./worker-checkpoint.ts";
 
 const AFTER_FIELDS = [
 	"schema_version", "delegation_id", "recorded_at", "status", "exit_code", "pinned_identity",
@@ -122,6 +123,10 @@ const SCOPE_FIELDS = [
 	"write_journal", "change_set",
 ] as const;
 const SCOPE_FIELDS_WITH_COMMAND = [...SCOPE_FIELDS, "command_provenance"] as const;
+const SCOPE_FIELDS_WITH_PROMOTION = [...SCOPE_FIELDS, "budget_promotion"] as const;
+const SCOPE_FIELDS_WITH_COMMAND_AND_PROMOTION = [
+	...SCOPE_FIELDS, "command_provenance", "budget_promotion",
+] as const;
 
 export type DelegationReviewV2ErrorCode =
 	| "authority_invalid"
@@ -345,7 +350,9 @@ function authorityFromGeneration(generation: DelegationCommittedGenerationV2): G
 	const scope = generation.records["scope.json"];
 	if (!isRecord(before) || !isRecord(after) ||
 		!isRecord(identity) || !exactFields(identity, IDENTITY_FIELDS) || !isRecord(scope)
-		|| !(exactFields(scope, SCOPE_FIELDS) || exactFields(scope, SCOPE_FIELDS_WITH_COMMAND))) return undefined;
+		|| !(exactFields(scope, SCOPE_FIELDS) || exactFields(scope, SCOPE_FIELDS_WITH_COMMAND)
+			|| exactFields(scope, SCOPE_FIELDS_WITH_PROMOTION)
+			|| exactFields(scope, SCOPE_FIELDS_WITH_COMMAND_AND_PROMOTION))) return undefined;
 	const guardV2 = before.diff_identity_kind === DELEGATION_WORKSPACE_DIFF_IDENTITY_KIND_V2 ||
 		after.diff_identity_kind === DELEGATION_WORKSPACE_DIFF_IDENTITY_KIND_V2;
 	const envelopeTagged = guardV2 && Object.prototype.hasOwnProperty.call(after, "review_envelope");
@@ -423,6 +430,11 @@ function authorityFromGeneration(generation: DelegationCommittedGenerationV2): G
 	const commandProvenance = Object.prototype.hasOwnProperty.call(scope, "command_provenance")
 		? scope.command_provenance as DelegationCommandProvenanceRecord
 		: undefined;
+	const budgetPromotion = Object.prototype.hasOwnProperty.call(scope, "budget_promotion")
+		? scope.budget_promotion
+		: undefined;
+	if (budgetPromotion !== undefined && (canonicalContract.value.budget_profile !== "standard"
+		|| !validateWorkerBudgetPromotionV1(budgetPromotion))) return undefined;
 	if (commandTagged !== (commandProvenance !== undefined)
 		|| (commandProvenance !== undefined && (!validateDelegationCommandProvenance(commandProvenance, changeSet)
 			|| after.command_provenance_hash !== commandProvenance.command_provenance_hash
@@ -642,7 +654,7 @@ function artifactFor(state: DelegationTransactionRecord, reviewedAt: string, rev
 		contract_hash: state.contract_hash,
 		worker_identity: { ...state.worker_identity },
 		generation: state.generation,
-		transaction_revision: 3,
+		transaction_revision: state.revision,
 		reviewed_at: reviewedAt,
 		review: canonicalReview,
 	};

@@ -39,6 +39,8 @@ export const DELEGATION_REPAIR_LINEAGE_MAX_PATHS = DELEGATION_TRANSACTION_MAX_PA
 export const DELEGATION_TRANSACTION_ID_RE = /^\d{8}-\d{6}-[A-Za-z0-9]{4}$/;
 export const DELEGATION_TRANSACTION_HASH_RE = /^[a-f0-9]{64}$/;
 export const DELEGATION_TRANSACTION_WORKER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
+export const BUDGET_PAUSED_RECOVERY_REASON_V2 =
+	"worker paused at a bounded budget epoch before terminal facts" as const;
 
 export const DELEGATION_TASK_KINDS = ["implementation", "diagnosis"] as const;
 export type DelegationTaskKind = (typeof DELEGATION_TASK_KINDS)[number];
@@ -887,7 +889,8 @@ export function resumeDelegationTransaction(
 	const casError = validateCas(state, input);
 	if (casError) return { ok: false, error: casError };
 	if (state.status !== "RECOVERY_REQUIRED" || state.terminal_outcome !== null || state.committed_proof !== null
-		|| state.recovery_reason !== "worker runner failed before terminal facts") {
+		|| (state.recovery_reason !== "worker runner failed before terminal facts"
+			&& state.recovery_reason !== BUDGET_PAUSED_RECOVERY_REASON_V2)) {
 		return { ok: false, error: `cannot resume checkpointed delegation from ${state.status}` };
 	}
 	return { ok: true, state: nextState(state, input.now, { status: "RUNNING", recovery_reason: null }) };

@@ -71,6 +71,10 @@ import {
 import { validateWorkspaceGuard, type WorkspaceGuardRecord } from "./workspace-guard.ts";
 import { validateWorkerWriteJournalRecord, type WorkerWriteJournalRecord } from "./write-journal.ts";
 import {
+	validateWorkerBudgetPromotionV1,
+	type WorkerBudgetPromotionV1,
+} from "./worker-checkpoint.ts";
+import {
 	normalizePlanReference,
 	parsePlanReference,
 	type PlanReferenceV1,
@@ -169,6 +173,8 @@ export interface BuildDelegationCommittedArtifactsV2Input {
 	after: AfterFacts | DelegationWorkspaceAfterFactsV2;
 	changeSetLifecycle: Readonly<FinalizedDelegationChangeSetLifecycleV2>;
 	worker: LedgerWorkerFacts;
+	/** Required when a standard contract completed under its sole promoted extended profile. */
+	budgetPromotion?: Readonly<WorkerBudgetPromotionV1>;
 	reportText: string;
 	secrets?: readonly string[];
 	/** Required for every non-zero implementation generation written by the current runtime. */
@@ -801,10 +807,13 @@ function buildDelegationCommittedArtifactsUnchecked(
 		(outcome.task_kind === "diagnosis" && outcome.delta_hash !== null)) {
 		return fail("binding_conflict", "ChangeSet authority conflicts with the terminal outcome");
 	}
+	const promotedSpend = contract.budget_profile === "standard" && input.worker.spendProfile === "extended"
+		&& validateWorkerBudgetPromotionV1(input.budgetPromotion);
 	if (!validateWorkerFacts(input.worker) || input.worker.exitCode !== outcome.exit_code ||
 		input.worker.provider !== transaction.worker_identity.provider ||
 		input.worker.model !== transaction.worker_identity.model ||
-		input.worker.spendProfile !== contract.budget_profile ||
+		(input.worker.spendProfile !== contract.budget_profile && !promotedSpend) ||
+		(input.worker.spendProfile === contract.budget_profile && input.budgetPromotion !== undefined) ||
 		(input.worker.turns > 0) !== outcome.provider_success ||
 		input.worker.workerSuccess !== outcome.worker_success ||
 		input.worker.workerFailureCode !== outcome.worker_failure_code) {
@@ -970,6 +979,9 @@ function buildDelegationCommittedArtifactsUnchecked(
 			changed_paths: [...outcome.changed_paths],
 			write_journal: structuredClone(lifecycle.sealed_journal),
 			change_set: structuredClone(changeSet),
+			...(input.budgetPromotion === undefined ? {} : {
+				budget_promotion: structuredClone(input.budgetPromotion),
+			}),
 			...(commandProvenance === undefined ? {} : {
 				command_provenance: structuredClone(commandProvenance),
 			}),

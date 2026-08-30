@@ -7,6 +7,7 @@ import test, { type TestContext } from "node:test";
 import { promisify } from "node:util";
 
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
+import { canonicalHash } from "../extensions/workbench-runtime/cache/canonical-hash.ts";
 
 import {
 	bindDelegationBoundedTaskContractV2,
@@ -218,12 +219,13 @@ async function journalWorker(
 	paths: readonly string[],
 	result: WorkerRunResult,
 	outcome: "succeeded" | "failed" = "succeeded",
+	startingRevision = 0,
 ): Promise<WorkerRunResult> {
-	let revision = 0;
+	let revision = startingRevision;
 	let observation = EMPTY_WORKER_WRITE_JOURNAL_RUNTIME_OBSERVATION;
 	for (let index = 0; index < paths.length; index += 1) {
 		const path = paths[index]!;
-		const operationId = (index + 1).toString(16).padStart(64, "0");
+		const operationId = (startingRevision + index + 1).toString(16).padStart(64, "0");
 		const begun = await beginWriteJournalOperation({
 			project_root: projectRoot, delegation_id: delegationId, contract_hash: contractHash,
 			expected_revision: revision, operation_id: operationId, kind: "write", path,
@@ -920,7 +922,8 @@ test("execution v2: a cumulative hard turn boundary pauses without commit or sem
 	assert.equal(result.status, "PAUSED_BUDGET");
 	if (result.status !== "PAUSED_BUDGET") return;
 	assert.equal(result.worker_failure_code, "SPEND_TURN_LIMIT");
-	assert.equal(result.durable_state.status, "RUNNING");
+	assert.equal(result.durable_state.status, "RECOVERY_REQUIRED");
+	assert.equal(result.durable_state.recovery_reason, "worker paused at a bounded budget epoch before terminal facts");
 	assert.deepEqual(result.durable_state.postcondition_reasons, []);
 	assert.equal(result.durable_state.terminal_outcome, null);
 	assert.equal(result.checkpoint.machine_state, "PAUSED_BUDGET");
@@ -1080,6 +1083,103 @@ test("execution v2: a new process resumes the exact recovery transaction from it
 	assert.deepEqual(resumedCalls[0]!.initialSpendState, { turns: 32, totalTokens: 480, outputTokens: 64 });
 	assert.equal(resumed.result.usage.totalTokens, 640);
 	assert.deepEqual(resumed.after.changedSinceBefore, ["src/changed.ts"]);
+});
+
+test("execution v2: explicit paused-budget authorization promotes once without resetting cumulative spend", async (t) => {
+	const projectRoot = await root(t);
+	const delegationId = id(63);
+	const { contract_hash: _baseHash, ...baseContract } = contract("implementation");
+	const boundResult = bindDelegationBoundedTaskContractV2({ ...baseContract, allowed_paths: ["src/"] });
+	assert.equal(boundResult.ok, true);
+	if (!boundResult.ok) return;
+	const bound = boundResult.value;
+	const hard = worker("bounded epoch paused", {
+		turns: 64,
+		spendState: { turns: 64, totalTokens: 160, outputTokens: 40 },
+		spendBand: "hard",
+		spendReasons: ["turns"],
+		spendSoftReached: { turns: true, totalTokens: false, outputTokens: false },
+		spendHardExceeded: { turns: true, totalTokens: false, outputTokens: false },
+	});
+	const ticks = clock();
+	const paused = await executeDelegationV2({
+		projectRoot,
+		delegationId,
+		contract: bound,
+		workerIdentity: { ...WORKER_IDENTITY },
+		clock: ticks,
+		exec: realExec,
+		onPrepared: async (_state, _before, prepared) => {
+			const persisted = await persistDelegationResumeAuthorityV1({
+				project_root: projectRoot,
+				delegation_id: delegationId,
+				contract: bound,
+				prepared,
+			});
+			assert.equal(persisted.ok, true);
+		},
+		runWorker: async () => journalWorker(projectRoot, delegationId, bound.contract_hash, ["src/changed.ts"], hard),
+	});
+	assert.equal(paused.ok, true);
+	if (!paused.ok || paused.status !== "PAUSED_BUDGET") return;
+	assert.equal(paused.durable_state.status, "RECOVERY_REQUIRED");
+	const withoutHash = {
+		schema_version: 1 as const,
+		kind: "budget-continuation-authorization-v1" as const,
+		delegation_id: delegationId,
+		checkpoint_hash: paused.checkpoint.checkpoint_hash,
+		target_profile: "extended" as const,
+		prompt_hash: "8".repeat(64),
+	};
+	const budgetContinuation = { ...withoutHash, authority_hash: canonicalHash(withoutHash) };
+	const authority = await collectCheckpointResumeExecutionAuthorityV1({
+		project_root: projectRoot,
+		delegation_id: delegationId,
+		exec: realExec,
+		budget_continuation: budgetContinuation,
+	});
+	assert.equal(authority.ok, true, authority.ok ? "" : authority.code);
+	if (!authority.ok) return;
+	const calls: RunWorkerOptions[] = [];
+	const resumed = await executeDelegationV2({
+		projectRoot,
+		delegationId,
+		contract: bound,
+		workerIdentity: { ...WORKER_IDENTITY },
+		clock: ticks,
+		exec: realExec,
+		checkpointRecovery: authority.value,
+		runWorker: async (options) => {
+			calls.push(options);
+			assert.equal(options.initialWriteJournalObservation?.state, "complete");
+			assert.equal(options.initialWriteJournalObservation?.revision, 2);
+			return journalWorker(
+				projectRoot,
+				delegationId,
+				bound.contract_hash,
+				["src/changed.ts"],
+				worker(completeReport(["src/changed.ts"]), {
+					turns: 2,
+					spendProfile: "extended",
+					spendState: { turns: 66, totalTokens: 320, outputTokens: 80 },
+					spendBand: "soft",
+					spendReasons: ["turns"],
+					spendSoftReached: { turns: true, totalTokens: false, outputTokens: false },
+				}),
+				"succeeded",
+				options.initialWriteJournalObservation.revision,
+			);
+		},
+	});
+	assert.equal(resumed.ok, true, resumed.ok ? "" : JSON.stringify(resumed));
+	if (!resumed.ok || resumed.status === "PAUSED_BUDGET") return;
+	assert.equal(calls.length, 1);
+	assert.equal(calls[0]!.spendProfile, "extended");
+	assert.deepEqual(calls[0]!.initialSpendState, { turns: 64, totalTokens: 160, outputTokens: 40 });
+	assert.equal((calls[0]!.continuationCapsule as { budget_profile?: string }).budget_profile, "extended");
+	assert.equal(authority.value.checkpoint.cumulative_turns, 64, "prior cumulative telemetry remains durable");
+	assert.equal(resumed.result.turns, 66, "the committed worker summary remains cumulative");
+	assert.equal(resumed.result.usage.totalTokens, 320);
 });
 
 test("execution v2: unknown out-of-journal drift blocks automatic checkpoint continuation", async (t) => {

@@ -212,10 +212,20 @@ function gateFailure(code: string) {
 	return { ok: false as const, code };
 }
 
-function canonicalBudgetPause(dependencies: AutomaticDeliveryContinuationRuntimeControllerDependenciesV1): boolean {
+/**
+ * Checkpoint budget authority owns the whole turn.  The lifecycle refresh
+ * listener runs before this adapter and may replace PAUSED_BUDGET with the
+ * one-turn, user-authorized CONTINUE_CHECKPOINT action.  Treating only the
+ * pre-authorization snapshot as exclusive lets this older delivery scanner
+ * inject a second, conflicting status action after the exact resume action.
+ */
+function canonicalCheckpointContinuationOwnsTurn(
+	dependencies: AutomaticDeliveryContinuationRuntimeControllerDependenciesV1,
+): boolean {
 	try {
 		const snapshot = dependencies.getLifecycleActionSnapshot?.();
-		return snapshot?.action === "PAUSED_BUDGET" && snapshot.authorization === "USER_REQUIRED";
+		return snapshot?.action === "PAUSED_BUDGET" && snapshot.authorization === "USER_REQUIRED"
+			|| snapshot?.action === "CONTINUE_CHECKPOINT" && snapshot.authorization === "EXISTING";
 	} catch {
 		return false;
 	}
@@ -620,7 +630,7 @@ export function createAutomaticDeliveryContinuationRuntimeControllerV1(
 				return undefined;
 			});
 			dependencies.pi.on("before_agent_start", async (_event, ctx): Promise<BeforeAgentStartEventResult | undefined> => {
-				if (canonicalBudgetPause(dependencies)) {
+				if (canonicalCheckpointContinuationOwnsTurn(dependencies)) {
 					lifecycle.suppressPendingForCanonicalPause();
 					return undefined;
 				}
@@ -635,7 +645,7 @@ export function createAutomaticDeliveryContinuationRuntimeControllerV1(
 				};
 			});
 			dependencies.pi.on("agent_settled", async (_event, ctx) => {
-				if (canonicalBudgetPause(dependencies)) {
+				if (canonicalCheckpointContinuationOwnsTurn(dependencies)) {
 					lifecycle.suppressPendingForCanonicalPause();
 					return undefined;
 				}

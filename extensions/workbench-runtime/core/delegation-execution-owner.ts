@@ -17,11 +17,13 @@ import {
 	createNodeDelegationTransactionStorageAdapter,
 	persistAbortedDelegationTransaction,
 	persistRecoveryRequiredDelegationTransaction,
+	readDelegationWorkerCheckpointV1,
 	readDelegationTransactionV2,
 	type DelegationTransactionStorageAdapter,
 	type DelegationTransactionStorageOptions,
 } from "./delegation-transaction-storage.ts";
 import {
+	BUDGET_PAUSED_RECOVERY_REASON_V2,
 	DELEGATION_TRANSACTION_HASH_RE,
 	DELEGATION_TRANSACTION_ID_RE,
 	type DelegationTransactionRecord,
@@ -514,6 +516,12 @@ function checkpointRecoveryJournal(journal: WorkerWriteJournalRecord): boolean {
 		&& journal.meter.paths_completed === journal.meter.paths_attempted;
 }
 
+function pausedBudgetRecoveryJournal(journal: WorkerWriteJournalRecord): boolean {
+	return journal.state === "OPEN" && journal.journal_hash === null
+		&& journal.operations.every((operation) => operation.status === "completed")
+		&& journal.meter.paths_completed === journal.meter.paths_attempted;
+}
+
 /** Raw recovery kinds whose inherited bytes must be rebound exactly before retry. */
 export function strictRawRepairRequiresCurrentByteRebaseV1(
 	retryKind: StrictRetryableRawRepairEvidenceV1["retry_kind"],
@@ -593,13 +601,13 @@ export async function hasStrictReleasedRepairRecoveryEnvelopeV2(
 	return await safeRepairRecoveryInventory(projectRoot, transaction.delegation_id, adapterOf(options)) === "safe";
 }
 
-/** Strict retry authority for a lineaged rev2 recovery with zero worker IO. */
+/** Strict retry authority for a lineaged even-revision recovery with zero worker IO. */
 export async function isStrictRetryableEmptyRepairRecoveryV2(
 	projectRoot: string,
 	transaction: DelegationTransactionRecord,
 	options?: DelegationExecutionOwnerOptionsV2,
 ): Promise<boolean> {
-	if (transaction.status !== "RECOVERY_REQUIRED" || transaction.revision !== 2 ||
+	if (transaction.status !== "RECOVERY_REQUIRED" || transaction.revision < 2 || transaction.revision % 2 !== 0 ||
 		transaction.repair_lineage === undefined || transaction.committed_proof !== null ||
 		transaction.terminal_outcome !== null || transaction.review !== null || transaction.abort_reason !== null ||
 		transaction.postcondition_reasons.length !== 0 || transaction.recovery_reason === null ||
@@ -614,7 +622,7 @@ export async function isStrictRetryableEmptyRepairRecoveryV2(
 }
 
 /**
- * Strict retry authority for the post-worker rev2 crash window. The worker
+ * Strict retry authority for a post-worker even-revision crash window. The worker
  * journal is complete and sealed, but ChangeSet finalization never published
  * terminal facts. Current byte identity is deliberately checked by the
  * separate finalization-rebase reader before this evidence can launch work.
@@ -624,7 +632,7 @@ export async function isStrictRetryableFinalizationRepairRecoveryV2(
 	transaction: DelegationTransactionRecord,
 	options?: DelegationExecutionOwnerOptionsV2,
 ): Promise<boolean> {
-	if (transaction.status !== "RECOVERY_REQUIRED" || transaction.revision !== 2 ||
+	if (transaction.status !== "RECOVERY_REQUIRED" || transaction.revision < 2 || transaction.revision % 2 !== 0 ||
 		transaction.repair_lineage === undefined || transaction.committed_proof !== null ||
 		transaction.terminal_outcome !== null || transaction.review !== null || transaction.abort_reason !== null ||
 		transaction.postcondition_reasons.length !== 0 ||
@@ -654,14 +662,17 @@ export async function isStrictRetryableCheckpointRepairRecoveryV2(
 		transaction.committed_proof !== null ||
 		transaction.terminal_outcome !== null || transaction.review !== null || transaction.abort_reason !== null ||
 		transaction.postcondition_reasons.length !== 0 ||
-		transaction.recovery_reason !== RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed ||
+		(transaction.recovery_reason !== RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed
+			&& transaction.recovery_reason !== BUDGET_PAUSED_RECOVERY_REASON_V2) ||
 		!await hasStrictReleasedRepairRecoveryEnvelopeV2(projectRoot, transaction, options)) return false;
 	const journal = await readWorkerWriteJournal({
 		project_root: projectRoot,
 		delegation_id: transaction.delegation_id,
 		contract_hash: transaction.contract_hash,
 	});
-	return journal.ok && checkpointRecoveryJournal(journal.value);
+	return journal.ok && (transaction.recovery_reason === BUDGET_PAUSED_RECOVERY_REASON_V2
+		? pausedBudgetRecoveryJournal(journal.value)
+		: checkpointRecoveryJournal(journal.value));
 }
 
 /**
@@ -703,8 +714,10 @@ export async function readStrictRetryableRawRepairEvidenceV1(
 		}
 	} else if (!journal.ok || (retryKind === "EMPTY_RECOVERY"
 		? !emptyRecoveryJournal(journal.value)
-		: retryKind === "CHECKPOINT_RECOVERY"
-			? !checkpointRecoveryJournal(journal.value)
+			: retryKind === "CHECKPOINT_RECOVERY"
+				? !(transaction.recovery_reason === BUDGET_PAUSED_RECOVERY_REASON_V2
+					? pausedBudgetRecoveryJournal(journal.value)
+					: checkpointRecoveryJournal(journal.value))
 			: !finalizationRecoveryJournal(journal.value))) {
 		return { ok: false, code: !journal.ok && journal.error.code === "storage_failure" ? "STORAGE_FAILURE" : "NOT_RETRYABLE" };
 	}
@@ -729,12 +742,21 @@ export async function readStrictRetryableRawRepairEvidenceV1(
 			const expected = new Set(["transaction.json:file", "write-journal.json:file"]);
 			for (const entry of inventory) {
 				if (expected.has(entry)) continue;
-				if (retryKind === "CHECKPOINT_RECOVERY" && entry === "worker-checkpoint-v1.json:file") continue;
+				if ((retryKind === "CHECKPOINT_RECOVERY" || retryKind === "FINALIZATION_RECOVERY") &&
+					entry === "worker-checkpoint-v1.json:file") continue;
 				if (entry !== "generations:directory" || (await adapter.list(join(path, "generations"))).length !== 0) {
 					return { ok: false, code: "NOT_RETRYABLE" };
 				}
 			}
 			if (![...expected].every((entry) => inventory.includes(entry))) return { ok: false, code: "NOT_RETRYABLE" };
+			if (retryKind === "FINALIZATION_RECOVERY" && inventory.includes("worker-checkpoint-v1.json:file")) {
+				const checkpoint = await readDelegationWorkerCheckpointV1(projectRoot, transaction.delegation_id);
+				if (!checkpoint.ok || checkpoint.value === undefined || checkpoint.value.delegation_id !== transaction.delegation_id ||
+					checkpoint.value.contract_hash !== transaction.contract_hash) return {
+					ok: false,
+					code: checkpoint.ok || checkpoint.error.code !== "storage_failure" ? "NOT_RETRYABLE" : "STORAGE_FAILURE",
+				};
+			}
 		}
 	} catch {
 		return { ok: false, code: "STORAGE_FAILURE" };

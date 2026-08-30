@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { canonicalHash } from "../extensions/workbench-runtime/cache/canonical-hash.ts";
+import { bindDelegationBoundedTaskContractV2 } from "../extensions/workbench-runtime/core/delegation-transaction-artifacts.ts";
 
 import {
+	authorizedWorkerBudgetPromotionV1,
 	buildWorkerCheckpointV1,
 	remainingWorkerBudgetV1,
+	validateWorkerCheckpointBudgetContinuationV1,
 	validateWorkerCheckpointContinuationV1,
 	validateWorkerCheckpointV1,
 	workerCheckpointContinuationCapsuleV1,
@@ -17,9 +21,15 @@ import {
 	persistPreparedDelegationTransaction,
 	persistRunningDelegationTransaction,
 	publishDelegationWorkerCheckpointV1,
+	readDelegationTransactionV2,
 	readDelegationWorkerCheckpointV1,
 	type DelegationTransactionStorageFaultPoint,
 } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
+import {
+	preparePausedBudgetContinuationV1,
+	recoverDelegationContractFromSessionDirectoryV1,
+} from "../extensions/workbench-runtime/core/delegation-resume-authority.ts";
+import { createWorkerWriteJournal } from "../extensions/workbench-runtime/core/write-journal.ts";
 import { WORKER_MODEL_ID, WORKER_PROVIDER } from "../extensions/workbench-runtime/core/worker-policy.ts";
 
 const ID = "20260829-010000-LCO4";
@@ -137,6 +147,157 @@ test("WorkerCheckpointV1 is hash-bound, bounded, monotonic, and produces a trans
 	assert.equal(second.cumulative_turns > first.cumulative_turns, true);
 	assert.equal(second.cumulative_usage.totalTokens > first.cumulative_usage.totalTokens, true);
 	assert.equal(checkpoint(1, 64).machine_state, "PAUSED_BUDGET");
+});
+
+test("an authorized standard-to-extended promotion preserves cumulative enforcement", () => {
+	const paused = checkpoint(1, 64);
+	assert.equal(validateWorkerCheckpointBudgetContinuationV1(paused, {
+		delegation_id: ID,
+		contract_hash: CONTRACT,
+		checkpoint_hash: paused.checkpoint_hash,
+		before_binding_hash: BEFORE,
+		current_binding_hash: CURRENT,
+		allowed_paths: ["src/**"],
+	}), true);
+	const authorizationHash = "9".repeat(64);
+	const promotion = authorizedWorkerBudgetPromotionV1(paused, authorizationHash);
+	assert.ok(promotion);
+	const cumulative = usage(70);
+	const remaining = remainingWorkerBudgetV1(
+		"extended",
+		70,
+		cumulative.totalTokens,
+		cumulative.output,
+	);
+	assert.ok(remaining);
+	const { schema_version: _schema, kind: _kind, checkpoint_hash: _hash, ...base } = paused;
+	const built = buildWorkerCheckpointV1({
+		...base,
+		attempt: 2,
+		parent_checkpoint_hash: paused.checkpoint_hash,
+		cumulative_usage: cumulative,
+		cumulative_turns: 70,
+		budget_promotion: promotion,
+		remaining_budget: remaining,
+		machine_state: "CHECKPOINTED",
+		created_at: "2026-08-29T01:01:00.000Z",
+	});
+	assert.equal(built.ok, true);
+	if (!built.ok) return;
+	assert.equal(built.value.cumulative_turns, 70, "lifetime telemetry remains cumulative");
+	assert.equal(built.value.remaining_budget.turns, 26);
+	assert.equal(built.value.budget_promotion?.authorization_hash, authorizationHash);
+	assert.equal(authorizedWorkerBudgetPromotionV1(built.value, authorizationHash), undefined, "promotion is one-shot");
+});
+
+test("checkpoint storage advances a paused standard checkpoint only through an authorized promotion", async () => {
+	const root = await mkdtemp(join(tmpdir(), "lco-budget-promotion-"));
+	try {
+		const options = await runningProject(root);
+		const paused = checkpoint(1, 64);
+		assert.equal((await publishDelegationWorkerCheckpointV1(root, paused, options)).ok, true);
+		const promotion = authorizedWorkerBudgetPromotionV1(paused, "9".repeat(64));
+		assert.ok(promotion);
+		const cumulative = usage(65);
+		const remaining = remainingWorkerBudgetV1("extended", 65, cumulative.totalTokens, cumulative.output);
+		assert.ok(remaining);
+		const { schema_version: _schema, kind: _kind, checkpoint_hash: _hash, ...base } = paused;
+		const next = buildWorkerCheckpointV1({
+			...base,
+			attempt: 2,
+			parent_checkpoint_hash: paused.checkpoint_hash,
+			cumulative_usage: cumulative,
+			cumulative_turns: 65,
+			budget_promotion: promotion,
+			remaining_budget: remaining,
+			machine_state: "CHECKPOINTED",
+			created_at: "2026-08-29T01:01:00.000Z",
+		});
+		assert.equal(next.ok, true);
+		if (next.ok) assert.equal((await publishDelegationWorkerCheckpointV1(root, next.value, options)).ok, true);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("a legacy RUNNING budget pause migrates only under the exact checkpoint grant", async () => {
+	const root = await mkdtemp(join(tmpdir(), "lco-budget-migration-"));
+	try {
+		const options = await runningProject(root);
+		const paused = checkpoint(1, 64);
+		assert.equal((await publishDelegationWorkerCheckpointV1(root, paused, options)).ok, true);
+		assert.equal((await createWorkerWriteJournal({
+			project_root: root,
+			delegation_id: ID,
+			contract_hash: CONTRACT,
+		})).ok, true);
+		const withoutHash = {
+			schema_version: 1 as const,
+			kind: "budget-continuation-authorization-v1" as const,
+			delegation_id: ID,
+			checkpoint_hash: paused.checkpoint_hash,
+			target_profile: "extended" as const,
+			prompt_hash: "8".repeat(64),
+		};
+		const authorization = { ...withoutHash, authority_hash: canonicalHash(withoutHash) };
+		const migrated = await preparePausedBudgetContinuationV1({
+			project_root: root,
+			delegation_id: ID,
+			authorization,
+		});
+		assert.deepEqual(migrated, { ok: true });
+		const transaction = await readDelegationTransactionV2(root, ID);
+		assert.equal(transaction.ok, true);
+		if (transaction.ok) {
+			assert.equal(transaction.value.status, "RECOVERY_REQUIRED");
+			assert.equal(transaction.value.recovery_reason, "worker paused at a bounded budget epoch before terminal facts");
+		}
+		assert.deepEqual(await preparePausedBudgetContinuationV1({
+			project_root: root,
+			delegation_id: ID,
+			authorization: { ...authorization, checkpoint_hash: "7".repeat(64) },
+		}), { ok: false, code: "BUDGET_AUTHORIZATION_INVALID" }, "tampered authority hash is rejected before migration");
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
+});
+
+test("legacy recovery finds one exact contract in a bounded sibling session scan", async () => {
+	const root = await mkdtemp(join(tmpdir(), "lco-legacy-session-contract-"));
+	try {
+		const bound = bindDelegationBoundedTaskContractV2({
+			task_kind: "implementation",
+			task: "Complete the exact paused implementation slice.",
+			allowed_paths: ["src/**"],
+			acceptance_criteria: ["The bounded slice is complete."],
+			verification: [],
+			timeout_seconds: 600,
+			budget_profile: "standard",
+		});
+		assert.equal(bound.ok, true);
+		if (!bound.ok) return;
+		const { contract_hash: _contractHash, ...arguments_ } = bound.value;
+		await writeFile(join(root, "legacy.jsonl"), [
+			JSON.stringify({ type: "session", cwd: "/project" }),
+			JSON.stringify({
+				type: "message",
+				message: { role: "assistant", content: [{ type: "toolCall", name: "workbench_delegate_worker", arguments: arguments_ }] },
+			}),
+			JSON.stringify({ type: "message", message: { role: "toolResult", content: ID } }),
+		].join("\n") + "\n");
+		const recovered = await recoverDelegationContractFromSessionDirectoryV1(root, ID, {
+			contract_hash: bound.value.contract_hash,
+			task_kind: "implementation",
+			allowed_paths: ["src/**"],
+		});
+		assert.equal(recovered?.contract_hash, bound.value.contract_hash);
+		assert.deepEqual(recovered, bound.value);
+		assert.equal(await recoverDelegationContractFromSessionDirectoryV1(root, ID, {
+			contract_hash: "0".repeat(64), task_kind: "implementation", allowed_paths: ["src/**"],
+		}), undefined);
+	} finally {
+		await rm(root, { recursive: true, force: true });
+	}
 });
 
 async function runningProject(root: string, adapter = createNodeDelegationTransactionStorageAdapter()) {

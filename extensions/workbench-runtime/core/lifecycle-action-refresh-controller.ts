@@ -1,6 +1,11 @@
 /** Serialized durable lifecycle refresh used by UI and per-turn injection. */
 
 import type { ExecFn } from "./config.ts";
+import {
+	authorizePausedBudgetContinuationTurnV1,
+	type BudgetContinuationAuthorizationV1,
+} from "./budget-continuation-authorization.ts";
+import { lifecycleActionTurnMessageV2 } from "./agent-next-action.ts";
 import { isStrictRetryableCheckpointRepairRecoveryV2 } from "./delegation-execution-owner.ts";
 import {
 	appendLifecycleActionSnapshotIfChangedV2,
@@ -34,6 +39,17 @@ export interface LifecycleActionRefreshDependenciesV2 {
 
 export interface LifecycleActionRefreshControllerV2 {
 	refresh(projectRoot: string, stateOverride?: Readonly<DelegationState>): Promise<Readonly<LifecycleActionSnapshotV2> | undefined>;
+	refreshTurn(input: Readonly<{
+		enabled: boolean;
+		getProjectRoot: () => Promise<string>;
+		prompt: string;
+		getActiveTools: () => readonly string[];
+	}>): Promise<Readonly<{
+		message?: ReturnType<typeof lifecycleActionTurnMessageV2>;
+		budgetAuthorized: boolean;
+	}> | undefined>;
+	takeBudgetContinuationAuthorization(delegationId: string): Readonly<BudgetContinuationAuthorizationV1> | undefined;
+	clearBudgetContinuationAuthorization(): void;
 }
 
 /** Re-read authority for every queued refresh and publish in the same order. */
@@ -41,11 +57,17 @@ export function createLifecycleActionRefreshControllerV2(
 	dependencies: LifecycleActionRefreshDependenciesV2,
 ): LifecycleActionRefreshControllerV2 {
 	let tail: Promise<void> = Promise.resolve();
-	const refresh = (
+	let pendingBudgetContinuationAuthorization: Readonly<BudgetContinuationAuthorizationV1> | undefined;
+	const enqueueRefresh = (
 		projectRoot: string,
 		stateOverride?: Readonly<DelegationState>,
-	): Promise<Readonly<LifecycleActionSnapshotV2> | undefined> => {
+		prompt?: string,
+	): Promise<Readonly<{
+		snapshot?: Readonly<LifecycleActionSnapshotV2>;
+		budgetAuthorized: boolean;
+	}>> => {
 		const operation = tail.then(async () => {
+			if (prompt !== undefined) pendingBudgetContinuationAuthorization = undefined;
 			const state = stateOverride ?? dependencies.getDelegationState();
 			const status = await readDelegationRepairStatusV1(
 				projectRoot,
@@ -69,18 +91,61 @@ export function createLifecycleActionRefreshControllerV2(
 				resolution,
 				...(checkpoint === undefined ? {} : { checkpoint }),
 			});
-			if (!built.ok) return undefined;
+			if (!built.ok) return { budgetAuthorized: false };
+			const authorized = prompt === undefined
+				? undefined
+				: authorizePausedBudgetContinuationTurnV1(built.value, prompt, checkpoint);
+			const snapshot = authorized?.snapshot ?? built.value;
+			if (authorized !== undefined) pendingBudgetContinuationAuthorization = authorized.authorization;
 			const appended = appendLifecycleActionSnapshotIfChangedV2(
-				built.value,
+				snapshot,
 				dependencies.getLatestSnapshotHash(),
 				dependencies.appendEntry,
 			);
 			if (appended !== undefined) dependencies.setLatestSnapshotHash(appended.latest_snapshot_hash);
-			dependencies.publish(status, built.value);
-			return built.value;
+			dependencies.publish(status, snapshot);
+			return { snapshot, budgetAuthorized: authorized !== undefined };
 		});
 		tail = operation.then(() => undefined, () => undefined);
 		return operation;
 	};
-	return Object.freeze({ refresh });
+	const refresh = async (
+		projectRoot: string,
+		stateOverride?: Readonly<DelegationState>,
+	): Promise<Readonly<LifecycleActionSnapshotV2> | undefined> =>
+		(await enqueueRefresh(projectRoot, stateOverride)).snapshot;
+	const refreshTurn = async (input: Readonly<{
+		enabled: boolean;
+		getProjectRoot: () => Promise<string>;
+		prompt: string;
+		getActiveTools: () => readonly string[];
+	}>) => {
+		if (!input.enabled) return undefined;
+		try {
+			const result = await enqueueRefresh(await input.getProjectRoot(), undefined, input.prompt);
+			if (result.snapshot === undefined) return undefined;
+			return Object.freeze({
+				message: lifecycleActionTurnMessageV2(result.snapshot, input.getActiveTools()),
+				budgetAuthorized: result.budgetAuthorized,
+			});
+		} catch {
+			// Per-turn status/tool refresh remains fail-closed and non-disruptive.
+			return undefined;
+		}
+	};
+	const takeBudgetContinuationAuthorization = (delegationId: string) => {
+		if (pendingBudgetContinuationAuthorization?.delegation_id !== delegationId) return undefined;
+		const authorization = pendingBudgetContinuationAuthorization;
+		pendingBudgetContinuationAuthorization = undefined;
+		return authorization;
+	};
+	const clearBudgetContinuationAuthorization = (): void => {
+		pendingBudgetContinuationAuthorization = undefined;
+	};
+	return Object.freeze({
+		refresh,
+		refreshTurn,
+		takeBudgetContinuationAuthorization,
+		clearBudgetContinuationAuthorization,
+	});
 }

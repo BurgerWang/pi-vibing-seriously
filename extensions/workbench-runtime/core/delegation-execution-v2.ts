@@ -10,6 +10,7 @@
 import { isAbsolute, posix } from "node:path";
 
 import { canonicalHash } from "../cache/canonical-hash.ts";
+import { validateBudgetContinuationAuthorizationV1 } from "./budget-continuation-authorization.ts";
 
 import {
 	bindDelegationBoundedTaskContractV2,
@@ -63,6 +64,7 @@ import {
 	type DelegationExecutionOwnerOptionsV2,
 } from "./delegation-execution-owner.ts";
 import {
+	BUDGET_PAUSED_RECOVERY_REASON_V2,
 	DELEGATION_TRANSACTION_HASH_RE,
 	DELEGATION_TRANSACTION_ID_RE,
 	DELEGATION_TRANSACTION_WORKER_ID_RE,
@@ -103,11 +105,14 @@ import { collectReviewRelevanceV2 } from "./review-relevance-v2.ts";
 import { preflightSemanticReviewEnvelopeV1 } from "./diff-review.ts";
 import type { SemanticReviewEnvelopeV1 } from "./semantic-review-envelope.ts";
 import {
+	authorizedWorkerBudgetPromotionV1,
 	buildWorkerCheckpointV1,
 	remainingWorkerBudgetV1,
 	validateWorkerCheckpointContinuationV1,
+	workerCheckpointBudgetContinuationCapsuleV1,
 	workerCheckpointContinuationCapsuleV1,
 	validateWorkerCheckpointV1,
+	type WorkerBudgetPromotionV1,
 	type WorkerCheckpointV1,
 } from "./worker-checkpoint.ts";
 import { WORKBENCH_RUNTIME_BUILD_IDENTITY } from "./runtime-build-identity.ts";
@@ -598,9 +603,11 @@ function aggregateWorkerAttempts(
 		commandObservation = merged;
 	}
 	const denominator = usage.input + usage.cacheRead;
+	const spendState = latest.spendState;
 	return {
 		...latest,
-		turns: latest.spendState.turns,
+		turns: spendState.turns,
+		spendState,
 		usage,
 		cacheHitRatio: denominator > 0 ? usage.cacheRead / denominator : null,
 		deniedWriteCount,
@@ -693,6 +700,7 @@ async function buildDurableWorkerCheckpoint(
 	storageOptions: DelegationTransactionStorageOptions | undefined,
 	checkpointRuntimeIdentity = WORKBENCH_RUNTIME_BUILD_IDENTITY.source_hash,
 	inheritedRecipeRunIds: readonly string[] = [],
+	budgetPromotion?: Readonly<WorkerBudgetPromotionV1>,
 ): Promise<Readonly<WorkerCheckpointV1> | undefined> {
 	const journalRead = await readWorkerWriteJournal({
 		project_root: checked.projectRoot,
@@ -750,6 +758,7 @@ async function buildDurableWorkerCheckpoint(
 		completed_recipe_run_ids: completedRecipeRunIds,
 		cumulative_usage: structuredClone(worker.usage),
 		cumulative_turns: worker.spendState.turns,
+		...(budgetPromotion === undefined ? {} : { budget_promotion: structuredClone(budgetPromotion) }),
 		remaining_budget: remaining,
 		machine_state: machineState,
 		worker_advisory: worker.checkpointRequest?.advisory ?? { completed_criteria: [], remaining_criteria: [] },
@@ -766,11 +775,13 @@ function validCheckpointRecoveryInput(
 ): value is Readonly<CheckpointResumeExecutionAuthorityV1> {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const recovery = value as CheckpointResumeExecutionAuthorityV1;
+	const budgetContinuation = recovery.budget_continuation;
 	if (recovery.schema_version !== 1 || recovery.kind !== "checkpoint-resume-execution-authority-v1"
 		|| recovery.delegation_id !== checked.delegationId
 		|| recovery.contract.contract_hash !== checked.contract.contract_hash
 		|| canonicalHash(recovery.contract) !== canonicalHash(checked.contract)
 		|| recovery.transaction.status !== "RECOVERY_REQUIRED"
+		|| budgetContinuation !== undefined && recovery.transaction.recovery_reason !== BUDGET_PAUSED_RECOVERY_REASON_V2
 		|| recovery.transaction.delegation_id !== checked.delegationId
 		|| recovery.transaction.contract_hash !== checked.contract.contract_hash
 		|| recovery.transaction.worker_identity.provider !== checked.workerIdentity.provider
@@ -781,11 +792,21 @@ function validCheckpointRecoveryInput(
 		|| recovery.prepared.delegation_id !== checked.delegationId
 		|| recovery.prepared.contract_hash !== checked.contract.contract_hash
 		|| !validateWorkerCheckpointV1(recovery.checkpoint)
-		|| recovery.checkpoint.machine_state !== "CHECKPOINTED"
+		|| (budgetContinuation === undefined
+			? recovery.checkpoint.machine_state !== "CHECKPOINTED"
+			: recovery.checkpoint.machine_state !== "PAUSED_BUDGET"
+				|| !validateBudgetContinuationAuthorizationV1(budgetContinuation)
+				|| budgetContinuation.delegation_id !== checked.delegationId
+				|| budgetContinuation.checkpoint_hash !== recovery.checkpoint.checkpoint_hash
+				|| budgetContinuation.target_profile !== "extended"
+				|| recovery.checkpoint.remaining_budget.profile !== "standard"
+				|| recovery.checkpoint.budget_promotion !== undefined)
 		|| recovery.checkpoint.delegation_id !== checked.delegationId
 		|| recovery.checkpoint.contract_hash !== checked.contract.contract_hash
 		|| recovery.checkpoint.before_binding_hash !== recovery.prepared.before_guard.workspace_guard_hash
-		|| workerCheckpointContinuationCapsuleV1(recovery.checkpoint) === undefined) return false;
+		|| (budgetContinuation === undefined
+			? workerCheckpointContinuationCapsuleV1(recovery.checkpoint)
+			: workerCheckpointBudgetContinuationCapsuleV1(recovery.checkpoint)) === undefined) return false;
 	const { authority_hash: supplied, ...withoutHash } = recovery;
 	return typeof supplied === "string" && supplied === canonicalHash(withoutHash);
 }
@@ -963,15 +984,34 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 	let worker: WorkerRunResult | undefined;
 	const workerAttempts: WorkerRunResult[] = [];
 	let attempt = checkpointRecovery === undefined ? 1 : checkpointRecovery.checkpoint.attempt + 1;
+	const budgetContinuation = checkpointRecovery?.budget_continuation;
+	const authorizedPromotion = checkpointRecovery === undefined || budgetContinuation === undefined
+		? undefined
+		: authorizedWorkerBudgetPromotionV1(
+			checkpointRecovery.checkpoint,
+			budgetContinuation.authority_hash,
+		);
+	if (checkpointRecovery !== undefined && budgetContinuation !== undefined && authorizedPromotion === undefined) {
+		return failure("checkpoint_failed", checked, input, { durable_state: state });
+	}
+	const budgetPromotion = authorizedPromotion ?? checkpointRecovery?.checkpoint.budget_promotion;
+	const executionSpendProfile: WorkerSpendProfile = budgetContinuation !== undefined
+		? "extended"
+		: checkpointRecovery?.checkpoint.remaining_budget.profile ?? checked.contract.budget_profile as WorkerSpendProfile;
 	let initialSpendState: Readonly<{ turns: number; totalTokens: number; outputTokens: number }> | undefined =
-		checkpointRecovery === undefined ? undefined : {
-			turns: checkpointRecovery.checkpoint.cumulative_turns,
-			totalTokens: checkpointRecovery.checkpoint.cumulative_usage.totalTokens,
-			outputTokens: checkpointRecovery.checkpoint.cumulative_usage.output,
-		};
+		checkpointRecovery === undefined
+			? undefined
+			: {
+				turns: checkpointRecovery.checkpoint.cumulative_turns,
+				totalTokens: checkpointRecovery.checkpoint.cumulative_usage.totalTokens,
+				outputTokens: checkpointRecovery.checkpoint.cumulative_usage.output,
+			};
 	let continuationCapsule: Readonly<Record<string, unknown>> | undefined = checkpointRecovery === undefined
 		? undefined
-		: workerCheckpointContinuationCapsuleV1(checkpointRecovery.checkpoint);
+		: budgetContinuation === undefined
+			? workerCheckpointContinuationCapsuleV1(checkpointRecovery.checkpoint)
+			: workerCheckpointBudgetContinuationCapsuleV1(checkpointRecovery.checkpoint);
+	let initialWriteJournalObservation = baselineWriteObservation;
 	let parentCheckpointHash: string | null = checkpointRecovery?.checkpoint.checkpoint_hash ?? null;
 	const checkpointRuntimeIdentity = checkpointRecovery?.checkpoint.runtime_build_identity
 		?? WORKBENCH_RUNTIME_BUILD_IDENTITY.source_hash;
@@ -992,10 +1032,11 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 				timeoutMs: checked.contract.timeout_seconds * 1_000,
 				signal: input.signal,
 				onProgress: input.onProgress,
-				spendProfile: checked.contract.budget_profile as WorkerSpendProfile,
+				spendProfile: executionSpendProfile,
 				attempt,
 				...(initialSpendState === undefined ? {} : { initialSpendState }),
 				...(continuationCapsule === undefined ? {} : { continuationCapsule }),
+				...(initialWriteJournalObservation === undefined ? {} : { initialWriteJournalObservation }),
 			});
 		} catch (error) {
 			const preflightCode = workerRunnerPreflightFailureCode(error);
@@ -1036,13 +1077,20 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 			const checkpoint: Readonly<WorkerCheckpointV1> | undefined = checkpointAt === undefined ? undefined : await buildDurableWorkerCheckpoint(
 				checked, changeSetPrepared, aggregate, aggregate.commandEffectObservation, attempt,
 				parentCheckpointHash, "PAUSED_BUDGET", checkpointAt, input.exec, storageOptions,
-				checkpointRuntimeIdentity, inheritedRecipeRunIds,
+				checkpointRuntimeIdentity, inheritedRecipeRunIds, budgetPromotion,
 			);
 			if (checkpoint === undefined) {
 				state = await attemptRecovery(checked, state, input.clock, storageOptions,
 					RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed);
 				return failure("checkpoint_failed", checked, input, { durable_state: state });
 			}
+			state = await attemptRecovery(
+				checked,
+				state,
+				input.clock,
+				storageOptions,
+				BUDGET_PAUSED_RECOVERY_REASON_V2,
+			);
 			releaseIncompleteOwner = true;
 			return {
 				ok: true,
@@ -1064,7 +1112,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 			const checkpoint: Readonly<WorkerCheckpointV1> | undefined = checkpointAt === undefined ? undefined : await buildDurableWorkerCheckpoint(
 				checked, changeSetPrepared, aggregate, aggregate.commandEffectObservation, attempt,
 				parentCheckpointHash, "CHECKPOINTED", checkpointAt, input.exec, storageOptions,
-				checkpointRuntimeIdentity, inheritedRecipeRunIds,
+				checkpointRuntimeIdentity, inheritedRecipeRunIds, budgetPromotion,
 			);
 			if (checkpoint === undefined) {
 				state = await attemptRecovery(checked, state, input.clock, storageOptions,
@@ -1095,6 +1143,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 				outputTokens: checkpoint.cumulative_usage.output,
 			};
 			continuationCapsule = capsule;
+			initialWriteJournalObservation = aggregate.writeJournalObservation;
 			attempt += 1;
 			continue;
 		}
@@ -1270,6 +1319,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 			after,
 			changeSetLifecycle,
 			worker: ledgerWorker,
+			...(budgetPromotion === undefined ? {} : { budgetPromotion }),
 			reportText: worker.reportText,
 			secrets: checked.secrets,
 			...(reviewEnvelope === undefined ? {} : { reviewEnvelope }),
