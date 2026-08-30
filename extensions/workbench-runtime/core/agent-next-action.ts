@@ -79,7 +79,7 @@ export function delegationLifecycleActionTextV1(action: DelegationLifecyclePrima
 				? `call workbench_git action=quarantine_unreadable_authority delegation_id=${id}; source bytes and Git remain preserved`
 				: "select and quarantine the exact unreadable project authority; development and VERIFY remain fail-closed until then";
 		case "REBASE_CURRENT_BINDING":
-			return `retry the exact ${id} operation; Workbench will rebase the current binding under the writer lock`;
+			return `start a fresh bounded successor delegation for ${id}; the finalized immutable slice cannot be rebound in place`;
 		case "BLOCK_OVERLAPPING_PATHS":
 			return "resolve the overlapping or unknown path authority; ordinary delegation and VERIFY remain blocked for that scope";
 		case "RECLAIM_STALE_LOCK":

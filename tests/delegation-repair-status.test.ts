@@ -257,7 +257,7 @@ test("binding conflict and project-chain invalidity never advertise an executabl
 	assert.equal(conflict.kind, "repair_required");
 	const conflictAction = delegationNextActionTextV1(state, conflict) ?? "";
 	assert.doesNotMatch(conflictAction, /start the exact semantic repair/);
-	assert.match(conflictAction, /rebase the current binding under the writer lock/u);
+	assert.match(conflictAction, /start a fresh bounded successor delegation/u);
 	assert.equal(conflict.resolution?.primary_action.action, "REBASE_CURRENT_BINDING");
 	assert.doesNotMatch(conflictAction, /workbench_repair_delegation/u);
 	assert.equal(delegationExactRepairRouteLineV1(conflict), undefined);
@@ -394,7 +394,7 @@ test("lineaged terminal retry, active execution, and pending review have distinc
 		retryable: true,
 	});
 	assert.equal(staleFailed.resolution?.primary_action.action, "REBASE_CURRENT_BINDING");
-	assert.match(delegationNextActionTextV1(state, staleFailed) ?? "", /rebase the current binding under the writer lock/u);
+	assert.match(delegationNextActionTextV1(state, staleFailed) ?? "", /start a fresh bounded successor delegation/u);
 	assert.doesNotMatch(delegationRepairStatusLinesV1(staleFailed).join("\n"), /workbench_repair_delegation/u);
 
 	const active = classifyDelegationRepairStatusV1({

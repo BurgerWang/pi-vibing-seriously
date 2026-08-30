@@ -223,6 +223,36 @@ test("terminal repair rebase rejects clean, out-of-lineage and changed-HEAD work
 	});
 });
 
+test("terminal repair rebase ignores disjoint dirt but still binds only carried paths", async () => {
+	await withTempDir(async (root) => {
+		await initialize(root);
+		await writeFile(join(root, "src", "carried.ts"), "carried\n", "utf8");
+		const sealed = await collectWorkspaceGuard({ project_root: root, exec: spawnExec });
+		assert.equal(sealed.ok, true);
+		if (!sealed.ok) return;
+		await mkdir(join(root, "notes"), { recursive: true });
+		await writeFile(join(root, "notes", "unrelated.md"), "outside worker authority\n", "utf8");
+
+		const result = await collectTerminalRepairRebaseAuthorityV1({
+			projectRoot: root,
+			committed: committed(sealed.guard, ["src/carried.ts"]),
+			exec: spawnExec,
+		});
+		assert.equal(result.ok, true, result.ok ? "" : result.code);
+		if (!result.ok) return;
+		assert.deepEqual(result.value.relevant_paths, ["src/carried.ts"]);
+
+		await writeFile(join(root, "notes", "unrelated.md"), "changed again\n", "utf8");
+		const replay = await collectTerminalRepairRebaseAuthorityV1({
+			projectRoot: root,
+			committed: committed(sealed.guard, ["src/carried.ts"]),
+			exec: spawnExec,
+		});
+		assert.equal(replay.ok, true);
+		if (replay.ok) assert.equal(replay.value.rebase_hash, result.value.rebase_hash);
+	});
+});
+
 test("terminal repair rebase rejects unmerged status even on a carried path", async () => {
 	await withTempDir(async (root) => {
 		await initialize(root);

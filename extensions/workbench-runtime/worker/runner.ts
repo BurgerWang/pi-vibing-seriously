@@ -634,6 +634,9 @@ function childEnvironment(
 	initialSpendState: Readonly<WorkerSpendState>,
 ): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = { ...process.env };
+	// Keep Python reads/tests non-mutating from the first child process. This
+	// prevents interpreter cache artifacts from contaminating ChangeSet scope.
+	env.PYTHONDONTWRITEBYTECODE = "1";
 	// Parent-session identity/model facts must never masquerade as child facts.
 	for (const key of ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_PROVIDER", "PI_MODEL", "PI_REASONING_LEVEL"]) {
 		delete env[key];

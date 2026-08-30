@@ -24,6 +24,7 @@ import {
 	readDelegationReviewV2,
 	readDelegationTerminalNegativeSolAuthorityV1,
 } from "./delegation-transaction-storage.ts";
+import { collectTerminalRepairRebaseAuthorityV1 } from "./delegation-repair-rebase.ts";
 import { recoverExactRepairCommandAuthorityV1 } from "./exact-repair-authority.ts";
 import { recoverRawLineageExactRepairAuthorityV1 } from "./exact-repair-raw-lineage-authority.ts";
 import {
@@ -48,6 +49,7 @@ export interface DelegationRepairStatusReaderServicesV1 {
 	readCommittedGeneration?: typeof readDelegationCommittedGenerationV2;
 	readReview?: typeof readDelegationReviewV2;
 	readTerminalNegativeRepair?: typeof readDelegationTerminalNegativeSolAuthorityV1;
+	collectTerminalRebase?: typeof collectTerminalRepairRebaseAuthorityV1;
 }
 
 const DEFAULT_READER_SERVICES = Object.freeze({
@@ -58,6 +60,7 @@ const DEFAULT_READER_SERVICES = Object.freeze({
 	readCommittedGeneration: readDelegationCommittedGenerationV2,
 	readReview: readDelegationReviewV2,
 	readTerminalNegativeRepair: readDelegationTerminalNegativeSolAuthorityV1,
+	collectTerminalRebase: collectTerminalRepairRebaseAuthorityV1,
 }) satisfies DelegationRepairStatusReaderServicesV1;
 
 type V2Observation = Extract<DelegationAuthorityObservationV2, { kind: "v2" }>;
@@ -454,7 +457,20 @@ async function hasExecutableExactRepairAuthorityV1(input: {
 			repairOf: input.delegationId,
 			committed: committed.value,
 		});
-		return recovered.ok ? fromAuthority(recovered.value) : undefined;
+		if (!recovered.ok) return undefined;
+		if (recovered.value.authority_kind === "terminal-lineage") {
+			const binding = await input.services.collectBinding(input.projectRoot, input.delegationId, input.exec);
+			if (binding.status === "unavailable") return undefined;
+			if (binding.status !== "fresh") {
+				const rebased = await (input.services.collectTerminalRebase ?? collectTerminalRepairRebaseAuthorityV1)({
+					projectRoot: input.projectRoot,
+					committed: committed.value,
+					exec: input.exec,
+				});
+				if (!rebased.ok) return undefined;
+			}
+		}
+		return fromAuthority(recovered.value);
 	}
 	if (committed.error.code === "storage_failure") return undefined;
 	const recovered = await recoverRawLineageExactRepairAuthorityV1({

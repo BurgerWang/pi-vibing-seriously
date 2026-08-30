@@ -1068,7 +1068,7 @@ test("finalized v2 drift keeps the artifact immutable and remains STALE in memor
 		await persistCompact(stub, ctx);
 		const compact = latestCompact(stub);
 		assert.equal(compact.pendingDelegationReview, true, "in-memory compact mirror remains blocking");
-		assert.match(compact.nextDelegationAction ?? "", new RegExp(`retry the exact ${fixture.id} operation; Workbench will rebase the current binding under the writer lock`));
+		assert.match(compact.nextDelegationAction ?? "", new RegExp(`start a fresh bounded successor delegation for ${fixture.id}`));
 		assert.deepEqual(await readFile(join(root, strict.value.review_path)), artifactBytes);
 		const committed = await readDelegationCommittedGenerationV2(root, fixture.id);
 		assert.equal(committed.ok, true);
@@ -1081,7 +1081,7 @@ test("finalized v2 drift keeps the artifact immutable and remains STALE in memor
 		await persistCompact(stub, ctx);
 		const healedCompact = latestCompact(stub);
 		assert.equal(healedCompact.pendingDelegationReview, true);
-		assert.match(healedCompact.nextDelegationAction ?? "", new RegExp(`retry the exact ${fixture.id} operation; Workbench will rebase the current binding under the writer lock`));
+		assert.match(healedCompact.nextDelegationAction ?? "", new RegExp(`start a fresh bounded successor delegation for ${fixture.id}`));
 		assert.deepEqual(await readFile(join(root, strict.value.review_path)), artifactBytes, "mirror healing never rewrites finalized bytes");
 		const afterHeal = await readDelegationCommittedGenerationV2(root, fixture.id);
 		assert.equal(afterHeal.ok, true);

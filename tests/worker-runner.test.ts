@@ -334,13 +334,13 @@ test("worker system prompt pins the three mandatory execution disciplines (early
 
 test("runner pins xhigh model selector and passes a non-recursive worker role contract", async () => {
 	const script = `
-const facts = JSON.stringify({ argv: process.argv.slice(2), role: process.env.WORKBENCH_AGENT_ROLE, depth: process.env.WORKBENCH_WORKER_DEPTH, paths: JSON.parse(process.env.WORKBENCH_WORKER_ALLOWED_PATHS || "[]"), taskKind: process.env.${WORKER_TASK_KIND_ENV} || null, timeoutMs: process.env.${WORKER_TIMEOUT_MS_ENV} || null, inheritedModel: process.env.PI_MODEL || null, spendProfile: process.env.${WORKER_SPEND_PROFILE_ENV} || null });
+const facts = JSON.stringify({ argv: process.argv.slice(2), role: process.env.WORKBENCH_AGENT_ROLE, depth: process.env.WORKBENCH_WORKER_DEPTH, paths: JSON.parse(process.env.WORKBENCH_WORKER_ALLOWED_PATHS || "[]"), taskKind: process.env.${WORKER_TASK_KIND_ENV} || null, timeoutMs: process.env.${WORKER_TIMEOUT_MS_ENV} || null, inheritedModel: process.env.PI_MODEL || null, spendProfile: process.env.${WORKER_SPEND_PROFILE_ENV} || null, pythonBytecode: process.env.PYTHONDONTWRITEBYTECODE || null });
 console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "openai-codex", model: "gpt-5.6-luna", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
 `;
 	await withFakeWorker(script, async (invocation, dir) => {
 		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
 		assertWorkerSucceeded(result);
-		const facts = JSON.parse(result.output) as { argv: string[]; role: string; depth: string; paths: string[]; taskKind: string | null; timeoutMs: string | null; inheritedModel: string | null; spendProfile: string | null };
+		const facts = JSON.parse(result.output) as { argv: string[]; role: string; depth: string; paths: string[]; taskKind: string | null; timeoutMs: string | null; inheritedModel: string | null; spendProfile: string | null; pythonBytecode: string | null };
 		const modelFlag = facts.argv.indexOf("--model");
 		assert.ok(modelFlag >= 0);
 		assert.equal(facts.argv[modelFlag + 1], WORKER_MODEL_SELECTOR);
@@ -355,6 +355,7 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 		assert.ok(facts.argv[toolsFlag + 1]?.split(",").includes("write"));
 		assert.equal(facts.inheritedModel, null, "parent PI_MODEL must not masquerade as the child model");
 		assert.equal(facts.spendProfile, "standard", "the runner writes the bounded default into the fixed child env contract");
+		assert.equal(facts.pythonBytecode, "1", "worker verification cannot emit Python bytecode cache artifacts");
 		assert.equal(result.spendProfile, "standard");
 	});
 });

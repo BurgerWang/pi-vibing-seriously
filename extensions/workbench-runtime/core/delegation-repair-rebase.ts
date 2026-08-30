@@ -21,6 +21,7 @@ import {
 } from "./delegation-execution-owner.ts";
 import type { DelegationCommittedGenerationV2 } from "./delegation-transaction-storage.ts";
 import {
+	delegationPathAllowedV2,
 	parseDelegationRepairLineageV1,
 	type DelegationTransactionRecord,
 } from "./delegation-transaction.ts";
@@ -32,7 +33,9 @@ import {
 import { readWorkerWriteJournal } from "./write-journal.ts";
 import {
 	collectWorkspaceGuard,
+	computeWorkspaceGuardHash,
 	validateWorkspaceGuard,
+	type WorkspaceGuardEntry,
 	type WorkspaceGuardRecord,
 } from "./workspace-guard.ts";
 
@@ -115,6 +118,7 @@ function isUnmergedStatus(status: string): boolean {
 function projection(input: {
 	committed: DelegationCommittedGenerationV2;
 	guard: WorkspaceGuardRecord;
+	relevantEntries: readonly WorkspaceGuardEntry[];
 }): Omit<TerminalRepairRebaseAuthorityV1, "rebase_hash"> {
 	const lineage = input.committed.state.repair_lineage!;
 	return {
@@ -125,8 +129,8 @@ function projection(input: {
 		generation_content_hash: input.committed.proof.content_hash,
 		lineage_hash: lineage.lineage_hash,
 		git_head: input.guard.git_head!,
-		relevant_paths: input.guard.entries.map((entry) => entry.path).sort(byteCompare),
-		workspace_guard_hash: input.guard.workspace_guard_hash,
+		relevant_paths: input.relevantEntries.map((entry) => entry.path).sort(byteCompare),
+		workspace_guard_hash: computeWorkspaceGuardHash(input.guard.git_head, input.relevantEntries),
 	};
 }
 
@@ -152,11 +156,22 @@ export async function collectTerminalRepairRebaseAuthorityV1(input: {
 	if (current.guard.git_head !== sealedAfter.git_head) return { ok: false, code: "head_changed" };
 	if (current.guard.entries.length === 0) return { ok: false, code: "clean_workspace" };
 	const carried = new Set(lineage.carried_paths);
+	const relevantEntries: WorkspaceGuardEntry[] = [];
 	for (const entry of current.guard.entries) {
 		if (isUnmergedStatus(entry.status)) return { ok: false, code: "unmerged_path", path: entry.path };
-		if (!carried.has(entry.path)) return { ok: false, code: "path_outside_lineage", path: entry.path };
+		if (carried.has(entry.path)) {
+			relevantEntries.push(entry);
+			continue;
+		}
+		// Dirt outside the immutable worker write contract cannot have been
+		// produced by this repair and therefore must not poison its continuation.
+		// Unknown dirt inside the contract remains ambiguous and fail-closed.
+		if (delegationPathAllowedV2(entry.path, state.allowed_paths)) {
+			return { ok: false, code: "path_outside_lineage", path: entry.path };
+		}
 	}
-	const withoutHash = projection({ committed: input.committed, guard: current.guard });
+	if (relevantEntries.length === 0) return { ok: false, code: "clean_workspace" };
+	const withoutHash = projection({ committed: input.committed, guard: current.guard, relevantEntries });
 	return {
 		ok: true,
 		value: Object.freeze({ ...withoutHash, rebase_hash: canonicalHash(withoutHash) }),

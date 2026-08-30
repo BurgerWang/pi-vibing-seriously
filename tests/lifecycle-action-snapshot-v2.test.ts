@@ -10,6 +10,7 @@ import {
 	validateLifecycleActionSnapshotV2,
 	type DelegationLifecycleAttemptV1,
 	type DelegationLifecycleAuthorityHealthV1,
+	type DelegationLifecycleBindingV1,
 } from "../extensions/workbench-runtime/core/delegation-lifecycle-resolver.ts";
 import {
 	lifecycleActionSnapshotCommandV2,
@@ -21,12 +22,16 @@ import { buildWorkerCheckpointV1, remainingWorkerBudgetV1 } from "../extensions/
 const ID = "20260829-020000-LCO5";
 const HASH = "a".repeat(64);
 
-function resolution(attempt: DelegationLifecycleAttemptV1, health: DelegationLifecycleAuthorityHealthV1 = "VALID") {
+function resolution(
+	attempt: DelegationLifecycleAttemptV1,
+	health: DelegationLifecycleAuthorityHealthV1 = "VALID",
+	binding: DelegationLifecycleBindingV1 = "CURRENT",
+) {
 	const snapshot = delegationLifecycleSnapshotFromCompatibilityProjectionV1({
 		source_authority: { id: ID, revision: 1 },
 		authority_health: health,
 		authority_disposition: "INACTIVE",
-		binding: "CURRENT",
+		binding,
 		attempt,
 		target: { kind: "DELEGATION", id: ID },
 		recovery_rank: { unresolved_obligations: attempt === "NONE" ? 0 : 1, unresolved_attempts: attempt === "NONE" ? 0 : 1 },
@@ -99,6 +104,25 @@ test("status text, tool command, and active tools consume the same snapshot targ
 	const tools = computeActiveToolsForLifecycleSnapshotV2("DEV", DEV_TOOLS, review);
 	assert.equal(tools.includes("workbench_review_worker_diff"), true);
 	assert.equal(tools.includes("workbench_delegate_worker"), false);
+	assert.equal(tools.includes("edit"), false);
+});
+
+test("a stale finalized slice exposes the guarded fresh-successor lane instead of a status no-op", () => {
+	const built = buildLifecycleActionSnapshotV2({
+		project_root: "/project",
+		mode: "DEV",
+		resolution: resolution("AWAITING_REVIEW", "VALID", "REBASEABLE"),
+	});
+	assert.equal(built.ok, true);
+	if (!built.ok) return;
+	assert.equal(built.value.action, "START_DELEGATION");
+	assert.equal(built.value.tool, "workbench_delegate_worker");
+	assert.equal(built.value.arguments, null, "the successor contract must be freshly bounded from current work");
+	assert.equal(built.value.safe_automatic, false);
+	assert.equal(built.value.authorization, "EXISTING");
+	const tools = computeActiveToolsForLifecycleSnapshotV2("DEV", DEV_TOOLS, built.value);
+	assert.equal(tools.includes("workbench_delegate_worker"), true);
+	assert.equal(tools.includes("workbench_review_worker_diff"), false);
 	assert.equal(tools.includes("edit"), false);
 });
 

@@ -30,7 +30,7 @@ interface RuntimeTool {
 	): Promise<RuntimeResult>;
 }
 
-function statusTool(trustError?: string): RuntimeTool {
+function statusTool(trustError?: string, onRefresh?: () => void): RuntimeTool {
 	let tool: RuntimeTool | undefined;
 	registerDelegationStatusTool({
 		pi: {
@@ -40,6 +40,7 @@ function statusTool(trustError?: string): RuntimeTool {
 		projectRootFor: async () => "/project",
 		syncLease: () => {},
 		delegationStatusLines: async () => ({ lines: ["latest       : (no delegation)"], gitRefresh: "fresh" }),
+		refreshStatus: async () => { onRefresh?.(); },
 	});
 	assert.ok(tool);
 	return tool;
@@ -88,7 +89,9 @@ test("runtime doctor compares the immutable load snapshot with the current sourc
 });
 
 test("delegation status exposes the same stable build identity in text and structured details", async () => {
-	const result = await statusTool().execute("status", {}, undefined, undefined, context());
+	let refreshes = 0;
+	const result = await statusTool(undefined, () => { refreshes += 1; }).execute("status", {}, undefined, undefined, context());
+	assert.equal(refreshes, 1, "the status read refreshes the executable lifecycle tool surface in the same turn");
 	const text = textOf(result);
 	assert.match(text, new RegExp(`^extension build  : ${WORKBENCH_RUNTIME_BUILD_IDENTITY.build.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`, "m"));
 	assert.match(text, new RegExp(`^extension version: ${WORKBENCH_RUNTIME_BUILD_IDENTITY.version}$`, "m"));

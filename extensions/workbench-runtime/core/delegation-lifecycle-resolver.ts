@@ -656,11 +656,17 @@ function actionProjectionV2(resolution: Readonly<DelegationLifecycleResolutionV1
 				safe_automatic: false, authorization: "USER_REQUIRED", retryable: false };
 		case "QUARANTINE_CORRUPT_AUTHORITY":
 		case "REPORT_STORAGE_FAILURE":
-		case "REBASE_CURRENT_BINDING":
 		case "RECLAIM_STALE_LOCK":
 			return { action: "RECOVER_AUTHORITY", exact_target: action.exact_target.kind === "DELEGATION" ? { delegation_id: id } : {},
 				tool: "workbench_delegation_status", arguments: {}, safe_automatic: action.safe_automatic,
 				authorization: action.requires_user_authorization ? "USER_REQUIRED" : "EXISTING", retryable: true };
+		case "REBASE_CURRENT_BINDING":
+			// A finalized immutable slice cannot be rebound in place.  Expose the
+			// existing guarded successor lane so the commander can continue from
+			// the current workspace baseline instead of polling status forever.
+			return { action: "START_DELEGATION", exact_target: { delegation_id: id },
+				tool: "workbench_delegate_worker", arguments: null, safe_automatic: false,
+				authorization: "EXISTING", retryable: true };
 		default:
 			return assertNever(action.action);
 	}

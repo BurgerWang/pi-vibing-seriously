@@ -97,6 +97,8 @@ const BASE_RECIPES = [
 	"  - name: echo-env",
 	'    command: ["node", "-e", "console.log(process.env.ONLY_ME || process.env.NOT_DECLARED || \\"none\\")"]',
 	"    environment: [ONLY_ME]",
+	"  - name: python-import",
+	'    command: ["python3", "-c", "import sample_module"]',
 	"  - name: write-out",
 	'    command: ["node", "-e", "require(\\"fs\\").mkdirSync(\\"out\\", { recursive: true }); require(\\"fs\\").writeFileSync(\\"out/result.json\\", \\"{}\\")"]',
 	"    writes: [\"out/\"]",
@@ -617,6 +619,20 @@ test("only declared environment variables reach the process", async () => {
 				else process.env[key] = value;
 			}
 		}
+	});
+});
+
+test("recipe execution disables Python bytecode cache writes", async () => {
+	await withTempDir(async (dir) => {
+		await setupProject(dir);
+		await writeFile(join(dir, "sample_module.py"), "VALUE = 1\n", "utf8");
+		const result = await runRecipe({ projectRoot: dir, recipeName: "python-import", mode: "DEV", exec: spawnExec });
+		assert.equal(result.ok, true);
+		assert.equal((await readdir(dir)).includes("__pycache__"), false);
+		const environment = JSON.parse(await readFile(join(result.runDir!, "environment.json"), "utf8")) as {
+			environment: Record<string, string>;
+		};
+		assert.equal(environment.environment.PYTHONDONTWRITEBYTECODE, "1");
 	});
 });
 

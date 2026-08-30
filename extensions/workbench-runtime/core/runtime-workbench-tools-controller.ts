@@ -329,6 +329,7 @@ export function registerRuntimeWorkbenchToolsV1(
 		projectRootFor: controller.projectRootFor,
 		syncLease: controller.syncLease,
 		delegationStatusLines: controller.delegationStatusLines,
+		refreshStatus: controller.refreshStatus,
 	});
 	registerRecoveryTool({
 		pi: controller.pi,

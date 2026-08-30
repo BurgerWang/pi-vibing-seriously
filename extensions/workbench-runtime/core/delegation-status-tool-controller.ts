@@ -15,6 +15,7 @@ export interface DelegationStatusToolController {
 	projectRootFor(ctx: ExtensionContext): Promise<string>;
 	syncLease(): void;
 	delegationStatusLines(projectRoot: string): Promise<{ lines: string[]; gitRefresh: "fresh" | "unavailable" }>;
+	refreshStatus?(ctx: ExtensionContext): Promise<void>;
 }
 
 /** Register delegation_status at its fixed catalog position. */
@@ -35,6 +36,10 @@ export function registerDelegationStatusTool(controller: DelegationStatusToolCon
 			controller.syncLease();
 			const projectRoot = await controller.projectRootFor(ctx);
 			const status = await controller.delegationStatusLines(projectRoot);
+			// The read just refreshed the durable repair projection. Rebuild the
+			// action snapshot and active-tool surface in the same tool turn so the
+			// commander can execute the reported route immediately.
+			await controller.refreshStatus?.(ctx);
 			const contextRisk = delegationContextRiskLine(ctx.sessionManager.getEntries());
 			const lines = [...buildLines, ...status.lines];
 			if (contextRisk) lines.push(contextRisk);

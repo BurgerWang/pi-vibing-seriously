@@ -312,8 +312,10 @@ async function reuseCurrentOrdinaryFinalVerificationV1(input: {
 	};
 }
 
+const PYTHON_BYTECODE_ENV = "PYTHONDONTWRITEBYTECODE" as const;
+
 function buildEnvironment(recipe: Recipe): Record<string, string> {
-	const env: Record<string, string> = { PATH: process.env.PATH ?? "" };
+	const env: Record<string, string> = { PATH: process.env.PATH ?? "", [PYTHON_BYTECODE_ENV]: "1" };
 	for (const name of recipe.environment) {
 		const value = process.env[name];
 		if (value !== undefined) env[name] = value;
@@ -712,7 +714,14 @@ export async function runRecipe(input: RunRecipeInput): Promise<RunRecipeResult>
 				after_exact_output_evidence: commandEffectStarted.before_exact_output_evidence,
 			}));
 		}
-		result = await exec(argv[0] ?? "", argv.slice(1), {
+		// Pi's exec surface intentionally has no arbitrary env option. Use the
+		// POSIX env launcher for this one deterministic runtime setting so Python
+		// verification cannot create __pycache__ dirt that is later mistaken for
+		// worker-owned source drift.
+		const environmentArguments = Object.entries(env)
+			.sort(([left], [right]) => Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8")))
+			.map(([name, value]) => `${name}=${value}`);
+		result = await exec("env", ["-i", ...environmentArguments, argv[0] ?? "", ...argv.slice(1)], {
 			cwd,
 			timeout: recipe.timeout_ms,
 			signal: input.signal,

@@ -252,6 +252,7 @@ interface CommittedOptions {
 	dependencyPaths?: readonly string[];
 	commandPath?: string;
 	commandPathWasWorkspaceDrift?: boolean;
+	workspaceDriftPaths?: readonly string[];
 	legacyCleanRunFailure?: boolean;
 	withLineage?: boolean;
 	legacyOutcome?: boolean;
@@ -268,7 +269,10 @@ function committed(options: CommittedOptions = {}): DelegationCommittedGeneratio
 		stateContractHash,
 		options.workerPaths ?? ["src/worker.ts"],
 		options.dependencyPaths ?? ["src/dependency.ts"],
-		options.commandPathWasWorkspaceDrift && options.commandPath !== undefined ? [options.commandPath] : [],
+		sorted([
+			...(options.workspaceDriftPaths ?? []),
+			...(options.commandPathWasWorkspaceDrift && options.commandPath !== undefined ? [options.commandPath] : []),
+		]),
 	);
 	const command = options.commandPath === undefined
 		? undefined
@@ -307,7 +311,7 @@ function committed(options: CommittedOptions = {}): DelegationCommittedGeneratio
 		report_complete: true,
 		terminal_facts_complete: true,
 		scope_complete: true,
-		change_set_status: command?.effective_status ?? "ATTRIBUTED" as const,
+		change_set_status: command?.effective_status ?? change.status,
 		changed_paths: [...effectivePaths],
 		successful_write_count: change.worker_delta.length,
 		denied_write_count: 0,
@@ -325,7 +329,7 @@ function committed(options: CommittedOptions = {}): DelegationCommittedGeneratio
 		revision: 3,
 		created_at: NOW,
 		updated_at: NOW,
-		postcondition_reasons: options.legacyCleanRunFailure
+		postcondition_reasons: options.legacyCleanRunFailure || change.status === "WORKSPACE_DRIFT"
 			? ["WORKSPACE_DRIFT_DETECTED" as const]
 			: ["WORKER_RUN_FAILED" as const],
 		terminal_outcome: outcome,
@@ -425,6 +429,21 @@ test("lineaged recovery accepts base drift fully attributed by durable command p
 			"src/dependency.ts", "src/generated.ts", "src/root.ts", "src/worker.ts",
 		]);
 	}
+});
+
+test("lineaged terminal recovery preserves worker scope when unrelated workspace drift is present", () => {
+	const source = committed({ workspaceDriftPaths: ["notes/unrelated.md"] });
+	const scope = source.records["scope.json"] as { change_set: ChangeSetRecord };
+	assert.equal(scope.change_set.status, "WORKSPACE_DRIFT");
+	assert.deepEqual(scope.change_set.workspace_drift.map((entry) => entry.path), ["notes/unrelated.md"]);
+
+	const recovered = recoverExactRepairCommandAuthorityV1({ repairOf: ID, committed: source });
+	assert.equal(recovered.ok, true, recovered.ok ? "" : recovered.code);
+	if (!recovered.ok) return;
+	assert.equal(recovered.value.authority_kind, "terminal-lineage");
+	assert.deepEqual(recovered.value.successor_lineage.carried_paths, [
+		"src/dependency.ts", "src/root.ts", "src/worker.ts",
+	], "unrelated drift remains outside inherited worker authority");
 });
 
 test("lineaged recovery accepts only the legacy CLEAN command-failure shape as attributed scope", () => {

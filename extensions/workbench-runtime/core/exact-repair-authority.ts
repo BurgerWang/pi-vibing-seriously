@@ -241,6 +241,9 @@ function strictCommittedRepairScopeV1(
 	const effectiveHash = commandProvenance?.effective_delta_hash ?? changeSet.worker_delta_hash;
 	const terminalNegativeCompatibility = allowTerminalNegativeCompatibility
 		&& isDelegationTerminalNegativeReviewEligibleFromCommittedV1(state, committed.records);
+	const terminalLineageWorkspaceRebase = state.repair_lineage !== undefined
+		&& (state.status === "FAILED" || state.status === "RECOVERY_REQUIRED")
+		&& effectiveStatus === "WORKSPACE_DRIFT";
 	const scopeChangedPaths = scope.changed_paths;
 	const scopeAllowedPaths = scope.allowed_paths;
 	const outcome = state.terminal_outcome;
@@ -249,7 +252,7 @@ function strictCommittedRepairScopeV1(
 		!Array.isArray(scopeAllowedPaths) || !scopeAllowedPaths.every((path): path is string => typeof path === "string") ||
 		!sameStrings(scopeChangedPaths, effectivePaths) || !sameStrings(scopeAllowedPaths, state.allowed_paths) ||
 		!sameStrings(outcome.changed_paths, effectivePaths) || outcome.change_set_status !== effectiveStatus ||
-		(!terminalNegativeCompatibility && (commandProvenance === undefined
+		(!terminalNegativeCompatibility && !terminalLineageWorkspaceRebase && (commandProvenance === undefined
 			? effectiveStatus !== "ATTRIBUTED"
 			: !isDelegationCommandScopeAttributedV1(commandProvenance, changeSet))) ||
 		outcome.delta_hash !== effectiveHash ||
