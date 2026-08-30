@@ -466,7 +466,7 @@ export function buildArgv(recipe: Recipe, params: Readonly<Record<string, unknow
 
 	const argv: string[] = [];
 	for (const part of recipe.command) {
-		const expanded = part.replace(PLACEHOLDER_RE, (match, rawName: string) => {
+		const expanded = part.replace(PLACEHOLDER_RE, (_match, rawName: string) => {
 			const param = declared.get(rawName);
 			if (!param) {
 				throw new RecipeParamError(

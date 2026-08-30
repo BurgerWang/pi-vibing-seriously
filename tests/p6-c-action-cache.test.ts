@@ -959,7 +959,7 @@ test("store: a post-execution persistence failure releases the live cache lock",
 		const base = fakeExec();
 		const exec = (async (command: string, args: string[], options?: Parameters<ExecFn>[2]) => {
 			const result = await base(command, args, options);
-			if (command === "hello-cli") {
+			if (command === "env" && args.includes("hello-cli")) {
 				const runsRoot = join(root, CONFIG, "workbench", "runs");
 				const staging = (await readdir(runsRoot)).find((name) => name.includes(".staging-"));
 				assert.ok(staging, "the run transaction staging directory exists during execution");

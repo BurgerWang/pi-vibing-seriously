@@ -450,7 +450,6 @@ function validGitFacts(value: unknown, after: boolean): value is DelegationWorks
 		typeof value.diffHash !== "string" || !DELEGATION_TRANSACTION_HASH_RE.test(value.diffHash) ||
 		(value.gitHead !== null && (typeof value.gitHead !== "string" || !/^[a-f0-9]{40,64}$/.test(value.gitHead))) ||
 		!validSortedUniquePaths(value.changedPaths) || !isRecord(value.pathStatuses) || !isRecord(value.pathDigests)) return false;
-	const changed = value.changedPaths as string[];
 	if (!Object.values(value.pathStatuses).every((status) => typeof status === "string" && status.length > 0 && status.length <= 4)) return false;
 	const digestPaths = Object.keys(value.pathDigests).sort();
 	if (!digestPaths.every(isStrictRelativePath) ||

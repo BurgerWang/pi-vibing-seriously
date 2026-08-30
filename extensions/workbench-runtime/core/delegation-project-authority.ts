@@ -22,7 +22,6 @@ import {
 	type DelegationState,
 } from "./delegation-state.ts";
 import {
-	hasDelegationSemanticRepairAuthorityV2,
 	hasDelegationSemanticReviewAuthorityV2,
 	isDelegationTerminalNegativeReviewEligibleFromCommittedV1,
 	readDelegationCommittedGenerationV2,
@@ -483,10 +482,6 @@ function pathSubset(left: readonly string[], right: readonly string[]): boolean 
 function exactByteSortedUnion(...groups: readonly (readonly string[])[]): string[] {
 	return [...new Set(groups.flat())].sort((left, right) =>
 		Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8")));
-}
-
-function sameStrings(left: readonly string[], right: readonly string[]): boolean {
-	return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
 async function strictLineageChangeSet(

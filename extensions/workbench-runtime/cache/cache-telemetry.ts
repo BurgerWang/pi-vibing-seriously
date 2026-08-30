@@ -53,7 +53,6 @@ import {
 	systemPromptHash,
 	wholeItemLcpFacts,
 	type PayloadSummary,
-	type ToolFingerprint,
 	type ToolInfoLike,
 } from "./prompt-fingerprint.ts";
 import {

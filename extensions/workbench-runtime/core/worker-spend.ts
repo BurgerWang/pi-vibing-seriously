@@ -338,8 +338,9 @@ export function formatWorkerSpendSteerText(state: unknown, profile: WorkerSpendP
 	const s = normalizeWorkerSpendState(state);
 	const profileName = resolveWorkerSpendProfile(profile);
 	const limits = limitsFor(profileName);
+	const flags = workerSpendDimensionFlags(s, profileName);
 	const softReasons = WORKER_SPEND_REASON_ORDER.filter(
-		(reason) => workerSpendDimensionFlags(s, profileName).soft[dimensionKey(reason)],
+		(reason) => flags.soft[dimensionKey(reason)],
 	);
 	const facts =
 		softReasons.length > 0

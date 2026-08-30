@@ -1909,19 +1909,6 @@ function sliceProjection(
 	return projectContextHistory({ ...input, messages, maxToolTextBytes, maxBundles });
 }
 
-function emptyProjection(): ProjectContextHistoryResult {
-	return {
-		messages: [],
-		facts: {
-			originalToolTextBytes: 0,
-			finalToolTextBytes: 0,
-			collapsedResults: 0,
-			removedBundles: 0,
-			protectedLatestBundles: 0,
-		},
-	};
-}
-
 function projectionMatches(
 	projection: ProjectContextHistoryResult,
 	hash: string,

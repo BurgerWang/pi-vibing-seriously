@@ -2,7 +2,7 @@
 
 import { createHash } from "node:crypto";
 import { copyFile, lstat, mkdir, open, readFile, realpath, writeFile } from "node:fs/promises";
-import { basename, dirname, join, relative, sep } from "node:path";
+import { basename, dirname, join, sep } from "node:path";
 import { globSync } from "node:fs";
 
 import { realpathContained } from "./path-guard.ts";

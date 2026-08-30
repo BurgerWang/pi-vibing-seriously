@@ -58,10 +58,7 @@ import {
 	workerContextRatio,
 	workerContextTokens,
 } from "../core/worker-budget.ts";
-import {
-	OUTPUT_CONTROL_TELEMETRY_ENTRY_TYPE,
-	parseOutputControlTelemetryEntry,
-} from "../core/output-control-telemetry.ts";
+import { parseOutputControlTelemetryEntry } from "../core/output-control-telemetry.ts";
 import {
 	EMPTY_WORKER_WRITE_JOURNAL_RUNTIME_OBSERVATION,
 	observeWorkerWriteJournalRuntimeEntry,

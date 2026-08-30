@@ -37,7 +37,6 @@ import {
 	DEVELOPMENT_FIRST_SOL_DEV_ALLOWLIST,
 	defaultWritePolicy,
 	detectActorRole,
-	STRICT_SOL_DEV_ALLOWLIST,
 } from "./write-authority.ts";
 import { validateLifecycleActionSnapshotV2, type LifecycleActionSnapshotV2 } from "./delegation-lifecycle-resolver.ts";
 

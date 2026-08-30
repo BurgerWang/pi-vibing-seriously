@@ -308,10 +308,6 @@ function operationIsCompleted(value: unknown): value is WorkerWriteJournalRecord
 		&& (value.outcome === "succeeded" || value.outcome === "failed");
 }
 
-function safeNonNegative(value: unknown): value is number {
-	return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-}
-
 function validOpenJournal(
 	value: unknown,
 	identity: { delegation_id: string; contract_hash: string },

@@ -24,7 +24,6 @@ import {
 } from "./delegation-transaction-storage.ts";
 import {
 	BUDGET_PAUSED_RECOVERY_REASON_V2,
-	DELEGATION_TRANSACTION_HASH_RE,
 	DELEGATION_TRANSACTION_ID_RE,
 	type DelegationTransactionRecord,
 	type DelegationWorkerIdentity,

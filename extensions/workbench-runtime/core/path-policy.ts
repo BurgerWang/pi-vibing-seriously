@@ -47,8 +47,6 @@ const EXACT_NAMES: readonly string[] = [
 
 const PREFIX_NAMES: readonly string[] = ["credentials.", "secrets.", "exchange-keys."];
 
-const SUFFIX_NAMES: readonly string[] = [".pem", ".key", ".token", ".p8", ".p12", ".pfx", ".jks"];
-
 /** .env.* variants that are safe to read/write (documented allowlist). */
 const ENV_DOT_ALLOWLIST = new Set([".env.example", ".env.template"]);
 

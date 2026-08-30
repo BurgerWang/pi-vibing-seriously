@@ -18,7 +18,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { copyFile, lstat, mkdir, readFile, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdir, writeFile } from "node:fs/promises";
 import { globSync } from "node:fs";
 import { basename, join, matchesGlob, relative } from "node:path";
 import { isDeepStrictEqual } from "node:util";
@@ -1046,7 +1046,7 @@ class JsonArtifactError extends Error {
 	}
 }
 
-async function resolveJsonFile(ctx: CheckContext, check: GateCheck, file: string, label: string): Promise<{ path: string; value: unknown }> {
+async function resolveJsonFile(ctx: CheckContext, file: string, label: string): Promise<{ path: string; value: unknown }> {
 	const absolute = await assertPathContained(ctx.effectiveProjectRoot, file, label);
 	const read = await readJsonFileBounded(absolute, GATE_JSON_ARTIFACT_MAX_BYTES, ctx.jsonFileReadHooks);
 	if (!read.ok) {
@@ -1448,7 +1448,7 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 				const file = check.json_file as string;
 				let resolved: { path: string; value: unknown };
 				try {
-					resolved = await resolveJsonFile(ctx, check, file, label);
+					resolved = await resolveJsonFile(ctx, file, label);
 				} catch (error) {
 					if (error instanceof GateSetupError) throw error;
 					const missing = error instanceof JsonArtifactError && error.missing;
@@ -1493,7 +1493,7 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 				const file = check.json_file as string;
 				let resolved: { path: string; value: unknown };
 				try {
-					resolved = await resolveJsonFile(ctx, check, file, label);
+					resolved = await resolveJsonFile(ctx, file, label);
 				} catch (error) {
 					if (error instanceof GateSetupError) throw error;
 					const missing = error instanceof JsonArtifactError && error.missing;
@@ -1598,7 +1598,7 @@ async function evaluateCheck(gateId: string, check: GateCheck, ctx: CheckContext
 				}
 				let resolved: { path: string; value: unknown };
 				try {
-					resolved = await resolveJsonFile(ctx, check, file, label);
+					resolved = await resolveJsonFile(ctx, file, label);
 				} catch (error) {
 					if (error instanceof GateSetupError) throw error;
 					const missing = error instanceof JsonArtifactError && error.missing;

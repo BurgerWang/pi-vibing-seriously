@@ -57,7 +57,6 @@ export function createLifecycleActionRefreshControllerV2(
 	const enqueueRefresh = (
 		projectRoot: string,
 		stateOverride?: Readonly<DelegationState>,
-		prompt?: string,
 	): Promise<Readonly<{
 		snapshot?: Readonly<LifecycleActionSnapshotV2>;
 		budgetAuthorized: boolean;
@@ -115,7 +114,7 @@ export function createLifecycleActionRefreshControllerV2(
 	}>) => {
 		if (!input.enabled) return undefined;
 		try {
-			const result = await enqueueRefresh(await input.getProjectRoot(), undefined, input.prompt);
+			const result = await enqueueRefresh(await input.getProjectRoot());
 			if (result.snapshot === undefined) return undefined;
 			return Object.freeze({
 				message: lifecycleActionTurnMessageV2(result.snapshot, input.getActiveTools()),

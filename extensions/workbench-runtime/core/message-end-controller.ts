@@ -285,14 +285,15 @@ export function registerMessageEndController(controller: MessageEndController): 
 			if (worker.role === "worker") {
 				try {
 					workerSpendState = addWorkerSpendUsage(workerSpendState, message.usage);
-					if (!workerSpendSoftSteerSent && workerSpendBand(workerSpendState, worker.spendProfile) !== "ok") {
+					const spendBand = workerSpendBand(workerSpendState, worker.spendProfile);
+					if (!workerSpendSoftSteerSent && spendBand !== "ok") {
 						controller.pi.sendMessage({
 							customType: WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE,
 							content: formatWorkerSpendSteerText(workerSpendState, worker.spendProfile),
 							display: false,
 							details: {
 								profile: worker.spendProfile,
-								band: workerSpendBand(workerSpendState, worker.spendProfile),
+								band: spendBand,
 								reasons: workerSpendReasons(workerSpendState, worker.spendProfile),
 								turns: workerSpendState.turns,
 								total_tokens: workerSpendState.totalTokens,

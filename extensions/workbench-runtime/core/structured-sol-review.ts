@@ -569,11 +569,6 @@ function sha256Text(value: string): string {
 	return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-function cloneFrozen<T>(value: T): Readonly<T> {
-	const clone = structuredClone(value);
-	return deepFreeze(clone);
-}
-
 function deepFreeze<T>(value: T): Readonly<T> {
 	if (value !== null && typeof value === "object") {
 		for (const child of Object.values(value as Record<string, unknown>)) deepFreeze(child);

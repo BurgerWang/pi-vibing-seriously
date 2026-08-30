@@ -127,7 +127,6 @@ import { collectWorkspaceGuard, type WorkspaceGuardEntry, type WorkspaceGuardRec
 import {
 	computeWorkerWriteJournalHash,
 	readWorkerWriteJournal,
-	type WorkerWriteJournalRecord,
 } from "./write-journal.ts";
 import {
 	readStrictBoundCommandEffectReceipt,

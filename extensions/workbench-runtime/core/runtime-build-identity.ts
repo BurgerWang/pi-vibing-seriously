@@ -1,6 +1,6 @@
 /** Stable, load-time identity for one workbench extension runtime instance. */
 
-import { createHash } from "node:crypto";
+import { createHash, type Hash } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
 import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,6 +23,11 @@ interface RuntimeSourceFile {
 	bytes: Buffer;
 }
 
+interface RuntimeSourcePath {
+	path: string;
+	absolutePath: string;
+}
+
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const RUNTIME_ROOT = dirname(MODULE_DIR);
 const HASH_DOMAIN = "pi-dev-workbench/workbench-runtime/source/v1\0";
@@ -35,37 +40,57 @@ function canonicalRelativePath(path: string): string {
 	return relative(RUNTIME_ROOT, path).split(sep).join("/");
 }
 
-function collectRuntimeSources(directory = RUNTIME_ROOT): RuntimeSourceFile[] {
-	const files: RuntimeSourceFile[] = [];
+function collectRuntimeSourcePaths(directory = RUNTIME_ROOT): RuntimeSourcePath[] {
+	const files: RuntimeSourcePath[] = [];
 	const entries = readdirSync(directory, { withFileTypes: true })
 		.sort((left, right) => compareUtf8(left.name, right.name));
 	for (const entry of entries) {
 		const path = join(directory, entry.name);
-		if (entry.isDirectory()) files.push(...collectRuntimeSources(path));
+		if (entry.isDirectory()) files.push(...collectRuntimeSourcePaths(path));
 		else if (entry.isFile() && entry.name.endsWith(".ts")) {
-			files.push({ path: canonicalRelativePath(path), bytes: readFileSync(path) });
+			files.push({ path: canonicalRelativePath(path), absolutePath: path });
 		}
 	}
 	return files;
+}
+
+function updateRuntimeSourceHash(hash: Hash, path: string, bytes: Buffer): void {
+	hash.update(path, "utf8");
+	hash.update("\0", "utf8");
+	hash.update(String(bytes.byteLength), "utf8");
+	hash.update("\0", "utf8");
+	hash.update(bytes);
+	hash.update("\0", "utf8");
 }
 
 /** Hash canonical relative paths and exact bytes; absolute checkout paths never enter the identity. */
 export function hashWorkbenchRuntimeSourcesV1(sources: readonly RuntimeSourceFile[]): string {
 	const hash = createHash("sha256");
 	hash.update(HASH_DOMAIN, "utf8");
-	for (const source of [...sources].sort((left, right) => compareUtf8(left.path, right.path))) {
-		hash.update(source.path, "utf8");
-		hash.update("\0", "utf8");
-		hash.update(String(source.bytes.byteLength), "utf8");
-		hash.update("\0", "utf8");
-		hash.update(source.bytes);
-		hash.update("\0", "utf8");
+	const sorted = sources
+		.map((source) => ({ source, pathBytes: Buffer.from(source.path, "utf8") }))
+		.sort((left, right) => left.pathBytes.compare(right.pathBytes));
+	for (const { source } of sorted) {
+		updateRuntimeSourceHash(hash, source.path, source.bytes);
+	}
+	return `sha256:${hash.digest("hex")}`;
+}
+
+/** Hash the live tree in canonical path order without retaining every source buffer. */
+function hashCurrentWorkbenchRuntimeSourcesV1(): string {
+	const hash = createHash("sha256");
+	hash.update(HASH_DOMAIN, "utf8");
+	const paths = collectRuntimeSourcePaths()
+		.map((source) => ({ source, pathBytes: Buffer.from(source.path, "utf8") }))
+		.sort((left, right) => left.pathBytes.compare(right.pathBytes));
+	for (const { source } of paths) {
+		updateRuntimeSourceHash(hash, source.path, readFileSync(source.absolutePath));
 	}
 	return `sha256:${hash.digest("hex")}`;
 }
 
 export function snapshotCurrentWorkbenchRuntimeBuildIdentityV1(): WorkbenchRuntimeBuildIdentityV1 {
-	const sourceHash = hashWorkbenchRuntimeSourcesV1(collectRuntimeSources());
+	const sourceHash = hashCurrentWorkbenchRuntimeSourcesV1();
 	const shortHash = sourceHash.slice("sha256:".length, "sha256:".length + 16);
 	return Object.freeze({
 		schema_version: WORKBENCH_RUNTIME_BUILD_SCHEMA_VERSION,
@@ -114,11 +139,12 @@ export function workbenchRuntimeDoctorLinesV1(doctor = doctorWorkbenchRuntimeBui
 /** Fail closed only at mutation boundaries; current-state diagnosis stays available. */
 export function workbenchRuntimeMutationBlockReasonV1(
 	toolName: unknown,
-	doctor: WorkbenchRuntimeBuildDoctorV1 = doctorWorkbenchRuntimeBuildV1(),
+	doctor?: WorkbenchRuntimeBuildDoctorV1,
 ): string | undefined {
 	if (!workbenchToolRequiresCheckoutLaneV1(toolName)) return undefined;
-	if (doctor.status === "CURRENT") return undefined;
-	return `Workbench runtime is stale (loaded ${doctor.loaded.source_hash}, disk ${doctor.disk.source_hash}); run /reload and verify /q-runtime-doctor before mutation`;
+	const current = doctor ?? doctorWorkbenchRuntimeBuildV1();
+	if (current.status === "CURRENT") return undefined;
+	return `Workbench runtime is stale (loaded ${current.loaded.source_hash}, disk ${current.disk.source_hash}); run /reload and verify /q-runtime-doctor before mutation`;
 }
 
 export function workbenchRuntimeBuildLinesV1(

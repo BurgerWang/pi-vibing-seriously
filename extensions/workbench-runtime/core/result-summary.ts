@@ -500,8 +500,6 @@ function cacheFactLine(cache: NonNullable<RecipeParentSummaryInput["cache"]>): s
 	return boundedBytes(parts.join(" — "), MAX_CACHE_LINE_BYTES);
 }
 
-const MINIMAL_FALLBACK_MARKER = "summary    : MINIMAL FALLBACK —";
-
 /**
  * Defensive minimal summary, used ONLY when the required-fact block does
  * not fit (unreachable under clamped caps — every field is bounded and the

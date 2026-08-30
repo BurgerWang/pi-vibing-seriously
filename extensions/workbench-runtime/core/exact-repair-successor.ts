@@ -73,16 +73,6 @@ function sameStrings(left: readonly string[], right: readonly string[]): boolean
 	return left.length === right.length && left.every((value, index) => value === right[index]);
 }
 
-function lineageMatchesAuthority(
-	parent: DelegationTransactionRecord,
-	authority: ExactRepairCommandAuthorityV1,
-	candidate: DelegationTransactionRecord,
-): boolean {
-	const lineage = candidate.repair_lineage;
-	return lineage !== undefined && lineage.repair_of === parent.delegation_id &&
-		canonicalHash(lineage) === canonicalHash(authority.successor_lineage);
-}
-
 function authorityMatchesParent(
 	parent: DelegationTransactionRecord,
 	authority: ExactRepairCommandAuthorityV1,

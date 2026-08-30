@@ -304,7 +304,7 @@ function isLockfileMap(value: unknown): value is Record<string, string> {
 	for (const name of keys) {
 		if (!KNOWN_LOCKFILES.includes(name)) return false;
 	}
-	for (const [name, hash] of Object.entries(value)) {
+	for (const hash of Object.values(value)) {
 		if (typeof hash !== "string") return false;
 		if (hash !== "missing" && hash !== "not-a-file" && hash !== "too-large" && !HASH_RE.test(hash)) return false;
 	}

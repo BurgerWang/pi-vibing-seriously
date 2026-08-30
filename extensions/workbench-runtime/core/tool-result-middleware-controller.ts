@@ -15,7 +15,6 @@ import {
 	TOOL_RESULT_INGRESS_BUDGET_BYTES,
 	projectToolResultIngress,
 	type ToolResultIngressProjectionMetadata,
-	type TrustedRecoveryAuthority,
 } from "./tool-result-ingress-projection.ts";
 import { finalizeReceipt, finalizeUnavailableCode, receiptRelativePath, type ReceiptHandle } from "./tool-result-recovery.ts";
 import { toolResultTextContentDigest } from "./trusted-recovery-authority.ts";

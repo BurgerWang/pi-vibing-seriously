@@ -18,7 +18,7 @@ import { lstat, readdir } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 
 import { canonicalHash } from "../cache/canonical-hash.ts";
-import { validateChangeSet, type ChangeSetRecord } from "./change-set.ts";
+import { validateChangeSet } from "./change-set.ts";
 import {
 	validateDelegationCommandProvenance,
 	type DelegationCommandProvenanceRecord,

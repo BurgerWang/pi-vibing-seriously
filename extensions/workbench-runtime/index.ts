@@ -6,11 +6,9 @@
  * output/authorization middleware. Keep public tool order and event order
  * stable; implementation history and feature contracts belong in docs/.
  */
-import { readFile } from "node:fs/promises";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
-import { checkToolCall, computeActiveTools, computeActiveToolsForLifecycleSnapshotV2, type WorkbenchMode } from "./core/mode-policy.ts";
+import { computeActiveTools, computeActiveToolsForLifecycleSnapshotV2, type WorkbenchMode } from "./core/mode-policy.ts";
 import { type ReceiptHandle } from "./core/tool-result-recovery.ts";
 import {
 	computeRoleActiveTools,
@@ -23,7 +21,6 @@ import {
 	WORKER_PROJECT_ROOT_ENV,
 	WORKER_ROLE_ENV,
 	WORKER_TASK_KIND_ENV, WORKER_TIMEOUT_MS_ENV,
-	type RecipeMutationFacts,
 } from "./core/worker-policy.ts";
 import { WORKER_WRITE_JOURNAL_RUNTIME_TELEMETRY_ENTRY_TYPE, createWorkerWriteJournalRuntime } from "./core/worker-write-journal-runtime.ts";
 import { parseWorkerInitialSpendStateEnvironment, resolveWorkerSpendProfile, WORKER_INITIAL_SPEND_STATE_ENV, WORKER_SPEND_PROFILE_ENV } from "./core/worker-spend.ts";
@@ -31,7 +28,6 @@ import { describeMode, loadModeFromEntries, MODE_ENTRY_TYPE, statusText } from "
 import { findProjectRoot, loadProjectConfig, type ExecFn } from "./core/config.ts";
 import { type WorkerFirstGateFacts } from "./core/gate-schema.ts";
 import { listRuns, readCommittedManifest } from "./core/runs.ts";
-import { join } from "node:path";
 import { runStatusLabel, fitToWidth } from "./core/format.ts";
 import { buildStatusLine } from "./core/status.ts";
 import { costStatusSegment } from "./core/cost-breakdown.ts";
@@ -66,7 +62,7 @@ import {
 import { decideCompactOverflowRecovery } from "./core/compact-overflow.ts";
 import { evaluateCompactSummaryPreflight } from "./core/compact-preflight.ts";
 import { createCacheTelemetry, type CacheTelemetry } from "./cache/cache-telemetry.ts";
-import { readDelegationLedger, type GitFacts } from "./core/delegation-ledger.ts";
+import { readDelegationLedger } from "./core/delegation-ledger.ts";
 import { readDelegationCommittedGenerationV2, readDelegationReviewV2, readDelegationTransactionV2 } from "./core/delegation-transaction-storage.ts";
 import {
 	readRecoverableUnpublishedDelegationV2,
@@ -76,7 +72,7 @@ import { delegationDisplayedStatusV1, delegationExactRepairRouteLineV1, delegati
 	type DelegationRepairStatusV1 } from "./core/delegation-repair-status.ts";
 import { type LifecycleActionSnapshotV2 } from "./core/delegation-lifecycle-resolver.ts";
 import { createLifecycleActionRefreshControllerV2 } from "./core/lifecycle-action-refresh-controller.ts";
-import { lifecycleActionSnapshotTextV2, lifecycleActionTurnMessageV2, mergeLifecycleActionStatusLinesV2 } from "./core/agent-next-action.ts";
+import { lifecycleActionSnapshotTextV2, mergeLifecycleActionStatusLinesV2 } from "./core/agent-next-action.ts";
 import { buildDelegationWorkerFirstGateFacts } from "./core/delegation-plan-reference.ts";
 import { resolveToolOutputPolicy } from "./core/output-policy.ts";
 import {
@@ -100,7 +96,6 @@ import {
 	type HistoryProjectionFacts,
 	type HistoryProjectionObservability,
 } from "./core/context-history-budget.ts";
-import { buildTrustedRecoveryAuthority } from "./core/trusted-recovery-authority.ts";
 import { applyExplicitPromptCacheBreakpoints } from "./core/prompt-cache-breakpoints.ts";
 import {
 	blockedControlText,
@@ -116,11 +111,8 @@ import {
 	type OutputControlTelemetryAccumulator,
 } from "./core/output-control-telemetry.ts";
 import {
-	blocksVerify,
-	delegationCompactSummary,
 	hasPendingReview,
 	hasStaleReview,
-	demoteReviewedToPending,
 	observeDiffChange,
 	recordBlockedWriteAttempt,
 	reviewBlockReason,
@@ -142,11 +134,8 @@ import { writeAuthorityFooterSegment } from "./core/lease-command.ts";
 import { registerCommanderWriteCommands } from "./core/commander-write-commands.ts";
 import { collectSecretValues } from "./core/redact.ts";
 import { registerMilestoneHandoffCommand } from "./core/milestone-handoff-controller.ts";
-import {
-	boundedCommandText as boundedToolText,
-} from "./core/command-output.ts";
 import { registerRunCommands } from "./core/run-commands.ts";
-import { gateParentSummaryLines, registerGateCommands } from "./core/gate-commands.ts";
+import { registerGateCommands } from "./core/gate-commands.ts";
 import { registerPromotionCommandV1 } from "./core/promotion-command.ts";
 import { registerInitCommand } from "./core/init-command.ts";
 import { registerCacheCommands } from "./core/cache-commands.ts";
@@ -154,17 +143,10 @@ import { registerStatusCommands, registerWidgetCommand } from "./core/status-com
 import { registerNativeToolOverrides } from "./core/native-tool-overrides-controller.ts";
 import {
 	assistantToolCalls,
-	boundedGuardReason,
 	ownDataValue,
 	streamingControlledApi,
 } from "./core/runtime-output-controller.ts";
-import {
-	fixedToolFailure,
-} from "./core/tool-presentation.ts";
-import {
-	doctorWorkbenchRuntimeBuildV1,
-	workbenchRuntimeMutationBlockReasonV1,
-} from "./core/runtime-build-identity.ts";
+import { workbenchRuntimeMutationBlockReasonV1 } from "./core/runtime-build-identity.ts";
 import { RUNTIME_CONTROLLER_SERVICES } from "./core/runtime-controller-services.ts";
 import { createRuntimeTransientState } from "./core/runtime-transient-state.ts";
 import { createDelegationSessionController } from "./core/delegation-session-controller.ts";
@@ -863,10 +845,6 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 
 	async function projectRootFor(ctx: ExtensionContext): Promise<string> {
 		return findProjectRoot(ctx.cwd, execFn);
-	}
-
-	function runsDirFor(projectRoot: string): string {
-		return join(projectRoot, CONFIG_DIR_NAME, "workbench", "runs");
 	}
 
 	/**

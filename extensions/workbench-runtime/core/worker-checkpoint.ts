@@ -160,12 +160,21 @@ function validUsage(value: unknown): value is Usage {
 }
 
 function validSortedStrings(value: unknown, maximum: number, maxBytes: number): value is string[] {
-	return Array.isArray(value) && value.length <= maximum && value.every((item) => validText(item, maxBytes))
-		&& value.every((item, index) => index === 0 || Buffer.from(value[index - 1]!, "utf8").compare(Buffer.from(item, "utf8")) < 0);
+	if (!Array.isArray(value) || value.length > maximum || !value.every((item) => validText(item, maxBytes))) return false;
+	let previous: Buffer | undefined;
+	for (const item of value as string[]) {
+		const bytes = Buffer.from(item, "utf8");
+		if (previous !== undefined && previous.compare(bytes) >= 0) return false;
+		previous = bytes;
+	}
+	return true;
 }
 
 function sortedUnique(values: readonly string[]): string[] {
-	return [...new Set(values)].sort((left, right) => Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8")));
+	return [...new Set(values)]
+		.map((value) => ({ value, bytes: Buffer.from(value, "utf8") }))
+		.sort((left, right) => left.bytes.compare(right.bytes))
+		.map(({ value }) => value);
 }
 
 function hasRichWorkerAdvisory(value: Record<string, unknown>): boolean {
@@ -205,7 +214,7 @@ export function buildWorkerCheckpointRichAdvisoryV1(
 			next_actions: sortedUnique(input.next_actions),
 		};
 		return validateWorkerCheckpointAdvisoryV1(value)
-			? Object.freeze(structuredClone(value))
+			? Object.freeze(value)
 			: undefined;
 	} catch {
 		return undefined;
@@ -218,7 +227,13 @@ function validTouchedPaths(value: unknown): value is WorkerCheckpointTouchedPath
 		&& validPath(item.path) && (item.before_hash === null || typeof item.before_hash === "string" && HASH_RE.test(item.before_hash))
 		&& (item.current_hash === null || typeof item.current_hash === "string" && HASH_RE.test(item.current_hash))
 		&& typeof item.journal_hash === "string" && HASH_RE.test(item.journal_hash))) return false;
-	return value.every((item, index) => index === 0 || Buffer.from(value[index - 1]!.path, "utf8").compare(Buffer.from(item.path, "utf8")) < 0);
+	let previous: Buffer | undefined;
+	for (const item of value as WorkerCheckpointTouchedPathV1[]) {
+		const bytes = Buffer.from(item.path, "utf8");
+		if (previous !== undefined && previous.compare(bytes) >= 0) return false;
+		previous = bytes;
+	}
+	return true;
 }
 
 function validAttemptSpend(value: unknown): value is WorkerCheckpointAttemptSpendV1 {
@@ -316,8 +331,14 @@ export function validateWorkerCheckpointV1(value: unknown): value is WorkerCheck
 		spendForLimit.output_tokens,
 	);
 	if (value.budget_promotion !== undefined && value.remaining_budget.profile !== "extended") return false;
-	if (expectedRemaining === undefined || canonicalHash(expectedRemaining) !== canonicalHash(value.remaining_budget)) return false;
-	const attemptLimitReached = Object.values(value.remaining_budget).some((remaining) => remaining === 0);
+	if (expectedRemaining === undefined
+		|| expectedRemaining.profile !== value.remaining_budget.profile
+		|| expectedRemaining.turns !== value.remaining_budget.turns
+		|| expectedRemaining.total_tokens !== value.remaining_budget.total_tokens
+		|| expectedRemaining.output_tokens !== value.remaining_budget.output_tokens) return false;
+	const attemptLimitReached = value.remaining_budget.turns === 0
+		|| value.remaining_budget.total_tokens === 0
+		|| value.remaining_budget.output_tokens === 0;
 	if (value.attempt_spend === undefined) {
 		if ((value.machine_state === "PAUSED_BUDGET") !== attemptLimitReached) return false;
 	} else if (value.machine_state !== "CHECKPOINTED") {
@@ -334,25 +355,26 @@ export function buildWorkerCheckpointV1(
 	input: Readonly<WorkerCheckpointBuildInputV1>,
 ): { ok: true; value: Readonly<WorkerCheckpointV1> } | { ok: false; code: "INVALID_CHECKPOINT" } {
 	try {
+		const cloned = structuredClone(input);
 		const payload: Omit<WorkerCheckpointV1, "checkpoint_hash"> = {
 			schema_version: WORKER_CHECKPOINT_SCHEMA_VERSION_V1,
 			kind: WORKER_CHECKPOINT_KIND_V1,
-			...structuredClone(input),
-			touched_paths: [...input.touched_paths].map((item) => structuredClone(item)).sort((left, right) => Buffer.from(left.path, "utf8").compare(Buffer.from(right.path, "utf8"))),
-			completed_recipe_run_ids: [...input.completed_recipe_run_ids].sort(),
+			...cloned,
+			touched_paths: [...cloned.touched_paths].sort((left, right) => Buffer.from(left.path, "utf8").compare(Buffer.from(right.path, "utf8"))),
+			completed_recipe_run_ids: [...cloned.completed_recipe_run_ids].sort(),
 			worker_advisory: {
-				completed_criteria: [...input.worker_advisory.completed_criteria].sort(),
-				remaining_criteria: [...input.worker_advisory.remaining_criteria].sort(),
-				...(input.worker_advisory.completed_work === undefined ? {} : { completed_work: [...input.worker_advisory.completed_work].sort() }),
-				...(input.worker_advisory.key_decisions === undefined ? {} : { key_decisions: [...input.worker_advisory.key_decisions].sort() }),
-				...(input.worker_advisory.verification_notes === undefined ? {} : { verification_notes: [...input.worker_advisory.verification_notes].sort() }),
-				...(input.worker_advisory.remaining_risks === undefined ? {} : { remaining_risks: [...input.worker_advisory.remaining_risks].sort() }),
-				...(input.worker_advisory.next_actions === undefined ? {} : { next_actions: [...input.worker_advisory.next_actions].sort() }),
+				completed_criteria: [...cloned.worker_advisory.completed_criteria].sort(),
+				remaining_criteria: [...cloned.worker_advisory.remaining_criteria].sort(),
+				...(cloned.worker_advisory.completed_work === undefined ? {} : { completed_work: [...cloned.worker_advisory.completed_work].sort() }),
+				...(cloned.worker_advisory.key_decisions === undefined ? {} : { key_decisions: [...cloned.worker_advisory.key_decisions].sort() }),
+				...(cloned.worker_advisory.verification_notes === undefined ? {} : { verification_notes: [...cloned.worker_advisory.verification_notes].sort() }),
+				...(cloned.worker_advisory.remaining_risks === undefined ? {} : { remaining_risks: [...cloned.worker_advisory.remaining_risks].sort() }),
+				...(cloned.worker_advisory.next_actions === undefined ? {} : { next_actions: [...cloned.worker_advisory.next_actions].sort() }),
 			},
 		};
 		const value = { ...payload, checkpoint_hash: computeWorkerCheckpointHashV1(payload) };
 		return validateWorkerCheckpointV1(value)
-			? { ok: true, value: Object.freeze(structuredClone(value)) }
+			? { ok: true, value: Object.freeze(value) }
 			: { ok: false, code: "INVALID_CHECKPOINT" };
 	} catch {
 		return { ok: false, code: "INVALID_CHECKPOINT" };

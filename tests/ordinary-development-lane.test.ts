@@ -63,7 +63,7 @@ test("ordinary DEV final verification reuses only the exact unchanged Candidate"
 
 		let recipeExecutions = 0;
 		const exec: ExecFn = async (command, args, options) => {
-			if (command === "node") recipeExecutions += 1;
+			if (command === "env") recipeExecutions += 1;
 			return spawnExec(command, args, options);
 		};
 		const now = monotonicClock();
@@ -158,7 +158,7 @@ test("workbench_run_recipe presents Candidate verification reuse without claimin
 
 		let recipeExecutions = 0;
 		const exec: ExecFn = async (command, args, options) => {
-			if (command === "node") recipeExecutions += 1;
+			if (command === "env") recipeExecutions += 1;
 			return spawnExec(command, args, options);
 		};
 		const tools = new Map<string, { execute: (...args: unknown[]) => Promise<{ content: Array<{ text: string }>; details: Record<string, unknown> }> }>();

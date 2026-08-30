@@ -47,7 +47,6 @@ import {
 import {
 	delegationReviewRelativePathV2,
 	hasDelegationSemanticRepairAuthorityV2,
-	hasDelegationSemanticReviewAuthorityV2,
 	hasDelegationTerminalNegativeSemanticRepairAuthorityV1,
 	isDelegationTerminalNegativeReviewEligibleFromCommittedV1,
 	isDelegationTerminalNegativeReviewEligibleV1,

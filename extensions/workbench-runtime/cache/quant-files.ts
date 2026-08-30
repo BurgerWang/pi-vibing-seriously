@@ -13,7 +13,6 @@
  *   - result artifact hash mismatch = corruption
  */
 
-import { createHash } from "node:crypto";
 import { globSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";

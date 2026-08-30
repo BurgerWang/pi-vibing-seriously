@@ -465,7 +465,7 @@ export interface DelegationLedger {
  * project changes — otherwise every delegation would dirty the very diff it
  * records.
  */
-export function isDelegationRecordPath(projectRoot: string, candidatePath: string): boolean {
+export function isDelegationRecordPath(_projectRoot: string, candidatePath: string): boolean {
 	const rel = normalizeStatusPath(candidatePath);
 	if (!rel) return false;
 	const prefix = `${CONFIG_DIR_NAME}/workbench/delegations`;
@@ -481,7 +481,7 @@ export function isDelegationRecordPath(projectRoot: string, candidatePath: strin
  * the trailing `/` guard means `.pi/workbench/tool-results-extra/...` and
  * `.pi/workbench/other/...` never match.
  */
-export function isToolResultReceiptPath(projectRoot: string, candidatePath: string): boolean {
+export function isToolResultReceiptPath(_projectRoot: string, candidatePath: string): boolean {
 	const rel = normalizeStatusPath(candidatePath);
 	if (!rel) return false;
 	const prefix = `${CONFIG_DIR_NAME}/workbench/tool-results`;

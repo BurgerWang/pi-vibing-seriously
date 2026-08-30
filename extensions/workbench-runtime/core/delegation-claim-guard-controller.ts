@@ -6,7 +6,6 @@ import { sha256Hex } from "../cache/canonical-hash.ts";
 import { repairDelegationToolActionV1 } from "./agent-next-action.ts";
 import {
 	exactRepairToolArgumentsV1,
-	type ExactRepairToolArgumentsV1,
 } from "./exact-repair-authority.ts";
 import {
 	DELEGATION_SCHEMA_VERSION,
