@@ -80,7 +80,15 @@ function checkpoint(
 		remaining_budget: remaining,
 		machine_state: remaining.turns === 0 || remaining.total_tokens === 0 || remaining.output_tokens === 0
 			? "PAUSED_BUDGET" : "CHECKPOINTED",
-		worker_advisory: { completed_criteria: ["criterion-a"], remaining_criteria: [remainingCriterion] },
+		worker_advisory: {
+			completed_criteria: ["criterion-a"],
+			remaining_criteria: [remainingCriterion],
+			completed_work: ["implemented parser path"],
+			key_decisions: ["preserve schema v1"],
+			verification_notes: ["recipe unit-test receipt verified"],
+			remaining_risks: ["legacy fixture needs review"],
+			next_actions: ["update compatibility docs"],
+		},
 		created_at: AT,
 	});
 	assert.equal(built.ok, true);
@@ -137,8 +145,10 @@ test("WorkerCheckpointV1 is hash-bound, bounded, monotonic, and produces a trans
 	}
 	const capsule = workerCheckpointContinuationCapsuleV1(first);
 	assert.ok(capsule);
-	assert.equal(Buffer.byteLength(JSON.stringify(capsule), "utf8") <= 4 * 1024, true);
+	assert.equal(Buffer.byteLength(JSON.stringify(capsule), "utf8") <= 16 * 1024, true);
 	assert.equal(JSON.stringify(capsule).includes("transcript"), false);
+	assert.deepEqual((capsule.worker_advisory as { key_decisions: string[] }).key_decisions, ["preserve schema v1"]);
+	assert.match(String(capsule.instruction), /not acceptance authority/);
 	assert.equal(validateWorkerCheckpointV1({ ...first, cumulative_turns: Number.NaN }), false);
 	assert.equal(validateWorkerCheckpointV1({ ...first, current_binding_hash: "0".repeat(64) }), false);
 
@@ -147,6 +157,45 @@ test("WorkerCheckpointV1 is hash-bound, bounded, monotonic, and produces a trans
 	assert.equal(second.cumulative_turns > first.cumulative_turns, true);
 	assert.equal(second.cumulative_usage.totalTokens > first.cumulative_usage.totalTokens, true);
 	assert.equal(checkpoint(1, 64).machine_state, "PAUSED_BUDGET");
+
+	const { schema_version: _legacySchema, kind: _legacyKind, checkpoint_hash: _legacyHash, ...legacyInput } = first;
+	const legacy = buildWorkerCheckpointV1({
+		...legacyInput,
+		worker_advisory: { completed_criteria: ["criterion-a"], remaining_criteria: ["criterion-b"] },
+	});
+	assert.equal(legacy.ok, true, "legacy two-list advisory checkpoints remain readable/buildable");
+	const partialRich = buildWorkerCheckpointV1({
+		...legacyInput,
+		worker_advisory: { completed_criteria: [], remaining_criteria: ["C1"], completed_work: [] },
+	});
+	assert.equal(partialRich.ok, false, "partial rich shapes fail closed instead of becoming ambiguous");
+	const oversizedRich = buildWorkerCheckpointV1({
+		...legacyInput,
+		worker_advisory: {
+			completed_criteria: [], remaining_criteria: ["C1"], completed_work: ["x".repeat(241)],
+			key_decisions: [], verification_notes: [], remaining_risks: [], next_actions: [],
+		},
+	});
+	assert.equal(oversizedRich.ok, false, "rich items enforce their UTF-8 byte bound");
+
+	const many = buildWorkerCheckpointV1({
+		...legacyInput,
+		touched_paths: Array.from({ length: 20 }, (_, index) => ({
+			path: `src/${String(index).padStart(2, "0")}.ts`, before_hash: null,
+			current_hash: "e".repeat(64), journal_hash: "f".repeat(64),
+		})),
+		completed_recipe_run_ids: Array.from({ length: 20 }, (_, index) => `20260829-0100${String(index).padStart(2, "0")}-run${index}`),
+	});
+	assert.equal(many.ok, true);
+	if (many.ok) {
+		const boundedCapsule = workerCheckpointContinuationCapsuleV1(many.value);
+		assert.ok(boundedCapsule);
+		assert.equal((boundedCapsule.touched_paths as unknown[]).length, 12);
+		assert.equal(boundedCapsule.touched_paths_omitted, 8);
+		assert.equal((boundedCapsule.completed_recipe_run_ids as unknown[]).length, 12);
+		assert.equal(boundedCapsule.completed_recipe_run_ids_omitted, 8);
+		assert.ok(Buffer.byteLength(JSON.stringify(boundedCapsule), "utf8") <= 16 * 1024);
+	}
 });
 
 test("an authorized standard-to-extended promotion preserves cumulative enforcement", () => {

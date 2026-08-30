@@ -111,6 +111,7 @@ import { preflightSemanticReviewEnvelopeV1 } from "./diff-review.ts";
 import type { SemanticReviewEnvelopeV1 } from "./semantic-review-envelope.ts";
 import {
 	authorizedWorkerBudgetPromotionV1,
+	buildWorkerCheckpointRichAdvisoryV1,
 	buildWorkerCheckpointV1,
 	remainingWorkerBudgetV1,
 	validateWorkerCheckpointContinuationV1,
@@ -118,6 +119,7 @@ import {
 	workerCheckpointContinuationCapsuleV1,
 	validateWorkerCheckpointV1,
 	type WorkerBudgetPromotionV1,
+	type WorkerCheckpointAdvisoryV1,
 	type WorkerCheckpointV1,
 } from "./worker-checkpoint.ts";
 import { WORKBENCH_RUNTIME_BUILD_IDENTITY } from "./runtime-build-identity.ts";
@@ -768,6 +770,31 @@ async function buildDurableWorkerCheckpoint(
 		attemptWorker.spendState.outputTokens,
 	);
 	if (remaining === undefined) return undefined;
+	const criterionReferences = checked.contract.acceptance_criteria.map((_, index) => `C${index + 1}`);
+	const criterionReference = (value: string): string | undefined => {
+		const normalized = value.toUpperCase();
+		if (criterionReferences.includes(normalized)) return normalized;
+		const index = checked.contract.acceptance_criteria.indexOf(value);
+		return index < 0 ? undefined : criterionReferences[index];
+	};
+	const requestedAdvisory = worker.checkpointRequest?.advisory;
+	const requestedRemaining = new Set((requestedAdvisory?.remaining_criteria ?? [])
+		.map(criterionReference)
+		.filter((value): value is string => value !== undefined));
+	const requestedCompleted = new Set((requestedAdvisory?.completed_criteria ?? [])
+		.map(criterionReference)
+		.filter((value): value is string => value !== undefined && !requestedRemaining.has(value)));
+	const normalizedAdvisory: Readonly<WorkerCheckpointAdvisoryV1> | undefined = buildWorkerCheckpointRichAdvisoryV1({
+		completed_criteria: [...requestedCompleted],
+		// Every unmentioned or conflicting criterion stays an explicit obligation.
+		remaining_criteria: criterionReferences.filter((reference) => !requestedCompleted.has(reference)),
+		completed_work: requestedAdvisory?.completed_work ?? [],
+		key_decisions: requestedAdvisory?.key_decisions ?? [],
+		verification_notes: requestedAdvisory?.verification_notes ?? [],
+		remaining_risks: requestedAdvisory?.remaining_risks ?? [],
+		next_actions: requestedAdvisory?.next_actions ?? [],
+	});
+	if (normalizedAdvisory === undefined) return undefined;
 	const built = buildWorkerCheckpointV1({
 		delegation_id: checked.delegationId,
 		contract_hash: checked.contract.contract_hash,
@@ -788,16 +815,7 @@ async function buildDurableWorkerCheckpoint(
 		...(budgetPromotion === undefined ? {} : { budget_promotion: structuredClone(budgetPromotion) }),
 		remaining_budget: remaining,
 		machine_state: machineState,
-		worker_advisory: worker.checkpointRequest?.advisory.completed_criteria.length ||
-			worker.checkpointRequest?.advisory.remaining_criteria.length
-			? worker.checkpointRequest.advisory
-			: {
-				completed_criteria: [],
-				// Until final machine verification, every contract criterion remains
-				// an explicit obligation for the fresh worker. This makes even a
-				// forced hard-boundary checkpoint a complete durable handoff document.
-				remaining_criteria: [...checked.contract.acceptance_criteria],
-			},
+		worker_advisory: normalizedAdvisory,
 		created_at: createdAt,
 	});
 	if (!built.ok) return undefined;

@@ -489,7 +489,7 @@ export function formatWorkerTask(contract: WorkerTaskContract): string {
 		...contract.allowedPaths.map((path) => `- ${path}`),
 		"",
 		diagnosis ? "Diagnostic objectives (evidence for Sol; never acceptance):" : "Acceptance criteria:",
-		...contract.acceptanceCriteria.map((criterion) => `- ${criterion}`),
+		...contract.acceptanceCriteria.map((criterion, index) => `- [C${index + 1}] ${criterion}`),
 	);
 	if (contract.verification.length > 0) {
 		lines.push("", "Requested write-free recipe verification:", ...contract.verification.map((step) => `- ${step}`));

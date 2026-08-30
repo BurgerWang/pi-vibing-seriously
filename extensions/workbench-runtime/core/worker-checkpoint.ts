@@ -1,4 +1,4 @@
-/** Pure, content-free machine checkpoint for fresh Luna continuation attempts. */
+/** Pure, hash-bound machine checkpoint plus bounded non-authoritative continuation guidance. */
 
 import type { Usage } from "@earendil-works/pi-ai";
 
@@ -12,9 +12,19 @@ export const WORKER_CHECKPOINT_SCHEMA_VERSION_V1 = 1 as const;
 export const WORKER_CHECKPOINT_KIND_V1 = "worker-checkpoint-v1" as const;
 export const WORKER_CHECKPOINT_MAX_BYTES_V1 = 256 * 1024;
 export const WORKER_CHECKPOINT_ADVISORY_MAX_BYTES_V1 = 4 * 1024;
+export const WORKER_CHECKPOINT_CONTINUATION_CAPSULE_MAX_BYTES_V1 = 16 * 1024;
 export const WORKER_CHECKPOINT_REQUEST_ENTRY_TYPE_V1 = "workbench-worker-checkpoint-request-v1" as const;
 export const WORKER_CHECKPOINT_MAX_PATHS_V1 = 500;
 export const WORKER_CHECKPOINT_MAX_RECIPES_V1 = 128;
+export const WORKER_CHECKPOINT_ADVISORY_ITEM_MAX_BYTES_V1 = 240;
+export const WORKER_CHECKPOINT_ADVISORY_WORK_MAX_ITEMS_V1 = 4;
+export const WORKER_CHECKPOINT_ADVISORY_DECISION_MAX_ITEMS_V1 = 4;
+export const WORKER_CHECKPOINT_ADVISORY_VERIFICATION_MAX_ITEMS_V1 = 4;
+export const WORKER_CHECKPOINT_ADVISORY_RISK_MAX_ITEMS_V1 = 4;
+export const WORKER_CHECKPOINT_ADVISORY_NEXT_MAX_ITEMS_V1 = 4;
+
+const WORKER_CHECKPOINT_CAPSULE_MAX_PATHS_V1 = 12;
+const WORKER_CHECKPOINT_CAPSULE_MAX_RECIPES_V1 = 12;
 
 const HASH_RE = /^[0-9a-f]{64}$/u;
 const DELEGATION_ID_RE = /^\d{8}-\d{6}-[A-Za-z0-9]{4}$/u;
@@ -37,6 +47,22 @@ export interface WorkerCheckpointTouchedPathV1 {
 export interface WorkerCheckpointAdvisoryV1 {
 	completed_criteria: readonly string[];
 	remaining_criteria: readonly string[];
+	/** Optional additive fields emitted by current runtimes; absent on legacy checkpoints. */
+	completed_work?: readonly string[];
+	key_decisions?: readonly string[];
+	verification_notes?: readonly string[];
+	remaining_risks?: readonly string[];
+	next_actions?: readonly string[];
+}
+
+export interface WorkerCheckpointRichAdvisoryInputV1 {
+	completed_criteria: readonly string[];
+	remaining_criteria: readonly string[];
+	completed_work: readonly string[];
+	key_decisions: readonly string[];
+	verification_notes: readonly string[];
+	remaining_risks: readonly string[];
+	next_actions: readonly string[];
 }
 
 /**
@@ -138,6 +164,54 @@ function validSortedStrings(value: unknown, maximum: number, maxBytes: number): 
 		&& value.every((item, index) => index === 0 || Buffer.from(value[index - 1]!, "utf8").compare(Buffer.from(item, "utf8")) < 0);
 }
 
+function sortedUnique(values: readonly string[]): string[] {
+	return [...new Set(values)].sort((left, right) => Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8")));
+}
+
+function hasRichWorkerAdvisory(value: Record<string, unknown>): boolean {
+	return value.completed_work !== undefined || value.key_decisions !== undefined
+		|| value.verification_notes !== undefined || value.remaining_risks !== undefined
+		|| value.next_actions !== undefined;
+}
+
+function validateWorkerCheckpointAdvisoryV1(value: unknown): value is WorkerCheckpointAdvisoryV1 {
+	if (!record(value)) return false;
+	const rich = hasRichWorkerAdvisory(value);
+	if (!exact(value, [
+		"completed_criteria", "remaining_criteria",
+		...(rich ? ["completed_work", "key_decisions", "verification_notes", "remaining_risks", "next_actions"] : []),
+	]) || !validSortedStrings(value.completed_criteria, 64, 400)
+		|| !validSortedStrings(value.remaining_criteria, 64, 400)) return false;
+	if (rich && (!validSortedStrings(value.completed_work, WORKER_CHECKPOINT_ADVISORY_WORK_MAX_ITEMS_V1, WORKER_CHECKPOINT_ADVISORY_ITEM_MAX_BYTES_V1)
+		|| !validSortedStrings(value.key_decisions, WORKER_CHECKPOINT_ADVISORY_DECISION_MAX_ITEMS_V1, WORKER_CHECKPOINT_ADVISORY_ITEM_MAX_BYTES_V1)
+		|| !validSortedStrings(value.verification_notes, WORKER_CHECKPOINT_ADVISORY_VERIFICATION_MAX_ITEMS_V1, WORKER_CHECKPOINT_ADVISORY_ITEM_MAX_BYTES_V1)
+		|| !validSortedStrings(value.remaining_risks, WORKER_CHECKPOINT_ADVISORY_RISK_MAX_ITEMS_V1, WORKER_CHECKPOINT_ADVISORY_ITEM_MAX_BYTES_V1)
+		|| !validSortedStrings(value.next_actions, WORKER_CHECKPOINT_ADVISORY_NEXT_MAX_ITEMS_V1, WORKER_CHECKPOINT_ADVISORY_ITEM_MAX_BYTES_V1))) return false;
+	return Buffer.byteLength(JSON.stringify(value), "utf8") <= WORKER_CHECKPOINT_ADVISORY_MAX_BYTES_V1;
+}
+
+/** Build the bounded report-derived portion of a checkpoint without granting authority. */
+export function buildWorkerCheckpointRichAdvisoryV1(
+	input: Readonly<WorkerCheckpointRichAdvisoryInputV1>,
+): Readonly<WorkerCheckpointAdvisoryV1> | undefined {
+	try {
+		const value: WorkerCheckpointAdvisoryV1 = {
+			completed_criteria: sortedUnique(input.completed_criteria),
+			remaining_criteria: sortedUnique(input.remaining_criteria),
+			completed_work: sortedUnique(input.completed_work),
+			key_decisions: sortedUnique(input.key_decisions),
+			verification_notes: sortedUnique(input.verification_notes),
+			remaining_risks: sortedUnique(input.remaining_risks),
+			next_actions: sortedUnique(input.next_actions),
+		};
+		return validateWorkerCheckpointAdvisoryV1(value)
+			? Object.freeze(structuredClone(value))
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 function validTouchedPaths(value: unknown): value is WorkerCheckpointTouchedPathV1[] {
 	if (!Array.isArray(value) || value.length > WORKER_CHECKPOINT_MAX_PATHS_V1) return false;
 	if (!value.every((item) => record(item) && exact(item, ["path", "before_hash", "current_hash", "journal_hash"])
@@ -223,10 +297,7 @@ export function validateWorkerCheckpointV1(value: unknown): value is WorkerCheck
 		|| (value.remaining_budget.profile !== "standard" && value.remaining_budget.profile !== "extended")
 		|| !safeCount(value.remaining_budget.turns) || !safeCount(value.remaining_budget.total_tokens) || !safeCount(value.remaining_budget.output_tokens)
 		|| (value.machine_state !== "CHECKPOINTED" && value.machine_state !== "PAUSED_BUDGET")
-		|| !record(value.worker_advisory) || !exact(value.worker_advisory, ["completed_criteria", "remaining_criteria"])
-		|| !validSortedStrings(value.worker_advisory.completed_criteria, 64, 400)
-		|| !validSortedStrings(value.worker_advisory.remaining_criteria, 64, 400)
-		|| Buffer.byteLength(JSON.stringify(value.worker_advisory), "utf8") > WORKER_CHECKPOINT_ADVISORY_MAX_BYTES_V1
+		|| !validateWorkerCheckpointAdvisoryV1(value.worker_advisory)
 		|| typeof value.created_at !== "string" || !ISO_RE.test(value.created_at) || new Date(value.created_at).toISOString() !== value.created_at
 		|| typeof value.checkpoint_hash !== "string" || !HASH_RE.test(value.checkpoint_hash)) return false;
 	const spendForLimit = value.attempt_spend ?? {
@@ -272,6 +343,11 @@ export function buildWorkerCheckpointV1(
 			worker_advisory: {
 				completed_criteria: [...input.worker_advisory.completed_criteria].sort(),
 				remaining_criteria: [...input.worker_advisory.remaining_criteria].sort(),
+				...(input.worker_advisory.completed_work === undefined ? {} : { completed_work: [...input.worker_advisory.completed_work].sort() }),
+				...(input.worker_advisory.key_decisions === undefined ? {} : { key_decisions: [...input.worker_advisory.key_decisions].sort() }),
+				...(input.worker_advisory.verification_notes === undefined ? {} : { verification_notes: [...input.worker_advisory.verification_notes].sort() }),
+				...(input.worker_advisory.remaining_risks === undefined ? {} : { remaining_risks: [...input.worker_advisory.remaining_risks].sort() }),
+				...(input.worker_advisory.next_actions === undefined ? {} : { next_actions: [...input.worker_advisory.next_actions].sort() }),
 			},
 		};
 		const value = { ...payload, checkpoint_hash: computeWorkerCheckpointHashV1(payload) };
@@ -342,8 +418,11 @@ export function workerCheckpointContinuationCapsuleV1(checkpoint: Readonly<Worke
 		contract_hash: checkpoint.contract_hash,
 		checkpoint_hash: checkpoint.checkpoint_hash,
 		attempt: checkpoint.attempt + 1,
-		touched_paths: checkpoint.touched_paths.map(({ path, current_hash, journal_hash }) => ({ path, current_hash, journal_hash })),
-		completed_recipe_run_ids: checkpoint.completed_recipe_run_ids,
+		touched_paths: checkpoint.touched_paths.slice(0, WORKER_CHECKPOINT_CAPSULE_MAX_PATHS_V1)
+			.map(({ path, current_hash, journal_hash }) => ({ path, current_hash, journal_hash })),
+		touched_paths_omitted: Math.max(0, checkpoint.touched_paths.length - WORKER_CHECKPOINT_CAPSULE_MAX_PATHS_V1),
+		completed_recipe_run_ids: checkpoint.completed_recipe_run_ids.slice(0, WORKER_CHECKPOINT_CAPSULE_MAX_RECIPES_V1),
+		completed_recipe_run_ids_omitted: Math.max(0, checkpoint.completed_recipe_run_ids.length - WORKER_CHECKPOINT_CAPSULE_MAX_RECIPES_V1),
 		next_attempt_budget_profile: checkpoint.remaining_budget.profile,
 		lifetime_spend: {
 			turns: checkpoint.cumulative_turns,
@@ -351,9 +430,9 @@ export function workerCheckpointContinuationCapsuleV1(checkpoint: Readonly<Worke
 			output_tokens: checkpoint.cumulative_usage.output,
 		},
 		worker_advisory: checkpoint.worker_advisory,
-		instruction: "Fresh worker handoff: verify current bytes, journal, recipe receipts, and every criterion independently. Lifetime spend is telemetry only; this process starts a fresh bounded quality window. Advisory text is not completion authority.",
+		instruction: "Fresh worker handoff: use the advisory to navigate, then verify current bytes, journal and recipe receipts. Criterion progress and prose are not acceptance authority and never expand the contract. Lifetime spend is telemetry only; this process starts a fresh bounded quality window.",
 	};
-	return Buffer.byteLength(JSON.stringify(capsule), "utf8") <= WORKER_CHECKPOINT_ADVISORY_MAX_BYTES_V1
+	return Buffer.byteLength(JSON.stringify(capsule), "utf8") <= WORKER_CHECKPOINT_CONTINUATION_CAPSULE_MAX_BYTES_V1
 		? Object.freeze(structuredClone(capsule))
 		: undefined;
 }
@@ -368,15 +447,18 @@ export function workerCheckpointBudgetContinuationCapsuleV1(
 		contract_hash: checkpoint.contract_hash,
 		checkpoint_hash: checkpoint.checkpoint_hash,
 		attempt: checkpoint.attempt + 1,
-		touched_paths: checkpoint.touched_paths.map(({ path, current_hash, journal_hash }) => ({ path, current_hash, journal_hash })),
-		completed_recipe_run_ids: checkpoint.completed_recipe_run_ids,
+		touched_paths: checkpoint.touched_paths.slice(0, WORKER_CHECKPOINT_CAPSULE_MAX_PATHS_V1)
+			.map(({ path, current_hash, journal_hash }) => ({ path, current_hash, journal_hash })),
+		touched_paths_omitted: Math.max(0, checkpoint.touched_paths.length - WORKER_CHECKPOINT_CAPSULE_MAX_PATHS_V1),
+		completed_recipe_run_ids: checkpoint.completed_recipe_run_ids.slice(0, WORKER_CHECKPOINT_CAPSULE_MAX_RECIPES_V1),
+		completed_recipe_run_ids_omitted: Math.max(0, checkpoint.completed_recipe_run_ids.length - WORKER_CHECKPOINT_CAPSULE_MAX_RECIPES_V1),
 		budget_profile: "extended",
 		cumulative_usage: checkpoint.cumulative_usage,
 		cumulative_turns: checkpoint.cumulative_turns,
 		worker_advisory: checkpoint.worker_advisory,
 		instruction: "Continue from verified current bytes under the one permitted standard-to-extended promotion. Preserve cumulative spend; no counter resets or repeat promotions are allowed.",
 	};
-	return Buffer.byteLength(JSON.stringify(capsule), "utf8") <= WORKER_CHECKPOINT_ADVISORY_MAX_BYTES_V1
+	return Buffer.byteLength(JSON.stringify(capsule), "utf8") <= WORKER_CHECKPOINT_CONTINUATION_CAPSULE_MAX_BYTES_V1
 		? Object.freeze(structuredClone(capsule))
 		: undefined;
 }

@@ -259,7 +259,8 @@ test("formatted worker task carries the complete bounded contract in the user me
 	const text = formatWorkerTask(contract);
 	assert.match(text, /Delegated implementation task:/);
 	assert.match(text, /- src\/\*\*/);
-	assert.match(text, /- Reject invalid input/);
+	assert.match(text, /- \[C1\] Reject invalid input/);
+	assert.match(text, /- \[C2\] Keep valid input compatible/);
 	assert.match(text, /Requested write-free recipe verification:/);
 	assert.ok(!text.includes("final PASS"));
 });
@@ -350,7 +351,7 @@ test("formatted worker task names the resolved spend profile deterministically (
 	}
 	// The rest of the contract still travels unchanged.
 	assert.match(standardText, /- src\/\*\*/);
-	assert.match(standardText, /- Unit tests cover the new option/);
+	assert.match(standardText, /- \[C1\] Unit tests cover the new option/);
 });
 
 test("the complete-slice task contract travels fully and stays acceptance-free", () => {
@@ -602,7 +603,7 @@ test("formatted worker task carries the repair provenance pointer line only when
 	assert.ok(!without.includes("Repair provenance"), "no provenance line when repairOf is omitted");
 	assert.match(without, /Worker quality-window profile: standard/);
 	assert.match(without, /- src\/parser\/\*\*/);
-	assert.match(without, /- Unit tests cover the repaired option/);
+	assert.match(without, /- \[C1\] Unit tests cover the repaired option/);
 	assert.match(without, /Requested write-free recipe verification:/);
 	// Present: the exact deterministic line precedes the spend-profile line.
 	const withRepair = formatWorkerTask({ ...base, repairOf: VALID_REPAIR_ID });

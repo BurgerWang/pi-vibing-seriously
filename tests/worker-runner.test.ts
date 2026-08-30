@@ -94,7 +94,7 @@ function journalTelemetryEvent(data: Readonly<Record<string, unknown>>): string 
 	});
 }
 
-function checkpointRequestEvent(attempt: number): string {
+function checkpointRequestEvent(attempt: number, legacy = false): string {
 	return JSON.stringify({
 		type: "entry_appended",
 		entry: {
@@ -106,6 +106,13 @@ function checkpointRequestEvent(attempt: number): string {
 				attempt,
 				completed_criteria: ["criterion-a"],
 				remaining_criteria: ["criterion-b"],
+				...(legacy ? {} : {
+					completed_work: ["implemented parser"],
+					key_decisions: ["preserve schema v1"],
+					verification_notes: ["recipe:unit-test run:20260830-120000-abcd outcome:SUCCESS"],
+					remaining_risks: ["legacy fixture needs review"],
+					next_actions: ["update compatibility docs"],
+				}),
 			},
 		},
 	});
@@ -163,7 +170,25 @@ test("runner carries the child extension checkpoint request into the controller 
 			advisory: {
 				completed_criteria: ["criterion-a"],
 				remaining_criteria: ["criterion-b"],
+				completed_work: ["implemented parser"],
+				key_decisions: ["preserve schema v1"],
+				verification_notes: ["recipe:unit-test run:20260830-120000-abcd outcome:SUCCESS"],
+				remaining_risks: ["legacy fixture needs review"],
+				next_actions: ["update compatibility docs"],
 			},
+		});
+	});
+});
+
+test("runner keeps legacy two-list checkpoint requests readable", async () => {
+	const checkpoint = checkpointRequestEvent(2, true);
+	const final = assistantEvent();
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${checkpoint}\n${final}\n`)});`, async (invocation, dir) => {
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, attempt: 2, invocation });
+		assertWorkerSucceeded(result);
+		assert.deepEqual(result.checkpointRequest?.advisory, {
+			completed_criteria: ["criterion-a"],
+			remaining_criteria: ["criterion-b"],
 		});
 	});
 });

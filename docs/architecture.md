@@ -457,6 +457,17 @@ mechanical `REVIEWED` is not semantic acceptance, and all missing facts remain
 unknown. Sol/xhigh drift is status-only. The ABBA canary is descriptive and
 cannot grant review, Gate, release, or production authority.
 
+Fresh-worker checkpoint continuation also carries a bounded rich advisory.
+Worker task criteria receive stable per-contract `C1..Cn` display references;
+after a soft steer, a reliable four-heading report is reduced to redacted
+completed-work, decision, verification, risk and next-action arrays. The
+advisory is capped at 4 KiB and the whole continuation capsule at 16 KiB; it
+contains no transcript, tool arguments, patches or logs. Its only purpose is
+navigation. Executable authority remains the hash-bound checkpoint plus the
+unchanged delegation contract, current workspace binding, journal and recipe
+receipts, and final semantic acceptance remains Sol-owned. Old two-list v1
+checkpoints validate unchanged.
+
 Phase 4 adds
 the numeric-only progress surface: `WorkerProgress` exposes the cumulative
 turns/total/output counters and the fixed `ok | soft | hard` band after

@@ -544,14 +544,23 @@ interface WorkerCheckpointV1 {
   worker_advisory: {
     completed_criteria: readonly string[];
     remaining_criteria: readonly string[];
+    // additive in current runtimes; absent on historical v1 checkpoints
+    completed_work?: readonly string[];
+    key_decisions?: readonly string[];
+    verification_notes?: readonly string[];
+    remaining_risks?: readonly string[];
+    next_actions?: readonly string[];
   };
   created_at: string;
   checkpoint_hash: string;
 }
 ```
 
-`worker_advisory` 只帮助下一 fresh worker 定向，不能证明 criterion 完成。下一 attempt
-必须自己读取合同、当前 bytes、journal 和已完成 recipe receipt。
+`worker_advisory` 只帮助下一 fresh worker 定向，不能证明 criterion 完成。当前 runtime
+为 contract criteria 提供 `C1..Cn` 显示引用，并从 soft steer 后可靠的四段式报告中提取
+上述五类可选字段；每项最多 240 UTF-8 bytes、每类最多四项、完整 advisory 最多 4 KiB。
+旧两字段 v1 记录继续原样可读。下一 attempt 必须自己读取合同、当前 bytes、journal 和
+已完成 recipe receipt；advisory 不能扩 scope、授予 lease、证明 receipt 或替代最终 Sol review。
 
 ### 7.4 `LifecycleActionSnapshotV2`
 
@@ -1836,3 +1845,35 @@ composite-status claim guard 均有独立证据；
 故其状态仍为 `NOT_EFFECTIVE_UNTIL_RELOAD_OR_NEW_SESSION`，不能把旧会话称为已生效。
 强制真实 provider 消耗至 soft threshold 的长时高成本 canary、commit、push、production
 release、cache experiment 与 PTC experiment 仍分别为 `NOT_RUN`。**
+
+### 2026-08-30 bounded rich handoff advisory 后续优化
+
+用户确认继续补齐 checkpoint 的主要剩余效率缺口后，当前源码在不改变 delegation/path/
+lease/review authority 的前提下完成以下 additive 优化：
+
+- worker task 中的 acceptance criteria 获得稳定的 `C1..Cn` 显示引用；soft steer 要求在
+  既有四段式报告中用 `Work completed for:`、`Decision:`、`Remaining criteria:`、`Next:`
+  提供 successor 所需的最小语义导航；
+- child extension 不再在 steer 后第一条任意 assistant/tool-use 消息上写空 request；只有
+  terminal assistant message 才能产生 request。可靠四段式报告会提取
+  `completed_work`、`key_decisions`、`verification_notes`、`remaining_risks`、`next_actions`；
+  malformed terminal report 降级为空 advisory，hard boundary 则继续使用 controller 的
+  machine-only all-criteria-remaining fallback；
+- rich advisory 每类最多四项、每项最多 240 UTF-8 bytes、整体最多 4 KiB，并在持久化前
+  清除已知环境 secret 与常见 credential pattern。continuation capsule 最多 16 KiB；最多
+  展示 12 个 touched paths 和 12 个 recipe ids，并携带 omission count；完整列表仍只存在
+  hash-bound checkpoint；
+- controller 把 worker 给出的 criterion progress 规范到当前 contract 的 `C1..Cn`，未知、
+  冲突和未提及 criterion 一律保持 remaining。advisory 不能扩 allowed paths、授予 lease、
+  证明 recipe、宣告 acceptance 或跳过最终 Sol review；旧两字段 v1 checkpoint 仍严格可读。
+
+验证结果：`npm run typecheck` PASS；checkpoint/runner/policy/execution 首轮聚焦
+148/148 PASS；恢复、限长、脱敏和 runtime-wiring 复核 100/100 PASS；最终聚焦回归
+163/163 PASS；最终全仓 `npm test` exit 0；`git diff --check` PASS。当前未提交源码 identity 为
+`sha256:0254930aa58deffe3da40596888886b64f3dba116f16b9cc9ac29fa1642350ef`。本后续优化没有
+修改 Scalper、Mace、Onchain，没有启动或重载其 live session，也没有 commit、push、release；
+因此源码/自动测试 verdict 为 `PASS`，新 hash 的 live-provider loaded-runtime canary 为
+`NOT_RUN`，既有 session 仍需 reload 或新开 session 才可能加载此后续优化。
+
+本小节 supersede 上一状态段中的 source-hash/commit 时点：上一轮 source correction 后来已经
+提交为 `e95a7ee`，但未 push；本小节列出的 rich-advisory diff 仍未提交。

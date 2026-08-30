@@ -508,6 +508,14 @@ wording and granularity guidance since Phase 5):
   controller automatically starts a fresh `--no-session` worker under the
   same contract and path authority. No budget renewal, profile promotion, or
   task-split authorization is created or consumed;
+- current soft handoffs derive a redacted, structured advisory only from a
+  reliable four-heading terminal report. It is bounded to 4 KiB (four items per
+  rich category, 240 UTF-8 bytes per item), hash-bound for integrity, and remains
+  non-authoritative: criterion progress, decisions, risks, verification prose
+  and next actions cannot expand paths or establish acceptance. The controller
+  derives executable continuation only from the existing contract, current
+  binding, journal and strict recipe receipts. Malformed reports and hard stops
+  fall back to machine-only continuation instead of trusting partial prose;
 - the 60-minute timeout remains an independent operational failure path.
 
 Historical committed v1/v2 records with `low` remain read-only compatible.

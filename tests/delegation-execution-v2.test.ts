@@ -932,7 +932,7 @@ test("execution v2: a worker hard turn boundary automatically hands off without 
 	assert.equal(calls[1]!.initialSpendState, undefined, "fresh worker receives a fresh quality window");
 	assert.deepEqual(
 		(calls[1]!.continuationCapsule as { worker_advisory?: { remaining_criteria?: string[] } }).worker_advisory?.remaining_criteria,
-		bound.acceptance_criteria,
+		["C1"],
 		"a forced hard boundary still leaves a complete machine-readable objective handoff",
 	);
 	assert.equal(result.result.turns, 66, "lifetime turns remain monotonic telemetry");
@@ -975,7 +975,7 @@ test("execution v2: a hard per-message context boundary also checkpoints and rel
 	assert.equal(calls[1]!.initialSpendState, undefined);
 	assert.deepEqual(
 		(calls[1]!.continuationCapsule as { worker_advisory?: { remaining_criteria?: string[] } }).worker_advisory?.remaining_criteria,
-		bound.acceptance_criteria,
+		["C1"],
 	);
 });
 
@@ -992,7 +992,15 @@ test("execution v2: a soft checkpoint continues with fresh-worker limits and lif
 		spendSoftReached: { turns: true, totalTokens: false, outputTokens: false },
 		checkpointRequest: {
 			attempt: 1,
-			advisory: { completed_criteria: [], remaining_criteria: ["The transaction is complete and authority-bound."] },
+			advisory: {
+				completed_criteria: ["C1"],
+				remaining_criteria: [],
+				completed_work: ["implementation path is in place"],
+				key_decisions: ["preserve transaction schema"],
+				verification_notes: ["focused receipt recorded"],
+				remaining_risks: ["final review is still pending"],
+				next_actions: ["inspect the current bytes"],
+			},
 		},
 	});
 	first.usage = {
@@ -1028,6 +1036,21 @@ test("execution v2: a soft checkpoint continues with fresh-worker limits and lif
 	assert.equal(calls[1]!.attempt, 2);
 	assert.equal(calls[1]!.initialSpendState, undefined);
 	assert.equal((calls[1]!.continuationCapsule as { attempt?: number }).attempt, 2);
+	assert.deepEqual(
+		(calls[1]!.continuationCapsule as { worker_advisory?: { key_decisions?: string[] } }).worker_advisory?.key_decisions,
+		["preserve transaction schema"],
+	);
+	assert.deepEqual(
+		(calls[1]!.continuationCapsule as { worker_advisory?: { completed_criteria?: string[]; remaining_criteria?: string[] } }).worker_advisory,
+		{
+			completed_criteria: ["C1"], remaining_criteria: [],
+			completed_work: ["implementation path is in place"],
+			key_decisions: ["preserve transaction schema"],
+			verification_notes: ["focused receipt recorded"],
+			remaining_risks: ["final review is still pending"],
+			next_actions: ["inspect the current bytes"],
+		},
+	);
 	assert.equal(result.result.turns, 34);
 	assert.equal(result.result.usage.totalTokens, 640);
 	const committed = await readDelegationCommittedGenerationV2(projectRoot, delegationId);

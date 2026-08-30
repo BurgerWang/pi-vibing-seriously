@@ -348,7 +348,7 @@ export function formatWorkerSpendSteerText(state: unknown, profile: WorkerSpendP
 	return [
 		`Worker process soft handoff point reached (profile ${profileName}): ${facts}.`,
 		"Stop starting unrelated work. Finish only the current atomic edit, refresh the machine write journal, and run only already-declared necessary focused recipes.",
-		"Publish a machine WorkerCheckpointV1 handoff with completed criteria and remaining work, then exit normally.",
+		"Write the required four-heading final report. Use Work completed for: C1,C2 and Remaining criteria: C3,C4 when applicable, plus Decision: and Next: bullets for remaining work and other facts the fresh worker needs. The runtime derives the bounded machine checkpoint; the prose remains advisory only.",
 		"The remaining hard limit is this worker's handoff reserve. The controller starts a fresh --no-session Luna under the same delegation and existing authority; never ask the user to authorize ordinary continuation.",
 	].join("\n");
 }

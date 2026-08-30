@@ -94,6 +94,8 @@ import {
 import { readWorkerRepairCapsule, type WorkerRepairAuthorityResult } from "../core/worker-repair-authority.ts";
 import type { WorkerRepairCapsule } from "../core/worker-repair-capsule.ts";
 import {
+	buildWorkerCheckpointRichAdvisoryV1,
+	WORKER_CHECKPOINT_CONTINUATION_CAPSULE_MAX_BYTES_V1,
 	WORKER_CHECKPOINT_REQUEST_ENTRY_TYPE_V1,
 	type WorkerCheckpointAdvisoryV1,
 } from "../core/worker-checkpoint.ts";
@@ -107,6 +109,8 @@ Inspect relevant files, then implement fully: no stubs or TODO shells. Edit/writ
 Before the first write, compare planned paths, criteria, requested recipes and remaining spend with the contract; stop if they do not fit. Before reporting, re-read changed paths and check scope, placeholders, generated artifacts and truthful verification without unrelated cleanup.
 
 Use exactly four final headings. Completed, Verification and Remaining Risks: at most 4 single-line bullets, each at most 240 characters. Files Changed: every actual project-relative path, one per bullet with no prose, or \`- None.\`. For each recipe run, Verification uses exactly \`recipe:<name> run:<run-id> outcome:SUCCESS\` or \`... outcome:FAILURE\`; never include logs. Do not repeat the task or criteria.
+
+After a soft-handoff steer, make the report useful to the fresh worker with these advisory-only prefixes when applicable: \`Work completed for: C1,C2\` and \`Decision: ...\` under Completed; \`Remaining criteria: C3,C4\` and \`Next: ...\` under Remaining Risks. C labels refer to the numbered acceptance list. These lines guide navigation only: they never assert acceptance, expand scope or replace machine evidence.
 
 The report is a handoff, never acceptance evidence. Do not claim final PASS or label criteria satisfied, met, passed, accepted or complete.
 
@@ -469,19 +473,34 @@ function parseWorkerCheckpointRequestV1(entry: unknown, expectedAttempt: number)
 	advisory: WorkerCheckpointAdvisoryV1;
 }> | undefined {
 	if (ownDataValue(entry, "type") !== "custom" || ownDataValue(entry, "customType") !== WORKER_CHECKPOINT_REQUEST_ENTRY_TYPE_V1) return undefined;
-	const data = exactDataRecord(ownDataValue(entry, "data"), [
+	const raw = ownDataValue(entry, "data");
+	const legacy = exactDataRecord(raw, [
 		"schema_version", "kind", "attempt", "completed_criteria", "remaining_criteria",
 	]);
+	const rich = legacy === undefined ? exactDataRecord(raw, [
+		"schema_version", "kind", "attempt", "completed_criteria", "remaining_criteria",
+		"completed_work", "key_decisions", "verification_notes", "remaining_risks", "next_actions",
+	]) : undefined;
+	const data = legacy ?? rich;
 	if (data === undefined || data.schema_version !== 1 || data.kind !== WORKER_CHECKPOINT_REQUEST_ENTRY_TYPE_V1
 		|| data.attempt !== expectedAttempt || !Array.isArray(data.completed_criteria) || !Array.isArray(data.remaining_criteria)) return undefined;
-	const lists = [data.completed_criteria, data.remaining_criteria];
-	if (lists.some((list) => list.length > 64 || !list.every((item) => typeof item === "string" && item.length > 0
+	const richLists = rich === undefined ? [] : [rich.completed_work, rich.key_decisions, rich.verification_notes, rich.remaining_risks, rich.next_actions];
+	const lists = [data.completed_criteria, data.remaining_criteria, ...richLists];
+	if (lists.some((list) => !Array.isArray(list) || list.length > 64 || !list.every((item) => typeof item === "string" && item.length > 0
 		&& Buffer.byteLength(item, "utf8") <= 400 && !/[\u0000-\u001f\u007f]/u.test(item)))) return undefined;
-	const advisory = {
+	const base = {
 		completed_criteria: [...data.completed_criteria].sort(),
 		remaining_criteria: [...data.remaining_criteria].sort(),
 	};
-	if (Buffer.byteLength(JSON.stringify(advisory), "utf8") > 4 * 1024) return undefined;
+	const advisory = rich === undefined ? base : buildWorkerCheckpointRichAdvisoryV1({
+		...base,
+		completed_work: rich.completed_work as string[],
+		key_decisions: rich.key_decisions as string[],
+		verification_notes: rich.verification_notes as string[],
+		remaining_risks: rich.remaining_risks as string[],
+		next_actions: rich.next_actions as string[],
+	});
+	if (advisory === undefined || Buffer.byteLength(JSON.stringify(advisory), "utf8") > 4 * 1024) return undefined;
 	return Object.freeze({ attempt: expectedAttempt, advisory: Object.freeze(advisory) });
 }
 
@@ -787,7 +806,7 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 	let taskText = baseTaskText;
 	if (options.continuationCapsule !== undefined) {
 		const capsule = JSON.stringify(options.continuationCapsule);
-		if (attempt < 2 || Buffer.byteLength(capsule, "utf8") > 4 * 1024) throw new Error("Worker continuation capsule is invalid");
+		if (attempt < 2 || Buffer.byteLength(capsule, "utf8") > WORKER_CHECKPOINT_CONTINUATION_CAPSULE_MAX_BYTES_V1) throw new Error("Worker continuation capsule is invalid");
 		taskText = `${baseTaskText}\n\nMachine continuation attempt: ${attempt}\n${capsule}`;
 	}
 	if (Buffer.byteLength(taskText, "utf8") > MAX_TASK_ARGUMENT_BYTES) {

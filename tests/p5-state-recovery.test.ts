@@ -706,10 +706,17 @@ function assistantUsage(totalTokens: number, overrides: Record<string, unknown> 
 	return { input: 10, output: 5, cacheRead: 20, cacheWrite: 0, totalTokens, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, ...overrides };
 }
 
-function messageEndEvent(totalTokens: number, overrides: Record<string, unknown> = {}): never {
+function messageEndEvent(
+	totalTokens: number,
+	overrides: Record<string, unknown> = {},
+	messageOverrides: Record<string, unknown> = {},
+): never {
 	return {
 		type: "message_end",
-		message: { role: "assistant", provider: WORKER_PROVIDER, model: WORKER_MODEL_ID, usage: assistantUsage(totalTokens, overrides) },
+		message: {
+			role: "assistant", provider: WORKER_PROVIDER, model: WORKER_MODEL_ID,
+			usage: assistantUsage(totalTokens, overrides), ...messageOverrides,
+		},
 	} as never;
 }
 
@@ -823,10 +830,25 @@ test("worker role sends exactly one hidden cumulative spend steer at the standar
 		"the steer is delivered before the machine checkpoint request",
 	);
 
-	// The next assistant message after the steer emits exactly one canonical
-	// machine checkpoint request. Further soft-band messages never duplicate
-	// either the steer or the checkpoint request.
+	// An intermediate assistant interval does not publish an empty advisory.
 	await handler(messageEndEvent(170_000), ctx);
+	assert.equal(stub.appendEntryCalls.filter((entry) =>
+		entry.customType === WORKER_CHECKPOINT_REQUEST_ENTRY_TYPE_V1).length, 0);
+	// The reliable four-heading terminal report emits exactly one canonical,
+	// rich machine checkpoint request. Further soft-band messages never
+	// duplicate either the steer or the checkpoint request.
+	await handler(messageEndEvent(170_000, {}, { stopReason: "stop", content: [{ type: "text", text: [
+		"## Completed",
+		"- Work completed for: C1",
+		"- Decision: preserve schema v1",
+		"## Files Changed",
+		"- None.",
+		"## Verification",
+		"- None.",
+		"## Remaining Risks",
+		"- Remaining criteria: C2",
+		"- Next: inspect current bytes",
+	].join("\n") }] }), ctx);
 	const checkpointRequests = stub.appendEntryCalls.filter((entry) =>
 		entry.customType === WORKER_CHECKPOINT_REQUEST_ENTRY_TYPE_V1);
 	assert.equal(checkpointRequests.length, 1);
@@ -834,8 +856,13 @@ test("worker role sends exactly one hidden cumulative spend steer at the standar
 		schema_version: 1,
 		kind: WORKER_CHECKPOINT_REQUEST_ENTRY_TYPE_V1,
 		attempt: 1,
-		completed_criteria: [],
-		remaining_criteria: [],
+		completed_criteria: ["C1"],
+		remaining_criteria: ["C2"],
+		completed_work: [],
+		key_decisions: ["preserve schema v1"],
+		verification_notes: [],
+		remaining_risks: [],
+		next_actions: ["inspect current bytes"],
 	});
 	await handler(messageEndEvent(170_000), ctx);
 	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 1, "the spend steer is one-shot");

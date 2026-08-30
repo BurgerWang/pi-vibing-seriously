@@ -1120,6 +1120,27 @@ timeout remains an operational failure path.
   next bounded worker. It does not commit a failed generation, create semantic
   REPAIR, or request user budget authority. Incomplete checkpoint persistence
   still requires `RECOVERY_REQUIRED`.
+- **Bounded rich advisory (wired):** acceptance criteria in the worker task are
+  numbered `C1`, `C2`, ... for compact cross-attempt references. After a soft
+  steer, the child extension waits for a reliable four-heading terminal report;
+  an intermediate tool-use message no longer publishes an empty checkpoint.
+  It extracts only bounded single-line `completed_work`, `key_decisions`,
+  `verification_notes`, `remaining_risks`, and `next_actions`, plus advisory
+  completed/remaining criterion references. Recognized credentials are redacted,
+  every item is at most 240 UTF-8 bytes, every category has at most four items,
+  and the complete advisory remains at most 4 KiB. A malformed terminal report
+  degrades to an empty advisory, while a hard boundary with no report uses the
+  controller's all-criteria-remaining fallback; neither case blocks automatic
+  continuation. The fresh-worker capsule is capped at 16 KiB and shows at most
+  twelve touched paths and recipe ids with explicit omission counts; the full
+  hash-bound lists remain in `worker-checkpoint-v1.json`.
+- **Authority boundary:** advisory criterion progress and prose are navigation,
+  not acceptance evidence. They cannot add paths, change the contract, grant a
+  write lease, prove a recipe result, or bypass final Sol review. The controller
+  still validates the checkpoint hash, delegation/contract/runtime identity,
+  parent link, workspace binding, write journal, current bytes and recipe
+  receipts before starting the successor. Legacy two-list v1 advisories remain
+  readable without migration.
 - **Profiles:** `standard` is the deterministic bounded default for every
   delegation without an explicit request; `extended` must be selected
   explicitly for a justified larger bounded slice. The public
