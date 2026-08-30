@@ -21,6 +21,8 @@ import {
 import type { WorkbenchMode } from "./mode-policy.ts";
 import { WORKBENCH_TOOL_METADATA, WORKBENCH_TOOL_PARAMETERS } from "./tool-catalog.ts";
 import { commanderBlockReason } from "./worker-policy.ts";
+import type { ExecFn } from "./config.ts";
+import { collectCheckpointResumeExecutionAuthorityV1 } from "./delegation-resume-authority.ts";
 
 type RepairToolExecuteV1 = ToolDefinition<
 	typeof WORKBENCH_TOOL_PARAMETERS.workbench_repair_delegation
@@ -35,6 +37,9 @@ export interface ExactRepairToolControllerV1 {
 	readonly getMode: () => WorkbenchMode;
 	readonly runtimeCurrentOrError: (ctx: ExtensionContext) => string | undefined;
 	readonly reconcileProjectAuthority: (projectRoot: string, now: string) => Promise<unknown>;
+	readonly exec?: ExecFn;
+	/** Optional deterministic seam; production uses strict durable checkpoint collection. */
+	readonly collectCheckpointResumeAuthority?: typeof collectCheckpointResumeExecutionAuthorityV1;
 }
 
 export interface ExactRepairToolExecutionHandleV1 {
@@ -87,6 +92,7 @@ export function registerExactRepairToolV1(
 	controller: ExactRepairToolControllerV1,
 ): ExactRepairToolExecutionHandleV1 {
 	const executeRepair = async (
+		toolCallId: string,
 		repairOf: string,
 		signal: Parameters<RepairToolExecuteV1>[2],
 		onUpdate: Parameters<RepairToolExecuteV1>[3],
@@ -106,6 +112,29 @@ export function registerExactRepairToolV1(
 
 		try {
 			const projectRoot = await controller.projectRootFor(ctx);
+			const collectCheckpoint = controller.collectCheckpointResumeAuthority
+				?? collectCheckpointResumeExecutionAuthorityV1;
+			const checkpoint = controller.exec === undefined ? { ok: false as const, code: "CHECKPOINT_NOT_RETRYABLE" } : await collectCheckpoint({
+				project_root: projectRoot,
+				delegation_id: repairOf,
+				exec: controller.exec,
+				session_entries: ctx.sessionManager.getEntries(),
+			});
+			if (checkpoint.ok) {
+				if (controller.execution.executeCheckpointRecovery === undefined) {
+					throw new Error("checkpoint recovery execution is unavailable");
+				}
+				return controller.execution.executeCheckpointRecovery(
+					toolCallId,
+					checkpoint.value,
+					signal,
+					onUpdate,
+					ctx,
+				);
+			}
+			if (checkpoint.code !== "CHECKPOINT_NOT_RETRYABLE" && checkpoint.code !== "CHECKPOINT_SUCCESSOR_REQUIRED") {
+				throw new Error(`checkpoint recovery ${checkpoint.code}`);
+			}
 			const input = {
 				project_root: projectRoot,
 				repair_of: repairOf,
@@ -146,13 +175,14 @@ export function registerExactRepairToolV1(
 		}
 	};
 
-	const execute: RepairToolExecuteV1 = (_toolCallId, params, signal, onUpdate, ctx) =>
-		executeRepair(params.delegation_id, signal, onUpdate, ctx, EXACT_REPAIR_TOOL_NAME_V1, false);
-	const executeDelegateAlias: DelegateWorkerExecuteV1 = (_toolCallId, params, signal, onUpdate, ctx) => {
+	const execute: RepairToolExecuteV1 = (toolCallId, params, signal, onUpdate, ctx) =>
+		executeRepair(toolCallId, params.delegation_id, signal, onUpdate, ctx, EXACT_REPAIR_TOOL_NAME_V1, false);
+	const executeDelegateAlias: DelegateWorkerExecuteV1 = (toolCallId, params, signal, onUpdate, ctx) => {
 		if (params.repair_of === undefined) {
 			throw new Error("workbench_delegate_worker: exact repair compatibility route requires repair_of");
 		}
 		return executeRepair(
+			toolCallId,
 			params.repair_of,
 			signal,
 			onUpdate,

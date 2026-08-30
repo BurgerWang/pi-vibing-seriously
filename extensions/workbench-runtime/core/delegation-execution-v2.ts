@@ -39,6 +39,7 @@ import {
 import {
 	finalizeDelegationChangeSetLifecycleV2,
 	prepareDelegationChangeSetLifecycleV2,
+	validatePreparedDelegationChangeSetLifecycleV2,
 	type FinalizedDelegationChangeSetLifecycleV2,
 	type PreparedDelegationChangeSetLifecycleV2,
 } from "./delegation-change-set-lifecycle.ts";
@@ -49,6 +50,7 @@ import {
 	persistCommittingDelegationTransaction,
 	persistPreparedDelegationTransaction,
 	persistRecoveryRequiredDelegationTransaction,
+	persistResumedRunningDelegationTransaction,
 	persistRunningDelegationTransaction,
 	publishDelegationWorkerCheckpointV1,
 	type DelegationTransactionStorageOptions,
@@ -105,6 +107,7 @@ import {
 	remainingWorkerBudgetV1,
 	validateWorkerCheckpointContinuationV1,
 	workerCheckpointContinuationCapsuleV1,
+	validateWorkerCheckpointV1,
 	type WorkerCheckpointV1,
 } from "./worker-checkpoint.ts";
 import { WORKBENCH_RUNTIME_BUILD_IDENTITY } from "./runtime-build-identity.ts";
@@ -121,6 +124,7 @@ import {
 	type WorkerCommandEffectRuntimeObservation,
 } from "./delegation-command-effect-provenance.ts";
 import type { WorkerWriteJournalRuntimeObservation } from "./worker-write-journal-runtime.ts";
+import type { CheckpointResumeExecutionAuthorityV1 } from "./delegation-resume-authority.ts";
 
 export type DelegationExecutionV2FailureCode =
 	| "invalid_input"
@@ -186,6 +190,7 @@ export interface ExecuteDelegationV2Input {
 	onPrepared?: (
 		state: DelegationTransactionRecord,
 		before: Readonly<DelegationWorkspaceGitFactsV2>,
+		prepared: Readonly<PreparedDelegationChangeSetLifecycleV2>,
 	) => void | Promise<void>;
 	/** Explicit argv-only execution dependency used by the default collector. */
 	exec?: ExecFn;
@@ -194,6 +199,8 @@ export interface ExecuteDelegationV2Input {
 	storageOptions?: DelegationTransactionStorageOptions;
 	/** Test seam for boot identity; storage remains bound to storageOptions. */
 	executionOwnerOptions?: Omit<DelegationExecutionOwnerOptionsV2, "storage_options">;
+	/** Exact same-transaction continuation collected and revalidated under the checkout writer lease. */
+	checkpointRecovery?: Readonly<CheckpointResumeExecutionAuthorityV1>;
 }
 
 interface DelegationExecutionV2Common {
@@ -558,17 +565,22 @@ function mergeCommandEffectObservations(
 		: { state: "observed" as const, code: "none" as const, entries: Object.freeze(entries) });
 }
 
-function aggregateWorkerAttempts(attempts: readonly WorkerRunResult[]): WorkerRunResult | undefined {
+function aggregateWorkerAttempts(
+	attempts: readonly WorkerRunResult[],
+	baselineUsage?: Readonly<WorkerUsage>,
+	baselineWriteObservation?: Readonly<WorkerWriteJournalRuntimeObservation>,
+): WorkerRunResult | undefined {
 	const latest = attempts.at(-1);
 	if (latest === undefined) return undefined;
 	const usage = zeroWorkerUsage();
+	if (baselineUsage !== undefined) addWorkerUsage(usage, baselineUsage);
 	let deniedWriteCount = 0;
 	let maxContextTokens = 0;
 	let softBudgetReached = false;
 	let hardBudgetExceeded = false;
 	let compactionCount = 0;
 	const compactionReasons: string[] = [];
-	let writeObservation: Readonly<WorkerWriteJournalRuntimeObservation> | undefined;
+	let writeObservation: Readonly<WorkerWriteJournalRuntimeObservation> | undefined = baselineWriteObservation;
 	let commandObservation: Readonly<WorkerCommandEffectRuntimeObservation> = {
 		state: "empty", code: "none", entries: [],
 	};
@@ -603,6 +615,26 @@ function aggregateWorkerAttempts(attempts: readonly WorkerRunResult[]): WorkerRu
 	};
 }
 
+async function recoveredCheckpointWriteObservation(
+	checked: CheckedInput,
+): Promise<Readonly<WorkerWriteJournalRuntimeObservation> | undefined> {
+	const read = await readWorkerWriteJournal({
+		project_root: checked.projectRoot,
+		delegation_id: checked.delegationId,
+		contract_hash: checked.contract.contract_hash,
+	});
+	if (!read.ok || read.value.state !== "OPEN" || read.value.operations.length === 0
+		|| read.value.operations.some((operation) => operation.status !== "completed")) return undefined;
+	const last = read.value.operations.at(-1);
+	return last?.status === "completed" ? Object.freeze({
+		state: "complete" as const,
+		tool: last.kind,
+		outcome: last.outcome,
+		code: "none" as const,
+		revision: read.value.revision,
+	}) : undefined;
+}
+
 function identityContentHash(identity: StreamingPathIdentity): string | null {
 	return identity.kind === "missing" ? null : identity.sha256;
 }
@@ -628,9 +660,13 @@ function guardChangesAreJournalBound(
 async function verifiedRecipeRunIds(
 	checked: CheckedInput,
 	observation: Readonly<WorkerCommandEffectRuntimeObservation>,
+	inherited: readonly string[] = [],
 ): Promise<string[] | undefined> {
 	if (!validateWorkerCommandEffectRuntimeObservation(observation) || observation.state === "failed") return undefined;
-	const runIds = observation.entries.flatMap((entry) => entry.run_id === null ? [] : [entry.run_id]).sort(byteCompare);
+	const runIds = [...new Set([
+		...inherited,
+		...observation.entries.flatMap((entry) => entry.run_id === null ? [] : [entry.run_id]),
+	])].sort(byteCompare);
 	if (!sortedUniqueStrings(runIds)) return undefined;
 	for (const runId of runIds) {
 		const receipt = await readStrictBoundCommandEffectReceipt({
@@ -655,6 +691,8 @@ async function buildDurableWorkerCheckpoint(
 	createdAt: string,
 	exec: ExecFn,
 	storageOptions: DelegationTransactionStorageOptions | undefined,
+	checkpointRuntimeIdentity = WORKBENCH_RUNTIME_BUILD_IDENTITY.source_hash,
+	inheritedRecipeRunIds: readonly string[] = [],
 ): Promise<Readonly<WorkerCheckpointV1> | undefined> {
 	const journalRead = await readWorkerWriteJournal({
 		project_root: checked.projectRoot,
@@ -690,7 +728,7 @@ async function buildDurableWorkerCheckpoint(
 		};
 	});
 	if (touchedPaths.some((entry) => entry === undefined)) return undefined;
-	const completedRecipeRunIds = await verifiedRecipeRunIds(checked, commandObservation);
+	const completedRecipeRunIds = await verifiedRecipeRunIds(checked, commandObservation, inheritedRecipeRunIds);
 	if (completedRecipeRunIds === undefined) return undefined;
 	const profile = worker.spendProfile === "extended" ? "extended" : "standard";
 	const remaining = remainingWorkerBudgetV1(
@@ -705,7 +743,7 @@ async function buildDurableWorkerCheckpoint(
 		contract_hash: checked.contract.contract_hash,
 		attempt,
 		parent_checkpoint_hash: parentCheckpointHash,
-		runtime_build_identity: WORKBENCH_RUNTIME_BUILD_IDENTITY.source_hash,
+		runtime_build_identity: checkpointRuntimeIdentity,
 		before_binding_hash: prepared.before_guard.workspace_guard_hash,
 		current_binding_hash: currentGuard.guard.workspace_guard_hash,
 		touched_paths: touchedPaths as NonNullable<(typeof touchedPaths)[number]>[],
@@ -722,37 +760,78 @@ async function buildDurableWorkerCheckpoint(
 	return published.ok && published.value.checkpoint_hash === built.value.checkpoint_hash ? published.value : undefined;
 }
 
+function validCheckpointRecoveryInput(
+	checked: CheckedInput,
+	value: unknown,
+): value is Readonly<CheckpointResumeExecutionAuthorityV1> {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const recovery = value as CheckpointResumeExecutionAuthorityV1;
+	if (recovery.schema_version !== 1 || recovery.kind !== "checkpoint-resume-execution-authority-v1"
+		|| recovery.delegation_id !== checked.delegationId
+		|| recovery.contract.contract_hash !== checked.contract.contract_hash
+		|| canonicalHash(recovery.contract) !== canonicalHash(checked.contract)
+		|| recovery.transaction.status !== "RECOVERY_REQUIRED"
+		|| recovery.transaction.delegation_id !== checked.delegationId
+		|| recovery.transaction.contract_hash !== checked.contract.contract_hash
+		|| recovery.transaction.worker_identity.provider !== checked.workerIdentity.provider
+		|| recovery.transaction.worker_identity.model !== checked.workerIdentity.model
+		|| recovery.transaction.worker_identity.worker_id !== checked.workerIdentity.worker_id
+		|| !validatePreparedDelegationChangeSetLifecycleV2(recovery.prepared)
+		|| recovery.prepared.project_root !== checked.projectRoot
+		|| recovery.prepared.delegation_id !== checked.delegationId
+		|| recovery.prepared.contract_hash !== checked.contract.contract_hash
+		|| !validateWorkerCheckpointV1(recovery.checkpoint)
+		|| recovery.checkpoint.machine_state !== "CHECKPOINTED"
+		|| recovery.checkpoint.delegation_id !== checked.delegationId
+		|| recovery.checkpoint.contract_hash !== checked.contract.contract_hash
+		|| recovery.checkpoint.before_binding_hash !== recovery.prepared.before_guard.workspace_guard_hash
+		|| workerCheckpointContinuationCapsuleV1(recovery.checkpoint) === undefined) return false;
+	const { authority_hash: supplied, ...withoutHash } = recovery;
+	return typeof supplied === "string" && supplied === canonicalHash(withoutHash);
+}
+
 /** Execute one fresh generation-1 delegation under the v2 transaction. */
 export async function executeDelegationV2(input: ExecuteDelegationV2Input): Promise<DelegationExecutionV2Result> {
 	const checked = checkInput(input);
 	if (checked === undefined) return failure("invalid_input", undefined, input);
+	const checkpointRecovery = input.checkpointRecovery;
+	if (checkpointRecovery !== undefined && !validCheckpointRecoveryInput(checked, checkpointRecovery)) {
+		return failure("invalid_input", checked, input);
+	}
 	const storageOptions = input.storageOptions;
 	const preparedAt = safeClock(input.clock);
 	if (preparedAt === undefined) return failure("prepare_failed", checked, input);
-	const prepared = await persistPreparedDelegationTransaction(checked.projectRoot, {
-		delegation_id: checked.delegationId,
-		task_kind: checked.contract.task_kind,
-		contract_hash: checked.contract.contract_hash,
-		allowed_paths: checked.contract.allowed_paths,
-		worker_identity: checked.workerIdentity,
-		generation: 1,
-		now: preparedAt,
-		...(checked.repairLineage === undefined ? {} : { repair_lineage: checked.repairLineage }),
-	}, storageOptions).catch(() => undefined);
-	if (prepared === undefined || !prepared.ok) return failure("prepare_failed", checked, input);
-	let state = prepared.value;
+	let state: DelegationTransactionRecord;
+	if (checkpointRecovery === undefined) {
+		const prepared = await persistPreparedDelegationTransaction(checked.projectRoot, {
+			delegation_id: checked.delegationId,
+			task_kind: checked.contract.task_kind,
+			contract_hash: checked.contract.contract_hash,
+			allowed_paths: checked.contract.allowed_paths,
+			worker_identity: checked.workerIdentity,
+			generation: 1,
+			now: preparedAt,
+			...(checked.repairLineage === undefined ? {} : { repair_lineage: checked.repairLineage }),
+		}, storageOptions).catch(() => undefined);
+		if (prepared === undefined || !prepared.ok) return failure("prepare_failed", checked, input);
+		state = prepared.value;
+	} else {
+		state = structuredClone(checkpointRecovery.transaction);
+	}
 	const ownerAt = safeClock(input.clock);
 	if (ownerAt === undefined) {
-		const aborted = await persistAbortedDelegationTransaction(checked.projectRoot, {
-			delegation_id: checked.delegationId,
-			contract_hash: checked.contract.contract_hash,
-			worker_identity: checked.workerIdentity,
-			expected_generation: state.generation,
-			expected_revision: state.revision,
-			now: preparedAt,
-			reason: RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.executionOwnerTimeUnavailable,
-		}, storageOptions).catch(() => undefined);
-		if (aborted?.ok) state = aborted.value;
+		if (checkpointRecovery === undefined) {
+			const aborted = await persistAbortedDelegationTransaction(checked.projectRoot, {
+				delegation_id: checked.delegationId,
+				contract_hash: checked.contract.contract_hash,
+				worker_identity: checked.workerIdentity,
+				expected_generation: state.generation,
+				expected_revision: state.revision,
+				now: preparedAt,
+				reason: RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.executionOwnerTimeUnavailable,
+			}, storageOptions).catch(() => undefined);
+			if (aborted?.ok) state = aborted.value;
+		}
 		return failure("start_failed", checked, input, { durable_state: state });
 	}
 	const ownerOptions: DelegationExecutionOwnerOptionsV2 = {
@@ -769,7 +848,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 		// No worker has been launched yet. The claim primitive marks absence only
 		// after a strict not-found observation or after removing the exact token
 		// created by this call. A foreign EEXIST owner is never removed here.
-		if (owner !== undefined && !owner.ok && owner.error.owner_absent === true) {
+		if (checkpointRecovery === undefined && owner !== undefined && !owner.ok && owner.error.owner_absent === true) {
 			state = await attemptPreparedAbort(
 				checked,
 				state,
@@ -784,36 +863,48 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 	try {
 	let changeSetPrepared: Readonly<PreparedDelegationChangeSetLifecycleV2>;
 	if (input.exec === undefined) {
-		state = await attemptPreparedAbort(checked, state, input.clock, storageOptions,
-			RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.changeSetPreparationFailed);
+		if (checkpointRecovery === undefined) {
+			state = await attemptPreparedAbort(checked, state, input.clock, storageOptions,
+				RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.changeSetPreparationFailed);
+		}
 		return failure("change_set_prepare_failed", checked, input, { durable_state: state });
 	}
-	try {
-		const preparedLifecycle = await prepareDelegationChangeSetLifecycleV2({
-			project_root: checked.projectRoot,
-			delegation_id: checked.delegationId,
-			contract_hash: checked.contract.contract_hash,
-			dependency_paths: [...checked.dependencyPaths],
-			exec: input.exec,
-		});
-		if (!preparedLifecycle.ok) throw new Error("change set prepare failed");
-		changeSetPrepared = preparedLifecycle.value;
-	} catch {
-		state = await attemptPreparedAbort(checked, state, input.clock, storageOptions,
-			RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.changeSetPreparationFailed);
-		return failure("change_set_prepare_failed", checked, input, { durable_state: state });
+	if (checkpointRecovery !== undefined) {
+		changeSetPrepared = checkpointRecovery.prepared;
+	} else {
+		try {
+			const preparedLifecycle = await prepareDelegationChangeSetLifecycleV2({
+				project_root: checked.projectRoot,
+				delegation_id: checked.delegationId,
+				contract_hash: checked.contract.contract_hash,
+				dependency_paths: [...checked.dependencyPaths],
+				exec: input.exec,
+			});
+			if (!preparedLifecycle.ok) throw new Error("change set prepare failed");
+			changeSetPrepared = preparedLifecycle.value;
+		} catch {
+			state = await attemptPreparedAbort(checked, state, input.clock, storageOptions,
+				RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.changeSetPreparationFailed);
+			return failure("change_set_prepare_failed", checked, input, { durable_state: state });
+		}
 	}
 	const preparedBeforeResult = derivePreparedDelegationWorkspaceBeforeV2(changeSetPrepared);
 	if (!preparedBeforeResult.ok) {
-		state = await attemptPreparedAbort(checked, state, input.clock, storageOptions,
-			RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.guardBeforeFailed);
+		if (checkpointRecovery === undefined) {
+			state = await attemptPreparedAbort(checked, state, input.clock, storageOptions,
+				RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.guardBeforeFailed);
+		}
 		return failure("change_set_prepare_failed", checked, input, { durable_state: state });
 	}
 	const preparedBefore = preparedBeforeResult.value;
 
-	if (input.onPrepared !== undefined) {
+	if (checkpointRecovery === undefined && input.onPrepared !== undefined) {
 		try {
-			await input.onPrepared(structuredClone(state), structuredClone(preparedBefore));
+			await input.onPrepared(
+				structuredClone(state),
+				structuredClone(preparedBefore),
+				structuredClone(changeSetPrepared),
+			);
 		} catch {
 			const abortedAt = safeClock(input.clock);
 			if (abortedAt !== undefined) {
@@ -834,31 +925,57 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 
 	const runningAt = safeClock(input.clock);
 	if (runningAt === undefined) {
-		state = await attemptPreparedAbort(checked, state, input.clock, storageOptions,
-			RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.runningTimeUnavailable);
+		if (checkpointRecovery === undefined) {
+			state = await attemptPreparedAbort(checked, state, input.clock, storageOptions,
+				RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.runningTimeUnavailable);
+		}
 		return failure("start_failed", checked, input, { durable_state: state });
 	}
-	const running = await persistRunningDelegationTransaction(checked.projectRoot, {
+	const runningInput = {
 		delegation_id: checked.delegationId,
 		contract_hash: checked.contract.contract_hash,
 		worker_identity: checked.workerIdentity,
 		expected_generation: state.generation,
 		expected_revision: state.revision,
 		now: runningAt,
-	}, storageOptions).catch(() => undefined);
+	};
+	const running = await (checkpointRecovery === undefined
+		? persistRunningDelegationTransaction(checked.projectRoot, runningInput, storageOptions)
+		: persistResumedRunningDelegationTransaction(checked.projectRoot, runningInput, storageOptions))
+		.catch(() => undefined);
 	if (running === undefined || !running.ok) {
-		state = await attemptPreparedAbort(checked, state, input.clock, storageOptions,
-			RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.runningPersistFailed);
+		if (checkpointRecovery === undefined) {
+			state = await attemptPreparedAbort(checked, state, input.clock, storageOptions,
+				RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2.runningPersistFailed);
+		}
 		return failure("start_failed", checked, input, { durable_state: state });
 	}
 	state = running.value;
+	const baselineWriteObservation = checkpointRecovery === undefined
+		? undefined
+		: await recoveredCheckpointWriteObservation(checked);
+	if (checkpointRecovery !== undefined && baselineWriteObservation === undefined) {
+		state = await attemptRecovery(checked, state, input.clock, storageOptions,
+			RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed);
+		return failure("checkpoint_failed", checked, input, { durable_state: state });
+	}
 
 	let worker: WorkerRunResult | undefined;
 	const workerAttempts: WorkerRunResult[] = [];
-	let attempt = 1;
-	let initialSpendState: Readonly<{ turns: number; totalTokens: number; outputTokens: number }> | undefined;
-	let continuationCapsule: Readonly<Record<string, unknown>> | undefined;
-	let parentCheckpointHash: string | null = null;
+	let attempt = checkpointRecovery === undefined ? 1 : checkpointRecovery.checkpoint.attempt + 1;
+	let initialSpendState: Readonly<{ turns: number; totalTokens: number; outputTokens: number }> | undefined =
+		checkpointRecovery === undefined ? undefined : {
+			turns: checkpointRecovery.checkpoint.cumulative_turns,
+			totalTokens: checkpointRecovery.checkpoint.cumulative_usage.totalTokens,
+			outputTokens: checkpointRecovery.checkpoint.cumulative_usage.output,
+		};
+	let continuationCapsule: Readonly<Record<string, unknown>> | undefined = checkpointRecovery === undefined
+		? undefined
+		: workerCheckpointContinuationCapsuleV1(checkpointRecovery.checkpoint);
+	let parentCheckpointHash: string | null = checkpointRecovery?.checkpoint.checkpoint_hash ?? null;
+	const checkpointRuntimeIdentity = checkpointRecovery?.checkpoint.runtime_build_identity
+		?? WORKBENCH_RUNTIME_BUILD_IDENTITY.source_hash;
+	const inheritedRecipeRunIds = checkpointRecovery?.checkpoint.completed_recipe_run_ids ?? [];
 	for (;;) {
 		let currentAttempt: WorkerRunResult;
 		try {
@@ -901,7 +1018,11 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 			return failure("worker_identity_invalid", checked, input, { durable_state: state });
 		}
 		workerAttempts.push(currentAttempt);
-		const aggregate = aggregateWorkerAttempts(workerAttempts);
+		const aggregate = aggregateWorkerAttempts(
+			workerAttempts,
+			checkpointRecovery?.checkpoint.cumulative_usage,
+			baselineWriteObservation,
+		);
 		if (aggregate === undefined || aggregate.commandEffectObservation === undefined) {
 			state = await attemptRecovery(checked, state, input.clock, storageOptions,
 				RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed);
@@ -915,6 +1036,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 			const checkpoint: Readonly<WorkerCheckpointV1> | undefined = checkpointAt === undefined ? undefined : await buildDurableWorkerCheckpoint(
 				checked, changeSetPrepared, aggregate, aggregate.commandEffectObservation, attempt,
 				parentCheckpointHash, "PAUSED_BUDGET", checkpointAt, input.exec, storageOptions,
+				checkpointRuntimeIdentity, inheritedRecipeRunIds,
 			);
 			if (checkpoint === undefined) {
 				state = await attemptRecovery(checked, state, input.clock, storageOptions,
@@ -942,6 +1064,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 			const checkpoint: Readonly<WorkerCheckpointV1> | undefined = checkpointAt === undefined ? undefined : await buildDurableWorkerCheckpoint(
 				checked, changeSetPrepared, aggregate, aggregate.commandEffectObservation, attempt,
 				parentCheckpointHash, "CHECKPOINTED", checkpointAt, input.exec, storageOptions,
+				checkpointRuntimeIdentity, inheritedRecipeRunIds,
 			);
 			if (checkpoint === undefined) {
 				state = await attemptRecovery(checked, state, input.clock, storageOptions,
@@ -953,7 +1076,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 			if (!currentGuard.ok || capsule === undefined || !validateWorkerCheckpointContinuationV1(checkpoint, {
 				delegation_id: checked.delegationId,
 				contract_hash: checked.contract.contract_hash,
-				runtime_build_identity: WORKBENCH_RUNTIME_BUILD_IDENTITY.source_hash,
+				runtime_build_identity: checkpointRuntimeIdentity,
 				expected_attempt: attempt,
 				parent_checkpoint_hash: parentCheckpointHash,
 				before_binding_hash: changeSetPrepared.before_guard.workspace_guard_hash,

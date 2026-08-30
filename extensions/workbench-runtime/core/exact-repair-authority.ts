@@ -88,7 +88,7 @@ export interface ExactRepairTerminalNegativeAuthorityV1 extends ExactRepairComma
  */
 export interface ExactRepairRawLineageAuthorityV1 extends ExactRepairCommandAuthorityBaseV1 {
 	readonly authority_kind: "raw-lineage-retry";
-	readonly raw_tip_retry_kind: "ABORTED" | "EMPTY_RECOVERY" | "FINALIZATION_RECOVERY";
+	readonly raw_tip_retry_kind: "ABORTED" | "EMPTY_RECOVERY" | "CHECKPOINT_RECOVERY" | "FINALIZATION_RECOVERY";
 	readonly root_delegation_id: string;
 	readonly root_authority_kind: "semantic-repair" | "terminal-negative-repair";
 	readonly root_transaction_hash: string;

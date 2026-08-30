@@ -231,8 +231,10 @@ export function validateWorkerCheckpointContinuationV1(
 		|| checkpoint.contract_hash !== input.contract_hash || checkpoint.runtime_build_identity !== input.runtime_build_identity
 		|| checkpoint.attempt !== input.expected_attempt || checkpoint.parent_checkpoint_hash !== input.parent_checkpoint_hash
 		|| checkpoint.before_binding_hash !== input.before_binding_hash || checkpoint.current_binding_hash !== input.current_binding_hash
-		|| checkpoint.touched_paths.some((entry) => !input.allowed_paths.some((rule) =>
-			rule.endsWith("/**") ? entry.path === rule.slice(0, -3) || entry.path.startsWith(`${rule.slice(0, -3)}/`) : entry.path === rule))) return false;
+		|| checkpoint.touched_paths.some((entry) => !input.allowed_paths.some((rule) => {
+			const subtree = rule.endsWith("/**") ? rule.slice(0, -3) : rule.endsWith("/") ? rule.slice(0, -1) : undefined;
+			return subtree === undefined ? entry.path === rule : entry.path === subtree || entry.path.startsWith(`${subtree}/`);
+		}))) return false;
 	return Object.values(checkpoint.remaining_budget).some((remaining) => typeof remaining === "number" && remaining > 0);
 }
 

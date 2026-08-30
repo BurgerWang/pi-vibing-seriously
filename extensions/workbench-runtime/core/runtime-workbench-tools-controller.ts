@@ -34,6 +34,7 @@ import {
 	readDelegationTransactionV2,
 } from "./delegation-transaction-storage.ts";
 import { collectFinalizationRepairRebaseAuthorityV1 } from "./delegation-repair-rebase.ts";
+import type { LifecycleActionSnapshotV2 } from "./delegation-lifecycle-resolver.ts";
 import { registerExactRepairCommandV1 } from "./exact-repair-command.ts";
 import { runExactRepairServiceV1 } from "./exact-repair-service.ts";
 import { readExactRepairSuccessorV1 } from "./exact-repair-successor.ts";
@@ -78,6 +79,7 @@ export interface RuntimeWorkbenchToolsControllerV1 {
 	readonly exec: ExecFn;
 	readonly secrets: readonly string[];
 	readonly getMode: () => WorkbenchMode;
+	readonly getLifecycleActionSnapshot: () => Readonly<LifecycleActionSnapshotV2> | undefined;
 	readonly getIdentity: () => { readonly provider?: string; readonly model?: string };
 	readonly workerRoleContext: WorkerRoleContext;
 	readonly workerWriteJournalRuntime: WorkerWriteJournalRuntime;
@@ -212,6 +214,7 @@ export function registerRuntimeWorkbenchToolsV1(
 		exec: controller.exec,
 		secrets: controller.secrets,
 		getMode: controller.getMode,
+		getLifecycleActionSnapshot: controller.getLifecycleActionSnapshot,
 		runtimeCurrentOrError: () => runtimeFreshnessError(false),
 		compactionPending: controller.compactionPending,
 		projectRootFor: controller.projectRootFor,
@@ -370,6 +373,7 @@ export function registerRuntimeWorkbenchToolsV1(
 		getMode: controller.getMode,
 		runtimeCurrentOrError: () => runtimeFreshnessError(true),
 		reconcileProjectAuthority: controller.delegationSession.reconcileProjectAuthority,
+		exec: controller.exec,
 	});
 	executeModelRepairAlias = exactRepairToolExecution.executeDelegateAlias;
 	if (automaticDeliveryContinuationEnabled) automaticDeliveryContinuation.registerToolResultLocatorCaptureBeforeMiddleware();

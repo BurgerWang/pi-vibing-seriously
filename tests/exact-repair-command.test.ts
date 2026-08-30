@@ -832,6 +832,7 @@ test("exact repair can restore its own malformed verification catalog through bo
 					preparedCallbacks += 1;
 					throw new Error("intentional worker boundary after verification preflights");
 				},
+				persistResumeAuthority: async () => ({ ok: true, value: {} }) as never,
 				completeDefaultDelivery: async () => { throw new Error("must not deliver"); },
 				buildTrustedRecoveryAuthority: async () => undefined,
 			},

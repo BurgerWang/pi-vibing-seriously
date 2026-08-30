@@ -39,7 +39,10 @@ import {
 	isRecoverableUnpublishedPathAuthorityCandidateV1,
 	readRecoverableUnpublishedPathAuthorityV1,
 } from "./recoverable-unpublished-path-authority.ts";
-import { readStrictRetryableRawRepairEvidenceV1 } from "./delegation-execution-owner.ts";
+import {
+	readStrictRetryableRawRepairEvidenceV1,
+	strictRawRepairRequiresCurrentByteRebaseV1,
+} from "./delegation-execution-owner.ts";
 
 const BLOCKER_DIR_NAME = "blocker-closures-v2";
 const EMPTY_REPAIR_ATTEMPT_SUPERSESSION_DIR_NAME = "empty-repair-attempt-supersessions-v1";
@@ -362,7 +365,7 @@ async function resolveInactiveBlockerRelevantPathsV2(
 	// project authority graph deliberately rewinds to the parent.
 	if (transaction.repair_lineage !== undefined && transaction.committed_proof === null) {
 		const emptyAttempt = await readStrictRetryableRawRepairEvidenceV1(projectRoot, transaction);
-		if (emptyAttempt.ok && emptyAttempt.value.retry_kind !== "FINALIZATION_RECOVERY") {
+		if (emptyAttempt.ok && !strictRawRepairRequiresCurrentByteRebaseV1(emptyAttempt.value.retry_kind)) {
 			return { ok: true, value: { paths: [], journal_before: [] } };
 		}
 		if (!emptyAttempt.ok && emptyAttempt.code === "STORAGE_FAILURE") {
@@ -605,6 +608,18 @@ export async function readDelegationInactiveBlockerClosureV2(
 	}
 	if (!isEmptyRepairAttemptSupersessionCandidateV1(transaction)) {
 		return { ok: true, value: undefined };
+	}
+	// A completed-write raw recovery is a readable unresolved retry tip, not an
+	// empty attempt and not corrupt authority. It has no closure receipt to
+	// read: exact retry first rebinds the current bytes to the journal. Avoid
+	// routing it through the zero-path supersession resolver, which would
+	// otherwise misclassify an OPEN checkpoint journal as invalid authority.
+	const rawAttempt = await readStrictRetryableRawRepairEvidenceV1(projectRoot, transaction);
+	if (rawAttempt.ok && strictRawRepairRequiresCurrentByteRebaseV1(rawAttempt.value.retry_kind)) {
+		return { ok: true, value: undefined };
+	}
+	if (!rawAttempt.ok && rawAttempt.code === "STORAGE_FAILURE") {
+		return { ok: false, error: { code: "storage_failure" } };
 	}
 	resolved ??= await resolveInactiveBlockerRelevantPathsV2(projectRoot, transaction);
 	if (!resolved.ok) return resolved;

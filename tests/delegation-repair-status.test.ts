@@ -227,7 +227,7 @@ test("an eligible lineaged INTERRUPTED tip routes to q-review instead of generic
 	assert.match(delegationNextActionTextV1(state, projected) ?? "", new RegExp(`workbench_review_worker_diff with delegation_id=${ID}`));
 });
 
-test("ineligible lineageless FAILED authority remains on strict recovery and never invents q-review", async () => {
+test("a lineageless attributed zero-delta failure is satisfied and never becomes recovery noise", async () => {
 	const projected = await readDelegationRepairStatusV1("/tmp/project", state, (async () => {
 		throw new Error("unused");
 	}) as ExecFn, {
@@ -236,8 +236,11 @@ test("ineligible lineageless FAILED authority remains on strict recovery and nev
 		collectBinding: async () => ({ status: "fresh", hash: HASH, kind: "changeset-relevance-v2" }),
 		readCommittedGeneration: async () => ({ ok: true, value: terminalCommitted("FAILED", []) }),
 	});
-	assert.equal(projected.kind, "delegation_recovery");
+	assert.equal(projected.kind, "none");
+	assert.equal(projected.resolution?.state, "SATISFIED_NO_DELTA");
+	assert.equal(projected.resolution?.primary_action.action, "CLOSE_SATISFIED_NO_DELTA");
 	assert.doesNotMatch(delegationNextActionTextV1(state, projected) ?? "", /q-review/u);
+	assert.doesNotMatch(delegationNextActionTextV1(state, projected) ?? "", /strict path-lane admission/u);
 });
 
 test("binding conflict and project-chain invalidity never advertise an executable repair", async () => {

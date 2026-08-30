@@ -185,6 +185,7 @@ function controller(input: {
 			readRecoverableUnpublished: async () => ({ ok: false, error: { code: "not_recoverable" } }),
 			readLegacyLedger: async () => null,
 			executeDelegation: input.executeDelegation,
+			persistResumeAuthority: async () => ({ ok: true, value: {} }) as never,
 			completeDefaultDelivery: input.completeDefaultDelivery ?? (async () => { throw new Error("delivery must not run"); }),
 			buildTrustedRecoveryAuthority: async () => ({}),
 		},

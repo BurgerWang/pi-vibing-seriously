@@ -15,6 +15,7 @@ import {
 	parseDelegationTransaction,
 	publishDelegationCommit,
 	requireDelegationRecovery,
+	resumeDelegationTransaction,
 	reviewDelegationTransaction,
 	serializeDelegationTransaction,
 	startDelegationTransaction,
@@ -222,6 +223,26 @@ test("implementation follows PREPARED → RUNNING → COMMITTING → PENDING_REV
 	assert.deepEqual(states.map((state) => state.revision), [0, 1, 2, 3, 4]);
 	assert.equal(states[3]!.committed_proof?.contract_hash, CONTRACT_HASH, "published proof binds the approved contract");
 	assert.equal(states[4]!.review?.transaction_revision, 3);
+});
+
+test("checkpoint recovery resumes the same transaction with a monotonic revision", () => {
+	const active = running();
+	const recovery = ok(requireDelegationRecovery(active, {
+		...cas(active, T2),
+		reason: "worker runner failed before terminal facts",
+	}));
+	assert.equal(recovery.revision, 2);
+	const resumed = ok(resumeDelegationTransaction(recovery, cas(recovery, T3)));
+	assert.equal(resumed.status, "RUNNING");
+	assert.equal(resumed.revision, 3);
+	assert.equal(resumed.recovery_reason, null);
+	assert.equal(parseDelegationTransaction(resumed).ok, true);
+	assert.equal(resumeDelegationTransaction(recovery, {
+		...cas(recovery, T3),
+		expected_revision: recovery.revision - 1,
+	}).ok, false);
+	const unrelated = ok(requireDelegationRecovery(active, { ...cas(active, T2), reason: "ambiguous child state" }));
+	assert.equal(resumeDelegationTransaction(unrelated, cas(unrelated, T3)).ok, false);
 });
 
 test("closed worker failure facts publish attributed partial work as non-reviewable INTERRUPTED", () => {

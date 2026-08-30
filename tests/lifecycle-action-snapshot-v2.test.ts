@@ -14,7 +14,9 @@ import {
 } from "../extensions/workbench-runtime/core/delegation-lifecycle-resolver.ts";
 import {
 	lifecycleActionSnapshotCommandV2,
+	lifecycleActionStatusLinesV2,
 	lifecycleActionSnapshotTextV2,
+	lifecycleActionTurnDirectiveV2,
 } from "../extensions/workbench-runtime/core/agent-next-action.ts";
 import { computeActiveToolsForLifecycleSnapshotV2, DEV_TOOLS } from "../extensions/workbench-runtime/core/mode-policy.ts";
 import { buildWorkerCheckpointV1, remainingWorkerBudgetV1 } from "../extensions/workbench-runtime/core/worker-checkpoint.ts";
@@ -124,6 +126,9 @@ test("a stale finalized slice exposes the guarded fresh-successor lane instead o
 	assert.equal(tools.includes("workbench_delegate_worker"), true);
 	assert.equal(tools.includes("workbench_review_worker_diff"), false);
 	assert.equal(tools.includes("edit"), false);
+	const directive = lifecycleActionTurnDirectiveV2(built.value, tools);
+	assert.match(directive ?? "", /implementation contract must require a real in-scope delta/u);
+	assert.match(directive ?? "", /use task_kind=diagnosis/u);
 });
 
 test("checkpoint and budget pause override ACTIVE without creating semantic repair", () => {
@@ -132,8 +137,15 @@ test("checkpoint and budget pause override ACTIVE without creating semantic repa
 	assert.equal(continuing.ok, true);
 	if (!continuing.ok) return;
 	assert.equal(continuing.value.action, "CONTINUE_CHECKPOINT");
+	assert.equal(continuing.value.tool, "workbench_repair_delegation");
+	assert.deepEqual(continuing.value.arguments, { delegation_id: ID });
 	assert.equal(continuing.value.safe_automatic, true);
 	assert.equal(continuing.value.authorization, "EXISTING");
+	const directive = lifecycleActionTurnDirectiveV2(continuing.value, ["read", "workbench_repair_delegation"]);
+	assert.match(directive ?? "", /Fresh Workbench lifecycle facts for this turn/u);
+	assert.match(directive ?? "", /"tool_active":true/u);
+	assert.match(directive ?? "", new RegExp(`call the listed exact tool with the supplied delegation_id`, "u"));
+	assert.doesNotMatch(directive ?? "", /invent or reconstruct a new contract.*allowed_paths/u);
 
 	const paused = buildLifecycleActionSnapshotV2({ project_root: "/project", mode: "DEV", resolution: active, checkpoint: checkpoint(64) });
 	assert.equal(paused.ok, true);
@@ -141,6 +153,16 @@ test("checkpoint and budget pause override ACTIVE without creating semantic repa
 	assert.equal(paused.value.action, "PAUSED_BUDGET");
 	assert.equal(paused.value.authorization, "USER_REQUIRED");
 	assert.equal(lifecycleActionSnapshotTextV2(paused.value).includes("repair"), false);
+	assert.deepEqual(lifecycleActionStatusLinesV2(paused.value), [
+		"lifecycle v2 : PAUSED_BUDGET",
+		"typed action : PAUSED_BUDGET (PAUSED_BUDGET)",
+		"next action  : budget is paused; explicit user authorization is required to extend or split the task",
+	]);
+	const pausedDirective = lifecycleActionTurnDirectiveV2(paused.value, ["read", "workbench_delegation_status"]);
+	assert.match(pausedDirective ?? "", /Stop execution and request the exact explicit user authorization/u);
+	assert.match(pausedDirective ?? "", /do not call status as a substitute for authorization/u);
+	assert.match(pausedDirective ?? "", /do not create a successor/u);
+	assert.match(pausedDirective ?? "", /"tool":null/u);
 });
 
 test("executor rejects stale authority or a different exact target and never substitutes another action", () => {

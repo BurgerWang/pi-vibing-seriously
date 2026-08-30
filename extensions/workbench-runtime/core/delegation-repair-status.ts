@@ -24,13 +24,17 @@ import {
 	readDelegationReviewV2,
 	readDelegationTerminalNegativeSolAuthorityV1,
 } from "./delegation-transaction-storage.ts";
-import { collectTerminalRepairRebaseAuthorityV1 } from "./delegation-repair-rebase.ts";
+import {
+	collectFinalizationRepairRebaseAuthorityV1,
+	collectTerminalRepairRebaseAuthorityV1,
+} from "./delegation-repair-rebase.ts";
 import { recoverExactRepairCommandAuthorityV1 } from "./exact-repair-authority.ts";
 import { recoverRawLineageExactRepairAuthorityV1 } from "./exact-repair-raw-lineage-authority.ts";
 import {
 	DELEGATION_LIFECYCLE_EVENT_KIND_V1,
 	delegationLifecycleSnapshotFromCompatibilityProjectionV1,
 	delegationLifecycleSnapshotFromExactRepairAuthorityV1,
+	delegationLifecycleSnapshotFromInactiveBlockerClosureV1,
 	delegationLifecycleSnapshotFromReviewCandidateV1,
 	resolveDelegationLifecycleV1,
 	type DelegationLifecycleAttemptV1,
@@ -50,6 +54,7 @@ export interface DelegationRepairStatusReaderServicesV1 {
 	readReview?: typeof readDelegationReviewV2;
 	readTerminalNegativeRepair?: typeof readDelegationTerminalNegativeSolAuthorityV1;
 	collectTerminalRebase?: typeof collectTerminalRepairRebaseAuthorityV1;
+	collectFinalizationRebase?: typeof collectFinalizationRepairRebaseAuthorityV1;
 }
 
 const DEFAULT_READER_SERVICES = Object.freeze({
@@ -61,6 +66,7 @@ const DEFAULT_READER_SERVICES = Object.freeze({
 	readReview: readDelegationReviewV2,
 	readTerminalNegativeRepair: readDelegationTerminalNegativeSolAuthorityV1,
 	collectTerminalRebase: collectTerminalRepairRebaseAuthorityV1,
+	collectFinalizationRebase: collectFinalizationRepairRebaseAuthorityV1,
 }) satisfies DelegationRepairStatusReaderServicesV1;
 
 type V2Observation = Extract<DelegationAuthorityObservationV2, { kind: "v2" }>;
@@ -477,6 +483,12 @@ async function hasExecutableExactRepairAuthorityV1(input: {
 		project_root: input.projectRoot,
 		repair_of: input.delegationId,
 		collectCurrentBinding: (root, id) => input.services.collectBinding(root, id, input.exec),
+		collectFinalizationRebase: (root, transaction) =>
+			(input.services.collectFinalizationRebase ?? collectFinalizationRepairRebaseAuthorityV1)({
+				projectRoot: root,
+				transaction,
+				exec: input.exec,
+			}),
 	});
 	return recovered.ok ? fromAuthority(recovered.value) : undefined;
 }
@@ -547,6 +559,29 @@ export async function readDelegationRepairStatusV1(
 					delegationId,
 					code: committed.ok ? "terminal_negative_authority_mismatch" : committed.error.code,
 				});
+			}
+			if (authority.transactionStatus === "FAILED" && authority.repairLineage === undefined &&
+				authority.semanticRepair === undefined &&
+				committed.value.state.terminal_outcome?.change_set_status === "ATTRIBUTED" &&
+				committed.value.state.terminal_outcome.changed_paths.length === 0) {
+				const snapshot = delegationLifecycleSnapshotFromInactiveBlockerClosureV1({
+					delegation_id: delegationId,
+					source_authority: { state: committed.value.state, proof: committed.value.proof },
+					affected_paths: [],
+					relevant_paths_clean: true,
+					execution_active: false,
+					empty_attempt: false,
+					closed: false,
+				});
+				return {
+					kind: "none",
+					resolution: resolveDelegationLifecycleV1(snapshot, {
+						schema_version: 1,
+						kind: DELEGATION_LIFECYCLE_EVENT_KIND_V1,
+						event: "OBSERVE",
+						expected_snapshot_hash: null,
+					}),
+				};
 			}
 			terminalNegativeReviewEligible = isDelegationTerminalNegativeReviewEligibleFromCommittedV1(
 				committed.value.state,

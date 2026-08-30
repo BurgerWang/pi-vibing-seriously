@@ -326,6 +326,47 @@ test("control artifacts are separately bounded and cannot change the guard hash;
 	}
 });
 
+test("generated Python cache bytecode is non-authoritative while source-like siblings and legacy guards remain valid", async () => {
+	const root = await tempProject();
+	try {
+		const pyc = "src/pkg/__pycache__/module.cpython-314.pyc";
+		const relevantPaths = ["src/pkg/__pycache__/module.py", "src/pkg/module.pyc"];
+		const collected = success(await collectWorkspaceGuard({
+			project_root: root,
+			exec: fakeExec({ statusStdout: statusOutput([
+				{ status: "??", path: pyc },
+				...relevantPaths.map((path) => ({ status: "??", path })),
+			]) }),
+		}));
+		assert.deepEqual(collected.entries.map((entry) => entry.path), relevantPaths);
+		assert.deepEqual(collected.irrelevant_artifact_paths, [pyc]);
+		assert.equal(validateWorkspaceGuard(collected), true);
+
+		const legacyEntry = {
+			path: pyc,
+			status: "??",
+			identity: { kind: "missing" as const },
+		};
+		const legacyEntries = [...collected.entries, legacyEntry].sort((left, right) =>
+			Buffer.from(left.path, "utf8").compare(Buffer.from(right.path, "utf8")));
+		const legacy = {
+			...collected,
+			entries: legacyEntries,
+			irrelevant_artifact_paths: [],
+			meter: {
+				...collected.meter,
+				relevant_paths: legacyEntries.length,
+				irrelevant_paths: 0,
+				stat_calls: legacyEntries.length * 2,
+			},
+			workspace_guard_hash: computeWorkspaceGuardHash(collected.git_head, legacyEntries),
+		};
+		assert.equal(validateWorkspaceGuard(legacy), true, "pre-classification guards stay readable");
+	} finally {
+		await cleanup(root);
+	}
+});
+
 test("workspace guard hash is canonical across object key insertion order without mutating inputs", () => {
 	const canonicalEntries = [{
 		path: "src/live.ts",

@@ -5,6 +5,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 import type { DelegateWorkerExecuteV1 } from "../extensions/workbench-runtime/core/delegate-tool-controller.ts";
 import type { ExactRepairCommandAuthorityV1 } from "../extensions/workbench-runtime/core/exact-repair-authority.ts";
+import type { CheckpointResumeExecutionAuthorityV1 } from "../extensions/workbench-runtime/core/delegation-resume-authority.ts";
 import { registerExactRepairToolV1 } from "../extensions/workbench-runtime/core/exact-repair-tool-controller.ts";
 
 const PARENT = "20260827-192913-w7xf";
@@ -16,6 +17,7 @@ function context(): ExtensionContext {
 		model: { provider: "openai-codex", id: "gpt-5.6-sol", api: "responses" },
 		isProjectTrusted: () => true,
 		signal: undefined,
+		sessionManager: { getEntries: () => [] },
 	} as unknown as ExtensionContext;
 }
 
@@ -156,4 +158,46 @@ test("exact repair replay returns the same successor without a second worker", a
 	assert.equal(replay.details.delegation_id, CHILD);
 	assert.equal(replay.details.replayed, true);
 	assert.equal(testHarness.facts().executions, 1);
+});
+
+test("the exact repair tool resumes a durable checkpoint before considering a successor", async () => {
+	let registered: { execute: (...args: any[]) => Promise<any> } | undefined;
+	let checkpointExecutions = 0;
+	let semanticServiceReads = 0;
+	const checkpointAuthority = {
+		schema_version: 1,
+		kind: "checkpoint-resume-execution-authority-v1",
+		delegation_id: PARENT,
+	} as unknown as CheckpointResumeExecutionAuthorityV1;
+	registerExactRepairToolV1({
+		pi: { registerTool: (tool: any) => { registered = tool; } },
+		execution: {
+			execute: (async () => { throw new Error("broad delegate execute must not be used"); }) as DelegateWorkerExecuteV1,
+			executeExactRepair: (async () => { throw new Error("successor execution must not be used"); }) as never,
+			executeCheckpointRecovery: (async (_toolCallId: string, received: Readonly<CheckpointResumeExecutionAuthorityV1>) => {
+				checkpointExecutions += 1;
+				assert.equal(received, checkpointAuthority);
+				return { content: [{ type: "text", text: "checkpoint resumed" }], details: { ok: true, status: "PENDING_REVIEW" } };
+			}) as never,
+		},
+		serviceDependencies: {
+			readCommittedGeneration: (async () => { semanticServiceReads += 1; throw new Error("must not read semantic authority"); }) as never,
+			readReview: (async () => { throw new Error("must not read review"); }) as never,
+			recoverAuthority: (() => { throw new Error("must not recover successor authority"); }) as never,
+			readSuccessor: (async () => { throw new Error("must not read successor"); }) as never,
+			collectCurrentBinding: async () => ({ status: "unavailable" }),
+		},
+		trustedOrError: () => undefined,
+		projectRootFor: async () => "/project",
+		getMode: () => "DEV",
+		runtimeCurrentOrError: () => undefined,
+		reconcileProjectAuthority: async () => {},
+		exec: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
+		collectCheckpointResumeAuthority: async () => ({ ok: true, value: checkpointAuthority }),
+	});
+	assert.ok(registered);
+	const result = await registered!.execute("checkpoint-call", { delegation_id: PARENT }, undefined, undefined, context());
+	assert.equal(result.details.status, "PENDING_REVIEW");
+	assert.equal(checkpointExecutions, 1);
+	assert.equal(semanticServiceReads, 0);
 });

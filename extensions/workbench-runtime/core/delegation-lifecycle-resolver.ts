@@ -701,8 +701,8 @@ export function buildLifecycleActionSnapshotV2(
 			: {
 				action: "CONTINUE_CHECKPOINT" as const,
 				exact_target: { delegation_id: checkpoint.delegation_id, bound_hash: checkpoint.checkpoint_hash },
-				tool: null,
-				arguments: null,
+				tool: "workbench_repair_delegation",
+				arguments: { delegation_id: checkpoint.delegation_id },
 				safe_automatic: true,
 				authorization: "EXISTING" as const,
 				retryable: true,

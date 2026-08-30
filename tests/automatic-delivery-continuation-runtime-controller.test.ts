@@ -226,6 +226,7 @@ interface HarnessOptions {
 	recoverSettledCheckout?: AutomaticDeliveryContinuationRuntimeControllerDependenciesV1["recoverSettledCheckoutOperation"];
 	onLane?: (phase: "acquire" | "release", allowedPath: string) => void;
 	processStateSymbol?: symbol;
+	canonicalBudgetPaused?: boolean;
 }
 
 function harness(options: HarnessOptions = {}) {
@@ -241,6 +242,9 @@ function harness(options: HarnessOptions = {}) {
 		exec: async () => ({ stdout: "", stderr: "", code: 0, killed: false }),
 		secrets: [],
 		getMode: () => "DEV",
+		getLifecycleActionSnapshot: () => options.canonicalBudgetPaused
+			? { action: "PAUSED_BUDGET", authorization: "USER_REQUIRED" }
+			: undefined,
 		runtimeCurrentOrError: () => undefined,
 		compactionPending: () => options.compaction?.() ?? false,
 		projectRootFor: async () => ROOT,
@@ -699,6 +703,25 @@ test("session_start marks reload continuation only for startup, reload and resum
 			reason,
 		);
 	}
+});
+
+test("canonical budget pause clears non-authoritative continuation without review, repair, or advice", async () => {
+	const h = harness({ canonicalBudgetPaused: true });
+	h.runtime.registerToolResultLocatorCaptureBeforeMiddleware();
+	h.runtime.registerLifecycleListenersAfterMiddleware();
+	await h.pi.emit("tool_execution_end", {
+		type: "tool_execution_end", toolCallId: "paused", toolName: "workbench_delegate_worker",
+		result: { details: { delegation_id: ID } }, isError: false,
+	}, h.ctx);
+	await h.pi.emit("session_start", { type: "session_start", reason: "reload" }, h.ctx);
+	assert.equal(h.runtime.hasPendingBeforeAgentContinuation(), true);
+	const before = await h.pi.emit("before_agent_start", {
+		type: "before_agent_start", prompt: "continue", systemPrompt: "", systemPromptOptions: {},
+	}, h.ctx);
+	await h.pi.emit("agent_settled", { type: "agent_settled" }, h.ctx);
+	assert.equal(before.every((result) => result === undefined), true);
+	assert.equal(h.runtime.hasPendingBeforeAgentContinuation(), false);
+	assert.deepEqual({ review: h.reviewCalls, exact: h.exactCalls, sent: h.pi.sent.length }, { review: 0, exact: 0, sent: 0 });
 });
 
 test("production registers the failure locator before middleware and lifecycle only after cleanup", async () => {

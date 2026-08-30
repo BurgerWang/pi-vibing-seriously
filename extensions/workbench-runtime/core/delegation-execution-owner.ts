@@ -134,7 +134,7 @@ export type DelegationExecutionOwnerResultV2<T> =
 export interface StrictRetryableRawRepairEvidenceV1 {
 	readonly schema_version: 1;
 	readonly kind: "strict-retryable-raw-repair-evidence-v1";
-	readonly retry_kind: "ABORTED" | "EMPTY_RECOVERY" | "FINALIZATION_RECOVERY";
+	readonly retry_kind: "ABORTED" | "EMPTY_RECOVERY" | "CHECKPOINT_RECOVERY" | "FINALIZATION_RECOVERY";
 	readonly delegation_id: string;
 	readonly contract_hash: string;
 	readonly transaction_hash: string;
@@ -339,7 +339,8 @@ export async function claimDelegationExecutionOwnerV2(
 	options?: DelegationExecutionOwnerOptionsV2,
 ): Promise<DelegationExecutionOwnerResultV2<DelegationExecutionOwnerRecordV2>> {
 	const path = ownerPath(projectRoot, transaction.delegation_id);
-	if (path === undefined || transaction.status !== "PREPARED" || !isCanonicalTime(createdAt)) {
+	if (path === undefined || (transaction.status !== "PREPARED" && transaction.status !== "RECOVERY_REQUIRED")
+		|| !isCanonicalTime(createdAt)) {
 		return { ok: false, error: { code: "invalid_input" } };
 	}
 	const adapter = adapterOf(options);
@@ -505,6 +506,21 @@ function finalizationRecoveryJournal(journal: WorkerWriteJournalRecord): boolean
 		&& journal.meter.paths_completed === journal.meter.paths_attempted;
 }
 
+function checkpointRecoveryJournal(journal: WorkerWriteJournalRecord): boolean {
+	return journal.state === "OPEN" && journal.journal_hash === null
+		&& journal.operations.length > 0
+		&& journal.operations.every((operation) => operation.status === "completed")
+		&& journal.meter.paths_attempted > 0
+		&& journal.meter.paths_completed === journal.meter.paths_attempted;
+}
+
+/** Raw recovery kinds whose inherited bytes must be rebound exactly before retry. */
+export function strictRawRepairRequiresCurrentByteRebaseV1(
+	retryKind: StrictRetryableRawRepairEvidenceV1["retry_kind"],
+): boolean {
+	return retryKind === "CHECKPOINT_RECOVERY" || retryKind === "FINALIZATION_RECOVERY";
+}
+
 /**
  * Revalidate an already-persisted lineaged ABORTED transaction before it can
  * authorize another exact repair. Only the recovery-produced, before-write
@@ -552,6 +568,7 @@ async function safeRepairRecoveryInventory(
 		const entries = await adapter.list(path);
 		for (const entry of entries) {
 			if ((entry.name === "transaction.json" || entry.name === "write-journal.json") && entry.kind === "file") continue;
+			if (entry.name === "worker-checkpoint-v1.json" && entry.kind === "file") continue;
 			if (entry.name === "generations" && entry.kind === "directory") {
 				if ((await adapter.list(join(path, "generations"))).length === 0) continue;
 			}
@@ -622,6 +639,32 @@ export async function isStrictRetryableFinalizationRepairRecoveryV2(
 }
 
 /**
+ * Strict retry authority when the worker completed one or more journaled
+ * writes and then failed before terminal facts/checkpoint finalization.  No
+ * pending write may remain.  The separate current-byte rebase reader must
+ * still prove that Git-visible paths exactly equal the journal's last after
+ * identities before a successor can launch.
+ */
+export async function isStrictRetryableCheckpointRepairRecoveryV2(
+	projectRoot: string,
+	transaction: DelegationTransactionRecord,
+	options?: DelegationExecutionOwnerOptionsV2,
+): Promise<boolean> {
+	if (transaction.status !== "RECOVERY_REQUIRED" || transaction.revision < 2 || transaction.revision % 2 !== 0 ||
+		transaction.committed_proof !== null ||
+		transaction.terminal_outcome !== null || transaction.review !== null || transaction.abort_reason !== null ||
+		transaction.postcondition_reasons.length !== 0 ||
+		transaction.recovery_reason !== RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed ||
+		!await hasStrictReleasedRepairRecoveryEnvelopeV2(projectRoot, transaction, options)) return false;
+	const journal = await readWorkerWriteJournal({
+		project_root: projectRoot,
+		delegation_id: transaction.delegation_id,
+		contract_hash: transaction.contract_hash,
+	});
+	return journal.ok && checkpointRecoveryJournal(journal.value);
+}
+
+/**
  * Return the complete immutable evidence used by deterministic `/q-repair`
  * for a no-write raw lineage tip.  The boolean helpers above remain useful to
  * callers that only classify state; this reader additionally binds the exact
@@ -636,9 +679,11 @@ export async function readStrictRetryableRawRepairEvidenceV1(
 		? "ABORTED" as const
 		: await isStrictRetryableEmptyRepairRecoveryV2(projectRoot, transaction, options)
 			? "EMPTY_RECOVERY" as const
-			: await isStrictRetryableFinalizationRepairRecoveryV2(projectRoot, transaction, options)
-				? "FINALIZATION_RECOVERY" as const
-				: undefined;
+			: await isStrictRetryableCheckpointRepairRecoveryV2(projectRoot, transaction, options)
+				? "CHECKPOINT_RECOVERY" as const
+				: await isStrictRetryableFinalizationRepairRecoveryV2(projectRoot, transaction, options)
+					? "FINALIZATION_RECOVERY" as const
+					: undefined;
 	if (retryKind === undefined) return { ok: false, code: "NOT_RETRYABLE" };
 
 	const owner = await readDelegationExecutionOwnerV2(projectRoot, transaction, options);
@@ -658,7 +703,9 @@ export async function readStrictRetryableRawRepairEvidenceV1(
 		}
 	} else if (!journal.ok || (retryKind === "EMPTY_RECOVERY"
 		? !emptyRecoveryJournal(journal.value)
-		: !finalizationRecoveryJournal(journal.value))) {
+		: retryKind === "CHECKPOINT_RECOVERY"
+			? !checkpointRecoveryJournal(journal.value)
+			: !finalizationRecoveryJournal(journal.value))) {
 		return { ok: false, code: !journal.ok && journal.error.code === "storage_failure" ? "STORAGE_FAILURE" : "NOT_RETRYABLE" };
 	}
 
@@ -682,6 +729,7 @@ export async function readStrictRetryableRawRepairEvidenceV1(
 			const expected = new Set(["transaction.json:file", "write-journal.json:file"]);
 			for (const entry of inventory) {
 				if (expected.has(entry)) continue;
+				if (retryKind === "CHECKPOINT_RECOVERY" && entry === "worker-checkpoint-v1.json:file") continue;
 				if (entry !== "generations:directory" || (await adapter.list(join(path, "generations"))).length !== 0) {
 					return { ok: false, code: "NOT_RETRYABLE" };
 				}

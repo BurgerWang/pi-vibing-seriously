@@ -26,9 +26,12 @@ import {
 } from "./delegation-transaction.ts";
 import {
 	collectWorkspaceGuard,
+	computeWorkspaceGuardHash,
 	validateWorkspaceGuard,
 	type CollectWorkspaceGuardInput,
 	type CollectWorkspaceGuardResult,
+	type WorkspaceGuardEntry,
+	type WorkspaceGuardIdentity,
 	type WorkspaceGuardRecord,
 } from "./workspace-guard.ts";
 import {
@@ -53,9 +56,11 @@ import {
 	type ReadWorkerWriteJournalInput,
 	type SealWorkerWriteJournalInput,
 	type WorkerWriteJournalRecord,
+	type WriteJournalOperation,
 	type WriteJournalOptions,
 	type WriteJournalResult,
 } from "./write-journal.ts";
+import type { WorkerCheckpointV1 } from "./worker-checkpoint.ts";
 
 export const DELEGATION_CHANGE_SET_LIFECYCLE_SCHEMA_VERSION = 2 as const;
 
@@ -388,6 +393,155 @@ function validPrepared(value: unknown): value is PreparedDelegationChangeSetLife
 		|| !initialJournal(record.journal, record.delegation_id, record.contract_hash)) return false;
 	const journalPath = workerWriteJournalRelativePath(record.delegation_id);
 	return !record.before_guard.entries.some((entry) => entry.path === journalPath);
+}
+
+/** Public closed-schema validator used by crash-resume authority. */
+export function validatePreparedDelegationChangeSetLifecycleV2(
+	value: unknown,
+): value is PreparedDelegationChangeSetLifecycleV2 {
+	return validPrepared(value);
+}
+
+function beforeIdentity(operation: WriteJournalOperation): WorkspaceGuardIdentity {
+	const identity = operation.before;
+	return identity.kind === "missing"
+		? { kind: "missing" }
+		: {
+			kind: identity.kind,
+			byte_size: identity.byte_size,
+			stat: { ...identity.stat },
+		};
+}
+
+function syntheticBeforeGuard(
+	current: Readonly<WorkspaceGuardRecord>,
+	journal: Readonly<WorkerWriteJournalRecord>,
+	mask: number,
+	variablePaths: ReadonlySet<string>,
+): WorkspaceGuardRecord {
+	const touched = new Map<string, WriteJournalOperation>();
+	for (const operation of journal.operations) {
+		if (!touched.has(operation.path)) touched.set(operation.path, operation);
+	}
+	const currentByPath = new Map(current.entries.map((entry) => [entry.path, entry] as const));
+	const variables = [...variablePaths].sort(byteCompare);
+	const variableIndex = new Map(variables.map((path, index) => [path, index] as const));
+	const entries: WorkspaceGuardEntry[] = current.entries
+		.filter((entry) => !touched.has(entry.path))
+		.map((entry) => structuredClone(entry));
+	for (const [path, first] of touched) {
+		const currentEntry = currentByPath.get(path);
+		const index = variableIndex.get(path);
+		const include = index !== undefined && (mask & (1 << index)) !== 0;
+		if (!include || currentEntry === undefined) continue;
+		entries.push({ path, status: currentEntry.status, identity: beforeIdentity(first) });
+	}
+	entries.sort((left, right) => byteCompare(left.path, right.path));
+	// Legacy checkpoint recovery reconstructs authority from a fresh guard on
+	// every read. Runtime control artifacts (including the checkout lock owned
+	// by the recovering call itself) are deliberately excluded from the guard
+	// hash, but their diagnostic paths would otherwise make the full prepared
+	// authority differ before and after lock acquisition. Canonicalize only
+	// those non-authoritative telemetry fields; Git HEAD and every relevant
+	// path identity remain byte-bound by workspace_guard_hash.
+	return {
+		schema_version: 2,
+		git_head: current.git_head,
+		entries,
+		irrelevant_artifact_paths: [],
+		meter: {
+			status_bytes: 0,
+			relevant_paths: entries.length,
+			irrelevant_paths: 0,
+			stat_calls: entries.length * 2,
+			content_bytes_read: 0,
+		},
+		workspace_guard_hash: computeWorkspaceGuardHash(current.git_head, entries),
+	};
+}
+
+export interface RecoverPreparedDelegationChangeSetLifecycleV2Input {
+	project_root: string;
+	delegation_id: string;
+	contract_hash: string;
+	dependency_paths: readonly string[];
+	checkpoint: Readonly<WorkerCheckpointV1>;
+	exec: ExecFn;
+}
+
+export type RecoverPreparedDelegationChangeSetLifecycleV2Result =
+	| { ok: true; value: Readonly<PreparedDelegationChangeSetLifecycleV2> }
+	| { ok: false; code: "CURRENT_GUARD_CHANGED" | "INVALID_INPUT" | "JOURNAL_INVALID" | "LEGACY_BASELINE_AMBIGUOUS" };
+
+/**
+ * Recover a legacy pre-checkpoint baseline when no resume sidecar exists.
+ *
+ * V1 checkpoints bind the complete before-guard hash but did not embed the
+ * guard.  The journal supplies exact first-before identities.  Git status for
+ * a touched path can only be retained from the current guard or absent; every
+ * bounded combination is hashed and exactly one match is required.  New
+ * delegations persist the full prepared lifecycle and never use this bridge.
+ */
+export async function recoverPreparedDelegationChangeSetLifecycleV2(
+	input: Readonly<RecoverPreparedDelegationChangeSetLifecycleV2Input>,
+): Promise<RecoverPreparedDelegationChangeSetLifecycleV2Result> {
+	if (!validProjectRoot(input.project_root) || !DELEGATION_TRANSACTION_ID_RE.test(input.delegation_id)
+		|| !DELEGATION_TRANSACTION_HASH_RE.test(input.contract_hash)
+		|| !validDependencyPaths(input.dependency_paths, input.delegation_id)
+		|| typeof input.exec !== "function" || input.checkpoint.delegation_id !== input.delegation_id
+		|| input.checkpoint.contract_hash !== input.contract_hash) return { ok: false, code: "INVALID_INPUT" };
+	const journalRead = await readWorkerWriteJournal({
+		project_root: input.project_root,
+		delegation_id: input.delegation_id,
+		contract_hash: input.contract_hash,
+	});
+	if (!journalRead.ok || !validOpenJournal(journalRead.value, input)
+		|| journalRead.value.operations.length === 0
+		|| journalRead.value.operations.some((operation) => operation.status !== "completed")) {
+		return { ok: false, code: "JOURNAL_INVALID" };
+	}
+	const current = await collectWorkspaceGuard({ project_root: input.project_root, exec: input.exec });
+	if (!current.ok || current.guard.workspace_guard_hash !== input.checkpoint.current_binding_hash) {
+		return { ok: false, code: "CURRENT_GUARD_CHANGED" };
+	}
+	const touched = [...new Set(journalRead.value.operations.map((operation) => operation.path))].sort(byteCompare);
+	const currentPaths = new Set(current.guard.entries.map((entry) => entry.path));
+	const variablePaths = new Set(touched.filter((path) => currentPaths.has(path)));
+	// This is a compatibility bridge, not an unbounded reconstruction oracle.
+	if (variablePaths.size > 16) return { ok: false, code: "LEGACY_BASELINE_AMBIGUOUS" };
+	let matched: WorkspaceGuardRecord | undefined;
+	for (let mask = 0; mask < 2 ** variablePaths.size; mask += 1) {
+		const candidate = syntheticBeforeGuard(current.guard, journalRead.value, mask, variablePaths);
+		if (candidate.workspace_guard_hash !== input.checkpoint.before_binding_hash) continue;
+		if (!validateWorkspaceGuard(candidate) || matched !== undefined) {
+			return { ok: false, code: "LEGACY_BASELINE_AMBIGUOUS" };
+		}
+		matched = candidate;
+	}
+	if (matched === undefined) return { ok: false, code: "LEGACY_BASELINE_AMBIGUOUS" };
+	const initialJournal: WorkerWriteJournalRecord = {
+		schema_version: journalRead.value.schema_version,
+		delegation_id: input.delegation_id,
+		contract_hash: input.contract_hash,
+		state: "OPEN",
+		revision: 0,
+		limits: { ...journalRead.value.limits },
+		meter: { paths_attempted: 0, paths_completed: 0, bytes_read: 0 },
+		operations: [],
+		journal_hash: null,
+	};
+	const prepared: PreparedDelegationChangeSetLifecycleV2 = {
+		schema_version: DELEGATION_CHANGE_SET_LIFECYCLE_SCHEMA_VERSION,
+		project_root: input.project_root,
+		delegation_id: input.delegation_id,
+		contract_hash: input.contract_hash,
+		dependency_paths: [...input.dependency_paths],
+		before_guard: matched,
+		journal: initialJournal,
+	};
+	return validPrepared(prepared)
+		? { ok: true, value: deepFreeze(structuredClone(prepared)) }
+		: { ok: false, code: "LEGACY_BASELINE_AMBIGUOUS" };
 }
 
 function prepareDependencies(value: unknown): PrepareDelegationChangeSetLifecycleV2Dependencies | undefined {

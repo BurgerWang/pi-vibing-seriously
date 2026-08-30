@@ -67,15 +67,16 @@ import { decideCompactOverflowRecovery } from "./core/compact-overflow.ts";
 import { evaluateCompactSummaryPreflight } from "./core/compact-preflight.ts";
 import { createCacheTelemetry, type CacheTelemetry } from "./cache/cache-telemetry.ts";
 import { readDelegationLedger, type GitFacts } from "./core/delegation-ledger.ts";
-import { readDelegationCommittedGenerationV2, readDelegationReviewV2, readDelegationTransactionV2, readDelegationWorkerCheckpointV1 } from "./core/delegation-transaction-storage.ts";
+import { readDelegationCommittedGenerationV2, readDelegationReviewV2, readDelegationTransactionV2 } from "./core/delegation-transaction-storage.ts";
 import {
 	readRecoverableUnpublishedDelegationV2,
 	readDelegationAuthorityObservationV2 as readDelegationAuthorityObservation,
 } from "./core/delegation-project-authority.ts";
 import { delegationDisplayedStatusV1, delegationExactRepairRouteLineV1, delegationLifecycleResolutionForStatusV1, delegationNextActionTextV1, delegationProjectIssueRepairStatusV1, delegationRepairStatusLinesV1, delegationVerifyBlockReasonV1, readDelegationRepairStatusV1,
 	type DelegationRepairStatusV1 } from "./core/delegation-repair-status.ts";
-import { appendLifecycleActionSnapshotIfChangedV2, buildLifecycleActionSnapshotV2, type LifecycleActionSnapshotV2 } from "./core/delegation-lifecycle-resolver.ts";
-import { lifecycleActionSnapshotTextV2 } from "./core/agent-next-action.ts";
+import { type LifecycleActionSnapshotV2 } from "./core/delegation-lifecycle-resolver.ts";
+import { createLifecycleActionRefreshControllerV2 } from "./core/lifecycle-action-refresh-controller.ts";
+import { lifecycleActionSnapshotTextV2, lifecycleActionTurnMessageV2, mergeLifecycleActionStatusLinesV2 } from "./core/agent-next-action.ts";
 import { buildDelegationWorkerFirstGateFacts } from "./core/delegation-plan-reference.ts";
 import { resolveToolOutputPolicy } from "./core/output-policy.ts";
 import {
@@ -638,7 +639,20 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			),
 		);
 	}
-
+	const lifecycleActionRefreshV2 = createLifecycleActionRefreshControllerV2({
+		exec: execFn,
+		getMode: () => mode,
+		getDelegationState: () => delegationSession.getState(),
+		getLatestSnapshotHash: () => latestLifecycleActionSnapshotHashV2,
+		setLatestSnapshotHash: (hash) => { latestLifecycleActionSnapshotHashV2 = hash; },
+		appendEntry: (customType, data) => pi.appendEntry(customType, data),
+		publish: (status, snapshot) => {
+			latestRepairStatus = status;
+			latestLifecycleActionSnapshotV2 = snapshot;
+			applyModeTools();
+			refreshCompactP7Facts();
+		},
+	});
 	/** Reapply the development-first surface when a high-risk lease is no longer active. */
 	function syncLeaseLock(now?: string): void {
 		if (writeLease && leaseStatus(writeLease, now ?? new Date().toISOString()) !== "active") {
@@ -657,36 +671,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			if (ctx.isProjectTrusted()) {
 				const projectRoot = await projectRootFor(ctx);
 				if (refreshSerial !== uiRefreshSerial.status) return;
-				const repairStatus = delegationProjectIssueRepairStatusV1(delegationSession.getProjectAuthorityIssue()) ?? await readDelegationRepairStatusV1(projectRoot, delegationSession.getState(), execFn);
-				if (refreshSerial !== uiRefreshSerial.status) return;
-				latestRepairStatus = repairStatus;
-				const delegationState = delegationSession.getState();
-				const lifecycleResolution = delegationLifecycleResolutionForStatusV1(delegationState, repairStatus);
-				let checkpoint;
-				if (delegationState.latestId !== undefined) {
-					const transaction = await readDelegationTransactionV2(projectRoot, delegationState.latestId);
-					if (transaction.ok && transaction.value.status === "RUNNING") {
-						const readCheckpoint = await readDelegationWorkerCheckpointV1(projectRoot, delegationState.latestId);
-						if (readCheckpoint.ok) checkpoint = readCheckpoint.value;
-					}
-				}
-				const actionSnapshot = buildLifecycleActionSnapshotV2({
-					project_root: projectRoot,
-					mode,
-					resolution: lifecycleResolution,
-					...(checkpoint === undefined ? {} : { checkpoint }),
-				});
-				if (actionSnapshot.ok) {
-					latestLifecycleActionSnapshotV2 = actionSnapshot.value;
-					const appended = appendLifecycleActionSnapshotIfChangedV2(
-						actionSnapshot.value,
-						latestLifecycleActionSnapshotHashV2,
-						(customType, data) => pi.appendEntry(customType, data),
-					);
-					if (appended !== undefined) latestLifecycleActionSnapshotHashV2 = appended.latest_snapshot_hash;
-					applyModeTools();
-				}
-				refreshCompactP7Facts();
+				await lifecycleActionRefreshV2.refresh(projectRoot);
 				const config = await loadProjectConfig(projectRoot, { trusted: true });
 				if (refreshSerial !== uiRefreshSerial.status) return;
 				advisoryConfig = config.commanderAdvisory;
@@ -833,7 +818,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				persistLease();
 			}
 		}
-		mode = next;
+		mode = next; latestLifecycleActionSnapshotV2 = undefined; latestLifecycleActionSnapshotHashV2 = null;
 		cacheTelemetry.observeModeChange(next);
 		pi.appendEntry(MODE_ENTRY_TYPE, { mode });
 		applyModeTools();
@@ -910,6 +895,9 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			gitRefresh = "unavailable";
 		}
 		latestRepairStatus = await readDelegationRepairStatusV1(projectRoot, delegationState, execFn);
+		let lifecycleSnapshot: Readonly<LifecycleActionSnapshotV2> | undefined;
+		try { lifecycleSnapshot = await lifecycleActionRefreshV2.refresh(projectRoot, delegationState); }
+		catch { /* Rendering removes the compatibility action and fails closed. */ }
 		refreshCompactP7Facts(delegationState);
 		const actor = detectActorRole({
 			roleEnv: workerRoleContext.role,
@@ -922,6 +910,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			`write policy : ${policy ?? "not-applicable"}`,
 			`write lease  : ${leaseCompactSummary(writeLease, now)}`,
 		];
+		const canonicalRepairStatusLines = (status: DelegationRepairStatusV1): string[] => mergeLifecycleActionStatusLinesV2(delegationRepairStatusLinesV1(status, delegationState), lifecycleSnapshot);
 		const delegationProjectAuthorityIssue = latestRepairStatus.kind === "historical_multiplicity" ||
 			latestRepairStatus.kind === "authority_invalid"
 			? { code: latestRepairStatus.code, delegationId: latestRepairStatus.delegationId ?? undefined }
@@ -932,26 +921,26 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 					`project auth : HISTORICAL_MULTIPLICITY (${delegationProjectAuthorityIssue.code}) — request-specific strict path admission required`,
 					`latest       : ${delegationProjectAuthorityIssue.delegationId ?? delegationState.latestId ?? "(unknown)"} HISTORICAL_MULTIPLICITY`,
 					`blocked writes: ${delegationState.blockedWriteAttempts}`,
-					...delegationRepairStatusLinesV1(latestRepairStatus, delegationState),
+					...canonicalRepairStatusLines(latestRepairStatus),
 				);
 			} else {
 				lines.push(
 					`project auth : INVALID (${delegationProjectAuthorityIssue.code}) — delegation and verification fail closed`,
 					`latest       : ${delegationProjectAuthorityIssue.delegationId ?? delegationState.latestId ?? "(unknown)"} PROJECT_AUTHORITY_INVALID`,
 					`blocked writes: ${delegationState.blockedWriteAttempts}`,
-					...delegationRepairStatusLinesV1(latestRepairStatus, delegationState),
+					...canonicalRepairStatusLines(latestRepairStatus),
 				);
 			}
 		} else if (delegationState.latestId !== undefined) {
 			const authority = await readDelegationAuthorityObservation(projectRoot, delegationState.latestId);
-			const displayedStatus = delegationDisplayedStatusV1(delegationState.status, authority.kind === "v2" ? authority.transactionStatus : undefined);
+			const displayedStatus = lifecycleSnapshot?.exact_target.delegation_id === delegationState.latestId && ["PAUSED_BUDGET", "SATISFIED_NO_DELTA"].includes(lifecycleSnapshot.state) ? lifecycleSnapshot.state : delegationDisplayedStatusV1(delegationState.status, authority.kind === "v2" ? authority.transactionStatus : undefined);
 			lines.push(
 				`latest       : ${delegationState.latestId} ${displayedStatus}`,
 				`current hash : ${delegationState.currentDiffHash ?? "(none)"}`,
 				`reviewed hash: ${delegationState.reviewedDiffHash ?? "(none)"}`,
 				`blocked writes: ${delegationState.blockedWriteAttempts}`,
 			);
-			lines.push(...delegationRepairStatusLinesV1(latestRepairStatus, delegationState));
+			lines.push(...canonicalRepairStatusLines(latestRepairStatus));
 			const block = authority.kind === "v2" && !["PENDING_REVIEW", "REVIEWED"].includes(authority.transactionStatus)
 				? undefined
 				: reviewBlockReason(delegationState, "delegation");
@@ -1027,7 +1016,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			latestRepairStatus = { kind: "none" };
 			lines.push(`latest       : (no delegation)`);
 			lines.push(`blocked writes: ${delegationState.blockedWriteAttempts}`);
-			lines.push(...delegationRepairStatusLinesV1(latestRepairStatus, delegationState));
+			lines.push(...canonicalRepairStatusLines(latestRepairStatus));
 		}
 		if (gitRefresh === "unavailable") {
 			lines.push(`git refresh  : UNAVAILABLE — git status failed; the hashes above are persisted state, NOT freshly verified`);
@@ -1074,7 +1063,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		pendingOverflowRecoveryContext = undefined;
 		nativeOverflowCompactStarted = false;
 		latestHistoryProjectionBoundaryMarkers = [];
-		mode = loadModeFromEntries(entries);
+		mode = loadModeFromEntries(entries); latestLifecycleActionSnapshotV2 = undefined; latestLifecycleActionSnapshotHashV2 = null;
 		compactState = loadCompactStateFromEntries(entries, mode);
 		reconcileCompactAttempt(entries, event.reason);
 		// Restore delegation state. A confirmed write lease never crosses a
@@ -1166,7 +1155,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		// extension runtime. Reload every branch-owned presentation preference,
 		// then reconcile delegation truth from the project registry. Never retain
 		// a sibling branch's mode, lease, or delegation mirror in memory.
-		mode = loadModeFromEntries(entries);
+		mode = loadModeFromEntries(entries); latestLifecycleActionSnapshotV2 = undefined; latestLifecycleActionSnapshotHashV2 = null;
 		compactState = loadCompactStateFromEntries(entries, mode);
 		delegationSession.restore(entries);
 		writeLease = loadLeaseFromEntries(entries);
@@ -1346,9 +1335,20 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				},
 			};
 		}
+		if (workerRoleContext.role === undefined && ctx.isProjectTrusted() &&
+			(delegationSession.getState().latestId !== undefined ||
+				latestRepairStatus !== undefined && "projectIssue" in latestRepairStatus)) {
+			try {
+				const projectRoot = await projectRootFor(ctx);
+				const snapshot = await lifecycleActionRefreshV2.refresh(projectRoot);
+				const message = snapshot === undefined ? undefined : lifecycleActionTurnMessageV2(snapshot, pi.getActiveTools());
+				if (message !== undefined) return { message };
+			} catch {
+				// Status/tool surfaces remain fail-closed if the advisory refresh fails.
+			}
+		}
 		return undefined;
 	});
-
 	pi.on("agent_end", (event, ctx) => {
 		let assistant: unknown;
 		for (let index = event.messages.length - 1; index >= 0 && index >= event.messages.length - 256; index -= 1) {
@@ -1953,12 +1953,12 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	});
 
 	// --------------------------------------------------------- custom tools
-
 	const runtimeTools = registerRuntimeWorkbenchToolsV1({
 		pi,
 		exec: execFn,
 		secrets,
 		getMode: () => mode,
+		getLifecycleActionSnapshot: () => latestLifecycleActionSnapshotV2,
 		getIdentity: () => ({ provider: currentModelFacts.provider, model: currentModelFacts.model }),
 		workerRoleContext,
 		workerWriteJournalRuntime,

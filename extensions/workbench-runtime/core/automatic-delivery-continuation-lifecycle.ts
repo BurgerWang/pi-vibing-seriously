@@ -253,6 +253,8 @@ export interface AutomaticDeliveryContinuationLifecycleV1 {
 	markReloadPending(): void;
 	/** Lets an earlier claim-guard listener suppress contradictory raw-repair advice. */
 	hasPendingBeforeAgentContinuation(): boolean;
+	/** Drop ephemeral auto-continuation locators when canonical authority requires the user. */
+	suppressPendingForCanonicalPause(): void;
 	onAgentSettled(
 		input?: AutomaticDeliveryContinuationHookInputV1,
 	): Promise<AutomaticDeliveryContinuationLifecycleResultV1>;
@@ -853,6 +855,11 @@ export function createAutomaticDeliveryContinuationLifecycleV1(
 		},
 		hasPendingBeforeAgentContinuation() {
 			return reloadPending || toolLocatorOverflow || pendingToolLocators.size > 0;
+		},
+		suppressPendingForCanonicalPause() {
+			reloadPending = false;
+			toolLocatorOverflow = false;
+			pendingToolLocators.clear();
 		},
 		async onAgentSettled(input = {}) {
 			if (toolLocatorOverflow) {

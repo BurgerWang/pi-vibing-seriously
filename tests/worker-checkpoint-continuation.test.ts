@@ -92,6 +92,39 @@ test("WorkerCheckpointV1 is hash-bound, bounded, monotonic, and produces a trans
 		allowed_paths: ["src/**"],
 		active_attempt: false,
 	}), true);
+	assert.equal(validateWorkerCheckpointContinuationV1({
+		...first,
+		touched_paths: [{ ...first.touched_paths[0]!, path: "src/nested/a.ts" }],
+	}, {
+		delegation_id: ID,
+		contract_hash: CONTRACT,
+		runtime_build_identity: RUNTIME,
+		expected_attempt: 1,
+		parent_checkpoint_hash: null,
+		before_binding_hash: BEFORE,
+		current_binding_hash: CURRENT,
+		allowed_paths: ["src/"],
+		active_attempt: false,
+	}), false, "tampering still invalidates the checkpoint hash");
+	const { schema_version: _schema, kind: _kind, checkpoint_hash: _hash, ...directoryInput } = first;
+	const directoryCheckpoint = buildWorkerCheckpointV1({
+		...directoryInput,
+		touched_paths: [{ ...first.touched_paths[0]!, path: "src/nested/a.ts" }],
+	});
+	assert.equal(directoryCheckpoint.ok, true);
+	if (directoryCheckpoint.ok) {
+		assert.equal(validateWorkerCheckpointContinuationV1(directoryCheckpoint.value, {
+			delegation_id: ID,
+			contract_hash: CONTRACT,
+			runtime_build_identity: RUNTIME,
+			expected_attempt: 1,
+			parent_checkpoint_hash: null,
+			before_binding_hash: BEFORE,
+			current_binding_hash: CURRENT,
+			allowed_paths: ["src/"],
+			active_attempt: false,
+		}), true, "directory rules must authorize descendants exactly like delegation execution");
+	}
 	const capsule = workerCheckpointContinuationCapsuleV1(first);
 	assert.ok(capsule);
 	assert.equal(Buffer.byteLength(JSON.stringify(capsule), "utf8") <= 4 * 1024, true);

@@ -17,6 +17,7 @@ import {
 import {
 	buildLifecycleActionSnapshotV2,
 	validateLifecycleActionExecutionV2,
+	type LifecycleActionSnapshotV2,
 } from "./delegation-lifecycle-resolver.ts";
 
 import type {
@@ -102,6 +103,7 @@ export interface AutomaticDeliveryContinuationRuntimeControllerDependenciesV1 {
 	readonly exec: ExecFn;
 	readonly secrets: readonly string[];
 	readonly getMode: () => WorkbenchMode;
+	readonly getLifecycleActionSnapshot?: () => Readonly<Pick<LifecycleActionSnapshotV2, "action" | "authorization">> | undefined;
 	readonly runtimeCurrentOrError: (ctx: ExtensionContext) => string | undefined;
 	readonly compactionPending: (ctx: ExtensionContext) => boolean;
 	readonly projectRootFor: (ctx: ExtensionContext) => Promise<string>;
@@ -208,6 +210,15 @@ function contextFrom(value: unknown): ExtensionContext | undefined {
 
 function gateFailure(code: string) {
 	return { ok: false as const, code };
+}
+
+function canonicalBudgetPause(dependencies: AutomaticDeliveryContinuationRuntimeControllerDependenciesV1): boolean {
+	try {
+		const snapshot = dependencies.getLifecycleActionSnapshot?.();
+		return snapshot?.action === "PAUSED_BUDGET" && snapshot.authorization === "USER_REQUIRED";
+	} catch {
+		return false;
+	}
 }
 
 function checkRuntimeGates(
@@ -609,6 +620,10 @@ export function createAutomaticDeliveryContinuationRuntimeControllerV1(
 				return undefined;
 			});
 			dependencies.pi.on("before_agent_start", async (_event, ctx): Promise<BeforeAgentStartEventResult | undefined> => {
+				if (canonicalBudgetPause(dependencies)) {
+					lifecycle.suppressPendingForCanonicalPause();
+					return undefined;
+				}
 				const message = boundedMessage(await lifecycle.onBeforeAgentStart({ signal: ctx.signal, runtime_context: ctx }));
 				return message === undefined ? undefined : {
 					message: {
@@ -620,6 +635,10 @@ export function createAutomaticDeliveryContinuationRuntimeControllerV1(
 				};
 			});
 			dependencies.pi.on("agent_settled", async (_event, ctx) => {
+				if (canonicalBudgetPause(dependencies)) {
+					lifecycle.suppressPendingForCanonicalPause();
+					return undefined;
+				}
 				const result = await lifecycle.onAgentSettled({ signal: ctx.signal, runtime_context: ctx });
 				const message = boundedMessage(result);
 				if (message === undefined) return undefined;

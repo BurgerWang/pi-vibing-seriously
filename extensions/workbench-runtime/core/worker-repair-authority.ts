@@ -9,8 +9,10 @@
 import { readDelegationLedger, type LedgerWorkerSummaryRecord } from "./delegation-ledger.ts";
 import {
 	isStrictRetryableAbortedRepairV2,
+	isStrictRetryableCheckpointRepairRecoveryV2,
 	isStrictRetryableEmptyRepairRecoveryV2,
 	isStrictRetryableFinalizationRepairRecoveryV2,
+	strictRawRepairRequiresCurrentByteRebaseV1,
 } from "./delegation-execution-owner.ts";
 import { readRecoverableUnpublishedDelegationV2 } from "./delegation-project-authority.ts";
 import {
@@ -264,9 +266,11 @@ export async function readWorkerRepairCapsule(
 				? "ABORTED" as const
 				: await isStrictRetryableEmptyRepairRecoveryV2(projectRoot, raw.value)
 					? "EMPTY_RECOVERY" as const
-					: await isStrictRetryableFinalizationRepairRecoveryV2(projectRoot, raw.value)
-						? "FINALIZATION_RECOVERY" as const
-						: undefined
+					: await isStrictRetryableCheckpointRepairRecoveryV2(projectRoot, raw.value)
+						? "CHECKPOINT_RECOVERY" as const
+						: await isStrictRetryableFinalizationRepairRecoveryV2(projectRoot, raw.value)
+							? "FINALIZATION_RECOVERY" as const
+							: undefined
 			: undefined;
 		const safeRawLineage = rawRetryKind !== undefined;
 		if (raw.ok && safeRawLineage) {
@@ -274,15 +278,17 @@ export async function readWorkerRepairCapsule(
 			if (semanticDecision === undefined) return { ok: false, code: "authority_invalid" };
 			const plan = await strictRepairPlanFact(projectRoot, raw.value);
 			if (!plan.ok) return { ok: false, code: "authority_invalid" };
-			const finalizationJournal = rawRetryKind === "FINALIZATION_RECOVERY"
+			const requiresCurrentByteRebase = strictRawRepairRequiresCurrentByteRebaseV1(rawRetryKind);
+			const finalizationJournal = requiresCurrentByteRebase
 				? await readWorkerWriteJournal({
 					project_root: projectRoot,
 					delegation_id: raw.value.delegation_id,
 					contract_hash: raw.value.contract_hash,
 				})
 				: undefined;
-			if (rawRetryKind === "FINALIZATION_RECOVERY" &&
-				(finalizationJournal === undefined || !finalizationJournal.ok || finalizationJournal.value.journal_hash === null)) {
+			if (requiresCurrentByteRebase && (finalizationJournal === undefined || !finalizationJournal.ok ||
+				(rawRetryKind === "FINALIZATION_RECOVERY" && finalizationJournal.value.journal_hash === null) ||
+				(rawRetryKind === "CHECKPOINT_RECOVERY" && finalizationJournal.value.journal_hash !== null))) {
 				return { ok: false, code: "authority_invalid" };
 			}
 			const finalizationPaths = finalizationJournal?.ok === true
@@ -301,7 +307,9 @@ export async function readWorkerRepairCapsule(
 					reason_codes: ["SEMANTIC_REPAIR_REQUIRED",
 						rawRetryKind === "ABORTED"
 							? "REPAIR_ATTEMPT_ABORTED"
-							: rawRetryKind === "FINALIZATION_RECOVERY"
+							: rawRetryKind === "CHECKPOINT_RECOVERY"
+								? "REPAIR_CHECKPOINT_RECOVERY_REQUIRED"
+								: rawRetryKind === "FINALIZATION_RECOVERY"
 								? "REPAIR_FINALIZATION_RECOVERY_REQUIRED"
 								: "REPAIR_EMPTY_RECOVERY_REQUIRED"],
 					successful_write_count: null,

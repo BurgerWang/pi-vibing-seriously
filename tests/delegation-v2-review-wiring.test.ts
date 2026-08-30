@@ -630,7 +630,7 @@ test("historical mechanical FINAL migrates by complete Sol presentation plus two
 		assert.match(text(status), /latest\s+: .* PENDING_REVIEW/);
 		assert.match(text(status), /review v2\s+: PASS .*\(FINAL\)/);
 		assert.match(text(status), /semantic v2\s+: MISSING .*not hash-bound Sol ACCEPT/);
-		assert.match(text(status), new RegExp(`call workbench_review_worker_diff with delegation_id=${fixture.id} to resume the exact durable semantic review`));
+		assert.match(text(status), new RegExp(`call workbench_review_worker_diff delegation_id=${fixture.id}`));
 		const historicalRepair = await tool(stub, "workbench_delegate_worker").execute(
 			"historical-mechanical-repair-refused",
 			{
@@ -911,8 +911,8 @@ test("registered semantic REPAIR exposes deterministic q-repair guidance while s
 		const repairStatus = await tool(stub, "workbench_delegation_status").execute(
 			"v2-repair-status", {}, undefined, undefined, ctx,
 		);
-		assert.match(text(repairStatus), new RegExp(`next action\\s+: call workbench_repair_delegation with delegation_id=${fixture.id}`));
-		assert.match(text(repairStatus), /typed action\s+: EXECUTE_EXACT_REPAIR \(EXACT_REPAIR_DECISION_CURRENT\)/u);
+		assert.match(text(repairStatus), new RegExp(`next action\\s+: call workbench_repair_delegation delegation_id=${fixture.id}`));
+		assert.match(text(repairStatus), /typed action\s+: START_EXACT_REPAIR \(EXACT_REPAIR_DECISION_CURRENT\)/u);
 		assert.doesNotMatch(text(repairStatus), /repair route\s+:/u, "status renders the exact repair action only once");
 		assert.doesNotMatch(text(repairStatus), /call workbench_delegate_worker with repair_of/u);
 		assert.doesNotMatch(text(repairStatus), /blocked\s+: Starting a new worker delegation/u);

@@ -32,6 +32,7 @@ import {
 	publishDelegationCommit,
 	requireDelegationRecovery,
 	reviewDelegationTransaction,
+	resumeDelegationTransaction,
 	serializeDelegationTransaction,
 	startDelegationTransaction,
 	type BeginDelegationCommitInput,
@@ -2352,6 +2353,22 @@ export async function persistRunningDelegationTransaction(
 		if (!current.ok) return current;
 		const next = startDelegationTransaction(current.value, input);
 		if (!next.ok) return failure("conflict", "delegation start CAS or lifecycle check failed");
+		return publishState(paths, next.state, adapter, "state");
+	});
+}
+
+/** CAS the exact checkpointed RECOVERY_REQUIRED transaction back to RUNNING. */
+export async function persistResumedRunningDelegationTransaction(
+	projectRoot: string,
+	input: DelegationCasInput,
+	options?: DelegationTransactionStorageOptions,
+): Promise<DelegationTransactionStorageResult<DelegationTransactionRecord>> {
+	const adapter = adapterOf(options);
+	return withDelegationLock(projectRoot, input.delegation_id, input.now, adapter, async (paths) => {
+		const current = await readStateAt(paths.transaction, adapter);
+		if (!current.ok) return current;
+		const next = resumeDelegationTransaction(current.value, input);
+		if (!next.ok) return failure("conflict", "delegation checkpoint resume CAS or lifecycle check failed");
 		return publishState(paths, next.state, adapter, "state");
 	});
 }

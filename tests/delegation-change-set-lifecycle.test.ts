@@ -11,11 +11,17 @@ import type { FinalizeChangeSetV2Result } from "../extensions/workbench-runtime/
 import {
 	finalizeDelegationChangeSetLifecycleV2,
 	prepareDelegationChangeSetLifecycleV2,
+	recoverPreparedDelegationChangeSetLifecycleV2,
 	type FinalizeDelegationChangeSetLifecycleV2Result,
 	type PrepareDelegationChangeSetLifecycleV2Input,
 	type PrepareDelegationChangeSetLifecycleV2Result,
 	type PreparedDelegationChangeSetLifecycleV2,
 } from "../extensions/workbench-runtime/core/delegation-change-set-lifecycle.ts";
+import { collectWorkspaceGuard } from "../extensions/workbench-runtime/core/workspace-guard.ts";
+import {
+	buildWorkerCheckpointV1,
+	remainingWorkerBudgetV1,
+} from "../extensions/workbench-runtime/core/worker-checkpoint.ts";
 import {
 	EMPTY_WORKER_WRITE_JOURNAL_RUNTIME_OBSERVATION,
 	type WorkerWriteJournalRuntimeObservation,
@@ -177,6 +183,64 @@ test("real clean Git no-op accepts only EMPTY, keeps journal artifact irrelevant
 		assert.deepEqual(value.change_set.worker_delta, []);
 		assert.equal(Object.isFrozen(value), true);
 		assert.equal(Object.isFrozen(value.change_set), true);
+	});
+});
+
+test("legacy checkpoint recovery ignores its own runtime lock telemetry without weakening relevant path authority", async () => {
+	await withRepository(async (root) => {
+		const prepared = preparedSuccess(await prepareDelegationChangeSetLifecycleV2(prepareInput(root)));
+		await journalOperation(root, "continued.txt", "write", "succeeded", "checkpoint bytes\n");
+		const current = await collectWorkspaceGuard({ project_root: root, exec: realExec });
+		assert.equal(current.ok, true);
+		if (!current.ok) throw new Error("current guard unavailable");
+		const remaining = remainingWorkerBudgetV1("standard", 1, 10, 2);
+		assert.notEqual(remaining, undefined);
+		const checkpoint = buildWorkerCheckpointV1({
+			delegation_id: ID,
+			contract_hash: CONTRACT,
+			attempt: 1,
+			parent_checkpoint_hash: null,
+			runtime_build_identity: "sha256:legacy-recovery-test",
+			before_binding_hash: prepared.before_guard.workspace_guard_hash,
+			current_binding_hash: current.guard.workspace_guard_hash,
+			touched_paths: [{
+				path: "continued.txt",
+				before_hash: null,
+				current_hash: "b".repeat(64),
+				journal_hash: "c".repeat(64),
+			}],
+			completed_recipe_run_ids: [],
+			cumulative_usage: {
+				input: 6,
+				output: 2,
+				cacheRead: 2,
+				cacheWrite: 0,
+				totalTokens: 10,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			cumulative_turns: 1,
+			remaining_budget: remaining!,
+			machine_state: "CHECKPOINTED",
+			worker_advisory: { completed_criteria: [], remaining_criteria: [] },
+			created_at: "2026-08-20T15:01:00.000Z",
+		});
+		assert.equal(checkpoint.ok, true);
+		const recover = () => recoverPreparedDelegationChangeSetLifecycleV2({
+			project_root: root,
+			delegation_id: ID,
+			contract_hash: CONTRACT,
+			dependency_paths: [],
+			checkpoint: checkpoint.value,
+			exec: realExec,
+		});
+		const beforeLock = await recover();
+		assert.equal(beforeLock.ok, true);
+		await writeFile(join(root, ".pi", "workbench", "delegation-start.lock"), "runtime lock telemetry\n");
+		const afterLock = await recover();
+		assert.equal(afterLock.ok, true);
+		assert.deepEqual(afterLock.value, beforeLock.value);
+		assert.deepEqual(afterLock.value.before_guard.irrelevant_artifact_paths, []);
+		assert.equal(afterLock.value.before_guard.meter.irrelevant_paths, 0);
 	});
 });
 

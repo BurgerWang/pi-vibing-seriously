@@ -274,6 +274,17 @@ function isIrrelevantArtifactPath(path: string): boolean {
 		|| isDelegationStartLockArtifactPath(".", path);
 }
 
+/** Generated Python import caches are runtime byproducts, never source authority. */
+function isEphemeralPythonBytecodePath(path: string): boolean {
+	const segments = path.split("/");
+	const name = segments.at(-1) ?? "";
+	return segments.slice(0, -1).includes("__pycache__") && /\.(?:pyc|pyo)$/u.test(name);
+}
+
+function isCollectedIrrelevantArtifactPath(path: string): boolean {
+	return isIrrelevantArtifactPath(path) || isEphemeralPythonBytecodePath(path);
+}
+
 function byteCompare(left: string, right: string): number {
 	return Buffer.from(left, "utf8").compare(Buffer.from(right, "utf8"));
 }
@@ -424,7 +435,7 @@ export function validateWorkspaceGuard(
 	}
 	previous = undefined;
 	for (const path of value.irrelevant_artifact_paths) {
-		if (!isStrictWorkspaceGuardPath(path) || !isIrrelevantArtifactPath(path)) return false;
+		if (!isStrictWorkspaceGuardPath(path) || !isCollectedIrrelevantArtifactPath(path)) return false;
 		if (Buffer.byteLength(path, "utf8") > normalizedLimits.max_path_bytes) return false;
 		if (previous !== undefined && byteCompare(previous, path) >= 0) return false;
 		previous = path;
@@ -519,7 +530,7 @@ export async function collectWorkspaceGuard(
 	for (const item of parsed) {
 		if (seen.has(item.path)) return failure("invalid_path", meter);
 		seen.add(item.path);
-		if (isIrrelevantArtifactPath(item.path)) irrelevant.push(item.path);
+		if (isCollectedIrrelevantArtifactPath(item.path)) irrelevant.push(item.path);
 		else relevant.push(item);
 	}
 	if (irrelevant.length > limits.max_irrelevant_paths) return failure("path_overflow", meter);

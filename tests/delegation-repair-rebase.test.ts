@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test } from "node:test";
 
@@ -70,7 +70,7 @@ function committed(
 	} as unknown as DelegationCommittedGenerationV2;
 }
 
-async function finalizationRecovery(root: string) {
+async function finalizationRecovery(root: string, allowedPaths: readonly string[] = ["src/recovered.ts"]) {
 	const lineage = bindDelegationRepairLineageV1({
 		schema_version: 1,
 		kind: "semantic-repair-lineage-v1",
@@ -94,7 +94,7 @@ async function finalizationRecovery(root: string) {
 		delegation_id: ID,
 		task_kind: "implementation",
 		contract_hash: contractHash,
-		allowed_paths: ["src/recovered.ts"],
+		allowed_paths: [...allowedPaths],
 		worker_identity: workerIdentity,
 		generation: 1,
 		now: "2026-08-27T01:02:03.000Z",
@@ -317,6 +317,15 @@ test("post-worker finalization rebase admits only the journal-exact dirty bytes"
 			assert.match(accepted.value.rebase_hash, /^[a-f0-9]{64}$/u);
 		}
 
+		await writeFile(join(root, "src", "same-bytes.tmp"), "worker final\n", "utf8");
+		await rename(join(root, "src", "same-bytes.tmp"), join(root, "src", "recovered.ts"));
+		const sameBytesNewInode = await collectFinalizationRepairRebaseAuthorityV1({
+			projectRoot: root,
+			transaction,
+			exec: spawnExec,
+		});
+		assert.equal(sameBytesNewInode.ok, true, sameBytesNewInode.ok ? "" : sameBytesNewInode.code);
+
 		await writeFile(join(root, "src", "recovered.ts"), "external mutation\n", "utf8");
 		const changed = await collectFinalizationRepairRebaseAuthorityV1({ projectRoot: root, transaction, exec: spawnExec });
 		assert.deepEqual(changed, { ok: false, code: "final_identity_mismatch", path: "src/recovered.ts" });
@@ -324,10 +333,19 @@ test("post-worker finalization rebase admits only the journal-exact dirty bytes"
 
 	await withTempDir(async (root) => {
 		await initialize(root);
-		const transaction = await finalizationRecovery(root);
+		const transaction = await finalizationRecovery(root, ["src/"]);
 		await writeFile(join(root, "src", "outside.ts"), "outside\n", "utf8");
 		const outside = await collectFinalizationRepairRebaseAuthorityV1({ projectRoot: root, transaction, exec: spawnExec });
 		assert.deepEqual(outside, { ok: false, code: "path_set_mismatch", path: "src/outside.ts" });
+	});
+
+	await withTempDir(async (root) => {
+		await initialize(root);
+		const transaction = await finalizationRecovery(root);
+		await mkdir(join(root, "notes"), { recursive: true });
+		await writeFile(join(root, "notes", "unrelated.md"), "disjoint dirt\n", "utf8");
+		const disjoint = await collectFinalizationRepairRebaseAuthorityV1({ projectRoot: root, transaction, exec: spawnExec });
+		assert.equal(disjoint.ok, true, disjoint.ok ? "" : disjoint.code);
 	});
 });
 

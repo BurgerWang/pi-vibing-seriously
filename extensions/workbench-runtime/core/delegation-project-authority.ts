@@ -63,6 +63,7 @@ import {
 	recoverInterruptedDelegationV2,
 	releaseOrphanedTerminalExecutionOwnerV2,
 	isStrictRetryableAbortedRepairV2,
+	isStrictRetryableCheckpointRepairRecoveryV2,
 	isStrictRetryableEmptyRepairRecoveryV2,
 	isStrictRetryableFinalizationRepairRecoveryV2,
 	readStrictRetryableRawRepairEvidenceV1,
@@ -546,6 +547,7 @@ async function validRepairParentState(
 	if (transaction.status !== "RECOVERY_REQUIRED" || transaction.repair_lineage === undefined) return false;
 	if (transaction.committed_proof !== null) return (await strictLineageChangeSet(projectRoot, transaction)).ok;
 	if (await isStrictRetryableEmptyRepairRecoveryV2(projectRoot, transaction)) return true;
+	if (await isStrictRetryableCheckpointRepairRecoveryV2(projectRoot, transaction)) return true;
 	if (await isStrictRetryableFinalizationRepairRecoveryV2(projectRoot, transaction)) return true;
 	return (await readRecoverableUnpublishedDelegationV2(projectRoot, transaction.delegation_id)).ok;
 }

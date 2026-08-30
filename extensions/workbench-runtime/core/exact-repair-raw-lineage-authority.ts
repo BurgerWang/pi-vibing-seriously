@@ -3,6 +3,7 @@
 import { canonicalHash } from "../cache/canonical-hash.ts";
 import {
 	readStrictRetryableRawRepairEvidenceV1,
+	strictRawRepairRequiresCurrentByteRebaseV1,
 	type StrictRetryableRawRepairEvidenceV1,
 } from "./delegation-execution-owner.ts";
 import type { CollectFinalizationRepairRebaseResultV1 } from "./delegation-repair-rebase.ts";
@@ -186,7 +187,7 @@ export async function readRawLineageImmutableRepairV1(
 		return { ok: false, code: evidence.code === "STORAGE_FAILURE" ? "STORAGE_FAILURE" :
 			evidence.code === "AUTHORITY_CHANGED" ? "AUTHORITY_CHANGED" : "RAW_TIP_NOT_RETRYABLE" };
 	}
-	if (evidence.value.retry_kind !== "FINALIZATION_RECOVERY" &&
+	if (!strictRawRepairRequiresCurrentByteRebaseV1(evidence.value.retry_kind) &&
 		lineage.depth > EXACT_REPAIR_RAW_LINEAGE_MAX_RETRYABLE_DEPTH_V1) {
 		return { ok: false, code: "RAW_TIP_NOT_RETRYABLE" };
 	}
@@ -300,19 +301,20 @@ export async function recoverRawLineageExactRepairAuthorityV1(input: {
 		!admission.repair_tip_ids.includes(immutable.value.repair_of)) {
 		return { ok: false, code: "PROJECT_CLOSURE_INVALID" };
 	}
-	const finalizationRebase = immutable.value.raw_tip_retry_kind === "FINALIZATION_RECOVERY"
+	const requiresCurrentByteRebase = strictRawRepairRequiresCurrentByteRebaseV1(immutable.value.raw_tip_retry_kind);
+	const finalizationRebase = requiresCurrentByteRebase
 		? await input.collectFinalizationRebase?.(input.project_root, immutable.value.parent)
 		: undefined;
-	if (immutable.value.raw_tip_retry_kind === "FINALIZATION_RECOVERY" &&
+	if (requiresCurrentByteRebase &&
 		(finalizationRebase === undefined || !finalizationRebase.ok)) {
 		return { ok: false, code: "CURRENT_BINDING_CHANGED" };
 	}
-	const bindingTarget = immutable.value.raw_tip_retry_kind === "FINALIZATION_RECOVERY"
+	const bindingTarget = requiresCurrentByteRebase
 		? immutable.value.repair_of
 		: immutable.value.continuation_decision_delegation_id;
 	const binding = await input.collectCurrentBinding(input.project_root, bindingTarget);
 	if (binding.status !== "fresh" || typeof binding.hash !== "string" || !/^[a-f0-9]{64}$/u.test(binding.hash) ||
-		(immutable.value.raw_tip_retry_kind !== "FINALIZATION_RECOVERY" &&
+		(!requiresCurrentByteRebase &&
 			binding.hash !== immutable.value.continuation_expected_binding_hash)) {
 		return { ok: false, code: "CURRENT_BINDING_CHANGED" };
 	}

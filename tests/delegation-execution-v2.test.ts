@@ -21,6 +21,10 @@ import {
 	type ExecuteDelegationV2Input,
 } from "../extensions/workbench-runtime/core/delegation-execution-v2.ts";
 import {
+	collectCheckpointResumeExecutionAuthorityV1,
+	persistDelegationResumeAuthorityV1,
+} from "../extensions/workbench-runtime/core/delegation-resume-authority.ts";
+import {
 	committedStructuredReviewAuthorityV2,
 	reviewDelegationV2,
 } from "../extensions/workbench-runtime/core/delegation-review-v2.ts";
@@ -982,6 +986,100 @@ test("execution v2: a soft checkpoint continues in one delegation with cumulativ
 	const committed = await readDelegationCommittedGenerationV2(projectRoot, delegationId);
 	assert.equal(committed.ok, true);
 	if (committed.ok) assert.equal(committed.value.state.generation, 1);
+});
+
+test("execution v2: a new process resumes the exact recovery transaction from its durable checkpoint", async (t) => {
+	const projectRoot = await root(t);
+	const delegationId = id(62);
+	const { contract_hash: _baseHash, ...baseContract } = contract("implementation");
+	const boundResult = bindDelegationBoundedTaskContractV2({
+		...baseContract,
+		allowed_paths: ["src/"],
+	});
+	assert.equal(boundResult.ok, true);
+	if (!boundResult.ok) return;
+	const bound = boundResult.value;
+	const first = worker("checkpoint handoff", {
+		turns: 32,
+		spendState: { turns: 32, totalTokens: 480, outputTokens: 64 },
+		spendBand: "soft",
+		spendReasons: ["turns"],
+		spendSoftReached: { turns: true, totalTokens: false, outputTokens: false },
+		checkpointRequest: {
+			attempt: 1,
+			advisory: { completed_criteria: [], remaining_criteria: ["The transaction is complete and authority-bound."] },
+		},
+	});
+	first.usage = {
+		input: 320, output: 64, cacheRead: 96, cacheWrite: 0, totalTokens: 480,
+		cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 },
+	};
+	const ticks = clock();
+	let calls = 0;
+	const crashed = await executeDelegationV2({
+		projectRoot,
+		delegationId,
+		contract: bound,
+		workerIdentity: { ...WORKER_IDENTITY },
+		clock: ticks,
+		exec: realExec,
+		onPrepared: async (_state, _before, prepared) => {
+			const persisted = await persistDelegationResumeAuthorityV1({
+				project_root: projectRoot,
+				delegation_id: delegationId,
+				contract: bound,
+				prepared,
+			});
+			assert.equal(persisted.ok, true);
+		},
+		runWorker: async () => {
+			calls += 1;
+			if (calls === 1) {
+				return journalWorker(projectRoot, delegationId, bound.contract_hash, ["src/changed.ts"], first);
+			}
+			throw new Error("simulated process loss after checkpoint");
+		},
+	});
+	assert.equal(crashed.ok, false);
+	if (crashed.ok) return;
+	assert.equal(crashed.code, "runner_failed");
+	assert.equal(crashed.durable_state?.status, "RECOVERY_REQUIRED");
+	const authority = await collectCheckpointResumeExecutionAuthorityV1({
+		project_root: projectRoot,
+		delegation_id: delegationId,
+		exec: realExec,
+	});
+	assert.equal(authority.ok, true, authority.ok ? "" : authority.code);
+	if (!authority.ok) return;
+	const resumedCalls: RunWorkerOptions[] = [];
+	const resumed = await executeDelegationV2({
+		projectRoot,
+		delegationId,
+		contract: bound,
+		workerIdentity: { ...WORKER_IDENTITY },
+		clock: ticks,
+		exec: realExec,
+		checkpointRecovery: authority.value,
+		runWorker: async (options) => {
+			resumedCalls.push(options);
+			return worker(completeReport(["src/changed.ts"]), {
+				turns: 2,
+				spendState: { turns: 34, totalTokens: 640, outputTokens: 104 },
+				spendBand: "soft",
+				spendReasons: ["turns"],
+				spendSoftReached: { turns: true, totalTokens: false, outputTokens: false },
+			});
+		},
+	});
+	assert.equal(resumed.ok, true, resumed.ok ? "" : JSON.stringify(resumed));
+	if (!resumed.ok || resumed.status === "PAUSED_BUDGET") return;
+	assert.equal(resumed.status, "PENDING_REVIEW");
+	assert.equal(resumed.durable_state.revision, 5);
+	assert.equal(resumedCalls.length, 1);
+	assert.equal(resumedCalls[0]!.attempt, 2);
+	assert.deepEqual(resumedCalls[0]!.initialSpendState, { turns: 32, totalTokens: 480, outputTokens: 64 });
+	assert.equal(resumed.result.usage.totalTokens, 640);
+	assert.deepEqual(resumed.after.changedSinceBefore, ["src/changed.ts"]);
 });
 
 test("execution v2: unknown out-of-journal drift blocks automatic checkpoint continuation", async (t) => {

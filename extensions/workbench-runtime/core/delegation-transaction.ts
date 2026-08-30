@@ -688,29 +688,29 @@ function validStateInvariants(state: DelegationTransactionRecord): boolean {
 			return state.revision === 0 && outcome === null && proof === null && review === null &&
 				state.abort_reason === null && state.recovery_reason === null;
 		case "RUNNING":
-			return state.revision === 1 && outcome === null && proof === null && review === null &&
+			return state.revision >= 1 && state.revision % 2 === 1 && outcome === null && proof === null && review === null &&
 				state.abort_reason === null && state.recovery_reason === null;
 		case "COMMITTING":
-			return state.revision === 2 && outcome !== null && proof === null && review === null &&
+			return state.revision >= 2 && state.revision % 2 === 0 && outcome !== null && proof === null && review === null &&
 				state.abort_reason === null && state.recovery_reason === null;
 		case "PENDING_REVIEW":
-			return state.revision === 3 && state.task_kind === "implementation" && outcome !== null && proof !== null && review === null &&
-				proof.revision === 2 &&
+			return state.revision >= 3 && state.revision % 2 === 1 && state.task_kind === "implementation" && outcome !== null && proof !== null && review === null &&
+				proof.revision === state.revision - 1 &&
 				state.postcondition_reasons.length === 0 && state.abort_reason === null && state.recovery_reason === null;
 		case "INTERRUPTED":
-			return state.revision === 3 && outcome !== null && proof !== null && review === null && proof.revision === 2 &&
+			return state.revision >= 3 && state.revision % 2 === 1 && outcome !== null && proof !== null && review === null && proof.revision === state.revision - 1 &&
 				isDelegationInterruptedCandidateV2(state, outcome) && state.abort_reason === null && state.recovery_reason === null;
 		case "FINISHED":
-			return state.revision === 3 && state.task_kind === "diagnosis" && outcome !== null && proof !== null && review === null &&
-				proof.revision === 2 &&
+			return state.revision >= 3 && state.revision % 2 === 1 && state.task_kind === "diagnosis" && outcome !== null && proof !== null && review === null &&
+				proof.revision === state.revision - 1 &&
 				state.postcondition_reasons.length === 0 && state.abort_reason === null && state.recovery_reason === null;
 		case "REVIEWED":
-			return state.revision === 4 && state.task_kind === "implementation" && outcome !== null && proof !== null && review !== null &&
-				proof.revision === 2 && review.transaction_revision === 3 &&
+			return state.revision >= 4 && state.revision % 2 === 0 && state.task_kind === "implementation" && outcome !== null && proof !== null && review !== null &&
+				proof.revision === state.revision - 2 && review.transaction_revision === state.revision - 1 &&
 				state.postcondition_reasons.length === 0 && state.abort_reason === null && state.recovery_reason === null;
 		case "FAILED":
-			return state.revision === 3 && outcome !== null && proof !== null && review === null && state.postcondition_reasons.length > 0 &&
-				proof.revision === 2 &&
+			return state.revision >= 3 && state.revision % 2 === 1 && outcome !== null && proof !== null && review === null && state.postcondition_reasons.length > 0 &&
+				proof.revision === state.revision - 1 &&
 				outcome.terminal_facts_complete && outcome.scope_complete && !isDelegationInterruptedCandidateV2(state, outcome) &&
 				state.abort_reason === null && state.recovery_reason === null;
 		case "ABORTED":
@@ -718,9 +718,9 @@ function validStateInvariants(state: DelegationTransactionRecord): boolean {
 				state.abort_reason !== null && state.recovery_reason === null;
 		case "RECOVERY_REQUIRED":
 			if (review !== null || state.abort_reason !== null || state.recovery_reason === null) return false;
-			if (state.revision === 2) return outcome === null && proof === null;
-			if (state.revision !== 3 || outcome === null) return false;
-			return proof === null || proof.revision === 2;
+			if (outcome === null) return state.revision >= 2 && state.revision % 2 === 0 && proof === null;
+			if (state.revision < 3 || state.revision % 2 !== 1) return false;
+			return proof === null || proof.revision === state.revision - 1;
 	}
 }
 
@@ -874,6 +874,23 @@ export function startDelegationTransaction(
 	if (casError) return { ok: false, error: casError };
 	if (state.status !== "PREPARED") return { ok: false, error: `cannot start delegation from ${state.status}` };
 	return { ok: true, state: nextState(state, input.now, { status: "RUNNING" }) };
+}
+
+/** Resume the exact incomplete transaction after strict checkpoint revalidation. */
+export function resumeDelegationTransaction(
+	state: DelegationTransactionRecord,
+	input: DelegationCasInput,
+): DelegationTransactionResult {
+	const source = validateTransitionSourceState(state);
+	if (!source.ok) return source;
+	state = source.state;
+	const casError = validateCas(state, input);
+	if (casError) return { ok: false, error: casError };
+	if (state.status !== "RECOVERY_REQUIRED" || state.terminal_outcome !== null || state.committed_proof !== null
+		|| state.recovery_reason !== "worker runner failed before terminal facts") {
+		return { ok: false, error: `cannot resume checkpointed delegation from ${state.status}` };
+	}
+	return { ok: true, state: nextState(state, input.now, { status: "RUNNING", recovery_reason: null }) };
 }
 
 export function beginDelegationCommit(

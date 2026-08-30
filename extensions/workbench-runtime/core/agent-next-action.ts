@@ -7,6 +7,7 @@ import {
 } from "./delegation-lifecycle-resolver.ts";
 
 export const EXACT_REPAIR_TOOL_NAME_V1 = "workbench_repair_delegation" as const;
+export const LIFECYCLE_ACTION_TURN_MESSAGE_TYPE_V2 = "workbench-lifecycle-action-turn-v2" as const;
 
 export function reviewDelegationToolActionV1(delegationId: string): string {
 	return `call workbench_review_worker_diff with delegation_id=${delegationId}`;
@@ -124,4 +125,101 @@ export function lifecycleActionSnapshotTextV2(snapshot: Readonly<LifecycleAction
 		case "RECOVER_AUTHORITY": return command ?? "recover the exact snapshot-bound authority";
 		default: return assertNever(snapshot.action);
 	}
+}
+
+/** Canonical status projection sourced from the same V2 snapshot as tool selection. */
+export function lifecycleActionStatusLinesV2(snapshot: unknown): string[] {
+	if (!validateLifecycleActionSnapshotV2(snapshot)) return [
+		"lifecycle v2 : UNAVAILABLE (INVALID_ACTION_SNAPSHOT)",
+		"typed action : UNAVAILABLE (INVALID_ACTION_SNAPSHOT)",
+		"next action  : recover lifecycle authority; do not infer an action from legacy status labels",
+	];
+	return [
+		`lifecycle v2 : ${snapshot.state}`,
+		`typed action : ${snapshot.action} (${snapshot.reason_code})`,
+		`next action  : ${lifecycleActionSnapshotTextV2(snapshot)}`,
+	];
+}
+
+/** Replace compatibility action lines without discarding their durable evidence. */
+export function mergeLifecycleActionStatusLinesV2(baseLines: readonly string[], snapshot: unknown): string[] {
+	const base = baseLines.filter((line) => !line.startsWith("typed action :") && !line.startsWith("next action  :"));
+	const action = lifecycleActionStatusLinesV2(snapshot);
+	return base.length === 0 ? action : [base[0]!, ...action, ...base.slice(1)];
+}
+
+/**
+ * Hidden, per-turn machine facts for an actionable lifecycle snapshot.
+ *
+ * Long conversations may contain an older assistant claim that a tool was not
+ * available.  The runtime-selected tool list is newer and authoritative, so
+ * the model must not use conversation memory to veto a tool that Pi actually
+ * exposed for this turn.  This remains guidance rather than an automatic
+ * mutation: report-only requests stay report-only and USER_REQUIRED actions
+ * still stop for explicit authorization.
+ */
+export function lifecycleActionTurnDirectiveV2(
+	snapshot: Readonly<LifecycleActionSnapshotV2>,
+	activeTools: readonly string[],
+): string | undefined {
+	if (!validateLifecycleActionSnapshotV2(snapshot) ||
+		["NONE", "CONTINUE_DIRECT_DEVELOPMENT"].includes(snapshot.action)) return undefined;
+	const tools = [...new Set(activeTools)].sort();
+	const toolActive = snapshot.tool !== null && tools.includes(snapshot.tool);
+	const facts = JSON.stringify({
+		snapshot_hash: snapshot.snapshot_hash,
+		action: snapshot.action,
+		exact_target: snapshot.exact_target,
+		tool: snapshot.tool,
+		arguments: snapshot.arguments,
+		authorization: snapshot.authorization,
+		reason_code: snapshot.reason_code,
+		tool_active: toolActive,
+		active_tools: tools,
+	});
+	const execution = snapshot.authorization === "USER_REQUIRED"
+		? "Stop execution and request the exact explicit user authorization described by next_action; do not execute, replace, or work around this action until authorization is granted."
+		: snapshot.tool === null
+			? "No executable tool is selected; report the exact lifecycle state without inventing a different action."
+		: toolActive
+			? "If the current user message asks to continue, fix, or complete the work, execute this action in this turn before declaring a block. For a report-only request, report these facts without mutating."
+			: "The selected tool is not active in this mode; report the exact mode/tool mismatch without inventing a different action.";
+	const delegation = snapshot.action === "START_DELEGATION"
+		? " For START_DELEGATION, derive one fresh bounded contract from the current objective and repository evidence, then call the listed tool without repair_of. An implementation contract must require a real in-scope delta and must not describe zero delta as success; use task_kind=diagnosis when the bounded objective is only to verify that the current baseline already satisfies the criteria."
+		: snapshot.action === "CONTINUE_CHECKPOINT"
+			? " For CONTINUE_CHECKPOINT, call the listed exact tool with the supplied delegation_id; do not invent or reconstruct a new contract."
+			: "";
+	const budgetPause = snapshot.action === "PAUSED_BUDGET"
+		? " PAUSED_BUDGET is a hard stop: do not call status as a substitute for authorization, do not resume or repair the delegation, do not create a successor, and do not expand its budget. Ask the user to authorize either an extended budget or a bounded split."
+		: "";
+	return [
+		"Fresh Workbench lifecycle facts for this turn override older conversation assumptions about lifecycle state and tool availability.",
+		facts,
+		"Never claim a tool listed in active_tools is unavailable. Use only the snapshot-selected action and exact target.",
+		`${execution}${delegation}${budgetPause}`,
+		"After the tool result, follow its machine next_action and re-check lifecycle status; do not substitute unrelated cleanup.",
+	].join("\n");
+}
+
+/** Build the hidden runtime message without coupling the composition root to its schema. */
+export function lifecycleActionTurnMessageV2(
+	snapshot: Readonly<LifecycleActionSnapshotV2>,
+	activeTools: readonly string[],
+): Readonly<{
+	customType: typeof LIFECYCLE_ACTION_TURN_MESSAGE_TYPE_V2;
+	content: string;
+	display: false;
+	details: { snapshot_hash: string; action: string; tool: string | null };
+}> | undefined {
+	const content = lifecycleActionTurnDirectiveV2(snapshot, activeTools);
+	return content === undefined ? undefined : Object.freeze({
+		customType: LIFECYCLE_ACTION_TURN_MESSAGE_TYPE_V2,
+		content,
+		display: false as const,
+		details: {
+			snapshot_hash: snapshot.snapshot_hash,
+			action: snapshot.action,
+			tool: snapshot.tool,
+		},
+	});
 }

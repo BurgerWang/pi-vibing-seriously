@@ -17,6 +17,7 @@ import {
 	isStrictRetryableAbortedRepairV2,
 	isStrictRetryableEmptyRepairRecoveryV2,
 	readStrictRetryableRawRepairEvidenceV1,
+	strictRawRepairRequiresCurrentByteRebaseV1,
 } from "./delegation-execution-owner.ts";
 import type { makeDelegationId, readDelegationLedger } from "./delegation-ledger.ts";
 import { isVerifyConfigMaintenanceDelegation, type WorkbenchMode } from "./mode-policy.ts";
@@ -36,6 +37,11 @@ import {
 	type DelegationPathLaneAdmissionV1,
 } from "./delegation-path-lane-admission.ts";
 import { normalizeDelegationBoundedTaskContractV2 } from "./delegation-transaction-artifacts.ts";
+import {
+	collectCheckpointResumeExecutionAuthorityV1,
+	persistDelegationResumeAuthorityV1,
+	type CheckpointResumeExecutionAuthorityV1,
+} from "./delegation-resume-authority.ts";
 import {
 	acquireProjectDelegationStartLockV1,
 	releaseProjectDelegationStartLockV1,
@@ -129,6 +135,7 @@ function attachDelegateSessionMirrorWarning(
 }
 
 type PreparedCallbackStep =
+	| "resume_authority_persist"
 	| "verification_recheck"
 	| "plan_recheck"
 	| "repair_authority_recheck"
@@ -360,6 +367,8 @@ export interface DelegateToolServices {
 	readRecoverableUnpublished: typeof readRecoverableUnpublishedDelegationV2;
 	readLegacyLedger: typeof readDelegationLedger;
 	executeDelegation: typeof executeDelegationV2;
+	/** Optional deterministic seam; production persists the strict resume sidecar. */
+	persistResumeAuthority?: typeof persistDelegationResumeAuthorityV1;
 	completeDefaultDelivery: typeof completeDefaultDelegationDeliveryV2;
 	buildTrustedRecoveryAuthority: typeof buildTrustedRecoveryAuthority;
 }
@@ -375,10 +384,19 @@ export type DelegateExactRepairExecuteV1 = (
 	ctx: Parameters<DelegateWorkerExecuteV1>[4],
 ) => ReturnType<DelegateWorkerExecuteV1>;
 
+export type DelegateCheckpointRecoveryExecuteV1 = (
+	toolCallId: string,
+	authority: Readonly<CheckpointResumeExecutionAuthorityV1>,
+	signal: Parameters<DelegateWorkerExecuteV1>[2],
+	onUpdate: Parameters<DelegateWorkerExecuteV1>[3],
+	ctx: Parameters<DelegateWorkerExecuteV1>[4],
+) => ReturnType<DelegateWorkerExecuteV1>;
+
 /** The user command and model-callable tool share this exact execution function. */
 export interface DelegateToolExecutionHandleV1 {
 	readonly execute: DelegateWorkerExecuteV1;
 	readonly executeExactRepair: DelegateExactRepairExecuteV1;
+	readonly executeCheckpointRecovery?: DelegateCheckpointRecoveryExecuteV1;
 }
 
 /**
@@ -396,6 +414,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 		onUpdate: Parameters<DelegateWorkerExecuteV1>[3],
 		ctx: Parameters<DelegateWorkerExecuteV1>[4],
 		exactRepairAuthority?: ExactRepairCommandAuthorityV1,
+		checkpointRecoveryAuthority?: Readonly<CheckpointResumeExecutionAuthorityV1>,
 	): ReturnType<DelegateWorkerExecuteV1> => {
 			let trustedIngress: TIngress | undefined;
 			const sessionMirrorWarnings: DelegateSessionMirrorWarning[] = [];
@@ -449,6 +468,12 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 						exactRepairAuthority.repair_of !== contract.value.repair_of ||
 						canonicalHash(params) !== canonicalHash(exactRepairAuthority.arguments))) {
 					throw new Error("workbench_delegate_worker: in-process exact repair authority binding is invalid");
+				}
+				if (checkpointRecoveryAuthority !== undefined &&
+					(checkpointRecoveryAuthority.delegation_id !== checkpointRecoveryAuthority.transaction.delegation_id
+						|| canonicalHash(contract.value) !== canonicalHash(checkpointRecoveryAuthority.contract)
+						|| checkpointRecoveryAuthority.contract.contract_hash !== checkpointRecoveryAuthority.transaction.contract_hash)) {
+					throw new Error("workbench_delegate_worker: in-process checkpoint recovery authority binding is invalid");
 				}
 				if (contract.value.repair_of !== undefined && exactRepairAuthority === undefined) {
 					throw new Error(`workbench_delegate_worker: unbound repair_of ${contract.value.repair_of} reached the delegation kernel`);
@@ -516,7 +541,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 				// lifecycle-wide checkout writer lease.
 				await controller.reconcileProjectAuthority(projectRoot, controller.services.now().toISOString());
 				const preflightProjectIssueCode = controller.getProjectAuthorityIssueCode?.();
-				if (preflightProjectIssueCode !== undefined && !pathLaneMayResolveProjectIssue(preflightProjectIssueCode)) {
+				if (checkpointRecoveryAuthority === undefined && preflightProjectIssueCode !== undefined && !pathLaneMayResolveProjectIssue(preflightProjectIssueCode)) {
 					const projectBlock = controller.getProjectAuthorityBlockReason("delegation");
 					throw new Error(`workbench_delegate_worker: ${projectBlock ?? `project authority is ${preflightProjectIssueCode}; delegation fails closed`}`);
 				}
@@ -529,18 +554,21 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 				};
 				const admitPathLane = controller.services.admitPathLane ?? admitProjectDelegationPathLaneV1;
 				const revalidatePathLane = controller.services.revalidatePathLane ?? revalidateProjectDelegationPathLaneV1;
-				const pathLaneAdmission = await admitPathLane(laneAdmissionInput);
-				if (pathLaneAdmission.decision.decision !== "ALLOW") {
+				const pathLaneAdmission = checkpointRecoveryAuthority === undefined
+					? await admitPathLane(laneAdmissionInput)
+					: undefined;
+				if (pathLaneAdmission !== undefined && pathLaneAdmission.decision.decision !== "ALLOW") {
 					throw new Error(`workbench_delegate_worker: path lane admission blocked: ${pathLaneBlockSummary(pathLaneAdmission)}`);
 				}
-				if (preflightProjectIssueCode !== undefined &&
+				if (pathLaneAdmission !== undefined && preflightProjectIssueCode !== undefined &&
 					!pathLaneAllowsHistoricalBypass(pathLaneAdmission, exactRepairAuthority?.repair_of)) {
 					const projectBlock = controller.getProjectAuthorityBlockReason("delegation");
 					throw new Error(`workbench_delegate_worker: ${projectBlock ?? `project authority is ${preflightProjectIssueCode}; delegation fails closed`}`);
 				}
 				const startedAt = guardedCheckoutOperation?.start_lock_lease.acquired_at
 					?? controller.services.now().toISOString();
-				const delegationId = guardedCheckoutOperation?.delegation_id
+				const delegationId = checkpointRecoveryAuthority?.delegation_id
+					?? guardedCheckoutOperation?.delegation_id
 					?? controller.services.makeDelegationId(new Date(startedAt));
 				const readTransaction = controller.services.readTransaction ?? readDelegationTransactionV2;
 				const readReview = controller.services.readReview ?? readDelegationReviewV2;
@@ -599,8 +627,8 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 				await controller.reconcileProjectAuthority(projectRoot, controller.services.now().toISOString());
 				const projectBlock = controller.getProjectAuthorityBlockReason("delegation");
 				const projectIssueCode = controller.getProjectAuthorityIssueCode?.();
-				if ((projectIssueCode !== undefined && !pathLaneMayResolveProjectIssue(projectIssueCode)) ||
-					(projectBlock !== undefined && controller.getProjectAuthorityIssueCode === undefined)) {
+				if (checkpointRecoveryAuthority === undefined && ((projectIssueCode !== undefined && !pathLaneMayResolveProjectIssue(projectIssueCode)) ||
+					(projectBlock !== undefined && controller.getProjectAuthorityIssueCode === undefined))) {
 					throw new Error(`workbench_delegate_worker: ${projectBlock ?? `project authority is ${projectIssueCode}; delegation fails closed`}`);
 				}
 
@@ -969,7 +997,8 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 									if (negative.ok) continuationDecisionHash = negative.value.decision.decision_hash;
 								}
 								if (continuationDecisionHash !== exact.continuation_decision_hash) return false;
-								if (exact.raw_tip_retry_kind === "FINALIZATION_RECOVERY") {
+								const requiresCurrentByteRebase = strictRawRepairRequiresCurrentByteRebaseV1(exact.raw_tip_retry_kind);
+								if (requiresCurrentByteRebase) {
 									const rebased = await collectFinalizationRepairRebaseAuthorityV1({
 										projectRoot,
 										transaction: raw.value,
@@ -978,7 +1007,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 									if (!rebased.ok || rebased.value.rebase_hash !== exact.raw_tip_rebase_hash) return false;
 								} else if (exact.raw_tip_rebase_hash !== null) return false;
 								const binding = await controller.collectCurrentDelegationBinding(projectRoot,
-									exact.raw_tip_retry_kind === "FINALIZATION_RECOVERY"
+									requiresCurrentByteRebase
 										? exact.repair_of
 										: exact.continuation_decision_delegation_id);
 								return binding.status === "fresh" && binding.hash === exact.expected_current_binding_hash;
@@ -1066,7 +1095,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 				}
 				const verifiedRepairTipExclusionId = v2RepairAuthority?.exactCommandAuthority?.repair_of;
 				let currentState = controller.getDelegationState();
-				if (currentState.latestId !== undefined &&
+				if (pathLaneAdmission !== undefined && currentState.latestId !== undefined &&
 					!pathLaneAllowsSessionBindingBypass(pathLaneAdmission, currentState.latestId, verifiedRepairTipExclusionId)) {
 					const priorBinding = await controller.collectCurrentDelegationBinding(projectRoot, currentState.latestId);
 					if (priorBinding.status === "unavailable") {
@@ -1079,12 +1108,14 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 						currentState = observedState;
 					}
 				}
-				if (projectBlock !== undefined && !pathLaneAllowsHistoricalBypass(pathLaneAdmission, verifiedRepairTipExclusionId)) {
+				if (pathLaneAdmission !== undefined && projectBlock !== undefined && !pathLaneAllowsHistoricalBypass(pathLaneAdmission, verifiedRepairTipExclusionId)) {
 					throw new Error(`workbench_delegate_worker: ${projectBlock}`);
 				}
-				const reviewBlock = reviewBlockReason(currentState, "delegation");
+				const reviewBlock = checkpointRecoveryAuthority === undefined
+					? reviewBlockReason(currentState, "delegation")
+					: undefined;
 				const strictExactTipRepair = v2RepairAuthority?.exactCommandAuthority !== undefined &&
-					pathLaneAdmission.repair_tip_exclusion_id === v2RepairAuthority.id &&
+					pathLaneAdmission?.repair_tip_exclusion_id === v2RepairAuthority.id &&
 					pathLaneAdmission.repair_tip_ids.includes(v2RepairAuthority.id);
 				const exactBlockingRepair = reviewBlock !== undefined && v2RepairAuthority !== undefined &&
 					(currentState.latestId === v2RepairAuthority.id || strictExactTipRepair);
@@ -1103,14 +1134,14 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 						}
 					}
 				}
-				const laneBypassedBlockingId = reviewBlock !== undefined && !exactBlockingRepair && finalizedStaleSuccessorId === undefined &&
+				const laneBypassedBlockingId = pathLaneAdmission !== undefined && reviewBlock !== undefined && !exactBlockingRepair && finalizedStaleSuccessorId === undefined &&
 					pathLaneAllowsSessionBlockBypass(pathLaneAdmission, currentState.latestId)
 					? currentState.latestId
 					: undefined;
 				if (reviewBlock && !exactBlockingRepair && finalizedStaleSuccessorId === undefined && laneBypassedBlockingId === undefined) {
 					throw new Error(`workbench_delegate_worker: ${reviewBlock}`);
 				}
-				const reviewedPrelaunch = v2RepairAuthority === undefined && reviewBlock === undefined && currentState.latestId !== undefined &&
+				const reviewedPrelaunch = checkpointRecoveryAuthority === undefined && v2RepairAuthority === undefined && reviewBlock === undefined && currentState.latestId !== undefined &&
 					currentState.status === "REVIEWED" && currentState.reviewedDiffHash !== undefined
 					? { id: currentState.latestId, hash: currentState.reviewedDiffHash }
 					: undefined;
@@ -1124,7 +1155,8 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 				// follows its existing dedicated authority path above. Every ordinary
 				// successor must preserve (or explicitly replace) a proven latest plan.
 				const lineagePlanRoot = v2RepairAuthority?.repairLineage?.root_delegation_id;
-				if (lineagePlanRoot !== undefined || !(v2RepairAuthority !== undefined && v2RepairAuthority.kind !== "committed" && exactBlockingRepair)) {
+				if (checkpointRecoveryAuthority === undefined &&
+					(lineagePlanRoot !== undefined || !(v2RepairAuthority !== undefined && v2RepairAuthority.kind !== "committed" && exactBlockingRepair))) {
 					const priorPlan = await readPlanContractAuthority(
 						projectRoot,
 						lineagePlanRoot ?? (laneBypassedBlockingId === undefined ? currentState.latestId : undefined),
@@ -1148,17 +1180,29 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 				// deliberately the final awaited authority check before the callee can
 				// publish PREPARED. The full unexcluded authority and any exact tip
 				// exclusion are both bound by the expected hash.
-				const laneRevalidation = await revalidatePathLane({
-					...laneAdmissionInput,
-					expected_authority_hash: pathLaneAdmission.authority_hash,
-				});
-				if (!laneRevalidation.unchanged || laneRevalidation.admission.decision.decision !== "ALLOW") {
-					const changed = laneRevalidation.unchanged ? "" : "authority changed; ";
-					throw new Error(`workbench_delegate_worker: path lane revalidation blocked before PREPARED: ${changed}${pathLaneBlockSummary(laneRevalidation.admission)}`);
-				}
-				if (laneRevalidation.admission.repair_tip_exclusion_id !== null &&
-					laneRevalidation.admission.repair_tip_exclusion_id !== verifiedRepairTipExclusionId) {
-					throw new Error("workbench_delegate_worker: path lane repair-tip exclusion lacks exact in-process repair authority");
+				if (pathLaneAdmission !== undefined) {
+					const laneRevalidation = await revalidatePathLane({
+						...laneAdmissionInput,
+						expected_authority_hash: pathLaneAdmission.authority_hash,
+					});
+					if (!laneRevalidation.unchanged || laneRevalidation.admission.decision.decision !== "ALLOW") {
+						const changed = laneRevalidation.unchanged ? "" : "authority changed; ";
+						throw new Error(`workbench_delegate_worker: path lane revalidation blocked before PREPARED: ${changed}${pathLaneBlockSummary(laneRevalidation.admission)}`);
+					}
+					if (laneRevalidation.admission.repair_tip_exclusion_id !== null &&
+						laneRevalidation.admission.repair_tip_exclusion_id !== verifiedRepairTipExclusionId) {
+						throw new Error("workbench_delegate_worker: path lane repair-tip exclusion lacks exact in-process repair authority");
+					}
+				} else {
+					const revalidatedCheckpoint = await collectCheckpointResumeExecutionAuthorityV1({
+						project_root: projectRoot,
+						delegation_id: delegationId,
+						exec: controller.exec,
+						session_entries: ctx.sessionManager.getEntries(),
+					});
+					if (!revalidatedCheckpoint.ok || revalidatedCheckpoint.value.authority_hash !== checkpointRecoveryAuthority?.authority_hash) {
+						throw new Error("workbench_delegate_worker: checkpoint recovery authority changed before resume");
+					}
 				}
 
 				let preparedCallbackStep: PreparedCallbackStep | undefined;
@@ -1182,11 +1226,24 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					exec: controller.exec,
 					clock: () => controller.services.now().toISOString(),
 					checkoutOperationToken: checkoutOperationLease.token,
-					onPrepared: async (_transaction, preparedBefore) => {
+					...(checkpointRecoveryAuthority === undefined ? {} : {
+						checkpointRecovery: checkpointRecoveryAuthority,
+					}),
+					onPrepared: async (_transaction, preparedBefore, preparedLifecycle) => {
 						// executeDelegation invokes this callback only after strict durable
 						// PREPARED publication. From this point an outer throw is ambiguous
 						// until exact durable readback proves a terminal replacement.
 						preserveStartLock = true;
+						preparedCallbackStep = "resume_authority_persist";
+						const persistResumeAuthority = controller.services.persistResumeAuthority
+							?? persistDelegationResumeAuthorityV1;
+						const resumeAuthority = await persistResumeAuthority({
+							project_root: projectRoot,
+							delegation_id: delegationId,
+							contract: contract.value,
+							prepared: preparedLifecycle,
+						});
+						if (!resumeAuthority.ok) throw new Error(`resume authority ${resumeAuthority.code}`);
 						preparedCallbackStep = "verification_recheck";
 						await verifyRecipesBeforeLaunch();
 						if (contract.value.plan_ref !== undefined) {
@@ -1590,11 +1647,26 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 	};
 	const executeExactRepair: DelegateExactRepairExecuteV1 = (authority, signal, onUpdate, ctx) =>
 		executeKernel(authority.tool_call_id, authority.arguments, signal, onUpdate, ctx, authority);
+	const executeCheckpointRecovery: DelegateCheckpointRecoveryExecuteV1 = (toolCallId, authority, signal, onUpdate, ctx) => {
+		if (authority.contract.budget_profile !== "standard" && authority.contract.budget_profile !== "extended") {
+			throw new Error("workbench_delegate_worker: checkpoint contract uses a retired budget profile");
+		}
+		const { contract_hash: _contractHash, ...arguments_ } = authority.contract;
+		return executeKernel(
+			toolCallId,
+			arguments_ as Parameters<DelegateWorkerExecuteV1>[1],
+			signal,
+			onUpdate,
+			ctx,
+			undefined,
+			authority,
+		);
+	};
 	controller.pi.registerTool({
 		...WORKBENCH_TOOL_METADATA.workbench_delegate_worker,
 		parameters: WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker,
 		executionMode: "sequential",
 		execute,
 	});
-	return Object.freeze({ execute, executeExactRepair });
+	return Object.freeze({ execute, executeExactRepair, executeCheckpointRecovery });
 }

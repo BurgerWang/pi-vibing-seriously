@@ -31,6 +31,7 @@ import {
 } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
 import {
 	bindDelegationRepairLineageV1,
+	delegationPathAllowedV2,
 	type DelegationTransactionRecord,
 } from "../extensions/workbench-runtime/core/delegation-transaction.ts";
 import { normalizeDelegationBoundedTaskContractV2 } from "../extensions/workbench-runtime/core/delegation-transaction-artifacts.ts";
@@ -51,12 +52,19 @@ import {
 	WORKER_TASK_KIND_ENV,
 } from "../extensions/workbench-runtime/core/worker-policy.ts";
 import { WORKER_SPEND_PROFILE_ENV } from "../extensions/workbench-runtime/core/worker-spend.ts";
-import { createWorkerWriteJournal, sealWorkerWriteJournal } from "../extensions/workbench-runtime/core/write-journal.ts";
+import {
+	beginWriteJournalOperation,
+	completeWriteJournalOperation,
+	createWorkerWriteJournal,
+	sealWorkerWriteJournal,
+} from "../extensions/workbench-runtime/core/write-journal.ts";
 import {
 	readStrictRetryableRawRepairEvidenceV1,
 	RETRYABLE_BEFORE_WRITE_ABORT_REASONS_V2,
+	RETRYABLE_EMPTY_RECOVERY_REASONS_V2,
 } from "../extensions/workbench-runtime/core/delegation-execution-owner.ts";
 import { recoverRawLineageExactRepairAuthorityV1 } from "../extensions/workbench-runtime/core/exact-repair-raw-lineage-authority.ts";
+import { collectFinalizationRepairRebaseAuthorityV1 } from "../extensions/workbench-runtime/core/delegation-repair-rebase.ts";
 import { readExactRepairSuccessorV1 } from "../extensions/workbench-runtime/core/exact-repair-successor.ts";
 import { readWorkerRepairCapsule } from "../extensions/workbench-runtime/core/worker-repair-authority.ts";
 import {
@@ -66,6 +74,7 @@ import {
 	readProjectDelegationRepairClosureV1,
 } from "../extensions/workbench-runtime/core/delegation-project-authority.ts";
 import { collectWorkspaceGuard } from "../extensions/workbench-runtime/core/workspace-guard.ts";
+import { captureStreamingIdentities } from "../extensions/workbench-runtime/core/streaming-identity.ts";
 import { buildDelegationWorkerFirstGateFacts } from "../extensions/workbench-runtime/core/delegation-plan-reference.ts";
 import { LIFECYCLE_ACTION_SNAPSHOT_ENTRY_TYPE_V2 } from "../extensions/workbench-runtime/core/delegation-lifecycle-resolver.ts";
 import { spawnExec, withTempDir, writeConfigFile } from "./helpers.ts";
@@ -1393,7 +1402,7 @@ test("public WORKSPACE_DRIFT failure routes to REPAIR-only review and never auto
 			const status = await delegationStatusTool(stub).execute("implementation-drift-status", {}, undefined, undefined, ctx);
 			const statusOutput = resultText(status);
 			assert.match(statusOutput, new RegExp(`latest\\s+: ${state.latestId} FAILED`, "u"));
-			assert.match(statusOutput, new RegExp(`next action\\s+: call workbench_review_worker_diff with delegation_id=${state.latestId}`, "u"));
+			assert.match(statusOutput, new RegExp(`next action\\s+: call workbench_review_worker_diff delegation_id=${state.latestId}`, "u"));
 			assert.match(statusOutput, /committed non-empty delta requires REPAIR-only Sol review/u);
 			assert.doesNotMatch(statusOutput, /repair_of=/u, "non-attributed drift has no fabricated exact-repair authority");
 			assert.doesNotMatch(statusOutput, /latest\s+: .* PENDING_REVIEW/u);
@@ -1508,8 +1517,8 @@ test("model-supplied repair_of cannot supersede a committed FAILED delegation wi
 		const transactionBefore = await readFile(transactionPath, "utf8");
 		const status = await delegationStatusTool(stub).execute("committed-failed-status", {}, undefined, undefined, ctx);
 		assert.match(resultText(status), /completion v2:\s+FAIL/);
-		assert.match(resultText(status), /typed action\s+: BLOCK_OVERLAPPING_PATHS/u);
-		assert.match(resultText(status), /next action\s+: resolve the overlapping or unknown path authority/u);
+		assert.match(resultText(status), /typed action\s+: NONE \(OVERLAPPING_PATHS\)/u);
+		assert.match(resultText(status), /next action\s+: overlapping or unknown path authority remains blocked; use strict path-lane admission/u);
 		assert.doesNotMatch(resultText(status), /repair_of=/u, "the zero-quality diagnosis failure has no Sol terminal-negative sidecar");
 		const refusedReview = await reviewTool(stub).execute(
 			"committed-failed-review", { delegation_id: failedId }, undefined, undefined, ctx,
@@ -1745,7 +1754,7 @@ test("q-repair replays a matching PREPARED successor after a pre-launch crash wi
 			"q-repair-prepared-aborted-status", {}, undefined, undefined, toolCtx,
 		));
 		assert.match(abortedStatus, new RegExp(`latest\\s+: ${preparedId} ABORTED`, "u"));
-		assert.match(abortedStatus, new RegExp(`next action\\s+: call workbench_repair_delegation with delegation_id=${preparedId}`, "u"));
+		assert.match(abortedStatus, new RegExp(`next action\\s+: call workbench_repair_delegation delegation_id=${preparedId}`, "u"));
 		assert.equal((abortedStatus.match(/next action\s+:/gu) ?? []).length, 1);
 		const rawAuthority = await recoverRawLineageExactRepairAuthorityV1({
 			project_root: root,
@@ -1783,6 +1792,233 @@ test("q-repair replays a matching PREPARED successor after a pre-launch crash wi
 		assert.match(notices.at(-1) ?? "", /authority_kind: raw-lineage-retry/u);
 		assert.match(notices.at(-1) ?? "", /shared delegate execution completed/u);
 		assert.equal(stub.sentUserMessageCount, 0);
+	});
+});
+
+test("project closure accepts a hash-bound successor whose parent is a written checkpoint recovery", async () => {
+	await withTempDir(async (root) => {
+		await initializeProject(root);
+		await writeFile(join(root, ".gitignore"), [
+			`${CONFIG_DIR_NAME}/workbench/delegations/`,
+			`${CONFIG_DIR_NAME}/workbench/tool-results/`,
+			`${CONFIG_DIR_NAME}/workbench/runs/`,
+			`${CONFIG_DIR_NAME}/workbench/delegation-start.lock`,
+			"fake-worker-*.cjs",
+			"",
+		].join("\n"), "utf8");
+		assert.equal((await spawnExec("git", ["add", ".gitignore", `${CONFIG_DIR_NAME}/workbench/project.yaml`], { cwd: root })).code, 0);
+		assert.equal((await spawnExec("git", [
+			"-c", "user.name=Workbench Test", "-c", "user.email=workbench@example.invalid",
+			"commit", "-q", "-m", "test baseline",
+		], { cwd: root })).code, 0);
+		const parentPath = "src/raw-checkpoint-parent.ts";
+		const childPath = "src/raw-checkpoint-child.ts";
+		const paths = [childPath, parentPath];
+		const rootScript = await writeFakeWorker(root, { changedPaths: paths, body: "known-bad\n" });
+		const stub = commanderRuntime();
+		const ctx = commanderContext(root, "raw-checkpoint-parent");
+		const initial = await withFakeWorker(rootScript, () => delegateTool(stub).execute(
+			"raw-checkpoint-root",
+			delegateParams({ task_kind: "implementation", allowed_paths: paths }),
+			undefined,
+			undefined,
+			ctx,
+		));
+		const rootId = delegationId(initial);
+		const decision = await requireCurrentSemanticRepair(
+			root,
+			stub,
+			ctx,
+			rootId,
+			"Seed exact repair authority for the raw checkpoint parent.",
+		);
+		assert.equal(typeof decision.details.repair_decision_hash, "string");
+		const decisionHash = decision.details.repair_decision_hash as string;
+		const parentLineage = bindDelegationRepairLineageV1({
+			schema_version: 1,
+			kind: "semantic-repair-lineage-v1",
+			root_delegation_id: rootId,
+			repair_of: rootId,
+			root_decision_hash: decisionHash,
+			continuation_decision_delegation_id: rootId,
+			continuation_decision_hash: decisionHash,
+			parent_lineage_hash: null,
+			depth: 1,
+			carried_paths: paths,
+		});
+		assert.ok(parentLineage);
+		const parentId = "20991231-235950-rw01";
+		const parentContract = normalizeDelegationBoundedTaskContractV2({
+			...delegateParams({ task_kind: "implementation", allowed_paths: paths }),
+			repair_of: rootId,
+		});
+		assert.equal(parentContract.ok, true);
+		if (!parentContract.ok) return;
+		const workerIdentity = { provider: WORKER_PROVIDER, model: WORKER_MODEL_ID, worker_id: `worker:${parentId}` } as const;
+		const prepared = await persistPreparedDelegationTransaction(root, {
+			delegation_id: parentId,
+			task_kind: "implementation",
+			contract_hash: parentContract.value.contract_hash,
+			allowed_paths: paths,
+			worker_identity: workerIdentity,
+			generation: 1,
+			now: "2099-12-31T23:59:50.000Z",
+			repair_lineage: parentLineage,
+		});
+		assert.equal(prepared.ok, true, prepared.ok ? "" : prepared.error.code);
+		if (!prepared.ok) return;
+		assert.equal((await createWorkerWriteJournal({
+			project_root: root,
+			delegation_id: parentId,
+			contract_hash: parentContract.value.contract_hash,
+		})).ok, true);
+		const running = await persistRunningDelegationTransaction(root, {
+			delegation_id: parentId,
+			contract_hash: parentContract.value.contract_hash,
+			worker_identity: workerIdentity,
+			expected_generation: 1,
+			expected_revision: 0,
+			now: "2099-12-31T23:59:51.000Z",
+		});
+		assert.equal(running.ok, true, running.ok ? "" : running.error.code);
+		const begun = await beginWriteJournalOperation({
+			project_root: root,
+			delegation_id: parentId,
+			contract_hash: parentContract.value.contract_hash,
+			expected_revision: 0,
+			operation_id: "9".repeat(64),
+			kind: "edit",
+			path: parentPath,
+		});
+		assert.equal(begun.ok, true, begun.ok ? "" : begun.error.code);
+		if (!begun.ok) return;
+		await writeFile(join(root, parentPath), "partial parent repair\n", "utf8");
+		const completed = await completeWriteJournalOperation({
+			project_root: root,
+			delegation_id: parentId,
+			contract_hash: parentContract.value.contract_hash,
+			expected_revision: begun.value.revision,
+			operation_id: "9".repeat(64),
+			kind: "edit",
+			path: parentPath,
+			outcome: "succeeded",
+		});
+		assert.equal(completed.ok, true, completed.ok ? "" : completed.error.code);
+		const recovery = await persistRecoveryRequiredDelegationTransaction(root, {
+			delegation_id: parentId,
+			contract_hash: parentContract.value.contract_hash,
+			worker_identity: workerIdentity,
+			expected_generation: 1,
+			expected_revision: 1,
+			now: "2099-12-31T23:59:52.000Z",
+			reason: RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed,
+		});
+		assert.equal(recovery.ok, true, recovery.ok ? "" : recovery.error.code);
+		if (!recovery.ok) return;
+		const childLineage = bindDelegationRepairLineageV1({
+			schema_version: 1,
+			kind: "semantic-repair-lineage-v1",
+			root_delegation_id: rootId,
+			repair_of: parentId,
+			root_decision_hash: decisionHash,
+			continuation_decision_delegation_id: rootId,
+			continuation_decision_hash: decisionHash,
+			parent_lineage_hash: parentLineage.lineage_hash,
+			depth: 2,
+			carried_paths: paths,
+		});
+		assert.ok(childLineage);
+		const childId = "20991231-235953-rw02";
+		const childContract = normalizeDelegationBoundedTaskContractV2({
+			...delegateParams({ task_kind: "implementation", allowed_paths: paths }),
+			repair_of: parentId,
+		});
+		assert.equal(childContract.ok, true);
+		if (!childContract.ok) return;
+		const childWorkerIdentity = { provider: WORKER_PROVIDER, model: WORKER_MODEL_ID, worker_id: `worker:${childId}` } as const;
+		const child = await persistPreparedDelegationTransaction(root, {
+			delegation_id: childId,
+			task_kind: "implementation",
+			contract_hash: childContract.value.contract_hash,
+			allowed_paths: paths,
+			worker_identity: childWorkerIdentity,
+			generation: 1,
+			now: "2099-12-31T23:59:53.000Z",
+			repair_lineage: childLineage,
+		});
+		assert.equal(child.ok, true, child.ok ? "" : child.error.code);
+		if (!child.ok) return;
+		assert.equal((await createWorkerWriteJournal({
+			project_root: root,
+			delegation_id: childId,
+			contract_hash: childContract.value.contract_hash,
+		})).ok, true);
+		const childRunning = await persistRunningDelegationTransaction(root, {
+			delegation_id: childId,
+			contract_hash: childContract.value.contract_hash,
+			worker_identity: childWorkerIdentity,
+			expected_generation: 1,
+			expected_revision: 0,
+			now: "2099-12-31T23:59:54.000Z",
+		});
+		assert.equal(childRunning.ok, true, childRunning.ok ? "" : childRunning.error.code);
+		const childBegun = await beginWriteJournalOperation({
+			project_root: root,
+			delegation_id: childId,
+			contract_hash: childContract.value.contract_hash,
+			expected_revision: 0,
+			operation_id: "8".repeat(64),
+			kind: "edit",
+			path: childPath,
+		});
+		assert.equal(childBegun.ok, true, childBegun.ok ? "" : childBegun.error.code);
+		if (!childBegun.ok) return;
+		await writeFile(join(root, childPath), "partial child repair\n", "utf8");
+		const childCompleted = await completeWriteJournalOperation({
+			project_root: root,
+			delegation_id: childId,
+			contract_hash: childContract.value.contract_hash,
+			expected_revision: childBegun.value.revision,
+			operation_id: "8".repeat(64),
+			kind: "edit",
+			path: childPath,
+			outcome: "succeeded",
+		});
+		assert.equal(childCompleted.ok, true, childCompleted.ok ? "" : childCompleted.error.code);
+		const childRecovery = await persistRecoveryRequiredDelegationTransaction(root, {
+			delegation_id: childId,
+			contract_hash: childContract.value.contract_hash,
+			worker_identity: childWorkerIdentity,
+			expected_generation: 1,
+			expected_revision: 1,
+			now: "2099-12-31T23:59:55.000Z",
+			reason: RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed,
+		});
+		assert.equal(childRecovery.ok, true, childRecovery.ok ? "" : childRecovery.error.code);
+		if (!childRecovery.ok) return;
+		const currentGuard = await collectWorkspaceGuard({ project_root: root, exec: spawnExec });
+		assert.equal(currentGuard.ok, true, currentGuard.ok ? "" : currentGuard.error.code);
+		if (!currentGuard.ok) return;
+		const currentPaths = currentGuard.guard.entries
+			.map((entry) => entry.path)
+			.filter((candidate) => delegationPathAllowedV2(candidate, childRecovery.value.allowed_paths))
+			.sort();
+		assert.deepEqual(currentPaths, paths);
+		const currentIdentities = await captureStreamingIdentities({ project_root: root, paths: currentPaths });
+		assert.equal(currentIdentities.ok, true, currentIdentities.ok ? "" : JSON.stringify(currentIdentities.error));
+		const rebased = await collectFinalizationRepairRebaseAuthorityV1({
+			projectRoot: root,
+			transaction: childRecovery.value,
+			exec: spawnExec,
+		});
+		assert.equal(rebased.ok, true, rebased.ok ? "" : `${rebased.code}:${rebased.path ?? ""}`);
+		if (rebased.ok) assert.deepEqual(rebased.value.relevant_paths, paths);
+		assert.deepEqual(await readProjectDelegationRepairClosureV1(root), {
+			ok: true,
+			unresolvedTipId: childId,
+			rootCount: 1,
+			lineageCount: 2,
+		});
 	});
 });
 
@@ -2791,8 +3027,8 @@ test("a fresh session discovers durable ABORTED project authority without report
 		const status = await delegationStatusTool(stub).execute("project-aborted-status", {}, undefined, undefined, ctx);
 		assert.match(resultText(status), /authority v2\s+: transaction ABORTED/);
 		assert.match(resultText(status), /completion v2: FAIL/);
-		assert.match(resultText(status), /typed action\s+: CONTINUE_DEVELOPMENT/u);
-		assert.match(resultText(status), /next action\s+: continue ordinary development; no lifecycle command is required/u);
+		assert.match(resultText(status), /typed action\s+: CONTINUE_DIRECT_DEVELOPMENT \(NO_CURRENT_BLOCKER\)/u);
+		assert.match(resultText(status), /next action\s+: continue ordinary direct development; no lifecycle command is required/u);
 		assert.doesNotMatch(resultText(status), /INVALID|\(no delegation\)/);
 		assert.equal(stub.appendedEntries.length, entriesBeforeStatus + 1, "status appends exactly one changed bounded action snapshot");
 		assert.equal(stub.appendedEntries.at(-1)?.customType, LIFECYCLE_ACTION_SNAPSHOT_ENTRY_TYPE_V2);
@@ -2901,7 +3137,7 @@ test("session_start atomically aborts an ownerless preboot empty RUNNING transac
 		assert.equal(latestSessionState(stub).status, "REVIEWED");
 		const status = await delegationStatusTool(stub).execute("project-interrupted-status", {}, undefined, undefined, ctx);
 		assert.doesNotMatch(resultText(status), /blocked\s+: Starting a new worker delegation/);
-		assert.match(resultText(status), /next action\s+: continue ordinary development; no lifecycle command is required/u);
+		assert.match(resultText(status), /next action\s+: continue ordinary direct development; no lifecycle command is required/u);
 	});
 });
 
@@ -3018,7 +3254,7 @@ test("a corrupt newest project transaction overrides an optimistic REVIEWED sess
 		assert.match(resultText(status), /PROJECT_AUTHORITY_INVALID/);
 		const generalStatus = await runtimeCommandText(stub, "q-status", ctx);
 		assert.match(generalStatus, /project auth\s+: INVALID \(invalid_record\)/);
-		assert.match(generalStatus, /typed action\s+: QUARANTINE_CORRUPT_AUTHORITY/u);
+		assert.match(generalStatus, /typed action\s+: RECOVER_AUTHORITY \(UNDERLYING_AUTHORITY_CORRUPT\)/u);
 		assert.doesNotMatch(generalStatus, /DELEGATION .* REVIEWED/u, "q-status must not render the optimistic session mirror");
 	});
 });

@@ -701,6 +701,7 @@ test("delegate controller preflights recipe references before authority work and
 					}
 					throw new Error("verification drift should stop before worker launch");
 				},
+				persistResumeAuthority: async () => ({ ok: true, value: {} }) as never,
 				completeDefaultDelivery: async () => { throw new Error("must not deliver"); },
 				buildTrustedRecoveryAuthority: async () => undefined,
 			},
@@ -929,6 +930,7 @@ test("delegate controller keeps durable worker success when review postprocessin
 				readCommittedGeneration: async () => ({ ok: false, error: { code: "not_found" } }),
 				readRecoverableUnpublished: async () => ({ ok: false, error: { code: "not_recoverable" } }),
 				readLegacyLedger: async () => null,
+				persistResumeAuthority: async () => ({ ok: true, value: {} }) as never,
 				executeDelegation: async (input: { onPrepared?: (transaction: unknown, before: { diffHash: string }) => Promise<void> }) => {
 					await input.onPrepared?.({}, { diffHash: beforeHash });
 					return {
