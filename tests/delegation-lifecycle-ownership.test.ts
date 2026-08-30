@@ -42,6 +42,9 @@ test("status is a read-only projection with one typed next-action renderer", asy
 	for (const forbidden of ["reconcileProjectAuthority", ".setState(", ".persistBestEffort(", ".appendEntry("]) {
 		assert.equal(statusSource.includes(forbidden), false, `status must not call ${forbidden}`);
 	}
+	assert.match(statusSource, /createDelegationRepairStatusReadScopeV1\(projectRoot, execFn\)/);
+	assert.equal(statusSource.includes("readDelegationRepairStatusV1("), false);
+	assert.equal(statusSource.includes("readDelegationAuthorityObservation"), false);
 
 	const repairStatus = await source("core/delegation-repair-status.ts");
 	assert.equal(repairStatus.includes("readWorkerRepairCapsule"), false);

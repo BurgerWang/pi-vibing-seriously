@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
 	classifyDelegationRepairStatusV1,
+	createDelegationRepairStatusReadScopeV1,
 	delegationDisplayedStatusV1,
 	delegationExactRepairRouteLineV1,
 	delegationNextActionTextV1,
@@ -77,6 +78,37 @@ function terminalCommitted(status: "INTERRUPTED" | "FAILED", changedPaths: reado
 		},
 	} as never;
 }
+
+test("one repair-status read scope shares closure, authority and status observations", async () => {
+	let closureReads = 0;
+	let authorityReads = 0;
+	let bindingReads = 0;
+	const closure = { ok: true as const, unresolvedTipId: ID, rootCount: 1, lineageCount: 0 };
+	const authority = observation();
+	const scope = createDelegationRepairStatusReadScopeV1("/tmp/project", (async () => {
+		throw new Error("unused");
+	}) as ExecFn, {
+		readRepairClosure: async () => { closureReads += 1; return closure; },
+		readAuthority: async (_root, delegationId, prevalidatedClosure) => {
+			authorityReads += 1;
+			assert.equal(delegationId, ID);
+			assert.equal(prevalidatedClosure, closure);
+			return authority;
+		},
+		collectBinding: async () => {
+			bindingReads += 1;
+			return { status: "fresh", hash: HASH, kind: "changeset-relevance-v2" };
+		},
+	});
+	const [firstStatus, secondStatus] = await Promise.all([scope.readStatus(state), scope.readStatus(state)]);
+	const [firstAuthority, secondAuthority] = await Promise.all([scope.readAuthority(ID), scope.readAuthority(ID)]);
+	assert.equal(firstStatus, secondStatus);
+	assert.equal(firstAuthority, authority);
+	assert.equal(secondAuthority, authority);
+	assert.equal(closureReads, 1);
+	assert.equal(authorityReads, 1);
+	assert.equal(bindingReads, 1);
+});
 
 test("repair status projects a fresh negative decision into one exact next action", () => {
 	const status = classifyDelegationRepairStatusV1({

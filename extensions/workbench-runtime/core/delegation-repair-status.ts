@@ -12,6 +12,7 @@ import {
 	readProjectDelegationRepairClosureV1,
 	type CurrentDelegationBindingV2,
 	type DelegationAuthorityObservationV2,
+	type ProjectDelegationRepairClosureV1,
 } from "./delegation-project-authority.ts";
 import { emptyDelegationState, type DelegationState } from "./delegation-state.ts";
 import {
@@ -68,6 +69,61 @@ const DEFAULT_READER_SERVICES = Object.freeze({
 	collectTerminalRebase: collectTerminalRepairRebaseAuthorityV1,
 	collectFinalizationRebase: collectFinalizationRepairRebaseAuthorityV1,
 }) satisfies DelegationRepairStatusReaderServicesV1;
+
+/**
+ * One read-only operation scope for status, lifecycle rendering and authority
+ * details. It intentionally expires after its caller returns: no authority is
+ * cached across turns, while repeated consumers in the same projection share
+ * the exact closure and authority observation they are rendering.
+ */
+export interface DelegationRepairStatusReadScopeV1 {
+	readStatus(state: Readonly<DelegationState>): Promise<DelegationRepairStatusV1>;
+	readAuthority(delegationId: string): Promise<DelegationAuthorityObservationV2>;
+}
+
+export function createDelegationRepairStatusReadScopeV1(
+	projectRoot: string,
+	exec: ExecFn,
+	services: DelegationRepairStatusReaderServicesV1 = DEFAULT_READER_SERVICES,
+): DelegationRepairStatusReadScopeV1 {
+	const baseReadClosure = services.readRepairClosure ?? readProjectDelegationRepairClosureV1;
+	let closure: Promise<ProjectDelegationRepairClosureV1> | undefined;
+	const readClosure = (): Promise<ProjectDelegationRepairClosureV1> => {
+		closure ??= baseReadClosure(projectRoot);
+		return closure;
+	};
+	const authorities = new Map<string, Promise<DelegationAuthorityObservationV2>>();
+	const readAuthority = (delegationId: string): Promise<DelegationAuthorityObservationV2> => {
+		let observed = authorities.get(delegationId);
+		if (observed === undefined) {
+			observed = (async () => {
+				const repairClosure = await readClosure();
+				return services.readAuthority(projectRoot, delegationId, repairClosure);
+			})();
+			authorities.set(delegationId, observed);
+		}
+		return observed;
+	};
+	const scopedServices: DelegationRepairStatusReaderServicesV1 = {
+		...services,
+		readRepairClosure: async (root) => root === projectRoot ? readClosure() : baseReadClosure(root),
+		readAuthority: async (root, delegationId) => root === projectRoot
+			? readAuthority(delegationId)
+			: services.readAuthority(root, delegationId),
+	};
+	const statuses = new WeakMap<object, Promise<DelegationRepairStatusV1>>();
+	return Object.freeze({
+		readStatus(state: Readonly<DelegationState>): Promise<DelegationRepairStatusV1> {
+			let status = statuses.get(state);
+			if (status === undefined) {
+				status = readDelegationRepairStatusV1(projectRoot, state, exec, scopedServices);
+				statuses.set(state, status);
+			}
+			return status;
+		},
+		readAuthority,
+	});
+}
 
 type V2Observation = Extract<DelegationAuthorityObservationV2, { kind: "v2" }>;
 

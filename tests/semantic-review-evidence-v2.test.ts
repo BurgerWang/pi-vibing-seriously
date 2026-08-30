@@ -63,6 +63,53 @@ function evidence(decision: "ACCEPT" | "REPAIR" = "ACCEPT", paths = ["src/a.ts",
 	return (built as { ok: true; value: SemanticReviewEvidenceV2 }).value;
 }
 
+test("evidence construction isolates every nested input with one owned snapshot", () => {
+	const streams = ["src/b.ts", "src/a.ts"].map((path, index) => ({
+		source: "FRESH" as const,
+		stream_id: `stream-${index + 1}`,
+		path,
+		content_hash: H(`owned-content-${index}`),
+		page_binding_hashes: [H(`owned-page-${index}`)],
+		assessment_hash: H(`owned-assessment-${index}`),
+		verdict: "PASS" as const,
+	}));
+	const streamSetHash = canonicalHash(streams.map(({ stream_id, path, content_hash }) => ({ stream_id, path, content_hash })));
+	const modelIdentity = { provider: "openai-codex" as const, model: "gpt-5.6-sol" as const, api: "openai-codex-responses" };
+	const crossFileAssessment = cross("ACCEPT", streamSetHash);
+	const nestedUsage = structuredClone(usage);
+	const built = buildSemanticReviewEvidenceV2({
+		delegation_id: "20260829-120000-abcd",
+		generation: 2,
+		generation_content_hash: H("owned-generation"),
+		contract_hash: H("owned-contract"),
+		bound_diff_hash: H("owned-diff"),
+		relevance_projection_hash: H("owned-relevance"),
+		review_envelope_hash: H("owned-envelope"),
+		review_policy_hash: H("owned-policy"),
+		model_identity: modelIdentity,
+		runtime_build_identity: H("owned-runtime"),
+		stream_set_hash: streamSetHash,
+		parent_evidence_hash: null,
+		streams,
+		cross_file_assessment: crossFileAssessment,
+		final_decision: "ACCEPT",
+		repair_reason: null,
+		nested_usage: nestedUsage,
+		completed_at: "2026-08-29T12:00:00.000Z",
+	});
+	assert.equal(built.ok, true);
+	if (!built.ok) return;
+	const snapshot = structuredClone(built.value);
+	(modelIdentity as { model: string }).model = "mutated";
+	streams[0]!.path = "src/mutated.ts";
+	streams[0]!.page_binding_hashes[0] = H("mutated-page");
+	(crossFileAssessment.affected_paths as string[]).push("src/mutated.ts");
+	nestedUsage.cost.total = 999;
+	assert.deepEqual(built.value, snapshot);
+	assert.deepEqual(built.value.streams.map((stream) => stream.path), ["src/a.ts", "src/b.ts"]);
+	assert.equal(validateSemanticReviewEvidenceV2(built.value), true);
+});
+
 test("SemanticReviewEvidenceV2 accepts a complete fresh authority and rejects every binding drift", () => {
 	const value = evidence();
 	assert.equal(validateSemanticReviewEvidenceV2(value), true);

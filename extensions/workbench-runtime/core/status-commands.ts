@@ -13,7 +13,7 @@ import {
 	reviewBlockReason,
 	type DelegationState,
 } from "./delegation-state.ts";
-import { loadProjectConfig } from "./config.ts";
+import { loadProjectStatusConfig } from "./config.ts";
 import { MODE_TOOLS, type WorkbenchMode } from "./mode-policy.ts";
 import {
 	doctorWorkbenchRuntimeBuildV1,
@@ -155,7 +155,7 @@ export function registerStatusCommands(controller: StatusCommandController): voi
 			try {
 				if (ctx.isProjectTrusted()) {
 					const projectRoot = await controller.projectRootFor(ctx);
-					advisoryConfig = (await loadProjectConfig(projectRoot, { trusted: true })).commanderAdvisory;
+					advisoryConfig = (await loadProjectStatusConfig(projectRoot, { trusted: true })).commanderAdvisory;
 				}
 			} catch {
 				// Observation stays available with default advisory thresholds.

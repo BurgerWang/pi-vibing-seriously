@@ -115,6 +115,17 @@ export interface LoadProjectConfigOptions {
 	parsedGatesDocument?: ParsedGatesDocumentOverride;
 }
 
+/**
+ * The bounded project.yaml projection needed by status/footer/telemetry paths.
+ * It deliberately excludes recipes, gates, profiles and all authority-bearing
+ * configuration so those files are not parsed on every UI refresh.
+ */
+export interface ProjectStatusConfig {
+	readonly profile: string | undefined;
+	readonly cacheTelemetry: boolean;
+	readonly commanderAdvisory: AdvisoryConfig;
+}
+
 /** The workbench config directory for a project root. */
 export function workbenchDir(projectRoot: string): string {
 	return join(resolve(projectRoot), CONFIG_DIR_NAME, WORKBENCH_DIR);
@@ -189,6 +200,49 @@ async function readOptionalText(path: string): Promise<string | undefined> {
 		throw new ConfigFileReadError(path, "source identity changed after read");
 	}
 	return read.value.text;
+}
+
+/**
+ * Read only the non-authoritative project.yaml fields used by hot status paths.
+ * Trust and bounded/same-identity file checks are identical to the full loader;
+ * missing, malformed or non-mapping YAML preserves the historical defaults.
+ */
+export async function loadProjectStatusConfig(
+	projectRoot: string,
+	options: Pick<LoadProjectConfigOptions, "trusted">,
+): Promise<ProjectStatusConfig> {
+	if (!options.trusted) throw new UntrustedProjectError(projectRoot);
+	const content = await readOptionalText(join(workbenchDir(projectRoot), "project.yaml"));
+	let projectDoc: Record<string, unknown> | undefined;
+	if (content !== undefined) {
+		try {
+			const parsed: unknown = parseYaml(content);
+			if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+				projectDoc = parsed as Record<string, unknown>;
+			}
+		} catch {
+			// Full config loading records the YAML issue and leaves these fields at
+			// defaults. This bounded projection has no issue surface of its own.
+		}
+	}
+
+	const profile = typeof projectDoc?.profile === "string" ? projectDoc.profile : undefined;
+	let cacheTelemetry = true;
+	const cacheDoc = projectDoc?.cache;
+	if (cacheDoc !== undefined && typeof cacheDoc === "object" && cacheDoc !== null && !Array.isArray(cacheDoc)) {
+		const telemetry = (cacheDoc as Record<string, unknown>).telemetry;
+		if (telemetry === false) cacheTelemetry = false;
+	}
+	const commanderDoc = projectDoc?.commander;
+	const advisoryDoc = typeof commanderDoc === "object" && commanderDoc !== null && !Array.isArray(commanderDoc)
+		? (commanderDoc as Record<string, unknown>).advisory
+		: undefined;
+
+	return Object.freeze({
+		profile,
+		cacheTelemetry,
+		commanderAdvisory: parseAdvisoryConfig(advisoryDoc).config,
+	});
 }
 
 /**

@@ -308,16 +308,17 @@ export function buildSemanticReviewEvidenceV2(
 	input: Readonly<SemanticReviewEvidenceBuildInputV2>,
 ): { ok: true; value: Readonly<SemanticReviewEvidenceV2> } | { ok: false; code: "INVALID_EVIDENCE" } {
 	try {
-		const streams = [...input.streams].map((stream) => structuredClone(stream)).sort((left, right) => compareUtf8(left.path, right.path));
+		const cloned = structuredClone(input);
+		const streams = [...cloned.streams].sort((left, right) => compareUtf8(left.path, right.path));
 		const payload: Omit<SemanticReviewEvidenceV2, "evidence_hash"> = {
 			schema_version: SEMANTIC_REVIEW_EVIDENCE_SCHEMA_VERSION_V2,
 			kind: SEMANTIC_REVIEW_EVIDENCE_KIND_V2,
-			...structuredClone(input),
+			...cloned,
 			streams,
 		};
 		const value: SemanticReviewEvidenceV2 = { ...payload, evidence_hash: computeSemanticReviewEvidenceHashV2(payload) };
 		return validateSemanticReviewEvidenceV2(value)
-			? { ok: true, value: Object.freeze(structuredClone(value)) }
+			? { ok: true, value: Object.freeze(value) }
 			: { ok: false, code: "INVALID_EVIDENCE" };
 	} catch {
 		return { ok: false, code: "INVALID_EVIDENCE" };

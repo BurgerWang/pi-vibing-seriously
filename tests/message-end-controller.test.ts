@@ -7,6 +7,75 @@ import {
 	WORKER_TIME_FINALIZE_MESSAGE_TYPE,
 } from "../extensions/workbench-runtime/core/message-end-controller.ts";
 
+test("message_end reuses one successful project-root lookup for telemetry and status", async () => {
+	const handlers = new Map<string, Array<(...args: any[]) => unknown>>();
+	let rootReads = 0;
+	let telemetryRoot: string | undefined;
+	let telemetryObservations = 0;
+	let statusRoot: string | undefined;
+	registerMessageEndController({
+		pi: {
+			on(name: string, handler: (...args: any[]) => unknown) { handlers.set(name, [handler]); },
+			sendMessage() {}, appendEntry() {}, getThinkingLevel: () => "xhigh",
+			getActiveTools: () => [], getAllTools: () => [],
+		} as never,
+		cacheTelemetry: {
+			setProjectRoot(root: string) { telemetryRoot = root; },
+			async observeMessageEnd() { telemetryObservations += 1; },
+		} as never,
+		getWorkerContext: () => ({ role: undefined, spendProfile: "extended" }),
+		projectRootFor: async () => { rootReads += 1; return "/project"; },
+		refreshStatus: async (_ctx, _message, knownProjectRoot) => { statusRoot = knownProjectRoot; },
+	});
+	const message = {
+		role: "assistant",
+		provider: "openai-codex",
+		model: "gpt-5.6-sol",
+		usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { total: 0 } },
+	};
+	for (const handler of handlers.get("message_end") ?? []) {
+		await handler({ type: "message_end", message }, {
+			isProjectTrusted: () => true,
+			model: { api: "openai-codex-responses" },
+			thinkingLevel: "xhigh",
+			getSystemPrompt: () => "system",
+		});
+	}
+	assert.equal(rootReads, 1);
+	assert.equal(telemetryRoot, "/project");
+	assert.equal(telemetryObservations, 1);
+	assert.equal(statusRoot, "/project");
+});
+
+test("message_end leaves status free to retry when the telemetry root lookup fails", async () => {
+	const handlers = new Map<string, Array<(...args: any[]) => unknown>>();
+	let rootReads = 0;
+	let statusRoot: string | undefined = "not-called";
+	const projectRootFor = async (): Promise<string> => {
+		rootReads += 1;
+		if (rootReads === 1) throw new Error("transient lookup failure");
+		return "/project";
+	};
+	registerMessageEndController({
+		pi: {
+			on(name: string, handler: (...args: any[]) => unknown) { handlers.set(name, [handler]); },
+			sendMessage() {}, appendEntry() {}, getThinkingLevel: () => "xhigh",
+			getActiveTools: () => [], getAllTools: () => [],
+		} as never,
+		cacheTelemetry: {} as never,
+		getWorkerContext: () => ({ role: undefined, spendProfile: "extended" }),
+		projectRootFor,
+		refreshStatus: async (_ctx, _message, knownProjectRoot) => {
+			statusRoot = knownProjectRoot ?? await projectRootFor();
+		},
+	});
+	for (const handler of handlers.get("message_end") ?? []) {
+		await handler({ type: "message_end", message: { role: "assistant" } }, { isProjectTrusted: () => true });
+	}
+	assert.equal(rootReads, 2);
+	assert.equal(statusRoot, "/project");
+});
+
 test("worker wall-clock advisories fire at 65% and 85%, then reset on session replacement", () => {
 	const handlers = new Map<string, Array<(...args: unknown[]) => unknown>>();
 	const timers: Array<{ callback: () => void; delay: number; cleared: boolean }> = [];

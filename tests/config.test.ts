@@ -15,6 +15,7 @@ import {
 	findProjectRoot,
 	ConfigFileReadError,
 	loadProjectConfig,
+	loadProjectStatusConfig,
 	resolveEffectiveProjectRoot,
 	UntrustedProjectError,
 	workbenchDir,
@@ -73,6 +74,54 @@ test("untrusted projects are rejected before any config is read", async () => {
 			loadProjectConfig(dir, { trusted: false }),
 			(error) => error instanceof UntrustedProjectError && error.message.includes("not trusted"),
 		);
+	});
+});
+
+test("bounded status config preserves the full loader's status fields", async () => {
+	const documents = [
+		undefined,
+		[
+			"profile: focused",
+			"cache:",
+			"  telemetry: false",
+			"commander:",
+			"  advisory:",
+			"    soft: { requests: 5 }",
+			"    high: { requests: 10 }",
+			"",
+		].join("\n"),
+		"profile: 3\ncache:\n  telemetry: invalid\ncommander: invalid\n",
+		"profile: [\n",
+	] as const;
+	for (const document of documents) {
+		await withTempDir(async (dir) => {
+			if (document !== undefined) await writeConfigFile(dir, "project.yaml", document);
+			const [full, bounded] = await Promise.all([
+				loadProjectConfig(dir, { trusted: true }),
+				loadProjectStatusConfig(dir, { trusted: true }),
+			]);
+			assert.deepEqual(bounded, {
+				profile: full.profile,
+				cacheTelemetry: full.cacheTelemetry,
+				commanderAdvisory: full.commanderAdvisory,
+			});
+		});
+	}
+});
+
+test("bounded status config rejects untrusted reads and skips unrelated config files", async () => {
+	await withTempDir(async (dir) => {
+		await writeConfigFile(dir, "project.yaml", "profile: focused\ncache: { telemetry: false }\n");
+		await mkdir(join(workbenchDir(dir), "recipes.yaml"), { recursive: true });
+		await assert.rejects(
+			loadProjectStatusConfig(dir, { trusted: false }),
+			(error) => error instanceof UntrustedProjectError,
+		);
+		const bounded = await loadProjectStatusConfig(dir, { trusted: true });
+		assert.equal(bounded.profile, "focused");
+		assert.equal(bounded.cacheTelemetry, false);
+		assert.equal(bounded.commanderAdvisory.soft.requests, 200);
+		assert.equal(bounded.commanderAdvisory.high.requests, 300);
 	});
 });
 

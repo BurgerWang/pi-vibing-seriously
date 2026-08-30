@@ -11,7 +11,8 @@ import {
 } from "./delegation-lifecycle-resolver.ts";
 import {
 	delegationLifecycleResolutionForStatusV1,
-	readDelegationRepairStatusV1,
+	createDelegationRepairStatusReadScopeV1,
+	type DelegationRepairStatusReadScopeV1,
 	type DelegationRepairStatusV1,
 } from "./delegation-repair-status.ts";
 import type { DelegationState } from "./delegation-state.ts";
@@ -35,7 +36,11 @@ export interface LifecycleActionRefreshDependenciesV2 {
 }
 
 export interface LifecycleActionRefreshControllerV2 {
-	refresh(projectRoot: string, stateOverride?: Readonly<DelegationState>): Promise<Readonly<LifecycleActionSnapshotV2> | undefined>;
+	refresh(
+		projectRoot: string,
+		stateOverride?: Readonly<DelegationState>,
+		readScope?: DelegationRepairStatusReadScopeV1,
+	): Promise<Readonly<LifecycleActionSnapshotV2> | undefined>;
 	refreshTurn(input: Readonly<{
 		enabled: boolean;
 		getProjectRoot: () => Promise<string>;
@@ -57,17 +62,15 @@ export function createLifecycleActionRefreshControllerV2(
 	const enqueueRefresh = (
 		projectRoot: string,
 		stateOverride?: Readonly<DelegationState>,
+		readScope?: DelegationRepairStatusReadScopeV1,
 	): Promise<Readonly<{
 		snapshot?: Readonly<LifecycleActionSnapshotV2>;
 		budgetAuthorized: boolean;
 	}>> => {
 		const operation = tail.then(async () => {
 			const state = stateOverride ?? dependencies.getDelegationState();
-			const status = await readDelegationRepairStatusV1(
-				projectRoot,
-				state,
-				dependencies.exec,
-			);
+			const operationReadScope = readScope ?? createDelegationRepairStatusReadScopeV1(projectRoot, dependencies.exec);
+			const status = await operationReadScope.readStatus(state);
 			const resolution = delegationLifecycleResolutionForStatusV1(state, status);
 			let checkpoint;
 			if (state.latestId !== undefined) {
@@ -104,8 +107,9 @@ export function createLifecycleActionRefreshControllerV2(
 	const refresh = async (
 		projectRoot: string,
 		stateOverride?: Readonly<DelegationState>,
+		readScope?: DelegationRepairStatusReadScopeV1,
 	): Promise<Readonly<LifecycleActionSnapshotV2> | undefined> =>
-		(await enqueueRefresh(projectRoot, stateOverride)).snapshot;
+		(await enqueueRefresh(projectRoot, stateOverride, readScope)).snapshot;
 	const refreshTurn = async (input: Readonly<{
 		enabled: boolean;
 		getProjectRoot: () => Promise<string>;

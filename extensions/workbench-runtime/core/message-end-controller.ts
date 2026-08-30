@@ -136,7 +136,7 @@ export interface MessageEndController {
 	cacheTelemetry: CacheTelemetry;
 	getWorkerContext(): WorkerMessageContext;
 	projectRootFor(ctx: ExtensionContext): Promise<string>;
-	refreshStatus(ctx: ExtensionContext, pendingMessage?: unknown): Promise<void>;
+	refreshStatus(ctx: ExtensionContext, pendingMessage?: unknown, knownProjectRoot?: string): Promise<void>;
 	onWorkerBudgetSteerSent?(): void;
 	/** Deterministic timer seams for direct tests. */
 	scheduleTimer?(callback: () => void, delayMs: number): unknown;
@@ -228,11 +228,13 @@ export function registerMessageEndController(controller: MessageEndController): 
 			errorMessage?: string;
 			content?: unknown;
 		};
+		let knownProjectRoot: string | undefined;
 		if (event.message.role === "assistant") {
 			const spendSteerWasSentBeforeMessage = workerSpendSoftSteerSent;
 			try {
 				if (ctx.isProjectTrusted()) {
 					const projectRoot = await controller.projectRootFor(ctx);
+					knownProjectRoot = projectRoot;
 					controller.cacheTelemetry.setProjectRoot(projectRoot);
 					if (message.usage) {
 						await controller.cacheTelemetry.observeMessageEnd({
@@ -333,7 +335,7 @@ export function registerMessageEndController(controller: MessageEndController): 
 			}
 		}
 		try {
-			await controller.refreshStatus(ctx, event.message);
+			await controller.refreshStatus(ctx, event.message, knownProjectRoot);
 		} catch {
 			// Status refresh is best effort.
 		}

@@ -1165,8 +1165,9 @@ export async function collectCurrentDelegationBindingV2(
 export async function readDelegationAuthorityObservationV2(
 	projectRoot: string,
 	delegationId: string,
+	prevalidatedRepairClosure?: ProjectDelegationRepairClosureV1,
 ): Promise<DelegationAuthorityObservationV2> {
-	const repairClosure = await readProjectDelegationRepairClosureV1(projectRoot);
+	const repairClosure = prevalidatedRepairClosure ?? await readProjectDelegationRepairClosureV1(projectRoot);
 	if (!repairClosure.ok) return { kind: "invalid-v2", code: repairClosure.issue.code };
 	const raw = await readDelegationTransactionV2(projectRoot, delegationId);
 	if (!raw.ok) {

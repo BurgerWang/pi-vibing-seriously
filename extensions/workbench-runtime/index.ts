@@ -25,7 +25,7 @@ import {
 import { WORKER_WRITE_JOURNAL_RUNTIME_TELEMETRY_ENTRY_TYPE, createWorkerWriteJournalRuntime } from "./core/worker-write-journal-runtime.ts";
 import { parseWorkerInitialSpendStateEnvironment, resolveWorkerSpendProfile, WORKER_INITIAL_SPEND_STATE_ENV, WORKER_SPEND_PROFILE_ENV } from "./core/worker-spend.ts";
 import { describeMode, loadModeFromEntries, MODE_ENTRY_TYPE, statusText } from "./core/state.ts";
-import { findProjectRoot, loadProjectConfig, type ExecFn } from "./core/config.ts";
+import { findProjectRoot, loadProjectStatusConfig, type ExecFn } from "./core/config.ts";
 import { type WorkerFirstGateFacts } from "./core/gate-schema.ts";
 import { listRuns, readCommittedManifest } from "./core/runs.ts";
 import { runStatusLabel, fitToWidth } from "./core/format.ts";
@@ -66,9 +66,8 @@ import { readDelegationLedger } from "./core/delegation-ledger.ts";
 import { readDelegationCommittedGenerationV2, readDelegationReviewV2, readDelegationTransactionV2 } from "./core/delegation-transaction-storage.ts";
 import {
 	readRecoverableUnpublishedDelegationV2,
-	readDelegationAuthorityObservationV2 as readDelegationAuthorityObservation,
 } from "./core/delegation-project-authority.ts";
-import { delegationDisplayedStatusV1, delegationExactRepairRouteLineV1, delegationLifecycleResolutionForStatusV1, delegationNextActionTextV1, delegationProjectIssueRepairStatusV1, delegationRepairStatusLinesV1, delegationVerifyBlockReasonV1, readDelegationRepairStatusV1,
+import { createDelegationRepairStatusReadScopeV1, delegationDisplayedStatusV1, delegationExactRepairRouteLineV1, delegationLifecycleResolutionForStatusV1, delegationNextActionTextV1, delegationProjectIssueRepairStatusV1, delegationRepairStatusLinesV1, delegationVerifyBlockReasonV1, readDelegationRepairStatusV1,
 	type DelegationRepairStatusV1 } from "./core/delegation-repair-status.ts";
 import { type LifecycleActionSnapshotV2 } from "./core/delegation-lifecycle-resolver.ts";
 import { createLifecycleActionRefreshControllerV2 } from "./core/lifecycle-action-refresh-controller.ts";
@@ -643,7 +642,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 	}
 
 	/** Refresh the bounded status line from persisted project/session facts. */
-	async function refreshStatus(ctx: ExtensionContext, pendingMessage?: unknown): Promise<void> {
+	async function refreshStatus(ctx: ExtensionContext, pendingMessage?: unknown, knownProjectRoot?: string): Promise<void> {
 		const refreshSerial = ++uiRefreshSerial.status;
 		// No status bar exists in print/json modes; skip silently.
 		if (ctx.mode === "print" || ctx.mode === "json") return;
@@ -651,10 +650,10 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		let advisoryConfig: AdvisoryConfig | undefined;
 		try {
 			if (ctx.isProjectTrusted()) {
-				const projectRoot = await projectRootFor(ctx);
+				const projectRoot = knownProjectRoot ?? await projectRootFor(ctx);
 				if (refreshSerial !== uiRefreshSerial.status) return;
 				await lifecycleActionRefreshV2.refresh(projectRoot);
-				const config = await loadProjectConfig(projectRoot, { trusted: true });
+				const config = await loadProjectStatusConfig(projectRoot, { trusted: true });
 				if (refreshSerial !== uiRefreshSerial.status) return;
 				advisoryConfig = config.commanderAdvisory;
 				cacheTelemetry.setEnabled(config.cacheTelemetry);
@@ -721,7 +720,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				return;
 			}
 			const projectRoot = await projectRootFor(ctx);
-			const config = await loadProjectConfig(projectRoot, { trusted: true });
+			const config = await loadProjectStatusConfig(projectRoot, { trusted: true });
 			cacheTelemetry.setEnabled(config.cacheTelemetry);
 		} catch {
 			// default on — telemetry is best-effort, hashed and content-free numeric
@@ -872,10 +871,11 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 			// freshly verified when the live binding cannot be collected.
 			gitRefresh = "unavailable";
 		}
-		latestRepairStatus = await readDelegationRepairStatusV1(projectRoot, delegationState, execFn);
+		const authorityReadScope = createDelegationRepairStatusReadScopeV1(projectRoot, execFn);
 		let lifecycleSnapshot: Readonly<LifecycleActionSnapshotV2> | undefined;
-		try { lifecycleSnapshot = await lifecycleActionRefreshV2.refresh(projectRoot, delegationState); }
+		try { lifecycleSnapshot = await lifecycleActionRefreshV2.refresh(projectRoot, delegationState, authorityReadScope); }
 		catch { /* Rendering removes the compatibility action and fails closed. */ }
+		latestRepairStatus = await authorityReadScope.readStatus(delegationState);
 		refreshCompactP7Facts(delegationState);
 		const actor = detectActorRole({
 			roleEnv: workerRoleContext.role,
@@ -910,7 +910,7 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 				);
 			}
 		} else if (delegationState.latestId !== undefined) {
-			const authority = await readDelegationAuthorityObservation(projectRoot, delegationState.latestId);
+			const authority = await authorityReadScope.readAuthority(delegationState.latestId);
 			const displayedStatus = lifecycleSnapshot?.exact_target.delegation_id === delegationState.latestId && ["PAUSED_BUDGET", "SATISFIED_NO_DELTA"].includes(lifecycleSnapshot.state) ? lifecycleSnapshot.state : delegationDisplayedStatusV1(delegationState.status, authority.kind === "v2" ? authority.transactionStatus : undefined);
 			lines.push(
 				`latest       : ${delegationState.latestId} ${displayedStatus}`,
