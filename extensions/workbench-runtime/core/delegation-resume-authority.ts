@@ -83,7 +83,7 @@ export interface CheckpointResumeExecutionAuthorityV1 {
 	readonly raw_evidence_hash: string;
 	readonly path_lane_authority_hash: string;
 	readonly resume_record_hash: string | null;
-	/** Present only for a user-authorized fresh bounded spend epoch. */
+	/** Historical replay evidence only; current checkpoint relay never requires it. */
 	readonly budget_continuation?: Readonly<BudgetContinuationAuthorizationV1>;
 	readonly authority_hash: string;
 }
@@ -320,7 +320,8 @@ export async function collectCheckpointResumeExecutionAuthorityV1(input: Readonl
 		|| budgetContinuation.target_profile !== "extended")) {
 		return { ok: false, code: "BUDGET_AUTHORIZATION_INVALID" };
 	}
-	if (checkpoint === undefined || budgetContinuation === undefined && checkpoint.machine_state !== "CHECKPOINTED"
+	if (checkpoint === undefined || budgetContinuation === undefined &&
+		checkpoint.machine_state !== "CHECKPOINTED" && checkpoint.machine_state !== "PAUSED_BUDGET"
 		|| budgetContinuation !== undefined && checkpoint.machine_state !== "PAUSED_BUDGET") {
 		return { ok: false, code: transaction.repair_lineage === undefined
 			? "CHECKPOINT_UNAVAILABLE"
@@ -430,16 +431,19 @@ export async function collectCheckpointResumeExecutionAuthorityV1(input: Readonl
 
 /**
  * Upgrade a legacy PAUSED_BUDGET/RUNNING record into the same strict recovery
- * state now written by fixed runtimes. No semantic contract or project bytes
- * are changed, and a live execution owner always blocks the migration.
+ * state now written by fixed runtimes. This is a same-contract, same-path,
+ * fresh-worker handoff and therefore consumes no user budget authorization.
+ * An optional historical grant is validated only for replay compatibility.
+ * No semantic contract or project bytes are changed, and a live execution
+ * owner always blocks the migration.
  */
 export async function preparePausedBudgetContinuationV1(input: Readonly<{
 	project_root: string;
 	delegation_id: string;
-	authorization: Readonly<BudgetContinuationAuthorizationV1>;
+	authorization?: Readonly<BudgetContinuationAuthorizationV1>;
 }>): Promise<{ ok: true } | { ok: false; code: string }> {
-	if (!validateBudgetContinuationAuthorizationV1(input.authorization)
-		|| input.authorization.delegation_id !== input.delegation_id) return { ok: false, code: "BUDGET_AUTHORIZATION_INVALID" };
+	if (input.authorization !== undefined && (!validateBudgetContinuationAuthorizationV1(input.authorization)
+		|| input.authorization.delegation_id !== input.delegation_id)) return { ok: false, code: "BUDGET_AUTHORIZATION_INVALID" };
 	const transactionRead = await readDelegationTransactionV2(input.project_root, input.delegation_id);
 	const checkpointRead = await readDelegationWorkerCheckpointV1(input.project_root, input.delegation_id);
 	if (!transactionRead.ok || !checkpointRead.ok || checkpointRead.value === undefined) {
@@ -447,9 +451,13 @@ export async function preparePausedBudgetContinuationV1(input: Readonly<{
 	}
 	const transaction = transactionRead.value;
 	const checkpoint = checkpointRead.value;
-	if (checkpoint.machine_state !== "PAUSED_BUDGET" || checkpoint.checkpoint_hash !== input.authorization.checkpoint_hash
-		|| checkpoint.remaining_budget.profile !== "standard" || checkpoint.budget_promotion !== undefined
-		|| input.authorization.target_profile !== "extended"
+	if (transaction.status !== "RUNNING" && transaction.status !== "RECOVERY_REQUIRED") {
+		return { ok: false, code: "TRANSACTION_NOT_PAUSED" };
+	}
+	if (checkpoint.machine_state !== "PAUSED_BUDGET") return { ok: false, code: "TRANSACTION_NOT_PAUSED" };
+	if (input.authorization !== undefined && (checkpoint.checkpoint_hash !== input.authorization.checkpoint_hash
+			|| checkpoint.remaining_budget.profile !== "standard" || checkpoint.budget_promotion !== undefined
+			|| input.authorization.target_profile !== "extended")
 		|| checkpoint.delegation_id !== transaction.delegation_id || checkpoint.contract_hash !== transaction.contract_hash) {
 		return { ok: false, code: "BUDGET_AUTHORIZATION_STALE" };
 	}
@@ -458,7 +466,6 @@ export async function preparePausedBudgetContinuationV1(input: Readonly<{
 			? { ok: true }
 			: { ok: false, code: "RECOVERY_REASON_CONFLICT" };
 	}
-	if (transaction.status !== "RUNNING") return { ok: false, code: "TRANSACTION_NOT_PAUSED" };
 	const owner = await readDelegationExecutionOwnerV2(input.project_root, transaction);
 	if (owner.ok || owner.error.code !== "not_found") return { ok: false, code: "EXECUTION_OWNER_NOT_RELEASED" };
 	const journal = await readWorkerWriteJournal({

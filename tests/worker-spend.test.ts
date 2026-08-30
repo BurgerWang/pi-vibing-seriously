@@ -321,12 +321,13 @@ test("soft steer text is deterministic and names profile, reasons, and current/s
 	assert.ok(steer.includes("turns 32/32"), "steer names the triggered turn dimension with current/soft values");
 	assert.ok(steer.includes("total_tokens 5440000/5440000"), "steer names the triggered total dimension with current/soft values");
 	assert.ok(!steer.includes("output_tokens"), "untriggered dimensions are not named");
-	assert.match(steer, /continuation reserve/i);
+	assert.match(steer, /handoff reserve/i);
+	assert.match(steer, /never ask the user to authorize ordinary continuation/i);
 	assert.match(steer, /Stop starting unrelated work/i);
 	assert.match(steer, /handoff/i);
 	assert.match(steer, /remaining work/i);
-	assert.match(steer, /current Sol session/i);
-	assert.match(steer, /never ask the user to open a new Sol session/i);
+	assert.match(steer, /same delegation and existing authority/i);
+	assert.match(steer, /fresh --no-session Luna/i);
 	assert.ok(steer.length < 1000, "steer stays small and bounded");
 
 	// All three dimensions triggered → fixed order in the facts line.
@@ -350,26 +351,26 @@ test("soft steer text is deterministic and names profile, reasons, and current/s
 });
 
 test("hard-stop text is deterministic and names winning dimensions with current/hard values", () => {
-	const action = " Continue with a bounded follow-up delegation in the current Sol session after reviewing any partial delta; do not request a new Sol session.";
+	const action = " The controller must preserve the checkpoint and start a fresh bounded worker under the same delegation; no user budget authorization is required.";
 	assert.equal(
 		formatWorkerSpendHardStop({ turns: 64, totalTokens: 10_880_000, outputTokens: 0 }, "standard"),
-		`Worker cumulative spend hard budget reached (profile standard): turns 64/64, total_tokens 10880000/10880000.${action}`,
+		`Worker process hard handoff point reached (profile standard): turns 64/64, total_tokens 10880000/10880000.${action}`,
 	);
 	assert.equal(
 		formatWorkerSpendHardStop({ turns: 70, totalTokens: 100_000, outputTokens: 330_000 }, "standard"),
-		`Worker cumulative spend hard budget reached (profile standard): turns 70/64, output_tokens 330000/320000.${action}`,
+		`Worker process hard handoff point reached (profile standard): turns 70/64, output_tokens 330000/320000.${action}`,
 	);
 	assert.equal(
 		formatWorkerSpendHardStop({ turns: 96, totalTokens: 0, outputTokens: 0 }, "low"),
-		`Worker cumulative spend hard budget reached (profile standard): turns 96/64.${action}`,
+		`Worker process hard handoff point reached (profile standard): turns 96/64.${action}`,
 	);
 	assert.equal(
 		formatWorkerSpendHardStop({ turns: 96, totalTokens: 17_408_000, outputTokens: 512_000 }, "extended"),
-		`Worker cumulative spend hard budget reached (profile extended): turns 96/96, total_tokens 17408000/17408000, output_tokens 512000/512000.${action}`,
+		`Worker process hard handoff point reached (profile extended): turns 96/96, total_tokens 17408000/17408000, output_tokens 512000/512000.${action}`,
 	);
 	assert.equal(
 		formatWorkerSpendHardStop(EMPTY_WORKER_SPEND_STATE, "standard"),
-		`Worker cumulative spend hard budget reached (profile standard): no dimension at its hard limit.${action}`,
+		`Worker process hard handoff point reached (profile standard): no dimension at its hard limit.${action}`,
 	);
 	// Deterministic: same inputs, same string.
 	assert.equal(
@@ -379,48 +380,48 @@ test("hard-stop text is deterministic and names winning dimensions with current/
 });
 
 test("hard-stop text derives reasons strictly from hard flags; soft-only states render the degenerate form", () => {
-	const action = " Continue with a bounded follow-up delegation in the current Sol session after reviewing any partial delta; do not request a new Sol session.";
+	const action = " The controller must preserve the checkpoint and start a fresh bounded worker under the same delegation; no user budget authorization is required.";
 	// Soft-only states (at/above soft, below every hard limit) must never
 	// reuse soft-band reasons with hard denominators — one dimension at a time.
 	assert.equal(
 		formatWorkerSpendHardStop({ turns: 40, totalTokens: 0, outputTokens: 0 }, "standard"),
-		`Worker cumulative spend hard budget reached (profile standard): no dimension at its hard limit.${action}`,
+		`Worker process hard handoff point reached (profile standard): no dimension at its hard limit.${action}`,
 	);
 	assert.equal(
 		formatWorkerSpendHardStop({ turns: 0, totalTokens: 8_000_000, outputTokens: 0 }, "standard"),
-		`Worker cumulative spend hard budget reached (profile standard): no dimension at its hard limit.${action}`,
+		`Worker process hard handoff point reached (profile standard): no dimension at its hard limit.${action}`,
 	);
 	assert.equal(
 		formatWorkerSpendHardStop({ turns: 0, totalTokens: 0, outputTokens: 200_000 }, "standard"),
-		`Worker cumulative spend hard budget reached (profile standard): no dimension at its hard limit.${action}`,
+		`Worker process hard handoff point reached (profile standard): no dimension at its hard limit.${action}`,
 	);
 	// Multiple soft dimensions at once: still no dimension at its hard limit.
 	assert.equal(
 		formatWorkerSpendHardStop({ turns: 40, totalTokens: 8_000_000, outputTokens: 200_000 }, "standard"),
-		`Worker cumulative spend hard budget reached (profile standard): no dimension at its hard limit.${action}`,
+		`Worker process hard handoff point reached (profile standard): no dimension at its hard limit.${action}`,
 	);
 	// Exactly at a soft limit (below hard) stays degenerate; other profiles too.
 	assert.equal(
 		formatWorkerSpendHardStop({ turns: 32, totalTokens: 0, outputTokens: 0 }, "standard"),
-		`Worker cumulative spend hard budget reached (profile standard): no dimension at its hard limit.${action}`,
+		`Worker process hard handoff point reached (profile standard): no dimension at its hard limit.${action}`,
 	);
 	assert.equal(
 		formatWorkerSpendHardStop({ turns: 10, totalTokens: 0, outputTokens: 0 }, "low"),
-		`Worker cumulative spend hard budget reached (profile standard): no dimension at its hard limit.${action}`,
+		`Worker process hard handoff point reached (profile standard): no dimension at its hard limit.${action}`,
 	);
 	assert.equal(
 		formatWorkerSpendHardStop({ turns: 80, totalTokens: 0, outputTokens: 0 }, "extended"),
-		`Worker cumulative spend hard budget reached (profile extended): no dimension at its hard limit.${action}`,
+		`Worker process hard handoff point reached (profile extended): no dimension at its hard limit.${action}`,
 	);
 	// Mixed soft+hard: only the hard-triggered dimension is named, with the
 	// hard denominator — never a soft reason with a hard denominator.
 	assert.equal(
 		formatWorkerSpendHardStop({ turns: 40, totalTokens: 10_880_000, outputTokens: 0 }, "standard"),
-		`Worker cumulative spend hard budget reached (profile standard): total_tokens 10880000/10880000.${action}`,
+		`Worker process hard handoff point reached (profile standard): total_tokens 10880000/10880000.${action}`,
 	);
 	assert.equal(
 		formatWorkerSpendHardStop({ turns: 70, totalTokens: 8_000_000, outputTokens: 200_000 }, "standard"),
-		`Worker cumulative spend hard budget reached (profile standard): turns 70/64.${action}`,
+		`Worker process hard handoff point reached (profile standard): turns 70/64.${action}`,
 	);
 	// workerSpendReasons keeps current-band semantics: soft-only states still
 	// list their soft reasons there — formatter and band reasons stay distinct.

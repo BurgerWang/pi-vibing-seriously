@@ -331,13 +331,13 @@ One invocation:
    event reports the exact pinned `openai-codex/gpt-5.6-luna` identity;
 7. tracks per-message context tokens against the pinned budget (soft
    handoff / hard stop, see below) and rejects any `compaction_start` event;
-8. accumulates the cumulative delegation-spend state after every assistant
-    message (pure `core/worker-spend.ts` policy — turns / total tokens /
-    output tokens per the active profile) and terminates the child fail-closed
-    when any cumulative turn/total/output dimension reaches a hard limit; the
-    hard turn boundary forces oversized work into a bounded continuation;
-9. terminates the child on completion, timeout, parent abort, hard-budget
-    stop (context or cumulative turn/total/output spend), or a compaction attempt;
+8. accumulates the current worker-process spend after every assistant message
+    (pure `core/worker-spend.ts` policy — turns / total tokens / output tokens
+    per the active profile). A soft or hard quality boundary persists a
+    checkpoint and automatically relays to a fresh worker; delegation-lifetime
+    counters remain telemetry only;
+9. terminates the child on completion, timeout, parent abort, per-process hard
+    handoff (context or turn/total/output spend), or a compaction attempt;
 10. advances to `COMMITTING`, evaluates fixed machine postconditions, and
     stages one immutable generation at
     `.pi/workbench/delegations/<id>/v2/generations/g########/` containing
@@ -1032,29 +1032,29 @@ and the structured `details` carry `max_context_tokens`,
 `max_context_ratio`, `soft_budget_reached`, `hard_budget_exceeded`,
 `compaction_count`, and `compaction_reasons`.
 
-## Worker cumulative spend-budget protection
+## Per-worker quality-window protection
 
 Independent of the per-message context budget above, the approved worker
 token-budget repair (`docs/plans/worker-token-budget-repair.md`) adds a
-**cumulative delegation-spend policy** in
+**per-worker quality-window policy** in
 `extensions/workbench-runtime/core/worker-spend.ts` — pure logic, no Pi
 imports, reusing `workerContextTokens` from `core/worker-budget.ts` for the
 per-message total semantics. **Phases 2–4 status: runtime wiring, public profile selection,
 v2 generation persistence, handoff rendering and numeric-only progress
 landed; Phase 5 (task-contract profile wording and delegation-granularity
-guidance) landed.** The runner accumulates the cumulative
-spend state after every assistant message (same pure policy), records the
-final profile/state/band/reasons facts on every run result, and terminates
-the child fail-closed whenever a cumulative turn/total/output dimension reaches
-a hard limit (`>=`, deterministic hard-stop message). The hard turn boundary is
-an enforced slice limit; partial evidence remains available for a bounded
-continuation rather than allowing a single worker to grow without bound.
+guidance) landed.** The runner accumulates process-local spend state after
+every assistant message (same pure policy), records the
+final profile/state/band/reasons facts on every run result, and ends the current
+child whenever a turn/total/output dimension reaches a hard limit (`>=`,
+deterministic handoff message). The hard turn boundary is an enforced
+per-process quality limit; durable evidence is checkpointed and the same
+delegation automatically launches a fresh `--no-session` worker.
 The worker-role lifecycle reads the
 spend profile from the fixed child env contract
 (`WORKBENCH_WORKER_SPEND_PROFILE` — the runner writes `standard` or
 `extended`; retired `low` and malformed/missing child env fall back to
 `standard` defensively), accumulates its own independent spend state
-on assistant `message_end` events, and sends exactly one hidden cumulative
+on assistant `message_end` events, and sends exactly one hidden process-local
 soft steer when the band first becomes soft or hard. **Phase 3 status:
 public selection, contract validation, v2 generation persistence and handoff
 rendering landed.** The optional `budget_profile` tool parameter (closed
@@ -1064,7 +1064,7 @@ explicit only for justified larger bounded slices) is resolved by the strict con
 resolved profile is recorded in the before contract
 (`before.json` → `contract.budget_profile`) and passed to the runner (the
 same profile reaches the child env and every outcome's spend facts —
-exception fallbacks included), and the canonical cumulative `spend` object
+exception fallbacks included), and the canonical per-process `spend` object
 is persisted additively in `usage.json` / `worker-summary.json` on every
 finished success and failure and rendered into the bounded parent handoff.
 Per-message context safety (above) is unchanged.
@@ -1077,14 +1077,14 @@ Per-message context safety (above) is unchanged.
 These are the current `gpt-5.6-luna-xhigh-continuation-v2` limits. Total-token
 thresholds are fixed multiples of Luna's Pi-advertised 272,000-token context
 window: standard 20×/40×, extended 40×/64× (soft/hard).
-The interval between soft and hard is an intentional continuation reserve:
-soft does not terminate the worker and must not direct the user to open a new
-Sol session. It asks the worker to finish the coherent change and hand back
-remaining work for a bounded follow-up delegation in the current Sol session.
-Every hard dimension is a fail-closed attempt boundary. Tool-heavy work may use
-the soft-to-hard continuation reserve, but work still incomplete at the hard
-turn limit must resume as another bounded slice. The independent timeout also
-bounds wall-clock execution.
+The interval between soft and hard is an intentional handoff reserve. Soft asks
+the worker to finish the current atomic change, refresh the journal, emit a
+machine checkpoint and exit normally. A hard dimension ends only that worker.
+In both cases the controller keeps the same delegation, contract, paths and
+privileges and starts a fresh worker automatically. Delegation-lifetime usage is
+monotonic telemetry only: it never pauses development and never asks the user
+to renew a budget, promote a profile or authorize a task split. The independent
+timeout remains an operational failure path.
 
 - **Per-message totals** reuse the context-budget semantics: a positive
   `totalTokens` is authoritative; otherwise the non-negative
@@ -1096,7 +1096,7 @@ bounds wall-clock execution.
   per-message total took; a provider that omits `output` undercounts this
   dimension (accepted heuristic guard). `total_tokens` is the primary
   spend dimension.
-- **Cumulative dimensions** per delegation run: `turns` (processed
+- **Process-local dimensions** per worker: `turns` (processed
   assistant messages), `total_tokens` (Σ per-message normalized total),
   `output_tokens` (Σ per-message output). Updates are immutable and
   deterministic.
@@ -1105,8 +1105,8 @@ bounds wall-clock execution.
   dimension reached → `soft`; else `ok`. Triggered reasons are listed in
   the fixed order `turns`, `total_tokens`, `output_tokens`. This persisted
   classification is also the runner's hard-boundary enforcement input.
-- **Soft steer (wired):** at most one hidden cumulative soft steer per
-  delegation (`WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE =
+- **Soft steer (wired):** at most one hidden soft steer per worker process
+  (`WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE =
   "workbench-worker-spend-soft-steer"`, `display: false`,
   `deliverAs: "steer"`), sent by the worker-role lifecycle only — the
   commander session never receives it — with its OWN one-shot flag,
@@ -1114,15 +1114,12 @@ bounds wall-clock execution.
   dimension(s) in the fixed reason order, and current vs. limit values; a
   send failure is swallowed and never breaks a model request. The steer is
   a request, not an enforcement.
-- **Hard stop (wired):** when cumulative turns, total or output reaches a hard limit
-  the runner terminates the child and the invocation fails closed
-  (`assertWorkerSucceeded`), naming the winning dimension(s) and
-  current/limit values via the deterministic hard-stop formatter; the
-  outcome is committed as `FAILED` when its terminal facts and immutable
-  generation are complete; incomplete persistence requires
-  `RECOVERY_REQUIRED`. The hard turn boundary deliberately terminates an
-  oversized attempt so it can continue as a bounded, idempotent slice. The
-  60-minute timeout remains an independent failure path.
+- **Hard handoff (wired):** when current-worker turns, total or output reaches
+  a hard limit, the runner ends that child and the delegation controller writes
+  `CHECKPOINTED`, validates the journal/binding and automatically launches the
+  next bounded worker. It does not commit a failed generation, create semantic
+  REPAIR, or request user budget authority. Incomplete checkpoint persistence
+  still requires `RECOVERY_REQUIRED`.
 - **Profiles:** `standard` is the deterministic bounded default for every
   delegation without an explicit request; `extended` must be selected
   explicitly for a justified larger bounded slice. The public
@@ -1297,11 +1294,11 @@ Semantic acceptance is review authority only; it never grants a Gate PASS.
 `implementation`. Stage 1 accepts exactly `implementation | diagnosis`;
 `mechanical`, case variants, unknown strings, and wrong types fail closed.
 
-`budget_profile` is optional and selects the cumulative delegation-spend
-profile (`standard | extended`; omitted resolves to `standard`). The profile
-bounds cumulative spend only — it never expands the approved paths or scope.
-`standard` is the deterministic bounded default; `extended` is explicit only
-for a justified larger bounded slice. The worker task text carries the resolved profile as one
+`budget_profile` is optional and selects the per-worker quality-window profile
+(`standard | extended`; omitted resolves to `standard`). The profile bounds one
+worker process only; it neither expands the approved paths/scope nor limits the
+delegation lifetime. `standard` is the deterministic bounded default;
+`extended` selects a larger single-worker window. The worker task text carries the resolved profile as one
 informational line; enforcement is the runner's fixed child-env contract,
 never task prose.
 
@@ -1532,11 +1529,13 @@ The tool fails rather than silently falling back when:
 - the child cannot start;
 - the pinned model is unavailable;
 - an assistant event reports another provider/model;
-- an assistant event reaches the 244,800-token (90%) hard context budget;
-- any cumulative spend dimension reaches its hard limit (turns / total
-  tokens / output tokens per the active profile — `standard` by default,
-  `extended` as the explicit larger-slice selection via the optional `budget_profile`
-  parameter);
+- an assistant event reaches the 244,800-token (90%) hard context handoff
+  boundary; the child ends and the delegation controller continues from a
+  validated checkpoint under existing authority;
+- any current-worker spend dimension reaches its hard handoff point (turns /
+  total tokens / output tokens per the active profile); this ends that child
+  and is consumed by the delegation controller as an automatic checkpoint
+  continuation, not a terminal user-facing failure;
 - the child emits any `compaction_start` event (a compaction attempt);
 - the child exits non-zero, times out, or is aborted;
 - the child reports an error/aborted stop reason;

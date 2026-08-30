@@ -3,8 +3,8 @@
 | 元数据 | 值 |
 | --- | --- |
 | Plan ID | `pi-workbench-long-chain-throughput-context-optimization-v1` |
-| 版本 | `1.0` |
-| 状态 | **APPROVED DIRECTION / IMPLEMENTATION NOT_STARTED** |
+| 版本 | `1.1`（`2026-08-30` 用户修订；文件名保留 v1.0 以维持既有引用） |
+| 状态 | **SOURCE CORRECTION PASS / LIVE RUNTIME RELOAD NOT_RUN** |
 | 方案批准日期 | `2026-08-29` |
 | 计划落盘日期 | `2026-08-29` |
 | 执行仓库 | `/home/hanbaoji/Projects/pi-vibing-seriously` |
@@ -21,6 +21,25 @@
 或修改三个外部项目。任何未执行项目均为 `NOT_RUN`；源码存在、单元测试通过、
 运行时已加载、真实项目有效和 Gate/发布获批必须分别陈述。
 
+### 2026-08-30 用户修订（后出且优先）
+
+本修订替代本文所有把 worker spend 当作 delegation 总预算、用户授权或任务拆分
+边界的旧条款：
+
+1. soft/hard spend 只限制**单个 worker 进程**的连续工作窗口，用于控制长时间单模型
+   工作造成的上下文退化；它不限制整个开发目标可以继续多久；
+2. 达到 soft 或 hard 交接点时，当前 worker 必须刷新 journal 并写入 hash-bound 机器
+   checkpoint，然后由 controller 在**同一 delegation、同一合同、同一路径权限**下
+   自动启动 fresh `--no-session` worker 接力；
+3. delegation-lifetime turns/tokens/attempts 保持严格单调，但仅作 telemetry、审计和
+   性能诊断，永远不得触发用户“预算续期”、standard→extended 授权或任务拆分提示；
+4. 只有合同、路径、项目、权限等级或不可逆外部动作发生真实扩大时，才需要新的用户
+   授权；换 worker 本身不是权限扩大；
+5. 旧 `PAUSED_BUDGET` 与 budget-promotion records 仅保留历史读取/恢复兼容。加载旧
+   pause 后应自动投影为 `CONTINUE_CHECKPOINT / EXISTING`，不得再次询问用户；
+6. checkpoint 缺失、hash/journal/authority drift 或并发 writer 仍然 fail closed，进入
+   operational recovery；这些是证据完整性故障，不是预算授权。
+
 ---
 
 ## 1. 执行结论
@@ -34,7 +53,8 @@
    每批最多 8 页或 64 KiB；主控上下文只接收不超过 2 KiB 的机器摘要。
 3. **同 delegation checkpoint 续接**：保留每次 Luna 都是 fresh `--no-session`
    进程，但 spend soft limit 不再被当成语义失败或新 repair；同一 delegation 依据
-   机器 checkpoint 继续，累计预算不重置。
+   机器 checkpoint 继续；每个 fresh worker 获得新的质量窗口，delegation-lifetime
+   usage 只作为单调 telemetry 保留。
 4. **唯一动作快照与状态感知上下文面**：由一个 hash-bound
    `LifecycleActionSnapshotV2` 同时驱动状态显示、可见工具和自动动作；相同快照
    重复调用必须是 no-op。
@@ -170,7 +190,7 @@ compaction 变小，已经发生的模型调用、序列化、WebSocket/工具�
 3. Commander session 不接收完整 review 页或完整 page assessment；只接收稳定、
    有界、可定位到 durable evidence 的摘要。
 4. worker soft spend 到达时可在同一 delegation 下续接，fresh 进程隔离保持不变。
-5. 只有语义缺陷创建 repair successor；预算暂停、provider 错误、进程退出和可恢复
+5. 只有语义缺陷创建 repair successor；worker 交接、provider 错误、进程退出和可恢复
    存储错误不得伪装成语义 REPAIR。
 6. status、next action、active tools、自动动作和 executor admission 必须消费同一份
    `LifecycleActionSnapshotV2`。
@@ -209,8 +229,9 @@ compaction 变小，已经发生的模型调用、序列化、WebSocket/工具�
 4. **身份稳定**：delegation、generation、contract、bound diff、review policy、
    stream set、parent evidence 和 runtime build identity 必须交叉绑定。
 5. **隔离保持**：每个 Luna attempt 仍使用 fresh `--no-session` 进程和受限工具集。
-6. **预算不重置**：checkpoint continuation 的 turns、total tokens、output tokens、
-   wall time 和 attempt 数均累计。
+6. **worker 窗口重置、审计不重置**：checkpoint continuation 的新 worker 从零开始
+   计算本进程 soft/hard 窗口；delegation-lifetime turns、tokens、wall time 和 attempt
+   数继续单调累计，但不参与停止或授权判定。
 7. **故障不升级语义**：provider、存储、预算和进程故障只产生 operational state，
    不能产生语义 REPAIR/ACCEPT。
 8. **一次一个 writer**：同一项目和同一 delegation 不允许两个并发 Luna writer。
@@ -517,6 +538,7 @@ interface WorkerCheckpointV1 {
   completed_recipe_run_ids: readonly string[];
   cumulative_usage: Usage;
   cumulative_turns: number;
+  attempt_spend: WorkerSpendState;
   remaining_budget: WorkerRemainingBudgetV1;
   machine_state: "CHECKPOINTED" | "PAUSED_BUDGET";
   worker_advisory: {
@@ -765,27 +787,27 @@ EXECUTING(attempt N)
       -> COMMITTED_GENERATION
       -> PENDING_REVIEW
 
-  -> CHECKPOINT_REQUESTED (首次达到 soft spend，仍有 hard reserve)
+  -> CHECKPOINT_REQUESTED (当前 worker 达到 soft 或 hard 交接点)
       -> CHECKPOINTED
       -> EXECUTING(attempt N+1, fresh --no-session)
-
-  -> PAUSED_BUDGET (累计 hard spend / 无剩余预算)
 
   -> OPERATIONAL_FAILURE (authority、journal、进程或存储不可恢复)
 ```
 
-`CHECKPOINTED`、`PAUSED_BUDGET` 和 `OPERATIONAL_FAILURE` 都不是语义 REPAIR。
+`CHECKPOINTED` 和 `OPERATIONAL_FAILURE` 都不是语义 REPAIR。`PAUSED_BUDGET` 仅是历史
+兼容输入，当前 runtime 不再产生该状态。
 
 ### 10.3 触发规则
 
 - soft spend 第一次到达时，向 worker 发一次 hidden steer：停止开启新工作，只完成
   当前原子编辑、刷新 journal、运行已声明的必要 focused recipe 并写 checkpoint；
 - checkpoint 成功读回后，当前 child 正常退出；
-- 若仍有剩余累计 hard budget，snapshot 可安全自动启动下一 fresh attempt；
-- 达到累计 hard limit 时立即进入 `PAUSED_BUDGET`；不得创建 repair successor；
-- 用户显式将 standard 提升为 extended 时，已消费 turns/tokens 不清零，只增加剩余
-  上限；
-- extended 也耗尽时必须拆分任务或等待用户决定，不得无限自动扩容。
+- checkpoint 成功后，snapshot 在同一合同与路径权限下安全自动启动下一 fresh attempt；
+- 当前 worker 达到 hard limit 时也必须先持久化 checkpoint 并自动换 worker，不创建
+  repair successor，不进入用户授权状态；
+- `standard`/`extended` 只描述单 worker 的质量窗口配置，不是 continuation 权限；
+- lifetime usage 不得用于停止任务。若 checkpoint/authority 无法证明或发生并发 writer，
+  才进入 operational recovery 并报告精确证据故障。
 
 ### 10.4 Checkpoint 有效性
 
@@ -797,7 +819,7 @@ checkpoint 只有满足下列条件才能自动续接：
 4. journal 能解释 before/current hash；
 5. checkout 没有未知 writer 或 out-of-scope drift；
 6. completed recipe ids 可从 durable run records 读回；
-7. usage 单调累计且 remaining budget 可重算；
+7. lifetime usage 单调累计，attempt spend 与当前 worker remaining window 可重算；
 8. 没有同时运行的另一个 attempt；
 9. checkpoint bytes、hash 和 transaction state 交叉绑定。
 
@@ -812,7 +834,7 @@ checkpoint 只有满足下列条件才能自动续接：
 - checkpoint hash 与 attempt 号；
 - touched path + current hash 列表；
 - 已完成 recipe run ids；
-- 剩余累计预算；
+- 当前 worker 的 fresh quality window 与 lifetime usage telemetry；
 - bounded worker advisory（最多 4 KiB）；
 - 明确要求自行验证 current bytes，不相信 advisory 的完成声明。
 
@@ -851,11 +873,11 @@ target；preflight 只能拒绝过期/非法 snapshot，不能静默换成另一
 | 状态 | Commander 主工具面 |
 | --- | --- |
 | 普通直接 DEV，无高风险条件 | 原有普通 read/edit/write/inspect 工具；隐藏 lifecycle repair/review 噪音 |
-| Worker executing/checkpointed | 只暴露状态、取消/授权边界和 snapshot 指定的 continuation |
+| Worker executing/checkpointed | 只暴露状态、取消和 snapshot 指定的 automatic continuation |
 | PENDING_REVIEW | 只暴露一个 review start/resume 动作和只读检查 |
 | RETRYABLE review failure | 只暴露同一 review job 的 retry/recover，不暴露 fresh delegation |
 | Semantic REPAIR | 只暴露 exact `repair_of` 动作 |
-| PAUSED_BUDGET | 只暴露查看预算、显式 extended/split 的动作；不得伪装 repair |
+| legacy PAUSED_BUDGET | 自动投影为现有权限下的 exact checkpoint continuation；不得要求预算授权或 split |
 | VERIFY/strict Candidate | 保持现有 Gate/Candidate/Artifact 工具和限制 |
 | Authority invalid | 只暴露只读诊断/恢复；所有写动作 fail closed |
 
@@ -878,11 +900,11 @@ target；preflight 只能拒绝过期/非法 snapshot，不能静默换成另一
 1. `safe_automatic=true`；
 2. `authorization=EXISTING`；
 3. snapshot authority hash 仍是 current；
-4. 动作为只恢复同一 durable job/attempt，不扩大路径、预算、合同或项目；
+4. 动作为只恢复同一 durable job/attempt，不扩大路径、权限、合同或项目；
 5. idempotency key 尚未完成，且没有并发 owner；
 6. 失败不会产生业务源码外的新写入或不可逆外部副作用。
 
-创建新 delegation、扩大 budget、扩大 allowed paths、修改外部项目业务文件、commit、
+创建新 delegation、扩大权限等级、扩大 allowed paths、修改外部项目业务文件、commit、
 push、release 均不得由该规则推导为自动授权。
 
 ---
@@ -1080,8 +1102,8 @@ Sol 固定合同和 allowed paths，Luna 完成 bounded 实现，Sol 审阅实�
 2. worker soft steer 增加机器 checkpoint 协议；
 3. runner 累积 attempt usage、journal 和 checkpoint chain；
 4. delegation execution owner 支持同 id attempt N+1；
-5. hard spend 改为 `PAUSED_BUDGET`，不自动创建 repair；
-6. 显式 standard→extended 时保留累计消费；
+5. soft/hard spend 都写 durable checkpoint 并在同 delegation 自动启动 fresh worker；
+6. 分离 current-attempt quality window 与 lifetime telemetry；
 7. final ready 前不触发 full semantic review；
 8. 同 delegation 同时最多一个 child writer。
 
@@ -1104,15 +1126,16 @@ Sol 固定合同和 allowed paths，Luna 完成 bounded 实现，Sol 审阅实�
 - checkpoint 后外部 drift；
 - usage 回退/溢出/NaN；
 - hard limit 无 checkpoint；
-- standard→extended 与 retry；
+- legacy paused checkpoint 自动迁移与 retry；
 - final-ready 后响应丢失。
 
 **验收**：
 
 - `LCO-WP4-AC01`：每 attempt 仍为 fresh `--no-session`；
 - `LCO-WP4-AC02`：soft limit 后可在同 delegation 继续；
-- `LCO-WP4-AC03`：累计预算、turns 和 attempt 严格单调；
-- `LCO-WP4-AC04`：hard limit 产生 `PAUSED_BUDGET`，不产生 semantic REPAIR；
+- `LCO-WP4-AC03`：lifetime turns/tokens/attempt 严格单调，fresh worker 窗口从零开始；
+- `LCO-WP4-AC04`：hard limit 产生 `CHECKPOINTED` 并自动接力，不产生 semantic REPAIR
+  或用户预算授权；
 - `LCO-WP4-AC05`：只有一个最终 committed generation 和一次完整 review；
 - `LCO-WP4-AC06`：unknown drift 时自动续接 fail closed；
 - `LCO-WP4-AC07`：同 checkpoint 不会启动两个 worker。
@@ -1311,6 +1334,84 @@ Sol 固定合同和 allowed paths，Luna 完成 bounded 实现，Sol 审阅实�
 - commit、push、production release、cache experiment 与 PTC experiment 均为
   `NOT_RUN`；未获得相应授权，也不由测试通过替代。
 
+#### 2026-08-30 live defect 修订快照
+
+本快照后出且只修订 worker 交接与 legacy authority 兼容结论；它不改写上面的
+2026-08-29 历史证据。
+
+- 当前源码把 soft/hard spend 固定为单个 worker 的质量窗口。soft checkpoint、spend
+  hard boundary 与 context hard boundary 都先持久化 `CHECKPOINTED`，再在同一
+  delegation/contract/path authority 下启动 fresh worker；fresh worker 不继承上一进程的
+  `initialSpendState`。lifetime turns/tokens 继续单调累计，但只作 telemetry。
+- 当前 runtime 不再生成或消费 budget-continuation grant，不再把 legacy
+  `PAUSED_BUDGET` 映射为用户授权或 split；旧记录投影为
+  `CONTINUE_CHECKPOINT / EXISTING / safe_automatic=true`。旧 promotion record 仅保留
+  byte/hash replay 兼容。
+- `delegation-path-lane-admission` 已接受 strict committed scope 中既有的可选
+  `budget_promotion` 和 `command_provenance` 字段，且继续验证 promotion 内容；这修复了
+  Onchain exact repair 被误判 `INVALID_AUTHORITY/INVALID_REQUEST` 的读取缺口。
+- 修订源码 identity 为
+  `pi-dev-workbench/workbench-runtime@0.10.0+sha256.a579a1ddecec9756`，完整 source hash
+  为 `sha256:a579a1ddecec97563e7918bc3fdfb886d5c2f865a37950d80012fe6b238bb4d6`。
+- `npm run typecheck`、受影响 focused tests 与 `git diff --check` 通过；其中
+  `delegation-execution-v2` 为 47/47，`worker-runner` 为 52/52。
+- 全仓测试为 3167 tests / 3163 pass / 3 fail / 1 skip；三个失败分别是
+  `ordinary-development-lane` 两项和 `p6-c-action-cache` 一项，并已在未修改的
+  `40de226` 基线 checkout 中逐项重现。因此本修订新增 regression 为 0，但不能把全仓
+  verification 记作全绿。
+- 真实项目保持只读。Scalper legacy delegation `20260830-081354-5cym` 由修订源码解析为
+  `CONTINUE_CHECKPOINT / EXISTING / safe_automatic=true`；Onchain repair delegation
+  `20260830-130735-5xad` 的真实 committed path-lane 解析为 `ALLOW`；三个项目的脱敏
+  history replay 通过。上述是新源码读取旧 authority 的 canary，不等于旧 live session
+  已热更新。
+- live runtime reload/restart、新会话加载确认、修订源码下的长时真实接力、commit、push、
+  production release 均为 `NOT_RUN`。因此本次 source correction 为 `PASS`，但在 loaded
+  runtime identity 和 live continuation canary 完成前，不恢复整份计划的 `COMPLETE`。
+
+#### 2026-08-30 最终链式复核快照
+
+本快照在 source correction 之后重新从入口到出口检查同一条链，不以单元测试替代 loaded
+runtime，也不把三个项目互相替代。
+
+- worker 子进程通过 `WORKBENCH_WORKER_ATTEMPT` 获得精确 attempt；child extension 在 soft
+  steer 后的下一个 assistant message 自动追加一次 canonical checkpoint request，runner 将该
+  request 带回 execution controller。controller 先持久化 `CHECKPOINTED`，再以相同
+  delegation/contract/path authority 启动 fresh worker；successor 不继承上一进程的
+  `initialSpendState`，而 lifetime turns/tokens 只单调累计为 telemetry。
+- 新增的三 worker 连续交接用例覆盖 attempt 1 -> 2 -> 3：两个不同 checkpoint hash、attempt
+  严增、累计 66 turns / 1,120 tokens、最终只提交一个 generation。hard turns、hard context、
+  soft checkpoint、跨进程恢复和 extended profile 的六类链式筛选均通过。
+- 真实 authority 继续只读：Scalper legacy pause 解析为
+  `CONTINUE_CHECKPOINT / EXISTING / safe_automatic=true`；Mace 与 Onchain 的 committed
+  path-lane 均为 `ALLOW`；Scalper/Mace/Onchain 三份脱敏 history replay 独立通过。
+- 在用户授权的 `/tmp/pi-lco-wp7-W0u29w` 隔离克隆中，Scalper、Mace、Onchain 三个 fresh
+  Sol 进程均实际加载最终 source hash
+  `sha256:6511bbaafc060e5f0feb416bdf3ffdd2414f4eacdb21f3f5ad15ddb6d454c4c7`。Scalper 为
+  no delegation、Onchain 为 `REVIEWED`，二者均返回
+  `CONTINUE_DIRECT_DEVELOPMENT (NO_CURRENT_BLOCKER)` 且不要求用户授权；Mace 的 durable
+  transaction 为 `FAILED`、session mirror 为 `REVIEWED`，canonical lifecycle 仍正确返回
+  `TERMINAL_NON_BLOCKING / CONTINUE_DIRECT_DEVELOPMENT`。
+- 最终 hash 下另执行一次真实 Sol -> Luna 零写入 diagnosis：Scalper 隔离 clone 的
+  delegation `20260830-170632-w5ul` 由 `openai-codex/gpt-5.6-luna` 在 2 turns、0 writes、
+  exit 0 下完成；独立 fresh Sol readback 为 transaction `FINISHED`、completion `PASS`、
+  lifecycle `TERMINAL_NON_BLOCKING`、typed action
+  `CONTINUE_DIRECT_DEVELOPMENT (NO_CURRENT_BLOCKER)`，且 clone 的业务 Git status 前后不变。
+- Mace fresh canary 首次暴露了一个复合状态展示缺口：claim guard 把 status 工具的
+  `latest ... FAILED` composite line 错当成 session `FAILED`，因而拒绝机器原文。现已将
+  FAILED/FINISHED/active transaction-only token 在带 `latest` 或 transaction label 时绑定到
+  transaction，同时保持无标签 run outcome 不进入 delegation 状态域；56/56 定向测试与
+  fresh Mace canary 均通过。
+- `npm run typecheck`、124 项 checkpoint/runner 定向测试、6 项链式筛选和
+  `git diff --check` 均通过。最终全仓测试为 3169 tests / 3165 pass / 3 fail / 1 skip；三个
+  失败仍是已在未修改 `40de226` 基线复现的两项 `ordinary-development-lane` 与一项
+  `p6-c-action-cache`，本轮新增 regression 为 0。
+- fresh-runtime source/authority/continuation/reporting chain 的 verdict 为 `PASS`。但三个真实
+  项目中已经启动的旧 Pi 进程仍加载旧 runtime；本轮没有重启或热更新它们，也没有修改其
+  业务仓库。因此“新会话可加载并正常运行”已证实，“既有旧会话已经自动生效”仍为
+  `NOT_EFFECTIVE_UNTIL_RELOAD_OR_NEW_SESSION`。强制消耗到真实 provider soft threshold 的
+  长时高成本 canary 未执行；交接边界由确定性三 worker 故障注入链验证。
+- commit、push、production release 均为 `NOT_RUN`。
+
 ---
 
 ## 13. 依赖图、实施切片与提交边界
@@ -1482,7 +1583,8 @@ WP4 可以在 WP1–3 期间单独开发，但不得与同一文件范围并行�
 | --- | ---: |
 | soft-limit 后 fresh continuation 成功率 | ≥95%（有效 checkpoint 样本） |
 | continuation 中重复 review | 0 |
-| budget reset | 0 |
+| lifetime telemetry reset | 0 |
+| fresh worker quality-window reset | 100% |
 | hard-limit 自动 repair | 0 |
 | 同 checkpoint 重复 worker | 0 |
 | checkpoint 恢复时完整 transcript 重放 | 0 |
@@ -1596,14 +1698,14 @@ source + tests
 - cache 没有收益：保持 `cacheRetention: none`；
 - PTC capability 不可用：保持普通确定性 TypeScript orchestration；
 - review 超 large cap：`SPLIT_REQUIRED`；
-- checkpoint 不完整：`PAUSED/RECOVERY_REQUIRED`，不自动续接；
+- checkpoint 不完整：`RECOVERY_REQUIRED`，不自动续接；
 - loaded runtime 不匹配：判 `NOT_EFFECTIVE`，不宣称修复失败或成功；
 - provider 暂时失败：保留 progress，稍后 retry missing batches。
 
 ### 18.3 需要用户新授权的情况
 
-- 开始实现本计划；
-- 将 standard budget 提升为 extended；
+- 初次开始实现本计划（本项授权已履行）；
+- 扩大合同、allowed paths 或权限等级；
 - 修改三个外部项目的业务文件；
 - reload/restart live Pi；
 - 在 active real delegation 上做 canary；
@@ -1631,7 +1733,7 @@ source + tests
 
 - attempt count；
 - checkpoint count/hash chain；
-- cumulative spend 和 remaining budget；
+- lifetime usage telemetry、attempt spend 和当前 worker remaining window；
 - soft/hard reason；
 - worker process identity；
 - touched path/journal hash；
@@ -1682,8 +1784,10 @@ source + tests
    fresh review；
 4. 47 页 review 可在最多 6 个 batches + 1 final 中完成，并能从第 17 页故障继续；
 5. raw review pages/assessments 不进入 Commander session；
-6. 同 delegation checkpoint continuation 保持 fresh `--no-session`，累计预算不重置；
-7. hard budget 只产生 `PAUSED_BUDGET`，只有语义 defect 产生 repair；
+6. 同 delegation checkpoint continuation 保持 fresh `--no-session`；每 worker quality
+   window 重置，lifetime usage telemetry 不重置；
+7. soft/hard 交接点都产生 `CHECKPOINTED` 并自动启动下一 worker；不产生用户预算授权，
+   只有语义 defect 产生 repair；
 8. `LifecycleActionSnapshotV2` 同时驱动 status、tools、automatic action 和 executor
    exact target；
 9. 重复 status/retry/response-loss 不产生 duplicate worker、duplicate batch 或新
@@ -1722,8 +1826,13 @@ source + tests
 11. WP7 前不 reload live runtime、不碰三个外部项目；
 12. 最终依据 §20 给出分层 verdict。
 
-本计划当前状态：**LCO-WP0–LCO-WP7、质量出口、最终 runtime、synthetic 与三项目
-隔离 canary、Scalper mixed `INHERITED/FRESH` successor E2E，以及保留原工作量的脱敏
-same-topology 性能复演均为 `PASS`。正式状态为
-`COMPLETE / QUALITY_PASS / PERFORMANCE_PASS`、`plan_complete=true`。commit、push、
-production release、cache experiment 与 PTC experiment 仍分别为 `NOT_RUN`。**
+本计划当前状态：**2026-08-30 source correction 与最终 fresh-runtime 链式复核均为
+`PASS`：三 worker 自动软交接、legacy automatic continuation、三项目 authority/history、
+三类隔离 fresh Sol runtime identity、真实 Sol -> Luna 零写入 delegation 以及 Mace
+composite-status claim guard 均有独立证据；
+最终源码 hash 为
+`sha256:6511bbaafc060e5f0feb416bdf3ffdd2414f4eacdb21f3f5ad15ddb6d454c4c7`，新增 regression
+为 0。开发实现与新会话运行链已完成；三个真实项目的既有旧 Pi 进程没有被重启或热更新，
+故其状态仍为 `NOT_EFFECTIVE_UNTIL_RELOAD_OR_NEW_SESSION`，不能把旧会话称为已生效。
+强制真实 provider 消耗至 soft threshold 的长时高成本 canary、commit、push、production
+release、cache experiment 与 PTC experiment 仍分别为 `NOT_RUN`。**

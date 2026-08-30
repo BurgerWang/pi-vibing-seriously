@@ -2128,7 +2128,11 @@ function workerCheckpointCanAdvanceV1(prior: WorkerCheckpointV1 | undefined, nex
 		&& prior.remaining_budget.profile === "standard" && prior.budget_promotion === undefined
 		&& next.remaining_budget.profile === "extended" && next.budget_promotion?.from_profile === "standard"
 		&& next.budget_promotion.to_profile === "extended";
-	if ((!samePromotion && !authorizedPromotion) || (prior.machine_state === "PAUSED_BUDGET" && !authorizedPromotion)
+	const automaticAttemptHandoff = prior.machine_state === "PAUSED_BUDGET"
+		&& next.machine_state === "CHECKPOINTED" && next.attempt_spend !== undefined
+		&& prior.remaining_budget.profile === next.remaining_budget.profile && samePromotion;
+	if ((!samePromotion && !authorizedPromotion) ||
+		(prior.machine_state === "PAUSED_BUDGET" && !authorizedPromotion && !automaticAttemptHandoff)
 		|| next.attempt !== prior.attempt + 1
 		|| next.parent_checkpoint_hash !== prior.checkpoint_hash || next.delegation_id !== prior.delegation_id
 		|| next.contract_hash !== prior.contract_hash || next.runtime_build_identity !== prior.runtime_build_identity

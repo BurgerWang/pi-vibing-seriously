@@ -8,6 +8,7 @@ import test from "node:test";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import { reviewDelegationV2 } from "../extensions/workbench-runtime/core/delegation-review-v2.ts";
+import { admitProjectDelegationPathLaneV1 } from "../extensions/workbench-runtime/core/delegation-path-lane-admission.ts";
 import {
 	closeInactiveProjectDelegationBlockerV2,
 	collectCurrentDelegationBindingV2,
@@ -1002,6 +1003,41 @@ test("review v2: complete Sol REPAIR is immutable negative authority, remains Ga
 		if (!acceptAfterRepair.ok) assert.equal(acceptAfterRepair.error.code, "review_conflict");
 		assert.deepEqual(await readFile(join(transactionDir(fixture.root), "repair-decision.json")), repairBytes,
 			"conflicting semantic decisions cannot mutate the immutable REPAIR record");
+	} finally {
+		await cleanup(fixture);
+	}
+});
+
+test("path-lane admission accepts a committed budget-promotion scope for its exact repair tip", async () => {
+	const fixture = await setupReviewFixture(
+		["src/a.ts"], undefined, ["src/a.ts"], false, false, undefined, undefined, [], undefined, false, true,
+	);
+	try {
+		const presented = await reviewDelegationV2({
+			projectRoot: fixture.root,
+			delegationId: ID,
+			exec: spawnExec,
+			now: at(4),
+		});
+		assert.equal(presented.ok, true, presented.ok ? "" : JSON.stringify(presented.error));
+		if (!presented.ok || presented.review.record === undefined) return;
+		const repaired = await repairPresentedReview(
+			fixture,
+			presented.review.record.bound_diff_hash,
+			"Continue the exact rejected implementation without widening its path lane.",
+			5,
+		);
+		assert.equal(repaired.ok, true, repaired.ok ? "" : JSON.stringify(repaired.error));
+		if (!repaired.ok) return;
+
+		const admission = await admitProjectDelegationPathLaneV1({
+			project_root: fixture.root,
+			allowed_paths: ["src/**"],
+			repair_tip_exclusion_id: ID,
+		});
+		assert.equal(admission.decision.decision, "ALLOW", JSON.stringify(admission));
+		assert.deepEqual(admission.repair_tip_ids, [ID]);
+		assert.equal(admission.repair_tip_exclusion_id, ID);
 	} finally {
 		await cleanup(fixture);
 	}

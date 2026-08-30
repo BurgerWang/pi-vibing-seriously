@@ -39,6 +39,19 @@ export interface WorkerCheckpointAdvisoryV1 {
 	remaining_criteria: readonly string[];
 }
 
+/**
+ * Spend consumed by the worker process which produced this checkpoint.
+ * Lifetime counters remain in cumulative_usage/cumulative_turns for audit;
+ * only this fresh-process slice is compared with the worker quality limit.
+ * Historical checkpoints omit this field and retain their original
+ * delegation-cumulative interpretation.
+ */
+export interface WorkerCheckpointAttemptSpendV1 {
+	turns: number;
+	total_tokens: number;
+	output_tokens: number;
+}
+
 /** One hash-bound standard -> extended promotion; it never resets spend. */
 export interface WorkerBudgetPromotionV1 {
 	from_profile: "standard";
@@ -60,6 +73,8 @@ export interface WorkerCheckpointV1 {
 	completed_recipe_run_ids: readonly string[];
 	cumulative_usage: Readonly<Usage>;
 	cumulative_turns: number;
+	/** Present on automatic-handoff checkpoints produced by the current runtime. */
+	attempt_spend?: Readonly<WorkerCheckpointAttemptSpendV1>;
 	/** Present after the one permitted standard -> extended promotion. */
 	budget_promotion?: Readonly<WorkerBudgetPromotionV1>;
 	remaining_budget: Readonly<WorkerRemainingBudgetV1>;
@@ -132,6 +147,11 @@ function validTouchedPaths(value: unknown): value is WorkerCheckpointTouchedPath
 	return value.every((item, index) => index === 0 || Buffer.from(value[index - 1]!.path, "utf8").compare(Buffer.from(item.path, "utf8")) < 0);
 }
 
+function validAttemptSpend(value: unknown): value is WorkerCheckpointAttemptSpendV1 {
+	return record(value) && exact(value, ["turns", "total_tokens", "output_tokens"])
+		&& safeCount(value.turns) && safeCount(value.total_tokens) && safeCount(value.output_tokens);
+}
+
 function checkpointProjection(value: Omit<WorkerCheckpointV1, "checkpoint_hash">): unknown {
 	const { created_at: _createdAt, ...authority } = value;
 	return authority;
@@ -183,6 +203,7 @@ export function validateWorkerCheckpointV1(value: unknown): value is WorkerCheck
 		"schema_version", "kind", "delegation_id", "contract_hash", "attempt", "parent_checkpoint_hash",
 		"runtime_build_identity", "before_binding_hash", "current_binding_hash", "touched_paths",
 		"completed_recipe_run_ids", "cumulative_usage", "cumulative_turns",
+		...(value.attempt_spend === undefined ? [] : ["attempt_spend"]),
 		...(value.budget_promotion === undefined ? [] : ["budget_promotion"]),
 		"remaining_budget", "machine_state",
 		"worker_advisory", "created_at", "checkpoint_hash",
@@ -196,6 +217,7 @@ export function validateWorkerCheckpointV1(value: unknown): value is WorkerCheck
 		|| !validTouchedPaths(value.touched_paths)
 		|| !validSortedStrings(value.completed_recipe_run_ids, WORKER_CHECKPOINT_MAX_RECIPES_V1, 160)
 		|| !validUsage(value.cumulative_usage) || !safeCount(value.cumulative_turns)
+		|| !(value.attempt_spend === undefined || validAttemptSpend(value.attempt_spend))
 		|| !(value.budget_promotion === undefined || validateWorkerBudgetPromotionV1(value.budget_promotion))
 		|| !record(value.remaining_budget) || !exact(value.remaining_budget, ["profile", "turns", "total_tokens", "output_tokens"])
 		|| (value.remaining_budget.profile !== "standard" && value.remaining_budget.profile !== "extended")
@@ -207,15 +229,31 @@ export function validateWorkerCheckpointV1(value: unknown): value is WorkerCheck
 		|| Buffer.byteLength(JSON.stringify(value.worker_advisory), "utf8") > WORKER_CHECKPOINT_ADVISORY_MAX_BYTES_V1
 		|| typeof value.created_at !== "string" || !ISO_RE.test(value.created_at) || new Date(value.created_at).toISOString() !== value.created_at
 		|| typeof value.checkpoint_hash !== "string" || !HASH_RE.test(value.checkpoint_hash)) return false;
+	const spendForLimit = value.attempt_spend ?? {
+		turns: value.cumulative_turns,
+		total_tokens: value.cumulative_usage.totalTokens,
+		output_tokens: value.cumulative_usage.output,
+	};
+	if (value.attempt_spend !== undefined &&
+		(value.attempt_spend.turns > value.cumulative_turns ||
+			value.attempt_spend.total_tokens > value.cumulative_usage.totalTokens ||
+			value.attempt_spend.output_tokens > value.cumulative_usage.output)) return false;
 	const expectedRemaining = remainingWorkerBudgetV1(
 		value.remaining_budget.profile,
-		value.cumulative_turns,
-		value.cumulative_usage.totalTokens,
-		value.cumulative_usage.output,
+		spendForLimit.turns,
+		spendForLimit.total_tokens,
+		spendForLimit.output_tokens,
 	);
 	if (value.budget_promotion !== undefined && value.remaining_budget.profile !== "extended") return false;
 	if (expectedRemaining === undefined || canonicalHash(expectedRemaining) !== canonicalHash(value.remaining_budget)) return false;
-	if ((value.machine_state === "PAUSED_BUDGET") !== Object.values(value.remaining_budget).some((remaining) => remaining === 0)) return false;
+	const attemptLimitReached = Object.values(value.remaining_budget).some((remaining) => remaining === 0);
+	if (value.attempt_spend === undefined) {
+		if ((value.machine_state === "PAUSED_BUDGET") !== attemptLimitReached) return false;
+	} else if (value.machine_state !== "CHECKPOINTED") {
+		// Current runtimes hand off at a per-worker limit; they never turn that
+		// internal quality boundary into a delegation-wide user block.
+		return false;
+	}
 	const { checkpoint_hash: supplied, ...payload } = value;
 	return supplied === computeWorkerCheckpointHashV1(payload as Omit<WorkerCheckpointV1, "checkpoint_hash">)
 		&& Buffer.byteLength(`${JSON.stringify(value)}\n`, "utf8") <= WORKER_CHECKPOINT_MAX_BYTES_V1;
@@ -260,7 +298,8 @@ export function validateWorkerCheckpointContinuationV1(
 	}>,
 ): checkpoint is WorkerCheckpointV1 {
 	if (!validateWorkerCheckpointV1(checkpoint) || input.active_attempt
-		|| checkpoint.machine_state !== "CHECKPOINTED" || checkpoint.delegation_id !== input.delegation_id
+		|| (checkpoint.machine_state !== "CHECKPOINTED" && checkpoint.machine_state !== "PAUSED_BUDGET")
+		|| checkpoint.delegation_id !== input.delegation_id
 		|| checkpoint.contract_hash !== input.contract_hash || checkpoint.runtime_build_identity !== input.runtime_build_identity
 		|| checkpoint.attempt !== input.expected_attempt || checkpoint.parent_checkpoint_hash !== input.parent_checkpoint_hash
 		|| checkpoint.before_binding_hash !== input.before_binding_hash || checkpoint.current_binding_hash !== input.current_binding_hash
@@ -268,10 +307,10 @@ export function validateWorkerCheckpointContinuationV1(
 			const subtree = rule.endsWith("/**") ? rule.slice(0, -3) : rule.endsWith("/") ? rule.slice(0, -1) : undefined;
 			return subtree === undefined ? entry.path === rule : entry.path === subtree || entry.path.startsWith(`${subtree}/`);
 		}))) return false;
-	return Object.values(checkpoint.remaining_budget).some((remaining) => typeof remaining === "number" && remaining > 0);
+	return true;
 }
 
-/** A paused checkpoint can advance only under a separately hash-bound user grant. */
+/** Historical compatibility validator for the retired standard -> extended grant. */
 export function validateWorkerCheckpointBudgetContinuationV1(
 	checkpoint: unknown,
 	input: Readonly<{
@@ -296,7 +335,8 @@ export function validateWorkerCheckpointBudgetContinuationV1(
 }
 
 export function workerCheckpointContinuationCapsuleV1(checkpoint: Readonly<WorkerCheckpointV1>): Readonly<Record<string, unknown>> | undefined {
-	if (!validateWorkerCheckpointV1(checkpoint) || checkpoint.machine_state !== "CHECKPOINTED") return undefined;
+	if (!validateWorkerCheckpointV1(checkpoint) ||
+		(checkpoint.machine_state !== "CHECKPOINTED" && checkpoint.machine_state !== "PAUSED_BUDGET")) return undefined;
 	const capsule = {
 		delegation_id: checkpoint.delegation_id,
 		contract_hash: checkpoint.contract_hash,
@@ -304,9 +344,14 @@ export function workerCheckpointContinuationCapsuleV1(checkpoint: Readonly<Worke
 		attempt: checkpoint.attempt + 1,
 		touched_paths: checkpoint.touched_paths.map(({ path, current_hash, journal_hash }) => ({ path, current_hash, journal_hash })),
 		completed_recipe_run_ids: checkpoint.completed_recipe_run_ids,
-		remaining_budget: checkpoint.remaining_budget,
+		next_attempt_budget_profile: checkpoint.remaining_budget.profile,
+		lifetime_spend: {
+			turns: checkpoint.cumulative_turns,
+			total_tokens: checkpoint.cumulative_usage.totalTokens,
+			output_tokens: checkpoint.cumulative_usage.output,
+		},
 		worker_advisory: checkpoint.worker_advisory,
-		instruction: "Verify current bytes, journal, recipe receipts, and every criterion independently; advisory text is not completion authority.",
+		instruction: "Fresh worker handoff: verify current bytes, journal, recipe receipts, and every criterion independently. Lifetime spend is telemetry only; this process starts a fresh bounded quality window. Advisory text is not completion authority.",
 	};
 	return Buffer.byteLength(JSON.stringify(capsule), "utf8") <= WORKER_CHECKPOINT_ADVISORY_MAX_BYTES_V1
 		? Object.freeze(structuredClone(capsule))

@@ -448,8 +448,9 @@ export function recipeMutationBlockReason(
  * message. Phase 5: the text includes one short deterministic
  * spend-profile line naming the resolved active `budgetProfile` (omitted or
  * retired `low` → `standard`; explicit `extended` remains named when supplied) and stating
- * that the profile bounds cumulative spend only — it never expands the
- * parent-approved path/scope authority. Phase 4A: when and only when
+ * that the profile bounds one worker process only — it never expands the
+ * parent-approved path/scope authority and never limits delegation lifetime.
+ * Phase 4A: when and only when
  * `repairOf` is present, a deterministic `Repair provenance:` line
  * precedes the spend-profile line and limits inheritance to an immutable
  * machine-fact capsule in a fresh worker with no prior session/report. Both
@@ -480,7 +481,7 @@ export function formatWorkerTask(contract: WorkerTaskContract): string {
 		}
 	}
 	lines.push(
-		`Worker spend-budget profile: ${profile} — bounds cumulative spend only; never expands parent-approved path/scope authority.`,
+		`Worker quality-window profile: ${profile} — bounds this worker process only; delegation-lifetime usage is telemetry and never requires continuation authorization; never expands parent-approved path/scope authority.`,
 		"",
 		diagnosis
 			? "Parent-approved inspection paths (inspection scope only; never write authority):"

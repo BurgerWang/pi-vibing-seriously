@@ -749,6 +749,22 @@ test("multiple ids and transaction/session statuses bind only to their own claus
 		{ ok: true },
 	);
 
+	const renderedFailedStatus = inspectDelegationClaims(assistant([
+		`latest       : ${REAL_ID} FAILED`,
+		"authority v2 : transaction FAILED",
+		"review v2    : PASS at 2026-08-30T08:18:28.174Z (FINAL)",
+	].join("\n")));
+	assert.ok(renderedFailedStatus);
+	assert.deepEqual(renderedFailedStatus.expectedStatuses[REAL_ID], [
+		{ status: "FAILED", source: "transaction" },
+		{ status: "FAILED", source: "transaction" },
+	]);
+	assert.deepEqual(
+		validateDelegationClaims(renderedFailedStatus, evidence(), [{ id: REAL_ID, status: "FAILED", sessionStatus: "REVIEWED" }]),
+		{ ok: true },
+		"an exact status-tool projection may report a failed transaction beside a reviewed session mirror",
+	);
+
 	const forgedTransaction = inspectDelegationClaims(assistant(
 		`authority v2: transaction REVIEWED for delegation ${REAL_ID}`,
 	));

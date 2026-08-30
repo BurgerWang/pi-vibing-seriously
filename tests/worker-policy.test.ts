@@ -332,19 +332,20 @@ test("formatted worker task names the resolved spend profile deterministically (
 	};
 	// Omitted and retired internal input resolve deterministically to the bounded standard default.
 	const defaultText = formatWorkerTask(base);
-	assert.match(defaultText, /Worker spend-budget profile: standard/);
-	assert.match(formatWorkerTask({ ...base, budgetProfile: "low" }), /Worker spend-budget profile: standard/);
+	assert.match(defaultText, /Worker quality-window profile: standard/);
+	assert.match(formatWorkerTask({ ...base, budgetProfile: "low" }), /Worker quality-window profile: standard/);
 	// Both active profiles remain explicit, including the larger extended slice.
 	const standardText = formatWorkerTask({ ...base, budgetProfile: "standard" });
-	assert.match(standardText, /Worker spend-budget profile: standard/);
+	assert.match(standardText, /Worker quality-window profile: standard/);
 	const explicitExtendedText = formatWorkerTask({ ...base, budgetProfile: "extended" });
-	assert.match(explicitExtendedText, /Worker spend-budget profile: extended/);
+	assert.match(explicitExtendedText, /Worker quality-window profile: extended/);
 	// The profile line states the profile bounds spend only — it never
 	// expands the parent-approved path/scope authority (informational
 	// wording; the runner/child env contract enforces the profile and
 	// thresholds are unchanged).
 	for (const text of [standardText, defaultText, explicitExtendedText]) {
-		assert.match(text, /bounds cumulative spend only/);
+		assert.match(text, /bounds this worker process only/);
+		assert.match(text, /lifetime usage is telemetry and never requires continuation authorization/);
 		assert.match(text, /never expands parent-approved path\/scope authority/);
 	}
 	// The rest of the contract still travels unchanged.
@@ -599,7 +600,7 @@ test("formatted worker task carries the repair provenance pointer line only when
 	// unchanged.
 	const without = formatWorkerTask(base);
 	assert.ok(!without.includes("Repair provenance"), "no provenance line when repairOf is omitted");
-	assert.match(without, /Worker spend-budget profile: standard/);
+	assert.match(without, /Worker quality-window profile: standard/);
 	assert.match(without, /- src\/parser\/\*\*/);
 	assert.match(without, /- Unit tests cover the repaired option/);
 	assert.match(without, /Requested write-free recipe verification:/);
@@ -608,25 +609,25 @@ test("formatted worker task carries the repair provenance pointer line only when
 	const repairLine = `Repair provenance: ${VALID_REPAIR_ID} — fresh worker; immutable machine-fact capsule only; no prior session/report inherited.`;
 	assert.ok(withRepair.includes(repairLine), "exact provenance line is present");
 	const repairIndex = withRepair.indexOf("Repair provenance:");
-	const profileIndex = withRepair.indexOf("Worker spend-budget profile:");
+	const profileIndex = withRepair.indexOf("Worker quality-window profile:");
 	assert.ok(repairIndex !== -1 && repairIndex < profileIndex, "provenance line precedes the spend-profile line");
 	// Informational only: paths, criteria, verification, and the budget
 	// profile line all remain unchanged.
 	for (const path of base.allowedPaths) assert.ok(withRepair.includes(path), `allowed path missing: ${path}`);
 	for (const criterion of base.acceptanceCriteria) assert.ok(withRepair.includes(criterion), `criterion missing: ${criterion}`);
 	for (const step of base.verification) assert.ok(withRepair.includes(step), `verification step missing: ${step}`);
-	assert.match(withRepair, /Worker spend-budget profile: standard/);
+	assert.match(withRepair, /Worker quality-window profile: standard/);
 	// Adding repairOf changes nothing but the inserted line.
 	assert.equal(
 		withRepair,
-		without.replace("Worker spend-budget profile:", `${repairLine}\nWorker spend-budget profile:`),
+		without.replace("Worker quality-window profile:", `${repairLine}\nWorker quality-window profile:`),
 		"the only difference is the provenance line",
 	);
 	// Combined with an explicit budget profile, both lines coexist with the
 	// provenance pointer first and the profile rendering unchanged.
 	const combined = formatWorkerTask({ ...base, repairOf: VALID_REPAIR_ID, budgetProfile: "standard" });
-	assert.ok(combined.indexOf("Repair provenance:") < combined.indexOf("Worker spend-budget profile: standard"));
-	assert.match(combined, /Worker spend-budget profile: standard — bounds cumulative spend only/);
+	assert.ok(combined.indexOf("Repair provenance:") < combined.indexOf("Worker quality-window profile: standard"));
+	assert.match(combined, /Worker quality-window profile: standard — bounds this worker process only/);
 });
 
 test("formatted repair task carries only a bounded structured authority capsule", () => {

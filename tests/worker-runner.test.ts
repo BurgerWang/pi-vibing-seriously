@@ -23,6 +23,7 @@ import {
 	WORKER_MODEL_ID,
 	WORKER_MODEL_SELECTOR,
 	WORKER_PROVIDER,
+	WORKER_ATTEMPT_ENV,
 	WORKER_TASK_KIND_ENV,
 	WORKER_TIMEOUT_MS_ENV,
 	type WorkerTaskContract,
@@ -40,6 +41,7 @@ import {
 	WORKER_REPAIR_CAPSULE_SCHEMA,
 	type WorkerRepairCapsule,
 } from "../extensions/workbench-runtime/core/worker-repair-capsule.ts";
+import { WORKER_CHECKPOINT_REQUEST_ENTRY_TYPE_V1 } from "../extensions/workbench-runtime/core/worker-checkpoint.ts";
 
 const CONTRACT: WorkerTaskContract = {
 	task: "Implement one bounded change",
@@ -92,6 +94,23 @@ function journalTelemetryEvent(data: Readonly<Record<string, unknown>>): string 
 	});
 }
 
+function checkpointRequestEvent(attempt: number): string {
+	return JSON.stringify({
+		type: "entry_appended",
+		entry: {
+			type: "custom",
+			customType: WORKER_CHECKPOINT_REQUEST_ENTRY_TYPE_V1,
+			data: {
+				schema_version: 1,
+				kind: WORKER_CHECKPOINT_REQUEST_ENTRY_TYPE_V1,
+				attempt,
+				completed_criteria: ["criterion-a"],
+				remaining_criteria: ["criterion-b"],
+			},
+		},
+	});
+}
+
 test("runner consumes JSON events, pins model identity, and aggregates usage", async () => {
 	const first = assistantEvent({ content: [{ type: "text", text: "working" }], stopReason: "toolUse" });
 	const final = assistantEvent();
@@ -124,6 +143,28 @@ test("runner consumes JSON events, pins model identity, and aggregates usage", a
 		assert.deepEqual(result.spendSoftReached, { turns: false, totalTokens: false, outputTokens: false });
 		assert.deepEqual(result.spendHardExceeded, { turns: false, totalTokens: false, outputTokens: false });
 		assert.strictEqual(result.writeJournalObservation, EMPTY_WORKER_WRITE_JOURNAL_RUNTIME_OBSERVATION);
+	});
+});
+
+test("runner carries the child extension checkpoint request into the controller result", async () => {
+	const checkpoint = checkpointRequestEvent(3);
+	const final = assistantEvent();
+	await withFakeWorker(`process.stdout.write(${JSON.stringify(`${checkpoint}\n${final}\n`)});`, async (invocation, dir) => {
+		const result = await runPinnedWorker({
+			projectRoot: dir,
+			contract: CONTRACT,
+			timeoutMs: 2_000,
+			attempt: 3,
+			invocation,
+		});
+		assertWorkerSucceeded(result);
+		assert.deepEqual(result.checkpointRequest, {
+			attempt: 3,
+			advisory: {
+				completed_criteria: ["criterion-a"],
+				remaining_criteria: ["criterion-b"],
+			},
+		});
 	});
 });
 
@@ -332,15 +373,15 @@ test("worker system prompt pins the three mandatory execution disciplines (early
 	);
 });
 
-test("runner pins xhigh model selector and passes a non-recursive worker role contract", async () => {
+test("runner pins xhigh model selector and passes a non-recursive fresh-worker role contract", async () => {
 	const script = `
-const facts = JSON.stringify({ argv: process.argv.slice(2), role: process.env.WORKBENCH_AGENT_ROLE, depth: process.env.WORKBENCH_WORKER_DEPTH, paths: JSON.parse(process.env.WORKBENCH_WORKER_ALLOWED_PATHS || "[]"), taskKind: process.env.${WORKER_TASK_KIND_ENV} || null, timeoutMs: process.env.${WORKER_TIMEOUT_MS_ENV} || null, inheritedModel: process.env.PI_MODEL || null, spendProfile: process.env.${WORKER_SPEND_PROFILE_ENV} || null, pythonBytecode: process.env.PYTHONDONTWRITEBYTECODE || null });
+const facts = JSON.stringify({ argv: process.argv.slice(2), role: process.env.WORKBENCH_AGENT_ROLE, depth: process.env.WORKBENCH_WORKER_DEPTH, paths: JSON.parse(process.env.WORKBENCH_WORKER_ALLOWED_PATHS || "[]"), taskKind: process.env.${WORKER_TASK_KIND_ENV} || null, timeoutMs: process.env.${WORKER_TIMEOUT_MS_ENV} || null, attempt: process.env.${WORKER_ATTEMPT_ENV} || null, inheritedModel: process.env.PI_MODEL || null, spendProfile: process.env.${WORKER_SPEND_PROFILE_ENV} || null, pythonBytecode: process.env.PYTHONDONTWRITEBYTECODE || null });
 console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", provider: "openai-codex", model: "gpt-5.6-luna", content: [{ type: "text", text: facts }], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } } } }));
 `;
 	await withFakeWorker(script, async (invocation, dir) => {
-		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, invocation });
+		const result = await runPinnedWorker({ projectRoot: dir, contract: CONTRACT, timeoutMs: 2_000, attempt: 3, invocation });
 		assertWorkerSucceeded(result);
-		const facts = JSON.parse(result.output) as { argv: string[]; role: string; depth: string; paths: string[]; taskKind: string | null; timeoutMs: string | null; inheritedModel: string | null; spendProfile: string | null; pythonBytecode: string | null };
+		const facts = JSON.parse(result.output) as { argv: string[]; role: string; depth: string; paths: string[]; taskKind: string | null; timeoutMs: string | null; attempt: string | null; inheritedModel: string | null; spendProfile: string | null; pythonBytecode: string | null };
 		const modelFlag = facts.argv.indexOf("--model");
 		assert.ok(modelFlag >= 0);
 		assert.equal(facts.argv[modelFlag + 1], WORKER_MODEL_SELECTOR);
@@ -350,6 +391,7 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 		assert.deepEqual(facts.paths, CONTRACT.allowedPaths);
 		assert.equal(facts.taskKind, "implementation", "omitted task kind is explicitly carried as the compatibility default");
 		assert.equal(facts.timeoutMs, "2000", "the child sees the existing hard timeout for advisory checkpoints");
+		assert.equal(facts.attempt, "3", "the fresh child receives the exact checkpoint-chain attempt number");
 		const toolsFlag = facts.argv.indexOf("--tools");
 		assert.ok(facts.argv[toolsFlag + 1]?.split(",").includes("edit"));
 		assert.ok(facts.argv[toolsFlag + 1]?.split(",").includes("write"));
@@ -598,9 +640,10 @@ console.log(JSON.stringify({ type: "message_end", message: { role: "assistant", 
 			// The task text (the final child argv element) names the SAME resolved
 			// profile used by child env and result.
 			const taskText = facts.argv[facts.argv.length - 1] ?? "";
-			const taskProfile = /Worker spend-budget profile: (standard|extended)/.exec(taskText)?.[1];
+			const taskProfile = /Worker quality-window profile: (standard|extended)/.exec(taskText)?.[1];
 			assert.equal(taskProfile, "standard", "task text names the defensive standard profile");
-			assert.match(taskText, /bounds cumulative spend only/, "profile wording bounds cumulative spend only");
+			assert.match(taskText, /bounds this worker process only/, "profile wording bounds one worker process only");
+			assert.match(taskText, /lifetime usage is telemetry and never requires continuation authorization/);
 			assert.match(taskText, /never expands parent-approved path\/scope authority/, "profile wording never expands parent-approved path/scope authority");
 			assert.equal(facts.spendProfile, taskProfile, "child env profile equals the task-text profile");
 			assert.equal(result.spendProfile, taskProfile, "result profile equals the task-text profile");

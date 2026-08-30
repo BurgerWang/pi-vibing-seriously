@@ -1458,12 +1458,11 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 					throw new Error(boundedSummary);
 				}
 				if (execution.status === "PAUSED_BUDGET") {
-					// The child owner is already released.  Releasing the checkout/start
-					// lease lets the user inspect or explicitly extend/split the task;
-					// the checkpoint binding will reject any intervening drift.
+					// Read compatibility only: current execution consumes worker handoffs
+					// internally and never returns this state. If an older adapter does,
+					// expose an exact automatic continuation without minting user authority.
 					preserveStartLock = false;
 					const checkpoint = execution.checkpoint;
-					const standardPromotion = checkpoint.remaining_budget.profile === "standard";
 					return {
 						content: [{
 							type: "text" as const,
@@ -1474,9 +1473,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 								`checkpoint     : ${checkpoint.checkpoint_hash}`,
 								`remaining      : turns ${checkpoint.remaining_budget.turns}; total ${checkpoint.remaining_budget.total_tokens}; output ${checkpoint.remaining_budget.output_tokens}`,
 								"semantic review: NOT_RUN — no committed generation exists",
-								standardPromotion
-									? "next action    : send one ordinary explicit continue/authorize instruction to promote this exact checkpoint to the cumulative extended profile"
-									: "next action    : SPLIT_REQUIRED — define a new bounded task for the exact remaining objective; cumulative extended budget cannot be renewed",
+								`next action    : ${repairDelegationToolActionV1(delegationId)} — automatic existing-authority handoff; do not request budget authorization or task split`,
 							].join("\n"),
 						}],
 						details: {
@@ -1486,9 +1483,7 @@ export function registerDelegateTool<TIngress>(controller: DelegateToolControlle
 							attempt: checkpoint.attempt,
 							remaining_budget: checkpoint.remaining_budget,
 							semantic_review: "NOT_RUN",
-							next_action: standardPromotion
-								? "USER_CONTINUE_PROMOTES_TO_CUMULATIVE_EXTENDED"
-								: "SPLIT_REQUIRED_AFTER_EXTENDED_BUDGET",
+							next_action: "CONTINUE_CHECKPOINT_AUTOMATIC_EXISTING_AUTHORITY",
 						},
 					};
 				}

@@ -190,16 +190,15 @@ test("an authorized standard-to-extended promotion preserves cumulative enforcem
 	assert.equal(authorizedWorkerBudgetPromotionV1(built.value, authorizationHash), undefined, "promotion is one-shot");
 });
 
-test("checkpoint storage advances a paused standard checkpoint only through an authorized promotion", async () => {
-	const root = await mkdtemp(join(tmpdir(), "lco-budget-promotion-"));
+test("checkpoint storage advances a legacy paused checkpoint through an automatic fresh-worker handoff", async () => {
+	const root = await mkdtemp(join(tmpdir(), "lco-automatic-handoff-"));
 	try {
 		const options = await runningProject(root);
 		const paused = checkpoint(1, 64);
 		assert.equal((await publishDelegationWorkerCheckpointV1(root, paused, options)).ok, true);
-		const promotion = authorizedWorkerBudgetPromotionV1(paused, "9".repeat(64));
-		assert.ok(promotion);
-		const cumulative = usage(65);
-		const remaining = remainingWorkerBudgetV1("extended", 65, cumulative.totalTokens, cumulative.output);
+		const cumulative = usage(66);
+		const attempt = usage(2);
+		const remaining = remainingWorkerBudgetV1("standard", 2, attempt.totalTokens, attempt.output);
 		assert.ok(remaining);
 		const { schema_version: _schema, kind: _kind, checkpoint_hash: _hash, ...base } = paused;
 		const next = buildWorkerCheckpointV1({
@@ -207,20 +206,30 @@ test("checkpoint storage advances a paused standard checkpoint only through an a
 			attempt: 2,
 			parent_checkpoint_hash: paused.checkpoint_hash,
 			cumulative_usage: cumulative,
-			cumulative_turns: 65,
-			budget_promotion: promotion,
+			cumulative_turns: 66,
+			attempt_spend: { turns: 2, total_tokens: attempt.totalTokens, output_tokens: attempt.output },
 			remaining_budget: remaining,
 			machine_state: "CHECKPOINTED",
 			created_at: "2026-08-29T01:01:00.000Z",
 		});
 		assert.equal(next.ok, true);
-		if (next.ok) assert.equal((await publishDelegationWorkerCheckpointV1(root, next.value, options)).ok, true);
+		if (next.ok) {
+			assert.equal((await publishDelegationWorkerCheckpointV1(root, next.value, options)).ok, true);
+			assert.equal(next.value.cumulative_turns, 66);
+			assert.equal(next.value.attempt_spend?.turns, 2);
+			assert.equal(next.value.remaining_budget.turns, 62);
+			assert.equal(validateWorkerCheckpointContinuationV1(paused, {
+				delegation_id: ID, contract_hash: CONTRACT, runtime_build_identity: RUNTIME,
+				expected_attempt: 1, parent_checkpoint_hash: null, before_binding_hash: BEFORE,
+				current_binding_hash: CURRENT, allowed_paths: ["src/**"], active_attempt: false,
+			}), true, "legacy pauses are valid automatic handoff inputs");
+		}
 	} finally {
 		await rm(root, { recursive: true, force: true });
 	}
 });
 
-test("a legacy RUNNING budget pause migrates only under the exact checkpoint grant", async () => {
+test("a legacy RUNNING budget pause migrates automatically without user authorization", async () => {
 	const root = await mkdtemp(join(tmpdir(), "lco-budget-migration-"));
 	try {
 		const options = await runningProject(root);
@@ -243,7 +252,6 @@ test("a legacy RUNNING budget pause migrates only under the exact checkpoint gra
 		const migrated = await preparePausedBudgetContinuationV1({
 			project_root: root,
 			delegation_id: ID,
-			authorization,
 		});
 		assert.deepEqual(migrated, { ok: true });
 		const transaction = await readDelegationTransactionV2(root, ID);

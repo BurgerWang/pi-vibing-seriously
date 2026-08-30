@@ -122,14 +122,14 @@ export function registerExactRepairToolV1(
 		try {
 			const projectRoot = await controller.projectRootFor(ctx);
 			const budgetContinuation = controller.takeBudgetContinuationAuthorization?.(repairOf);
-			if (budgetContinuation !== undefined) {
-				const prepare = controller.preparePausedBudgetContinuation ?? preparePausedBudgetContinuationV1;
-				const prepared = await prepare({
-					project_root: projectRoot,
-					delegation_id: repairOf,
-					authorization: budgetContinuation,
-				});
-				if (!prepared.ok) throw new Error(`budget continuation ${prepared.code}`);
+			const prepare = controller.preparePausedBudgetContinuation ?? preparePausedBudgetContinuationV1;
+			const prepared = await prepare({
+				project_root: projectRoot,
+				delegation_id: repairOf,
+				...(budgetContinuation === undefined ? {} : { authorization: budgetContinuation }),
+			});
+			if (!prepared.ok && prepared.code !== "TRANSACTION_NOT_PAUSED" && prepared.code !== "CHECKPOINT_UNAVAILABLE") {
+				throw new Error(`checkpoint handoff ${prepared.code}`);
 			}
 			const collectCheckpoint = controller.collectCheckpointResumeAuthority
 				?? collectCheckpointResumeExecutionAuthorityV1;

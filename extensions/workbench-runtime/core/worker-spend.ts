@@ -1,12 +1,12 @@
 /**
- * Pinned GPT-5.6 Luna xhigh cumulative delegation-spend policy — pure logic,
+ * Pinned GPT-5.6 Luna xhigh per-worker quality-window policy — pure logic,
  * no Pi imports.
  *
  * Phases 1–2 of the approved worker token-budget repair
  * (`docs/plans/worker-token-budget-repair.md`): this module is the pure
  * policy and is **WIRED into the runtime since Phase 2** — the runner
- * accumulates the cumulative spend state after every assistant message and
- * terminates fail-closed on any hard turn/total/output dimension, and the worker-role
+ * accumulates the current process spend after every assistant message and
+ * ends that worker on any hard turn/total/output dimension, and the worker-role
  * lifecycle sends exactly one hidden soft steer when the band first becomes
  * soft/hard (profile carried through the fixed `WORKER_SPEND_PROFILE_ENV`
  * child env contract). Public profile selection and ledger/handoff
@@ -15,10 +15,10 @@
  * It operates independently of the per-message context safety in
  * `core/worker-budget.ts` (272,000-token window, 217,600 soft handoff /
  * 244,800 hard stop): context safety bounds any single
- * message; this policy observes cumulative turns and bounds actual cumulative
- * total/output consumption across a delegation run. The hard turn boundary is
- * also enforced so an oversized task must hand off as a bounded continuation
- * instead of growing into an unrecoverable 200+ turn process.
+ * message; this policy bounds the turns and token usage of one worker process.
+ * Delegation-lifetime counters remain monotonic telemetry, but never stop the
+ * task or create a user authorization boundary. A soft or hard boundary writes
+ * a durable checkpoint and starts a fresh worker under the same contract.
  *
  * The current limits are Luna-specific and expressed in 272K context-window
  * equivalents. Every profile has a substantial continuation reserve between
@@ -45,11 +45,11 @@
  *     `soft`; else `ok`. The triggered-reasons list is the subset of
  *     dimensions at/above the current band's threshold, in the fixed order
  *     `turns`, `total_tokens`, `output_tokens`.
- *   - At most one hidden cumulative soft steer per delegation (delivered
+ *   - At most one hidden soft steer per worker process (delivered
  *     exactly like the existing context steer, `display: false`,
  *     `deliverAs: "steer"`); the steer is a request, not enforcement. Any
- *     hard turn/total/output dimension → runner terminates the attempt and the
- *     invocation fails closed with retained evidence for a bounded continuation.
+ *     hard turn/total/output dimension ends only the current attempt; the
+ *     delegation controller retains evidence and launches its bounded successor.
  *
  * Malformed counters, malformed usage, and unrecognized profile values
  * never throw and never produce NaN: counters normalize to zero, and limit
@@ -63,7 +63,7 @@ import { workerContextTokens } from "./worker-budget.ts";
 export type WorkerSpendProfile = "low" | "standard" | "extended";
 /** Profiles that may be selected for a current delegation. */
 export type ActiveWorkerSpendProfile = Exclude<WorkerSpendProfile, "low">;
-/** Cumulative spend band for one delegation run. */
+/** Spend band for one worker process. */
 export type WorkerSpendBand = "ok" | "soft" | "hard";
 /**
  * Spend dimension identifiers in the fixed reason order — never
@@ -84,7 +84,7 @@ export interface WorkerSpendLimits {
 	readonly hard: WorkerSpendDimensionLimits;
 }
 
-/** Cumulative spend state of one delegation run (one entry per message). */
+/** Spend state of one worker process (one entry per message). */
 export interface WorkerSpendState {
 	turns: number;
 	totalTokens: number;
@@ -114,10 +114,10 @@ export const WORKER_SPEND_POLICY_ID = "gpt-5.6-luna-xhigh-continuation-v2" as co
  * `standard` (defensive mirror of `resolveWorkerSpendProfile`).
  */
 export const WORKER_SPEND_PROFILE_ENV = "WORKBENCH_WORKER_SPEND_PROFILE";
-/** Exact cumulative counters inherited by a fresh continuation process. */
+/** Legacy replay/test seam; current continuations start a fresh process window. */
 export const WORKER_INITIAL_SPEND_STATE_ENV = "WORKBENCH_WORKER_INITIAL_SPEND_STATE";
 
-/** customType of the one-shot hidden cumulative soft-budget steer message. */
+/** customType of the one-shot hidden per-worker soft-handoff steer message. */
 export const WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE = "workbench-worker-spend-soft-steer";
 
 /**
@@ -346,10 +346,10 @@ export function formatWorkerSpendSteerText(state: unknown, profile: WorkerSpendP
 			? softReasons.map((reason) => `${reason} ${currentValue(s, reason)}/${limitValue(limits.soft, reason)}`).join(", ")
 			: "no dimension at its soft limit";
 	return [
-		`Worker cumulative spend soft budget reached (profile ${profileName}): ${facts}.`,
+		`Worker process soft handoff point reached (profile ${profileName}): ${facts}.`,
 		"Stop starting unrelated work. Finish only the current atomic edit, refresh the machine write journal, and run only already-declared necessary focused recipes.",
 		"Publish a machine WorkerCheckpointV1 handoff with completed criteria and remaining work, then exit normally.",
-		"The remaining hard limit is the continuation reserve. The next attempt is a fresh --no-session Luna under the same delegation in the current Sol session; never ask the user to open a new Sol session, request a new delegation, or reset cumulative spend.",
+		"The remaining hard limit is this worker's handoff reserve. The controller starts a fresh --no-session Luna under the same delegation and existing authority; never ask the user to authorize ordinary continuation.",
 	].join("\n");
 }
 
@@ -373,7 +373,7 @@ export function formatWorkerSpendHardStop(state: unknown, profile: WorkerSpendPr
 		reasons.length > 0
 			? reasons.map((reason) => `${reason} ${currentValue(s, reason)}/${limitValue(limits.hard, reason)}`).join(", ")
 			: "no dimension at its hard limit";
-	return `Worker cumulative spend hard budget reached (profile ${profileName}): ${facts}. Continue with a bounded follow-up delegation in the current Sol session after reviewing any partial delta; do not request a new Sol session.`;
+	return `Worker process hard handoff point reached (profile ${profileName}): ${facts}. The controller must preserve the checkpoint and start a fresh bounded worker under the same delegation; no user budget authorization is required.`;
 }
 
 /**

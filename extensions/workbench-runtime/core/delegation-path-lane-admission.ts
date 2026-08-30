@@ -46,6 +46,7 @@ import {
 	parseDelegationTransaction,
 	type DelegationTransactionRecord,
 } from "./delegation-transaction.ts";
+import { validateWorkerBudgetPromotionV1 } from "./worker-checkpoint.ts";
 import { readStrictRetryableRawRepairEvidenceV1 } from "./delegation-execution-owner.ts";
 import { readRecoverableUnpublishedPathAuthorityV1 } from "./recoverable-unpublished-path-authority.ts";
 import {
@@ -217,10 +218,16 @@ function strictCommittedPaths(
 		"schema_version", "delegation_id", "task_kind", "contract_hash", "allowed_paths", "changed_paths", "write_journal", "change_set",
 	] as const;
 	const hasCommand = Object.prototype.hasOwnProperty.call(scope, "command_provenance");
-	if (!exactFields(scope, hasCommand ? [...baseFields, "command_provenance"] : baseFields) ||
+	const hasBudgetPromotion = Object.prototype.hasOwnProperty.call(scope, "budget_promotion");
+	const optionalFields = [
+		...(hasBudgetPromotion ? ["budget_promotion"] : []),
+		...(hasCommand ? ["command_provenance"] : []),
+	];
+	if (!exactFields(scope, [...baseFields, ...optionalFields]) ||
 		scope.schema_version !== 2 || scope.delegation_id !== transaction.delegation_id ||
 		scope.task_kind !== transaction.task_kind || scope.contract_hash !== transaction.contract_hash ||
-		!strictStringList(scope.changed_paths)) return undefined;
+		!strictStringList(scope.changed_paths) ||
+		(hasBudgetPromotion && !validateWorkerBudgetPromotionV1(scope.budget_promotion))) return undefined;
 	const changeSet = scope.change_set;
 	if (!validateChangeSet(changeSet) || changeSet.delegation_id !== transaction.delegation_id ||
 		changeSet.contract_hash !== transaction.contract_hash) return undefined;

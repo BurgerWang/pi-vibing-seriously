@@ -160,33 +160,22 @@ test("checkpoint and budget pause override ACTIVE without creating semantic repa
 	const paused = buildLifecycleActionSnapshotV2({ project_root: "/project", mode: "DEV", resolution: active, checkpoint: pausedCheckpoint });
 	assert.equal(paused.ok, true);
 	if (!paused.ok) return;
-	assert.equal(paused.value.action, "PAUSED_BUDGET");
-	assert.equal(paused.value.authorization, "USER_REQUIRED");
-	assert.equal(lifecycleActionSnapshotTextV2(paused.value).includes("repair"), false);
+	assert.equal(paused.value.action, "CONTINUE_CHECKPOINT");
+	assert.equal(paused.value.authorization, "EXISTING");
+	assert.equal(paused.value.safe_automatic, true);
+	assert.equal(paused.value.tool, "workbench_repair_delegation");
 	assert.deepEqual(lifecycleActionStatusLinesV2(paused.value), [
 		"lifecycle v2 : PAUSED_BUDGET",
-		"typed action : PAUSED_BUDGET (PAUSED_BUDGET_STANDARD_PROMOTION_AVAILABLE)",
-		"next action  : the cumulative standard budget is paused; one ordinary explicit continue/authorize instruction promotes this exact checkpoint to the finite extended profile without resetting spend",
+		"typed action : CONTINUE_CHECKPOINT (LEGACY_PAUSED_BUDGET_AUTO_HANDOFF)",
+		`next action  : continue the exact checkpoint ${pausedCheckpoint.checkpoint_hash}; do not resume prior conversation state`,
 	]);
-	const pausedDirective = lifecycleActionTurnDirectiveV2(paused.value, ["read", "workbench_delegation_status"]);
-	assert.match(pausedDirective ?? "", /Stop execution and request the exact explicit user authorization/u);
-	assert.match(pausedDirective ?? "", /do not call status as a substitute for authorization/iu);
-	assert.match(pausedDirective ?? "", /do not create a successor/u);
-	assert.match(pausedDirective ?? "", /"tool":null/u);
+	const pausedDirective = lifecycleActionTurnDirectiveV2(paused.value, ["read", "workbench_repair_delegation"]);
+	assert.match(pausedDirective ?? "", /call the listed exact tool/u);
+	assert.match(pausedDirective ?? "", /"authorization":"EXISTING"/u);
+	assert.doesNotMatch(pausedDirective ?? "", /request.*user authorization/iu);
 
-	for (const prompt of ["继续", "好的，那么请继续推进", "授权延长预算", "I authorize you to resume"]) {
-		const authorized = authorizePausedBudgetContinuationTurnV1(paused.value, prompt, pausedCheckpoint);
-		assert.ok(authorized, prompt);
-		assert.equal(authorized.snapshot.action, "CONTINUE_CHECKPOINT");
-		assert.equal(authorized.snapshot.tool, "workbench_repair_delegation");
-		assert.equal(authorized.snapshot.authorization, "EXISTING");
-		assert.equal(authorized.authorization.checkpoint_hash, paused.value.exact_target.bound_hash);
-		assert.equal(authorized.authorization.target_profile, "extended");
-		assert.equal(JSON.stringify(authorized.authorization).includes(prompt), false, "raw prompt must not enter authority");
-	}
-	for (const prompt of ["为什么不能继续？", "是否可以继续", "不要继续", "报告当前状态"]) {
-		assert.equal(authorizePausedBudgetContinuationTurnV1(paused.value, prompt, pausedCheckpoint), undefined, prompt);
-	}
+	assert.equal(authorizePausedBudgetContinuationTurnV1(paused.value, "继续", pausedCheckpoint), undefined,
+		"ordinary handoff no longer creates or consumes user budget authority");
 
 	const extendedCheckpoint = checkpoint(96, "extended");
 	const extended = buildLifecycleActionSnapshotV2({
@@ -194,10 +183,11 @@ test("checkpoint and budget pause override ACTIVE without creating semantic repa
 	});
 	assert.equal(extended.ok, true);
 	if (!extended.ok) return;
-	assert.equal(extended.value.reason_code, "PAUSED_BUDGET_EXTENDED_SPLIT_REQUIRED");
-	assert.match(lifecycleActionSnapshotTextV2(extended.value), /new bounded task split/u);
+	assert.equal(extended.value.reason_code, "LEGACY_PAUSED_BUDGET_AUTO_HANDOFF");
+	assert.equal(extended.value.action, "CONTINUE_CHECKPOINT");
+	assert.equal(extended.value.authorization, "EXISTING");
 	assert.equal(authorizePausedBudgetContinuationTurnV1(extended.value, "继续", extendedCheckpoint), undefined);
-	assert.match(lifecycleActionTurnDirectiveV2(extended.value, ["read"]) ?? "", /SPLIT_REQUIRED/u);
+	assert.doesNotMatch(lifecycleActionTurnDirectiveV2(extended.value, ["read", "workbench_repair_delegation"]) ?? "", /SPLIT_REQUIRED/u);
 });
 
 test("executor rejects stale authority or a different exact target and never substitutes another action", () => {

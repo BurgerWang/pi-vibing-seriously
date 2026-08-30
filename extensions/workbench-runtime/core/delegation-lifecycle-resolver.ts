@@ -688,17 +688,7 @@ export function buildLifecycleActionSnapshotV2(
 			return { ok: false, code: "INVALID_INPUT" };
 		}
 		const checkpoint = input.checkpoint;
-		const projected = checkpoint === undefined ? actionProjectionV2(input.resolution) : checkpoint.machine_state === "PAUSED_BUDGET"
-			? {
-				action: "PAUSED_BUDGET" as const,
-				exact_target: { delegation_id: checkpoint.delegation_id, bound_hash: checkpoint.checkpoint_hash },
-				tool: null,
-				arguments: null,
-				safe_automatic: false,
-				authorization: "USER_REQUIRED" as const,
-				retryable: false,
-			}
-			: {
+		const projected = checkpoint === undefined ? actionProjectionV2(input.resolution) : {
 				action: "CONTINUE_CHECKPOINT" as const,
 				exact_target: { delegation_id: checkpoint.delegation_id, bound_hash: checkpoint.checkpoint_hash },
 				tool: "workbench_repair_delegation",
@@ -716,9 +706,7 @@ export function buildLifecycleActionSnapshotV2(
 			state: checkpoint?.machine_state ?? input.resolution.state,
 			...projected,
 			reason_code: checkpoint?.machine_state === "PAUSED_BUDGET"
-				? checkpoint.remaining_budget.profile === "standard"
-					? "PAUSED_BUDGET_STANDARD_PROMOTION_AVAILABLE"
-					: "PAUSED_BUDGET_EXTENDED_SPLIT_REQUIRED"
+				? "LEGACY_PAUSED_BUDGET_AUTO_HANDOFF"
 				: checkpoint?.machine_state ?? input.resolution.primary_action.reason,
 			invalidation_conditions: [...INVALIDATION_CONDITIONS_V2],
 		};

@@ -65,6 +65,7 @@ import {
 	WORKER_SPEND_PROFILE_ENV,
 	WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE,
 } from "../extensions/workbench-runtime/core/worker-spend.ts";
+import { WORKER_CHECKPOINT_REQUEST_ENTRY_TYPE_V1 } from "../extensions/workbench-runtime/core/worker-checkpoint.ts";
 import { WORKER_NO_PROGRESS_STEER_MESSAGE_TYPE } from "../extensions/workbench-runtime/core/development-efficiency.ts";
 import {
 	acquireProjectCheckoutOperationV1,
@@ -767,7 +768,7 @@ test("worker role sends exactly one hidden soft-budget steer at/above 80%", asyn
 	assert.deepEqual(spend.options, { deliverAs: "steer" });
 	assert.match(spend.content, /profile standard/);
 	assert.match(spend.content, /total_tokens 5635199\/5440000/);
-	assert.match(spend.content, /current Sol session/);
+	assert.match(spend.content, /same delegation and existing authority/);
 
 	// One-shot again: another soft/hard message re-sends neither steer.
 	await handler(messageEndEvent(200_000), ctx);
@@ -812,14 +813,34 @@ test("worker role sends exactly one hidden cumulative spend steer at the standar
 	assert.deepEqual(steer.options, { deliverAs: "steer" }, "delivered in the active tool loop, not deferred to a future user turn");
 	assert.match(steer.content, /profile standard/);
 	assert.match(steer.content, /total_tokens 5440000\/5440000/);
-	assert.match(steer.content, /continuation reserve/);
+	assert.match(steer.content, /handoff reserve/);
+	assert.match(steer.content, /never ask the user to authorize ordinary continuation/);
 	assert.match(steer.content, /Stop starting unrelated work/);
 	assert.match(steer.content, /handoff/i);
+	assert.equal(
+		stub.appendEntryCalls.filter((entry) => entry.customType === WORKER_CHECKPOINT_REQUEST_ENTRY_TYPE_V1).length,
+		0,
+		"the steer is delivered before the machine checkpoint request",
+	);
 
-	// One-shot: further soft-band messages never re-send the steer.
+	// The next assistant message after the steer emits exactly one canonical
+	// machine checkpoint request. Further soft-band messages never duplicate
+	// either the steer or the checkpoint request.
 	await handler(messageEndEvent(170_000), ctx);
+	const checkpointRequests = stub.appendEntryCalls.filter((entry) =>
+		entry.customType === WORKER_CHECKPOINT_REQUEST_ENTRY_TYPE_V1);
+	assert.equal(checkpointRequests.length, 1);
+	assert.deepEqual(checkpointRequests[0]!.data, {
+		schema_version: 1,
+		kind: WORKER_CHECKPOINT_REQUEST_ENTRY_TYPE_V1,
+		attempt: 1,
+		completed_criteria: [],
+		remaining_criteria: [],
+	});
 	await handler(messageEndEvent(170_000), ctx);
 	assert.equal(messagesOfType(stub, WORKER_SPEND_SOFT_STEER_MESSAGE_TYPE).length, 1, "the spend steer is one-shot");
+	assert.equal(stub.appendEntryCalls.filter((entry) =>
+		entry.customType === WORKER_CHECKPOINT_REQUEST_ENTRY_TYPE_V1).length, 1, "the checkpoint request is one-shot");
 });
 
 test("worker role maps retired low to standard and steers at the exact soft-turn boundary", async () => {

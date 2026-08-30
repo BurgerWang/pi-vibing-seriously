@@ -1,10 +1,7 @@
 /** Serialized durable lifecycle refresh used by UI and per-turn injection. */
 
 import type { ExecFn } from "./config.ts";
-import {
-	authorizePausedBudgetContinuationTurnV1,
-	type BudgetContinuationAuthorizationV1,
-} from "./budget-continuation-authorization.ts";
+import type { BudgetContinuationAuthorizationV1 } from "./budget-continuation-authorization.ts";
 import { lifecycleActionTurnMessageV2 } from "./agent-next-action.ts";
 import { isStrictRetryableCheckpointRepairRecoveryV2 } from "./delegation-execution-owner.ts";
 import {
@@ -57,7 +54,6 @@ export function createLifecycleActionRefreshControllerV2(
 	dependencies: LifecycleActionRefreshDependenciesV2,
 ): LifecycleActionRefreshControllerV2 {
 	let tail: Promise<void> = Promise.resolve();
-	let pendingBudgetContinuationAuthorization: Readonly<BudgetContinuationAuthorizationV1> | undefined;
 	const enqueueRefresh = (
 		projectRoot: string,
 		stateOverride?: Readonly<DelegationState>,
@@ -67,7 +63,6 @@ export function createLifecycleActionRefreshControllerV2(
 		budgetAuthorized: boolean;
 	}>> => {
 		const operation = tail.then(async () => {
-			if (prompt !== undefined) pendingBudgetContinuationAuthorization = undefined;
 			const state = stateOverride ?? dependencies.getDelegationState();
 			const status = await readDelegationRepairStatusV1(
 				projectRoot,
@@ -92,11 +87,9 @@ export function createLifecycleActionRefreshControllerV2(
 				...(checkpoint === undefined ? {} : { checkpoint }),
 			});
 			if (!built.ok) return { budgetAuthorized: false };
-			const authorized = prompt === undefined
-				? undefined
-				: authorizePausedBudgetContinuationTurnV1(built.value, prompt, checkpoint);
-			const snapshot = authorized?.snapshot ?? built.value;
-			if (authorized !== undefined) pendingBudgetContinuationAuthorization = authorized.authorization;
+			// A worker handoff reuses existing delegation authority. User prompt
+			// wording must never mint or consume a budget-continuation grant.
+			const snapshot = built.value;
 			const appended = appendLifecycleActionSnapshotIfChangedV2(
 				snapshot,
 				dependencies.getLatestSnapshotHash(),
@@ -104,7 +97,7 @@ export function createLifecycleActionRefreshControllerV2(
 			);
 			if (appended !== undefined) dependencies.setLatestSnapshotHash(appended.latest_snapshot_hash);
 			dependencies.publish(status, snapshot);
-			return { snapshot, budgetAuthorized: authorized !== undefined };
+			return { snapshot, budgetAuthorized: false };
 		});
 		tail = operation.then(() => undefined, () => undefined);
 		return operation;
@@ -133,15 +126,10 @@ export function createLifecycleActionRefreshControllerV2(
 			return undefined;
 		}
 	};
-	const takeBudgetContinuationAuthorization = (delegationId: string) => {
-		if (pendingBudgetContinuationAuthorization?.delegation_id !== delegationId) return undefined;
-		const authorization = pendingBudgetContinuationAuthorization;
-		pendingBudgetContinuationAuthorization = undefined;
-		return authorization;
-	};
-	const clearBudgetContinuationAuthorization = (): void => {
-		pendingBudgetContinuationAuthorization = undefined;
-	};
+	// Compatibility methods remain until the old public controller surface is
+	// retired; the current runtime never creates a budget authorization.
+	const takeBudgetContinuationAuthorization = (_delegationId: string): undefined => undefined;
+	const clearBudgetContinuationAuthorization = (): void => undefined;
 	return Object.freeze({
 		refresh,
 		refreshTurn,

@@ -470,6 +470,16 @@ function inspectWorkbenchRunClaims(text: string): {
 function statusSource(clause: string, status: string, statusIndex: number): DelegationClaimStatusSource {
 	if (status === "STALE") return "session";
 	const prefix = clause.slice(0, statusIndex);
+	// The status renderer's `latest` line is a composite projection: active and
+	// failed transaction states come from durable transaction authority, while
+	// REVIEWED/PENDING_REVIEW/STALE may come from the session mirror.  Do not
+	// misclassify an exact `latest ... FAILED` or `latest ... FINISHED` copy as a
+	// session claim; those values are not valid session-review statuses at all.
+	// Keep otherwise-unlabelled tokens unspecified so a run-result line cannot
+	// become an unbound delegation-status claim.
+	if (["FAILED", "FINISHED", "ABORTED", "RUNNING", "PREPARED", "COMMITTING", "RECOVERY_REQUIRED"].includes(status)) {
+		return /\btransaction\b|authority\s+v2|\blatest\b/iu.test(prefix) ? "transaction" : "unspecified";
+	}
 	const transactionLabels = [...prefix.matchAll(/\btransaction\b|authority\s+v2/giu)];
 	const sessionLabels = [...prefix.matchAll(/\blatest\b|\bsession\b|会话|review[_ ]status/giu)];
 	const transactionIndex = transactionLabels.at(-1)?.index ?? -1;
@@ -1001,7 +1011,7 @@ function claimGuardNextAction(
 		return `${noDelegateCall}discard guessed delegation ids; query workbench_delegation_status; if its persisted next action permits delegation, call workbench_delegate_worker and report only the returned delegation_id`;
 	}
 	if (code === "status_mismatch") {
-		return "query workbench_delegation_status and restate each machine_mismatch_fact without collapsing transaction FINISHED into transaction REVIEWED";
+		return "query workbench_delegation_status and restate each machine_mismatch_fact without collapsing transaction and session status";
 	}
 	return "query workbench_delegation_status and follow its persisted next action; review PENDING_REVIEW or STALE, and delegate only when unblocked";
 }

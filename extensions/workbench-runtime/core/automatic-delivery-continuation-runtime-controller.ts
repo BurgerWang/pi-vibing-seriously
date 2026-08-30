@@ -213,18 +213,17 @@ function gateFailure(code: string) {
 }
 
 /**
- * Checkpoint budget authority owns the whole turn.  The lifecycle refresh
- * listener runs before this adapter and may replace PAUSED_BUDGET with the
- * one-turn, user-authorized CONTINUE_CHECKPOINT action.  Treating only the
- * pre-authorization snapshot as exclusive lets this older delivery scanner
- * inject a second, conflicting status action after the exact resume action.
+ * Checkpoint handoff authority owns the whole turn. The lifecycle refresh
+ * listener projects current checkpoints as automatic CONTINUE_CHECKPOINT
+ * actions. PAUSED_BUDGET remains read-only compatibility for legacy state and
+ * must never request fresh user authority.
  */
 function canonicalCheckpointContinuationOwnsTurn(
 	dependencies: AutomaticDeliveryContinuationRuntimeControllerDependenciesV1,
 ): boolean {
 	try {
 		const snapshot = dependencies.getLifecycleActionSnapshot?.();
-		return snapshot?.action === "PAUSED_BUDGET" && snapshot.authorization === "USER_REQUIRED"
+		return snapshot?.action === "PAUSED_BUDGET"
 			|| snapshot?.action === "CONTINUE_CHECKPOINT" && snapshot.authorization === "EXISTING";
 	} catch {
 		return false;

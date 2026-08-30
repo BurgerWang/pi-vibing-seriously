@@ -53,6 +53,7 @@ import {
 	readDelegationReviewV2,
 	readDelegationTerminalNegativeSolAuthorityV1,
 	readDelegationTransactionV2,
+	readDelegationWorkerCheckpointV1,
 } from "../extensions/workbench-runtime/core/delegation-transaction-storage.ts";
 import {
 	closeInactiveProjectDelegationBlockerV2,
@@ -898,9 +899,10 @@ test("execution v2: ambiguous owner prepublication failure is closed under the e
 	if (retry.ok) assert.equal((await releaseProjectDelegationStartLockV1(retry.value)).ok, true);
 });
 
-test("execution v2: a cumulative hard turn boundary pauses without commit or semantic repair", async (t) => {
+test("execution v2: a worker hard turn boundary automatically hands off without user authorization", async (t) => {
 	const projectRoot = await root(t);
 	const delegationId = id(46);
+	const bound = contract("implementation");
 	const report = completeReport(["src/changed.ts"]);
 	const markedWorker = worker(report, {
 		turns: 64,
@@ -910,29 +912,74 @@ test("execution v2: a cumulative hard turn boundary pauses without commit or sem
 		spendSoftReached: { turns: true, totalTokens: false, outputTokens: false },
 		spendHardExceeded: { turns: true, totalTokens: false, outputTokens: false },
 	});
-	const result = await executeDelegationV2(await input(
-		projectRoot,
-		delegationId,
-		"implementation",
-		after(["src/changed.ts"]),
-		markedWorker,
-	));
-	assert.equal(result.ok, true);
-	if (!result.ok) return;
-	assert.equal(result.status, "PAUSED_BUDGET");
-	if (result.status !== "PAUSED_BUDGET") return;
-	assert.equal(result.worker_failure_code, "SPEND_TURN_LIMIT");
-	assert.equal(result.durable_state.status, "RECOVERY_REQUIRED");
-	assert.equal(result.durable_state.recovery_reason, "worker paused at a bounded budget epoch before terminal facts");
-	assert.deepEqual(result.durable_state.postcondition_reasons, []);
-	assert.equal(result.durable_state.terminal_outcome, null);
-	assert.equal(result.checkpoint.machine_state, "PAUSED_BUDGET");
-	assert.equal(result.checkpoint.cumulative_turns, 64);
+	const before = await collectGitFacts(projectRoot, realExec);
+	const calls: RunWorkerOptions[] = [];
+	const result = await executeDelegationV2({
+		projectRoot, delegationId, contract: bound, before,
+		workerIdentity: { ...WORKER_IDENTITY }, clock: clock(), exec: realExec,
+		runWorker: async (options) => {
+			calls.push(options);
+			return calls.length === 1
+				? journalWorker(projectRoot, delegationId, bound.contract_hash, ["src/changed.ts"], markedWorker)
+				: worker(report);
+		},
+	});
+	assert.equal(result.ok, true, result.ok ? "" : result.code);
+	if (!result.ok || result.status === "PAUSED_BUDGET") return;
+	assert.equal(result.status, "PENDING_REVIEW");
+	assert.equal(calls.length, 2);
+	assert.equal(calls[1]!.attempt, 2);
+	assert.equal(calls[1]!.initialSpendState, undefined, "fresh worker receives a fresh quality window");
+	assert.deepEqual(
+		(calls[1]!.continuationCapsule as { worker_advisory?: { remaining_criteria?: string[] } }).worker_advisory?.remaining_criteria,
+		bound.acceptance_criteria,
+		"a forced hard boundary still leaves a complete machine-readable objective handoff",
+	);
+	assert.equal(result.result.turns, 66, "lifetime turns remain monotonic telemetry");
+	assert.equal(result.result.usage.totalTokens, 320);
 	const committed = await readDelegationCommittedGenerationV2(projectRoot, delegationId);
-	assert.equal(committed.ok, false, "a paused checkpoint is not a committed generation");
+	assert.equal(committed.ok, true, "the relay produces one final committed generation");
 });
 
-test("execution v2: a soft checkpoint continues in one delegation with cumulative spend and one final generation", async (t) => {
+test("execution v2: a hard per-message context boundary also checkpoints and relays automatically", async (t) => {
+	const projectRoot = await root(t);
+	const delegationId = id(64);
+	const bound = contract("implementation");
+	const first = worker("context quality handoff", {
+		hardBudgetExceeded: true,
+		softBudgetReached: true,
+		maxContextTokens: 244_800,
+		maxContextRatio: 0.9,
+	});
+	const calls: RunWorkerOptions[] = [];
+	const result = await executeDelegationV2({
+		projectRoot,
+		delegationId,
+		contract: bound,
+		before: await collectGitFacts(projectRoot, realExec),
+		workerIdentity: { ...WORKER_IDENTITY },
+		clock: clock(),
+		exec: realExec,
+		runWorker: async (options) => {
+			calls.push(options);
+			return calls.length === 1
+				? journalWorker(projectRoot, delegationId, bound.contract_hash, ["src/changed.ts"], first)
+				: worker(completeReport(["src/changed.ts"]));
+		},
+	});
+	assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result));
+	if (!result.ok || result.status === "PAUSED_BUDGET") return;
+	assert.equal(result.status, "PENDING_REVIEW");
+	assert.equal(calls.length, 2);
+	assert.equal(calls[1]!.attempt, 2);
+	assert.equal(calls[1]!.initialSpendState, undefined);
+	assert.deepEqual(
+		(calls[1]!.continuationCapsule as { worker_advisory?: { remaining_criteria?: string[] } }).worker_advisory?.remaining_criteria,
+		bound.acceptance_criteria,
+	);
+});
+
+test("execution v2: a soft checkpoint continues with fresh-worker limits and lifetime telemetry", async (t) => {
 	const projectRoot = await root(t);
 	const delegationId = id(47);
 	const bound = contract("implementation");
@@ -954,10 +1001,7 @@ test("execution v2: a soft checkpoint continues in one delegation with cumulativ
 	};
 	const second = worker(completeReport(["src/changed.ts"]), {
 		turns: 2,
-		spendState: { turns: 34, totalTokens: 640, outputTokens: 104 },
-		spendBand: "soft",
-		spendReasons: ["turns"],
-		spendSoftReached: { turns: true, totalTokens: false, outputTokens: false },
+		spendState: { turns: 2, totalTokens: 160, outputTokens: 40 },
 	});
 	const before = await collectGitFacts(projectRoot, realExec);
 	const result = await executeDelegationV2({
@@ -982,13 +1026,82 @@ test("execution v2: a soft checkpoint continues in one delegation with cumulativ
 	assert.equal(calls.length, 2);
 	assert.equal(calls[0]!.attempt, 1);
 	assert.equal(calls[1]!.attempt, 2);
-	assert.deepEqual(calls[1]!.initialSpendState, { turns: 32, totalTokens: 480, outputTokens: 64 });
+	assert.equal(calls[1]!.initialSpendState, undefined);
 	assert.equal((calls[1]!.continuationCapsule as { attempt?: number }).attempt, 2);
 	assert.equal(result.result.turns, 34);
 	assert.equal(result.result.usage.totalTokens, 640);
 	const committed = await readDelegationCommittedGenerationV2(projectRoot, delegationId);
 	assert.equal(committed.ok, true);
 	if (committed.ok) assert.equal(committed.value.state.generation, 1);
+});
+
+test("execution v2: two consecutive handoffs form one monotonic three-worker chain", async (t) => {
+	const projectRoot = await root(t);
+	const delegationId = id(65);
+	const bound = contract("implementation");
+	const report = completeReport(["src/changed.ts"]);
+	const checkpointWorker = (attempt: number): WorkerRunResult => {
+		const result = worker(`checkpoint handoff ${attempt}`, {
+			turns: 32,
+			spendState: { turns: 32, totalTokens: 480, outputTokens: 64 },
+			spendBand: "soft",
+			spendReasons: ["turns"],
+			spendSoftReached: { turns: true, totalTokens: false, outputTokens: false },
+			checkpointRequest: {
+				attempt,
+				advisory: { completed_criteria: [], remaining_criteria: [...bound.acceptance_criteria] },
+			},
+		});
+		result.usage = {
+			input: 320, output: 64, cacheRead: 96, cacheWrite: 0, totalTokens: 480,
+			cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 },
+		};
+		return result;
+	};
+	const calls: RunWorkerOptions[] = [];
+	const result = await executeDelegationV2({
+		projectRoot,
+		delegationId,
+		contract: bound,
+		before: await collectGitFacts(projectRoot, realExec),
+		workerIdentity: { ...WORKER_IDENTITY },
+		clock: clock(),
+		exec: realExec,
+		runWorker: async (options) => {
+			calls.push(options);
+			if (calls.length === 1) {
+				return journalWorker(projectRoot, delegationId, bound.contract_hash, ["src/changed.ts"], checkpointWorker(1));
+			}
+			if (calls.length === 2) return checkpointWorker(2);
+			return worker(report);
+		},
+	});
+	assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result));
+	if (!result.ok || result.status === "PAUSED_BUDGET") return;
+	assert.equal(result.status, "PENDING_REVIEW");
+	assert.deepEqual(calls.map((call) => call.attempt), [1, 2, 3]);
+	assert.ok(calls.every((call) => call.initialSpendState === undefined), "every worker receives a fresh quality window");
+	assert.equal((calls[1]!.continuationCapsule as { attempt?: number }).attempt, 2);
+	assert.equal((calls[2]!.continuationCapsule as { attempt?: number }).attempt, 3);
+	assert.notEqual(
+		(calls[1]!.continuationCapsule as { checkpoint_hash?: string }).checkpoint_hash,
+		(calls[2]!.continuationCapsule as { checkpoint_hash?: string }).checkpoint_hash,
+		"each handoff advances the immutable checkpoint hash chain",
+	);
+	assert.equal(result.result.turns, 66, "lifetime turns remain monotonic telemetry across all three workers");
+	assert.equal(result.result.usage.totalTokens, 1_120);
+	const checkpoint = await readDelegationWorkerCheckpointV1(projectRoot, delegationId);
+	assert.equal(checkpoint.ok, true, checkpoint.ok ? "" : checkpoint.error.code);
+	if (checkpoint.ok) {
+		assert.equal(checkpoint.value?.attempt, 2);
+		assert.equal(checkpoint.value?.machine_state, "CHECKPOINTED");
+		assert.equal(checkpoint.value?.attempt_spend?.turns, 32);
+		assert.notEqual(checkpoint.value?.parent_checkpoint_hash, null);
+		assert.equal(checkpoint.value?.cumulative_turns, 64);
+		assert.equal(checkpoint.value?.cumulative_usage.totalTokens, 960);
+	}
+	const committed = await readDelegationCommittedGenerationV2(projectRoot, delegationId);
+	assert.equal(committed.ok, true, "the three-worker chain publishes one final generation");
 });
 
 test("execution v2: a new process resumes the exact recovery transaction from its durable checkpoint", async (t) => {
@@ -1067,10 +1180,7 @@ test("execution v2: a new process resumes the exact recovery transaction from it
 			resumedCalls.push(options);
 			return worker(completeReport(["src/changed.ts"]), {
 				turns: 2,
-				spendState: { turns: 34, totalTokens: 640, outputTokens: 104 },
-				spendBand: "soft",
-				spendReasons: ["turns"],
-				spendSoftReached: { turns: true, totalTokens: false, outputTokens: false },
+				spendState: { turns: 2, totalTokens: 160, outputTokens: 40 },
 			});
 		},
 	});
@@ -1080,106 +1190,61 @@ test("execution v2: a new process resumes the exact recovery transaction from it
 	assert.equal(resumed.durable_state.revision, 5);
 	assert.equal(resumedCalls.length, 1);
 	assert.equal(resumedCalls[0]!.attempt, 2);
-	assert.deepEqual(resumedCalls[0]!.initialSpendState, { turns: 32, totalTokens: 480, outputTokens: 64 });
+	assert.equal(resumedCalls[0]!.initialSpendState, undefined);
 	assert.equal(resumed.result.usage.totalTokens, 640);
 	assert.deepEqual(resumed.after.changedSinceBefore, ["src/changed.ts"]);
 });
 
-test("execution v2: explicit paused-budget authorization promotes once without resetting cumulative spend", async (t) => {
+test("execution v2: an extended worker limit also relays automatically without split authorization", async (t) => {
 	const projectRoot = await root(t);
 	const delegationId = id(63);
 	const { contract_hash: _baseHash, ...baseContract } = contract("implementation");
-	const boundResult = bindDelegationBoundedTaskContractV2({ ...baseContract, allowed_paths: ["src/"] });
+	const boundResult = bindDelegationBoundedTaskContractV2({
+		...baseContract,
+		allowed_paths: ["src/"],
+		budget_profile: "extended",
+		extended_reason: "Exercise the fresh-worker relay boundary.",
+	});
 	assert.equal(boundResult.ok, true);
 	if (!boundResult.ok) return;
 	const bound = boundResult.value;
-	const hard = worker("bounded epoch paused", {
-		turns: 64,
-		spendState: { turns: 64, totalTokens: 160, outputTokens: 40 },
+	const hard = worker("bounded worker handoff", {
+		turns: 96,
+		spendProfile: "extended",
+		spendState: { turns: 96, totalTokens: 160, outputTokens: 40 },
 		spendBand: "hard",
 		spendReasons: ["turns"],
 		spendSoftReached: { turns: true, totalTokens: false, outputTokens: false },
 		spendHardExceeded: { turns: true, totalTokens: false, outputTokens: false },
 	});
-	const ticks = clock();
-	const paused = await executeDelegationV2({
-		projectRoot,
-		delegationId,
-		contract: bound,
-		workerIdentity: { ...WORKER_IDENTITY },
-		clock: ticks,
-		exec: realExec,
-		onPrepared: async (_state, _before, prepared) => {
-			const persisted = await persistDelegationResumeAuthorityV1({
-				project_root: projectRoot,
-				delegation_id: delegationId,
-				contract: bound,
-				prepared,
-			});
-			assert.equal(persisted.ok, true);
-		},
-		runWorker: async () => journalWorker(projectRoot, delegationId, bound.contract_hash, ["src/changed.ts"], hard),
-	});
-	assert.equal(paused.ok, true);
-	if (!paused.ok || paused.status !== "PAUSED_BUDGET") return;
-	assert.equal(paused.durable_state.status, "RECOVERY_REQUIRED");
-	const withoutHash = {
-		schema_version: 1 as const,
-		kind: "budget-continuation-authorization-v1" as const,
-		delegation_id: delegationId,
-		checkpoint_hash: paused.checkpoint.checkpoint_hash,
-		target_profile: "extended" as const,
-		prompt_hash: "8".repeat(64),
-	};
-	const budgetContinuation = { ...withoutHash, authority_hash: canonicalHash(withoutHash) };
-	const authority = await collectCheckpointResumeExecutionAuthorityV1({
-		project_root: projectRoot,
-		delegation_id: delegationId,
-		exec: realExec,
-		budget_continuation: budgetContinuation,
-	});
-	assert.equal(authority.ok, true, authority.ok ? "" : authority.code);
-	if (!authority.ok) return;
+	const before = await collectGitFacts(projectRoot, realExec);
 	const calls: RunWorkerOptions[] = [];
-	const resumed = await executeDelegationV2({
+	const result = await executeDelegationV2({
 		projectRoot,
 		delegationId,
 		contract: bound,
+		before,
 		workerIdentity: { ...WORKER_IDENTITY },
-		clock: ticks,
+		clock: clock(),
 		exec: realExec,
-		checkpointRecovery: authority.value,
 		runWorker: async (options) => {
 			calls.push(options);
-			assert.equal(options.initialWriteJournalObservation?.state, "complete");
-			assert.equal(options.initialWriteJournalObservation?.revision, 2);
-			return journalWorker(
-				projectRoot,
-				delegationId,
-				bound.contract_hash,
-				["src/changed.ts"],
-				worker(completeReport(["src/changed.ts"]), {
-					turns: 2,
+			return calls.length === 1
+				? journalWorker(projectRoot, delegationId, bound.contract_hash, ["src/changed.ts"], hard)
+				: worker(completeReport(["src/changed.ts"]), {
 					spendProfile: "extended",
-					spendState: { turns: 66, totalTokens: 320, outputTokens: 80 },
-					spendBand: "soft",
-					spendReasons: ["turns"],
-					spendSoftReached: { turns: true, totalTokens: false, outputTokens: false },
-				}),
-				"succeeded",
-				options.initialWriteJournalObservation.revision,
-			);
+					spendState: { turns: 2, totalTokens: 160, outputTokens: 40 },
+				});
 		},
 	});
-	assert.equal(resumed.ok, true, resumed.ok ? "" : JSON.stringify(resumed));
-	if (!resumed.ok || resumed.status === "PAUSED_BUDGET") return;
-	assert.equal(calls.length, 1);
-	assert.equal(calls[0]!.spendProfile, "extended");
-	assert.deepEqual(calls[0]!.initialSpendState, { turns: 64, totalTokens: 160, outputTokens: 40 });
-	assert.equal((calls[0]!.continuationCapsule as { budget_profile?: string }).budget_profile, "extended");
-	assert.equal(authority.value.checkpoint.cumulative_turns, 64, "prior cumulative telemetry remains durable");
-	assert.equal(resumed.result.turns, 66, "the committed worker summary remains cumulative");
-	assert.equal(resumed.result.usage.totalTokens, 320);
+	assert.equal(result.ok, true, result.ok ? "" : JSON.stringify(result));
+	if (!result.ok || result.status === "PAUSED_BUDGET") return;
+	assert.equal(calls.length, 2);
+	assert.equal(calls[1]!.spendProfile, "extended");
+	assert.equal(calls[1]!.initialSpendState, undefined);
+	assert.equal((calls[1]!.continuationCapsule as { next_attempt_budget_profile?: string }).next_attempt_budget_profile, "extended");
+	assert.equal(result.result.turns, 98, "lifetime telemetry spans both fresh workers");
+	assert.equal(result.result.usage.totalTokens, 320);
 });
 
 test("execution v2: unknown out-of-journal drift blocks automatic checkpoint continuation", async (t) => {

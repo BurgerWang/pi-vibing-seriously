@@ -138,7 +138,7 @@ const WORKBENCH_DELEGATE_WORKER_V1_PROPERTIES = {
 const WORKBENCH_DELEGATE_WORKER_CURRENT_BUDGET_PROFILE = Type.Optional(
 	Type.Union([Type.Literal("standard"), Type.Literal("extended")], {
 		description:
-			"Luna xhigh cumulative spend profile. standard (default): soft at 32 turns / 5,440,000 total / 160,000 output and hard stop at 64 turns / 10,880,000 total / 320,000 output. extended (explicit only): soft at 64 turns / 10,880,000 total / 320,000 output and hard stop at 96 turns / 17,408,000 total / 512,000 output. Soft steer requests a coherent handoff in the current Sol session; every hard turn/total/output boundary terminates the bounded attempt with retained evidence. The retired low literal is rejected for new delegations.",
+			"Luna xhigh per-worker quality-window profile. standard (default): soft at 32 turns / 5,440,000 total / 160,000 output and hard handoff at 64 turns / 10,880,000 total / 320,000 output. extended: soft at 64 turns / 10,880,000 total / 320,000 output and hard handoff at 96 turns / 17,408,000 total / 512,000 output. Both boundaries preserve a checkpoint and continue automatically with a fresh worker under the same delegation; lifetime usage is telemetry, not user authorization. The retired low literal is rejected for new delegations.",
 		default: "standard",
 	}),
 );

@@ -108,9 +108,9 @@ export function registerMessageEndController(controller: MessageEndController): 
 		workerSpendState = worker.initialSpendState === undefined
 			? { ...EMPTY_WORKER_SPEND_STATE }
 			: { ...worker.initialSpendState };
-		// Cumulative soft steering is one-shot across fresh checkpoint
-		// processes. A continuation that already inherited soft-band spend must
-		// not immediately emit the same steer and checkpoint again.
+		// Per-process soft steering is one-shot. Current fresh continuations
+		// start at zero; the optional initial state remains a legacy/test seam.
+		// If that seam starts inside the soft band, do not emit a duplicate steer.
 		workerSpendSoftSteerSent = worker.role === "worker"
 			&& workerSpendBand(workerSpendState, worker.spendProfile) !== "ok";
 		if (worker.role === "worker" && worker.timeoutMs !== undefined) {

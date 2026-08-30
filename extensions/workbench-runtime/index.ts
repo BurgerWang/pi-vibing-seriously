@@ -230,8 +230,8 @@ export default function workbenchRuntime(runtimePi: ExtensionAPI): void {
 		projectRoot: process.env[WORKER_PROJECT_ROOT_ENV],
 		allowedPaths: parseWorkerAllowedPaths(process.env[WORKER_ALLOWED_PATHS_ENV]),
 		taskKind: parseWorkerTaskKindEnvironment(process.env[WORKER_TASK_KIND_ENV]),
-		// Phase 2 (worker token-budget repair): the delegation spend profile
-		// from the fixed child env contract. Current runners write only
+		// Phase 2 (worker token-budget repair): the per-process quality-window
+		// profile from the fixed child env contract. Current runners write only
 		// standard/extended; retired `low` and malformed/missing child env
 		// resolve defensively to `standard`.
 		spendProfile: resolveWorkerSpendProfile(process.env[WORKER_SPEND_PROFILE_ENV]),

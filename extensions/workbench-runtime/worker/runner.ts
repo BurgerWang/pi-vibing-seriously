@@ -226,8 +226,8 @@ export interface WorkerRunResult {
 	/** Distinct compaction reasons in arrival order (manual|threshold|overflow). */
 	compactionReasons: string[];
 	// ---------------------------------------------------------------- Phase 2
-	// Cumulative delegation-spend facts (worker token-budget repair, Phase 2):
-	// the profile this run accumulated against, the final cumulative spend
+	// Per-process spend facts (worker token-budget repair, Phase 2):
+	// the profile this fresh worker accumulated against, the final process spend
 	// state (turns / total / output), the final band, the triggered reasons in
 	// the fixed order, and per-dimension soft/hard trigger flags. All facts
 	// derive from the pure policy in core/worker-spend.ts and are recorded on
@@ -236,9 +236,9 @@ export interface WorkerRunResult {
 	// `standard` default when no profile was requested).
 	/** Spend profile this run accumulated against (deterministic default: standard). */
 	spendProfile: WorkerSpendProfile;
-	/** Final cumulative spend state (turns / totalTokens / outputTokens). */
+	/** Final fresh-process spend state (turns / totalTokens / outputTokens). */
 	spendState: WorkerSpendState;
-	/** Final cumulative spend band ("ok" | "soft" | "hard"). */
+	/** Final fresh-process spend band ("ok" | "soft" | "hard"). */
 	spendBand: WorkerSpendBand;
 	/** Triggered spend dimensions for the final band, fixed order. */
 	spendReasons: WorkerSpendReason[];
@@ -283,11 +283,11 @@ export interface WorkerOutputControlFacts {
 
 export interface WorkerProgress {
 	/**
-	 * Phase 4 (worker token-budget repair): numeric-only cumulative spend
+	 * Phase 4 (worker token-budget repair): numeric-only per-process spend
 	 * progress. Every callback carries exactly turns / totalTokens /
 	 * outputTokens / spendBand plus the pinned provider/model identity —
 	 * never worker text, reasons, report content, tool arguments, patches,
-	 * logs, or error prose. All three counters come from ONE cumulative
+	 * logs, or error prose. All three counters come from ONE process-local
 	 * spend-state snapshot after that assistant message was accumulated and
 	 * evaluated (band via the same pure policy), so the final progress tuple
 	 * exactly equals the final WorkerRunResult spendState/spendBand facts.
@@ -295,11 +295,11 @@ export interface WorkerProgress {
 	 * is always the fixed `ok` | `soft` | `hard` enum.
 	 */
 	turns: number;
-	/** Cumulative normalized total tokens after this assistant message. */
+	/** Process-local normalized total tokens after this assistant message. */
 	totalTokens: number;
-	/** Cumulative normalized output tokens after this assistant message. */
+	/** Process-local normalized output tokens after this assistant message. */
 	outputTokens: number;
-	/** Cumulative spend band after this assistant message (fixed enum). */
+	/** Process-local spend band after this assistant message (fixed enum). */
 	spendBand: WorkerSpendBand;
 	/** Latest child context projection gauge (outgoing tool-result text bytes). */
 	currentToolTextBytes: number;
@@ -335,16 +335,17 @@ export interface RunWorkerOptions {
 	/** Test seam for a fake JSON-event subprocess. */
 	invocation?: PiInvocation;
 	/**
-	 * Internal cumulative spend profile for this delegation run (worker
+	 * Internal per-process spend profile for this worker attempt (worker
 	 * token-budget repair, Phase 2). Optional and deterministic: omitted
 	 * values, including the retired historical `low` literal, resolve to the
-	 * `extended` profile. `standard` is the explicit small-slice profile. The resolved profile is
+	 * bounded `standard` profile; only explicit `extended` selects the larger
+	 * per-worker window. The resolved profile is
 	 * passed to the child through the fixed WORKER_SPEND_PROFILE_ENV env
 	 * contract, so the worker-role lifecycle enforces the SAME profile the
 	 * runner accumulates against. Public selection (tool schema) is Phase 3.
 	 */
 	spendProfile?: WorkerSpendProfile;
-	/** Cumulative state from the prior verified checkpoint; never reset between attempts. */
+	/** Legacy test/compatibility seam; current delegation handoffs start each fresh worker at zero. */
 	initialSpendState?: Readonly<WorkerSpendState>;
 	/** One-based attempt number. Every invocation still uses a fresh --no-session child. */
 	attempt?: number;
@@ -996,13 +997,13 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 					result.errorMessage = `Pinned worker exceeded the ${WORKER_HARD_BUDGET}-token hard context budget — fail closed`;
 					terminate("error");
 				}
-				// Phase 2 cumulative spend accounting (independent of the per-message
+				// Per-process spend accounting (independent of the per-message
 				// context safety above): every assistant message increments the
-				// cumulative spend state exactly once via the pure policy — turns + 1,
+				// process spend state exactly once via the pure policy — turns + 1,
 				// normalized total/output added (positive totalTokens authoritative,
 				// else the non-negative component sum; cacheRead counts; malformed
 				// usage contributes zero but still counts the turn — never NaN). Any
-				// cumulative hard dimension reached (`>=`) terminates this bounded
+				// process hard dimension reached (`>=`) terminates this bounded
 				// attempt with a deterministic handoff boundary. Turn enforcement is
 				// intentional: larger work must resume as another idempotent slice, not
 				// grow into an unbounded 200+ turn worker.
@@ -1040,7 +1041,7 @@ export async function runPinnedWorker(options: RunWorkerOptions): Promise<Worker
 					result.reportTextOversized = Buffer.byteLength(text, "utf8") > MAX_WORKER_REPORT_BYTES;
 				}
 				// Phase 4: the progress tuple is built AFTER the message was
-				// accumulated/evaluated above, from the SAME cumulative spend
+				// accumulated/evaluated above, from the SAME process-local spend
 				// state the final result facts derive from — every tuple matches
 				// the final ledger counters at the last event, hard stops
 				// included (the callback still runs after terminate()). Numeric

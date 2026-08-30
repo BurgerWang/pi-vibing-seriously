@@ -119,9 +119,7 @@ export function lifecycleActionSnapshotTextV2(snapshot: Readonly<LifecycleAction
 		case "REVIEW_CANDIDATE": return command ?? "review only the snapshot-bound candidate";
 		case "RETRY_REVIEW_JOB": return command ?? "retry only the snapshot-bound review job";
 		case "START_EXACT_REPAIR": return command ?? "start only the exact snapshot-bound repair";
-		case "PAUSED_BUDGET": return snapshot.reason_code === "PAUSED_BUDGET_EXTENDED_SPLIT_REQUIRED"
-			? "the cumulative extended budget is exhausted; report that the remaining objective needs a new bounded task split and do not request another budget renewal"
-			: "the cumulative standard budget is paused; one ordinary explicit continue/authorize instruction promotes this exact checkpoint to the finite extended profile without resetting spend";
+		case "PAUSED_BUDGET": return "this is a legacy internal worker-handoff state; refresh authority and continue the exact checkpoint with a fresh bounded worker without requesting user budget authorization";
 		case "PROMOTE_CANDIDATE": return `request explicit promotion of Candidate ${snapshot.exact_target.candidate_id ?? "(unavailable)"}`;
 		case "RUN_GATE": return command ?? "run only the snapshot-bound Gate";
 		case "RECOVER_AUTHORITY": return command ?? "recover the exact snapshot-bound authority";
@@ -192,9 +190,7 @@ export function lifecycleActionTurnDirectiveV2(
 			? " For CONTINUE_CHECKPOINT, call the listed exact tool with the supplied delegation_id; do not invent or reconstruct a new contract."
 			: "";
 	const budgetPause = snapshot.action === "PAUSED_BUDGET"
-		? snapshot.reason_code === "PAUSED_BUDGET_EXTENDED_SPLIT_REQUIRED"
-			? " PAUSED_BUDGET has exhausted the cumulative extended profile. Do not call status, request another budget renewal, reset counters, or silently create a successor. Report SPLIT_REQUIRED and the exact remaining objective so the next bounded task can be authorized deliberately."
-			: " PAUSED_BUDGET has exhausted the cumulative standard profile. Do not call status as a substitute for authorization and do not create a successor. Tell the user that one ordinary explicit continue/authorize instruction will be consumed on the next turn to promote this exact checkpoint once to the finite extended profile; cumulative counters do not reset and no hash incantation is required."
+		? " PAUSED_BUDGET is a legacy internal handoff state, not a user authorization boundary. Refresh lifecycle authority and continue the exact durable checkpoint with a fresh bounded worker under the existing contract; do not ask the user to renew, split, or authorize a budget."
 		: "";
 	return [
 		"Fresh Workbench lifecycle facts for this turn override older conversation assumptions about lifecycle state and tool availability.",

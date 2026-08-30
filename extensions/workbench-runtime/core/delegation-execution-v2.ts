@@ -82,7 +82,12 @@ import {
 	WORKER_PROVIDER,
 	type WorkerTaskContract,
 } from "./worker-policy.ts";
-import type { WorkerSpendProfile } from "./worker-spend.ts";
+import {
+	workerSpendBand,
+	workerSpendDimensionFlags,
+	workerSpendReasons,
+	type WorkerSpendProfile,
+} from "./worker-spend.ts";
 import type { WorkerRunFailureCode } from "./worker-run-failure.ts";
 import {
 	captureStreamingIdentities,
@@ -573,6 +578,7 @@ function mergeCommandEffectObservations(
 function aggregateWorkerAttempts(
 	attempts: readonly WorkerRunResult[],
 	baselineUsage?: Readonly<WorkerUsage>,
+	baselineTurns = 0,
 	baselineWriteObservation?: Readonly<WorkerWriteJournalRuntimeObservation>,
 ): WorkerRunResult | undefined {
 	const latest = attempts.at(-1);
@@ -589,8 +595,16 @@ function aggregateWorkerAttempts(
 	let commandObservation: Readonly<WorkerCommandEffectRuntimeObservation> = {
 		state: "empty", code: "none", entries: [],
 	};
+	const lifetimeSpendState = {
+		turns: baselineTurns,
+		totalTokens: baselineUsage?.totalTokens ?? 0,
+		outputTokens: baselineUsage?.output ?? 0,
+	};
 	for (const attempt of attempts) {
 		addWorkerUsage(usage, attempt.usage);
+		lifetimeSpendState.turns += attempt.spendState.turns;
+		lifetimeSpendState.totalTokens += attempt.spendState.totalTokens;
+		lifetimeSpendState.outputTokens += attempt.spendState.outputTokens;
 		deniedWriteCount += attempt.deniedWriteCount;
 		maxContextTokens = Math.max(maxContextTokens, attempt.maxContextTokens);
 		softBudgetReached ||= attempt.softBudgetReached;
@@ -603,11 +617,18 @@ function aggregateWorkerAttempts(
 		commandObservation = merged;
 	}
 	const denominator = usage.input + usage.cacheRead;
-	const spendState = latest.spendState;
+	const lifetimeSpendFlags = workerSpendDimensionFlags(lifetimeSpendState, latest.spendProfile);
+	const spansFreshWorkers = baselineUsage !== undefined || attempts.length > 1;
 	return {
 		...latest,
-		turns: spendState.turns,
-		spendState,
+		...(spansFreshWorkers ? {
+			turns: lifetimeSpendState.turns,
+			spendState: lifetimeSpendState,
+			spendBand: workerSpendBand(lifetimeSpendState, latest.spendProfile),
+			spendReasons: workerSpendReasons(lifetimeSpendState, latest.spendProfile),
+			spendSoftReached: lifetimeSpendFlags.soft,
+			spendHardExceeded: lifetimeSpendFlags.hard,
+		} : {}),
 		usage,
 		cacheHitRatio: denominator > 0 ? usage.cacheRead / denominator : null,
 		deniedWriteCount,
@@ -691,6 +712,7 @@ async function buildDurableWorkerCheckpoint(
 	checked: CheckedInput,
 	prepared: Readonly<PreparedDelegationChangeSetLifecycleV2>,
 	worker: Readonly<WorkerRunResult>,
+	attemptWorker: Readonly<WorkerRunResult>,
 	commandObservation: Readonly<WorkerCommandEffectRuntimeObservation>,
 	attempt: number,
 	parentCheckpointHash: string | null,
@@ -738,12 +760,12 @@ async function buildDurableWorkerCheckpoint(
 	if (touchedPaths.some((entry) => entry === undefined)) return undefined;
 	const completedRecipeRunIds = await verifiedRecipeRunIds(checked, commandObservation, inheritedRecipeRunIds);
 	if (completedRecipeRunIds === undefined) return undefined;
-	const profile = worker.spendProfile === "extended" ? "extended" : "standard";
+	const profile = attemptWorker.spendProfile === "extended" ? "extended" : "standard";
 	const remaining = remainingWorkerBudgetV1(
 		profile,
-		worker.spendState.turns,
-		worker.spendState.totalTokens,
-		worker.spendState.outputTokens,
+		attemptWorker.spendState.turns,
+		attemptWorker.spendState.totalTokens,
+		attemptWorker.spendState.outputTokens,
 	);
 	if (remaining === undefined) return undefined;
 	const built = buildWorkerCheckpointV1({
@@ -758,10 +780,24 @@ async function buildDurableWorkerCheckpoint(
 		completed_recipe_run_ids: completedRecipeRunIds,
 		cumulative_usage: structuredClone(worker.usage),
 		cumulative_turns: worker.spendState.turns,
+		attempt_spend: {
+			turns: attemptWorker.spendState.turns,
+			total_tokens: attemptWorker.spendState.totalTokens,
+			output_tokens: attemptWorker.spendState.outputTokens,
+		},
 		...(budgetPromotion === undefined ? {} : { budget_promotion: structuredClone(budgetPromotion) }),
 		remaining_budget: remaining,
 		machine_state: machineState,
-		worker_advisory: worker.checkpointRequest?.advisory ?? { completed_criteria: [], remaining_criteria: [] },
+		worker_advisory: worker.checkpointRequest?.advisory.completed_criteria.length ||
+			worker.checkpointRequest?.advisory.remaining_criteria.length
+			? worker.checkpointRequest.advisory
+			: {
+				completed_criteria: [],
+				// Until final machine verification, every contract criterion remains
+				// an explicit obligation for the fresh worker. This makes even a
+				// forced hard-boundary checkpoint a complete durable handoff document.
+				remaining_criteria: [...checked.contract.acceptance_criteria],
+			},
 		created_at: createdAt,
 	});
 	if (!built.ok) return undefined;
@@ -793,7 +829,7 @@ function validCheckpointRecoveryInput(
 		|| recovery.prepared.contract_hash !== checked.contract.contract_hash
 		|| !validateWorkerCheckpointV1(recovery.checkpoint)
 		|| (budgetContinuation === undefined
-			? recovery.checkpoint.machine_state !== "CHECKPOINTED"
+			? recovery.checkpoint.machine_state !== "CHECKPOINTED" && recovery.checkpoint.machine_state !== "PAUSED_BUDGET"
 			: recovery.checkpoint.machine_state !== "PAUSED_BUDGET"
 				|| !validateBudgetContinuationAuthorizationV1(budgetContinuation)
 				|| budgetContinuation.delegation_id !== checked.delegationId
@@ -998,14 +1034,6 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 	const executionSpendProfile: WorkerSpendProfile = budgetContinuation !== undefined
 		? "extended"
 		: checkpointRecovery?.checkpoint.remaining_budget.profile ?? checked.contract.budget_profile as WorkerSpendProfile;
-	let initialSpendState: Readonly<{ turns: number; totalTokens: number; outputTokens: number }> | undefined =
-		checkpointRecovery === undefined
-			? undefined
-			: {
-				turns: checkpointRecovery.checkpoint.cumulative_turns,
-				totalTokens: checkpointRecovery.checkpoint.cumulative_usage.totalTokens,
-				outputTokens: checkpointRecovery.checkpoint.cumulative_usage.output,
-			};
 	let continuationCapsule: Readonly<Record<string, unknown>> | undefined = checkpointRecovery === undefined
 		? undefined
 		: budgetContinuation === undefined
@@ -1034,7 +1062,6 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 				onProgress: input.onProgress,
 				spendProfile: executionSpendProfile,
 				attempt,
-				...(initialSpendState === undefined ? {} : { initialSpendState }),
 				...(continuationCapsule === undefined ? {} : { continuationCapsule }),
 				...(initialWriteJournalObservation === undefined ? {} : { initialWriteJournalObservation }),
 			});
@@ -1062,6 +1089,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 		const aggregate = aggregateWorkerAttempts(
 			workerAttempts,
 			checkpointRecovery?.checkpoint.cumulative_usage,
+			checkpointRecovery?.checkpoint.cumulative_turns ?? 0,
 			baselineWriteObservation,
 		);
 		if (aggregate === undefined || aggregate.commandEffectObservation === undefined) {
@@ -1070,47 +1098,21 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 			return failure("checkpoint_failed", checked, input, { durable_state: state });
 		}
 		const currentFailure = workerRunFailure(currentAttempt);
-		const cumulativeHard = currentAttempt.spendHardExceeded.turns
-			|| currentAttempt.spendHardExceeded.totalTokens || currentAttempt.spendHardExceeded.outputTokens;
-		if (cumulativeHard) {
-			const checkpointAt = safeClock(input.clock);
-			const checkpoint: Readonly<WorkerCheckpointV1> | undefined = checkpointAt === undefined ? undefined : await buildDurableWorkerCheckpoint(
-				checked, changeSetPrepared, aggregate, aggregate.commandEffectObservation, attempt,
-				parentCheckpointHash, "PAUSED_BUDGET", checkpointAt, input.exec, storageOptions,
-				checkpointRuntimeIdentity, inheritedRecipeRunIds, budgetPromotion,
-			);
-			if (checkpoint === undefined) {
-				state = await attemptRecovery(checked, state, input.clock, storageOptions,
-					RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed);
-				return failure("checkpoint_failed", checked, input, { durable_state: state });
-			}
-			state = await attemptRecovery(
-				checked,
-				state,
-				input.clock,
-				storageOptions,
-				BUDGET_PAUSED_RECOVERY_REASON_V2,
-			);
-			releaseIncompleteOwner = true;
-			return {
-				ok: true,
-				status: "PAUSED_BUDGET",
-				delegation_id: checked.delegationId,
-				before: structuredClone(preparedBefore),
-				durable_state: structuredClone(state),
-				checkpoint,
-				worker_failure_code: currentFailure?.code,
-			};
-		}
-		if (currentAttempt.checkpointRequest !== undefined) {
-			if (currentFailure !== undefined || currentAttempt.checkpointRequest.attempt !== attempt) {
+		const spendBoundaryFailure = currentFailure?.code === "SPEND_TURN_LIMIT"
+			|| currentFailure?.code === "SPEND_TOTAL_TOKEN_LIMIT"
+			|| currentFailure?.code === "SPEND_OUTPUT_TOKEN_LIMIT";
+		const qualityBoundaryFailure = spendBoundaryFailure || currentFailure?.code === "CONTEXT_HARD_LIMIT";
+		const automaticHandoff = currentAttempt.checkpointRequest !== undefined || qualityBoundaryFailure;
+		if (automaticHandoff) {
+			if (currentAttempt.checkpointRequest !== undefined && currentAttempt.checkpointRequest.attempt !== attempt
+				|| currentFailure !== undefined && !qualityBoundaryFailure) {
 				state = await attemptRecovery(checked, state, input.clock, storageOptions,
 					RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed);
 				return failure("checkpoint_failed", checked, input, { durable_state: state });
 			}
 			const checkpointAt = safeClock(input.clock);
 			const checkpoint: Readonly<WorkerCheckpointV1> | undefined = checkpointAt === undefined ? undefined : await buildDurableWorkerCheckpoint(
-				checked, changeSetPrepared, aggregate, aggregate.commandEffectObservation, attempt,
+				checked, changeSetPrepared, aggregate, currentAttempt, aggregate.commandEffectObservation, attempt,
 				parentCheckpointHash, "CHECKPOINTED", checkpointAt, input.exec, storageOptions,
 				checkpointRuntimeIdentity, inheritedRecipeRunIds, budgetPromotion,
 			);
@@ -1137,11 +1139,6 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 				return failure("checkpoint_failed", checked, input, { durable_state: state, checkpoint });
 			}
 			parentCheckpointHash = checkpoint.checkpoint_hash;
-			initialSpendState = {
-				turns: checkpoint.cumulative_turns,
-				totalTokens: checkpoint.cumulative_usage.totalTokens,
-				outputTokens: checkpoint.cumulative_usage.output,
-			};
 			continuationCapsule = capsule;
 			initialWriteJournalObservation = aggregate.writeJournalObservation;
 			attempt += 1;
@@ -1155,7 +1152,7 @@ export async function executeDelegationV2(input: ExecuteDelegationV2Input): Prom
 			RETRYABLE_EMPTY_RECOVERY_REASONS_V2.workerRunnerFailed);
 		return failure("runner_failed", checked, input, { durable_state: state });
 	}
-	const runnerFailure = workerRunFailure(worker);
+	const runnerFailure = workerRunFailure(workerAttempts.at(-1)!);
 	// Provider transport/identity success is independent from the overall
 	// worker outcome. A locally enforced budget/timeout/report failure after
 	// verified Luna assistant messages must never become PROVIDER_NOT_SUCCESS.

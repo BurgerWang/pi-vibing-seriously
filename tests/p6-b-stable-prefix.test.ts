@@ -186,7 +186,7 @@ test("same mode: consecutive prefix fingerprint builds are identical", () => {
 
 test("current public tool surface has the intentional ordinary-development transition hash", () => {
 	const baselineHash = "1c82f913f7dc0fe6c999ca982db1d714df940dfa09a75165aca5b6a01cd1f8dd";
-	const currentHash = "f58f921761395f57fa4d1c22a9cf7cc2d068fd3bfbd03e16a132a316793cef16";
+	const currentHash = "a3806783e75f44cbfa0bcf11eb6e61b42f160cf3fac6aeccbe4b6e61381ba309";
 	assert.notEqual(currentHash, baselineHash, "0.10.0 intentionally changes the frozen 8ec8c269 public tool surface");
 	assert.equal(canonicalHash(publicToolSurface()), currentHash, "current registered static sources match the ordinary-development transition hash");
 });
@@ -418,11 +418,11 @@ test("workbench_delegate_worker metadata is static, compact, and preserves autho
 	);
 	assert.doesNotMatch(budgetProfileSchema.description ?? "", /low =/);
 	assert.match(budgetProfileSchema.description ?? "", /retired low literal is rejected/);
-	assert.match(budgetProfileSchema.description ?? "", /Luna xhigh cumulative spend profile/);
-	assert.match(budgetProfileSchema.description ?? "", /standard \(default\): soft at 32 turns \/ 5,440,000 total \/ 160,000 output and hard stop at 64 turns \/ 10,880,000 total \/ 320,000 output/);
-	assert.match(budgetProfileSchema.description ?? "", /extended \(explicit only\): soft at 64 turns \/ 10,880,000 total \/ 320,000 output and hard stop at 96 turns \/ 17,408,000 total \/ 512,000 output/);
-	assert.match(budgetProfileSchema.description ?? "", /every hard turn\/total\/output boundary terminates the bounded attempt/);
-	assert.match(budgetProfileSchema.description ?? "", /current Sol session/);
+	assert.match(budgetProfileSchema.description ?? "", /Luna xhigh per-worker quality-window profile/);
+	assert.match(budgetProfileSchema.description ?? "", /standard \(default\): soft at 32 turns \/ 5,440,000 total \/ 160,000 output and hard handoff at 64 turns \/ 10,880,000 total \/ 320,000 output/);
+	assert.match(budgetProfileSchema.description ?? "", /extended: soft at 64 turns \/ 10,880,000 total \/ 320,000 output and hard handoff at 96 turns \/ 17,408,000 total \/ 512,000 output/);
+	assert.match(budgetProfileSchema.description ?? "", /continue automatically with a fresh worker under the same delegation/);
+	assert.match(budgetProfileSchema.description ?? "", /lifetime usage is telemetry, not user authorization/);
 	// The current surface retains Phase 4A's public shape while strengthening
 	// its authority semantics: repair_of stays OPTIONAL —
 	// absent from `required` — and is an exactly-20-character string pinned
@@ -477,7 +477,7 @@ test("workbench_delegate_worker metadata is static, compact, and preserves autho
 	);
 	assert.equal(
 		canonicalHash(WORKBENCH_TOOL_PARAMETERS.workbench_delegate_worker),
-		"c718ef6cd8dbb1e8c624350b5884c2feacddefcc83dc8a4df7d2a1eae5674572",
+		"cdcd91d6f09bc2495c61202bd8cf7ca073a21c08c3c7b5a3dab47cf51060382b",
 		"current delegate parameter schema hash is pinned after semantic-repair continuity",
 	);
 });
@@ -684,7 +684,7 @@ test("delegation status metadata distinguishes new-v2 relevance from legacy full
 	);
 	assert.equal(
 		canonicalHash(workbenchToolMetadataOrdered()),
-		"26f5554785bf80c08bdfc9193754d8bc5159338b57241c9f1a24c97f2689756e",
+		"e5d8e9ed9a250d4405b3136d774257fa5ed2c4995d63220dfc644e6ed51b9d9b",
 		"current public catalog hash is machine-pinned after ordinary Candidate convergence",
 	);
 });

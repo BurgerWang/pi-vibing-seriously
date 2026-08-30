@@ -444,8 +444,9 @@ Commander/project compaction reserve):
   otherwise the non-negative `input + output + cacheRead + cacheWrite` sum);
 - at 217,600 tokens (80%) the worker role sends one hidden steer to stop new
   implementation, finish a concise handoff, and list remaining work;
-- at 244,800 tokens (90%) the runner terminates the child and the invocation
-  fails closed;
+- at 244,800 tokens (90%) the runner terminates the current child; the
+  delegation controller persists and validates a checkpoint, then starts a
+  fresh worker under existing authority (checkpoint failure still fails closed);
 - in the worker role only, `session_before_compact` is cancelled
   (`{ cancel: true }`) so a worker never silently continues through lossy
   compaction — the Commander's compaction behavior is unchanged;
@@ -453,15 +454,16 @@ Commander/project compaction reserve):
   distinct reasons) and any compaction attempt fails the result closed even
   if the child exits 0.
 
-Cumulative spend-budget protection (Phases 1–5 of the approved worker
+Per-worker quality-window protection (evolved from Phases 1–5 of the worker
 token-budget repair; `core/worker-spend.ts` pure policy, **wired into the
 runtime since Phase 2**, public selection + ledger/handoff persistence
 since Phase 3, numeric-only progress since Phase 4, task-contract profile
 wording and granularity guidance since Phase 5):
 
 - operates independently of the per-message context budget above (which is
-  unchanged) and accumulates turns, total tokens and output tokens over
-  all assistant messages of a delegation run;
+  unchanged) and accumulates turns, total tokens and output tokens only over
+  the current worker process; delegation-lifetime totals are separate monotonic
+  telemetry and never stop the task or require user authorization;
 - two active profiles — `standard` (the bounded default), `extended`
   (explicit only for a justified larger slice) — with exact soft/hard turns,
   total-token and output-token limits; "reached" means at or above (`>=`);
@@ -472,11 +474,11 @@ wording and granularity guidance since Phase 5):
   negative values contribute zero — never NaN, never a crash;
 - band evaluation `ok | soft | hard` with hard-over-soft precedence and
   the fixed reason order `turns`, `total_tokens`, `output_tokens`;
-- deterministic soft-steer text (one hidden steer per delegation), hard-stop
-  reason text, and spend summary formatters; the runner terminates the
-  child fail-closed on any hard dimension (the deterministic hard-stop
-  message names the winning dimension(s) and values) and the worker-role
-  lifecycle sends exactly one hidden cumulative soft steer (worker role
+- deterministic soft-steer text (one hidden steer per worker), hard-handoff
+  reason text, and spend summary formatters; the runner terminates only the
+  current child on any hard dimension (the deterministic handoff message
+  names the winning dimension(s) and values) and the worker-role lifecycle
+  sends exactly one hidden soft steer (worker role
   only — the commander session never receives it, its own one-shot flag
   independent of the context steer, send failures swallowed);
 - the spend profile reaches the child through the fixed
@@ -495,14 +497,18 @@ wording and granularity guidance since Phase 5):
   bounded parent handoff renders the deterministic spend summary line and
   nested spend details from the SAME persisted worker-summary spend
   object;
-- progress events (Phase 4) expose numeric-only cumulative spend counters
+- progress events (Phase 4) expose numeric-only current-worker spend counters
   (turns, total/output tokens, fixed `ok | soft | hard` band) plus the
   pinned provider/model identity — never worker text, reasons, report
   content, tool arguments, patches, logs, or error prose; the starting/
   running onUpdate keeps the exact
   `Pinned worker: N turn(s), model provider/model` text prefix and adds
   only deterministic counters/band;
-- the 60-minute timeout remains an independent failure path.
+- soft and hard boundaries persist `WorkerCheckpointV1`; the delegation
+  controller automatically starts a fresh `--no-session` worker under the
+  same contract and path authority. No budget renewal, profile promotion, or
+  task-split authorization is created or consumed;
+- the 60-minute timeout remains an independent operational failure path.
 
 Historical committed v1/v2 records with `low` remain read-only compatible.
 The public contract and new committed-artifact boundary reject `low` before
