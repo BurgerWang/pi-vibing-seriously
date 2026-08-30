@@ -226,6 +226,7 @@ export function registerRuntimeWorkbenchToolsV1(
 			recoverSettledGenericProjectCheckoutOperationV1(projectRoot),
 		reconcileProjectAuthority: async ({ project_root: projectRoot, now }) =>
 			controller.delegationSession.reconcileProjectAuthority(projectRoot, now),
+		getProjectAuthorityIssueCode: () => controller.delegationSession.getProjectAuthorityIssue()?.code,
 		resolveCandidate: resolveAutomaticDeliveryContinuationCandidateV1,
 		confirmSettled: async (input) => {
 			try {

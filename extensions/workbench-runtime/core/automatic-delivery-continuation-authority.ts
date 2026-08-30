@@ -462,8 +462,9 @@ async function buildCandidate(
 
 /**
  * Resolve at most one strict depth-zero candidate. Nonempty locator sets never
- * fall back to another project transaction; an empty set performs the bounded
- * reload scan and accepts only one durable sidecar root.
+ * fall back to another project transaction. An empty reload scan may select
+ * the newest durable sidecar only after every candidate independently passes
+ * full path-lane admission against all remaining project authority.
  */
 export async function resolveAutomaticDeliveryContinuationCandidateV1(
 	input: AutomaticDeliveryContinuationAuthorityResolveInputV1,
@@ -520,7 +521,15 @@ export async function resolveAutomaticDeliveryContinuationCandidateV1(
 			if (built.status === "DEFER" || built.status === "BLOCKED") return built;
 			candidates.push(built.candidate);
 		}
-		if (candidates.length > 1) return { status: "BLOCKED", code: "AMBIGUOUS_CANDIDATES" };
+		if (candidates.length > 1) {
+			if (locatorIds.length > 0) return { status: "BLOCKED", code: "AMBIGUOUS_CANDIDATES" };
+			// The scan ids and returned candidates use canonical delegation-id byte
+			// order. Building every candidate above is intentional: one overlapping
+			// or unknown lane blocks the whole reload instead of being skipped. When
+			// all are independently ALLOW, the newest id is the deterministic current
+			// objective and the lifecycle still permits only one attempt this epoch.
+			return { status: "CANDIDATE", candidate: candidates[candidates.length - 1]! };
+		}
 		if (candidates.length === 1) return { status: "CANDIDATE", candidate: candidates[0]! };
 		if (input.trigger === "before_agent_start" &&
 			(missingSidecar || metadataAdmission.ordinary_blocker_ids.length > 0)) {

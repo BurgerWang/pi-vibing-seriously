@@ -457,7 +457,7 @@ function addSemanticRoot(source: Fixture, id: string, offset: number, bound: str
 	source.repairTips.sort();
 }
 
-test("locator sets select one exact depth-zero sidecar while reload and two live ids remain ambiguous", async () => {
+test("locator sets select one exact sidecar while reload selects the newest only after every lane is admitted", async () => {
 	const source = fixture();
 	addSemanticRoot(source, ID_A, 0, BOUND_A, AFTER_A);
 	addSemanticRoot(source, ID_B, 10, BOUND_B, AFTER_B);
@@ -495,7 +495,11 @@ test("locator sets select one exact depth-zero sidecar while reload and two live
 	const reloadAmbiguous = await resolveAutomaticDeliveryContinuationCandidateV1(
 		resolveInput([], "before_agent_start", false), readers(source),
 	);
-	assert.deepEqual(reloadAmbiguous, { status: "BLOCKED", code: "AMBIGUOUS_CANDIDATES" });
+	assert.equal(reloadAmbiguous.status, "CANDIDATE", JSON.stringify(reloadAmbiguous));
+	if (reloadAmbiguous.status === "CANDIDATE") {
+		assert.equal(reloadAmbiguous.candidate.delegation_id, ID_B,
+			"the canonical newest durable candidate owns the one reload attempt");
+	}
 	const closedOnly = await resolveAutomaticDeliveryContinuationCandidateV1(
 		resolveInput([ID_CLOSED]), readers(source),
 	);
@@ -637,6 +641,16 @@ test("unknown authority and metadata or repair path overlap all fail closed befo
 	assert.deepEqual(await resolveAutomaticDeliveryContinuationCandidateV1(resolveInput([ID_A]), readers(repairOverlap)), {
 		status: "BLOCKED", code: "REPAIR_PATH_ADMISSION_BLOCKED",
 	});
+
+	const reloadOverlap = fixture();
+	addSemanticRoot(reloadOverlap, ID_A, 20, BOUND_A, AFTER_A);
+	addSemanticRoot(reloadOverlap, ID_B, 30, BOUND_B, AFTER_B);
+	reloadOverlap.closure = { ok: false, issue: { code: "repair_lineage_multiple_unresolved" } };
+	reloadOverlap.exactOverlap.add(ID_A);
+	assert.deepEqual(await resolveAutomaticDeliveryContinuationCandidateV1(
+		resolveInput([], "before_agent_start", false), readers(reloadOverlap),
+	), { status: "BLOCKED", code: "REPAIR_PATH_ADMISSION_BLOCKED" },
+	"reload never skips one blocked candidate to execute a disjoint candidate");
 });
 
 test("revalidation strictly rereads transaction, sidecar, closure, and path admission and detects TOCTOU", async () => {

@@ -73,6 +73,9 @@ import {
 	COMMANDER_PROVIDERS,
 	WORKER_TOOL_NAME,
 } from "./worker-policy.ts";
+import {
+	isDelegationPathLaneBypassableProjectIssueV1,
+} from "./delegation-path-lane-admission.ts";
 
 export const AUTOMATIC_DELIVERY_CONTINUATION_MESSAGE_TYPE_V1 =
 	"workbench-automatic-delivery-continuation-v1" as const;
@@ -115,6 +118,8 @@ export interface AutomaticDeliveryContinuationRuntimeControllerDependenciesV1 {
 		readonly now: string;
 		readonly runtime_context: ExtensionContext;
 	}) => Promise<boolean>;
+	/** Exact issue from the immediately preceding failed project reconciliation. */
+	readonly getProjectAuthorityIssueCode: () => string | undefined;
 	/** Full project scan. It must filter closed/reviewed locators before counting. */
 	readonly resolveCandidate: (
 		input: Parameters<AutomaticDeliveryContinuationLifecycleDependenciesV1["resolveCandidate"]>[0],
@@ -415,11 +420,23 @@ export function createAutomaticDeliveryContinuationRuntimeControllerV1(
 			try {
 				const recovered = await recoverSettledCheckoutOperation({ project_root: projectRoot });
 				if (!recovered.ok) return { ok: false, code: "CHECKOUT_OPERATION_RECOVERY_FAILED" };
-				return await dependencies.reconcileProjectAuthority({
+				const reconciled = await dependencies.reconcileProjectAuthority({
 					project_root: projectRoot,
 					now: safeNow(dependencies.now),
 					runtime_context: ctx,
-				}) ? { ok: true } : { ok: false, code: "PROJECT_AUTHORITY_RECOVERY_FAILED" };
+				});
+				if (reconciled) return { ok: true };
+				// A project-wide mirror cannot select one state when multiple historical
+				// authorities remain open. That is not a storage/recovery failure: the
+				// next durable candidate reader can still prove one exact locator and run
+				// strict path-lane admission against every other authority. Only the two
+				// project issues explicitly classified for that path-scoped bypass may
+				// cross this boundary; unknown, corrupt and overlapping paths still fail
+				// closed in resolveCandidate before any writer operation is acquired.
+				const issueCode = dependencies.getProjectAuthorityIssueCode();
+				return isDelegationPathLaneBypassableProjectIssueV1(issueCode)
+					? { ok: true }
+					: { ok: false, code: "PROJECT_AUTHORITY_RECOVERY_FAILED" };
 			} catch {
 				return { ok: false, code: "PROJECT_AUTHORITY_RECOVERY_FAILED" };
 			}

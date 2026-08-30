@@ -223,6 +223,8 @@ interface HarnessOptions {
 	onConfirm?: (authorityHash: string) => void;
 	onRecoverSettledCheckout?: () => void;
 	onReconcile?: () => void;
+	reconcileProjectAuthority?: () => boolean;
+	projectAuthorityIssueCode?: string;
 	recoverSettledCheckout?: AutomaticDeliveryContinuationRuntimeControllerDependenciesV1["recoverSettledCheckoutOperation"];
 	onLane?: (phase: "acquire" | "release", allowedPath: string) => void;
 	processStateSymbol?: symbol;
@@ -255,7 +257,11 @@ function harness(options: HarnessOptions = {}) {
 			options.onRecoverSettledCheckout?.();
 			return options.recoverSettledCheckout?.(input) ?? { ok: true, value: "absent" };
 		},
-		reconcileProjectAuthority: async () => { options.onReconcile?.(); return true; },
+		reconcileProjectAuthority: async () => {
+			options.onReconcile?.();
+			return options.reconcileProjectAuthority?.() ?? true;
+		},
+		getProjectAuthorityIssueCode: () => options.projectAuthorityIssueCode,
 		resolveCandidate: async (input) => {
 			options.onResolve?.(input);
 			const resolved = options.resolve?.(input, current) ?? current;
@@ -429,6 +435,63 @@ test("settled delegation CAS proceeds to transaction-aware authority reconciliat
 	await h.pi.emit("agent_settled", { type: "agent_settled" }, h.ctx);
 	assert.deepEqual(order.slice(0, 2), ["checkout-observe", "delegation-cas-reconcile"]);
 	assert.equal(h.exactCalls, 1, "transaction-aware reconciliation may close the old delegation before one successor");
+});
+
+test("known multi-authority reconciliation uses the exact locator's strict path lane instead of deferring", async () => {
+	for (const projectAuthorityIssueCode of [
+		"additional_unresolved_authority",
+		"repair_lineage_multiple_unresolved",
+	]) {
+		const resolvedInputs: AutomaticDeliveryContinuationResolveInputV1[] = [];
+		const h = harness({
+			reconcileProjectAuthority: () => false,
+			projectAuthorityIssueCode,
+			onResolve: (input) => resolvedInputs.push(input),
+		});
+		h.runtime.registerToolResultLocatorCaptureBeforeMiddleware();
+		h.runtime.registerLifecycleListenersAfterMiddleware();
+		await h.pi.emit("tool_execution_end", {
+			type: "tool_execution_end",
+			toolCallId: projectAuthorityIssueCode,
+			toolName: "workbench_delegate_worker",
+			result: { details: { delegation_id: ID } },
+			isError: false,
+		}, h.ctx);
+		await h.pi.emit("agent_settled", { type: "agent_settled" }, h.ctx);
+
+		assert.equal(h.exactCalls, 1, projectAuthorityIssueCode);
+		assert.deepEqual(resolvedInputs[0]?.locator_delegation_ids, [ID]);
+		assert.equal(resolvedInputs[0]?.require_full_path_admission, true);
+		assert.equal(h.pi.sent[0]?.message.details.status, "CHAIN_RESULT");
+	}
+});
+
+test("non-path-scoped reconciliation failures still defer before candidate selection", async () => {
+	for (const projectAuthorityIssueCode of [
+		"storage_failure",
+		"repair_lineage_invalid",
+		undefined,
+	]) {
+		let resolves = 0;
+		const h = harness({
+			reconcileProjectAuthority: () => false,
+			projectAuthorityIssueCode,
+			onResolve: () => { resolves += 1; },
+		});
+		h.runtime.registerToolResultLocatorCaptureBeforeMiddleware();
+		h.runtime.registerLifecycleListenersAfterMiddleware();
+		await h.pi.emit("tool_execution_end", {
+			type: "tool_execution_end",
+			toolCallId: projectAuthorityIssueCode ?? "missing-issue",
+			toolName: "workbench_delegate_worker",
+			result: { details: { delegation_id: ID } },
+			isError: false,
+		}, h.ctx);
+		await h.pi.emit("agent_settled", { type: "agent_settled" }, h.ctx);
+
+		assert.deepEqual({ resolves, exact: h.exactCalls }, { resolves: 0, exact: 0 });
+		assert.equal(h.pi.sent[0]?.message.details.code, "RECONCILE_FAILED");
+	}
 });
 
 test("final projected tool details are a success locator and multiple locators are filtered by strict resolver", async () => {

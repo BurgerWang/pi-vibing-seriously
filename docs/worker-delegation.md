@@ -162,6 +162,19 @@ callable tool; slash commands remain user-only conveniences. Historical
 aliases: every caller-supplied task, path, criterion, verification and budget
 field is ignored, and the immutable contract is recovered from the id.
 
+Automatic delivery continuation does not treat the two path-lane-bypassable
+project reconciliation issues (`additional_unresolved_authority` and
+`repair_lineage_multiple_unresolved`) as storage failures. After checkout
+recovery it proceeds only to the strict durable candidate reader, which must
+select the exact event locator and prove its requested path lane against every
+other unresolved authority before review or repair can run. A missing or
+ambiguous event-locator set, real path overlap, unknown/corrupt authority, or
+any other reconciliation failure remains blocked without acquiring a writer
+operation. A reload has no event locator; it first proves every durable repair
+candidate's full path lane against all others, then deterministically selects
+the newest id for the single automatic attempt allowed in that session epoch.
+It never skips a blocked candidate to reach a convenient one.
+
 If an exact lineaged repair attempt terminates before any worker write, its
 strict raw inventory may be closed with `close_inactive_blocker`. The receipt
 is stored beside, never inside, the immutable `v2` envelope and supersedes only
